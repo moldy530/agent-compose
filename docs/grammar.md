@@ -3906,14 +3906,12 @@ a flow input field can accept it.
 - Generated apps expose `start`, `resume`, and `status` routes; resume payloads
   are validated against the interrupting `human` node's output schema (PRD 5.11).
 
-**`auth:`, `callback_auth:` and `callback_allow:` are reserved grammar in v0**
-(§15): fully specified here, parsed, checked, and carried into the IR, and read
-by nothing the compiler generates yet. A served trigger declaring `auth:` is
-exactly as open as one declaring none, and a callback is still delivered to
-whatever URL the payload named. Everything the rest of §13.3 states in the
-present tense is what the M3 runtime is written against — a deployment that
-needs the guarantee before then keeps its gateway, and the block is the
-specification that gateway is configured to match.
+**`auth:`, `callback_auth:` and `callback_allow:` are enforced by the generated
+app.** A served trigger declaring `auth:` verifies its caller before it reads a
+payload; a delivery carries the identity `callback_auth:` declares and goes only
+where `callback_allow:` admits it. Everything the rest of §13.3 states in the
+present tense is what a built project does, and the launch-time environment
+check refuses a deployment missing any credential these blocks name (§4.3).
 
 **Authenticating the caller: `auth:`.** v0's posture was "deploy behind your own
 gateway". Webhook-style events make the generated app the thing a vendor calls
@@ -3963,6 +3961,13 @@ triggers:
 - **The secrets are `${ENV}` references** and nothing else, in both blocks and
   both directions: a literal is a compile error, because a secret never lives in
   the spec text (§4.3, Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)).
+  A reference that resolves to the **empty string** refuses the app at launch,
+  naming the variable. §4.3's presence check counts an empty variable as set,
+  which is right for a `base_url:` and wrong for a credential: an empty expected
+  token compares equal to the empty token every anonymous caller can send, and an
+  HMAC key of no bytes signs a body anybody can sign — so an unexpanded `${TOKEN}`
+  in a launch wrapper is a route that is open and says nothing about it, which
+  the refusal turns into one sentence on the first start.
 - **Exactly one scheme.** A block declaring neither, and a block declaring both,
   are both compile errors: one request carries one credential, and a route that
   verified either would be exactly as open as its weaker half.
@@ -3997,6 +4002,20 @@ answers an unauthenticated poll or resume, and an execution a no-auth trigger
 began keeps open routes (PRD resolved q32). `run` is untouched — no server, no
 caller to verify.
 
+**What an `hmac` trigger asks of those two routes** is worth spelling out,
+because the two schemes do not cost a client the same thing. A `bearer`
+trigger's three routes all take one header carrying one token. An `hmac`
+trigger's do not: the signature is over **that request's own raw body bytes**,
+so a `GET /executions/:id` of such an execution is signed over the *empty* body
+a `GET` carries — `HMAC(secret, "")`, written under the trigger's `header:`,
+`prefix:`, `algorithm:` and `encoding:` — and a `POST /executions/:id/resume` is
+signed over the resume payload exactly as sent, byte for byte, never over a
+re-serialization of it. That is the start route's rule applied to two more
+routes rather than a second rule; what makes it worth writing down is that "the
+auth of the trigger that started this execution" reads, for `hmac`, as a
+per-request signature a poller has to compute rather than as a credential it
+holds.
+
 **Identifying the delivery: `callback_auth:` and `callback_allow:`.** Outbound
 auth is opt-in and mirrors the inbound pair, so one verification recipe serves
 both directions. `bearer` sends a static token on every delivery; `hmac` signs
@@ -4014,6 +4033,34 @@ authenticate its deliveries must not hand them — credential and all — to wha
 host a payload named. A URL outside the list is refused **when it is read**, at
 parking or at settle rather than at start, and recorded as a refused delivery
 rather than as anybody's failure.
+
+**A delivery follows no redirect**, which is the same guarantee read one step
+further. The list is matched against the URL the trigger produced, so a receiver
+answering `3xx` must not be able to pass this report — with its signature, and a
+`callback_auth: bearer` token written under the header name its author chose — on
+to a `Location:` the list admits nowhere: what a cross-origin redirect strips is
+a fixed list of standard credential headers, never a name a composition chose and
+never the body's signature. The quieter
+half is that a `301`, `302` or `303` rewrites the request to a bodyless `GET`, so
+an allowlisted receiver redirecting to itself would answer `2xx` to a request
+carrying no report at all. A `3xx` is a failed attempt like any other non-2xx
+status (`docs/durability.md` §3.7); a receiver that has moved is a `callback:`
+naming where it moved to.
+
+**A callback URL that carries userinfo is refused**, which is the same guarantee
+read one step *back*. The list is matched against the URL as text, and userinfo —
+the `user:pass@` an authority may put before its host — is where the text and the
+destination part company: `http://hooks.example.com:9000@attacker.test/hook`
+begins with `http://hooks.example.com:`, so the entry
+`http://hooks.example.com:*/hook` — what an author writes for a receiver whose
+port the operating system chose — admits it while the host the request reaches is
+`attacker.test`. So a URL with an `@` in its authority is a refused delivery like
+any other, recorded and never sent, and it is refused **whether or not the
+trigger declares a list**: the two JavaScript runtimes a built project runs under
+disagree about such a URL — one drops the userinfo and delivers to the host after
+the `@`, the other refuses to construct the request at all — and a wire contract
+that turned on which one `serve` found would be no contract. An `@` after the
+authority, in a path or a query, is an ordinary character and means nothing here.
 
 **A trigger with a `callback:` and no `callback_auth:` is a documented test
 posture**: it signs nothing, claims nothing, and may POST anywhere. That is the
@@ -4072,8 +4119,10 @@ shape (Decision [D127](#d127-a-callback-allowlist-entry-is-a-wildcard-url-and-th
 
 **The delivery wire.** A callback fires on lifecycle events — every quiescence
 that opened new pauses, and settle — carrying the status route's report plus
-delivery metadata (PRD resolved q34, q35). Every delivery carries these headers,
-and they are normative:
+delivery metadata (PRD resolved q34, q35). A quiescence is the moment every
+branch of the execution has parked or finished, so a `map` over a flow with
+`human` nodes is **one** delivery listing all of its pauses rather than one per
+item. Every delivery carries these headers, and they are normative:
 
 | Header | Value |
 |---|---|
@@ -4105,11 +4154,12 @@ Outbound `hmac:` takes **no** keys but `secret:`: signing is fixed at
 HMAC-SHA256 written in hex, so one receiver-side recipe verifies every
 agent-compose deployment. Deliveries are journaled and at-least-once with bounded
 retry, so a parking delivery and a settle delivery **can arrive out of order**:
-receivers order by `X-AgentCompose-Ordinal`, never by arrival (PRD resolved q35).
+receivers order by `X-AgentCompose-Ordinal`, never by arrival, and dedupe on
+`X-AgentCompose-Delivery` (PRD resolved q35).
 
-The runtime half of all of this — verifying, signing, matching, delivering — is
-M3's; §13.3 is the grammar it is written against, and §15 lists the three keys
-among the constructs a v0 deployment must not rely on.
+The retry schedule, what a refused or exhausted delivery leaves behind, and what
+a restarted `serve` picks up are `docs/durability.md` §3.7's, which is normative
+for the delivery ledger the way §13.3 is normative for the wire.
 
 ### 13.4 `schedule` (RESERVED grammar — parsed and validated, no-op in v0)
 
@@ -4286,42 +4336,39 @@ its runtime effect is a documented no-op (PRD 5.10, 5.11).
 | `triggers.<t>.type: schedule` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: event` | parsed + validated, no-op | M3 |
 | `network:` on a placement | parsed, no-op | M3 |
-| `triggers.<t>.auth` | parsed + validated, no-op — the route serves unauthenticated | M3 |
-| `triggers.<t>.callback_auth` | parsed + validated, no-op — deliveries carry no credential | M3 |
-| `triggers.<t>.callback_allow` | parsed + validated, no-op — no callback URL is refused | M3 |
 
-The last three rows are the ones that read differently from the rest, and §13.3
-says so where it specifies them. A no-op `schedule` runs nothing, which is
-visible the first morning it does not fire; a no-op `auth:` **serves every
-caller** and is indistinguishable, from outside, from a guarded route. The keys
-are a declaration of what a deployment will enforce, so anything that needs the
-guarantee before M3 puts a gateway in front of the generated app.
+**Two constructs have left this list, and both left it by their runtime
+landing.**
 
-A wrong claim about a security control is worse than a missing one, and this one
-has to be retracted in the same change that makes it false — so it is bound to
-the compiler's behaviour rather than left to a reviewer's memory:
-`crates/compose-core/tests/trigger_auth_surface.rs` asserts that a built project
-carries **none** of an authenticated trigger's material, and enumerates every
-document repeating the claim — here, §13.3, both topics, and the
-`missing-callback-allowlist` explanation. The commit that teaches `serve` to
-verify a caller fails that test until those sentences go with it.
+`human` nodes were here until M2: a compiled project really pauses, publishes
+the question, and resumes (§8.7), and its waits now survive a restart as well —
+a resumed execution re-parks under the same wait id and reads its answers out of
+the journal (`docs/durability.md`).
 
-One **code** site is on the retraction list beside the documents, because what
-holds there today is an absence rather than a sentence:
-`crates/compose-core/src/codegen/env.rs` builds `src/env.ts` by walking
-`definitions` and the deploy layer, never `triggers`, so an authenticated
-trigger's four `${ENV}` references reach no generated file — consistent while
-the keys are inert, and wrong the moment `serve` reads one. §4.3's promise is
-that the variables a deployment needs are computable from the artifact
-statically; a runtime that read `process.env.WEBHOOK_TOKEN` without teaching
-that walk the same name would let a deployment missing the variable start clean
-and fail on every real delivery instead.
+**The three authentication keys were here until the http-native events pass**,
+and they are the ones that read differently from every other row, which is why
+their retraction is bound rather than remembered. A no-op `schedule` runs
+nothing, which is visible the first morning it does not fire; a no-op `auth:`
+would **serve every caller** and be indistinguishable, from outside, from a
+guarded route — a wrong claim about a security control is worse than a missing
+one, in both directions. So `crates/compose-core/tests/trigger_auth_surface.rs`
+now asserts the opposite of what it used to: that an authenticated trigger's
+material really does reach the generated project, that its credentials reach the
+environment manifest `src/env.ts` builds, and that the documents which once
+called the surface inert say it is enforced. A change that made these keys inert
+again fails there rather than shipping a `docs triggers` that promises a
+guarantee the app does not keep.
 
-`human` nodes were on this list and have left it: the runtime landed in M2, so a
-compiled project really pauses, publishes the question, and resumes (§8.7). What
-is still deferred is not the construct but its **durability** — a wait is a
-parked promise in the serving process rather than a checkpoint, and survives no
-restart until durable execution arrives in M3.
+The environment manifest is the half of that with no sentence to bind:
+`crates/compose-core/src/codegen/env.rs` walks `ir.triggers` beside the
+definitions and the deploy layer, so an authenticated trigger's four `${ENV}`
+references — `auth.bearer.token`, `auth.hmac.secret`,
+`callback_auth.bearer.token`, `callback_auth.hmac.secret` — are in the list
+`readEnvironment()` checks at process start. §4.3's promise is that the
+variables a deployment needs are computable from the artifact statically, and a
+runtime reading `process.env.WEBHOOK_TOKEN` that the walk did not know about
+would let a deployment missing the variable start clean and then refuse every
+real call.
 
 ---
 

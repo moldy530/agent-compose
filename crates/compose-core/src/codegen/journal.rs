@@ -166,6 +166,280 @@ mod tests {
         );
     }
 
+    /// **A delivery is journaled before it is attempted**
+    /// (`docs/durability.md` §3.7, PRD resolved q35).
+    ///
+    /// The inventory above is about the seven sites a *replay* consumes, and a
+    /// callback delivery is deliberately none of them: nothing in the graph
+    /// dispatches it, it is addressed by an execution and an ordinal rather
+    /// than by an instance path, and no replay ever reads it back. So it sits
+    /// in a ledger of its own — and `attemptDelivery`, the one declaration in
+    /// the emitted app that calls the world for one, is exempted from the
+    /// primitive walk above.
+    ///
+    /// An exemption with nothing else holding it is how a journaled delivery
+    /// decays into a bare `fetch`. This is what holds it, in the direction the
+    /// failure runs: the **intent** is recorded before anything is sent, and
+    /// each attempt's outcome after it — which is what makes a delivery
+    /// at-least-once across a restart rather than at-most-once inside one
+    /// process. Read off the seams rather than off the file, because the order
+    /// is what is being asserted and a file-wide search would find both calls
+    /// wherever they were.
+    #[test]
+    fn a_delivery_is_journaled_before_it_is_attempted() {
+        let serve = include_str!("js/serve.ts");
+        let document = include_str!("../../../../docs/durability.md");
+
+        let opening = function_body(serve, "opening");
+        let intent = opening
+            .find("intendDelivery(")
+            .expect("a delivery records its intent");
+        let sending = opening
+            .find("attempts(")
+            .expect("a delivery is then worked on its schedule");
+        assert!(
+            intent < sending,
+            "the intent of a delivery is recorded **before** the first attempt, or a process \
+             that dies mid-attempt leaves nothing for a later start to finish \
+             (`docs/durability.md` §3.7)"
+        );
+        assert!(
+            opening.contains("refuseDelivery("),
+            "a callback URL the allowlist admits nowhere is a recorded refusal rather than a \
+             silent drop (grammar 13.3, PRD resolved q33)"
+        );
+
+        let attempts = function_body(serve, "attempts");
+        let attempted = attempts
+            .find("attemptDelivery(")
+            .expect("the schedule makes attempts");
+        let recorded = attempts
+            .find("journaling(")
+            .expect("…and records what each one did");
+        assert!(
+            attempted < recorded,
+            "an attempt's outcome is recorded after the attempt, which is the only order that \
+             can hold one"
+        );
+        assert!(
+            function_body(serve, "journaling").contains("recordDeliveryAttempt("),
+            "the seam `attempts` hands its outcomes to no longer reaches the journal, so an \
+             attempt is made and recorded nowhere (`docs/durability.md` §3.7)"
+        );
+
+        // …and the one place a delivery leaves the process is the declaration
+        // the walk above exempts by name, rather than wherever a later edit put
+        // a second `fetch`.
+        let sites: Vec<String> = declarations(serve)
+            .into_iter()
+            .filter(|(_, body)| body.contains("fetch("))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            sites,
+            ["attemptDelivery"],
+            "the emitted app calls the world in exactly one place, and it is the one \
+             `NOT_AN_EFFECT` names"
+        );
+
+        for named in ["`attemptDelivery`", "`src/serve.ts`", "delivery"] {
+            assert!(
+                document.contains(named),
+                "`docs/durability.md` §3.7 does not name {named}, so the ledger this test binds \
+                 is documented nowhere"
+            );
+        }
+    }
+
+    /// **One loop per delivery, and one outcome per row**
+    /// (`docs/durability.md` §3.7).
+    ///
+    /// The sibling above binds the *order* of a delivery's two journal writes.
+    /// This binds who may make them, which is the half a restart puts under
+    /// pressure: one start reaches [`attempts`] from two directions. `recover`
+    /// walks the open executions without waiting for the replays it starts
+    /// (§6.1), so an execution that re-parks journals a `parked` intent and sets
+    /// its schedule going while that walk is still going on — and the walk over
+    /// every `pending` row that follows it then reads the row written a moment
+    /// ago.
+    ///
+    /// Two loops over one row would POST it twice under one id, which a receiver
+    /// dedupes, and would each append attempts to one row, which nothing
+    /// dedupes: the journal would hold a delivery that made more attempts than
+    /// the schedule §3.7 bounds, and a loop writing `pending` after the other
+    /// wrote `delivered` would leave the next start owing a webhook already
+    /// taken. So the claim is read off the app — a row is claimed before it is
+    /// attempted and released when the loop ends — and the guard under it off
+    /// the journal: **every** statement that moves a delivery row carries the
+    /// predicate that it is still `pending`, so a late writer meets a row with
+    /// an outcome and changes nothing.
+    #[test]
+    fn one_delivery_is_worked_once_and_a_row_that_ended_is_not_reopened() {
+        let serve = include_str!("js/serve.ts");
+        let journal = include_str!("js/journal.ts");
+
+        let attempts = function_body(serve, "attempts");
+        let claimed = attempts
+            .find("working.add(")
+            .expect("a delivery is claimed by the loop that works it");
+        let attempted = attempts
+            .find("attemptDelivery(")
+            .expect("…which is the loop that sends it");
+        assert!(
+            claimed < attempted,
+            "a delivery is claimed **before** it is attempted, or the second loop over one row \
+             is already sending it by the time the first says so (`docs/durability.md` §3.7)"
+        );
+        assert!(
+            attempts.contains("working.delete("),
+            "a claim that is never released is a delivery this process would not pick up again"
+        );
+        assert!(
+            function_body(serve, "resumeDelivery").contains("working.has("),
+            "the start's walk over every `pending` row is the second direction one delivery is \
+             reached from, so it is the one that has to ask whether the row is already being \
+             worked"
+        );
+
+        let moved: Vec<&str> = journal
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("\"UPDATE deliveries SET"))
+            .collect();
+        assert_eq!(
+            moved.len(),
+            3,
+            "the three ways a delivery row moves are a refusal, an exhaustion and an attempt: \
+             {moved:?}"
+        );
+        for statement in moved {
+            assert!(
+                statement.contains("AND status = 'pending'"),
+                "a delivery has one outcome, so a row that already reached one is left as it is: \
+                 {statement}"
+            );
+        }
+    }
+
+    /// **A journal write that fails loses neither the event nor the row's end**
+    /// (`docs/durability.md` §3.7).
+    ///
+    /// The two siblings above bind the *order* of a delivery's journal writes
+    /// and *who* may make them. This binds the third thing, which is what
+    /// happens when one of them does not land — a second process holding the
+    /// file past the lock wait, a disk momentarily full, both states §2 says a
+    /// healthy deployment reaches. Neither of the two failures it prevents is
+    /// visible from outside the process, and both are silent for the life of a
+    /// journal:
+    ///
+    ///  * a **parking announced to nobody**. `parking` marks a quiescence's
+    ///    pauses as reported before the intent is journaled, because the guard
+    ///    it marks them for is synchronous. Marked and then not journaled, every
+    ///    later quiescence of that execution finds the set already reported —
+    ///    and a receiver that subscribed to the question is told about the
+    ///    settle and never about the question, which under `respond: async` is
+    ///    the whole of what it was subscribed for.
+    ///  * a **row left `pending` past its schedule**. An attempt whose outcome
+    ///    the journal would not take leaves the row under-counting its attempts,
+    ///    and `attempts` on the row is the one thing a later start reads to
+    ///    decide how much of the schedule is left: the status route reports the
+    ///    execution as owing a webhook for ever, and the next start resumes the
+    ///    delivery below the offset it really reached and POSTs past the bound
+    ///    §3.7 calls normative.
+    ///  * a **settle announced to nobody**. `closed` journals its intent in the
+    ///    last moment the lifecycle row is open, and the row closes as it
+    ///    returns: after that `recover` walks no `open` execution for it and the
+    ///    walk over `pending` rows finds none, so an intent the journal refused
+    ///    once is a settle nothing will ever send — to a caller holding a `202`
+    ///    who, by resolved q34's reasoning, is not polling either.
+    ///
+    /// So all three are read off the seams: the marks come back off where the
+    /// intent did not go down, an attempt the journal refused is **carried**
+    /// rather than dropped — kept for the write that does land — and the two
+    /// writes nothing would ever come back to are insisted on where they stand.
+    #[test]
+    fn a_write_the_journal_refuses_leaves_neither_a_lost_event_nor_a_row_that_never_ends() {
+        let serve = include_str!("js/serve.ts");
+
+        let parking = function_body(serve, "parking");
+        assert!(
+            parking.contains("execution.reported.add(") && parking.contains("announcing("),
+            "a parking marks its pauses and hands the journaling to the seam that can put the \
+             marks back, or a failed intent is a question announced to nobody"
+        );
+        assert!(
+            !parking.contains("deliver("),
+            "`parking` journals its intent directly again, so nothing observes whether the \
+             journal took it and the marks it left stand for a row that does not exist"
+        );
+
+        let announcing = function_body(serve, "announcing");
+        let asked = announcing
+            .find("deliver(")
+            .expect("`announcing` is what journals a parking's intent");
+        let unmarked = announcing
+            .find("execution.reported.delete(")
+            .expect("…and what puts the pauses back where the journal would not take it");
+        assert!(
+            asked < unmarked,
+            "the marks come off **after** the journal has refused the intent, not before it is \
+             offered one"
+        );
+        assert!(
+            function_body(serve, "deliver").contains("return false;"),
+            "`deliver` no longer answers whether the journal took the intent, so `announcing` \
+             cannot tell a parking that was recorded from one that was lost"
+        );
+
+        let attempts = function_body(serve, "attempts");
+        let held = attempts
+            .find("owed.push(")
+            .expect("an attempt's outcome is held before it is written");
+        let written = attempts
+            .find("journaling(")
+            .expect("…and then offered to the journal");
+        assert!(
+            held < written,
+            "an attempt is recorded in this process before it is offered to the journal, which \
+             is what lets the next write carry what this one could not put down"
+        );
+        assert!(
+            attempts.contains("insisting("),
+            "the write that ends a delivery is the one nothing comes back to, so it is insisted \
+             on rather than tried once: a row left `pending` past its schedule is neither of \
+             §3.7's two ends"
+        );
+
+        let journaling = function_body(serve, "journaling");
+        let refused = journaling
+            .find("return false;")
+            .expect("`journaling` says when the journal would not take an attempt");
+        let dropped = journaling
+            .find("owed.shift()")
+            .expect("…and drops an attempt only once it is down");
+        assert!(
+            refused < dropped,
+            "an attempt the journal refused is dropped anyway, so the row under-counts its \
+             attempts and the next start POSTs past the bound §3.7 states"
+        );
+        let closed = function_body(serve, "closed");
+        let insisted = closed
+            .find("insisting(")
+            .expect("the settle's intent is insisted on, not tried once");
+        assert!(
+            closed[insisted..].contains("deliver(execution, \"settled\""),
+            "`closed` journals the settle's intent with a write nothing observes: the lifecycle \
+             row closes as it returns, so a journal that says no once loses the settle for the \
+             life of the journal (`docs/durability.md` §3.7)"
+        );
+
+        assert!(
+            function_body(serve, "insisting").contains("JOURNAL_RETRY_MS["),
+            "the ladder a refused write is retried on is unbounded, which is a queue rather \
+             than the courtesy §3.7 calls a webhook"
+        );
+    }
+
     /// The seven journaled seams, by the name each is declared under.
     const SEAMS: [&str; 7] = [
         "callModel",
@@ -303,14 +577,16 @@ mod tests {
         //  * `releaseExecution` — grammar 11.1's `scope: execution` lifetime,
         //    run by `runFlow` when a run ends. It removes what the run owned;
         //    running it twice removes it twice.
-        //  * `notify` — the completion webhook of an `async` `http` trigger
-        //    (grammar 13.3). It reports an execution that has **ended**, and
-        //    `settling` fires it on exactly the outcomes that close the
-        //    lifecycle row — it is skipped under `runtime.staysOpen`, which is
-        //    the same predicate the row itself is closed by. So the execution a
-        //    later process replays is one no webhook has been sent for, and the
-        //    process that finishes a run is the one that calls this, once
-        //    (`docs/durability.md` §6.1).
+        //  * `attemptDelivery` — one attempt at an `http` trigger's lifecycle
+        //    webhook (grammar 13.3, `docs/durability.md` §3.7). It is a
+        //    journaled effect, and it is **not** one of the seven: a delivery
+        //    is not something the graph dispatches, is not addressed by an
+        //    instance path, and is never consumed by a replay — it is the
+        //    *lifecycle* being reported, so it has a ledger of its own beside
+        //    `effects`. What keeps a replay from making it twice is that
+        //    ledger's own at-least-once discipline, which
+        //    `a_delivery_is_journaled_before_it_is_attempted` reads off the
+        //    same seam rather than leaving it to this exemption.
         //  * `writeTrace` — the run's own trace document, written by the command
         //    after the run (`docs/trace.md`). A resumed generation writes a fresh
         //    whole one, which is §9's promise rather than a repeat.
@@ -321,7 +597,7 @@ mod tests {
         //    journal, which is what a replay *is*.
         const NOT_AN_EFFECT: [(&str, &str); 8] = [
             ("src/stores.ts", "releaseExecution"),
-            ("src/serve.ts", "notify"),
+            ("src/serve.ts", "attemptDelivery"),
             ("src/cli.ts", "writeTrace"),
             ("src/journal.ts", "SqliteJournal"),
             ("src/journal.ts", "openJournal"),
@@ -626,7 +902,7 @@ mod tests {
         Some(name)
     }
 
-    /// The body of one exported function of an emitted module.
+    /// The body of one top-level function of an emitted module.
     ///
     /// The same reader `compose-core`'s `tests/trace_format_inventory.rs` uses,
     /// and for its reason: a rule about what one function does is only a rule if
@@ -635,12 +911,22 @@ mod tests {
     /// zero and closes on a line that is exactly `}` — which is what makes a
     /// line scan enough, and a brace count wrong: a signature's own inline
     /// object type (`request: { … }`) opens a brace before the body does.
+    ///
+    /// The four spellings are read rather than the one, because whether a
+    /// function is exported says nothing about what it does: the delivery seams
+    /// are module-internal and are as much a rule as the seven exported ones.
     fn function_body(source: &str, name: &str) -> String {
-        let header = format!("export async function {name}(");
-        let mut lines = source.lines().skip_while(|line| !line.starts_with(&header));
+        let headers = [
+            format!("export async function {name}("),
+            format!("async function {name}("),
+            format!("export function {name}("),
+            format!("function {name}("),
+        ];
+        let opens = |line: &str| headers.iter().any(|header| line.starts_with(header));
+        let mut lines = source.lines().skip_while(|line| !opens(line));
         let opened = lines
             .next()
-            .unwrap_or_else(|| panic!("the emitted module declares `{header}…`"));
+            .unwrap_or_else(|| panic!("the emitted module declares `function {name}(…`"));
         let mut held = String::from(opened);
         for line in lines {
             held.push('\n');

@@ -149,8 +149,9 @@ fn the_whole_auth_surface_parses_and_resolves_clean() {
         render(&diagnostics)
     );
     // A composition `validate` accepts is one `build` owes a project to, and
-    // codegen does not read these keys yet — an emitter that indexed one anyway
-    // would arrive here as a panic rather than as a diagnostic.
+    // every key of this surface is one the emitter reads — an emitter that
+    // indexed one wrongly would arrive here as a panic rather than as a
+    // diagnostic.
     assert!(
         !compose_core::emit(&ir).files().is_empty(),
         "the auth surface validates, so `build` owes it a project"
@@ -510,6 +511,10 @@ fn a_transport_header_is_refused_outbound_and_stays_legal_inbound() {
 ///
 /// The bullet is located rather than the document searched, because the failure
 /// is exactly a claim living under the *other* scheme.
+///
+/// What the runtime *does* about the requirement is the sibling below's, and the
+/// two are worth having separately: this one fails when a document stops asking,
+/// which is how the next implementer comes to write the wrong comparison.
 #[test]
 fn both_inbound_schemes_require_a_constant_time_comparison() {
     let grammar = fs::read_to_string(
@@ -540,74 +545,204 @@ fn both_inbound_schemes_require_a_constant_time_comparison() {
             assert!(
                 bullet(document, scheme).contains("constant"),
                 "{source}'s `{scheme}` bullet no longer requires a constant-time comparison, \
-                 and it is the only place the runtime is told to make one"
+                 and it is where the next implementer of this surface reads about one"
             );
         }
     }
 }
 
-/// The reserved claim, bound to the thing it claims — and the list of what to
-/// unwind when it stops holding.
+/// …and the app **makes** one, on both schemes (grammar 13.3, Decision D125).
 ///
-/// `auth:`, `callback_auth:` and `callback_allow:` are reserved grammar
-/// (grammar 15): parsed, checked, carried into the IR, and read by **nothing**
-/// that is generated. That asymmetry is why four shipped documents say so in
-/// as many words — a no-op `schedule` runs nothing and is visibly inert, while
-/// a no-op `auth:` serves every caller and looks exactly like a guarded route,
-/// so a reader told otherwise is told something false about a security control.
+/// The requirement above is the only security property this surface has, and
+/// until the runtime landed prose was the whole of what held it. It is not any
+/// more, and a document nobody disagrees with is the weakest possible binding
+/// for a property whose loss is invisible: a later cleanup writes `return
+/// offered === expected` — the `TextEncoder` round trip reads as ceremony — and
+/// every gate in this repository stays green, because every other assertion
+/// about `auth:` is about *which* requests are refused and none is about how
+/// long a refusal took. What ships then leaks, byte by byte to a caller who can
+/// time it, the expected HMAC digest for a body of that caller's choosing, and
+/// a request forged with a digest recovered that way is accepted without the
+/// caller ever holding `${WEBHOOK_SECRET}`.
 ///
-/// The obligation runs the other way too: the change that makes these keys live
-/// must delete those sentences in the same commit, or the shipped binary tells
-/// an operator through `agent-compose docs triggers` and `agent-compose explain
-/// missing-callback-allowlist` that nothing is enforced while the served app
-/// enforces both. This test is what makes that a build failure rather than a
-/// reviewer's memory. When the runtime lands, the first half fails, and these
-/// are the five places to unwind — four documents and one pass:
-///
-/// * `docs/grammar.md` §13.3 ("reserved grammar in v0") and §15 (three rows)
-/// * `docs/topics/triggers.md` ("All three keys below are reserved in v0" and
-///   the closing "What `reserved` means")
-/// * `docs/topics/targets.md` (three rows)
-/// * `crates/compose-core/src/docs/codes/missing-callback-allowlist.md`
-///   ("This check is live; the matching it demands is not")
-/// * `crates/compose-core/src/codegen/env.rs`, `References::of` — the walk that
-///   builds `src/env.ts`. It visits `ir.definitions` and `ir.deploy` and never
-///   `ir.triggers`, which is why the four env refs of an authenticated trigger
-///   reach no generated file: the assertion below is what holds that today. The
-///   commit that teaches `serve` to read `process.env.WEBHOOK_TOKEN` has to
-///   teach that walk the same names in the same change, or a deployment missing
-///   the variable starts clean — `readEnvironment()` reports only what
-///   `environmentReferences` lists — and then fails on every real delivery,
-///   which is exactly the promise that module's own header makes ("the set of
-///   variables an isolated deployment needs is computable from it, statically").
+/// So it is read off the emitted app, at the seam rather than over the file:
+/// **both** of `verified`'s schemes have to reach the comparison, which is the
+/// asymmetry D125 is written about, and the comparison has to be the one
+/// `node:crypto` provides. A file-wide search for `timingSafeEqual` would be
+/// satisfied by the bearer half alone.
 #[test]
-fn the_auth_surface_is_reserved_grammar_and_every_document_saying_so_is_listed_here() {
-    let ir = resolve_clean("reserved", &source());
+fn both_inbound_schemes_compare_in_constant_time_in_the_generated_app() {
+    let ir = resolve_clean("constant-time", &source());
     let generated = compose_core::emit(&ir);
-    // Every value that would have to reach the runtime for one of these keys to
-    // be enforced: the credentials, the header names, and the allowlist.
+    let app = generated
+        .files()
+        .iter()
+        .find(|file| file.path == "src/serve.ts")
+        .expect("every project emits the app over its triggers")
+        .contents
+        .clone();
+
+    // The three routes' one guard, split at the digest: what is before
+    // `createHmac` is the `bearer` half and what is after it is the `hmac` half.
+    let verified = function_body(&app, "function verified(");
+    let digest = verified
+        .find("createHmac(")
+        .expect("`verified` computes the signature it verifies");
+    for (half, scheme) in [
+        (&verified[..digest], "bearer"),
+        (&verified[digest..], "hmac"),
+    ] {
+        assert!(
+            half.contains("equal("),
+            "`verified`'s `{scheme}` half compares the credential itself rather than through \
+             the constant-time comparison, so a caller who can time a refusal recovers what \
+             this trigger expects (grammar 13.3, D125)"
+        );
+    }
+
+    let equal = function_body(&app, "function equal(");
+    assert!(
+        equal.contains("timingSafeEqual("),
+        "the comparison both schemes reach no longer uses `node:crypto`'s constant-time one: \
+         a byte-by-byte early return leaks the token to a caller who can time it, and the \
+         expected digest for a body of that caller's choosing (grammar 13.3, D125)"
+    );
+    assert!(
+        !equal.contains("offered ===") && !equal.contains("=== offered"),
+        "the credential a caller offered is compared directly somewhere in `equal`, which is \
+         the leak `timingSafeEqual` is there to prevent however the call beside it reads"
+    );
+    assert!(
+        app.contains("import { createHmac, timingSafeEqual } from \"node:crypto\";"),
+        "`src/serve.ts` no longer takes its comparison from the runtime's own crypto module"
+    );
+}
+
+/// The body of one top-level declaration of an emitted module.
+///
+/// `compose-core`'s own `codegen::journal` and `tests/trace_format_inventory.rs`
+/// read the emitted modules the same way, and for the same reason: a rule about
+/// what one function does is only a rule if it is read off that function rather
+/// than off the file around it. The module is formatted, so a top-level
+/// declaration opens at column zero and closes on a line that is exactly `}`.
+fn function_body(source: &str, header: &str) -> String {
+    let mut lines = source.lines().skip_while(|line| !line.starts_with(header));
+    let opened = lines
+        .next()
+        .unwrap_or_else(|| panic!("`src/serve.ts` declares `{header}…`"));
+    let mut held = String::from(opened);
+    for line in lines {
+        held.push('\n');
+        held.push_str(line);
+        if line == "}" {
+            return held;
+        }
+    }
+    panic!("`{header}…` has no closing brace in the first column")
+}
+
+/// The enforced claim, bound to the thing that enforces it — and the list of
+/// documents that must not go back on it.
+///
+/// `auth:`, `callback_auth:` and `callback_allow:` were **reserved** grammar
+/// until the http-native events pass: parsed, checked, carried into the IR, and
+/// read by nothing that was generated. Four shipped documents said so in as
+/// many words, and this test was their opposite — it asserted that none of an
+/// authenticated trigger's material reached a built project, and enumerated the
+/// five places to unwind when the runtime landed.
+///
+/// It has been turned around, because the asymmetry that made it worth writing
+/// runs in both directions. A no-op `schedule` runs nothing and is visibly
+/// inert, while a no-op `auth:` **serves every caller** and is
+/// indistinguishable, from outside, from a guarded route — so a reader told the
+/// wrong thing about this surface is told something false about a security
+/// control whichever way the sentence points. What is asserted now is that the
+/// material really does reach the generated project, that the credentials reach
+/// the **environment manifest** so a deployment missing one is refused at
+/// launch, and that the documents which used to call the surface inert say it
+/// is enforced. A change that made the keys inert again — an emitter that
+/// stopped writing them, a walk that stopped visiting `ir.triggers` — fails
+/// here rather than shipping a binary whose `agent-compose docs triggers`
+/// promises a guarantee the app does not keep.
+#[test]
+fn the_auth_surface_reaches_the_generated_app_and_every_document_says_so() {
+    let ir = resolve_clean("enforced", &source());
+    let generated = compose_core::emit(&ir);
+    let triggers_module = generated
+        .files()
+        .iter()
+        .find(|file| file.path == "src/triggers.ts")
+        .expect("a composition with triggers emits the table")
+        .contents
+        .clone();
+    let environment = generated
+        .files()
+        .iter()
+        .find(|file| file.path == "src/env.ts")
+        .expect("every project emits its environment manifest")
+        .contents
+        .clone();
+
+    // Everything that has to reach the runtime for these keys to be enforced:
+    // the header names and the allowlist, which are values the app compares
+    // against, and the credentials, which reach it as the **names** of the
+    // variables holding them (grammar 4.3 — `build` resolves nothing).
     for material in [
-        "WEBHOOK_SECRET",
-        "WEBHOOK_TOKEN",
-        "CALLBACK_SECRET",
-        "CALLBACK_TOKEN",
         "X-Hub-Signature-256",
         "X-Delivery-Token",
         "hooks.example.com",
-        "X-AgentCompose-",
+        "sha512",
+        "base64",
+        "\"WEBHOOK_SECRET\"",
+        "\"WEBHOOK_TOKEN\"",
+        "\"CALLBACK_SECRET\"",
+        "\"CALLBACK_TOKEN\"",
     ] {
-        for file in generated.files() {
-            assert!(
-                !file.contents.contains(material),
-                "`{}` carries `{material}`, so the authentication surface is no longer inert — \
-                 the documents this test names have to stop saying it is",
-                file.path
-            );
-        }
+        assert!(
+            triggers_module.contains(material),
+            "`src/triggers.ts` carries no `{material}`, so the app cannot enforce what the \
+             trigger declared"
+        );
+    }
+    for reference in ["${WEBHOOK_SECRET}", "${CALLBACK_TOKEN}"] {
+        assert!(
+            !triggers_module.contains(reference),
+            "a credential reaches generated code as a variable *name* and never as a resolved \
+             value or an uninterpreted `{reference}` (grammar 4.3)"
+        );
     }
 
-    // …and the documents that say it. Each is checked for the sentence that
-    // would become false, so one deleted early fails here rather than silently.
+    // The launch check, which is the half with no sentence to bind: a runtime
+    // reading `process.env.WEBHOOK_TOKEN` that `References::of` did not know
+    // about would let a deployment missing the variable start clean and then
+    // refuse every real call. `readEnvironment()` reports only what this list
+    // holds.
+    for (variable, site) in [
+        ("WEBHOOK_SECRET", "triggers.intake.auth.hmac.secret"),
+        ("WEBHOOK_TOKEN", "triggers.minimal.auth.bearer.token"),
+        (
+            "CALLBACK_TOKEN",
+            "triggers.intake.callback_auth.bearer.token",
+        ),
+        (
+            "CALLBACK_SECRET",
+            "triggers.intake.callback_auth.hmac.secret",
+        ),
+    ] {
+        assert!(
+            environment.contains(&format!("name: \"{variable}\"")),
+            "`src/env.ts` does not name `{variable}`, so a deployment missing it starts clean \
+             and fails on every real call (grammar 4.3, 15)"
+        );
+        assert!(
+            environment.contains(&format!("\"{site}\"")),
+            "`src/env.ts` does not say where `{variable}` is referenced (`{site}`)"
+        );
+    }
+
+    // …and the documents. Each is checked for the sentence that would become
+    // false if the surface went inert again, so a reserved posture reintroduced
+    // in one document fails here rather than silently.
     let triggers = compose_core::docs::topic("triggers").expect("the `triggers` topic ships");
     let targets = compose_core::docs::topic("targets").expect("the `targets` topic ships");
     let allowlist = compose_core::docs::explanation(
@@ -623,27 +758,94 @@ fn the_auth_surface_is_reserved_grammar_and_every_document_saying_so_is_listed_h
     )
     .expect("the grammar is readable");
     for (document, claim) in [
-        (grammar.as_str(), "are reserved grammar in v0"),
+        (grammar.as_str(), "are enforced by the generated\napp"),
         (
             grammar.as_str(),
-            "| `triggers.<t>.auth` | parsed + validated, no-op",
+            "**The three authentication keys were here until the http-native events pass**",
         ),
-        (triggers.body, "All three keys below are reserved in v0"),
-        (triggers.body, "## What `reserved` means"),
+        (
+            triggers.body,
+            "**All three keys below are enforced by the generated app.**",
+        ),
+        (
+            triggers.body,
+            "**The three authentication keys were on this list and have left it.**",
+        ),
         (
             targets.body,
-            "| `triggers.<t>.callback_allow` | parsed + validated, no-op",
+            "An `http` trigger's `auth:`, `callback_auth:` and `callback_allow:` have left it",
         ),
-        (
-            allowlist,
-            "This check is live; the matching it demands is not",
-        ),
+        (allowlist, "**The check and the matching are both live.**"),
     ] {
         assert!(
             document.contains(claim),
-            "a document that states the reserved posture no longer contains {claim:?} — \
-             if the runtime landed, unwind all five sites this test names; if it did not, \
-             the sentence has to come back"
+            "a document that states the enforced posture no longer contains {claim:?} — \
+             the sentence has to come back, or the runtime has to go"
+        );
+    }
+
+    // The reserved posture must survive **nowhere**: no shipped document may
+    // still file one of these three keys among the constructs a deployment must
+    // not rely on.
+    for (name, document) in [
+        ("docs/grammar.md", grammar.as_str()),
+        ("the `triggers` topic", triggers.body),
+        ("the `targets` topic", targets.body),
+        ("the `missing-callback-allowlist` explanation", allowlist),
+    ] {
+        for row in [
+            "| `triggers.<t>.auth` |",
+            "| `triggers.<t>.callback_auth` |",
+            "| `triggers.<t>.callback_allow` |",
+        ] {
+            assert!(
+                !document.contains(row),
+                "{name} still files `{row}` among the reserved constructs, and the app enforces it"
+            );
+        }
+    }
+}
+
+/// A project in the **committed golden corpus** populates all three keys, so
+/// the generated-code gates type-check the values the emitter writes.
+///
+/// `tests/generated_code_gates.rs` runs `tsc` over every golden, and what that
+/// buys for this surface depends entirely on a golden carrying a *value*: a
+/// corpus in which no trigger declares `auth:` type-checks the `InboundAuth` and
+/// `CallbackAuth` declarations against nothing. An emitter that wrote `secret:`
+/// where the interface says `secretEnv:` — a plausible symmetry edit, since the
+/// inbound block spells the same credential differently — would then be caught
+/// by no gate at all: the string-matching tests in `codegen::trigger` move with
+/// it, and the acceptance suite that would meet the failure at runtime returns
+/// early on a machine with no JavaScript toolchain. A contributor without Bun
+/// would see a fully green `cargo test` for a build whose served app throws on
+/// its first signed delivery.
+///
+/// So the corpus property is asserted here rather than left to whoever next
+/// edits `tests/projects/every-schema-form/main.yml`.
+#[test]
+fn a_golden_project_carries_a_populated_auth_table() {
+    let goldens = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/goldens");
+    let tables: Vec<String> = fs::read_dir(&goldens)
+        .expect("the golden corpus exists")
+        .filter_map(|entry| {
+            let path = entry
+                .expect("a readable entry")
+                .path()
+                .join("src/triggers.ts");
+            fs::read_to_string(path).ok()
+        })
+        .collect();
+    assert!(
+        !tables.is_empty(),
+        "no golden emits `src/triggers.ts`, so nothing type-checks the trigger table at all"
+    );
+    for populated in ["    auth: {", "    callbackAuth: {", "    callbackAllow: ["] {
+        assert!(
+            tables.iter().any(|table| table.contains(populated)),
+            "no golden's `src/triggers.ts` contains `{populated}`, so `tsc` checks the \
+             declaration of this key against no value the emitter ever wrote: give a golden \
+             project's `http` trigger the key back (grammar 13.3)"
         );
     }
 }

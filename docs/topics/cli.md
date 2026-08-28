@@ -240,6 +240,7 @@ requires no deploy file at all. See `agent-compose docs targets`.
 |---|---|---|
 | `AGENT_COMPOSE_INTERACTIVE` | `run`, `resume` | `1` answers `human` pauses at the terminal even when stdin is not one; `0` forces the exit-`3` path. Any other value is a usage error refused before the run starts |
 | `AGENT_COMPOSE_DATA_DIR` | the emitted project | moves the project's data directory — local stores, the execution journal, and the trace files under `.agent-compose/traces/` |
+| `AGENT_COMPOSE_CALLBACK_RETRY` | `serve` | overrides the callback delivery retry schedule with a comma-separated list of durations (`0s,1s,2s`), for a test or a diagnostic run; unset, the schedule is `docs/durability.md` §3.7's five attempts across fifteen minutes. A value that is not such a list — an unspellable duration, or an empty list, which a variable *set to nothing* is — is a usage error refused before the app listens |
 | `NO_COLOR` | every verb that reports | any non-empty value turns styling off, whatever the stream is |
 
 Provider credentials reach a run the same way: an `${ENV}` reference in the spec

@@ -9843,7 +9843,8 @@ fn a_completion_webhook_fires_with_the_runs_report_and_only_when_a_url_was_given
     assert_eq!(harness::settled(&app, &execution)["status"], "completed");
 
     let delivered = receiver.wait_for(1, Duration::from_secs(30));
-    let report = &delivered[0];
+    let report = &delivered[0].body;
+    assert_eq!(delivered[0].event(), "settled", "{report}");
     assert_eq!(report["execution_id"], execution, "{report}");
     assert_eq!(report["status"], "completed", "{report}");
     assert_eq!(report["outputs"]["answer"], "notified", "{report}");
@@ -15851,12 +15852,24 @@ fn a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for() 
             .as_str()
             .expect("a resume url")
             .to_string();
-        // Dropped holding the pause: the run never finished, so no webhook has
-        // fired and the caller is still waiting.
+        // The parking fires while this process is alive, and is waited for
+        // here rather than after the block: `settled` answers the moment the
+        // pause opens, which is ahead of the delivery it sets going, and a
+        // process killed in between would leave the webhook for the *next*
+        // start to make (`docs/durability.md` §3.7) — which is a different
+        // claim from the one this test is about.
+        let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+        assert_eq!(
+            parked[0].body["execution_id"], execution,
+            "the parking names the execution: {:?}",
+            parked[0].body
+        );
+        // …and dropped holding the pause: the run never *finished*, so no
+        // `settled` webhook has fired and the caller is still waiting.
     }
     assert!(
-        receiver.delivered().is_empty(),
-        "a run that never finished fired no webhook: {:?}",
+        receiver.of_event("settled").is_empty(),
+        "a run that never finished fired no settle webhook: {:?}",
         receiver.delivered()
     );
 
@@ -15875,14 +15888,23 @@ fn a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for() 
         answered.text()
     );
 
-    let delivered = receiver.wait_for(1, Duration::from_secs(30));
-    let report = &delivered[0];
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    let report = &delivered[0].body;
     assert_eq!(report["execution_id"], execution, "{report}");
     assert_eq!(report["status"], "completed", "{report}");
     assert_eq!(
         report["outputs"],
         json!({ "note": "worth signing off", "decision": "approve" }),
         "the webhook carries the report of the run this process finished: {report}"
+    );
+    // …and the recovered generation re-parked under the wait id its predecessor
+    // published, which is not a new question and fires no second parking
+    // (PRD resolved q35).
+    assert_eq!(
+        receiver.distinct("parked").len(),
+        1,
+        "re-parking the same wait announces nothing: {:?}",
+        receiver.delivered()
     );
     assert_eq!(
         provider.snapshot().requests,
@@ -15947,7 +15969,10 @@ fn a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one() {
             .as_str()
             .expect("a resume url")
             .to_string();
-        // Dropped holding the pause, with the row open and nothing pushed.
+        // Dropped holding the pause, with the row open and nothing *settled*
+        // pushed. Its parking fired, and is on the journal — which is what keeps
+        // the two starts below from announcing the same question again.
+        receiver.wait_for_event("parked", 1, Duration::from_secs(30));
     }
 
     // The composition moves under the journal, which is how one does in
@@ -15975,7 +16000,7 @@ fn a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one() {
         // Given time to be sent, and then said not to have been: the push would
         // follow the status this process just published, so a read taken at once
         // would be a read taken too early.
-        nothing_delivered(&receiver, Duration::from_secs(3));
+        nothing_settled(&receiver, Duration::from_secs(3));
     }
 
     // The composition comes back, and so does the execution.
@@ -15997,18 +16022,24 @@ fn a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one() {
         answered.text()
     );
 
-    let delivered = receiver.wait_for(1, Duration::from_secs(30));
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
     assert_eq!(
         delivered.len(),
         1,
-        "one execution, one completion webhook: {delivered:?}"
+        "one execution, one settle webhook: {delivered:?}"
     );
-    let report = &delivered[0];
+    let report = &delivered[0].body;
     assert_eq!(report["execution_id"], execution, "{report}");
     assert_eq!(
         report["status"], "completed",
         "…and it is the report of the run that finished rather than the opinion of \
          the build that could not replay it: {report}"
+    );
+    assert_eq!(
+        receiver.distinct("parked").len(),
+        1,
+        "three starts, one question, one parking: {:?}",
+        receiver.delivered()
     );
     assert_eq!(
         provider.snapshot().requests,
@@ -16077,7 +16108,10 @@ fn a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook() {
             .as_str()
             .expect("a resume url")
             .to_string();
-        // Dropped holding the pause, with the row open and nothing pushed.
+        // Dropped holding the pause, with the row open and nothing *settled*
+        // pushed. Its parking fired, and is on the journal — which is what keeps
+        // the two starts below from announcing the same question again.
+        receiver.wait_for_event("parked", 1, Duration::from_secs(30));
     }
 
     // The flow's `inputs:` narrow under the journal, so the recorded invocation
@@ -16103,7 +16137,7 @@ fn a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook() {
              makes the error one no predicate over its class could catch: {refused}"
         );
         // Given time to be sent, and then said not to have been.
-        nothing_delivered(&receiver, Duration::from_secs(3));
+        nothing_settled(&receiver, Duration::from_secs(3));
     }
 
     // The composition comes back, and so does the execution.
@@ -16125,13 +16159,13 @@ fn a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook() {
         answered.text()
     );
 
-    let delivered = receiver.wait_for(1, Duration::from_secs(30));
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
     assert_eq!(
         delivered.len(),
         1,
-        "one execution, one completion webhook: {delivered:?}"
+        "one execution, one settle webhook: {delivered:?}"
     );
-    let report = &delivered[0];
+    let report = &delivered[0].body;
     assert_eq!(report["execution_id"], execution, "{report}");
     assert_eq!(
         report["status"], "completed",
@@ -16164,14 +16198,14 @@ fn narrowed_gate_inputs() -> String {
 /// would pass for a build that fires the push a moment later, which is the
 /// failure it exists to catch. Polling for a budget cannot flake the other way:
 /// a build that fires nothing has nothing to arrive however long this waits.
-fn nothing_delivered(receiver: &harness::Receiver, budget: Duration) {
+fn nothing_settled(receiver: &harness::Receiver, budget: Duration) {
     let deadline = std::time::Instant::now() + budget;
     while std::time::Instant::now() < deadline {
-        let held = receiver.delivered();
+        let held = receiver.of_event("settled");
         assert!(
             held.is_empty(),
             "an execution the journal keeps open has not finished, so its caller is \
-             owed nothing yet: {held:?}"
+             owed no settlement yet: {held:?}"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -16634,4 +16668,2805 @@ fn item_request(item: &str) -> Value {
         }],
         "tool_choice": { "type": "tool", "name": "worker_output" },
     })
+}
+
+// ---------------------------------------------------------------------------
+// The http-native events surface (grammar 13.3, PRD resolved q32–q35)
+// ---------------------------------------------------------------------------
+
+/// The `http-events` fixture's environment: the harness's own, plus the shim
+/// `flow.note` counts its executions with.
+///
+/// The counting shim is what makes "the refused request started **no**
+/// execution" an assertion rather than an inference: a `401` says what the route
+/// answered and nothing about what ran behind it, while a log holding one line
+/// per admitted call and none per refusal says both.
+fn events_environment(
+    provider: &MockProvider,
+    purpose: &str,
+) -> (harness::Scratch, std::path::PathBuf, Vec<(String, String)>) {
+    let shims = harness::Scratch::new(purpose);
+    let log = shims.path().join("tally.log");
+    harness::shim(
+        shims.path(),
+        "tally",
+        "printf 'ran\\n' >> \"$TALLY_LOG\"\nprintf 'noted'\n",
+    );
+    // The second shim beside it: awaited work of a length the caller chooses,
+    // which is what makes the pauses of one fan-out open at different moments
+    // (`flow.consider`). `pause_for` arrives upper-snake-cased, as an `exec:`
+    // node's bindings do (grammar 5.5).
+    harness::shim(
+        shims.path(),
+        "linger",
+        "sleep \"${PAUSE_FOR:-0}\"\nprintf 'lingered'\n",
+    );
+    // The third: work that runs until the test says otherwise, which is what a
+    // **detached** delivery has to be for an assertion about a parking made
+    // while one is in flight to be a fact rather than a race against a sleep.
+    // The line goes down before the wait starts, so a test that has seen it
+    // knows the sink is inside the loop, and only a file the test creates lets
+    // it out.
+    harness::shim(
+        shims.path(),
+        "hold",
+        "printf 'holding\\n' >> \"$TALLY_LOG.hold\"\n\
+         until [ -e \"$TALLY_LOG.released\" ]; do sleep 0.05; done\n\
+         printf 'held'\n",
+    );
+    // …and its other half, which the flow that dispatched the delivery runs
+    // before it parks: it returns once the sink is inside its wait, so the pause
+    // opens with the delivery in flight rather than racing it.
+    harness::shim(
+        shims.path(),
+        "escorting",
+        "until [ -e \"$TALLY_LOG.hold\" ]; do sleep 0.05; done\nprintf 'escorting'\n",
+    );
+    let mut environment = harness::environment(provider);
+    environment.push((
+        harness::TALLY_BIN.to_string(),
+        shims.path().display().to_string(),
+    ));
+    environment.push((harness::TALLY_LOG.to_string(), log.display().to_string()));
+    (shims, log, environment)
+}
+
+/// The `Authorization: Bearer <token>` an `http-events` caller sends.
+fn events_bearer() -> String {
+    format!("Bearer {}", harness::credential(harness::EVENTS_TOKEN))
+}
+
+/// Poll a **guarded** execution's status route until the run has completed,
+/// presenting the credential its starting trigger demands.
+///
+/// `harness::settled` cannot be used for one: its poller sends no credential,
+/// and an execution an authenticated trigger started never answers an
+/// unauthenticated poll — which is the rule these tests are about.
+///
+/// The credential is the caller's to build, because the two schemes ask for
+/// different things and an `hmac:` one asks for something worth stating: the
+/// signature is over the **request's** body, so a `GET` of a status route signs
+/// the empty body it carries. That is what "covers three routes, not one"
+/// (grammar 13.3) costs a client of a signed trigger, and it is the shape a
+/// receiver of one has to write.
+fn completed(app: &Client, execution: &str, credential: impl Fn(Request) -> Request) -> Value {
+    harness::until(Duration::from_secs(30), || {
+        let held = app
+            .send(credential(Request::get(format!("/executions/{execution}"))))
+            .expect("the status route answers");
+        assert_eq!(held.status, 200, "{}", held.text());
+        let report = held.json();
+        (report["status"] == "completed").then_some(report)
+    })
+}
+
+/// The `X-Hub-Signature-256` the `signed` and `sealed` triggers expect over
+/// these bytes — the prefix, algorithm and encoding both declare.
+///
+/// The argument is **bytes** and never a `Value`, because the whole property
+/// under test is that the digest is over what a request carried rather than over
+/// something either side re-serialized: a helper taking a value would hash a
+/// string the app never saw, and would agree with a build that hashed one too.
+fn events_signature(bytes: &[u8]) -> String {
+    format!(
+        "sha256={}",
+        harness::hmac_sha256(
+            harness::credential(harness::EVENTS_SECRET).as_bytes(),
+            bytes,
+        )
+    )
+}
+
+/// A request to the `signed` trigger, signed the way its `hmac:` expects.
+///
+/// The signature is over the **bytes this request carries** rather than over a
+/// value re-serialized on either side, which is the property grammar 13.3 makes
+/// normative: a body hashed after a decode-and-re-encode is a different byte
+/// string, and a verifier that did that would refuse every genuine delivery.
+fn signed_request(path: &str, body: &Value) -> Request {
+    let bytes = serde_json::to_vec(body).expect("a JSON body");
+    let signature = events_signature(&bytes);
+    Request::post(path)
+        .header("content-type", "application/json")
+        .header("X-Hub-Signature-256", signature)
+        .bytes(bytes)
+}
+
+/// This harness's own HMAC answers the published vector, so a signature it
+/// disagrees with is the app's mistake rather than its own (RFC 4231 case 2).
+///
+/// Every signing assertion below is a comparison against a value computed here,
+/// which is only worth something if this side is right. The vector is the one
+/// every implementation is checked against, and it is checked here rather than
+/// left to a reader to trust sixty lines of shifts.
+#[test]
+fn the_harnesss_own_hmac_answers_the_published_vector() {
+    assert_eq!(
+        harness::hmac_sha256(b"Jefe", b"what do ya want for nothing?"),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+}
+
+/// A trigger's `auth:` admits the credential it declares and refuses every
+/// other, starting nothing (grammar 13.3, PRD resolved q32).
+///
+/// Both schemes, because they fail differently and only one of them can be
+/// tested by sending the wrong string. `bearer` is a comparison against a static
+/// value, so what a test varies is the value: absent, wrong, and — the case a
+/// prefix-and-`startsWith` implementation gets wrong — a **truncation** of the
+/// real one, which shares its whole prefix. `hmac` is a comparison against a
+/// digest of the body, so what a test varies is the **body**: the same signature
+/// over a payload edited after it was computed is what a replayed request looks
+/// like, and a verifier that hashed the re-serialized value rather than the
+/// bytes would take it.
+///
+/// The counting shim is what makes the second half of resolved q32's sentence —
+/// "and no execution started" — observable. A `401` says what the route
+/// answered; the log says what ran.
+#[test]
+fn an_authenticated_start_admits_the_credential_it_declares_and_refuses_every_other() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, log, environment) = events_environment(&provider, "events-start-auth");
+    let Some(project) = harness::scratch_project("events-start-auth") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let body = json!({ "topic": "events" });
+
+    // Every way a bearer credential can be wrong, and the one way it is right.
+    let token = harness::credential(harness::EVENTS_TOKEN);
+    for (what, header) in [
+        ("no credential at all", None),
+        (
+            "a token that is not the one",
+            Some(format!("Bearer {token}-and-more")),
+        ),
+        // Shares the whole prefix of the real one, which is what a comparison
+        // that stopped at the first difference — or at the shorter length —
+        // would take.
+        (
+            "a truncation of the token",
+            Some(format!("Bearer {}", &token[..token.len() - 3])),
+        ),
+        ("the token under no prefix", Some(token.to_string())),
+    ] {
+        let mut request = Request::post("/guarded").json(&body);
+        if let Some(value) = header {
+            request = request.header("authorization", value);
+        }
+        let refused = app.send(request).expect("the trigger's route answers");
+        assert_eq!(refused.status, 401, "{what}: {}", refused.text());
+        let said = refused.json();
+        assert_eq!(said["trigger"], "guarded", "{said}");
+        assert_eq!(said["scheme"], "bearer", "{said}");
+        assert!(
+            said.get("execution_id").is_none(),
+            "a refused request starts nothing to report: {said}"
+        );
+        assert!(
+            !refused.text().contains(token),
+            "a refusal never echoes credential material: {}",
+            refused.text()
+        );
+    }
+
+    let accepted = app
+        .send(
+            Request::post("/guarded")
+                .json(&body)
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let execution = accepted.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    // Polled with the credential, because the status route of an execution an
+    // authenticated trigger started is guarded too — which is the sibling test's
+    // subject and this one's premise.
+    let finished = completed(&app, &execution, |request| {
+        request.header("authorization", events_bearer())
+    });
+    assert_eq!(finished["status"], "completed", "{finished}");
+
+    // The signed trigger: the same body signed verifies, and the same signature
+    // over a body edited afterwards does not.
+    let signed = app
+        .send(signed_request("/signed", &body))
+        .expect("the trigger's route answers");
+    assert_eq!(signed.status, 202, "{}", signed.text());
+    let empty = harness::hmac_sha256(harness::credential(harness::EVENTS_SECRET).as_bytes(), b"");
+    completed(
+        &app,
+        signed.json()["execution_id"]
+            .as_str()
+            .expect("an execution id"),
+        |request| request.header("X-Hub-Signature-256", format!("sha256={empty}")),
+    );
+
+    // …and the case that tells raw-byte verification from re-serialized
+    // verification, which the tampered request below cannot: a **legitimate**
+    // body whose bytes are not what re-serializing it would produce. A
+    // pretty-printed payload with a trailing newline is what a vendor sends, and
+    // an implementation that hashed `JSON.stringify(request.body)` computes a
+    // different digest for it and answers `401` — while passing every other
+    // assertion in this test, because a tampered body re-serializes differently
+    // too. This is the failure grammar 13.3 spells out.
+    let spaced = b"{\"topic\": \"events\"}\n".to_vec();
+    let over_bytes = harness::hmac_sha256(
+        harness::credential(harness::EVENTS_SECRET).as_bytes(),
+        &spaced,
+    );
+    let sent = app
+        .send(
+            Request::post("/signed")
+                .header("content-type", "application/json")
+                .header("X-Hub-Signature-256", format!("sha256={over_bytes}"))
+                .bytes(spaced),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(
+        sent.status,
+        202,
+        "a signature over the bytes a request carried verifies, whatever re-serializing \
+         the body would have produced: {}",
+        sent.text()
+    );
+    completed(
+        &app,
+        sent.json()["execution_id"]
+            .as_str()
+            .expect("an execution id"),
+        |request| request.header("X-Hub-Signature-256", format!("sha256={empty}")),
+    );
+
+    let tampered = signed_request("/signed", &body)
+        .bytes(serde_json::to_vec(&json!({ "topic": "something else" })).expect("a JSON body"));
+    let refused = app.send(tampered).expect("the trigger's route answers");
+    assert_eq!(refused.status, 401, "{}", refused.text());
+    assert_eq!(refused.json()["scheme"], "hmac", "{}", refused.text());
+    // …and a signature that is not one at all, which is the shape a caller who
+    // signed with the wrong secret sends.
+    let wrong = app
+        .send(
+            Request::post("/signed")
+                .json(&body)
+                .header("X-Hub-Signature-256", "sha256=00"),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(wrong.status, 401, "{}", wrong.text());
+
+    assert_eq!(
+        harness::lines_in(&log),
+        3,
+        "three requests were admitted and five were refused, so three executions ran"
+    );
+}
+
+/// A credential a request carried **twice** verifies nothing, on either scheme
+/// (grammar 13.3, PRD resolved q32).
+///
+/// Which of two values under one name a verifier reads is a thing HTTP stacks
+/// disagree about, and the two runtimes a generated project supports disagree
+/// with each other: Node's parsed headers keep the **first** `authorization` and
+/// drop the rest, Bun's keep the **last**, and both join repeats of every other
+/// name with `", "`. So a route deciding on the parsed map admits a request
+/// whose credential depends on which runtime the app was launched with — and a
+/// proxy in front of it that normalises on the other value is a header-smuggling
+/// differential in which the pair `<valid>, <junk>` and the pair `<junk>,
+/// <valid>` are the same request to two readers.
+///
+/// The pairs are sent in both orders for exactly that reason: an app that took
+/// the first value passes the second case and an app that took the last passes
+/// the first, and only a refusal passes both. The counting shim says the other
+/// half — a request offering two credentials starts nothing, like every other
+/// refusal on this route.
+#[test]
+fn a_credential_a_request_carried_twice_verifies_nothing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, log, environment) = events_environment(&provider, "events-repeated-credential");
+    let Some(project) = harness::scratch_project("events-repeated-credential") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let body = json!({ "topic": "repeats" });
+
+    let token = harness::credential(harness::EVENTS_TOKEN);
+    let junk = format!("Bearer {token}-and-more");
+    for (what, first, second) in [
+        ("the real credential first", events_bearer(), junk.clone()),
+        ("the real credential last", junk, events_bearer()),
+        // Two copies of the *same* valid credential, which is the case a rule
+        // written as "the values must agree" would still admit: a request
+        // carrying one credential carries it once.
+        (
+            "the same credential twice",
+            events_bearer(),
+            events_bearer(),
+        ),
+    ] {
+        let refused = app
+            .send(
+                Request::post("/guarded")
+                    .json(&body)
+                    .header("authorization", first)
+                    .header("authorization", second),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(refused.status, 401, "{what}: {}", refused.text());
+        let said = refused.json();
+        assert_eq!(said["scheme"], "bearer", "{what}: {said}");
+        assert!(
+            !refused.text().contains(token),
+            "{what}: a refusal never echoes credential material: {}",
+            refused.text()
+        );
+    }
+
+    // The signed scheme reaches the same lookup, so a rule applied to the bearer
+    // half alone would leave the header a vendor's signature arrives under
+    // resolved by whichever stack read it.
+    let bytes = serde_json::to_vec(&body).expect("a JSON body");
+    let signature = harness::hmac_sha256(
+        harness::credential(harness::EVENTS_SECRET).as_bytes(),
+        &bytes,
+    );
+    let signed = format!("sha256={signature}");
+    for (what, first, second) in [
+        (
+            "the real signature first",
+            signed.clone(),
+            "sha256=00".to_string(),
+        ),
+        ("the real signature last", "sha256=00".to_string(), signed),
+    ] {
+        let refused = app
+            .send(
+                Request::post("/signed")
+                    .header("content-type", "application/json")
+                    .header("X-Hub-Signature-256", first)
+                    .header("X-Hub-Signature-256", second)
+                    .bytes(bytes.clone()),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(refused.status, 401, "{what}: {}", refused.text());
+        assert_eq!(
+            refused.json()["scheme"],
+            "hmac",
+            "{what}: {}",
+            refused.text()
+        );
+    }
+
+    assert_eq!(
+        harness::lines_in(&log),
+        0,
+        "every request offered two credentials and none of them started an execution"
+    );
+}
+
+/// An execution's `status` and `resume` routes enforce the auth of the trigger
+/// that **started** it, and an execution a no-auth trigger began keeps them open
+/// (grammar 13.3's "covers three routes, not one", PRD resolved q32).
+///
+/// Both halves, because either alone is satisfied by a wrong build. A test that
+/// only watched a guarded execution refuse an unauthenticated poll would pass on
+/// an app that refused every poll of every execution; a test that only watched
+/// an open one answer would pass on an app that enforced nothing anywhere. What
+/// the pair pins is that the guard is the **execution's**, carried on its
+/// lifecycle row rather than derived from the route.
+///
+/// `resume` is the sharper of the two routes and is checked for the thing a
+/// refusal has to leave behind: the pause is still waiting afterwards, so a
+/// refused answer consumed no turn.
+#[test]
+fn an_executions_status_and_resume_enforce_the_auth_of_the_trigger_that_started_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-route-auth");
+    let Some(project) = harness::scratch_project("events-route-auth") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    // The guarded execution. No `callback_url`, so this is about the routes
+    // alone.
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({ "topic": "guarded" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let guarded = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let poll = format!("/executions/{guarded}");
+    let unauthenticated = app.get(&poll).expect("the status route answers");
+    assert_eq!(unauthenticated.status, 401, "{}", unauthenticated.text());
+    assert_eq!(unauthenticated.json()["trigger"], "watched");
+    assert!(
+        unauthenticated.json().get("status").is_none(),
+        "a refused poll answers nothing about the execution: {}",
+        unauthenticated.text()
+    );
+
+    // Polling takes the credential too, so the harness's own poller cannot be
+    // used for this execution: the report is read by hand until the pause is up.
+    let published = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers");
+        assert_eq!(held.status, 200, "{}", held.text());
+        let report = held.json();
+        (report["status"] == "interrupted").then_some(report)
+    });
+    let resume_url = published["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+
+    let refused = app
+        .post_json(&resume_url, &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert_eq!(refused.status, 401, "{}", refused.text());
+
+    // …and the pause is still waiting, so the refusal consumed no turn.
+    let still = app
+        .send(Request::get(&poll).header("authorization", events_bearer()))
+        .expect("the status route answers");
+    assert_eq!(still.json()["status"], "interrupted", "{}", still.text());
+
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    // The open execution, whose routes take no credential at all.
+    let opened = app
+        .post_json("/open", &json!({ "topic": "open" }))
+        .expect("the trigger's route answers");
+    assert_eq!(opened.status, 202, "{}", opened.text());
+    let open = opened.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let unguarded = harness::settled(&app, &open);
+    assert_eq!(unguarded["status"], "interrupted", "{unguarded}");
+    let open_resume = unguarded["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+    let taken = app
+        .post_json(&open_resume, &json!({ "decision": "reject" }))
+        .expect("the resume route answers");
+    assert_eq!(
+        taken.status,
+        202,
+        "an execution a no-auth trigger began keeps open routes: {}",
+        taken.text()
+    );
+}
+
+/// A **signed** execution's status and resume routes verify a signature over
+/// the body of the request that arrived — which, for a `GET`, is no body at all
+/// (grammar 13.3's "covers three routes, not one", PRD resolved q32).
+///
+/// The pair above runs entirely on `bearer`, where all three routes take one
+/// value and a build could read it from anywhere. `hmac` is the half where "the
+/// auth of the trigger that started this execution" is a *different* credential
+/// per request, and two plausible builds satisfy every bearer assertion in this
+/// suite: one that verifies the resume route over the decoded-and-re-serialized
+/// payload, and one that verifies it over the empty body the status route signs.
+/// Both are offered here and both have to be refused, over a body whose bytes no
+/// serializer would emit — the spaces are the point, because they are what makes
+/// the payload as sent and the payload as decoded two different byte strings.
+///
+/// The refusals are also checked for what they left behind: the pause is still
+/// waiting afterwards, so a wrong digest consumed no turn.
+#[test]
+fn a_signed_executions_status_and_resume_verify_over_each_requests_own_body() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-signed-routes");
+    let Some(project) = harness::scratch_project("events-signed-routes") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let topic = json!({ "topic": "signed routes" });
+    let started = app
+        .send(signed_request("/sealed", &topic))
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let poll = format!("/executions/{execution}");
+
+    let unsigned = app.get(&poll).expect("the status route answers");
+    assert_eq!(unsigned.status, 401, "{}", unsigned.text());
+    assert_eq!(unsigned.json()["scheme"], "hmac", "{}", unsigned.text());
+    assert_eq!(unsigned.json()["trigger"], "sealed", "{}", unsigned.text());
+
+    // A signature over the payload that *started* the execution is a signature
+    // over a body this request does not carry — the shape a client that reused
+    // the start request's header would send.
+    let stale = events_signature(&serde_json::to_vec(&topic).expect("a JSON body"));
+    let wrong = app
+        .send(Request::get(&poll).header("X-Hub-Signature-256", stale))
+        .expect("the status route answers");
+    assert_eq!(wrong.status, 401, "{}", wrong.text());
+
+    // A `GET` carries no body, so what it signs is none of it.
+    let nothing = events_signature(b"");
+    let published = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .send(Request::get(&poll).header("X-Hub-Signature-256", nothing.clone()))
+            .expect("the status route answers");
+        assert_eq!(held.status, 200, "{}", held.text());
+        let report = held.json();
+        (report["status"] == "interrupted").then_some(report)
+    });
+    let resume_url = published["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+
+    let answer = br#"{ "decision" : "approve" }"#;
+    let decoded = br#"{"decision":"approve"}"#;
+    for (what, signature) in [
+        (
+            "a digest over the payload as a decoder hands it back",
+            events_signature(decoded),
+        ),
+        (
+            "a digest over the empty body the status route signs",
+            nothing.clone(),
+        ),
+    ] {
+        let refused = app
+            .send(
+                Request::post(&resume_url)
+                    .header("content-type", "application/json")
+                    .header("X-Hub-Signature-256", signature)
+                    .bytes(answer.to_vec()),
+            )
+            .expect("the resume route answers");
+        assert_eq!(refused.status, 401, "{what}: {}", refused.text());
+        assert_eq!(
+            refused.json()["scheme"],
+            "hmac",
+            "{what}: {}",
+            refused.text()
+        );
+    }
+
+    let still = app
+        .send(Request::get(&poll).header("X-Hub-Signature-256", nothing.clone()))
+        .expect("the status route answers");
+    assert_eq!(
+        still.json()["status"],
+        "interrupted",
+        "a refused answer consumed no turn: {}",
+        still.text()
+    );
+
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .header("content-type", "application/json")
+                .header("X-Hub-Signature-256", events_signature(answer))
+                .bytes(answer.to_vec()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    let finished = completed(&app, &execution, |request| {
+        request.header("X-Hub-Signature-256", events_signature(b""))
+    });
+    assert_eq!(finished["outputs"]["decision"], "approve", "{finished}");
+}
+
+/// One parking, one settle, in ascending ordinals, each carrying the report the
+/// status route serves (grammar 13.3, PRD resolved q34).
+///
+/// The parking is the half a completion webhook could not stand in for, and its
+/// body is what makes a *push* worth as much as a poll: the pause, what the
+/// person is shown, the schema their answer has to fit, and the URL that
+/// delivers it. So the test answers the pause **through the URL the webhook
+/// carried** rather than through one it read off the status route — a delivery
+/// whose `resume_url` did not work would otherwise pass.
+#[test]
+fn a_parking_and_a_settle_reach_the_callback_in_ascending_ordinals() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-lifecycle");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-lifecycle") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({
+                    "topic": "lifecycle",
+                    "callback_url": format!("{}/allowed", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+    let first = &parked[0];
+    assert_eq!(
+        first.header("x-agentcompose-delivery"),
+        Some(format!("{execution}:0").as_str()),
+        "the delivery id is `<execution_id>:<ordinal>`: {:?}",
+        first.headers
+    );
+    assert_eq!(first.header("x-agentcompose-ordinal"), Some("0"));
+    assert!(
+        first
+            .header("x-agentcompose-timestamp")
+            .is_some_and(|at| at.ends_with('Z') && at.contains('T')),
+        "the delivery is stamped ISO-8601: {:?}",
+        first.headers
+    );
+    assert_eq!(first.body["execution_id"], execution, "{:?}", first.body);
+    assert_eq!(first.body["status"], "interrupted", "{:?}", first.body);
+    let pause = &first.body["interrupts"].as_array().expect("the pauses")[0];
+    assert_eq!(pause["node"], "sign_off", "{pause}");
+    assert_eq!(pause["input"]["note"], "lifecycle", "{pause}");
+    assert!(
+        pause["output_schema"]["properties"]["decision"].is_object(),
+        "{pause}"
+    );
+    let resume_url = pause["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+
+    // Answered through the URL the *webhook* published, which is what makes the
+    // push a surface a receiver can build on.
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    let settled = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    let second = &settled[0];
+    assert_eq!(second.header("x-agentcompose-ordinal"), Some("1"));
+    assert_eq!(
+        second.header("x-agentcompose-delivery"),
+        Some(format!("{execution}:1").as_str())
+    );
+    assert_eq!(second.body["status"], "completed", "{:?}", second.body);
+    assert_eq!(
+        second.body["outputs"]["decision"], "approve",
+        "{:?}",
+        second.body
+    );
+
+    // One parking and one settle, in that order, and the resume that came
+    // between them announced no second parking of a wait already reported.
+    assert_eq!(receiver.distinct("parked"), [format!("{execution}:0")]);
+    assert_eq!(receiver.distinct("settled"), [format!("{execution}:1")]);
+}
+
+/// A delivery carries the identity its trigger declared, over the bytes it
+/// actually sent (grammar 13.3, PRD resolved q33).
+///
+/// Both outbound schemes at once, which is the shape grammar 13.3 makes legal
+/// outbound and not inbound. The signature is verified here with **this
+/// repository's own** HMAC rather than the app's, over the exact bytes the
+/// receiver read: a check that re-serialized the decoded body would agree with
+/// an implementation that signed a re-serialization too, and both would fail
+/// against any receiver written to the published recipe.
+///
+/// The bearer half is checked for the two things this trigger configured away
+/// from their defaults — the header name and the prefix — because those are the
+/// values a build could plausibly hard-code and still pass a test written
+/// against the defaults.
+#[test]
+fn a_delivery_carries_the_identity_its_trigger_declared_over_the_bytes_it_sent() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-signing");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-signing") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({
+                    "topic": "signing",
+                    "callback_url": format!("{}/allowed/deliveries", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+
+    let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+    let delivery = &parked[0];
+
+    let expected = harness::hmac_sha256(
+        harness::credential(harness::DELIVERY_SECRET).as_bytes(),
+        &delivery.bytes,
+    );
+    assert_eq!(
+        delivery.header("x-agentcompose-signature"),
+        Some(format!("sha256={expected}").as_str()),
+        "the signature is HMAC-SHA256 in hex over the delivered body: {:?}",
+        delivery.headers
+    );
+    assert_eq!(
+        delivery.header("x-delivery-token"),
+        Some(format!("Token {}", harness::credential(harness::DELIVERY_TOKEN)).as_str()),
+        "the token is written under the header and prefix the trigger declared: {:?}",
+        delivery.headers
+    );
+    assert_eq!(
+        delivery.header("content-type"),
+        Some("application/json"),
+        "{:?}",
+        delivery.headers
+    );
+    // The inbound credentials are a different pair, and a delivery carries
+    // neither: a build that resolved one variable where it meant another would
+    // pass every assertion above that named only a shape.
+    let sent = String::from_utf8_lossy(&delivery.bytes);
+    for leaked in [
+        harness::credential(harness::EVENTS_TOKEN),
+        harness::credential(harness::EVENTS_SECRET),
+        harness::credential(harness::DELIVERY_SECRET),
+    ] {
+        assert!(
+            !sent.contains(leaked)
+                && !delivery
+                    .headers
+                    .values()
+                    .any(|value| value.contains(leaked)),
+            "a delivery carries no credential but the one its `bearer:` declares: {:?}",
+            delivery.headers
+        );
+    }
+}
+
+/// A callback URL the allowlist admits nowhere is a **refused delivery**:
+/// journaled, visible on the status route, never sent, and never the execution's
+/// failure (grammar 13.3, Decision D127, PRD resolved q33).
+///
+/// The URL is matched when it is **read** — at the parking and at the settle —
+/// rather than at the start, which is why the request that named it is a `202`
+/// like any other. What the run does afterwards is the assertion that matters:
+/// it parks, it is answered, and it completes, with two refusals recorded beside
+/// it and nothing at the receiver.
+#[test]
+fn a_callback_url_the_allowlist_admits_nowhere_is_refused_and_the_run_settles() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-allowlist");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-allowlist") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    // `/denied` is on the receiver the allowlist admits and under a path it does
+    // not: the entry is `http://127.0.0.1:*/allowed*`, so this is the delivery a
+    // match against the host alone would have let through.
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({
+                    "topic": "allowlist",
+                    "callback_url": format!("{}/denied", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(
+        started.status,
+        202,
+        "the URL is read at the delivery, not at the start: {}",
+        started.text()
+    );
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let poll = format!("/executions/{execution}");
+    let refused = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers")
+            .json();
+        (report["deliveries"].as_array().map(Vec::len) == Some(1)).then_some(report)
+    });
+    let recorded = &refused["deliveries"].as_array().expect("the deliveries")[0];
+    assert_eq!(recorded["status"], "refused", "{recorded}");
+    assert_eq!(recorded["event"], "parked", "{recorded}");
+    assert_eq!(recorded["ordinal"], 0, "{recorded}");
+    assert!(
+        recorded["attempts"].as_array().is_some_and(Vec::is_empty),
+        "a refused delivery was never attempted: {recorded}"
+    );
+    assert!(
+        recorded["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("callback_allow"),
+        "…and it says why: {recorded}"
+    );
+
+    let resume_url = refused["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    let finished = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers")
+            .json();
+        (report["status"] == "completed"
+            && report["deliveries"].as_array().map(Vec::len) == Some(2))
+        .then_some(report)
+    });
+    assert_eq!(
+        finished["deliveries"].as_array().expect("the deliveries")[1]["status"],
+        "refused",
+        "{finished}"
+    );
+    assert_eq!(
+        finished["outputs"]["decision"], "approve",
+        "a refused delivery is nobody's failure: {finished}"
+    );
+    assert!(
+        receiver.delivered().is_empty(),
+        "nothing was sent: {:?}",
+        receiver.delivered()
+    );
+}
+
+/// A callback URL that hides its host behind **userinfo** is a refused delivery,
+/// whatever the text of the list says about it (grammar 13.3, Decision D127).
+///
+/// `callback_allow:` is matched against the URL as a string, and a string is not
+/// where a URL's authority ends: everything before an `@` is userinfo, and the
+/// host is what follows it. So `http://127.0.0.1:9000@elsewhere/allowed` begins
+/// with `http://127.0.0.1:` and holds `/allowed`, which is every literal the
+/// entry `http://127.0.0.1:*/allowed*` asks for — the entry this fixture writes
+/// because a loopback receiver binds a port the operating system chose, and the
+/// entry any deployment with a per-tenant or per-environment port writes too.
+/// What would travel to the host after the `@` is the execution's whole report,
+/// under `X-AgentCompose-Signature` and a `callback_auth: bearer` token written
+/// to a header name of the composition's choosing.
+///
+/// The two runtimes a built project runs under do not even agree what such a URL
+/// means — one drops the userinfo and delivers, the other refuses to construct
+/// the request — so the assertion is on the *refusal* rather than on a
+/// blackhole staying quiet alone: a build that happened to throw would leave a
+/// `pending` row and an attempt, and a build that delivered would leave a
+/// `delivered` one. The detail is checked for **not** being the list's own
+/// refusal sentence, because an entry that stopped matching this URL's text
+/// would make the whole test pass for the wrong reason.
+#[test]
+fn a_callback_url_that_hides_its_host_behind_userinfo_is_refused() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, mut environment) = events_environment(&provider, "events-userinfo");
+    // One offset, so a build that *did* send would exhaust rather than spend
+    // fifteen minutes proving it.
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s".to_string()));
+    let elsewhere = harness::Blackhole::start().expect("a loopback socket");
+    let Some(project) = harness::scratch_project("events-userinfo") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let host = elsewhere
+        .base_url
+        .strip_prefix("http://")
+        .expect("the blackhole's base url names its scheme");
+    let callback = format!("http://127.0.0.1:9000@{host}/allowed");
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({ "topic": "userinfo", "callback_url": callback }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(
+        started.status,
+        202,
+        "the URL is read at the delivery, not at the start: {}",
+        started.text()
+    );
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let poll = format!("/executions/{execution}");
+    let refused = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers")
+            .json();
+        (report["deliveries"].as_array().map(Vec::len) == Some(1)).then_some(report)
+    });
+    let recorded = &refused["deliveries"].as_array().expect("the deliveries")[0];
+    assert_eq!(recorded["status"], "refused", "{recorded}");
+    assert_eq!(recorded["event"], "parked", "{recorded}");
+    assert!(
+        recorded["attempts"].as_array().is_some_and(Vec::is_empty),
+        "a refused delivery was never attempted: {recorded}"
+    );
+    let detail = recorded["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("userinfo"),
+        "…and it says which rule refused it: {recorded}"
+    );
+    assert!(
+        !detail.contains("matches no `callback_allow` entry"),
+        "the list admits this URL's text — the list's own refusal here would mean the entry \
+         `http://127.0.0.1:*/allowed*` stopped matching and this test proves nothing: {recorded}"
+    );
+
+    let resume_url = refused["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    let finished = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers")
+            .json();
+        (report["status"] == "completed"
+            && report["deliveries"].as_array().map(Vec::len) == Some(2))
+        .then_some(report)
+    });
+    assert_eq!(
+        finished["deliveries"].as_array().expect("the deliveries")[1]["status"],
+        "refused",
+        "{finished}"
+    );
+    assert_eq!(
+        finished["outputs"]["decision"], "approve",
+        "a refused delivery is nobody's failure: {finished}"
+    );
+    assert_eq!(
+        elsewhere.reached(),
+        0,
+        "the host after the `@` was never connected to"
+    );
+}
+
+/// A receiver that answers a delivery with a **redirect** sends it nowhere else
+/// (grammar 13.3, Decision D127).
+///
+/// `callback_allow:` is matched against the URL the trigger produced, so a
+/// delivery that followed a `Location:` would make the list a bound on the first
+/// hop rather than on where a signed report lands. And the list admits an open
+/// redirect as readily as any other path: `http://127.0.0.1:*/allowed*` is
+/// satisfied by `…/allowed?to=https://attacker.test/collect`, which is a URL an
+/// author's own receiver may well answer `307` to. What would travel is this
+/// execution's whole report — outputs, trace, and every human answer — under
+/// `X-AgentCompose-Signature` and a `callback_auth: bearer` token written to a
+/// header name of the composition's choosing — what a cross-origin redirect
+/// strips is a fixed list of standard credential headers, never a name a
+/// composition chose and never the body's signature.
+///
+/// The blackhole is the assertion, and it counts **connections** rather than
+/// deliveries: a `301`, `302` or `303` rewrites the POST into a bodyless `GET`,
+/// which reaches a host without looking like a delivery at all — and which is
+/// the quieter half of the same bug, since an allowlisted receiver redirecting
+/// to itself would then answer `2xx` to a request carrying no report and the row
+/// would be journaled `delivered`.
+///
+/// The `307` is a failed attempt like any other non-2xx, so the schedule runs
+/// out and the row is `exhausted` — and the execution parks, is answered and
+/// completes regardless, which is what a webhook being a courtesy means.
+#[test]
+fn a_receiver_that_redirects_a_delivery_sends_it_nowhere_else() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, mut environment) = events_environment(&provider, "events-redirect");
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s,0s".to_string()));
+    let elsewhere = harness::Blackhole::start().expect("a loopback socket");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    // `307` preserves the method and the body, which is the redirect that would
+    // carry the report itself. The bodyless-`GET` rewrite of a `303` is the same
+    // root cause and is covered by the same assertion.
+    receiver.redirecting_to(307, &format!("{}/collect", elsewhere.base_url));
+    let Some(project) = harness::scratch_project("events-redirect") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({
+                    "topic": "redirect",
+                    "callback_url": format!("{}/allowed/deliveries", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // Both attempts of the parking, so what is asserted below is the whole of
+    // the schedule rather than whichever attempt happened to have landed.
+    let attempted = receiver.wait_for_event("parked", 2, Duration::from_secs(30));
+    assert!(
+        attempted[0].header("x-agentcompose-signature").is_some()
+            && attempted[0].header("x-delivery-token").is_some(),
+        "the delivery the receiver redirected carried both credentials: {:?}",
+        attempted[0].headers
+    );
+
+    let poll = format!("/executions/{execution}");
+    let owed = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(Request::get(&poll).header("authorization", events_bearer()))
+            .expect("the status route answers")
+            .json();
+        (report["deliveries"][0]["status"] == "exhausted").then_some(report)
+    });
+    let recorded = &owed["deliveries"][0];
+    assert_eq!(
+        recorded["attempts"].as_array().map(Vec::len),
+        Some(2),
+        "a `3xx` is a failed attempt and the schedule ran out on it: {recorded}"
+    );
+    for attempt in recorded["attempts"].as_array().expect("the attempts") {
+        assert_eq!(attempt["outcome"], "failed", "{recorded}");
+        let detail = attempt["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("307") && detail.contains("redirect"),
+            "…and it says what the receiver asked for and was not given: {recorded}"
+        );
+    }
+
+    // The execution is untouched by any of it.
+    let resume_url = owed["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+    let finished = completed(&app, &execution, |request| {
+        request.header("authorization", events_bearer())
+    });
+    assert_eq!(finished["outputs"]["decision"], "approve", "{finished}");
+
+    // …and the settle is redirected too, so the count below is taken once every
+    // delivery this execution owes has been through its whole schedule.
+    receiver.wait_for_event("settled", 2, Duration::from_secs(30));
+    assert_eq!(
+        elsewhere.reached(),
+        0,
+        "a delivery goes where `callback_allow:` admits it or nowhere: {} connection(s) \
+         reached the host the receiver named",
+        elsewhere.reached()
+    );
+}
+
+/// The `http-events` fixture with `watched`'s allowlist entry given a **literal
+/// tail** after its wildcards.
+///
+/// `http://127.0.0.1:*/allowed*/callback` is an ordinary Decision D127 entry —
+/// `*` matches any run of characters and an author may write two — and it is the
+/// shape that separates a matcher which *scans* an entry from one which compiles
+/// it into a regular expression: the two wildcards give a backtracking engine a
+/// split point to try at every occurrence of the literal between them, and the
+/// tail is what makes every one of those tries fail.
+fn fixture_with_a_two_wildcard_allowlist() -> String {
+    let source = std::fs::read_to_string(harness::fixture("http-events")).expect("the fixture");
+    let edited = source.replace(
+        "      - \"http://127.0.0.1:*/allowed*\"",
+        "      - \"http://127.0.0.1:*/allowed*/callback\"",
+    );
+    assert_ne!(
+        edited, source,
+        "`watched`'s `callback_allow:` is the entry this copy grows a tail on"
+    );
+    edited
+}
+
+/// A callback URL is matched in time **bounded by its length** (grammar 13.3,
+/// Decision D127).
+///
+/// The URL comes out of the request payload, which is the whole reason D127 has
+/// it matched at the delivery rather than at the start: it is
+/// attacker-controlled by construction. So the matcher is part of the app's
+/// exposed surface, and an entry compiled into a regular expression puts a
+/// caller in charge of how long the one thread that answers every route and
+/// works every delivery spends on their URL — half a megabyte of the literal
+/// between two wildcards is minutes of blocked event loop per request, and a
+/// handful of requests is a `serve` that answers nothing and delivers nothing
+/// ever again.
+///
+/// Two executions say it, and the second is the assertion: one names a URL of
+/// 480 KB that the entry admits nowhere, and the other names a short one it
+/// admits. The short one's parking webhook arriving is the app still being
+/// there — and the long one's row being `refused` is the match having really
+/// run rather than having been skipped for its size.
+#[test]
+fn a_long_callback_url_is_refused_without_wedging_the_app() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-long-url");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-long-url") else {
+        return;
+    };
+    let tailed = harness::Scratch::new("two-wildcard-allowlist");
+    let entrypoint = tailed.path().join("main.yml");
+    std::fs::write(&entrypoint, fixture_with_a_two_wildcard_allowlist())
+        .expect("the scratch area is writable");
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    // The entry's head, then sixty thousand copies of the literal between its
+    // wildcards, then a character that is not its tail: every one of those
+    // copies is a split point a backtracking engine has to try, and none of
+    // them can succeed.
+    let adversarial = format!("http://127.0.0.1:{}z", "/allowed".repeat(60_000));
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({ "topic": "long", "callback_url": adversarial }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let wedging = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let admitted = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({
+                    "topic": "short",
+                    "callback_url": format!("{}/allowed/deep/callback", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(admitted.status, 202, "{}", admitted.text());
+    let short = admitted.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // The app is still answering, and the two-wildcard entry still admits what
+    // it is written to admit: a matcher that had been made safe by refusing
+    // everything would fail here.
+    let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+    assert_eq!(
+        parked[0].header("x-agentcompose-delivery"),
+        Some(format!("{short}:0").as_str()),
+        "{:?}",
+        parked[0].headers
+    );
+
+    let refused = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(
+                Request::get(format!("/executions/{wedging}"))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the status route answers")
+            .json();
+        (report["deliveries"].as_array().map(Vec::len) == Some(1)).then_some(report)
+    });
+    let recorded = &refused["deliveries"].as_array().expect("the deliveries")[0];
+    assert_eq!(recorded["status"], "refused", "{}", recorded["status"]);
+    assert_eq!(recorded["event"], "parked", "{}", recorded["event"]);
+    assert!(
+        recorded["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("callback_allow"),
+        "…and it says why: {}",
+        recorded["detail"]
+    );
+}
+
+/// A receiver that refuses twice is delivered to on the third attempt, under the
+/// same delivery id every time (PRD resolved q35, `docs/durability.md` §3.7).
+///
+/// The retry schedule is normative and bounded, and the override this test runs
+/// under — `AGENT_COMPOSE_CALLBACK_RETRY=0s,0s,0s` — is the diagnostic surface
+/// that document names beside it, because a test cannot wait fifteen minutes to
+/// find out that a schedule exists.
+///
+/// The **id** is what the assertion is about as much as the arrival: a retry is
+/// the same delivery, so a receiver deduping on `X-AgentCompose-Delivery` sees
+/// one event whatever number of requests reached it. A build that allocated a
+/// fresh ordinal per attempt would deliver three events for one settle and pass
+/// a test that only counted arrivals.
+#[test]
+fn a_delivery_two_refusals_could_not_stop_lands_on_the_third_attempt() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, mut environment) = events_environment(&provider, "events-retry");
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s,0s,0s".to_string()));
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    receiver.answer_with(&[500, 503]);
+    let Some(project) = harness::scratch_project("events-retry") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json(
+            "/posted",
+            &json!({
+                "topic": "retry",
+                "callback_url": format!("{}/anywhere", receiver.base_url),
+            }),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let arrived = receiver.wait_for_event("settled", 3, Duration::from_secs(30));
+    let id = format!("{execution}:0");
+    for attempt in &arrived {
+        assert_eq!(
+            attempt.header("x-agentcompose-delivery"),
+            Some(id.as_str()),
+            "every attempt is the same delivery: {:?}",
+            attempt.headers
+        );
+        assert_eq!(attempt.bytes, arrived[0].bytes, "…carrying the same bytes");
+    }
+
+    let report = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        (held["deliveries"][0]["status"] == "delivered").then_some(held)
+    });
+    let recorded = &report["deliveries"][0];
+    assert_eq!(recorded["delivery_id"], id, "{recorded}");
+    let attempts = recorded["attempts"].as_array().expect("the attempts");
+    assert_eq!(attempts.len(), 3, "{recorded}");
+    assert_eq!(attempts[0]["outcome"], "failed", "{recorded}");
+    assert_eq!(attempts[1]["outcome"], "failed", "{recorded}");
+    assert_eq!(attempts[2]["outcome"], "delivered", "{recorded}");
+    assert!(
+        attempts[0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("500"),
+        "an attempt records what the receiver answered: {recorded}"
+    );
+}
+
+/// A delivery no attempt lands is recorded **exhausted**, and the execution is
+/// not touched (PRD resolved q35).
+///
+/// "A webhook is a courtesy the status route backstops, not a contract worth an
+/// unbounded queue": the schedule ends, the journal says so, and the run that
+/// produced its outputs still reports them. A build that failed or reopened the
+/// execution over an unreachable receiver would make a composition's success
+/// depend on somebody else's uptime.
+#[test]
+fn a_delivery_no_attempt_lands_is_recorded_exhausted_and_leaves_the_run_alone() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, mut environment) = events_environment(&provider, "events-exhausted");
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s,0s".to_string()));
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-exhausted") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json(
+            "/posted",
+            &json!({
+                "topic": "exhausted",
+                "callback_url": format!("{}/anywhere", receiver.base_url),
+            }),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let report = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        (held["deliveries"][0]["status"] == "exhausted").then_some(held)
+    });
+    let recorded = &report["deliveries"][0];
+    assert_eq!(
+        recorded["attempts"].as_array().map(Vec::len),
+        Some(2),
+        "the schedule is bounded and it ended: {recorded}"
+    );
+    assert_eq!(report["status"], "completed", "{report}");
+    assert_eq!(report["outputs"]["noted"], "noted", "{report}");
+    assert_eq!(
+        receiver.of_event("settled").len(),
+        2,
+        "two attempts reached the receiver and neither was taken"
+    );
+}
+
+/// A delivery a crash interrupted completes after a restart, under the same
+/// delivery id and the same ordinal — and the resume of the recovered execution
+/// still verifies against the trigger that started it
+/// (`docs/durability.md` §3.7, §6.1, PRD resolved q32, q35).
+///
+/// The two halves are one test because they are one restart. What makes the
+/// delivery resumable is the intent being journaled **before** the first
+/// attempt; what makes the resume still guarded is the starting trigger being on
+/// the lifecycle row. A process that kept either in memory would pass every
+/// single-process test in this file and lose both on the first restart.
+///
+/// The schedule is what makes it deterministic rather than timed: the first
+/// process is given `0s,1h`, so its one attempt fails against a receiver
+/// answering `500` and the next is an hour away; the second is given `0s,0s`, so
+/// the delivery it picks up is due at once. The offsets are measured from the
+/// recorded intent either way, which is what a restart has to be able to read.
+#[test]
+fn a_delivery_a_restart_interrupted_completes_under_the_same_id() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-restart");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-restart") else {
+        return;
+    };
+
+    let mut stalled = base.clone();
+    stalled.push((harness::CALLBACK_RETRY.to_string(), "0s,1h".to_string()));
+    let execution;
+    let resume_url;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &stalled) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .send(
+                Request::post("/watched")
+                    .json(&json!({
+                        "topic": "restart",
+                        "callback_url": format!("{}/allowed", receiver.base_url),
+                    }))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // One attempt, refused. The intent is journaled — that is what this
+        // arrival proves — and the next offset is an hour away, so the process
+        // is killed holding a delivery nothing has taken.
+        let attempt = receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+        assert_eq!(
+            attempt[0].header("x-agentcompose-delivery"),
+            Some(format!("{execution}:0").as_str())
+        );
+        let report = app
+            .send(
+                Request::get(format!("/executions/{execution}"))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the status route answers")
+            .json();
+        resume_url = report["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+            .as_str()
+            .expect("a resume url")
+            .to_string();
+    }
+
+    receiver.always(200);
+    let mut prompt = base;
+    prompt.push((harness::CALLBACK_RETRY.to_string(), "0s,0s".to_string()));
+    let Some(second) = harness::serve_into(&project, "http-events", &prompt) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+
+    let taken = harness::until(Duration::from_secs(30), || {
+        let held: Vec<harness::Delivered> = receiver
+            .of_event("parked")
+            .into_iter()
+            .filter(|one| one.header("x-agentcompose-delivery") == Some(&format!("{execution}:0")))
+            .collect();
+        (held.len() >= 2).then_some(held)
+    });
+    assert_eq!(
+        taken[1].header("x-agentcompose-ordinal"),
+        Some("0"),
+        "a resumed delivery is the same delivery: {:?}",
+        taken[1].headers
+    );
+    assert_eq!(
+        taken[1].header("x-agentcompose-timestamp"),
+        taken[0].header("x-agentcompose-timestamp"),
+        "…stamped with the instant of the intent it was recorded under"
+    );
+    assert_eq!(taken[1].bytes, taken[0].bytes, "…carrying the same bytes");
+    assert_eq!(
+        receiver.distinct("parked").len(),
+        1,
+        "one parking, delivered twice: {:?}",
+        receiver.distinct("parked")
+    );
+
+    // …and the recovered execution's resume is still the *starting* trigger's to
+    // guard, which this process learned from the journal rather than from a
+    // request it never saw.
+    let refused = app
+        .post_json(&resume_url, &json!({ "decision": "approve" }))
+        .expect("the resume route answers");
+    assert_eq!(refused.status, 401, "{}", refused.text());
+    let answered = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .send(
+                Request::post(&resume_url)
+                    .json(&json!({ "decision": "approve" }))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the resume route answers");
+        // The recovered execution may still be replaying its way back to the
+        // pause, which is a `409` that says to send it again (§6.1).
+        (held.status == 202).then_some(held)
+    });
+    assert_eq!(answered.status, 202, "{}", answered.text());
+}
+
+/// An execution finished by `agent-compose resume` still journals the `settled`
+/// webhook it owes, and a later `serve` delivers it
+/// (`docs/durability.md` §3.7, §6.2, PRD resolved q35).
+///
+/// The hole this closes is the one the ordering rule exists for, reached by the
+/// other door. `serve` journals the intent before the lifecycle row closes, so a
+/// process killed mid-attempt leaves a row a later start finishes — but `serve`
+/// is not the only process that closes a row. An operator finishing a parked
+/// execution by hand closes it too, and a build that supplied the hook only in
+/// the app would close it with no delivery row beside it: `recover` then
+/// enumerates open executions and finds none, the ledger holds nothing
+/// `pending`, and a caller who was handed a `202` — and by resolved q34's own
+/// reasoning is not polling — is never told at all. Nothing anywhere would say
+/// so, which is why this is asserted from both ends: the row after the resume,
+/// and the request the next start makes.
+///
+/// **Recorded, not sent**, is the other half. The command exits when its run
+/// does and the schedule outlives it, so the receiver hears nothing until an app
+/// picks the row up.
+#[test]
+fn an_execution_finished_by_a_hand_resume_still_journals_the_settle_it_owes() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-hand-resume");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-hand-resume") else {
+        return;
+    };
+
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &base) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .send(
+                Request::post("/watched")
+                    .json(&json!({
+                        "topic": "by hand",
+                        "callback_url": format!("{}/allowed", receiver.base_url),
+                    }))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // Parked and told: the execution is open, its callback is on the
+        // lifecycle row, and the app that started it is about to go.
+        receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+    }
+
+    // The operator, at the terminal the app no longer answers for. The pause is
+    // the same pause under the same wait id, and answering it here is what closes
+    // the row.
+    let resumed = harness::resume_answering(
+        &project,
+        "http-events",
+        &execution,
+        &base,
+        &["{\"decision\": \"approve\"}"],
+        harness::Answers::Closed,
+    );
+    resumed.succeeded();
+    assert_eq!(
+        resumed.outputs(),
+        json!({ "decision": "approve" }),
+        "{}",
+        resumed.stderr()
+    );
+
+    let owed = journaled_deliveries(&project, &execution);
+    assert_eq!(owed.len(), 2, "one parking and one settle: {owed:?}");
+    assert_eq!(owed[1]["event"], "settled", "{owed:?}");
+    assert_eq!(
+        owed[1]["ordinal"], 1,
+        "the ordinal ascends across kinds: {owed:?}"
+    );
+    assert_eq!(
+        owed[1]["status"], "pending",
+        "a command that exits when its run does records the webhook and leaves the \
+         sending to an app: {owed:?}"
+    );
+    assert!(
+        receiver.of_event("settled").is_empty(),
+        "…and sent nothing itself: {:?}",
+        receiver.of_event("settled")
+    );
+
+    let mut prompt = base;
+    prompt.push((harness::CALLBACK_RETRY.to_string(), "0s".to_string()));
+    let Some(second) = harness::serve_into(&project, "http-events", &prompt) else {
+        return;
+    };
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(
+        delivered[0].header("x-agentcompose-delivery"),
+        Some(format!("{execution}:1").as_str()),
+        "{:?}",
+        delivered[0].headers
+    );
+    let body: Value = serde_json::from_slice(&delivered[0].bytes).expect("the body is JSON");
+    assert_eq!(body["status"], "completed", "{body}");
+    assert_eq!(body["trigger"], "watched", "{body}");
+    assert_eq!(body["outputs"]["decision"], "approve", "{body}");
+    // The identity the trigger declared, over the bytes a command in another
+    // process serialized: a report journaled without it would be delivered to a
+    // receiver that refuses it.
+    let expected = harness::hmac_sha256(
+        harness::credential(harness::DELIVERY_SECRET).as_bytes(),
+        &delivered[0].bytes,
+    );
+    assert_eq!(
+        delivered[0].header("x-agentcompose-signature"),
+        Some(format!("sha256={expected}").as_str()),
+        "{:?}",
+        delivered[0].headers
+    );
+    drop(second);
+}
+
+/// A `pending` delivery a shorter schedule leaves no attempt for is
+/// **exhausted**, not left pending for ever (`docs/durability.md` §3.7).
+///
+/// The offsets are measured from the intent and an attempt is owed per offset,
+/// so a row picked up under a schedule with fewer offsets than it already has
+/// attempts has nothing left to do. §3.7 gives a delivery two ends and staying
+/// `pending` is neither: a row nothing ever ends is read and skipped at every
+/// subsequent start and reported by the status route as a webhook still owed for
+/// the life of the journal.
+///
+/// `AGENT_COMPOSE_CALLBACK_RETRY` going from `0s,1h` to `0s` is exactly the shape
+/// an operator shortening a diagnostic schedule between two starts produces, and
+/// the assertion is that nothing is *sent* either — an end reached by making one
+/// more attempt would be a receiver hearing from a schedule that had run out.
+#[test]
+fn a_pending_delivery_a_shorter_schedule_leaves_no_attempt_for_is_exhausted() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-shortened");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-shortened") else {
+        return;
+    };
+
+    let mut stalled = base.clone();
+    stalled.push((harness::CALLBACK_RETRY.to_string(), "0s,1h".to_string()));
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &stalled) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/posted",
+                &json!({
+                    "topic": "shortened",
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // One attempt, refused: the row is `pending` with a single attempt on it
+        // and its next offset an hour away.
+        receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+        let finished = harness::settled(&app, &execution);
+        assert_eq!(finished["status"], "completed", "{finished}");
+    }
+    let attempted = receiver.of_event("settled").len();
+
+    let mut shortened = base;
+    shortened.push((harness::CALLBACK_RETRY.to_string(), "0s".to_string()));
+    let Some(second) = harness::serve_into(&project, "http-events", &shortened) else {
+        return;
+    };
+    let ended = harness::until(Duration::from_secs(30), || {
+        let held = harness::journal_rows(
+            &project,
+            &format!(
+                "SELECT ordinal, event, status, attempts, detail FROM deliveries \
+                 WHERE execution = '{execution}' ORDER BY ordinal ASC"
+            ),
+        );
+        let rows = held.as_array().expect("the query answers rows").clone();
+        (rows.first().map(|row| row["status"] == "exhausted") == Some(true)).then_some(rows)
+    });
+    assert_eq!(ended.len(), 1, "one event, one row: {ended:?}");
+    assert!(
+        ended[0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already made"),
+        "…and it says why it ended without one: {ended:?}"
+    );
+    let held: Vec<Value> =
+        serde_json::from_str(ended[0]["attempts"].as_str().unwrap_or("[]")).expect("the attempts");
+    assert_eq!(
+        held.len(),
+        1,
+        "the row is ended by the schedule running out, not by a further attempt: {ended:?}"
+    );
+    // A schedule with nothing left in it sends nothing: the receiver answering
+    // `500` would have taken another request at once had one been made.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        receiver.of_event("settled").len(),
+        attempted,
+        "nothing more was sent: {:?}",
+        receiver.delivered()
+    );
+    drop(second);
+}
+
+/// One quiescence that opened several pauses is **one** `parked` delivery
+/// listing all of them (PRD resolved q34).
+///
+/// "A parking fires **one** webhook listing every pause then open — never one
+/// per pause, because a `map` over a flow with `human` nodes would spray a
+/// receiver with N deliveries about one quiescence." Every other lifecycle test
+/// in this file watches a flow holding exactly one pause, and a build that
+/// coalesced with a timer rather than with a quiescence passes all of them: the
+/// single pause is alone in its turn whatever the rule.
+///
+/// So the fixture staggers. Each item lingers for a different length of time
+/// before it reaches its `human` node, which puts the three registrations in
+/// three different turns of the event loop — the shape a debounce answers with
+/// three deliveries, each listing a growing prefix of one event. What is
+/// asserted is the **first** delivery's own body: a rule that waited for the
+/// last branch lists three pauses in it, and one that did not lists one.
+#[test]
+fn one_quiescence_that_opened_many_pauses_is_one_parked_delivery() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-quiescence");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-quiescence") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .send(
+            Request::post("/fanned")
+                .json(&json!({
+                    "items": [
+                        { "topic": "first", "linger": "0" },
+                        { "topic": "second", "linger": "0.2" },
+                        { "topic": "third", "linger": "0.4" },
+                    ],
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(60));
+    let first = &parked[0];
+    assert_eq!(first.header("x-agentcompose-ordinal"), Some("0"));
+    let interrupts = first.body["interrupts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a parking webhook carries its pauses: {:?}", first.body))
+        .clone();
+    assert_eq!(
+        interrupts.len(),
+        3,
+        "one quiescence, one webhook, every pause it opened: {:?}",
+        first.body
+    );
+    let mut asked: Vec<&str> = interrupts
+        .iter()
+        .map(|pause| pause["input"]["note"].as_str().expect("what was shown"))
+        .collect();
+    asked.sort_unstable();
+    assert_eq!(
+        asked,
+        ["first", "second", "third"],
+        "…and each carries what its own item asked: {:?}",
+        first.body
+    );
+
+    // Answered through the URLs the webhook published, in the order it listed
+    // them. Answering one leaves the others waiting, and no pause the webhook
+    // already reported is announced a second time.
+    for pause in &interrupts {
+        let resume_url = pause["resume_url"].as_str().expect("a resume url");
+        let answered = app
+            .send(
+                Request::post(resume_url)
+                    .json(&json!({ "decision": "approve" }))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the resume route answers");
+        assert_eq!(answered.status, 202, "{}", answered.text());
+    }
+
+    let settled = receiver.wait_for_event("settled", 1, Duration::from_secs(60));
+    assert_eq!(settled[0].header("x-agentcompose-ordinal"), Some("1"));
+    assert_eq!(
+        settled[0].body["outputs"]["verdicts"],
+        json!(["approve", "approve", "approve"]),
+        "{:?}",
+        settled[0].body
+    );
+    assert_eq!(
+        receiver.distinct("parked"),
+        [format!("{execution}:0")],
+        "one parking, delivered once — not one per pause: {:?}",
+        receiver.distinct("parked")
+    );
+}
+
+/// A **detached** delivery still running does not hold a parking's webhook back
+/// (grammar 8.6 rule 7, PRD resolved q34).
+///
+/// Rule 7 says nothing a detached dispatch does may delay the enclosing flow
+/// instance, and a *quiescence* is one of the things that can be delayed: the
+/// sink of a detached dispatch to a `flow.*` runs its own nodes under this
+/// execution's id, so a reading of "every unit of work is waiting on a human"
+/// that counted them would answer `false` for as long as the delivery ran.
+/// D118 refuses a `human` node under a detached target, so that work can never
+/// park — the answer would be `false` until the delivery finished, whatever
+/// that took. Concretely: a receiver subscribed to a flow that detaches a slow
+/// sink is told about a pause it could have answered at once only when the
+/// delivery releases, minutes later.
+///
+/// Nothing here is timed. `flow.escorted` runs a node that waits for the sink's
+/// own line before it reaches the pause, so the parking happens with the
+/// delivery **provably** in flight; the sink cannot leave its wait until this
+/// test writes the file it is watching for, which it does after the webhook has
+/// arrived. A build that waited for the delivery delivers no `parked` webhook
+/// at all inside the budget below.
+#[test]
+fn a_parking_is_delivered_while_a_detached_dispatch_is_still_running() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, log, environment) = events_environment(&provider, "events-detached-parking");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-detached-parking") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .send(
+            Request::post("/escorted")
+                .json(&json!({
+                    "topic": "escorted",
+                    "topics": ["one"],
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // The delivery is running: its subprocess has written its line, and the only
+    // way out of the wait it is now in is a file this test has not created.
+    let holding = log.with_extension("log.hold");
+    let release = log.with_extension("log.released");
+    wait_for_lines(&holding, 1);
+
+    let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(60));
+    assert!(
+        !release.exists(),
+        "the parking webhook arrived while the detached delivery was still in flight, \
+         and nothing has released it"
+    );
+    assert_eq!(parked[0].header("x-agentcompose-ordinal"), Some("0"));
+    let interrupts = parked[0].body["interrupts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a parking webhook carries its pauses: {:?}", parked[0].body))
+        .clone();
+    assert_eq!(
+        interrupts.len(),
+        1,
+        "the pause the flow parked at, and nothing the delivery opened: {:?}",
+        parked[0].body
+    );
+    let resume_url = interrupts[0]["resume_url"]
+        .as_str()
+        .expect("a resume url")
+        .to_string();
+
+    // Released before the answer, because a run on its way out **does** wait for
+    // its detached deliveries (`docs/durability.md` §3.2): rule 7 is about the
+    // flow instance, and this is the one place a delivery with no record would
+    // be a delivery made twice.
+    std::fs::write(&release, "").expect("the release file is writable");
+    let answered = app
+        .send(
+            Request::post(&resume_url)
+                .json(&json!({ "decision": "approve" }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the resume route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+
+    let settled = receiver.wait_for_event("settled", 1, Duration::from_secs(60));
+    assert_eq!(settled[0].header("x-agentcompose-ordinal"), Some("1"));
+    assert_eq!(
+        settled[0].body["outputs"]["decision"],
+        json!("approve"),
+        "{:?}",
+        settled[0].body
+    );
+    assert_eq!(
+        receiver.distinct("parked"),
+        [format!("{execution}:0")],
+        "one parking, delivered once: {:?}",
+        receiver.distinct("parked")
+    );
+}
+
+/// A credential set to the **empty string** refuses the app at launch, naming
+/// the variable (grammar 13.3, PRD resolved q32).
+///
+/// `src/env.ts` counts an empty variable as present, which is §4.3's own rule
+/// and the right one for a `base_url:`. For a credential it is an open door: an
+/// empty expected token compares equal to the empty token every anonymous caller
+/// can send, so `EVENTS_TOKEN=` — an unexpanded `${TOKEN}` in a launch wrapper,
+/// a blank key in an env file — would leave `/guarded` answering `202` to
+/// anybody while looking guarded from the outside.
+///
+/// A refusal is checked rather than a `401`, because those are different
+/// products: a route that answered `401` to the deployment's *own* callers would
+/// be a service that is down, discovered on the first real request. This is one
+/// sentence on the first start.
+#[test]
+fn a_credential_set_to_nothing_refuses_the_app_at_launch() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-blank-credential");
+    let mut environment = base;
+    for entry in &mut environment {
+        if entry.0 == harness::EVENTS_TOKEN {
+            entry.1 = String::new();
+        }
+    }
+    let Some(refused) =
+        harness::serve_refused_with("events-blank-credential", "http-events", &environment)
+    else {
+        return;
+    };
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "a variable the deployment has to fix is a usage error: {said}"
+    );
+    assert!(
+        said.contains(harness::EVENTS_TOKEN),
+        "…and it names what to set: {said}"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).is_empty(),
+        "nothing was served: a readiness line would mean the routes were mounted: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+}
+
+/// `AGENT_COMPOSE_CALLBACK_RETRY` set to something that is not a schedule
+/// refuses the app at launch (`docs/durability.md` §3.7, Decision D50).
+///
+/// Both ways it can fail to be one, because only the first is obvious. A
+/// duration the grammar does not spell is a typo somebody sees; an **empty
+/// list** is what `AGENT_COMPOSE_CALLBACK_RETRY=$SHORT_SCHEDULE` expands to when
+/// the wrapper's own variable is unset, and a build that read it as "unset"
+/// would start clean on the fifteen-minute schedule while the diagnostic run it
+/// was written for waits ten minutes for a retry the operator believed was a
+/// second away. That is D50's failure exactly: a setting nobody read.
+#[test]
+fn a_callback_retry_schedule_that_is_not_one_refuses_the_app_at_launch() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-retry-refused");
+    for (what, written) in [
+        ("a duration the grammar does not spell", "0s,soon"),
+        ("an empty list, which a variable set to nothing is", ""),
+    ] {
+        let mut environment = base.clone();
+        environment.push((harness::CALLBACK_RETRY.to_string(), written.to_string()));
+        let Some(refused) =
+            harness::serve_refused_with("events-retry-refused", "http-events", &environment)
+        else {
+            return;
+        };
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "{what} is refused rather than ignored: {said}"
+        );
+        assert!(
+            said.contains(harness::CALLBACK_RETRY),
+            "…and the refusal names the variable ({what}): {said}"
+        );
+    }
+}
+
+/// A receiver that takes a delivery and never answers does not hold it open:
+/// the attempt runs out, the schedule ends, and the row stops being `pending`
+/// (`docs/durability.md` §3.7, PRD resolved q35).
+///
+/// "Retry is bounded … because a webhook is a courtesy the status route
+/// backstops, not a contract worth an unbounded queue" — which is a claim about
+/// wall-clock time as much as about the count. A socket that completes the
+/// handshake and writes nothing is the ordinary shape of an unreachable
+/// endpoint, and against it a `fetch` with no timeout never returns: the row
+/// stays `pending` for the life of the process, is re-attempted at every later
+/// start, and the status route reports an execution that finished minutes ago as
+/// still owing a webhook. The sibling exhaustion test cannot see this — its
+/// receiver answers `500` at once — so the black hole is what asks the question.
+#[test]
+fn a_receiver_that_never_answers_does_not_hold_a_delivery_open() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, mut environment) = events_environment(&provider, "events-unanswered");
+    // One attempt, so what is being timed is the attempt rather than the
+    // schedule around it.
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s".to_string()));
+    let hole = harness::Blackhole::start().expect("a loopback socket");
+    let Some(project) = harness::scratch_project("events-unanswered") else {
+        return;
+    };
+    let Some(served) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    let started = app
+        .post_json(
+            "/posted",
+            &json!({
+                "topic": "unanswered",
+                "callback_url": format!("{}/anywhere", hole.base_url),
+            }),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let execution = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // The budget is generous against the ten seconds one attempt waits: what is
+    // being asserted is that the attempt ends at all.
+    let report = harness::until(Duration::from_secs(60), || {
+        let held = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        (held["deliveries"][0]["status"] == "exhausted").then_some(held)
+    });
+    let recorded = &report["deliveries"][0];
+    assert_eq!(
+        recorded["attempts"].as_array().map(Vec::len),
+        Some(1),
+        "the one attempt the schedule allowed ended: {recorded}"
+    );
+    assert!(
+        recorded["attempts"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not answer"),
+        "…and the journal says the receiver never answered rather than naming a class: {recorded}"
+    );
+    assert_eq!(report["status"], "completed", "{report}");
+    assert_eq!(report["outputs"]["noted"], "noted", "{report}");
+    assert!(
+        hole.reached() >= 1,
+        "the delivery really reached the socket that swallowed it"
+    );
+}
+
+/// The statements the surgery below makes about a journal, which are the shape
+/// of the file a build **before** the delivery ledger wrote
+/// (`docs/durability.md` §11.2).
+///
+/// Two changes, and each fails loudly if this build's journal is not what it is
+/// described as: `DROP TABLE deliveries` without `IF EXISTS` refuses a file that
+/// has no such table, and the `INSERT … SELECT` names `executions.callback`, so
+/// a build that had never added the column could not run this either.
+const JOURNAL_BEFORE_DELIVERIES: &str = "\
+DROP TABLE deliveries;
+CREATE TABLE before_deliveries (
+  id              TEXT PRIMARY KEY,
+  flow            TEXT NOT NULL,
+  trigger_kind    TEXT NOT NULL,
+  inputs          TEXT NOT NULL,
+  session_key     TEXT NOT NULL,
+  status          TEXT NOT NULL,
+  journal_version INTEGER NOT NULL,
+  started_at      TEXT NOT NULL,
+  ended_at        TEXT,
+  error           TEXT
+);
+INSERT INTO before_deliveries
+  SELECT id, flow, trigger_kind, inputs, session_key, status, journal_version, started_at, ended_at, error
+  FROM executions;
+DROP TABLE executions;
+ALTER TABLE before_deliveries RENAME TO executions;
+";
+
+/// A journal written before the delivery ledger existed opens under this build,
+/// replays what it holds, and takes this build's deliveries
+/// (`docs/durability.md` §11.2).
+///
+/// §11.2 keeps `JOURNAL_VERSION` where it is by arguing that the ledger arrived
+/// as a compatible change: "A journal written before it opens unchanged — the
+/// table is created on first open, as `CREATE TABLE IF NOT EXISTS`". That
+/// argument is the whole reason an execution parked in an older file is still
+/// resumable, and until this test it was made only in a comment — every test in
+/// the suite creates its journal fresh under the current schema, so a `NOT NULL`
+/// column added to `deliveries` without the `PRAGMA table_info` probe the
+/// migrations beside it use would leave `cargo test` green and every deployed
+/// journal unable to record a webhook.
+///
+/// There is no older build in the tree to write the file, so the file is made:
+/// a real run's journal with the `deliveries` table dropped and the lifecycle
+/// row rebuilt without its `callback` column, which is exactly the two things
+/// this change added to the physical schema. What is then asserted is the three
+/// halves of the claim — it opens, the execution it holds replays and can still
+/// be answered, and this build writes its own ledger into the same file.
+#[test]
+fn a_journal_written_before_the_delivery_ledger_opens_and_serves_under_this_build() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-old-journal");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-old-journal") else {
+        return;
+    };
+
+    let execution;
+    let resume_url;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        // The no-auth trigger, so what the second process has to do with this
+        // execution is recovery rather than authentication.
+        let started = app
+            .post_json("/open", &json!({ "topic": "before the ledger" }))
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        let parked = harness::settled(&app, &execution);
+        assert_eq!(parked["status"], "interrupted", "{parked}");
+        resume_url = parked["interrupts"].as_array().expect("the pauses")[0]["resume_url"]
+            .as_str()
+            .expect("a resume url")
+            .to_string();
+    }
+
+    harness::journal_sql(&project, JOURNAL_BEFORE_DELIVERIES);
+
+    let Some(second) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+
+    // It opened, and what it held came back: the execution is on the board under
+    // the wait id the process that died published, which is what makes the
+    // `resume_url` that process handed out still work.
+    let recovered = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        (held["status"] == "interrupted").then_some(held)
+    });
+    assert_eq!(recovered["execution_id"], execution, "{recovered}");
+    let answered = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .post_json(&resume_url, &json!({ "decision": "approve" }))
+            .expect("the resume route answers");
+        // A recovered execution may still be replaying its way back to the
+        // pause, which is a `409` that says to send it again (§6.1).
+        (held.status == 202).then_some(held)
+    });
+    assert_eq!(answered.status, 202, "{}", answered.text());
+    let finished = harness::settled(&app, &execution);
+    assert_eq!(finished["status"], "completed", "{finished}");
+    assert_eq!(finished["outputs"]["decision"], "approve", "{finished}");
+
+    // …and the ledger this build wants is back in the same file: a new
+    // execution's webhook is journaled and delivered out of a journal that was
+    // created without one.
+    let posted = app
+        .post_json(
+            "/posted",
+            &json!({
+                "topic": "after the ledger",
+                "callback_url": format!("{}/anywhere", receiver.base_url),
+            }),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(posted.status, 202, "{}", posted.text());
+    let fresh = posted.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(
+        delivered[0].header("x-agentcompose-delivery"),
+        Some(format!("{fresh}:0").as_str()),
+        "{:?}",
+        delivered[0].headers
+    );
+    let report = harness::until(Duration::from_secs(30), || {
+        let held = app
+            .get(&format!("/executions/{fresh}"))
+            .expect("the status route answers")
+            .json();
+        (held["deliveries"][0]["status"] == "delivered").then_some(held)
+    });
+    assert_eq!(report["deliveries"][0]["ordinal"], 0, "{report}");
+}
+
+/// A lifecycle row this build cannot read, under a delivery it still owes.
+///
+/// `inputs` is the column taken away because reading it is what fails: the
+/// journal's queries are `SELECT *`, so a missing column is a missing *field*,
+/// and the one field the row's reader parses rather than copies is this one.
+/// Every other column would be read as `"undefined"` and hurt nothing.
+///
+/// The row is kept rather than deleted, because a row that is **not there** is
+/// an answer the picker-up already has a posture for (the execution's trigger
+/// cannot be named, so the delivery stays pending). What has no posture until
+/// one is written is a read that *throws*, which is what any transient journal
+/// failure looks like from inside the loop.
+///
+/// The delivery's own `trigger` is cleared beside it, and that is what leaves
+/// the lifecycle row as the only thing that can name this delivery's trigger: a
+/// row that names its own is picked up without reading an execution at all
+/// (`docs/durability.md` §3.7). So this is also the older shape of a delivery —
+/// a row written before the ledger recorded that field — met by the start that
+/// cannot read the execution behind it.
+const JOURNAL_WITH_AN_UNREADABLE_EXECUTION: &str = "\
+UPDATE deliveries SET trigger_kind = NULL;
+CREATE TABLE unreadable (
+  id              TEXT PRIMARY KEY,
+  flow            TEXT NOT NULL,
+  trigger_kind    TEXT NOT NULL,
+  session_key     TEXT NOT NULL,
+  callback        TEXT,
+  status          TEXT NOT NULL,
+  journal_version INTEGER NOT NULL,
+  started_at      TEXT NOT NULL,
+  ended_at        TEXT,
+  error           TEXT
+);
+INSERT INTO unreadable
+  SELECT id, flow, trigger_kind, session_key, callback, status, journal_version, started_at, ended_at, error
+  FROM executions;
+DROP TABLE executions;
+ALTER TABLE unreadable RENAME TO executions;
+";
+
+/// A journal read that fails while owed deliveries are being picked up leaves
+/// **one delivery** owed, not a deployment that will not start
+/// (`docs/durability.md` §3.7, §6.1).
+///
+/// Picking the owed webhooks up happens in the `onReady` hook, so a rejection
+/// out of that walk is an `app.listen()` that rejects: the process exits without
+/// binding a port, and the executions, routes and journal it was going to serve
+/// go with it. The reads in that walk can fail for reasons that have nothing to
+/// do with the deployment's health — §2 and §12 both make a second process
+/// contending the file a state a healthy project reaches, and a `SELECT` that
+/// waits out `busy_timeout` throws — so a webhook, which §3.7 calls "a courtesy
+/// the status route backstops", would take down a service that owes one.
+///
+/// A contended file cannot be scripted, so the read is made to fail the way a
+/// contended one does: the delivery is put back into the shape that has to read
+/// an execution at all — the older row, carrying no trigger of its own — and the
+/// lifecycle row it belongs to is rebuilt without the column its reader parses.
+/// What is asserted is that the app serves — a `401` from a guarded route is a
+/// route answering — and that the row is left exactly as it was found, for a
+/// start that can read it.
+#[test]
+fn a_delivery_whose_execution_cannot_be_read_leaves_the_app_serving() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-unreadable-row");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    // Refused, so the delivery is still owed when the process ends: one attempt
+    // is made at `0s` and the next is an hour away.
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-unreadable-row") else {
+        return;
+    };
+    let mut environment = base;
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s,1h".to_string()));
+
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/posted",
+                &json!({
+                    "topic": "unreadable",
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+        let finished = harness::settled(&app, &execution);
+        assert_eq!(finished["status"], "completed", "{finished}");
+    }
+
+    harness::journal_sql(&project, JOURNAL_WITH_AN_UNREADABLE_EXECUTION);
+
+    // The start enumerates the owed delivery, cannot read the execution it
+    // reports on — and binds its port anyway.
+    let Some(second) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+    let refused = app
+        .post_json("/guarded", &json!({ "topic": "unreadable" }))
+        .expect("the trigger's route answers");
+    assert_eq!(
+        refused.status,
+        401,
+        "the app is serving its routes: {}",
+        refused.text()
+    );
+
+    let held = journaled_deliveries(&project, &execution);
+    assert_eq!(
+        held[0]["status"], "pending",
+        "the row is left as it was found, for a start that can read it: {held:?}"
+    );
+    drop(second);
+}
+
+/// A delivery whose execution the journal does **not** hold is still finished,
+/// because the row names its own trigger (`docs/durability.md` §3.7).
+///
+/// The shape this is about is the one settle the `closing` hook is never reached
+/// for: a run that failed **before** it was journaled at all — its recorded
+/// inputs refused by a narrowed `inputs:`, a `session_key:` the composition has
+/// since started requiring — leaves no lifecycle row, so no start will ever
+/// recover it and the caller holding a `202` is owed the failure by the process
+/// that saw it. That delivery is journaled like any other, and a start that read
+/// its trigger off the execution would find no execution, name no trigger, and
+/// neither send the row nor end it: it would be read, logged and skipped at
+/// every start for the life of the journal, which is neither of the two ends
+/// §3.7 gives a delivery.
+///
+/// A run that fails that early cannot be scripted, so the state one leaves is
+/// made instead: an ordinary settle is journaled and left owed by a receiver
+/// answering `500`, and then the lifecycle row is taken out from under it. What
+/// the restart meets is exactly what that run leaves behind — a `pending`
+/// delivery about an execution the journal does not hold — and the delivery
+/// still lands, under the id it was allocated.
+#[test]
+fn a_settle_journaled_for_an_execution_the_journal_never_held_is_still_delivered() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-orphan-settle");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    // One attempt, refused, and the next an hour away: the process is killed
+    // holding a delivery nothing has taken.
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-orphan-settle") else {
+        return;
+    };
+
+    let mut stalled = base.clone();
+    stalled.push((harness::CALLBACK_RETRY.to_string(), "0s,1h".to_string()));
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &stalled) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/posted",
+                &json!({
+                    "topic": "orphaned",
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+        let finished = harness::settled(&app, &execution);
+        assert_eq!(finished["status"], "completed", "{finished}");
+    }
+
+    // The lifecycle row goes and the delivery it is about stays: the file now
+    // holds what a settle journaled for a never-journaled run leaves behind.
+    harness::journal_sql(
+        &project,
+        &format!("DELETE FROM executions WHERE id = '{execution}';"),
+    );
+    let owed = journaled_deliveries(&project, &execution);
+    assert_eq!(owed.len(), 1, "one settle, still owed: {owed:?}");
+    assert_eq!(owed[0]["status"], "pending", "{owed:?}");
+
+    receiver.always(200);
+    let mut prompt = base;
+    prompt.push((harness::CALLBACK_RETRY.to_string(), "0s,0s".to_string()));
+    let Some(second) = harness::serve_into(&project, "http-events", &prompt) else {
+        return;
+    };
+    let app = Client::new(&second.base_url).expect("a client for the generated app");
+
+    let taken = harness::until(Duration::from_secs(30), || {
+        let held: Vec<harness::Delivered> = receiver
+            .of_event("settled")
+            .into_iter()
+            .filter(|one| one.header("x-agentcompose-delivery") == Some(&format!("{execution}:0")))
+            .collect();
+        (held.len() >= 2).then_some(held)
+    });
+    assert_eq!(
+        taken[1].bytes, taken[0].bytes,
+        "the delivery a start with no execution to read picked up is the same delivery"
+    );
+    let ended = harness::until(Duration::from_secs(30), || {
+        let held = journaled_deliveries(&project, &execution);
+        (held.first().map(|row| row["status"] == "delivered") == Some(true)).then_some(held)
+    });
+    assert_eq!(ended[0]["event"], "settled", "{ended:?}");
+
+    // …and the execution really is one nothing in this file describes: the row
+    // a build would have read the trigger off is gone.
+    let unknown = app
+        .get(&format!("/executions/{execution}"))
+        .expect("the status route answers");
+    assert_eq!(unknown.status, 404, "{}", unknown.text());
+    drop(second);
+}
+
+/// The `http-events` fixture with one trigger renamed, so a build meets an
+/// execution its journal says was started by a trigger it does not declare.
+///
+/// The flows are untouched, which is what keeps the difference to the one thing
+/// under test: recovery replays the execution exactly, and only the *trigger*
+/// the lifecycle row names is missing.
+fn fixture_without_the_fanned_trigger() -> String {
+    let source = std::fs::read_to_string(harness::fixture("http-events")).expect("the fixture");
+    let edited = source.replace("\n  fanned:\n", "\n  unfanned:\n");
+    assert_ne!(
+        edited, source,
+        "`fanned` is the trigger this copy renames out of the composition"
+    );
+    edited
+}
+
+/// The same fixture with `watched`'s allowlist narrowed to admit nothing a test
+/// receiver binds.
+fn fixture_with_a_narrower_allowlist() -> String {
+    let source = std::fs::read_to_string(harness::fixture("http-events")).expect("the fixture");
+    let edited = source.replace(
+        "      - \"http://127.0.0.1:*/allowed*\"",
+        "      - \"http://127.0.0.1:*/nowhere*\"",
+    );
+    assert_ne!(
+        edited, source,
+        "`watched`'s `callback_allow:` is what this copy narrows"
+    );
+    edited
+}
+
+/// Every delivery row one execution has, as the journal holds it.
+fn journaled_deliveries(project: &std::path::Path, execution: &str) -> Vec<Value> {
+    harness::journal_rows(
+        project,
+        &format!(
+            "SELECT ordinal, event, status, url, detail FROM deliveries \
+             WHERE execution = '{execution}' ORDER BY ordinal ASC"
+        ),
+    )
+    .as_array()
+    .expect("the query answers rows")
+    .clone()
+}
+
+/// A lifecycle event a build cannot deliver is **journaled** and finished by a
+/// build that can (`docs/durability.md` §3.7).
+///
+/// The document's promise about a delivery whose trigger the composition no
+/// longer declares is that "the row stays `pending` for a build that declares
+/// the trigger, and the reason is written on stderr" — which is a promise about
+/// a row, and so a promise that a row exists. A build that recorded nothing
+/// would make the event both unrecoverable and invisible: no start could find
+/// it, and the status route would show a parking nobody was ever told about.
+///
+/// Reaching it takes three processes, because a lifecycle row only names a
+/// trigger the build lacks after the composition has moved under it. The first
+/// is killed while its fan-out is still lingering, so the execution is open and
+/// has announced nothing; the second is the same composition with the trigger
+/// renamed, which recovers the execution, parks it, and has a webhook to make
+/// and no identity to make it under; the third is the original again, which
+/// finishes what the second wrote down.
+///
+/// What is asserted between them is the journal itself, because the second
+/// build refuses that execution's status route on purpose (grammar 13.3: the
+/// guard is the starting trigger's, and this build cannot read it) — which is
+/// exactly the position a reader debugging one would be in.
+#[test]
+fn a_delivery_journaled_without_its_trigger_is_finished_by_a_build_that_declares_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-moved-trigger");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-moved-trigger") else {
+        return;
+    };
+    let callback = format!("{}/anywhere", receiver.base_url);
+
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        // Long enough that the process is killed while the item is still
+        // lingering: the execution is open, and no pause has been announced.
+        let started = app
+            .send(
+                Request::post("/fanned")
+                    .json(&json!({
+                        "items": [{ "topic": "moved", "linger": "5" }],
+                        "callback_url": callback,
+                    }))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // The lifecycle row is on the disk before the process goes, so what the
+        // next build meets is an execution rather than nothing.
+        harness::until(Duration::from_secs(30), || {
+            harness::journal_holds(&project, &[&execution]).then_some(())
+        });
+        // …and it has announced nothing, which is what the linger buys: a
+        // parking this process delivered would leave the next build with a
+        // question already asked and nothing to journal.
+        assert!(
+            receiver.delivered().is_empty(),
+            "the process was killed before its fan-out parked: {:?}",
+            receiver.delivered()
+        );
+    }
+
+    let moved = harness::Scratch::new("moved-trigger");
+    let entrypoint = moved.path().join("main.yml");
+    std::fs::write(&entrypoint, fixture_without_the_fanned_trigger())
+        .expect("the scratch area is writable");
+
+    {
+        let Some(second) = harness::serve_entrypoint_into(&project, &entrypoint, &environment)
+        else {
+            return;
+        };
+        // The row this build writes and does not send. It is the only thing this
+        // process publishes about the execution — its status route refuses,
+        // because the trigger that guarded it is not here to say who may poll.
+        let pending = harness::until(Duration::from_secs(60), || {
+            let held = journaled_deliveries(&project, &execution);
+            (!held.is_empty()).then_some(held)
+        });
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0]["status"], "pending", "{pending:?}");
+        assert_eq!(pending[0]["event"], "parked", "{pending:?}");
+        assert_eq!(pending[0]["ordinal"], 0, "{pending:?}");
+        assert_eq!(pending[0]["url"], callback, "{pending:?}");
+        let refused = Client::new(&second.base_url).expect("a client for the generated app");
+        let polled = refused
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers");
+        assert_eq!(
+            polled.status,
+            401,
+            "an execution whose starting trigger this build cannot read is not one it \
+             answers about: {}",
+            polled.text()
+        );
+        // …and nothing was sent under an identity this build could not promise.
+        assert!(
+            receiver.of_event("parked").is_empty(),
+            "{:?}",
+            receiver.delivered()
+        );
+    }
+
+    // The composition is put back, and the row is finished under the delivery id
+    // the second build allocated for it.
+    let Some(third) = harness::serve_into(&project, "http-events", &environment) else {
+        return;
+    };
+    let delivered = receiver.wait_for_event("parked", 1, Duration::from_secs(60));
+    assert_eq!(
+        delivered[0].header("x-agentcompose-delivery"),
+        Some(format!("{execution}:0").as_str()),
+        "the row the build that could not send it wrote is the delivery that lands: {:?}",
+        delivered[0].headers
+    );
+    let finished = harness::until(Duration::from_secs(60), || {
+        let held = journaled_deliveries(&project, &execution);
+        (held.first().map(|row| row["status"] == "delivered") == Some(true)).then_some(held)
+    });
+    assert_eq!(finished.len(), 1, "one event, one row: {finished:?}");
+    drop(third);
+}
+
+/// A pending delivery the trigger's allowlist no longer admits is **refused**
+/// rather than sent (grammar 13.3, Decision D127, `docs/durability.md` §3.7).
+///
+/// `callback_allow:` is matched when the URL is read, and a row a restart picks
+/// up is a URL being read again — by a build whose list may not be the list the
+/// row was written under. The URL came out of a request payload and is
+/// attacker-controlled by construction, so a resumed delivery that skipped the
+/// match would POST it to a host the deployment has since said it may not reach,
+/// which is the one thing the allowlist exists to prevent.
+///
+/// The refusal is written **onto the row**, not opened as a second event: the
+/// ordinal counts an execution's lifecycle events, and the event did not happen
+/// twice.
+#[test]
+fn a_pending_delivery_the_allowlist_no_longer_admits_is_refused_rather_than_sent() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-narrowed-allowlist");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-narrowed-allowlist") else {
+        return;
+    };
+    // One attempt now and the next an hour away, so the row is still `pending`
+    // when the process goes — the shape the restart test uses for the same
+    // reason.
+    let mut environment = base.clone();
+    environment.push((harness::CALLBACK_RETRY.to_string(), "0s,1h".to_string()));
+    let callback = format!("{}/allowed", receiver.base_url);
+
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &environment) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .send(
+                Request::post("/watched")
+                    .json(&json!({ "topic": "narrowed", "callback_url": callback }))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // One attempt, refused by the receiver: the row is journaled, pending,
+        // and its next offset is an hour away.
+        receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+    }
+    let attempted = receiver.of_event("parked").len();
+
+    let narrowed = harness::Scratch::new("narrowed-allowlist");
+    let entrypoint = narrowed.path().join("main.yml");
+    std::fs::write(&entrypoint, fixture_with_a_narrower_allowlist())
+        .expect("the scratch area is writable");
+
+    let mut prompt = base;
+    prompt.push((harness::CALLBACK_RETRY.to_string(), "0s,0s".to_string()));
+    let Some(second) = harness::serve_entrypoint_into(&project, &entrypoint, &prompt) else {
+        return;
+    };
+    let refused = harness::until(Duration::from_secs(60), || {
+        let held = journaled_deliveries(&project, &execution);
+        (held.first().map(|row| row["status"] == "refused") == Some(true)).then_some(held)
+    });
+    assert_eq!(refused.len(), 1, "one event, one row: {refused:?}");
+    assert_eq!(refused[0]["ordinal"], 0, "{refused:?}");
+    assert!(
+        refused[0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("callback_allow"),
+        "…and it says why: {refused:?}"
+    );
+    // The schedule this process runs under would have re-attempted it at once,
+    // so a receiver that saw no more requests saw a delivery that was refused
+    // rather than one that is merely late.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        receiver.of_event("parked").len(),
+        attempted,
+        "nothing more was sent to a URL this build's allowlist admits nowhere: {:?}",
+        receiver.delivered()
+    );
+    drop(second);
 }

@@ -218,19 +218,21 @@ on its runtime effect is a documented no-op.
 | `triggers.<t>.type: schedule` | parsed + validated, no-op |
 | `triggers.<t>.type: event` | parsed + validated, no-op |
 | `network:` on a placement | parsed, no-op |
-| `triggers.<t>.auth` | parsed + validated, no-op — the route serves unauthenticated |
-| `triggers.<t>.callback_auth` | parsed + validated, no-op — deliveries carry no credential |
-| `triggers.<t>.callback_allow` | parsed + validated, no-op — no callback URL is refused |
-
-The last three are the rows worth reading twice. A no-op `placements` is visible
-in what a deployment is not; a no-op `auth:` serves every caller and looks
-exactly like a guarded route, so anything that needs the guarantee today keeps a
-gateway in front of the generated app — see `agent-compose docs triggers`.
 
 `human` nodes were on this list and have left it: the runtime landed, so a
 compiled project really pauses and resumes — and their durability has left it
 too: a wait that a restart interrupted comes back with its id intact, because
 the wait id is the node's instance path and the journal is what a resumed
 execution reads its answers out of.
+
+An `http` trigger's `auth:`, `callback_auth:` and `callback_allow:` have left it
+as well, and they were the rows worth reading twice while they were here: a
+no-op `placements` is visible in what a deployment is not, while a no-op `auth:`
+would serve every caller and look exactly like a guarded route. The generated
+app verifies callers, signs deliveries and refuses a callback URL outside the
+list — see `agent-compose docs triggers`. What that adds to a *target's* story
+is the credential list: those blocks' `${ENV}` references are in the manifest a
+built project checks at process start, so a deployment receiving only the
+secrets its own surfaces name receives these too.
 
 Normative source: `docs/durability.md`, `docs/grammar.md` §14, §14.1, §14.2, §14.3, §15

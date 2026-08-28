@@ -103,6 +103,22 @@
 // `serve` holds is already being replayed by it and is finished through
 // `POST /executions/:id/resume`; `agent-compose resume` is for an execution
 // **no live process is running** — the one a crashed `run` left behind.
+//
+// # The second ledger: callback deliveries
+//
+// Beside the effects there is one more thing an execution can leave unfinished,
+// and it is not an effect of the graph: the lifecycle webhooks an `http`
+// trigger's `callback:` asks for (grammar 13.3, PRD resolved q34, q35). A
+// delivery is journaled the way an effect is *durable* and not the way one is
+// *replayed*: its intent — execution, ordinal, event kind, resolved URL and the
+// exact body — is recorded **before** the first attempt, each attempt's outcome
+// is recorded after it, and a restarted `serve` picks up what is still pending
+// and finishes it under the same delivery id. It is not keyed by an instance
+// path, is never consumed by a replay, and never sits in the frontier: the
+// graph does not dispatch it, the *lifecycle* does. So it is a table of its own
+// beside `effects` rather than a fifth [`EffectKind`], and an older journal
+// meets it as a `CREATE TABLE IF NOT EXISTS` — which is what keeps
+// [`JOURNAL_VERSION`] where it is (`docs/durability.md` §3.7, §11.2).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -216,6 +232,104 @@ export interface JournalRecord {
   readonly recordedAt: string;
 }
 
+/**
+ * Which lifecycle event a callback delivery reports (grammar 13.3, PRD
+ * resolved q34).
+ *
+ * Two, and a receiver routes on them: a **parking** — a quiescence that opened
+ * pauses nothing has reported yet — and the **settle** that closes the
+ * execution's lifecycle row.
+ */
+export type DeliveryEvent = "parked" | "settled";
+
+/**
+ * Where one delivery stands.
+ *
+ *  * `pending` — the intent is recorded and the schedule has attempts left.
+ *  * `delivered` — a receiver answered `2xx`.
+ *  * `refused` — the callback URL matched no `callback_allow` entry, so nothing
+ *    was ever sent. Recorded rather than raised: resolved q33 makes it "a
+ *    refused delivery rather than anybody's failure", so it is never retried
+ *    and never the execution's outcome (grammar 13.3, Decision D127).
+ *  * `exhausted` — the bounded schedule ran out. Recorded for the same reason:
+ *    a webhook is a courtesy the status route backstops (resolved q35).
+ */
+export type DeliveryStatus = "pending" | "delivered" | "refused" | "exhausted";
+
+/** What one attempt at a delivery did. */
+export interface DeliveryAttempt {
+  /** When it was made, as an ISO 8601 instant. */
+  readonly at: string;
+  readonly outcome: "delivered" | "failed";
+  /** The status the receiver answered, or the transport error. */
+  readonly detail?: string;
+}
+
+/**
+ * What a delivery is *of*, before it has an ordinal or a record.
+ *
+ * The body is the bytes rather than a value, because every attempt POSTs the
+ * same bytes: a signature is over what is sent, so a delivery re-serialized on
+ * a later attempt — or in a later process — would be a second delivery wearing
+ * the first one's id.
+ */
+export interface DeliveryIntent {
+  readonly execution: string;
+  /**
+   * The trigger whose `callback_auth:` signs this delivery and whose
+   * `callback_allow:` admits its URL (grammar 13.3).
+   *
+   * Recorded **on the delivery** rather than read off the execution's lifecycle
+   * row, because there is one delivery whose execution has no lifecycle row: a
+   * `settled` intent journaled for a run that failed before it was journaled at
+   * all (`docs/durability.md` §3.7). A start that could not name that row's
+   * trigger could neither deliver it nor end it, so it would be read, logged and
+   * skipped at every start for the life of the journal — and `pending` is
+   * neither of the two ends §3.7 gives a delivery.
+   *
+   * Absent only on a row written before this field was, where the lifecycle row
+   * is what names it.
+   */
+  readonly trigger?: string;
+  readonly event: DeliveryEvent;
+  readonly url: string;
+  readonly body: string;
+  /**
+   * The pauses a `parked` delivery reported, by wait id; empty on a `settled`
+   * one.
+   *
+   * Recorded because it is what a *later* generation needs: a recovered
+   * execution re-parks under the same wait ids (`docs/durability.md` §6.1), and
+   * re-firing a parking webhook for pauses a delivery already reported would
+   * tell a receiver a question was asked twice when nothing new was asked
+   * (PRD resolved q35).
+   */
+  readonly pauses: readonly string[];
+}
+
+/** One callback delivery, as the journal holds it (`docs/durability.md` §3.7). */
+export interface DeliveryRecord extends DeliveryIntent {
+  /**
+   * The event ordinal, monotonically increasing per execution across both
+   * kinds and allocated durably, so a restart cannot reuse one (resolved q35).
+   */
+  readonly ordinal: number;
+  /**
+   * `<execution_id>:<ordinal>` — the `X-AgentCompose-Delivery` header, and what
+   * a receiver dedupes on. The same on every attempt of one delivery.
+   */
+  readonly id: string;
+  readonly status: DeliveryStatus;
+  /** Every attempt so far, oldest first. */
+  readonly attempts: readonly DeliveryAttempt[];
+  /** When the intent was recorded — what the retry schedule is measured from. */
+  readonly intendedAt: string;
+  /** When it stopped being `pending`; absent while it still is. */
+  readonly settledAt?: string;
+  /** Why it was refused, or what the last attempt said. */
+  readonly detail?: string;
+}
+
 /** How an execution ended, or that it has not. */
 export type ExecutionStatus = "open" | "completed" | "failed";
 
@@ -291,6 +405,72 @@ export interface Journal {
    * [`JournalRecord.refused`]. Idempotent, and a no-op for a key nothing wrote.
    */
   refuse(execution: string, key: string): void;
+  /**
+   * Record the intent to deliver one lifecycle webhook, **before** the first
+   * attempt, allocating this execution's next event ordinal (resolved q35).
+   *
+   * Before, because that is what makes the delivery at-least-once rather than
+   * at-most-once: a process that dies mid-attempt leaves a row a later start
+   * finishes, under the id the receiver dedupes on.
+   */
+  intendDelivery(intent: DeliveryIntent): DeliveryRecord;
+  /**
+   * Record a delivery the allowlist refused, which is one nothing was ever sent
+   * for (grammar 13.3, Decision D127).
+   *
+   * It takes an ordinal like any other delivery: the ordinal counts an
+   * execution's lifecycle *events*, and this event happened — the receiver
+   * simply was not one this deployment may deliver to.
+   */
+  refuseDelivery(intent: DeliveryIntent, reason: string): DeliveryRecord;
+  /**
+   * Refuse a delivery this journal already holds **pending**, without an
+   * attempt.
+   *
+   * The one row that reaches this is the one a build with no declaration of the
+   * execution's trigger recorded and could not match: the allowlist belongs to
+   * that trigger, so the URL is held against it by the first build that has it
+   * (`docs/durability.md` §3.7). A row already delivered, refused or exhausted
+   * is left as it is — an outcome is not overwritten by a later reading of it.
+   */
+  refuseRecorded(execution: string, ordinal: number, reason: string): void;
+  /**
+   * End a delivery this journal already holds **pending** whose schedule has
+   * nothing left in it, without an attempt.
+   *
+   * The row that reaches this is one whose recorded attempts already number as
+   * many as the schedule this process runs under has offsets — a restart under a
+   * shorter `AGENT_COMPOSE_CALLBACK_RETRY` than the one that wrote it. There is
+   * no offset to wait for and so no attempt to record, and `docs/durability.md`
+   * §3.7 gives a delivery two ends and no third: a row left `pending` would be a
+   * webhook the status route reports as owed for ever. Idempotent, and it leaves
+   * an outcome another process wrote exactly as it is.
+   */
+  exhaustRecorded(execution: string, ordinal: number, reason: string): void;
+  /**
+   * Record what one attempt did, and where the delivery stands after it.
+   *
+   * A row that is no longer `pending` is left exactly as it is, for the reason
+   * the two above are: a delivery has one outcome, and an attempt landing after
+   * it would write `pending` back over a row a receiver has already taken —
+   * which the next start would read as a webhook it still owes.
+   */
+  recordAttempt(
+    execution: string,
+    ordinal: number,
+    attempt: DeliveryAttempt,
+    status: DeliveryStatus,
+  ): void;
+  /** Every delivery of one execution, by ordinal. */
+  deliveries(execution: string): readonly DeliveryRecord[];
+  /**
+   * Every delivery still owed an attempt, oldest intent first.
+   *
+   * What a restarted `serve` picks up beside the executions it recovers
+   * (`docs/durability.md` §6.1): a delivery is an unfinished effect of its own,
+   * and the execution it reports on may have ended in the process that died.
+   */
+  undelivered(): readonly DeliveryRecord[];
 }
 
 // ---------------------------------------------------------------------------
@@ -346,8 +526,24 @@ CREATE TABLE IF NOT EXISTS effects (
   recorded_at TEXT NOT NULL,
   PRIMARY KEY (execution, key)
 );
+CREATE TABLE IF NOT EXISTS deliveries (
+  execution    TEXT NOT NULL,
+  ordinal      INTEGER NOT NULL,
+  trigger_kind TEXT,
+  event        TEXT NOT NULL,
+  url          TEXT NOT NULL,
+  body         TEXT NOT NULL,
+  pauses       TEXT NOT NULL,
+  status       TEXT NOT NULL,
+  attempts     TEXT NOT NULL,
+  intended_at  TEXT NOT NULL,
+  settled_at   TEXT,
+  detail       TEXT,
+  PRIMARY KEY (execution, ordinal)
+);
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
+CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_at);
 `;
 
 /** The journal as a SQLite file — the only backend `--target local` binds. */
@@ -457,6 +653,163 @@ class SqliteJournal implements Journal {
       key,
     ]);
   }
+
+  intendDelivery(intent: DeliveryIntent): DeliveryRecord {
+    return this.#openDelivery(intent, "pending", undefined);
+  }
+
+  refuseDelivery(intent: DeliveryIntent, reason: string): DeliveryRecord {
+    return this.#openDelivery(intent, "refused", reason);
+  }
+
+  /**
+   * Allocate this execution's next event ordinal and write the row.
+   *
+   * The read and the write are two statements and are still atomic where it
+   * matters, for the reason the module header gives: every statement here is
+   * synchronous, so nothing else in this process runs between them, and **one
+   * process at a time writes a project's journal**. A `MAX(ordinal)` taken in
+   * the same synchronous step the row is written in is therefore a number no
+   * other writer can be holding.
+   */
+  #openDelivery(
+    intent: DeliveryIntent,
+    status: DeliveryStatus,
+    detail: string | undefined,
+  ): DeliveryRecord {
+    const found = this.#database.get(
+      "SELECT COALESCE(MAX(ordinal), -1) + 1 AS next FROM deliveries WHERE execution = ?",
+      [intent.execution],
+    ) as Row | null;
+    const ordinal = Number((found?.["next"] as number | undefined) ?? 0);
+    const at = new Date().toISOString();
+    const record: DeliveryRecord = {
+      ...intent,
+      ordinal,
+      id: `${intent.execution}:${ordinal}`,
+      status,
+      attempts: [],
+      intendedAt: at,
+      ...(status === "pending" ? {} : { settledAt: at }),
+      ...(detail === undefined ? {} : { detail }),
+    };
+    this.#database.run(
+      `INSERT INTO deliveries
+         (execution, ordinal, trigger_kind, event, url, body, pauses, status, attempts, intended_at, settled_at, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        record.execution,
+        record.ordinal,
+        record.trigger ?? null,
+        record.event,
+        record.url,
+        record.body,
+        JSON.stringify(record.pauses),
+        record.status,
+        "[]",
+        record.intendedAt,
+        record.settledAt ?? null,
+        detail ?? null,
+      ],
+    );
+    return record;
+  }
+
+  refuseRecorded(execution: string, ordinal: number, reason: string): void {
+    // `status = 'pending'` in the predicate rather than read first: a row that
+    // has already been delivered, refused or exhausted has an outcome, and one
+    // statement that will not touch it is better than two that could race.
+    this.#database.run(
+      "UPDATE deliveries SET status = 'refused', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
+      [new Date().toISOString(), reason, execution, ordinal],
+    );
+  }
+
+  exhaustRecorded(execution: string, ordinal: number, reason: string): void {
+    // The sibling above's statement with the other of §3.7's two ends in it,
+    // and the same predicate for the same reason: `attempts` is left alone,
+    // because this row's end is that there was no attempt left to make.
+    this.#database.run(
+      "UPDATE deliveries SET status = 'exhausted', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
+      [new Date().toISOString(), reason, execution, ordinal],
+    );
+  }
+
+  recordAttempt(
+    execution: string,
+    ordinal: number,
+    attempt: DeliveryAttempt,
+    status: DeliveryStatus,
+  ): void {
+    const held = this.#database.get(
+      "SELECT attempts, status FROM deliveries WHERE execution = ? AND ordinal = ?",
+      [execution, ordinal],
+    ) as Row | null;
+    // **A row that already has an outcome is not reopened by a late attempt**,
+    // which is the predicate the two statements above carry and this one needs
+    // for the same reason: an attempt recorded against a `delivered` row would
+    // write `pending` back over it, and the next start would read a webhook the
+    // receiver already took as one it still owes — past the bounded number of
+    // attempts `docs/durability.md` §3.7 promises.
+    if (held === null || held["status"] !== "pending") return;
+    const attempts = [...(JSON.parse(String(held["attempts"])) as DeliveryAttempt[]), attempt];
+    // The read and the write are one synchronous step (see [`#openDelivery`]),
+    // so the predicate repeats what the guard above decided rather than closing
+    // a window between them — and it is what a second writer would meet.
+    this.#database.run(
+      "UPDATE deliveries SET attempts = ?, status = ?, settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
+      [
+        JSON.stringify(attempts),
+        status,
+        status === "pending" ? null : new Date().toISOString(),
+        attempt.detail ?? null,
+        execution,
+        ordinal,
+      ],
+    );
+  }
+
+  deliveries(execution: string): readonly DeliveryRecord[] {
+    const rows = this.#database.all(
+      "SELECT * FROM deliveries WHERE execution = ? ORDER BY ordinal ASC",
+      [execution],
+    ) as Row[];
+    return rows.map((row) => deliveryOf(row));
+  }
+
+  undelivered(): readonly DeliveryRecord[] {
+    const rows = this.#database.all(
+      "SELECT * FROM deliveries WHERE status = 'pending' ORDER BY intended_at ASC, execution ASC, ordinal ASC",
+    ) as Row[];
+    return rows.map((row) => deliveryOf(row));
+  }
+}
+
+/** One `deliveries` row, as this module reads it. */
+function deliveryOf(row: Row): DeliveryRecord {
+  const settledAt = row["settled_at"];
+  const detail = row["detail"];
+  const trigger = row["trigger_kind"];
+  const execution = String(row["execution"]);
+  const ordinal = Number(row["ordinal"]);
+  return {
+    execution,
+    ordinal,
+    id: `${execution}:${ordinal}`,
+    // A row written before the ledger recorded it answers nothing here, and the
+    // lifecycle row is what names such a delivery's trigger (see
+    // [`DeliveryIntent.trigger`]).
+    ...(trigger === null || trigger === undefined ? {} : { trigger: String(trigger) }),
+    event: String(row["event"]) as DeliveryEvent,
+    url: String(row["url"]),
+    body: String(row["body"]),
+    pauses: JSON.parse(String(row["pauses"])) as string[],
+    status: String(row["status"]) as DeliveryStatus,
+    attempts: JSON.parse(String(row["attempts"])) as DeliveryAttempt[],
+    intendedAt: String(row["intended_at"]),
+    ...(settledAt === null || settledAt === undefined ? {} : { settledAt: String(settledAt) }),
+    ...(detail === null || detail === undefined ? {} : { detail: String(detail) }),
+  };
 }
 
 /** One error outcome, read back off its stored payload. */
@@ -598,6 +951,20 @@ async function migrated(
       if (!effects.some((column) => column["name"] === "refused")) {
         database.exec("ALTER TABLE effects ADD COLUMN refused INTEGER NOT NULL DEFAULT 0;");
       }
+      // The delivery's own trigger, added to the ledger after it: nullable
+      // because a row written before it cannot be backfilled — nothing in the
+      // file says what trigger that delivery was for — and a row that answers
+      // `null` is read off the lifecycle row instead (see
+      // [`DeliveryIntent.trigger`]).
+      const deliveries = database.all("PRAGMA table_info(deliveries)") as Row[];
+      if (!deliveries.some((column) => column["name"] === "trigger_kind")) {
+        database.exec("ALTER TABLE deliveries ADD COLUMN trigger_kind TEXT;");
+      }
+      // A whole *table* the schema grew needs no probe of its own: `CREATE
+      // TABLE IF NOT EXISTS` above created `deliveries` in a file written
+      // before it existed, and an execution open in such a file has no delivery
+      // rows — which is exactly right, because the build that wrote it made no
+      // lifecycle deliveries to record (see the module header).
       return database;
       // A write-ahead log is deliberately **not** asked for. This driver's
       // virtual file system does not implement one — `PRAGMA journal_mode =

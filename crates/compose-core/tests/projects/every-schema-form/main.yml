@@ -17,6 +17,9 @@
 # spelling only `tsc` or a real request would notice. The second agent is one of
 # those: it exists so a `map` can dispatch to an agent that carries an attached
 # flow, which is the one node shape whose entry holds both dispatch carriers.
+# The `triggers:` block at the foot is another: the authenticated `http` surface
+# of grammar 13.3, whose emitted table is a type declaration in every other
+# golden and a populated value here.
 version: "0.1"
 
 state:
@@ -408,3 +411,54 @@ flow.shape:
     - { from: notify, to: recall }
     - { from: recall, to: spread }
     - { from: spread, to: end }
+
+# The trigger surface of grammar 13.3, in the two spellings that make its
+# emitted table more than a type declaration.
+#
+# Every other project in the golden corpus declares an `http` trigger with no
+# `auth:`, `callback_auth:` or `callback_allow:`, so `src/triggers.ts` carries
+# the `InboundAuth` and `CallbackAuth` **types** and nothing that populates
+# them — and `tsc` type-checks a declaration nobody wrote a value for. The two
+# below are the values: an inbound `bearer` and an inbound `hmac` (the union's
+# two arms, which the emitter spells with different keys), an outbound block
+# carrying *both* schemes at once, and the allowlist that block makes mandatory.
+triggers:
+  signed_in:
+    type: http
+    flow: flow.shape
+    method: POST
+    path: /shape
+    respond: async
+    input:
+      goal: "payload.body.goal"
+      goals: "payload.body.goals"
+    callback: "payload.body.callback_url"
+    auth:
+      bearer:
+        token: ${SHAPE_TOKEN}
+    callback_auth:
+      bearer:
+        token: ${SHAPE_CALLBACK_TOKEN}
+        header: X-Delivery-Token
+        prefix: "Token "
+      hmac:
+        secret: ${SHAPE_CALLBACK_SECRET}
+    callback_allow:
+      - "https://hooks.example.com/*"
+
+  vendor_signed:
+    type: http
+    flow: flow.shape
+    method: POST
+    path: /shape/hook
+    respond: async
+    input:
+      goal: "payload.body.goal"
+      goals: "payload.body.goals"
+    auth:
+      hmac:
+        secret: ${SHAPE_SECRET}
+        header: X-Hub-Signature-256
+        algorithm: sha256
+        encoding: hex
+        prefix: "sha256="

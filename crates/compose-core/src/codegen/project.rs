@@ -394,14 +394,31 @@ cannot declare either: the compiler refuses one that does. On start it
 **recovers** every execution the journal holds open, before it accepts a
 connection, so a pause comes back under the same wait id and a resume URL
 prepared against the process that died still finds it; triggers are not
-re-fired, and a recovered execution that finishes delivers the `callback:`
-webhook its request asked for, because the caller who was handed a `202` is
-waiting to be told rather than polling. What is still tracked in the process
+re-fired, and a recovered execution that finishes delivers the `settled` webhook
+its request asked for, because the caller who was handed a `202` is waiting to
+be told rather than polling. Every callback delivery the journal still holds
+pending is picked up in the same pass. What is still tracked in the process
 alone is the *report*: a status
 route answers `404` for an id neither this process nor the journal knows, and
 every execution it has finished, with its outputs and its trace, is held for the
 life of the process — so a long-running `serve` grows with the number of
 requests it has answered, and restarting it is what reclaims that.
+
+**Who may call, and who a delivery says it is.** A trigger declaring `auth:`
+verifies its caller before it reads a payload, and the execution it starts
+carries that guard: its `GET /executions/:id` and `POST /executions/:id/resume`
+enforce the auth of the trigger that started it, in this process and in the one
+that recovers it after a restart. An execution a trigger with no `auth:` began
+keeps open routes. A trigger's `callback:` is a subscription to the execution's
+**lifecycle** rather than only to its end: one webhook per parking, listing every
+pause then open, and one when the execution settles, each carrying the report
+the status route serves under the `X-AgentCompose-*` headers the grammar
+tabulates. Deliveries are journaled and at-least-once — dedupe on
+`X-AgentCompose-Delivery`, order by `X-AgentCompose-Ordinal` — and a delivery
+that exhausts its bounded retry schedule is recorded and shown on the status
+route rather than failing the run. `AGENT_COMPOSE_CALLBACK_RETRY` shortens that
+schedule for a diagnostic run: a comma-separated list of durations
+(`0s,1s,2s`), refused at launch if it is not one.
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app and exits, so a supervisor that signals

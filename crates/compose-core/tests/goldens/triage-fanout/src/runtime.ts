@@ -93,7 +93,15 @@ import {
   refuseRecorded,
   replayedFailure,
 } from "./journal.ts";
-import type { EffectRecorder, ExecutionRow, Journal } from "./journal.ts";
+import type {
+  DeliveryAttempt,
+  DeliveryIntent,
+  DeliveryRecord,
+  DeliveryStatus,
+  EffectRecorder,
+  ExecutionRow,
+  Journal,
+} from "./journal.ts";
 
 export {
   JOURNAL_VERSION,
@@ -104,7 +112,17 @@ export {
   latchedDivergence,
   openJournal,
 } from "./journal.ts";
-export type { EffectKind, ExecutionRow, Journal, JournalRecord } from "./journal.ts";
+export type {
+  DeliveryAttempt,
+  DeliveryEvent,
+  DeliveryIntent,
+  DeliveryRecord,
+  DeliveryStatus,
+  EffectKind,
+  ExecutionRow,
+  Journal,
+  JournalRecord,
+} from "./journal.ts";
 
 // ---------------------------------------------------------------------------
 // Failures
@@ -985,6 +1003,10 @@ export async function runActivity<T>(
   // second attempt's model call is a second record rather than a collision with
   // the first attempt's (`docs/durability.md` §4).
   const effects = recorderFor(execution.id, site);
+  // What this node execution is, to a reader asking whether the execution has
+  // stopped advancing: one unit of concurrent work, in flight until the
+  // `finally` below (PRD resolved q34, and see [`quiescent`]).
+  const busy = working(execution.id, site);
 
   try {
     let last: unknown;
@@ -1108,6 +1130,10 @@ export async function runActivity<T>(
     // tick a pause was opening: every other way one node execution ends is one
     // where the instance below it had already finished.
     abandonPausesUnder(execution.id, site);
+    // …and the work is no longer in flight, which is announced **after** the
+    // pauses are abandoned so that a reader woken by it sees the board this
+    // node execution left rather than the one it was holding.
+    busy();
   }
 }
 
@@ -6324,25 +6350,39 @@ export async function runMap(
         modelCalls: undefined,
         toolDispatches: undefined,
       };
+      // And off the **quiescence** reading, which is the same statement about a
+      // third reader. A `flow.*` sink runs its own nodes under this execution's
+      // id, so a parking webhook that waited for them would wait for exactly the
+      // work rule 7 says nothing waits for — a subscriber told about a pause it
+      // could have answered when the delivery finally released (see
+      // [`inFlight`], [`quiescent`], and `src/serve.ts`'s `parking`). The mark
+      // goes down before the delivery is issued, so a sink that reaches its first
+      // node in this tick is already inside it, and comes off however the
+      // delivery ends — including before `route.run` is reached.
+      const undetach = detaching(scoped.execution.id, site.path.join("/"));
       const delivering = (async () => {
-        // `max_concurrency` is an **admission** bound over every in-flight
-        // dispatch, detached included (grammar 8.6's key table, D28): a detached
-        // delivery waits for a node permit to *start*, exactly as a joined
-        // instance does. It waits for it **behind the join**, though — rule 7's
-        // "nothing it does can delay the enclosing flow instance" is a statement
-        // about the permit queue as much as about the outcome. Both gates are
-        // taken after the barrier and as a `"detached"` waiter, so a joined
-        // instance of this call never queues behind this delivery and a later
-        // execution of this node never queues behind it either.
-        await joinedAdmitted;
-        await gate.acquire("detached");
-        await node.acquire("detached");
         try {
-          await route.run(instance.input, delivery, site);
+          // `max_concurrency` is an **admission** bound over every in-flight
+          // dispatch, detached included (grammar 8.6's key table, D28): a
+          // detached delivery waits for a node permit to *start*, exactly as a
+          // joined instance does. It waits for it **behind the join**, though —
+          // rule 7's "nothing it does can delay the enclosing flow instance" is
+          // a statement about the permit queue as much as about the outcome.
+          // Both gates are taken after the barrier and as a `"detached"` waiter,
+          // so a joined instance of this call never queues behind this delivery
+          // and a later execution of this node never queues behind it either.
+          await joinedAdmitted;
+          await gate.acquire("detached");
+          await node.acquire("detached");
+          try {
+            await route.run(instance.input, delivery, site);
+          } finally {
+            node.release();
+            gate.release();
+            retire(plan.admission, admission);
+          }
         } finally {
-          node.release();
-          gate.release();
-          retire(plan.admission, admission);
+          undetach();
         }
       })().catch((error: unknown) => {
         // Nothing it does can fail the enclosing flow instance, which is what an
@@ -6606,43 +6646,59 @@ async function attemptItem(
   // the item reached once describes a run that did not happen.
   let made = 0;
   let last: unknown;
-  for (let attempt = 1; attempt <= allowed; attempt += 1) {
-    made = attempt;
-    try {
-      return { value: await instance.route.run(instance.input, context, instance.site), attempts: attempt };
-    } catch (error) {
-      last = error;
-      // The rule [`runActivity`]'s ladder follows, for the ladder rule 10 gives
-      // an item: a pause this run has no way to answer is not something the
-      // instance did wrong, and re-executing it would repeat every effect it
-      // issued on the way to asking a question that still cannot be delivered.
-      if (interruptOf(error) !== undefined) throw new ItemAttempts(made, error);
-      // And the same rule for a pause this instance is no longer being waited
-      // on for: re-executing it would re-open the pause under a node that has
-      // stopped waiting, on top of repeating every effect the instance issued.
-      if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
-      // And a journal that does not describe this run, for [`runActivity`]'s
-      // reason: a second attempt would walk the next recorded effect forward and
-      // report a disagreement one step past the one that really happened.
-      if (divergenceOf(error) !== undefined) throw new ItemAttempts(made, error);
-      if (attempt === allowed) break;
-      // And the rule [`runActivity`]'s ladder follows between its attempts, for
-      // the same reason and at the same seam: this attempt is over, the next one
-      // re-executes the instance at **this very site**, and a pause a settled
-      // branch of the failed attempt left open would share its id with the pause
-      // the next attempt opens there. Two waits at one id settle each other (see
-      // [`abandonPausesUnder`]). The pause the *last* attempt leaves is the node
-      // execution's to abandon, which `runActivity`'s `finally` does for every
-      // instance this fan-out dispatched.
-      abandonPausesUnder(context.execution.id, instance.site.path.join("/"));
+  // The instance is a unit of concurrent work in its own right, and the one the
+  // map node's own registration cannot stand in for: this instance runs a graph
+  // of its own and advances while a sibling instance is parked, so an execution
+  // is quiescent only once every one of them has parked or finished (PRD
+  // resolved q34, and see [`quiescent`]). Held across the whole ladder rather
+  // than per attempt, because between two attempts the item is still work this
+  // execution is doing.
+  const busy = working(context.execution.id, instance.site.path.join("/"));
+  try {
+    for (let attempt = 1; attempt <= allowed; attempt += 1) {
+      made = attempt;
       try {
-        await sleep(backoffFor(retry!, attempt), context.signal);
-      } catch {
-        break;
+        return {
+          value: await instance.route.run(instance.input, context, instance.site),
+          attempts: attempt,
+        };
+      } catch (error) {
+        last = error;
+        // The rule [`runActivity`]'s ladder follows, for the ladder rule 10
+        // gives an item: a pause this run has no way to answer is not something
+        // the instance did wrong, and re-executing it would repeat every effect
+        // it issued on the way to asking a question that still cannot be
+        // delivered.
+        if (interruptOf(error) !== undefined) throw new ItemAttempts(made, error);
+        // And the same rule for a pause this instance is no longer being waited
+        // on for: re-executing it would re-open the pause under a node that has
+        // stopped waiting, on top of repeating every effect the instance issued.
+        if (abandonedOf(error) !== undefined) throw new ItemAttempts(made, error);
+        // And a journal that does not describe this run, for [`runActivity`]'s
+        // reason: a second attempt would walk the next recorded effect forward
+        // and report a disagreement one step past the one that really happened.
+        if (divergenceOf(error) !== undefined) throw new ItemAttempts(made, error);
+        if (attempt === allowed) break;
+        // And the rule [`runActivity`]'s ladder follows between its attempts,
+        // for the same reason and at the same seam: this attempt is over, the
+        // next one re-executes the instance at **this very site**, and a pause a
+        // settled branch of the failed attempt left open would share its id with
+        // the pause the next attempt opens there. Two waits at one id settle
+        // each other (see [`abandonPausesUnder`]). The pause the *last* attempt
+        // leaves is the node execution's to abandon, which `runActivity`'s
+        // `finally` does for every instance this fan-out dispatched.
+        abandonPausesUnder(context.execution.id, instance.site.path.join("/"));
+        try {
+          await sleep(backoffFor(retry!, attempt), context.signal);
+        } catch {
+          break;
+        }
       }
     }
+    throw new ItemAttempts(made, last);
+  } finally {
+    busy();
   }
-  throw new ItemAttempts(made, last);
 }
 
 /**
@@ -7147,6 +7203,197 @@ export function watchHumanPauses(execution: string, listener: () => void): () =>
     // has answered many runs is not left holding one per execution id.
     if (held.size === 0 && humanWatchers.get(execution) === held) {
       humanWatchers.delete(execution);
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Quiescence (PRD resolved q34)
+// ---------------------------------------------------------------------------
+
+/**
+ * The concurrent work each execution has in flight, by the site running it.
+ *
+ * One entry per unit of work that can reach a `human` node **on its own** —
+ * which is a node execution ([`runActivity`]) and a dispatched `map` instance
+ * ([`attemptItem`]), and nothing else. Those two are the only places this
+ * runtime forks: an instance dispatched by a `map` runs its own graph inside
+ * the map node's task (`src/graph.ts`'s
+ * `a-dispatch-runs-inside-the-map-nodes-task`), so the map node's site alone
+ * could not say whether item 2 was still working while item 1 was parked. A
+ * subflow a `flow:` node or an agent's `tools:` instantiates is one per node
+ * execution and needs no entry of its own — the node's does for it.
+ *
+ * A **detached** dispatch is absent (grammar 8.6 rule 7), and keeping it absent
+ * takes bookkeeping rather than silence. Nothing waits for a delivery and
+ * Decision D118 refuses a `human` node under one, so it can open no pause — but
+ * its *sink* is a graph like any other: a `flow.*` reached that way runs its
+ * nodes under this execution's id ([`runSubflow`] is handed `site.execution`),
+ * and every one of them would register here. Counting them would hold a parking
+ * webhook back for the whole of work the flow instance itself does not wait for
+ * — a `map` with `detach: true` to a flow whose `http:` node carries a
+ * thirty-minute budget would keep a subscriber from being told about a pause it
+ * could answer at once, which is rule 7's "nothing it does can delay the
+ * enclosing flow instance" broken at the one surface that reads this map.
+ * [`detaching`] marks the delivery's whole subtree and [`working`] reads the
+ * mark.
+ */
+const inFlight = new Map<string, Map<string, number>>();
+
+/** Who is told when one execution's in-flight work changes. See [`quiescent`]. */
+const quietWatchers = new Map<string, Set<() => void>>();
+
+/**
+ * Every **detached** dispatch in flight, by the instance path its sink runs
+ * under.
+ *
+ * A delivery's work is named the way a pause is (grammar 9.4): the dispatch's
+ * instance path is a prefix of every site inside its sink — the nodes of a
+ * `flow.*` it instantiates, and the subflows an `agent.*` reached that way calls
+ * from its `tools:`. So one entry answers for a whole subtree, and nothing has
+ * to be threaded across a boundary that rebuilds its context from `$run`.
+ *
+ * Counted for [`working`]'s reason and one of its own: a node `retry:` that
+ * re-executes a `map` issues the next attempt's deliveries at the very paths the
+ * failed attempt's are still being delivered at, and nothing cancels those.
+ */
+const detachedSites = new Map<string, Map<string, number>>();
+
+/**
+ * Mark everything under one instance path as a detached dispatch's work for as
+ * long as the delivery runs, and answer its release.
+ *
+ * Called by [`runMap`] before the delivery is issued, so a sink that reaches its
+ * first node in the same tick is already inside the mark.
+ */
+function detaching(execution: string, site: string): () => void {
+  let sites = detachedSites.get(execution);
+  if (sites === undefined) {
+    sites = new Map();
+    detachedSites.set(execution, sites);
+  }
+  const held = sites;
+  held.set(site, (held.get(site) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const count = (held.get(site) ?? 0) - 1;
+    if (count > 0) held.set(site, count);
+    else held.delete(site);
+    if (held.size === 0 && detachedSites.get(execution) === held) detachedSites.delete(execution);
+  };
+}
+
+/** Whether `site` is at, or inside, a detached dispatch. See [`detaching`]. */
+function detachedWork(execution: string, site: string): boolean {
+  const sites = detachedSites.get(execution);
+  if (sites === undefined) return false;
+  for (const root of sites.keys()) {
+    if (under(site, root)) return true;
+  }
+  return false;
+}
+
+/**
+ * Note one unit of concurrent work for as long as it runs, and answer its
+ * release.
+ *
+ * Counted rather than held as a set, because one site runs more than once in
+ * sequence — both retry ladders re-execute an instance at the site its
+ * predecessor ran at ([`runActivity`], [`attemptItem`]) — and a release that
+ * deleted the entry would drop a live registration if the two ever overlapped.
+ *
+ * Work inside a **detached** dispatch registers nothing at all: it is not work
+ * the enclosing instance is waiting for, and a quiescence that waited for it
+ * would be waiting for the one thing grammar 8.6 rule 7 says nothing waits for
+ * (see [`inFlight`]). The release such a caller is handed does nothing, because
+ * there is nothing to release and no reader whose answer its finishing changes.
+ */
+function working(execution: string, site: string): () => void {
+  if (detachedWork(execution, site)) return () => {};
+  let sites = inFlight.get(execution);
+  if (sites === undefined) {
+    sites = new Map();
+    inFlight.set(execution, sites);
+  }
+  const held = sites;
+  held.set(site, (held.get(site) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const count = (held.get(site) ?? 0) - 1;
+    if (count > 0) held.set(site, count);
+    else held.delete(site);
+    if (held.size === 0 && inFlight.get(execution) === held) inFlight.delete(execution);
+    const watchers = quietWatchers.get(execution);
+    if (watchers === undefined) return;
+    for (const watcher of [...watchers]) watcher();
+  };
+}
+
+/**
+ * Whether `execution` has stopped advancing on its own — every unit of work it
+ * is running is waiting on a human (PRD resolved q34).
+ *
+ * This is what "one webhook per **parking**" is decided by, and the reason it
+ * cannot be decided by a timer: a `map` over a flow with `human` nodes opens N
+ * pauses in one quiescence, and the item that opens the first may be a hundred
+ * milliseconds ahead of the item that opens the third. A debounce would deliver
+ * one webhook per item; this waits for the last of them.
+ *
+ * What makes the reading safe *between* two nodes of one branch is LangGraph's
+ * own superstep barrier: a step's tasks all run to completion before the next
+ * step is scheduled, so while any task is parked no sibling task can start a
+ * node — and a branch with nothing in flight is a branch that cannot open a
+ * pause until somebody answers one. What is **not** covered by that barrier is
+ * a dispatched instance, which runs a graph of its own inside the map node's
+ * task and advances while a sibling instance is parked; that is exactly why
+ * [`inFlight`] holds an entry per instance as well as per node execution.
+ *
+ * What the reading is **about** is the work the flow instance waits for, so a
+ * detached dispatch and everything under it is outside it: an execution whose
+ * only unparked work is a delivery has stopped advancing on its own, whatever
+ * that delivery is still doing (grammar 8.6 rule 7, and see [`detaching`]).
+ *
+ * An execution with nothing in flight is quiescent, which is the answer a run
+ * that has ended needs: nothing more will open.
+ */
+export function quiescent(execution: string): boolean {
+  const sites = inFlight.get(execution);
+  if (sites === undefined) return true;
+  for (const site of sites.keys()) {
+    if (pausesUnder(execution, site) === 0) return false;
+  }
+  return true;
+}
+
+/**
+ * Be told whenever one of `execution`'s units of work finishes; answers the
+ * unsubscribe.
+ *
+ * The companion of [`watchHumanPauses`] and the half it cannot supply: the last
+ * unparked branch of a quiescence **ends** rather than opening a pause, so the
+ * moment an execution becomes quiescent is a moment no pause event announces.
+ * Both are subscribed to by the one reader that decides a parking webhook
+ * (`src/serve.ts`).
+ */
+export function watchQuiescence(execution: string, listener: () => void): () => void {
+  let watchers = quietWatchers.get(execution);
+  if (watchers === undefined) {
+    watchers = new Set();
+    quietWatchers.set(execution, watchers);
+  }
+  const held = watchers;
+  held.add(listener);
+  return () => {
+    held.delete(listener);
+    // The empty set goes with the last subscriber, for [`watchHumanPauses`]'s
+    // reason: a `serve` that has answered many runs holds no listener per
+    // finished one.
+    if (held.size === 0 && quietWatchers.get(execution) === held) {
+      quietWatchers.delete(execution);
     }
   };
 }
@@ -7955,6 +8202,194 @@ export async function journaledExecution(id: string): Promise<ExecutionRow | und
 export async function openExecutions(): Promise<readonly ExecutionRow[]> {
   if (!journalExists()) return [];
   return (await openJournal()).openExecutions();
+}
+
+// ---------------------------------------------------------------------------
+// The delivery ledger (grammar 13.3, PRD resolved q34, q35)
+// ---------------------------------------------------------------------------
+//
+// `src/serve.ts` is what *makes* a delivery; these are what record it. They are
+// here rather than reached for directly because the emitted import graph has
+// one shape — `serve.ts` → `runtime.ts` → `journal.ts` — and the four
+// lifecycle-row readers above already keep it (see [`journaledExecution`]).
+
+/**
+ * Record the intent to deliver one lifecycle webhook, allocating its ordinal.
+ *
+ * Before any attempt, which is what makes the delivery at-least-once: a process
+ * that dies mid-attempt leaves a row a later start finishes, under the delivery
+ * id the receiver dedupes on (resolved q35).
+ */
+export async function intendDelivery(intent: DeliveryIntent): Promise<DeliveryRecord> {
+  return (await openJournal()).intendDelivery(intent);
+}
+
+/**
+ * Record a delivery `callback_allow:` refused, which is one nothing was sent
+ * for (grammar 13.3, Decision D127).
+ */
+export async function refuseDelivery(
+  intent: DeliveryIntent,
+  reason: string,
+): Promise<DeliveryRecord> {
+  return (await openJournal()).refuseDelivery(intent, reason);
+}
+
+/**
+ * Record the same refusal against a delivery the journal already holds pending
+ * — the row a build that did not declare the execution's trigger left for one
+ * that does (`docs/durability.md` §3.7).
+ */
+export async function refuseRecordedDelivery(
+  execution: string,
+  ordinal: number,
+  reason: string,
+): Promise<void> {
+  (await openJournal()).refuseRecorded(execution, ordinal, reason);
+}
+
+/**
+ * End a pending delivery whose schedule has no offset left in it, without an
+ * attempt (`docs/durability.md` §3.7).
+ *
+ * The row a restart under a **shorter** `AGENT_COMPOSE_CALLBACK_RETRY` than the
+ * one that wrote it meets: its recorded attempts already number as many as this
+ * process's schedule has offsets, so there is nothing to wait for and nothing to
+ * record — and a delivery has two ends, neither of which is staying `pending`
+ * while the status route reports it as owed.
+ */
+export async function exhaustRecordedDelivery(
+  execution: string,
+  ordinal: number,
+  reason: string,
+): Promise<void> {
+  (await openJournal()).exhaustRecorded(execution, ordinal, reason);
+}
+
+/** Record what one attempt did, and where the delivery stands after it. */
+export async function recordDeliveryAttempt(
+  execution: string,
+  ordinal: number,
+  attempt: DeliveryAttempt,
+  status: DeliveryStatus,
+): Promise<void> {
+  (await openJournal()).recordAttempt(execution, ordinal, attempt, status);
+}
+
+/**
+ * Every delivery one execution has, by ordinal.
+ *
+ * Read by the status route, which is what makes a refused or exhausted
+ * delivery visible rather than silent (resolved q33, q35), and by the parking
+ * webhook, which reads the pauses earlier deliveries already reported.
+ */
+export async function deliveriesOf(execution: string): Promise<readonly DeliveryRecord[]> {
+  if (!journalExists()) return [];
+  return (await openJournal()).deliveries(execution);
+}
+
+/** Every delivery still owed an attempt — what a restarted `serve` picks up. */
+export async function undeliveredDeliveries(): Promise<readonly DeliveryRecord[]> {
+  if (!journalExists()) return [];
+  return (await openJournal()).undelivered();
+}
+
+/** What a report is *of*, before the journal's own half is read into it. */
+export interface ReportedExecution {
+  readonly id: string;
+  readonly flow: string;
+  /** What started it: a trigger's name, or `manual` (`docs/durability.md` §3.5). */
+  readonly trigger: string;
+  readonly status: string;
+  /** The pauses it is holding, as the surface that can answer them presents them. */
+  readonly interrupts?: readonly unknown[];
+  readonly outputs?: Record<string, unknown>;
+  readonly error?: string;
+  readonly trace?: readonly TraceEntry[];
+}
+
+/**
+ * What the status route serves about an execution, and what every lifecycle
+ * webhook carries (grammar 13.3, PRD resolved q34).
+ *
+ * **One document, one writer.** The webhook's body is the status route's report
+ * — that is the wire grammar 13.3 states — and there are two places a report is
+ * made: `serve`, which answers the route and pushes the webhook, and
+ * `agent-compose resume`, which closes a `serve`-started execution by hand and
+ * journals the `settled` webhook it owes (`docs/durability.md` §6.2) with no app
+ * anywhere to serve one. Two writers would agree on the day they were written.
+ *
+ * `trace_version` travels **with** the trace and only with it (`docs/trace.md`):
+ * a version key describing nothing would be a number a reader could pin against
+ * no format at all. Two reports have nothing for it to describe — a run still
+ * going, which has recorded nothing yet, and a run that **failed** carrying no
+ * trace at all, which is a failure raised before the graph ran — and both carry
+ * neither key. The gate is whether a trace exists, not whether it has entries in
+ * it: a run that failed *inside* the graph having recorded nothing carries
+ * `trace: []` and the version beside it, because an empty trace is a statement
+ * about the run and an absent one is not. The rule a reader is given is the one
+ * this expresses — wherever a `trace` appears, the version that describes it
+ * appears beside it, and wherever one is absent so is the other — and it holds on
+ * the two surfaces this feeds, the status route and the completion webhook,
+ * exactly as it does for `run`'s JSON record and the trace file.
+ *
+ * `deliveries` is on the report of every execution that has made one. It is what
+ * makes a **refused** delivery — a callback URL `callback_allow:` admits nowhere
+ * — and an **exhausted** one visible rather than silent, which is what resolved
+ * q33 and q35 ask of them: neither is the execution's failure, so the run's own
+ * `status` says nothing about either and this is the only place a reader can see
+ * them. No credential appears in it, and neither does a delivered body: what is
+ * published is what happened.
+ */
+export async function executionReport(
+  execution: ReportedExecution,
+): Promise<Record<string, unknown>> {
+  let delivered: readonly DeliveryRecord[] = [];
+  try {
+    delivered = await deliveriesOf(execution.id);
+  } catch {
+    // A journal this process cannot read is not a reason to refuse the report:
+    // what a reader is asking about is the run, and the rest of it is here.
+  }
+  const waits = execution.interrupts ?? [];
+  return {
+    execution_id: execution.id,
+    flow: execution.flow,
+    trigger: execution.trigger,
+    status: execution.status,
+    ...(waits.length === 0 ? {} : { interrupts: waits }),
+    ...(delivered.length === 0 ? {} : { deliveries: delivered.map(reportedDelivery) }),
+    ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
+    ...(execution.error === undefined ? {} : { error: execution.error }),
+    ...(execution.trace === undefined
+      ? {}
+      : { trace_version: TRACE_VERSION, trace: execution.trace }),
+  };
+}
+
+/**
+ * One callback delivery, as a report publishes it.
+ *
+ * `snake_case` because these are document keys. The **body** is not among them —
+ * it is the report a receiver was sent, which a reader already has in front of
+ * them — and neither is anything `callback_auth:` resolved.
+ */
+function reportedDelivery(record: DeliveryRecord): Record<string, unknown> {
+  return {
+    delivery_id: record.id,
+    ordinal: record.ordinal,
+    event: record.event,
+    url: record.url,
+    status: record.status,
+    intended_at: record.intendedAt,
+    ...(record.settledAt === undefined ? {} : { settled_at: record.settledAt }),
+    attempts: record.attempts.map((attempt) => ({
+      at: attempt.at,
+      outcome: attempt.outcome,
+      ...(attempt.detail === undefined ? {} : { detail: attempt.detail }),
+    })),
+    ...(record.detail === undefined ? {} : { detail: record.detail }),
+  };
 }
 
 /** The graph state a node reads: the composition's channels, plus `$run`. */
