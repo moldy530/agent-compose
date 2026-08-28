@@ -238,6 +238,12 @@ route's report plus `X-AgentCompose-Event`, `X-AgentCompose-Delivery`
 at-least-once, so they can arrive out of order: **order by ordinal, never by
 arrival**.
 
+Those names are the receiver's contract, so the `X-AgentCompose-` namespace is
+reserved: a `callback_auth.bearer.header:` inside it is a compile error, since
+two values under one header name is not something a receiver can read. Inbound
+`auth:` may name them freely — that is how a trigger verifies deliveries from
+*another* agent-compose deployment.
+
 ## `schedule` and `event` — reserved
 
 Both are reserved in the sense the closing section gives: **fully parsed,

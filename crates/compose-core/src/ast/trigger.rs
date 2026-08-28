@@ -289,6 +289,15 @@ impl CallbackAuth {
     /// The keys a `callback_auth:` block may declare, in the order grammar 13.3
     /// lists them.
     pub const KEYS: &'static [&'static str] = &["bearer", "hmac"];
+
+    /// The namespace a delivery's own headers live in: `X-AgentCompose-Event`,
+    /// `-Delivery`, `-Ordinal`, `-Timestamp`, and — signed — `-Signature`.
+    ///
+    /// Reserved against a `bearer:` scheme's `header:`, and only outbound: the
+    /// names are normative for the receiver (grammar 13.3, Decision D127), so a
+    /// token asked for under one of them collides with a value the delivery
+    /// already writes.
+    pub const DELIVERY_HEADER_PREFIX: &'static str = "X-AgentCompose-";
 }
 
 /// The outbound `hmac:` scheme: one key, because the algorithm and the encoding

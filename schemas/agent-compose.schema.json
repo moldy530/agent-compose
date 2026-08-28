@@ -2577,11 +2577,22 @@
       "description": "An http trigger's outbound `callback_auth:` block: at least one scheme, and both together are legal. Some receivers verify a static token more readily than a signature, and one trigger may deliver to a receiver that wants both (grammar 13.3 / PRD resolved q33).",
       "type": "object",
       "properties": {
-        "bearer": { "description": "A static token on every delivery.", "$ref": "#/$defs/bearerAuth" },
+        "bearer": { "description": "A static token on every delivery.", "$ref": "#/$defs/callbackBearerAuth" },
         "hmac": { "description": "A signature over the delivered body.", "$ref": "#/$defs/callbackHmac" }
       },
       "additionalProperties": false,
       "anyOf": [{ "required": ["bearer"] }, { "required": ["hmac"] }]
+    },
+    "callbackBearerAuth": {
+      "description": "The outbound bearer scheme: a bearerAuth whose header: may not be one the delivery already writes. Every delivery carries X-AgentCompose-Event, -Delivery, -Ordinal and -Timestamp, and a signed one carries -Signature; those names are normative for the receiver, so a token carried under one of them replaces or joins the value the receiver reads (grammar 13.3, Decision D127).",
+      "allOf": [
+        { "$ref": "#/$defs/bearerAuth" },
+        {
+          "properties": {
+            "header": { "not": { "pattern": "^[Xx]-[Aa][Gg][Ee][Nn][Tt][Cc][Oo][Mm][Pp][Oo][Ss][Ee]-" } }
+          }
+        }
+      ]
     },
     "callbackHmac": {
       "description": "The outbound hmac scheme: one key, because outbound signing is not configurable. A delivery is signed with HMAC-SHA256, written in hex, and carried as `X-AgentCompose-Signature: sha256=<hex>`, so one verification recipe serves every agent-compose deployment (grammar 13.3 / PRD resolved q33).",

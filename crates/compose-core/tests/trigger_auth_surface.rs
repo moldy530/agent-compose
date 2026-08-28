@@ -313,6 +313,64 @@ fn a_forged_header_or_prefix_is_refused_on_every_block_that_takes_one() {
     }
 }
 
+/// The delivery's own header namespace is reserved against an outbound
+/// `bearer:` — and against nothing else (grammar 13.3, Decision D127).
+///
+/// Five `X-AgentCompose-*` headers are normative for a receiver, so a delivery
+/// asked to carry its static token under one of them writes two values to one
+/// name: the receiver reads whichever its HTTP stack kept, and its signature
+/// check then fails on every legitimate delivery — or passes on one whose
+/// signature it never read. The rule is the whole prefix rather than the five
+/// spellings, because the wire may grow a sixth and a receiver would meet the
+/// same collision.
+///
+/// The inbound direction is deliberately untouched, and this test pins that
+/// half too: a trigger *receiving* another deployment's callbacks verifies them
+/// by naming `X-AgentCompose-Signature` in its own `auth:`, exactly as it would
+/// name a vendor's. A rule applied to both directions would make the documented
+/// recipe unwritable.
+#[test]
+fn a_delivery_header_is_refused_outbound_and_stays_legal_inbound() {
+    for name in [
+        "X-AgentCompose-Signature",
+        "x-agentcompose-delivery",
+        "X-AgentCompose-Anything",
+    ] {
+        let source = format!(
+            "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"payload.body.callback_url\"\n    callback_allow:\n      - \"https://hooks.example.com/*\"\n    callback_auth:\n      bearer:\n        token: ${{CALLBACK_TOKEN}}\n        header: \"{name}\"\n"
+        );
+        let parsed = parse_str(&source, "main.yml");
+        assert!(
+            parsed.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .starts_with("`header` must not name an `X-AgentCompose-` delivery header")),
+            "a delivery may not carry its token under `{name}`, got:\n{}",
+            render(&parsed.diagnostics)
+        );
+    }
+
+    let source = format!(
+        "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n    auth:\n      hmac:\n        secret: ${{WEBHOOK_SECRET}}\n        header: X-AgentCompose-Signature\n        prefix: \"sha256=\"\n"
+    );
+    let ir = resolve_clean("delivery-header-inbound", &source);
+    let trigger = ir
+        .triggers
+        .as_ref()
+        .expect("the artifact holds a table")
+        .get("intake")
+        .expect("`intake` is declared");
+    let compose_core::ir::trigger::TriggerKind::Http(http) = &trigger.kind else {
+        panic!("`intake` is an `http` trigger");
+    };
+    let Some(compose_core::ir::trigger::InboundAuth::Hmac(hmac)) = &http.auth else {
+        panic!("`intake` declares an inbound `hmac` scheme");
+    };
+    assert_eq!(
+        hmac.header, "X-AgentCompose-Signature",
+        "verifying another deployment's deliveries is what naming this header inbound is for"
+    );
+}
+
 /// `callback_allow:` without `callback_auth:` is legal too: an allowlist bounds
 /// where a webhook may go whether or not the delivery is signed, and the
 /// mandatory direction is only the other one.

@@ -4032,8 +4032,18 @@ and they are normative:
 | `X-AgentCompose-Signature` | `sha256=<hex hmac-sha256 of the body>` — with `callback_auth.hmac` only |
 
 With `callback_auth.bearer`, the configured `header:` carries `prefix:` followed
-by the token. Outbound `hmac:` takes **no** keys but `secret:`: signing is fixed
-at HMAC-SHA256 written in hex, so one receiver-side recipe verifies every
+by the token — and that header may **not** be one of the five above: the
+`X-AgentCompose-` namespace belongs to the wire contract, and a
+`callback_auth.bearer.header:` inside it is a compile error
+(`invalid-value`). A token written under a name the delivery already writes
+arrives joined to that value or in place of it, and a receiver following this
+table then fails its signature check on every legitimate delivery — or passes on
+one whose signature it never read. The reservation is **outbound only**: an
+inbound `auth:` may name `X-AgentCompose-Signature` freely, which is exactly how
+a trigger that *receives* another deployment's callbacks verifies them.
+
+Outbound `hmac:` takes **no** keys but `secret:`: signing is fixed at
+HMAC-SHA256 written in hex, so one receiver-side recipe verifies every
 agent-compose deployment. Deliveries are journaled and at-least-once with bounded
 retry, so a parking delivery and a settle delivery **can arrive out of order**:
 receivers order by `X-AgentCompose-Ordinal`, never by arrival (PRD resolved q35).
@@ -6931,7 +6941,18 @@ is what lets a receiver be written against the language rather than against an
 observed release. Outbound signing takes no `algorithm:`/`encoding:` for the same
 reason: one recipe verifying every agent-compose deployment is worth more than a
 knob, and the inbound block is where a vendor's choices have to be matched
-because there the vendor made them. *PRD resolved q33, q34, q35, §13.3.*
+because there the vendor made them.
+
+*And naming them normatively reserves them*: a `callback_auth.bearer.header:`
+inside the `X-AgentCompose-` namespace is refused, because the delivery is
+already writing there. Two values under one header name is not a configuration a
+receiver can read — it gets whichever its HTTP stack kept, or the pair joined —
+so the same sentence that lets a receiver be written against this table has to
+stop a trigger from contradicting it. The prefix rather than the five spellings,
+so a sixth header added to the wire needs no second rule; **outbound only**, so
+that an inbound `auth:` naming `X-AgentCompose-Signature` — a trigger receiving
+another deployment's callbacks — stays exactly as writable as one naming
+GitHub's. *PRD resolved q33, q34, q35, §13.3.*
 
 ---
 

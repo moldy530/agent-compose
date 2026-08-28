@@ -680,6 +680,45 @@ fn prefix_shape(prefix: &Spanned<String>, cx: &mut Cx) -> bool {
     false
 }
 
+/// Whether a `callback_auth.bearer.header:` names a header the delivery does not
+/// already write itself (grammar 13.3, Decision D127).
+///
+/// The `X-AgentCompose-` namespace belongs to the wire contract: every delivery
+/// carries `X-AgentCompose-Event`, `-Delivery`, `-Ordinal` and `-Timestamp`, and
+/// a signed one carries `-Signature`. Those names are *normative* — a receiver
+/// is written against them rather than against an observed release — so a static
+/// token asked for under one of them arrives joined to the value the delivery
+/// wrote, or in place of it, and the receiver's check then fails on every
+/// legitimate delivery or passes on one whose signature was never read.
+///
+/// Only outbound, and deliberately: a trigger that *receives* agent-compose
+/// deliveries verifies them by naming `X-AgentCompose-Signature` in its inbound
+/// `auth:`, exactly as it would name any other vendor's header.
+fn delivery_header_is_free(header: &Spanned<String>, cx: &mut Cx) -> bool {
+    let prefix = CallbackAuth::DELIVERY_HEADER_PREFIX;
+    if !header
+        .value
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    {
+        return true;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            header.span.clone(),
+            format!(
+                "`header` must not name an `{prefix}` delivery header, found {:?}",
+                header.value
+            ),
+        )
+        .with_help(
+            "every delivery already writes `X-AgentCompose-Event`, `-Delivery`, `-Ordinal` and `-Timestamp`, and a signed one writes `-Signature`; those names are the receiver's contract, so a token carried under one of them replaces or joins the value the receiver reads — name the header the receiver expects the token on (grammar 13.3, Decision D127)",
+        ),
+    );
+    false
+}
+
 /// Read `callback_auth:` — how a delivery identifies itself to its receiver
 /// (grammar 13.3, PRD resolved q33).
 ///
@@ -722,7 +761,20 @@ fn callback_auth(
         block.finish(cx);
         return None;
     }
-    let bearer = bearer(&mut block, "bearer", &context, cx);
+    // The one difference between an outbound `bearer:` and an inbound one, and
+    // it is about the *other* headers on the same request rather than about
+    // this key's shape — so it is applied here, where the direction is known,
+    // rather than inside the shared reader.
+    let bearer = bearer(&mut block, "bearer", &context, cx).map(|mut scheme| {
+        if scheme
+            .header
+            .as_ref()
+            .is_some_and(|header| !delivery_header_is_free(header, cx))
+        {
+            scheme.header = None;
+        }
+        scheme
+    });
     let hmac = block.take("hmac").and_then(|node| {
         let context = format!("the `hmac` of {context}");
         let mapping = expect_mapping(node, &context, cx)?;

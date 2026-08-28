@@ -614,6 +614,19 @@ fn the_published_schema_accepts_the_whole_trigger_auth_surface() {
             "timeout": "30s",
             "auth": { "hmac": { "secret": "${WEBHOOK_SECRET}" } },
         }),
+        // The `X-AgentCompose-` namespace is reserved *outbound* only: a trigger
+        // that receives another deployment's deliveries verifies them by naming
+        // the delivery's own signature header, exactly as it would name any
+        // other vendor's (grammar 13.3, Decision D127).
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "auth": { "hmac": {
+                "secret": "${WEBHOOK_SECRET}",
+                "header": "X-AgentCompose-Signature",
+                "prefix": "sha256=",
+            } },
+        }),
         // Outbound: either scheme, and — the asymmetry with `auth:` — both.
         json!({
             "type": "http",
