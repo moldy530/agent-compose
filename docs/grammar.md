@@ -4030,6 +4030,17 @@ compile error too, the mirror of `timeout:` on an async trigger
 ([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)): the key describes a
 delivery this trigger never makes.
 
+**Anchor the host against the scheme.** `*` is *any* run of characters, and it
+crosses `/` and `?` like any other — there is no delimiter it stops at. So a
+wildcard written before a host suffix constrains no host:
+`https://*.hooks.example.com/*` is matched by
+`https://attacker.test/collect?x=.hooks.example.com/y`, where the leading `*`
+consumed a host, a path and a query on its way to the literal after it. Write
+the host as a literal from the scheme onwards — `https://hooks.example.com/*` —
+and give a second subdomain a second entry. A pattern whose first `*` falls
+inside the host is the one shape of this key that reads like a constraint and
+is not one.
+
 **The delivery wire.** A callback fires on lifecycle events — every quiescence
 that opened new pauses, and settle — carrying the status route's report plus
 delivery metadata (PRD resolved q34, q35). Every delivery carries these headers,
@@ -6940,17 +6951,25 @@ non-empty. Every delivery carries the `X-AgentCompose-*` headers §13.3
 tabulates, and outbound `hmac:` signing is HMAC-SHA256 in hex with no keys of
 its own (§13.3).
 
-**Rationale**. *One wildcard kind*, unlike §6.1's glob surfaces: `**` earns its
+**Rationale**. *One wildcard kind*, unlike §5.5's `glob:`: `**` earns its
 existence where a path tree has a directory boundary to be significant about,
 and a URL has no such boundary — `*` against the whole string is what an author
 writing `https://hooks.example.com/*` already means, and a second wildcard would
-only invite the question of what it did differently. *Scheme-anchored*, because
-a match that could not name the scheme would let one entry admit URLs that merely
-begin with the same characters. *`http` stays legal*: localhost development is
-the common first case, and refusing it would push every author to a workaround
-worse than the rule. *Non-empty*, because an allowlist satisfied by nothing
-refuses every delivery — a statically visible webhook that can never fire, and
-the same guaranteed-dead-end posture §7.6.3 takes. Matching itself is a
+only invite the question of what it did differently. The cost of having no
+boundary is that a `*` **crosses `/` and `?`**, so a wildcard standing before a
+host suffix constrains no host at all: `https://*.hooks.example.com/*` is
+satisfied by `https://attacker.test/collect?x=.hooks.example.com/y`, because the
+first `*` is free to consume a host, a path and a query on its way to the
+literal that follows. An entry therefore has to anchor its host against the
+scheme, and §13.3 says so where an author reads it — the alternative, a wildcard
+that stopped at a delimiter, is the second wildcard kind this entry just
+refused. *Scheme-anchored*, because a match that could not name the scheme would
+let one entry admit URLs that merely begin with the same characters. *`http`
+stays legal*: localhost development is the common first case, and refusing it
+would push every author to a workaround worse than the rule. *Non-empty*,
+because an allowlist satisfied by nothing refuses every delivery — a statically
+visible webhook that can never fire, and the same guaranteed-dead-end posture
+§7.6.3 takes. Matching itself is a
 **runtime** rule: the URL does not exist until the payload arrives, so `validate`
 owns entry shape and nothing more.
 

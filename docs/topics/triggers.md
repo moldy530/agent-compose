@@ -228,6 +228,12 @@ localhost receiver is the common first case. An empty list is an error: an
 allowlist admitting nothing refuses every delivery. Either key on a trigger with
 no `callback:` is an error too — it describes a delivery that never happens.
 
+**Anchor the host against the scheme.** `*` crosses `/` and `?` like any other
+character, so `https://hooks.example.com/*` constrains a host and
+`https://*.hooks.example.com/*` constrains none: that leading `*` swallows
+`attacker.test/collect?x=` on its way to the dot, and the payload naming it is
+admitted. One entry per subdomain.
+
 **A `callback:` with no `callback_auth:` is a documented test posture**: it signs
 nothing, claims nothing, needs no allowlist, and may POST anywhere. Choose it
 deliberately.

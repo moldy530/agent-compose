@@ -56,6 +56,12 @@ characters. A callback URL outside the list will be refused when it is read, at
 parking or at settle, and recorded as a refused delivery rather than as anybody's
 failure.
 
+**Anchor the host against the scheme.** `*` runs over anything, `/` and `?`
+included, so `https://hooks.example.com/*` constrains a host and
+`https://*.hooks.example.com/*` constrains none: its leading `*` is free to
+swallow `attacker.test/collect?x=` on the way to the dot, and a payload naming
+that URL is admitted. Give a second subdomain a second entry.
+
 **This check is live; the matching it demands is not.** `callback_auth:` and
 `callback_allow:` are reserved grammar in v0 (grammar §15): parsed, checked, and
 carried into the IR, and read by nothing generated yet — a built app signs no
