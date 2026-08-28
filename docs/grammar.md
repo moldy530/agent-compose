@@ -4002,6 +4002,20 @@ answers an unauthenticated poll or resume, and an execution a no-auth trigger
 began keeps open routes (PRD resolved q32). `run` is untouched — no server, no
 caller to verify.
 
+**What an `hmac` trigger asks of those two routes** is worth spelling out,
+because the two schemes do not cost a client the same thing. A `bearer`
+trigger's three routes all take one header carrying one token. An `hmac`
+trigger's do not: the signature is over **that request's own raw body bytes**,
+so a `GET /executions/:id` of such an execution is signed over the *empty* body
+a `GET` carries — `HMAC(secret, "")`, written under the trigger's `header:`,
+`prefix:`, `algorithm:` and `encoding:` — and a `POST /executions/:id/resume` is
+signed over the resume payload exactly as sent, byte for byte, never over a
+re-serialization of it. That is the start route's rule applied to two more
+routes rather than a second rule; what makes it worth writing down is that "the
+auth of the trigger that started this execution" reads, for `hmac`, as a
+per-request signature a poller has to compute rather than as a credential it
+holds.
+
 **Identifying the delivery: `callback_auth:` and `callback_allow:`.** Outbound
 auth is opt-in and mirrors the inbound pair, so one verification recipe serves
 both directions. `bearer` sends a static token on every delivery; `hmac` signs
@@ -4032,6 +4046,21 @@ an allowlisted receiver redirecting to itself would answer `2xx` to a request
 carrying no report at all. A `3xx` is a failed attempt like any other non-2xx
 status (`docs/durability.md` §3.7); a receiver that has moved is a `callback:`
 naming where it moved to.
+
+**A callback URL that carries userinfo is refused**, which is the same guarantee
+read one step *back*. The list is matched against the URL as text, and userinfo —
+the `user:pass@` an authority may put before its host — is where the text and the
+destination part company: `http://hooks.example.com:9000@attacker.test/hook`
+begins with `http://hooks.example.com:`, so the entry
+`http://hooks.example.com:*/hook` — what an author writes for a receiver whose
+port the operating system chose — admits it while the host the request reaches is
+`attacker.test`. So a URL with an `@` in its authority is a refused delivery like
+any other, recorded and never sent, and it is refused **whether or not the
+trigger declares a list**: the two JavaScript runtimes a built project runs under
+disagree about such a URL — one drops the userinfo and delivers to the host after
+the `@`, the other refuses to construct the request at all — and a wire contract
+that turned on which one `serve` found would be no contract. An `@` after the
+authority, in a path or a query, is an ordinary character and means nothing here.
 
 **A trigger with a `callback:` and no `callback_auth:` is a documented test
 posture**: it signs nothing, claims nothing, and may POST anywhere. That is the

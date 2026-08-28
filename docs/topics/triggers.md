@@ -195,6 +195,15 @@ auth of the trigger that **started that execution**. An execution an
 authenticated trigger began never answers an unauthenticated poll; one a no-auth
 trigger began keeps open routes.
 
+**An `hmac` trigger guards them with a signature per request**, which is not the
+same thing a `bearer` one asks for. A bearer token is one value on all three
+routes; an HMAC signature is over **that request's own raw body bytes**, so a
+`GET /executions/:id` of a signed trigger's execution carries `HMAC(secret, "")`
+— the empty body a `GET` has — and a `POST …/resume` carries a signature over
+the resume payload exactly as sent, never over a re-serialization of it. Same
+rule as the start route, applied to two more routes; worth knowing before
+writing the poller.
+
 ## Identifying a callback delivery
 
 Outbound auth mirrors the inbound pair, so one verification recipe serves both
@@ -227,6 +236,16 @@ token and all — to whatever host its `Location:` named, and a `301`/`302`/`303
 would rewrite the POST into a bodyless GET besides. The `3xx` is a failed attempt
 like any other non-2xx status, and a receiver that has moved is a `callback:`
 naming where it moved to.
+
+**A callback URL carrying userinfo is refused** — the same guarantee read one
+step back. The list is matched against the URL as text, and a `user:pass@` before
+the host makes the text and the destination disagree:
+`http://hooks.example.com:9000@attacker.test/hook` begins with
+`http://hooks.example.com:`, so an entry with a wildcard where the port goes
+admits it while the request reaches `attacker.test`. An `@` in the authority is a
+refused delivery, list or no list — the runtimes a build runs on do not even
+agree what such a URL means, one dropping the userinfo and one refusing to send
+at all. An `@` in a path or query is an ordinary character.
 
 An entry is an absolute `http`/`https` URL with `*` standing for any run of
 characters, matched against the whole callback URL. Write the scheme lowercase:

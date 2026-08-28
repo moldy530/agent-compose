@@ -67,6 +67,11 @@ not something this check answers — so a list that is a guarantee rather than a
 ceremony is one whose entries name their receivers. Give a second subdomain a
 second entry.
 
+One thing the list does **not** have to bound is a URL that hides its host: a
+callback URL carrying userinfo — `http://hooks.example.com:9000@attacker.test/x`,
+whose text begins with the entry and whose request reaches `attacker.test` — is a
+refused delivery on its own, list or no list.
+
 **The check and the matching are both live.** A built app signs its deliveries
 with what `callback_auth:` declares and refuses a callback URL this list admits
 nowhere — recorded as a refused delivery, visible on the execution's status

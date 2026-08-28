@@ -124,4 +124,89 @@ mod tests {
             "the app mounts these fixed routes; `RESERVED_ROUTES` says it mounts {RESERVED_ROUTES:?}"
         );
     }
+
+    /// A delivery's body is the report taken **where the event was**, not where
+    /// the delivery chain reached it.
+    ///
+    /// `deliver` chains onto a per-execution promise and the chain ahead of it
+    /// can be long — a first delivery still opening the journal while a resume
+    /// lands, runs on and finishes the execution. A body serialized inside that
+    /// chain would announce a `parked` event over a report reading `completed`,
+    /// with no `interrupts` for the receiver to answer, where PRD resolved q34
+    /// promises it the report a poll at the moment of the event would have
+    /// served. The bytes are fixed at the intent and every attempt resends
+    /// them, so nothing later corrects it.
+    ///
+    /// Read off the source because the race wants a journal open slower than a
+    /// person answering two pauses, which no acceptance test can stage
+    /// deterministically. What is checkable is *where* the snapshot is taken.
+    #[test]
+    fn a_deliverys_body_is_the_report_taken_where_the_event_was() {
+        let deliver = function_body("function deliver(");
+        assert!(
+            deliver.contains("const body = report(execution);"),
+            "`deliver` no longer snapshots the report at the event: {deliver}"
+        );
+        let opening = function_body("async function opening(");
+        assert!(
+            !opening.contains("report(execution)"),
+            "`opening` builds the report inside the delivery chain again, so a delivery can \
+             carry a report of a run that has moved on since its event: {opening}"
+        );
+    }
+
+    /// Both callback-URL gates ask **one** question (grammar 13.3, D127).
+    ///
+    /// A URL is held to its trigger in two places — before the first attempt,
+    /// and again when a restart puts an owed row back on its schedule — and a
+    /// rule one of them enforced alone would be a rule a crash suspends. So
+    /// neither matches the allowlist itself: they ask `unroutable`, which is
+    /// also where the authority is required to be the one the entry matched
+    /// against (`credentialed`).
+    #[test]
+    fn both_callback_url_gates_ask_the_same_question() {
+        let unroutable = function_body("function unroutable(");
+        for asked in ["credentialed(url)", "admits(trigger.callbackAllow, url)"] {
+            assert!(
+                unroutable.contains(asked),
+                "`unroutable` no longer asks `{asked}`, so a delivery is held to less than \
+                 grammar 13.3 says: {unroutable}"
+            );
+        }
+        for gate in ["async function opening(", "async function resumeDelivery("] {
+            let body = function_body(gate);
+            assert!(
+                body.contains("unroutable("),
+                "`{gate}…` no longer holds the callback URL to its trigger"
+            );
+            assert!(
+                !body.contains("admits("),
+                "`{gate}…` matches the allowlist on its own, and the two gates drift apart \
+                 the moment one of them grows a rule the other has not"
+            );
+        }
+    }
+
+    /// The body of one top-level declaration of the app.
+    ///
+    /// `codegen::journal` and `tests/trigger_auth_surface.rs` read it the same
+    /// way, and for the same reason: a rule about what one function does is
+    /// only a rule if it is read off that function rather than off the file
+    /// around it. The module is formatted, so a top-level declaration opens at
+    /// column zero and closes on a line that is exactly `}`.
+    fn function_body(header: &str) -> String {
+        let mut lines = SOURCE.lines().skip_while(|line| !line.starts_with(header));
+        let opened = lines
+            .next()
+            .unwrap_or_else(|| panic!("`src/serve.ts` declares `{header}…`"));
+        let mut held = String::from(opened);
+        for line in lines {
+            held.push('\n');
+            held.push_str(line);
+            if line == "}" {
+                return held;
+            }
+        }
+        panic!("`{header}…` has no closing brace in the first column")
+    }
 }

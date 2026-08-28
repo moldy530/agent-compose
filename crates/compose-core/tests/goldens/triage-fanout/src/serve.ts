@@ -1375,14 +1375,32 @@ function parking(execution: Execution): void {
  * has to *wait* for a delivery to be journaled is the one holding a lifecycle
  * row open until it is. It resolves when the intent is recorded, never when the
  * receiver answers.
+ *
+ * **The report is taken here**, where the event is, and not inside the chain.
+ * `report` reads the execution's status and the pauses the runtime is holding as
+ * it is called, and the chain ahead of it can be seconds long — a first delivery
+ * still opening the journal while a resume lands, runs on and finishes the
+ * execution. A body serialized then would announce a `parked` event whose report
+ * says `completed` and carries no `interrupts` at all: a push a receiver cannot
+ * render or answer, where resolved q34 promises it the same report a poll at the
+ * moment of the event would have served. Fixing it at the intent is the only
+ * place there is, because the intent's bytes are what every attempt resends.
  */
 function deliver(
   execution: Execution,
   event: runtime.DeliveryEvent,
   pauses: readonly string[],
 ): Promise<void> {
+  const url = execution.callback;
+  if (url === undefined) return execution.deliveries;
+  const body = report(execution);
+  // The chain below is what awaits it. A handler is attached here so that a
+  // journal failure inside `report` is not an unhandled rejection for as long as
+  // the chain is still ahead of it — the rejection still reaches [`opening`],
+  // and the `catch` below still says it.
+  body.catch(() => undefined);
   execution.deliveries = execution.deliveries
-    .then(() => opening(execution, event, pauses))
+    .then(() => opening(execution, event, pauses, url, body))
     .catch((error: unknown) => {
       // A delivery that could not even be *recorded* is not the execution's
       // failure — the run has produced whatever it produced and the status
@@ -1399,10 +1417,14 @@ function deliver(
  * Record one delivery's intent, and set its attempts going.
  *
  * Three things happen here and the order is the contract (resolved q35): the
- * URL is matched against `callback_allow:`, the intent is journaled, and only
+ * URL is held to what its trigger admits, the intent is journaled, and only
  * then is anything sent. The intent goes down **before** the first attempt so
  * that a process which dies mid-attempt leaves a row a later start finishes,
  * under the delivery id the receiver dedupes on.
+ *
+ * The `body` is the report [`deliver`] took at the event, awaited here rather
+ * than built here: it is the bytes every attempt resends, so it has to be the
+ * execution as it was when the thing being announced happened.
  *
  * **A trigger this build no longer declares leaves a `pending` row** rather than
  * nothing at all, which is what `docs/durability.md` §3.7 promises about it: the
@@ -1418,9 +1440,9 @@ async function opening(
   execution: Execution,
   event: runtime.DeliveryEvent,
   pauses: readonly string[],
+  url: string,
+  body: Promise<Record<string, unknown>>,
 ): Promise<void> {
-  const url = execution.callback;
-  if (url === undefined) return;
   const trigger = httpTriggers.find((one) => one.name === execution.trigger);
   const intent = {
     execution: execution.id,
@@ -1432,7 +1454,7 @@ async function opening(
     trigger: execution.trigger,
     event,
     url,
-    body: JSON.stringify(await report(execution)),
+    body: JSON.stringify(await body),
     pauses,
   };
   if (trigger === undefined) {
@@ -1447,22 +1469,86 @@ async function opening(
     );
     return;
   }
-  // **Matched when the URL is read**, which is at the delivery rather than at
-  // the start (grammar 13.3, Decision D110, D127): the callback URL comes out of
-  // the request payload and is attacker-controlled by construction. A URL the
-  // list admits nowhere is a *refused delivery* — journaled, visible on the
+  // **Held when the URL is read**, which is at the delivery rather than at the
+  // start (grammar 13.3, Decision D110, D127): the callback URL comes out of the
+  // request payload and is attacker-controlled by construction. A URL its
+  // trigger does not admit is a *refused delivery* — journaled, visible on the
   // status route, never retried, and never anybody's failure.
-  if (trigger.callbackAllow !== undefined && !admits(trigger.callbackAllow, url)) {
-    await refuseDelivery(intent, refusedUrl(trigger.name));
+  const refusal = unroutable(trigger, url);
+  if (refusal !== undefined) {
+    await refuseDelivery(intent, refusal);
     return;
   }
   const record = await intendDelivery(intent);
   void attempts(record, trigger);
 }
 
+/**
+ * Why this trigger may not deliver to this URL, or `undefined` where it may.
+ *
+ * Both gates ask it — [`opening`] before the first attempt and
+ * [`resumeDelivery`] before a restart puts an owed row back on its schedule — so
+ * a URL one of them would send is never one the other refuses.
+ */
+function unroutable(trigger: HttpTrigger, url: string): string | undefined {
+  if (credentialed(url)) return refusedUserinfo(trigger.name);
+  if (trigger.callbackAllow !== undefined && !admits(trigger.callbackAllow, url)) {
+    return refusedUrl(trigger.name);
+  }
+  return undefined;
+}
+
 /** Why a delivery was refused, in the one sentence both places that refuse use. */
 function refusedUrl(trigger: string): string {
   return `the callback URL matches no \`callback_allow\` entry of the trigger \`${trigger}\``;
+}
+
+/** The other refusal, in the same shape. See [`credentialed`]. */
+function refusedUserinfo(trigger: string): string {
+  return `the callback URL of the trigger \`${trigger}\` carries userinfo before its host, so the authority \`callback_allow\` matches against is not the authority the request would reach`;
+}
+
+/**
+ * Whether this URL puts **userinfo** before its host — the `user:pass@` an
+ * authority may carry.
+ *
+ * A refused delivery, and refused whether or not the trigger declares a list.
+ * Two reasons, and either alone would be enough.
+ *
+ * `callback_allow:` is matched against the URL **as text** (Decision D127), and
+ * userinfo is where the text and the destination part company: a URL reading
+ * `http://hooks.example.com:9000@attacker.test/hook` begins with
+ * `http://hooks.example.com:`, so an entry carrying a wildcard where the port
+ * goes — what an author writes for a receiver whose port the operating system
+ * chose — admits it, while the host the request reaches is `attacker.test`. What
+ * would travel is this execution's whole report under `X-AgentCompose-Signature`
+ * and a `callback_auth: bearer` token, which is the guarantee the redirect rule
+ * ([`attemptDelivery`]) keeps one step further on. Recognising it here rather
+ * than inside the match keeps the matcher the bounded text scan
+ * [`entryAdmits`] describes.
+ *
+ * And the two runtimes a built project runs under do not agree about such a
+ * URL: one drops the userinfo and delivers to the host after the `@`, the other
+ * refuses to construct the request at all. A wire contract that turned on which
+ * one `serve` found would be no contract, so the URL is refused before either
+ * of them is asked.
+ */
+function credentialed(url: string): boolean {
+  const scheme = url.indexOf("://");
+  if (scheme === -1) return false;
+  const from = scheme + 3;
+  // The authority ends at the first `/`, `?` or `#` after it; an `@` beyond that
+  // is an ordinary path or query character and names no host.
+  let end = url.length;
+  for (let index = from; index < url.length; index += 1) {
+    const character = url[index];
+    if (character === "/" || character === "?" || character === "#") {
+      end = index;
+      break;
+    }
+  }
+  const at = url.indexOf("@", from);
+  return at !== -1 && at < end;
 }
 
 /**
@@ -1734,16 +1820,17 @@ async function resumeDelivery(record: runtime.DeliveryRecord): Promise<void> {
     );
     return;
   }
-  // **The allowlist is matched here too**, and this is where a row [`opening`]
-  // could not match one against reaches its trigger's list at last: a delivery
+  // **The URL is held to its trigger here too**, and this is where a row
+  // [`opening`] could not hold reaches that trigger at last: a delivery
   // journaled by a build with no declaration of the trigger has never been
   // held to it, and picking it up unchecked would POST an attacker-supplied
   // URL that the trigger admits nowhere (grammar 13.3, Decision D127). The
   // refusal is written onto the row it is about rather than opened as a second
   // event: the ordinal is the lifecycle event's, and the event has not
   // happened twice.
-  if (trigger.callbackAllow !== undefined && !admits(trigger.callbackAllow, record.url)) {
-    await refuseRecordedDelivery(record.execution, record.ordinal, refusedUrl(trigger.name));
+  const refusal = unroutable(trigger, record.url);
+  if (refusal !== undefined) {
+    await refuseRecordedDelivery(record.execution, record.ordinal, refusal);
     process.stderr.write(`refused delivery ${record.id} (${record.event})\n`);
     return;
   }
@@ -1770,6 +1857,10 @@ function pause(milliseconds: number): Promise<void> {
  * other character, because a URL has no delimiter a second kind would be
  * significant about. The entry is compared as written, which is why the
  * compiler refuses a scheme spelled in another case: it would match nothing.
+ *
+ * Matching text against a URL is only a statement about where a delivery lands
+ * for a URL whose text names its own host, which is [`credentialed`]'s subject
+ * and why [`unroutable`] asks that first.
  */
 function admits(patterns: readonly string[], url: string): boolean {
   return patterns.some((pattern) => entryAdmits(pattern, url));
