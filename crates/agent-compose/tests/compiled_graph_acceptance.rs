@@ -9843,7 +9843,8 @@ fn a_completion_webhook_fires_with_the_runs_report_and_only_when_a_url_was_given
     assert_eq!(harness::settled(&app, &execution)["status"], "completed");
 
     let delivered = receiver.wait_for(1, Duration::from_secs(30));
-    let report = &delivered[0];
+    let report = &delivered[0].body;
+    assert_eq!(delivered[0].event(), "settled", "{report}");
     assert_eq!(report["execution_id"], execution, "{report}");
     assert_eq!(report["status"], "completed", "{report}");
     assert_eq!(report["outputs"]["answer"], "notified", "{report}");
@@ -15851,12 +15852,24 @@ fn a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for() 
             .as_str()
             .expect("a resume url")
             .to_string();
-        // Dropped holding the pause: the run never finished, so no webhook has
-        // fired and the caller is still waiting.
+        // The parking fires while this process is alive, and is waited for
+        // here rather than after the block: `settled` answers the moment the
+        // pause opens, which is ahead of the delivery it sets going, and a
+        // process killed in between would leave the webhook for the *next*
+        // start to make (`docs/durability.md` §3.7) — which is a different
+        // claim from the one this test is about.
+        let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+        assert_eq!(
+            parked[0].body["execution_id"], execution,
+            "the parking names the execution: {:?}",
+            parked[0].body
+        );
+        // …and dropped holding the pause: the run never *finished*, so no
+        // `settled` webhook has fired and the caller is still waiting.
     }
     assert!(
-        receiver.delivered().is_empty(),
-        "a run that never finished fired no webhook: {:?}",
+        receiver.of_event("settled").is_empty(),
+        "a run that never finished fired no settle webhook: {:?}",
         receiver.delivered()
     );
 
@@ -15875,14 +15888,23 @@ fn a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for() 
         answered.text()
     );
 
-    let delivered = receiver.wait_for(1, Duration::from_secs(30));
-    let report = &delivered[0];
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    let report = &delivered[0].body;
     assert_eq!(report["execution_id"], execution, "{report}");
     assert_eq!(report["status"], "completed", "{report}");
     assert_eq!(
         report["outputs"],
         json!({ "note": "worth signing off", "decision": "approve" }),
         "the webhook carries the report of the run this process finished: {report}"
+    );
+    // …and the recovered generation re-parked under the wait id its predecessor
+    // published, which is not a new question and fires no second parking
+    // (PRD resolved q35).
+    assert_eq!(
+        receiver.distinct("parked").len(),
+        1,
+        "re-parking the same wait announces nothing: {:?}",
+        receiver.delivered()
     );
     assert_eq!(
         provider.snapshot().requests,
@@ -15947,7 +15969,10 @@ fn a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one() {
             .as_str()
             .expect("a resume url")
             .to_string();
-        // Dropped holding the pause, with the row open and nothing pushed.
+        // Dropped holding the pause, with the row open and nothing *settled*
+        // pushed. Its parking fired, and is on the journal — which is what keeps
+        // the two starts below from announcing the same question again.
+        receiver.wait_for_event("parked", 1, Duration::from_secs(30));
     }
 
     // The composition moves under the journal, which is how one does in
@@ -15975,7 +16000,7 @@ fn a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one() {
         // Given time to be sent, and then said not to have been: the push would
         // follow the status this process just published, so a read taken at once
         // would be a read taken too early.
-        nothing_delivered(&receiver, Duration::from_secs(3));
+        nothing_settled(&receiver, Duration::from_secs(3));
     }
 
     // The composition comes back, and so does the execution.
@@ -15997,18 +16022,24 @@ fn a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one() {
         answered.text()
     );
 
-    let delivered = receiver.wait_for(1, Duration::from_secs(30));
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
     assert_eq!(
         delivered.len(),
         1,
-        "one execution, one completion webhook: {delivered:?}"
+        "one execution, one settle webhook: {delivered:?}"
     );
-    let report = &delivered[0];
+    let report = &delivered[0].body;
     assert_eq!(report["execution_id"], execution, "{report}");
     assert_eq!(
         report["status"], "completed",
         "…and it is the report of the run that finished rather than the opinion of \
          the build that could not replay it: {report}"
+    );
+    assert_eq!(
+        receiver.distinct("parked").len(),
+        1,
+        "three starts, one question, one parking: {:?}",
+        receiver.delivered()
     );
     assert_eq!(
         provider.snapshot().requests,
@@ -16077,7 +16108,10 @@ fn a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook() {
             .as_str()
             .expect("a resume url")
             .to_string();
-        // Dropped holding the pause, with the row open and nothing pushed.
+        // Dropped holding the pause, with the row open and nothing *settled*
+        // pushed. Its parking fired, and is on the journal — which is what keeps
+        // the two starts below from announcing the same question again.
+        receiver.wait_for_event("parked", 1, Duration::from_secs(30));
     }
 
     // The flow's `inputs:` narrow under the journal, so the recorded invocation
@@ -16103,7 +16137,7 @@ fn a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook() {
              makes the error one no predicate over its class could catch: {refused}"
         );
         // Given time to be sent, and then said not to have been.
-        nothing_delivered(&receiver, Duration::from_secs(3));
+        nothing_settled(&receiver, Duration::from_secs(3));
     }
 
     // The composition comes back, and so does the execution.
@@ -16125,13 +16159,13 @@ fn a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook() {
         answered.text()
     );
 
-    let delivered = receiver.wait_for(1, Duration::from_secs(30));
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
     assert_eq!(
         delivered.len(),
         1,
-        "one execution, one completion webhook: {delivered:?}"
+        "one execution, one settle webhook: {delivered:?}"
     );
-    let report = &delivered[0];
+    let report = &delivered[0].body;
     assert_eq!(report["execution_id"], execution, "{report}");
     assert_eq!(
         report["status"], "completed",
@@ -16164,14 +16198,14 @@ fn narrowed_gate_inputs() -> String {
 /// would pass for a build that fires the push a moment later, which is the
 /// failure it exists to catch. Polling for a budget cannot flake the other way:
 /// a build that fires nothing has nothing to arrive however long this waits.
-fn nothing_delivered(receiver: &harness::Receiver, budget: Duration) {
+fn nothing_settled(receiver: &harness::Receiver, budget: Duration) {
     let deadline = std::time::Instant::now() + budget;
     while std::time::Instant::now() < deadline {
-        let held = receiver.delivered();
+        let held = receiver.of_event("settled");
         assert!(
             held.is_empty(),
             "an execution the journal keeps open has not finished, so its caller is \
-             owed nothing yet: {held:?}"
+             owed no settlement yet: {held:?}"
         );
         std::thread::sleep(Duration::from_millis(25));
     }

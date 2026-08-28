@@ -67,12 +67,12 @@ not something this check answers — so a list that is a guarantee rather than a
 ceremony is one whose entries name their receivers. Give a second subdomain a
 second entry.
 
-**This check is live; the matching it demands is not.** `callback_auth:` and
-`callback_allow:` are reserved grammar in v0 (grammar §15): parsed, checked, and
-carried into the IR, and read by nothing generated yet — a built app signs no
-delivery and refuses no URL. Declaring them says what the deployment will
-enforce; anything that needs the guarantee today keeps a gateway in front, which
-is what the block below is the specification of.
+**The check and the matching are both live.** A built app signs its deliveries
+with what `callback_auth:` declares and refuses a callback URL this list admits
+nowhere — recorded as a refused delivery, visible on the execution's status
+report, never retried and never the execution's failure. So the list is the
+whole of where a signed delivery may go, and an entry left out is a receiver
+that will never be called rather than one that is called unsigned.
 
 **Or drop `callback_auth:`** when the trigger is a development or test entry
 point. Then the deployment signs nothing, claims nothing, and may POST wherever
@@ -106,5 +106,5 @@ triggers:
       - "https://hooks.example.com/*"
 ```
 
-Grammar: `docs/grammar.md` §13.3, §4.3, §15, Decision D126. Topic:
+Grammar: `docs/grammar.md` §13.3, §4.3, Decision D126, Decision D127. Topic:
 `agent-compose docs triggers`.

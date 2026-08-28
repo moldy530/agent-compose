@@ -166,6 +166,86 @@ mod tests {
         );
     }
 
+    /// **A delivery is journaled before it is attempted**
+    /// (`docs/durability.md` §3.7, PRD resolved q35).
+    ///
+    /// The inventory above is about the seven sites a *replay* consumes, and a
+    /// callback delivery is deliberately none of them: nothing in the graph
+    /// dispatches it, it is addressed by an execution and an ordinal rather
+    /// than by an instance path, and no replay ever reads it back. So it sits
+    /// in a ledger of its own — and `attemptDelivery`, the one declaration in
+    /// the emitted app that calls the world for one, is exempted from the
+    /// primitive walk above.
+    ///
+    /// An exemption with nothing else holding it is how a journaled delivery
+    /// decays into a bare `fetch`. This is what holds it, in the direction the
+    /// failure runs: the **intent** is recorded before anything is sent, and
+    /// each attempt's outcome after it — which is what makes a delivery
+    /// at-least-once across a restart rather than at-most-once inside one
+    /// process. Read off the seams rather than off the file, because the order
+    /// is what is being asserted and a file-wide search would find both calls
+    /// wherever they were.
+    #[test]
+    fn a_delivery_is_journaled_before_it_is_attempted() {
+        let serve = include_str!("js/serve.ts");
+        let document = include_str!("../../../../docs/durability.md");
+
+        let opening = function_body(serve, "opening");
+        let intent = opening
+            .find("intendDelivery(")
+            .expect("a delivery records its intent");
+        let sending = opening
+            .find("attempts(")
+            .expect("a delivery is then worked on its schedule");
+        assert!(
+            intent < sending,
+            "the intent of a delivery is recorded **before** the first attempt, or a process \
+             that dies mid-attempt leaves nothing for a later start to finish \
+             (`docs/durability.md` §3.7)"
+        );
+        assert!(
+            opening.contains("refuseDelivery("),
+            "a callback URL the allowlist admits nowhere is a recorded refusal rather than a \
+             silent drop (grammar 13.3, PRD resolved q33)"
+        );
+
+        let attempts = function_body(serve, "attempts");
+        let attempted = attempts
+            .find("attemptDelivery(")
+            .expect("the schedule makes attempts");
+        let recorded = attempts
+            .find("recordDeliveryAttempt(")
+            .expect("…and records what each one did");
+        assert!(
+            attempted < recorded,
+            "an attempt's outcome is recorded after the attempt, which is the only order that \
+             can hold one"
+        );
+
+        // …and the one place a delivery leaves the process is the declaration
+        // the walk above exempts by name, rather than wherever a later edit put
+        // a second `fetch`.
+        let sites: Vec<String> = declarations(serve)
+            .into_iter()
+            .filter(|(_, body)| body.contains("fetch("))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            sites,
+            ["attemptDelivery"],
+            "the emitted app calls the world in exactly one place, and it is the one \
+             `NOT_AN_EFFECT` names"
+        );
+
+        for named in ["`attemptDelivery`", "`src/serve.ts`", "delivery"] {
+            assert!(
+                document.contains(named),
+                "`docs/durability.md` §3.7 does not name {named}, so the ledger this test binds \
+                 is documented nowhere"
+            );
+        }
+    }
+
     /// The seven journaled seams, by the name each is declared under.
     const SEAMS: [&str; 7] = [
         "callModel",
@@ -303,14 +383,16 @@ mod tests {
         //  * `releaseExecution` — grammar 11.1's `scope: execution` lifetime,
         //    run by `runFlow` when a run ends. It removes what the run owned;
         //    running it twice removes it twice.
-        //  * `notify` — the completion webhook of an `async` `http` trigger
-        //    (grammar 13.3). It reports an execution that has **ended**, and
-        //    `settling` fires it on exactly the outcomes that close the
-        //    lifecycle row — it is skipped under `runtime.staysOpen`, which is
-        //    the same predicate the row itself is closed by. So the execution a
-        //    later process replays is one no webhook has been sent for, and the
-        //    process that finishes a run is the one that calls this, once
-        //    (`docs/durability.md` §6.1).
+        //  * `attemptDelivery` — one attempt at an `http` trigger's lifecycle
+        //    webhook (grammar 13.3, `docs/durability.md` §3.7). It is a
+        //    journaled effect, and it is **not** one of the seven: a delivery
+        //    is not something the graph dispatches, is not addressed by an
+        //    instance path, and is never consumed by a replay — it is the
+        //    *lifecycle* being reported, so it has a ledger of its own beside
+        //    `effects`. What keeps a replay from making it twice is that
+        //    ledger's own at-least-once discipline, which
+        //    `a_delivery_is_journaled_before_it_is_attempted` reads off the
+        //    same seam rather than leaving it to this exemption.
         //  * `writeTrace` — the run's own trace document, written by the command
         //    after the run (`docs/trace.md`). A resumed generation writes a fresh
         //    whole one, which is §9's promise rather than a repeat.
@@ -321,7 +403,7 @@ mod tests {
         //    journal, which is what a replay *is*.
         const NOT_AN_EFFECT: [(&str, &str); 8] = [
             ("src/stores.ts", "releaseExecution"),
-            ("src/serve.ts", "notify"),
+            ("src/serve.ts", "attemptDelivery"),
             ("src/cli.ts", "writeTrace"),
             ("src/journal.ts", "SqliteJournal"),
             ("src/journal.ts", "openJournal"),
@@ -626,7 +708,7 @@ mod tests {
         Some(name)
     }
 
-    /// The body of one exported function of an emitted module.
+    /// The body of one top-level function of an emitted module.
     ///
     /// The same reader `compose-core`'s `tests/trace_format_inventory.rs` uses,
     /// and for its reason: a rule about what one function does is only a rule if
@@ -635,12 +717,22 @@ mod tests {
     /// zero and closes on a line that is exactly `}` — which is what makes a
     /// line scan enough, and a brace count wrong: a signature's own inline
     /// object type (`request: { … }`) opens a brace before the body does.
+    ///
+    /// The four spellings are read rather than the one, because whether a
+    /// function is exported says nothing about what it does: the delivery seams
+    /// are module-internal and are as much a rule as the seven exported ones.
     fn function_body(source: &str, name: &str) -> String {
-        let header = format!("export async function {name}(");
-        let mut lines = source.lines().skip_while(|line| !line.starts_with(&header));
+        let headers = [
+            format!("export async function {name}("),
+            format!("async function {name}("),
+            format!("export function {name}("),
+            format!("function {name}("),
+        ];
+        let opens = |line: &str| headers.iter().any(|header| line.starts_with(header));
+        let mut lines = source.lines().skip_while(|line| !opens(line));
         let opened = lines
             .next()
-            .unwrap_or_else(|| panic!("the emitted module declares `{header}…`"));
+            .unwrap_or_else(|| panic!("the emitted module declares `function {name}(…`"));
         let mut held = String::from(opened);
         for line in lines {
             held.push('\n');

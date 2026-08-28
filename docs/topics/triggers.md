@@ -48,9 +48,9 @@ triggers:
     callback: "payload.body.callback_url"
 ```
 
-That `http` trigger is unauthenticated, which in v0 is a posture rather than an
+That `http` trigger is unauthenticated, which is a posture rather than an
 omission: "Authenticating an `http` trigger", below, is what a spec writes when
-it wants otherwise, and what the compiler does with it today.
+it wants otherwise, and what the generated app then enforces.
 
 ## One entry exists without being declared
 
@@ -147,15 +147,12 @@ validated against the interrupting `human` node's output schema.
 
 ## Authenticating an `http` trigger
 
-**All three keys below are reserved in v0.** `auth:`, `callback_auth:` and
-`callback_allow:` are **fully specified, parsed, type-checked, and carried into
-the IR**, and nothing generated reads them yet: a served trigger declaring
-`auth:` is exactly as open as one declaring none, and a callback still POSTs
-wherever the payload pointed. Everything below is the contract the runtime is
-written against, not what `serve` enforces today — until it lands, a deployment
-that needs these guarantees puts a gateway in front, and the block is what that
-gateway is configured to match. The closing section, "What `reserved` means", is
-the same statement once for every construct in this topic.
+**All three keys below are enforced by the generated app.** A trigger declaring
+`auth:` verifies its caller before it reads a payload, a delivery carries the
+identity `callback_auth:` declares, and a callback URL goes only where
+`callback_allow:` admits it. The credentials are `${ENV}` references the app
+resolves at process start, so a deployment missing one is refused at launch
+naming the variable rather than on its first real call.
 
 A generated app is the thing a webhook vendor calls directly, so verifying
 callers is its job rather than a gateway's. Auth is **per trigger, never
@@ -216,10 +213,10 @@ callback_allow:
 error, `missing-callback-allowlist`, not a warning. The callback URL comes from
 the payload and is attacker-controlled by construction, so a deployment careful
 enough to authenticate its deliveries must not hand them, credential and all, to
-whatever host a payload named. That compile error is live today; the matching it
-demands is not — a URL outside the list will be refused when it is read, at
-parking or settle, and recorded as a refused delivery, once the runtime reads the
-list at all.
+whatever host a payload named. A URL outside the list is refused **when it is
+read** — at a parking or at settle, not at start — and recorded as a refused
+delivery rather than as anybody's failure: nothing is sent, nothing is retried,
+and the refusal is on the execution's status report.
 
 An entry is an absolute `http`/`https` URL with `*` standing for any run of
 characters, matched against the whole callback URL. Write the scheme lowercase:
@@ -249,8 +246,12 @@ route's report plus `X-AgentCompose-Event`, `X-AgentCompose-Delivery`
 (`<execution_id>:<ordinal>`), `X-AgentCompose-Ordinal` and
 `X-AgentCompose-Timestamp`; with `callback_auth.hmac`, also
 `X-AgentCompose-Signature: sha256=<hex>`. Deliveries are journaled and
-at-least-once, so they can arrive out of order: **order by ordinal, never by
-arrival**.
+at-least-once — the intent is recorded before the first attempt, the schedule is
+five attempts across fifteen minutes, and a restarted `serve` finishes what is
+still pending — so one can arrive twice and two can arrive out of order:
+**dedupe on `X-AgentCompose-Delivery`, order by ordinal, never by arrival**. A
+delivery that exhausts its schedule is recorded and shows on the status report,
+and is never the execution's failure.
 
 Those names are the receiver's contract, so the `X-AgentCompose-` namespace is
 reserved: a `callback_auth.bearer.header:` inside it is a compile error, since
@@ -260,6 +261,44 @@ error covers the three a delivery writes without being asked — `Content-Type`,
 them all — because a token under one of those is refused before any receiver
 code runs. Inbound `auth:` may name any of them freely — that is how a trigger
 verifies deliveries from *another* agent-compose deployment.
+
+The whole surface written out, as a spec `validate` calls valid and `serve`
+enforces:
+
+```yaml spec
+version: "0.1"
+
+flow.support:
+  outputs: {}
+  nodes:
+    approve:
+      human:
+        input: {}
+        output:
+          decision: { enum: [approve, reject] }
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }
+
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+    callback_auth:
+      hmac:
+        secret: ${CALLBACK_SECRET}
+    callback_allow:
+      - "https://hooks.example.com/*"
+```
+
+`WEBHOOK_SECRET` and `CALLBACK_SECRET` are in the environment the built project
+checks at process start, so a deployment holding neither is refused before it
+serves a request — which is what `agent-compose docs targets` means by a
+statically computable credential list.
 
 ## `schedule` and `event` — reserved
 
@@ -329,50 +368,14 @@ on its runtime effect is a documented no-op.
 |---|---|
 | `triggers.<t>.type: schedule` | parsed + validated, no-op |
 | `triggers.<t>.type: event` | parsed + validated, no-op |
-| `triggers.<t>.auth` | parsed + validated, no-op — the route serves unauthenticated |
-| `triggers.<t>.callback_auth` | parsed + validated, no-op — deliveries carry no credential |
-| `triggers.<t>.callback_allow` | parsed + validated, no-op — no URL is refused |
 
-The three authentication keys are the ones worth reading twice: a no-op
-`schedule` runs nothing and is visibly inert, while a no-op `auth:` serves every
-caller and looks exactly like a guarded route. Read them as a declaration of
-what the deployment will enforce, and put a gateway in front of anything that
-needs the guarantee today.
-
-The whole surface written out is a spec `validate` calls valid and `build` owes
-a project to — which is the point of declaring it now:
-
-```yaml spec
-version: "0.1"
-
-flow.support:
-  outputs: {}
-  nodes:
-    approve:
-      human:
-        input: {}
-        output:
-          decision: { enum: [approve, reject] }
-  edges:
-    - { from: start, to: approve }
-    - { from: approve, to: end }
-
-triggers:
-  intake:
-    type: http
-    flow: flow.support
-    callback: "payload.body.callback_url"
-    auth:
-      hmac:
-        secret: ${WEBHOOK_SECRET}
-    callback_auth:
-      hmac:
-        secret: ${CALLBACK_SECRET}
-    callback_allow:
-      - "https://hooks.example.com/*"
-```
-
-Keep the block: it is what the gateway in front is configured to match, and it
-is what the release that lands the runtime reads.
+**The three authentication keys were on this list and have left it.** `auth:`,
+`callback_auth:` and `callback_allow:` are enforced by the app a build emits: a
+caller is verified, a delivery is signed, and a callback URL outside the list is
+refused. They were the rows worth reading twice while they were here — a no-op
+`schedule` runs nothing and is visibly inert, while a no-op `auth:` would serve
+every caller and look exactly like a guarded route — which is why nothing in
+this topic says so any more. `human` nodes left the same way, one milestone
+earlier.
 
 Normative source: `docs/grammar.md` §9.4, §13, §13.1–13.5, §15

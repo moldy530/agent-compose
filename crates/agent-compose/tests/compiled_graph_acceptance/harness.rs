@@ -176,7 +176,6 @@ pub const RECEIPT_BIN: &str = "RECEIPT_BIN";
 /// The file that sink appends one line to per delivery — the only account there
 /// is of a dispatch nothing waits for (grammar 8.6 rule 7).
 pub const RECEIPT_LOG: &str = "RECEIPT_LOG";
-
 /// The compiler under test.
 fn agent_compose() -> Command {
     Command::new(env!("CARGO_BIN_EXE_agent-compose"))
@@ -1515,43 +1514,91 @@ pub fn settled(app: &Client, execution: &str) -> Value {
     }
 }
 
-/// Where a `callback:` webhook is delivered: a socket that answers `200` and
-/// keeps what it was posted.
+/// One callback delivery, as its receiver saw it.
 ///
-/// The generated app POSTs its completion report to whatever URL the trigger's
-/// `callback:` CEL produced (grammar 13.3, PRD 5.11), and nothing else in this
-/// harness can receive one — [`MockProvider`] is a *provider* surface, and the
-/// served app is the thing under test. So this is the other end of the webhook:
-/// a listener a test points a `callback_url` at, which records every delivery in
-/// arrival order.
+/// The **bytes** are kept beside the decoded body because a signature is over
+/// what was sent: verifying `X-AgentCompose-Signature` against a body this
+/// harness re-serialized would be verifying a string the app never produced,
+/// which is exactly the mistake grammar 13.3 tells an implementer not to make on
+/// the inbound side.
+#[derive(Clone, Debug)]
+pub struct Delivered {
+    /// Every header, by lowercased name — the form HTTP/2 puts them in anyway.
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// The body as JSON.
+    pub body: Value,
+    /// The body as it arrived.
+    pub bytes: Vec<u8>,
+}
+
+impl Delivered {
+    /// One header by name, matched case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(&name.to_lowercase()).map(String::as_str)
+    }
+
+    /// The `X-AgentCompose-Event` this delivery reports.
+    pub fn event(&self) -> &str {
+        self.header("x-agentcompose-event")
+            .unwrap_or_else(|| panic!("a delivery names its event: {:?}", self.headers))
+    }
+}
+
+/// Where a `callback:` webhook is delivered: a socket that keeps what it was
+/// posted and answers what a test told it to.
 ///
-/// It answers `200` to anything and reads no route, because what is under test
-/// is which requests the app makes rather than what a receiver does with them.
+/// The generated app POSTs its lifecycle reports to whatever URL the trigger's
+/// `callback:` CEL produced (grammar 13.3, PRD resolved q34), and nothing else
+/// in this harness can receive one — [`MockProvider`] is a *provider* surface,
+/// and the served app is the thing under test. So this is the other end of the
+/// webhook: a listener a test points a `callback_url` at, which records every
+/// delivery in arrival order with its headers and its exact bytes.
+///
+/// It reads no route, because what is under test is which requests the app makes
+/// rather than what a receiver does with them. What it *does* decide is the
+/// **status**, because the retry schedule of `docs/durability.md` §3.7 is only
+/// observable against a receiver that refuses: [`Receiver::answer_with`] scripts
+/// a sequence and [`Receiver::always`] holds one until it is changed.
 pub struct Receiver {
     /// The base URL to build a `callback_url` from.
     pub base_url: String,
-    delivered: Arc<Mutex<Vec<Value>>>,
+    delivered: Arc<Mutex<Vec<Delivered>>>,
+    /// Statuses to answer the next requests with, oldest first.
+    script: Arc<Mutex<std::collections::VecDeque<u16>>>,
+    /// What to answer once the script is spent.
+    fallback: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Receiver {
-    /// Bind a receiver on loopback.
+    /// Bind a receiver on loopback, answering `200` until told otherwise.
     pub fn start() -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let base_url = format!("http://{}", listener.local_addr()?);
         listener.set_nonblocking(true)?;
         let delivered = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let fallback = Arc::new(AtomicU32::new(200));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let delivered = Arc::clone(&delivered);
+            let script = Arc::clone(&script);
+            let fallback = Arc::clone(&fallback);
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            if let Some(body) = deliver(&mut stream) {
-                                delivered.lock().expect("the deliveries").push(body);
+                            let answer = script
+                                .lock()
+                                .expect("the script")
+                                .pop_front()
+                                .unwrap_or_else(|| {
+                                    u16::try_from(fallback.load(Ordering::Relaxed)).unwrap_or(200)
+                                });
+                            if let Some(held) = deliver(&mut stream, answer) {
+                                delivered.lock().expect("the deliveries").push(held);
                             }
                         }
                         // Nothing has connected yet; the stop flag is read
@@ -1567,31 +1614,100 @@ impl Receiver {
         Ok(Self {
             base_url,
             delivered,
+            script,
+            fallback,
             stop,
             thread: Some(thread),
         })
     }
 
+    /// Answer the next requests with these statuses, in order, then fall back.
+    pub fn answer_with(&self, statuses: &[u16]) {
+        let mut script = self.script.lock().expect("the script");
+        script.extend(statuses.iter().copied());
+    }
+
+    /// Answer every request from now on with this status.
+    pub fn always(&self, status: u16) {
+        self.fallback.store(u32::from(status), Ordering::Relaxed);
+    }
+
     /// Every delivery so far, in arrival order.
-    pub fn delivered(&self) -> Vec<Value> {
+    pub fn delivered(&self) -> Vec<Delivered> {
         self.delivered.lock().expect("the deliveries").clone()
+    }
+
+    /// Every delivery of one lifecycle event, in arrival order.
+    ///
+    /// The filter is what keeps an assertion about *one* event honest now that a
+    /// `callback:` carries the whole lifecycle: a test that read `delivered[0]`
+    /// would be asserting about whichever event happened to be first.
+    pub fn of_event(&self, event: &str) -> Vec<Delivered> {
+        self.delivered()
+            .into_iter()
+            .filter(|held| held.event() == event)
+            .collect()
+    }
+
+    /// The **distinct delivery ids** of one event, in first-arrival order.
+    ///
+    /// What an assertion about *how many times something happened* has to count,
+    /// as against how many requests arrived. Delivery is at-least-once
+    /// (`docs/durability.md` §3.7): a process killed between its POST and the
+    /// row that records the attempt leaves the delivery `pending`, and the start
+    /// that picks it up sends the same bytes under the same
+    /// `X-AgentCompose-Delivery` again. That repeat is the contract — receivers
+    /// dedupe on the id — and counting requests instead would make a test fail
+    /// on the very behaviour it is there to protect.
+    pub fn distinct(&self, event: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for held in self.of_event(event) {
+            let id = held
+                .header("x-agentcompose-delivery")
+                .expect("a delivery names its id")
+                .to_string();
+            if !found.contains(&id) {
+                found.push(id);
+            }
+        }
+        found
     }
 
     /// Wait for `count` deliveries, or say what arrived instead.
     ///
-    /// A webhook is fired *after* the run settles, so a test that read the list
-    /// straight after a `202` would be asserting about scheduling luck.
-    pub fn wait_for(&self, count: usize, budget: Duration) -> Vec<Value> {
+    /// A webhook is fired *after* the event it reports, so a test that read the
+    /// list straight after a `202` would be asserting about scheduling luck.
+    pub fn wait_for(&self, count: usize, budget: Duration) -> Vec<Delivered> {
+        self.waiting(count, budget, |_| true, "deliveries")
+    }
+
+    /// The same, for deliveries of one lifecycle event.
+    pub fn wait_for_event(&self, event: &str, count: usize, budget: Duration) -> Vec<Delivered> {
+        self.waiting(count, budget, |held| held.event() == event, event)
+    }
+
+    fn waiting(
+        &self,
+        count: usize,
+        budget: Duration,
+        wanted: impl Fn(&Delivered) -> bool,
+        what: &str,
+    ) -> Vec<Delivered> {
         let deadline = Instant::now() + budget;
         loop {
-            let held = self.delivered();
+            let held: Vec<Delivered> = self
+                .delivered()
+                .into_iter()
+                .filter(|one| wanted(one))
+                .collect();
             if held.len() >= count {
                 return held;
             }
             assert!(
                 Instant::now() < deadline,
-                "only {} of {count} webhook deliveries arrived: {held:?}",
-                held.len()
+                "only {} of {count} `{what}` webhook deliveries arrived: {:?}",
+                held.len(),
+                self.delivered()
             );
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -1607,8 +1723,8 @@ impl Drop for Receiver {
     }
 }
 
-/// Read one HTTP request off `stream`, answer it `200`, and hand back its body.
-fn deliver(stream: &mut TcpStream) -> Option<Value> {
+/// Read one HTTP request off `stream`, answer it `status`, and hand it back.
+fn deliver(stream: &mut TcpStream, status: u16) -> Option<Delivered> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("a read budget");
@@ -1638,7 +1754,21 @@ fn deliver(stream: &mut TcpStream) -> Option<Value> {
             Ok(read) => buffer.extend_from_slice(&chunk[..read]),
         }
     }
-    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    let _ = stream.write_all(
+        format!("HTTP/1.1 {status} \r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes(),
+    );
     let start = head?;
-    serde_json::from_slice(&buffer[start..]).ok()
+    let head_text = String::from_utf8_lossy(&buffer[..start.saturating_sub(4)]).to_string();
+    let mut headers = std::collections::BTreeMap::new();
+    for line in head_text.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_lowercase(), value.trim().to_string());
+        }
+    }
+    let bytes = buffer[start..].to_vec();
+    Some(Delivered {
+        headers,
+        body: serde_json::from_slice(&bytes).ok()?,
+        bytes,
+    })
 }

@@ -34,7 +34,8 @@ project a given compiler release builds — like `src/runtime.ts` and
 
 1. [The journal is not the trace](#1-the-journal-is-not-the-trace)
 2. [Where it lives, and what a crash can leave](#2-where-it-lives-and-what-a-crash-can-leave)
-3. [What is recorded](#3-what-is-recorded)
+3. [What is recorded](#3-what-is-recorded) — including
+   [callback deliveries](#37-a-callback-delivery)
 4. [Keys](#4-keys)
 5. [Replay, and the frontier](#5-replay-and-the-frontier)
 6. [Recovery: `serve` and `resume`](#6-recovery-serve-and-resume)
@@ -197,10 +198,10 @@ outside the process. A specifier in neither class fails the test until somebody
 says which it is, and the platform globals that arrive with no import (`fetch`
 and the transports beside it) are named in the test. A handful of sites are
 exempt and each is named there with its reason: `releaseExecution`, which is
-grammar 11.1's `scope: execution` lifetime; `notify`, which fires only on the
-outcomes that close a lifecycle row (§6.1); `writeTrace`, which is the command's
-document rather than the graph's effect (§9); and the journal's own storage,
-which is the record a replay reads.
+grammar 11.1's `scope: execution` lifetime; `attemptDelivery`, which is a
+callback delivery and is journaled by the ledger of its own that §3.7 defines;
+`writeTrace`, which is the command's document rather than the graph's effect
+(§9); and the journal's own storage, which is the record a replay reads.
 
 Whatever its kind, one effect's record carries the same five things: its **key**
 (§4), the **request identity** the key's effect was issued under (§7), the
@@ -416,10 +417,10 @@ One row per execution, written before the graph is streamed:
 |---|---|
 | `id` | the execution id — what `resume` takes and what the trace's envelope carries |
 | `flow` | the flow's typed address |
-| `trigger` | what started it: `manual` for `agent-compose run` and for a `manual` trigger, an `http` trigger's own name where one did. **Recorded and never dispatched on** — resolved q28: recovery replays executions that exist, it does not re-fire the trigger that created them |
+| `trigger` | what started it: `manual` for `agent-compose run` and for a `manual` trigger, an `http` trigger's own name where one did. **Recorded and never dispatched on** — resolved q28: recovery replays executions that exist, it does not re-fire the trigger that created them. It is *read* for one thing besides diagnosis: this execution's resume and status routes enforce the `auth:` of the trigger that started it, and a `serve` restarted while somebody was thinking has no other way to know which that was (`docs/grammar.md` §13.3, PRD resolved q32) |
 | `inputs` | the invocation's inputs, as the flow's `inputs:` parsed them |
 | `sessionKey` | the session identity `scope: session` stores key off (`docs/grammar.md` §11.3) |
-| `callback` | where this execution's completion webhook goes, for an `async` `http` trigger that asked for one (`docs/grammar.md` §13.3) — absent for every other invocation. Recorded because the process that *finishes* an execution need not be the one that started it (§6.1), and resolved when the request arrives rather than when the run ends, which is what makes that possible. The URL only: the request it came out of is not kept |
+| `callback` | where this execution's lifecycle webhooks go, for an `async` `http` trigger that asked for one (`docs/grammar.md` §13.3) — absent for every other invocation. Recorded because the process that *finishes* an execution need not be the one that started it (§6.1), and resolved when the request arrives rather than when the run ends, which is what makes that possible. The URL only: the request it came out of is not kept. §3.7 is what is delivered to it |
 | `status` | `open`, `completed` or `failed` — §3.6 |
 | `journalVersion` | the version at the head of this document |
 | `startedAt`, `endedAt`, `error` | when, and why it failed |
@@ -438,6 +439,94 @@ be resumed:
   what recovery is for: the process died, or the run reached a `human` pause
   with nobody to answer it (`docs/grammar.md` §8.7) and ended `3`. The second is
   the reason an interrupt does not close the row.
+
+### 3.7 A callback delivery
+
+**Not an effect, and that is the whole shape of it.** An `http` trigger's
+`callback:` subscribes a receiver to the execution's lifecycle — every
+quiescence that opened new pauses, and settle — and each such event is delivered
+as one POST (`docs/grammar.md` §13.3, PRD resolved q34). Nothing in the
+composition dispatches one: the graph does not know the webhook exists, no
+instance path addresses it, and no replay ever consumes it. So a delivery is
+**not** an `EffectKind`, gets no §4 key, and never appears in the frontier §5
+defines. It is a second ledger beside the effects, and what it owes is
+durability rather than replay.
+
+What is recorded, and in this order (PRD resolved q35):
+
+| field | meaning |
+|---|---|
+| `execution`, `ordinal` | who it is about, and which of that execution's lifecycle events it is. The ordinal is **monotonically increasing per execution across both kinds** and is allocated in the journal, so a restart cannot reuse one |
+| `id` | `<execution_id>:<ordinal>` — the `X-AgentCompose-Delivery` header, and what a receiver dedupes on. The same on every attempt |
+| `event` | `parked` or `settled` |
+| `url` | the callback URL the request payload named, resolved when the request arrived (§3.5) |
+| `body` | the exact bytes every attempt POSTs. Bytes rather than a value, because a signature is over what is sent: a body re-serialized on a later attempt, or in a later process, would be a second delivery wearing the first one's id |
+| `pauses` | which pauses a `parked` delivery reported, by wait id; empty on a `settled` one. What keeps a **recovered** execution from re-announcing a question already asked — it re-parks under the same wait ids (§6.1), so a parking fires only where a quiescence opened a pause this set does not hold |
+| `status` | `pending`, `delivered`, `refused` or `exhausted` — below |
+| `attempts` | every attempt so far: when it was made, whether the receiver took it, and what it answered |
+| `intendedAt`, `settledAt`, `detail` | when the intent was recorded — what the schedule is measured from — when it stopped being `pending`, and why |
+
+**The intent is recorded before the first attempt.** That is what makes delivery
+at-least-once rather than at-most-once: a process that dies mid-attempt leaves a
+row a later start finishes, under the id the receiver dedupes on. The
+consequence is the one a receiver has to be built for and `docs/grammar.md`
+§13.3 states where it meets one — **a delivery can arrive twice, and two
+deliveries can arrive out of order** — so receivers dedupe on
+`X-AgentCompose-Delivery` and order on `X-AgentCompose-Ordinal`, never on
+arrival.
+
+**The retry schedule is normative**: five attempts, at **`+0s`, `+15s`, `+60s`,
+`+240s` and `+600s` from the intent**. Only a network error or a non-2xx status
+is retried; a `2xx` is delivered and stops the schedule. The offsets are
+measured from the recorded intent rather than from the last attempt, which is
+what lets a restart resume a delivery where it left off — a row with two
+attempts on it resumes at the third offset, due at `intendedAt + 60s`, which may
+already be in the past.
+
+**`AGENT_COMPOSE_CALLBACK_RETRY` overrides the schedule** with a comma-separated
+list of `docs/grammar.md` §4.4 durations — `AGENT_COMPOSE_CALLBACK_RETRY=0s,1s,2s`
+is three attempts, the first at once. It is a **diagnostic and test surface**
+rather than a deployment knob: a schedule is a promise to a receiver, and the
+one this document states is the promise. `0` is admitted where §4.4 admits none
+because the schedule's own first offset is `+0s`. A value that is not such a
+list — a duration this grammar does not spell, or an empty list — is a **usage
+error refused at launch**, naming what could not be read, rather than a setting
+nobody read (`docs/grammar.md` Decision D50).
+
+**Two ends are recorded and neither is the execution's failure.**
+
+* **`refused`** — the callback URL matched no `callback_allow:` entry. The URL
+  comes out of the request payload and is attacker-controlled by construction,
+  so it is matched **when it is read**, at the delivery rather than at the start
+  (`docs/grammar.md` §13.3, Decision D110, D127). Nothing is sent, nothing is
+  retried, and the refusal is on the status route.
+* **`exhausted`** — the schedule ran out. A webhook is a courtesy the status
+  route backstops, not a contract worth an unbounded queue.
+
+Neither reopens or fails the execution: a run that produced its outputs produced
+them, and `status` on the lifecycle row says nothing about who was told.
+
+**A restart resumes what is `pending`** (§6.1), beside the executions it
+recovers and separately from them — a delivery reports on an execution that may
+have *ended* in the process that died, so there is nothing to recover and
+something still to send.
+
+One case is left undelivered rather than sent, and it is the mirror of §6.1's
+open execution of a flow this build no longer declares: a delivery whose
+**trigger** the composition no longer declares. This build cannot know what
+identity that trigger's `callback_auth:` promised its receiver, and delivering
+without it is a request a receiver written against the promise refuses — or
+worse, accepts. So the row stays `pending` for a build that declares the
+trigger, and the reason is written on stderr.
+
+**Where it is implemented.** `deliver`, `opening`, `attempts` and
+`attemptDelivery` in the emitted `src/serve.ts`, over the delivery interface of
+`src/journal.ts`. `attemptDelivery` is the one declaration in the emitted app
+that reaches the network for a delivery, which is why §3's primitive walk names
+it as an exemption and
+`crates/compose-core/src/codegen/journal.rs`'s
+`a_delivery_is_journaled_before_it_is_attempted` binds the order this section
+states.
 
 ## 4. Keys
 
@@ -571,10 +660,20 @@ on:
 
 * an execution parked on a `human` wait **re-parks under the same wait id**, so
   a `POST /executions/:id/resume` prepared against the process that died still
-  finds its wait;
+  finds its wait — and, because the row records which trigger started the
+  execution (§3.5), that resume is verified against **that trigger's** `auth:`
+  in the new process exactly as it was in the old one
+  (`docs/grammar.md` §13.3, PRD resolved q32);
+* every delivery the journal holds `pending` is **picked up** (§3.7), beside the
+  executions and separately from them: a delivery reports on an execution that
+  may have ended in the process that died, and its remaining schedule is
+  computed from the recorded intent rather than started again;
+* an execution that re-parks under wait ids a `parked` delivery already reported
+  fires **no** parking webhook: re-parking is what recovery is, and nothing was
+  asked that had not been asked (PRD resolved q35);
 * the status route answers for a recovered execution exactly as it answers for
   one this process started, and a recovered execution that finishes **delivers
-  the `callback:` webhook** its request asked for — the URL is on the lifecycle
+  the `settled` webhook** its request asked for — the URL is on the lifecycle
   row (§3.5), because a caller who was handed a `202` and is waiting for a push
   is not polling the status route. *Finishes* is the word: the webhook fires on
   exactly the outcomes that **close the row**, so a replay that leaves the
@@ -775,7 +874,13 @@ project's stores.** It holds, by construction:
 * model completions in full;
 * what a model sent a tool, and what the tool answered;
 * what a store read and what it wrote;
-* **what a person answered a `human` node**.
+* **what a person answered a `human` node**;
+* the **body of every callback delivery** (§3.7), which is the status route's
+  report and so carries an execution's outputs and its open questions. Kept
+  because a retry must send the bytes the first attempt signed, and no longer:
+  what `callback_auth:` resolved — the token a delivery carried, the key it was
+  signed with — is never written down, and neither is the request the callback
+  URL was read out of.
 
 `docs/trace.md` §11 keeps every one of those out of the trace, and this document
 does not weaken that rule by a word: the two artifacts are separate files with
@@ -878,7 +983,10 @@ At a given `JOURNAL_VERSION`:
 * every field this document names, under the name and with the meaning given
   here;
 * the key derivation of §4, and the vocabulary of `EffectKind`;
-* the `status` vocabulary of §3.6;
+* the `status` vocabulary of §3.6, and the `DeliveryEvent` and `DeliveryStatus`
+  vocabularies of §3.7;
+* the delivery id derivation of §3.7 — `<execution_id>:<ordinal>` — and that a
+  retry of one delivery carries the id and the metadata its first attempt did;
 * that a record's payload round-trips: a value written by one generation is the
   value the next one is handed. Both ends of that: a payload is stored as
   canonical JSON, so the generation that *recorded* it goes on with the round
@@ -900,6 +1008,17 @@ Made **without** a version bump: adding a field to a record type; adding a new
 `EffectKind` whose absence in an older journal is simply a frontier; improving
 the text of a diagnostic; changing the physical SQLite schema in a way that
 reads older files.
+
+The **delivery ledger** (§3.7) arrived under that last clause, and it is worth
+saying why rather than leaving it to be inferred from the version this document
+still heads with. A journal written before it opens unchanged — the table is
+created on first open, as `CREATE TABLE IF NOT EXISTS` — and an execution open
+in such a file replays *identically*, because a delivery is not an effect, holds
+no §4 key, and is never consumed by a replay: nothing about the frontier moves,
+which is the failure §11.3's last bullet is about. What such an execution does
+not have is a record of the deliveries an older build never made, so its first
+parking under this build announces the pauses it is holding. That is a webhook a
+receiver dedupes or ignores, not a replay that re-issues an effect.
 
 ### 11.3 What requires a version bump
 

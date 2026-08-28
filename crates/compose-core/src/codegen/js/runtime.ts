@@ -87,7 +87,15 @@ import {
   refuseRecorded,
   replayedFailure,
 } from "./journal.ts";
-import type { EffectRecorder, ExecutionRow, Journal } from "./journal.ts";
+import type {
+  DeliveryAttempt,
+  DeliveryIntent,
+  DeliveryRecord,
+  DeliveryStatus,
+  EffectRecorder,
+  ExecutionRow,
+  Journal,
+} from "./journal.ts";
 
 export {
   JOURNAL_VERSION,
@@ -98,7 +106,17 @@ export {
   latchedDivergence,
   openJournal,
 } from "./journal.ts";
-export type { EffectKind, ExecutionRow, Journal, JournalRecord } from "./journal.ts";
+export type {
+  DeliveryAttempt,
+  DeliveryEvent,
+  DeliveryIntent,
+  DeliveryRecord,
+  DeliveryStatus,
+  EffectKind,
+  ExecutionRow,
+  Journal,
+  JournalRecord,
+} from "./journal.ts";
 
 // ---------------------------------------------------------------------------
 // Failures
@@ -7949,6 +7967,65 @@ export async function journaledExecution(id: string): Promise<ExecutionRow | und
 export async function openExecutions(): Promise<readonly ExecutionRow[]> {
   if (!journalExists()) return [];
   return (await openJournal()).openExecutions();
+}
+
+// ---------------------------------------------------------------------------
+// The delivery ledger (grammar 13.3, PRD resolved q34, q35)
+// ---------------------------------------------------------------------------
+//
+// `src/serve.ts` is what *makes* a delivery; these are what record it. They are
+// here rather than reached for directly because the emitted import graph has
+// one shape — `serve.ts` → `runtime.ts` → `journal.ts` — and the four
+// lifecycle-row readers above already keep it (see [`journaledExecution`]).
+
+/**
+ * Record the intent to deliver one lifecycle webhook, allocating its ordinal.
+ *
+ * Before any attempt, which is what makes the delivery at-least-once: a process
+ * that dies mid-attempt leaves a row a later start finishes, under the delivery
+ * id the receiver dedupes on (resolved q35).
+ */
+export async function intendDelivery(intent: DeliveryIntent): Promise<DeliveryRecord> {
+  return (await openJournal()).intendDelivery(intent);
+}
+
+/**
+ * Record a delivery `callback_allow:` refused, which is one nothing was sent
+ * for (grammar 13.3, Decision D127).
+ */
+export async function refuseDelivery(
+  intent: DeliveryIntent,
+  reason: string,
+): Promise<DeliveryRecord> {
+  return (await openJournal()).refuseDelivery(intent, reason);
+}
+
+/** Record what one attempt did, and where the delivery stands after it. */
+export async function recordDeliveryAttempt(
+  execution: string,
+  ordinal: number,
+  attempt: DeliveryAttempt,
+  status: DeliveryStatus,
+): Promise<void> {
+  (await openJournal()).recordAttempt(execution, ordinal, attempt, status);
+}
+
+/**
+ * Every delivery one execution has, by ordinal.
+ *
+ * Read by the status route, which is what makes a refused or exhausted
+ * delivery visible rather than silent (resolved q33, q35), and by the parking
+ * webhook, which reads the pauses earlier deliveries already reported.
+ */
+export async function deliveriesOf(execution: string): Promise<readonly DeliveryRecord[]> {
+  if (!journalExists()) return [];
+  return (await openJournal()).deliveries(execution);
+}
+
+/** Every delivery still owed an attempt — what a restarted `serve` picks up. */
+export async function undeliveredDeliveries(): Promise<readonly DeliveryRecord[]> {
+  if (!journalExists()) return [];
+  return (await openJournal()).undelivered();
 }
 
 /** The graph state a node reads: the composition's channels, plus `$run`. */

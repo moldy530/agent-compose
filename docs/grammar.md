@@ -3906,14 +3906,12 @@ a flow input field can accept it.
 - Generated apps expose `start`, `resume`, and `status` routes; resume payloads
   are validated against the interrupting `human` node's output schema (PRD 5.11).
 
-**`auth:`, `callback_auth:` and `callback_allow:` are reserved grammar in v0**
-(§15): fully specified here, parsed, checked, and carried into the IR, and read
-by nothing the compiler generates yet. A served trigger declaring `auth:` is
-exactly as open as one declaring none, and a callback is still delivered to
-whatever URL the payload named. Everything the rest of §13.3 states in the
-present tense is what the M3 runtime is written against — a deployment that
-needs the guarantee before then keeps its gateway, and the block is the
-specification that gateway is configured to match.
+**`auth:`, `callback_auth:` and `callback_allow:` are enforced by the generated
+app.** A served trigger declaring `auth:` verifies its caller before it reads a
+payload; a delivery carries the identity `callback_auth:` declares and goes only
+where `callback_allow:` admits it. Everything the rest of §13.3 states in the
+present tense is what a built project does, and the launch-time environment
+check refuses a deployment missing any credential these blocks name (§4.3).
 
 **Authenticating the caller: `auth:`.** v0's posture was "deploy behind your own
 gateway". Webhook-style events make the generated app the thing a vendor calls
@@ -4105,11 +4103,12 @@ Outbound `hmac:` takes **no** keys but `secret:`: signing is fixed at
 HMAC-SHA256 written in hex, so one receiver-side recipe verifies every
 agent-compose deployment. Deliveries are journaled and at-least-once with bounded
 retry, so a parking delivery and a settle delivery **can arrive out of order**:
-receivers order by `X-AgentCompose-Ordinal`, never by arrival (PRD resolved q35).
+receivers order by `X-AgentCompose-Ordinal`, never by arrival, and dedupe on
+`X-AgentCompose-Delivery` (PRD resolved q35).
 
-The runtime half of all of this — verifying, signing, matching, delivering — is
-M3's; §13.3 is the grammar it is written against, and §15 lists the three keys
-among the constructs a v0 deployment must not rely on.
+The retry schedule, what a refused or exhausted delivery leaves behind, and what
+a restarted `serve` picks up are `docs/durability.md` §3.7's, which is normative
+for the delivery ledger the way §13.3 is normative for the wire.
 
 ### 13.4 `schedule` (RESERVED grammar — parsed and validated, no-op in v0)
 
@@ -4286,42 +4285,39 @@ its runtime effect is a documented no-op (PRD 5.10, 5.11).
 | `triggers.<t>.type: schedule` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: event` | parsed + validated, no-op | M3 |
 | `network:` on a placement | parsed, no-op | M3 |
-| `triggers.<t>.auth` | parsed + validated, no-op — the route serves unauthenticated | M3 |
-| `triggers.<t>.callback_auth` | parsed + validated, no-op — deliveries carry no credential | M3 |
-| `triggers.<t>.callback_allow` | parsed + validated, no-op — no callback URL is refused | M3 |
 
-The last three rows are the ones that read differently from the rest, and §13.3
-says so where it specifies them. A no-op `schedule` runs nothing, which is
-visible the first morning it does not fire; a no-op `auth:` **serves every
-caller** and is indistinguishable, from outside, from a guarded route. The keys
-are a declaration of what a deployment will enforce, so anything that needs the
-guarantee before M3 puts a gateway in front of the generated app.
+**Two constructs have left this list, and both left it by their runtime
+landing.**
 
-A wrong claim about a security control is worse than a missing one, and this one
-has to be retracted in the same change that makes it false — so it is bound to
-the compiler's behaviour rather than left to a reviewer's memory:
-`crates/compose-core/tests/trigger_auth_surface.rs` asserts that a built project
-carries **none** of an authenticated trigger's material, and enumerates every
-document repeating the claim — here, §13.3, both topics, and the
-`missing-callback-allowlist` explanation. The commit that teaches `serve` to
-verify a caller fails that test until those sentences go with it.
+`human` nodes were here until M2: a compiled project really pauses, publishes
+the question, and resumes (§8.7), and its waits now survive a restart as well —
+a resumed execution re-parks under the same wait id and reads its answers out of
+the journal (`docs/durability.md`).
 
-One **code** site is on the retraction list beside the documents, because what
-holds there today is an absence rather than a sentence:
-`crates/compose-core/src/codegen/env.rs` builds `src/env.ts` by walking
-`definitions` and the deploy layer, never `triggers`, so an authenticated
-trigger's four `${ENV}` references reach no generated file — consistent while
-the keys are inert, and wrong the moment `serve` reads one. §4.3's promise is
-that the variables a deployment needs are computable from the artifact
-statically; a runtime that read `process.env.WEBHOOK_TOKEN` without teaching
-that walk the same name would let a deployment missing the variable start clean
-and fail on every real delivery instead.
+**The three authentication keys were here until the http-native events pass**,
+and they are the ones that read differently from every other row, which is why
+their retraction is bound rather than remembered. A no-op `schedule` runs
+nothing, which is visible the first morning it does not fire; a no-op `auth:`
+would **serve every caller** and be indistinguishable, from outside, from a
+guarded route — a wrong claim about a security control is worse than a missing
+one, in both directions. So `crates/compose-core/tests/trigger_auth_surface.rs`
+now asserts the opposite of what it used to: that an authenticated trigger's
+material really does reach the generated project, that its credentials reach the
+environment manifest `src/env.ts` builds, and that the documents which once
+called the surface inert say it is enforced. A change that made these keys inert
+again fails there rather than shipping a `docs triggers` that promises a
+guarantee the app does not keep.
 
-`human` nodes were on this list and have left it: the runtime landed in M2, so a
-compiled project really pauses, publishes the question, and resumes (§8.7). What
-is still deferred is not the construct but its **durability** — a wait is a
-parked promise in the serving process rather than a checkpoint, and survives no
-restart until durable execution arrives in M3.
+The environment manifest is the half of that with no sentence to bind:
+`crates/compose-core/src/codegen/env.rs` walks `ir.triggers` beside the
+definitions and the deploy layer, so an authenticated trigger's four `${ENV}`
+references — `auth.bearer.token`, `auth.hmac.secret`,
+`callback_auth.bearer.token`, `callback_auth.hmac.secret` — are in the list
+`readEnvironment()` checks at process start. §4.3's promise is that the
+variables a deployment needs are computable from the artifact statically, and a
+runtime reading `process.env.WEBHOOK_TOKEN` that the walk did not know about
+would let a deployment missing the variable start clean and then refuse every
+real call.
 
 ---
 

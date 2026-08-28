@@ -23,15 +23,20 @@
 //! the grammar's rule rather than a framework default the pin merely freezes
 //! (see `decodeBodies` in `js/serve.ts`).
 //!
-//! # What this milestone's app does not do
+//! # What the app tracks, and what the journal does
 //!
-//! Executions are tracked **in this process**: PRD §7 puts durable execution and
-//! checkpointers in M3, so a status route answers `404` for an id this process
-//! did not start, and the sync-timeout upgrade of grammar 13.3 continues the same
-//! in-process execution rather than resuming a checkpointed one. `resume` is
-//! routed, validates that the execution exists, and then reports the one thing it
-//! cannot do — an interrupt is the only thing there is to resume from, and PRD
-//! §9's resolved question 4 schedules the `human` node runtime for M2.
+//! The **reports** are this process's: a status route answers `404` for an id
+//! neither this process nor the journal knows, and nothing is evicted. The
+//! *executions* are not — every one is journaled as it goes and every open one
+//! is replayed at start (PRD resolved q26–q29), which is what makes a `resume`
+//! prepared against a process that died answer in the one that replaced it.
+//!
+//! The app is also where three of grammar 13.3's guarantees are kept, because
+//! all three are properties of a request rather than of a graph: a trigger's
+//! `auth:` verifying its caller, the same guard covering the resume and status
+//! routes of every execution that trigger started, and the lifecycle webhooks a
+//! `callback:` subscribes to — signed, allowlisted, and journaled as
+//! at-least-once deliveries (PRD resolved q32–q35, `docs/durability.md` §3.7).
 
 use crate::ir::Ir;
 
