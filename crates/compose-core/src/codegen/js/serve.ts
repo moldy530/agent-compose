@@ -1192,7 +1192,7 @@ function settling(execution: Execution, run: Promise<FlowRun>): Promise<void> {
       // since started requiring, a journal that could not be opened. No row
       // means no start will ever recover it, so the caller holding a `202` is
       // owed the failure now and this process is the only one that can push it.
-      if (await unjournaled(execution.id)) deliver(execution, "settled", []);
+      if (await unjournaled(execution.id)) void deliver(execution, "settled", []);
     });
 }
 
@@ -1353,12 +1353,54 @@ function parking(execution: Execution): void {
   if (!quiescent(execution.id)) return;
   const open = humanWaits(execution.id).map((wait) => wait.id);
   if (open.length === 0 || open.every((id) => execution.reported.has(id))) return;
+  // Marked **before** the journaling below rather than after it, because the
+  // guard above is synchronous and the journaling is not: a second quiescence
+  // arriving while the intent is still being written would find nothing reported
+  // and take a second delivery of one set. [`announcing`] is what takes the
+  // marks off again where the journal will not hold the row they stand for.
   for (const id of open) execution.reported.add(id);
-  deliver(execution, "parked", open);
+  void announcing(execution, open);
 }
 
 /**
- * Put one lifecycle event on this execution's delivery chain.
+ * Journal one parking's intent, and leave nothing marked as announced that the
+ * journal does not hold.
+ *
+ * The marks [`parking`] puts on are this process's reading of the `pauses` on
+ * the delivery rows — a later start reads them straight back off those rows
+ * ([`announced`]) — so a parking the journal would not take is a parking
+ * nothing announced. Left marked it would be announced *never*: every later
+ * quiescence of this execution finds the set already reported, and a receiver
+ * that subscribed to the question hears only the settle.
+ *
+ * What is retried here is the **journaling**, not the delivery: a row that was
+ * written has a schedule of its own ([`attempts`]) and this is only about
+ * getting one written. It is retried at all because nothing else would come
+ * back to it — an execution that has parked is waiting on a person, so the
+ * quiescence that reached [`parking`] is the last event it raises until somebody
+ * answers, and by then the question is closed and was never asked. Bounded for
+ * `docs/durability.md` §3.7's reason: a webhook is a courtesy the status route
+ * backstops, so the ladder's end is the marks coming off, never a queue that
+ * grows.
+ */
+async function announcing(execution: Execution, open: readonly string[]): Promise<void> {
+  for (let index = 0; ; index += 1) {
+    if (await deliver(execution, "parked", open)) return;
+    const wait = JOURNAL_RETRY_MS[index];
+    // Every round has already said its own reason on stderr ([`deliver`]).
+    if (wait === undefined) break;
+    await pause(wait);
+    // A run that has stopped is one [`closed`] has already reported on, and the
+    // report it carries is the settle. Announcing a `parked` event off it would
+    // push a body saying `completed` with no `interrupts` in it at all.
+    if (execution.status !== "running") break;
+  }
+  for (const id of open) execution.reported.delete(id);
+}
+
+/**
+ * Put one lifecycle event on this execution's delivery chain, and say whether
+ * the journal took its intent.
  *
  * The **ordinal** is what a receiver orders by (grammar 13.3), so allocating it
  * is serialized per execution; the attempts are not, because a delivery that is
@@ -1384,17 +1426,20 @@ function deliver(
   execution: Execution,
   event: runtime.DeliveryEvent,
   pauses: readonly string[],
-): Promise<void> {
+): Promise<boolean> {
   const url = execution.callback;
-  if (url === undefined) return execution.deliveries;
+  // Nothing is owed and nothing failed: an execution nobody subscribed to has
+  // no delivery to journal.
+  if (url === undefined) return execution.deliveries.then(() => true);
   const body = report(execution);
   // The chain below is what awaits it. A handler is attached here so that a
   // journal failure inside `report` is not an unhandled rejection for as long as
   // the chain is still ahead of it — the rejection still reaches [`opening`],
   // and the `catch` below still says it.
   body.catch(() => undefined);
-  execution.deliveries = execution.deliveries
+  const journaled = execution.deliveries
     .then(() => opening(execution, event, pauses, url, body))
+    .then(() => true)
     .catch((error: unknown) => {
       // A delivery that could not even be *recorded* is not the execution's
       // failure — the run has produced whatever it produced and the status
@@ -1403,8 +1448,13 @@ function deliver(
       process.stderr.write(
         `\`${execution.id}\`'s \`${event}\` webhook could not be journaled: ${message(error)}\n`,
       );
+      return false;
     });
-  return execution.deliveries;
+  // The chain carries no answer and never rejects: what it orders is the
+  // *allocation* of ordinals, and a round that failed to allocate one still has
+  // to let the next event through.
+  execution.deliveries = journaled.then(() => undefined);
+  return journaled;
 }
 
 /**
@@ -1569,6 +1619,14 @@ function credentialed(url: string): boolean {
  * **One loop per delivery in one process**, which is what [`working`] says. Two
  * of them over one row would POST it twice and then disagree in the journal
  * about what the receiver did with it.
+ *
+ * **An attempt the journal would not take is carried, never dropped.** `attempts`
+ * on the row is the one thing a later start reads to decide how much of the
+ * schedule is left, so a row that under-counts them is a delivery that makes
+ * more POSTs than §3.7 bounds it to — and one still `pending` when its schedule
+ * is spent is a webhook the status route reports as owed for the life of the
+ * journal. See [`journaling`] for what carries them and [`insisting`] for the
+ * write nothing else comes back to.
  */
 async function attempts(record: runtime.DeliveryRecord, trigger: HttpTrigger): Promise<void> {
   if (working.has(record.id)) return;
@@ -1577,47 +1635,121 @@ async function attempts(record: runtime.DeliveryRecord, trigger: HttpTrigger): P
     const schedule = retrySchedule();
     const intended = Date.parse(record.intendedAt);
     if (record.attempts.length >= schedule.length) {
-      try {
-        await exhaustRecordedDelivery(
-          record.execution,
-          record.ordinal,
-          `the schedule this process runs under names ${schedule.length} attempt${
-            schedule.length === 1 ? "" : "s"
-          } and ${record.attempts.length} were already made`,
-        );
-      } catch (error) {
-        process.stderr.write(
-          `\`${record.id}\`'s exhaustion could not be journaled: ${message(error)}\n`,
-        );
-      }
+      const spent = `the schedule this process runs under names ${schedule.length} attempt${
+        schedule.length === 1 ? "" : "s"
+      } and ${record.attempts.length} were already made`;
+      await insisting(async () => {
+        try {
+          await exhaustRecordedDelivery(record.execution, record.ordinal, spent);
+          return true;
+        } catch (error) {
+          process.stderr.write(
+            `\`${record.id}\`'s exhaustion could not be journaled: ${message(error)}\n`,
+          );
+          return false;
+        }
+      });
       return;
     }
+    const owed: runtime.DeliveryAttempt[] = [];
     for (let index = record.attempts.length; index < schedule.length; index += 1) {
       await pause(intended + (schedule[index] ?? 0) - Date.now());
       const outcome = await attemptDelivery(record, trigger);
-      const last = index === schedule.length - 1;
-      try {
-        await recordDeliveryAttempt(
-          record.execution,
-          record.ordinal,
-          {
-            at: new Date().toISOString(),
-            outcome: outcome.ok ? "delivered" : "failed",
-            detail: outcome.detail,
-          },
-          outcome.ok ? "delivered" : last ? "exhausted" : "pending",
-        );
-      } catch (error) {
-        process.stderr.write(
-          `\`${record.id}\`'s attempt could not be journaled: ${message(error)}\n`,
-        );
+      owed.push({
+        at: new Date().toISOString(),
+        outcome: outcome.ok ? "delivered" : "failed",
+        detail: outcome.detail,
+      });
+      if (!outcome.ok && index < schedule.length - 1) {
+        // Mid-schedule the next attempt's write is what carries whatever this
+        // one could not put down, and it is due at the next offset anyway — so
+        // this is tried once and no more.
+        await journaling(record, owed, "pending");
+        continue;
       }
-      if (outcome.ok) return;
+      // The schedule stops here, delivered or exhausted, and nothing in this
+      // process comes back to the row afterwards. So this write is insisted on
+      // rather than tried: it is the one that gives the row one of §3.7's two
+      // ends, and the one that tells a later start how many attempts this
+      // delivery really made.
+      await insisting(() => journaling(record, owed, outcome.ok ? "delivered" : "exhausted"));
+      return;
     }
   } finally {
     working.delete(record.id);
   }
 }
+
+/**
+ * Put the attempts this delivery has made and the journal has not taken onto its
+ * row, ending it where the schedule ends, and say whether the journal took them
+ * all.
+ *
+ * Every attempt but the last is written `pending`, because that is what the row
+ * was after it: `status` states where the delivery stands after its **latest**
+ * attempt, and the latest is the one this call ends on. What lands is dropped
+ * from `owed` and what does not is left there for the next call, which is how a
+ * journal that is briefly not there costs a row nothing but the moment.
+ */
+async function journaling(
+  record: runtime.DeliveryRecord,
+  owed: runtime.DeliveryAttempt[],
+  status: runtime.DeliveryStatus,
+): Promise<boolean> {
+  // The oldest first, and read afresh each round because the round before it
+  // took one off: the condition is "there is one still owed" written as the one
+  // thing that answers it.
+  for (let attempt = owed[0]; attempt !== undefined; attempt = owed[0]) {
+    try {
+      await recordDeliveryAttempt(
+        record.execution,
+        record.ordinal,
+        attempt,
+        owed.length === 1 ? status : "pending",
+      );
+    } catch (error) {
+      process.stderr.write(
+        `\`${record.id}\`'s attempt could not be journaled: ${message(error)}\n`,
+      );
+      return false;
+    }
+    owed.shift();
+  }
+  return true;
+}
+
+/**
+ * Make one journal write, waiting out a journal that is briefly not there.
+ *
+ * The writes this is for are the ones **nothing comes back to**: the end of a
+ * delivery's schedule, and the intent of a parking whose execution is now
+ * waiting on a person ([`announcing`], which runs its own ladder because the
+ * body it would resend has to be taken again each round). Every other write in
+ * this file is followed by another that would carry it.
+ *
+ * The `write` says whether it landed rather than raising, because each of them
+ * has its own sentence for a reader and says it itself.
+ */
+async function insisting(write: () => Promise<boolean>): Promise<boolean> {
+  for (let index = 0; ; index += 1) {
+    if (await write()) return true;
+    const wait = JOURNAL_RETRY_MS[index];
+    if (wait === undefined) return false;
+    await pause(wait);
+  }
+}
+
+/**
+ * The waits between one journal write's rounds, in milliseconds.
+ *
+ * Short and few, and what they are for is a journal held for a moment by a
+ * second process on the same project or a disk momentarily full
+ * (`docs/durability.md` §2) — not a journal that is gone. Bounded like every
+ * other ladder here: a webhook is a courtesy the status route backstops (§3.7),
+ * so the end of this one is a sentence on stderr rather than a retry that never
+ * stops.
+ */
+const JOURNAL_RETRY_MS: readonly number[] = [250, 1_000, 5_000];
 
 /**
  * The deliveries this process is working, by delivery id.

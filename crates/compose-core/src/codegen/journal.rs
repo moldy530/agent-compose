@@ -214,12 +214,17 @@ mod tests {
             .find("attemptDelivery(")
             .expect("the schedule makes attempts");
         let recorded = attempts
-            .find("recordDeliveryAttempt(")
+            .find("journaling(")
             .expect("…and records what each one did");
         assert!(
             attempted < recorded,
             "an attempt's outcome is recorded after the attempt, which is the only order that \
              can hold one"
+        );
+        assert!(
+            function_body(serve, "journaling").contains("recordDeliveryAttempt("),
+            "the seam `attempts` hands its outcomes to no longer reaches the journal, so an \
+             attempt is made and recorded nowhere (`docs/durability.md` §3.7)"
         );
 
         // …and the one place a delivery leaves the process is the declaration
@@ -314,6 +319,108 @@ mod tests {
                  {statement}"
             );
         }
+    }
+
+    /// **A journal write that fails loses neither the event nor the row's end**
+    /// (`docs/durability.md` §3.7).
+    ///
+    /// The two siblings above bind the *order* of a delivery's journal writes
+    /// and *who* may make them. This binds the third thing, which is what
+    /// happens when one of them does not land — a second process holding the
+    /// file past the lock wait, a disk momentarily full, both states §2 says a
+    /// healthy deployment reaches. Neither of the two failures it prevents is
+    /// visible from outside the process, and both are silent for the life of a
+    /// journal:
+    ///
+    ///  * a **parking announced to nobody**. `parking` marks a quiescence's
+    ///    pauses as reported before the intent is journaled, because the guard
+    ///    it marks them for is synchronous. Marked and then not journaled, every
+    ///    later quiescence of that execution finds the set already reported —
+    ///    and a receiver that subscribed to the question is told about the
+    ///    settle and never about the question, which under `respond: async` is
+    ///    the whole of what it was subscribed for.
+    ///  * a **row left `pending` past its schedule**. An attempt whose outcome
+    ///    the journal would not take leaves the row under-counting its attempts,
+    ///    and `attempts` on the row is the one thing a later start reads to
+    ///    decide how much of the schedule is left: the status route reports the
+    ///    execution as owing a webhook for ever, and the next start resumes the
+    ///    delivery below the offset it really reached and POSTs past the bound
+    ///    §3.7 calls normative.
+    ///
+    /// So both are read off the seams: the marks come back off where the intent
+    /// did not go down, and an attempt the journal refused is **carried** rather
+    /// than dropped — kept for the write that does land, and insisted on where
+    /// nothing later would come back to it.
+    #[test]
+    fn a_write_the_journal_refuses_leaves_neither_a_lost_event_nor_a_row_that_never_ends() {
+        let serve = include_str!("js/serve.ts");
+
+        let parking = function_body(serve, "parking");
+        assert!(
+            parking.contains("execution.reported.add(") && parking.contains("announcing("),
+            "a parking marks its pauses and hands the journaling to the seam that can put the \
+             marks back, or a failed intent is a question announced to nobody"
+        );
+        assert!(
+            !parking.contains("deliver("),
+            "`parking` journals its intent directly again, so nothing observes whether the \
+             journal took it and the marks it left stand for a row that does not exist"
+        );
+
+        let announcing = function_body(serve, "announcing");
+        let asked = announcing
+            .find("deliver(")
+            .expect("`announcing` is what journals a parking's intent");
+        let unmarked = announcing
+            .find("execution.reported.delete(")
+            .expect("…and what puts the pauses back where the journal would not take it");
+        assert!(
+            asked < unmarked,
+            "the marks come off **after** the journal has refused the intent, not before it is \
+             offered one"
+        );
+        assert!(
+            function_body(serve, "deliver").contains("return false;"),
+            "`deliver` no longer answers whether the journal took the intent, so `announcing` \
+             cannot tell a parking that was recorded from one that was lost"
+        );
+
+        let attempts = function_body(serve, "attempts");
+        let held = attempts
+            .find("owed.push(")
+            .expect("an attempt's outcome is held before it is written");
+        let written = attempts
+            .find("journaling(")
+            .expect("…and then offered to the journal");
+        assert!(
+            held < written,
+            "an attempt is recorded in this process before it is offered to the journal, which \
+             is what lets the next write carry what this one could not put down"
+        );
+        assert!(
+            attempts.contains("insisting("),
+            "the write that ends a delivery is the one nothing comes back to, so it is insisted \
+             on rather than tried once: a row left `pending` past its schedule is neither of \
+             §3.7's two ends"
+        );
+
+        let journaling = function_body(serve, "journaling");
+        let refused = journaling
+            .find("return false;")
+            .expect("`journaling` says when the journal would not take an attempt");
+        let dropped = journaling
+            .find("owed.shift()")
+            .expect("…and drops an attempt only once it is down");
+        assert!(
+            refused < dropped,
+            "an attempt the journal refused is dropped anyway, so the row under-counts its \
+             attempts and the next start POSTs past the bound §3.7 states"
+        );
+        assert!(
+            function_body(serve, "insisting").contains("JOURNAL_RETRY_MS["),
+            "the ladder a refused write is retried on is unbounded, which is a queue rather \
+             than the courtesy §3.7 calls a webhook"
+        );
     }
 
     /// The seven journaled seams, by the name each is declared under.
