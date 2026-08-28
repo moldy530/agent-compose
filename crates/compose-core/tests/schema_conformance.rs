@@ -561,10 +561,14 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
 /// Grammar 13.3's authentication surface in the direction the negative corpus
 /// cannot reach: the shapes the schema must **accept**.
 ///
-/// Nine fixtures under `invalid-schema/` pin the refusals, and every one of them
-/// is a conditional — a `oneOf`, an `anyOf`, two `if`/`then` pairs — where the
-/// accepting direction is the one that breaks silently. Tighten `callbackAuth`'s
-/// `anyOf` into `inboundAuth`'s `oneOf` by a copy-paste slip and the schema
+/// The `trigger-auth-*`, `trigger-callback-*` and `trigger-hmac-*` fixtures
+/// under `invalid-schema/` pin the refusals — the env-ref rule on every secret,
+/// the header and prefix shapes, the closed sets of `algorithm:`/`encoding:`,
+/// the allowlist entry pattern, and four conditionals: `inboundAuth`'s `oneOf`,
+/// `callbackAuth`'s `anyOf`, and the two `if`/`then` pairs that bind the
+/// callback keys. The conditionals are where the accepting direction breaks
+/// silently. Tighten `callbackAuth`'s `anyOf` into `inboundAuth`'s `oneOf` by a
+/// copy-paste slip and the schema
 /// refuses a trigger that signs *and* tokens its deliveries, which resolved q33
 /// spells "and/or"; hoist `callback_allow` out of its `if` and the schema
 /// refuses every unauthenticated callback, which is the documented test posture.
