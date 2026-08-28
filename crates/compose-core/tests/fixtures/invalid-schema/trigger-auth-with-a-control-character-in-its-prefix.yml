@@ -1,0 +1,11 @@
+# rule: an `auth:` `prefix:` is written into a header value, so a carriage return in it ends the field and begins another (grammar 13.3)
+# at: /triggers/intake/auth/hmac/prefix
+# via: /$defs/inboundHmac/properties/prefix/allOf/1/pattern
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        prefix: "sha256=\r\nX-Injected: 1"

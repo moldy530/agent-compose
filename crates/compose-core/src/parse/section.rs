@@ -563,7 +563,8 @@ fn auth_scheme(
                 .and_then(|node| lexical::env_ref(node, "`secret`", cx));
             let header = scheme
                 .take("header")
-                .and_then(|node| lexical::non_empty_text(node, "`header`", cx));
+                .and_then(|node| lexical::non_empty_text(node, "`header`", cx))
+                .filter(|header| header_shape(header, cx));
             let algorithm = scheme
                 .take("algorithm")
                 .and_then(|node| lexical::keyword(node, "`algorithm`", HMAC_ALGORITHMS, cx));
@@ -574,7 +575,8 @@ fn auth_scheme(
             // read as plain text rather than as a non-empty value.
             let prefix = scheme
                 .take("prefix")
-                .and_then(|node| lexical::text(node, "`prefix`", cx));
+                .and_then(|node| lexical::text(node, "`prefix`", cx))
+                .filter(|prefix| prefix_shape(prefix, cx));
             scheme.finish(cx);
             Some(AuthScheme::Hmac(HmacAuth {
                 secret,
@@ -605,16 +607,77 @@ fn bearer(
         .and_then(|node| lexical::env_ref(node, "`token`", cx));
     let header = scheme
         .take("header")
-        .and_then(|node| lexical::non_empty_text(node, "`header`", cx));
+        .and_then(|node| lexical::non_empty_text(node, "`header`", cx))
+        .filter(|header| header_shape(header, cx));
     let prefix = scheme
         .take("prefix")
-        .and_then(|node| lexical::text(node, "`prefix`", cx));
+        .and_then(|node| lexical::text(node, "`prefix`", cx))
+        .filter(|prefix| prefix_shape(prefix, cx));
     scheme.finish(cx);
     Some(BearerAuth {
         token,
         header,
         prefix,
     })
+}
+
+/// Whether a `header:` names one HTTP header, in the form `headers:` keys take
+/// (grammar 12.1, `NameForm::HeaderLike`).
+///
+/// The resolved name is what an inbound check reads a credential out of and what
+/// a delivery writes onto its own request, verbatim — codegen reads resolved
+/// values and re-derives nothing. So a space, a colon or a newline here does not
+/// name a header awkwardly, it forges a second one, and the value is held to a
+/// name's form for the reason `path:` above refuses whitespace.
+fn header_shape(header: &Spanned<String>, cx: &mut Cx) -> bool {
+    if header
+        .value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return true;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            header.span.clone(),
+            format!(
+                "`header` must be an HTTP header name, found {:?}",
+                header.value
+            ),
+        )
+        .with_help(
+            "a header name is letters, digits, `_`, and `-` — the form a provider's `headers:` keys take: the resolved name is written onto a request as it stands, so a space, a colon or a newline in it would forge a second header rather than name this one",
+        ),
+    );
+    false
+}
+
+/// Whether a `prefix:` is safe to write into a header value, ahead of the
+/// credential it introduces (grammar 13.3).
+///
+/// A prefix is legitimately empty and legitimately punctuated — `"Bearer "`,
+/// `"sha256="` — so the only shape it is held to is the one a header value
+/// cannot survive: a carriage return or a newline in it ends that field and
+/// begins another, which is `header:`'s injection again by the other half.
+fn prefix_shape(prefix: &Spanned<String>, cx: &mut Cx) -> bool {
+    if !prefix.value.chars().any(char::is_control) {
+        return true;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            prefix.span.clone(),
+            format!(
+                "`prefix` must not contain control characters, found {:?}",
+                prefix.value
+            ),
+        )
+        .with_help(
+            "the prefix is written into the header ahead of the credential, so a carriage return or newline in it ends that field and begins another: keep it to visible characters and spaces, as in `Bearer ` or `sha256=`",
+        ),
+    );
+    false
 }
 
 /// Read `callback_auth:` — how a delivery identifies itself to its receiver

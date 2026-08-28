@@ -3952,6 +3952,11 @@ triggers:
 - **Exactly one scheme.** A block declaring neither, and a block declaring both,
   are both compile errors: one request carries one credential, and a route that
   verified either would be exactly as open as its weaker half.
+- **`header:` is one header name** — letters, digits, `_` and `-`, the form a
+  provider's `headers:` keys take (§12.1) — and **`prefix:` carries no control
+  character**. Both resolved values are written onto a request as they stand, so
+  a colon or a newline in either would forge a second header rather than name or
+  introduce this one. Anything else is `invalid-value`.
 - Schemes whose signed payload is more than the body — Stripe's timestamped
   `t.body` with a tolerance window — are **deferred**, not forgotten: each is a
   vendor-specific shape, and genericizing them now is the support treadmill

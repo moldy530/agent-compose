@@ -2544,10 +2544,13 @@
       "properties": {
         "token": { "description": "The credential, as an ${ENV} reference. Never a literal (grammar 4.3, Decision D41).", "$ref": "#/$defs/envRef" },
         "header": {
-          "description": "The header the token is read from, or written to (default Authorization).",
-          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+          "description": "The header the token is read from, or written to (default Authorization). One HTTP header name, in the form a provider's headers: keys take: the resolved name is written onto a request as it stands, so a space, a colon or a newline in it would forge a second header (grammar 13.3, 12.1).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[a-zA-Z0-9_-]+$" }]
         },
-        "prefix": { "description": "What precedes the token in that header (default \"Bearer \", trailing space included).", "$ref": "#/$defs/noEnvRefString" }
+        "prefix": {
+          "description": "What precedes the token in that header (default \"Bearer \", trailing space included). Punctuation and spaces are the point; a control character is not, because a carriage return here ends the field and begins another (grammar 13.3).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[^\\x00-\\x1f\\x7f-\\x9f]*$" }]
+        }
       },
       "additionalProperties": false
     },
@@ -2558,12 +2561,15 @@
       "properties": {
         "secret": { "description": "The signing key, as an ${ENV} reference. Never a literal (grammar 4.3, Decision D41).", "$ref": "#/$defs/envRef" },
         "header": {
-          "description": "The header the signature arrives in (default X-Signature).",
-          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "minLength": 1 }]
+          "description": "The header the signature arrives in (default X-Signature). One HTTP header name, in the form a provider's headers: keys take (grammar 13.3, 12.1).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[a-zA-Z0-9_-]+$" }]
         },
         "algorithm": { "description": "The digest (default sha256).", "enum": ["sha1", "sha256", "sha512"] },
         "encoding": { "description": "How the signature is written on the wire (default hex).", "enum": ["hex", "base64"] },
-        "prefix": { "description": "What precedes the signature in that header, e.g. \"sha256=\" (default: the empty string).", "$ref": "#/$defs/noEnvRefString" }
+        "prefix": {
+          "description": "What precedes the signature in that header, e.g. \"sha256=\" (default: the empty string). Punctuation is the point; a control character is not, because a carriage return here ends the field and begins another (grammar 13.3).",
+          "allOf": [{ "$ref": "#/$defs/noEnvRefString" }, { "pattern": "^[^\\x00-\\x1f\\x7f-\\x9f]*$" }]
+        }
       },
       "additionalProperties": false
     },

@@ -259,6 +259,60 @@ fn a_callback_with_no_outbound_auth_needs_no_allowlist() {
     );
 }
 
+/// The `header:` and `prefix:` shape rules bind on **every** block that takes
+/// one, not on the block a fixture happens to name.
+///
+/// Three blocks carry the pair — the inbound `bearer:`, the inbound `hmac:`,
+/// and the outbound `bearer:` — and three call sites read them. A rule applied
+/// at two of the three ships the injection it refuses on whichever block the
+/// corpus left out, and nothing downstream recovers it: the resolved value is
+/// what a delivery writes onto its own request, verbatim.
+#[test]
+fn a_forged_header_or_prefix_is_refused_on_every_block_that_takes_one() {
+    let sites = [
+        (
+            "inbound bearer",
+            "    auth:\n      bearer:\n        token: ${WEBHOOK_TOKEN}\n",
+        ),
+        (
+            "inbound hmac",
+            "    auth:\n      hmac:\n        secret: ${WEBHOOK_SECRET}\n",
+        ),
+        (
+            "outbound bearer",
+            "    callback: \"payload.body.callback_url\"\n    callback_allow:\n      - \"https://hooks.example.com/*\"\n    callback_auth:\n      bearer:\n        token: ${CALLBACK_TOKEN}\n",
+        ),
+    ];
+    let forgeries = [
+        (
+            "header",
+            "\"X-Token: forged\"",
+            "`header` must be an HTTP header name",
+        ),
+        (
+            "prefix",
+            "\"Bearer \\r\\nX-Injected: 1\"",
+            "`prefix` must not contain control characters",
+        ),
+    ];
+    for (site, block) in sites {
+        for (key, value, expected) in forgeries {
+            let source = format!(
+                "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n{block}        {key}: {value}\n"
+            );
+            let parsed = parse_str(&source, "main.yml");
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.starts_with(expected)),
+                "the {site} `{key}` should be refused, got:\n{}",
+                render(&parsed.diagnostics)
+            );
+        }
+    }
+}
+
 /// `callback_allow:` without `callback_auth:` is legal too: an allowlist bounds
 /// where a webhook may go whether or not the delivery is signed, and the
 /// mandatory direction is only the other one.

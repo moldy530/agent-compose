@@ -426,6 +426,17 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // The shape of the two keys every scheme block shares. A row of its own
+        // rather than a clause on the two beside it, because it is the only
+        // rule here about what a *resolved* value does downstream: a delivery
+        // writes `header:` and `prefix:` onto its own request verbatim, so a
+        // colon or a carriage return in either forges a second header.
+        rule: "an auth block's `header:` is one HTTP header name and its `prefix:` carries no control character, inbound and outbound alike (13.3, 12.1)",
+        pass: "parse/section.rs",
+        codes: &["invalid-value", "unexpected-env-ref"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         // The outbound half. `missing-callback-allowlist` is its own code for
         // the reason `missing-credential` is: what is absent is decided by a
         // sibling, and the repair is a choice of two.
