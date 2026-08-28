@@ -17336,6 +17336,131 @@ fn a_callback_url_the_allowlist_admits_nowhere_is_refused_and_the_run_settles() 
     );
 }
 
+/// The `http-events` fixture with `watched`'s allowlist entry given a **literal
+/// tail** after its wildcards.
+///
+/// `http://127.0.0.1:*/allowed*/callback` is an ordinary Decision D127 entry —
+/// `*` matches any run of characters and an author may write two — and it is the
+/// shape that separates a matcher which *scans* an entry from one which compiles
+/// it into a regular expression: the two wildcards give a backtracking engine a
+/// split point to try at every occurrence of the literal between them, and the
+/// tail is what makes every one of those tries fail.
+fn fixture_with_a_two_wildcard_allowlist() -> String {
+    let source = std::fs::read_to_string(harness::fixture("http-events")).expect("the fixture");
+    let edited = source.replace(
+        "      - \"http://127.0.0.1:*/allowed*\"",
+        "      - \"http://127.0.0.1:*/allowed*/callback\"",
+    );
+    assert_ne!(
+        edited, source,
+        "`watched`'s `callback_allow:` is the entry this copy grows a tail on"
+    );
+    edited
+}
+
+/// A callback URL is matched in time **bounded by its length** (grammar 13.3,
+/// Decision D127).
+///
+/// The URL comes out of the request payload, which is the whole reason D127 has
+/// it matched at the delivery rather than at the start: it is
+/// attacker-controlled by construction. So the matcher is part of the app's
+/// exposed surface, and an entry compiled into a regular expression puts a
+/// caller in charge of how long the one thread that answers every route and
+/// works every delivery spends on their URL — half a megabyte of the literal
+/// between two wildcards is minutes of blocked event loop per request, and a
+/// handful of requests is a `serve` that answers nothing and delivers nothing
+/// ever again.
+///
+/// Two executions say it, and the second is the assertion: one names a URL of
+/// 480 KB that the entry admits nowhere, and the other names a short one it
+/// admits. The short one's parking webhook arriving is the app still being
+/// there — and the long one's row being `refused` is the match having really
+/// run rather than having been skipped for its size.
+#[test]
+fn a_long_callback_url_is_refused_without_wedging_the_app() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, environment) = events_environment(&provider, "events-long-url");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-long-url") else {
+        return;
+    };
+    let tailed = harness::Scratch::new("two-wildcard-allowlist");
+    let entrypoint = tailed.path().join("main.yml");
+    std::fs::write(&entrypoint, fixture_with_a_two_wildcard_allowlist())
+        .expect("the scratch area is writable");
+    let Some(served) = harness::serve_entrypoint_into(&project, &entrypoint, &environment) else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+
+    // The entry's head, then sixty thousand copies of the literal between its
+    // wildcards, then a character that is not its tail: every one of those
+    // copies is a split point a backtracking engine has to try, and none of
+    // them can succeed.
+    let adversarial = format!("http://127.0.0.1:{}z", "/allowed".repeat(60_000));
+    let started = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({ "topic": "long", "callback_url": adversarial }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(started.status, 202, "{}", started.text());
+    let wedging = started.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    let admitted = app
+        .send(
+            Request::post("/watched")
+                .json(&json!({
+                    "topic": "short",
+                    "callback_url": format!("{}/allowed/deep/callback", receiver.base_url),
+                }))
+                .header("authorization", events_bearer()),
+        )
+        .expect("the trigger's route answers");
+    assert_eq!(admitted.status, 202, "{}", admitted.text());
+    let short = admitted.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // The app is still answering, and the two-wildcard entry still admits what
+    // it is written to admit: a matcher that had been made safe by refusing
+    // everything would fail here.
+    let parked = receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+    assert_eq!(
+        parked[0].header("x-agentcompose-delivery"),
+        Some(format!("{short}:0").as_str()),
+        "{:?}",
+        parked[0].headers
+    );
+
+    let refused = harness::until(Duration::from_secs(30), || {
+        let report = app
+            .send(
+                Request::get(format!("/executions/{wedging}"))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the status route answers")
+            .json();
+        (report["deliveries"].as_array().map(Vec::len) == Some(1)).then_some(report)
+    });
+    let recorded = &refused["deliveries"].as_array().expect("the deliveries")[0];
+    assert_eq!(recorded["status"], "refused", "{}", recorded["status"]);
+    assert_eq!(recorded["event"], "parked", "{}", recorded["event"]);
+    assert!(
+        recorded["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("callback_allow"),
+        "…and it says why: {}",
+        recorded["detail"]
+    );
+}
+
 /// A receiver that refuses twice is delivered to on the third attempt, under the
 /// same delivery id every time (PRD resolved q35, `docs/durability.md` §3.7).
 ///
@@ -17600,6 +17725,226 @@ fn a_delivery_a_restart_interrupted_completes_under_the_same_id() {
         (held.status == 202).then_some(held)
     });
     assert_eq!(answered.status, 202, "{}", answered.text());
+}
+
+/// An execution finished by `agent-compose resume` still journals the `settled`
+/// webhook it owes, and a later `serve` delivers it
+/// (`docs/durability.md` §3.7, §6.2, PRD resolved q35).
+///
+/// The hole this closes is the one the ordering rule exists for, reached by the
+/// other door. `serve` journals the intent before the lifecycle row closes, so a
+/// process killed mid-attempt leaves a row a later start finishes — but `serve`
+/// is not the only process that closes a row. An operator finishing a parked
+/// execution by hand closes it too, and a build that supplied the hook only in
+/// the app would close it with no delivery row beside it: `recover` then
+/// enumerates open executions and finds none, the ledger holds nothing
+/// `pending`, and a caller who was handed a `202` — and by resolved q34's own
+/// reasoning is not polling — is never told at all. Nothing anywhere would say
+/// so, which is why this is asserted from both ends: the row after the resume,
+/// and the request the next start makes.
+///
+/// **Recorded, not sent**, is the other half. The command exits when its run
+/// does and the schedule outlives it, so the receiver hears nothing until an app
+/// picks the row up.
+#[test]
+fn an_execution_finished_by_a_hand_resume_still_journals_the_settle_it_owes() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-hand-resume");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    let Some(project) = harness::scratch_project("events-hand-resume") else {
+        return;
+    };
+
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &base) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .send(
+                Request::post("/watched")
+                    .json(&json!({
+                        "topic": "by hand",
+                        "callback_url": format!("{}/allowed", receiver.base_url),
+                    }))
+                    .header("authorization", events_bearer()),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // Parked and told: the execution is open, its callback is on the
+        // lifecycle row, and the app that started it is about to go.
+        receiver.wait_for_event("parked", 1, Duration::from_secs(30));
+    }
+
+    // The operator, at the terminal the app no longer answers for. The pause is
+    // the same pause under the same wait id, and answering it here is what closes
+    // the row.
+    let resumed = harness::resume_answering(
+        &project,
+        "http-events",
+        &execution,
+        &base,
+        &["{\"decision\": \"approve\"}"],
+        harness::Answers::Closed,
+    );
+    resumed.succeeded();
+    assert_eq!(
+        resumed.outputs(),
+        json!({ "decision": "approve" }),
+        "{}",
+        resumed.stderr()
+    );
+
+    let owed = journaled_deliveries(&project, &execution);
+    assert_eq!(owed.len(), 2, "one parking and one settle: {owed:?}");
+    assert_eq!(owed[1]["event"], "settled", "{owed:?}");
+    assert_eq!(
+        owed[1]["ordinal"], 1,
+        "the ordinal ascends across kinds: {owed:?}"
+    );
+    assert_eq!(
+        owed[1]["status"], "pending",
+        "a command that exits when its run does records the webhook and leaves the \
+         sending to an app: {owed:?}"
+    );
+    assert!(
+        receiver.of_event("settled").is_empty(),
+        "…and sent nothing itself: {:?}",
+        receiver.of_event("settled")
+    );
+
+    let mut prompt = base;
+    prompt.push((harness::CALLBACK_RETRY.to_string(), "0s".to_string()));
+    let Some(second) = harness::serve_into(&project, "http-events", &prompt) else {
+        return;
+    };
+    let delivered = receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+    assert_eq!(
+        delivered[0].header("x-agentcompose-delivery"),
+        Some(format!("{execution}:1").as_str()),
+        "{:?}",
+        delivered[0].headers
+    );
+    let body: Value = serde_json::from_slice(&delivered[0].bytes).expect("the body is JSON");
+    assert_eq!(body["status"], "completed", "{body}");
+    assert_eq!(body["trigger"], "watched", "{body}");
+    assert_eq!(body["outputs"]["decision"], "approve", "{body}");
+    // The identity the trigger declared, over the bytes a command in another
+    // process serialized: a report journaled without it would be delivered to a
+    // receiver that refuses it.
+    let expected = harness::hmac_sha256(
+        harness::credential(harness::DELIVERY_SECRET).as_bytes(),
+        &delivered[0].bytes,
+    );
+    assert_eq!(
+        delivered[0].header("x-agentcompose-signature"),
+        Some(format!("sha256={expected}").as_str()),
+        "{:?}",
+        delivered[0].headers
+    );
+    drop(second);
+}
+
+/// A `pending` delivery a shorter schedule leaves no attempt for is
+/// **exhausted**, not left pending for ever (`docs/durability.md` §3.7).
+///
+/// The offsets are measured from the intent and an attempt is owed per offset,
+/// so a row picked up under a schedule with fewer offsets than it already has
+/// attempts has nothing left to do. §3.7 gives a delivery two ends and staying
+/// `pending` is neither: a row nothing ever ends is read and skipped at every
+/// subsequent start and reported by the status route as a webhook still owed for
+/// the life of the journal.
+///
+/// `AGENT_COMPOSE_CALLBACK_RETRY` going from `0s,1h` to `0s` is exactly the shape
+/// an operator shortening a diagnostic schedule between two starts produces, and
+/// the assertion is that nothing is *sent* either — an end reached by making one
+/// more attempt would be a receiver hearing from a schedule that had run out.
+#[test]
+fn a_pending_delivery_a_shorter_schedule_leaves_no_attempt_for_is_exhausted() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_shims, _log, base) = events_environment(&provider, "events-shortened");
+    let receiver = harness::Receiver::start().expect("a loopback receiver");
+    receiver.always(500);
+    let Some(project) = harness::scratch_project("events-shortened") else {
+        return;
+    };
+
+    let mut stalled = base.clone();
+    stalled.push((harness::CALLBACK_RETRY.to_string(), "0s,1h".to_string()));
+    let execution;
+    {
+        let Some(first) = harness::serve_into(&project, "http-events", &stalled) else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .post_json(
+                "/posted",
+                &json!({
+                    "topic": "shortened",
+                    "callback_url": format!("{}/anywhere", receiver.base_url),
+                }),
+            )
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // One attempt, refused: the row is `pending` with a single attempt on it
+        // and its next offset an hour away.
+        receiver.wait_for_event("settled", 1, Duration::from_secs(30));
+        let finished = harness::settled(&app, &execution);
+        assert_eq!(finished["status"], "completed", "{finished}");
+    }
+    let attempted = receiver.of_event("settled").len();
+
+    let mut shortened = base;
+    shortened.push((harness::CALLBACK_RETRY.to_string(), "0s".to_string()));
+    let Some(second) = harness::serve_into(&project, "http-events", &shortened) else {
+        return;
+    };
+    let ended = harness::until(Duration::from_secs(30), || {
+        let held = harness::journal_rows(
+            &project,
+            &format!(
+                "SELECT ordinal, event, status, attempts, detail FROM deliveries \
+                 WHERE execution = '{execution}' ORDER BY ordinal ASC"
+            ),
+        );
+        let rows = held.as_array().expect("the query answers rows").clone();
+        (rows.first().map(|row| row["status"] == "exhausted") == Some(true)).then_some(rows)
+    });
+    assert_eq!(ended.len(), 1, "one event, one row: {ended:?}");
+    assert!(
+        ended[0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already made"),
+        "…and it says why it ended without one: {ended:?}"
+    );
+    let held: Vec<Value> =
+        serde_json::from_str(ended[0]["attempts"].as_str().unwrap_or("[]")).expect("the attempts");
+    assert_eq!(
+        held.len(),
+        1,
+        "the row is ended by the schedule running out, not by a further attempt: {ended:?}"
+    );
+    // A schedule with nothing left in it sends nothing: the receiver answering
+    // `500` would have taken another request at once had one been made.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        receiver.of_event("settled").len(),
+        attempted,
+        "nothing more was sent: {:?}",
+        receiver.delivered()
+    );
+    drop(second);
 }
 
 /// One quiescence that opened several pauses is **one** `parked` delivery

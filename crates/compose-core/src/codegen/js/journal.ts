@@ -412,6 +412,19 @@ export interface Journal {
    * is left as it is — an outcome is not overwritten by a later reading of it.
    */
   refuseRecorded(execution: string, ordinal: number, reason: string): void;
+  /**
+   * End a delivery this journal already holds **pending** whose schedule has
+   * nothing left in it, without an attempt.
+   *
+   * The row that reaches this is one whose recorded attempts already number as
+   * many as the schedule this process runs under has offsets — a restart under a
+   * shorter `AGENT_COMPOSE_CALLBACK_RETRY` than the one that wrote it. There is
+   * no offset to wait for and so no attempt to record, and `docs/durability.md`
+   * §3.7 gives a delivery two ends and no third: a row left `pending` would be a
+   * webhook the status route reports as owed for ever. Idempotent, and it leaves
+   * an outcome another process wrote exactly as it is.
+   */
+  exhaustRecorded(execution: string, ordinal: number, reason: string): void;
   /** Record what one attempt did, and where the delivery stands after it. */
   recordAttempt(
     execution: string,
@@ -677,6 +690,16 @@ class SqliteJournal implements Journal {
     // statement that will not touch it is better than two that could race.
     this.#database.run(
       "UPDATE deliveries SET status = 'refused', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
+      [new Date().toISOString(), reason, execution, ordinal],
+    );
+  }
+
+  exhaustRecorded(execution: string, ordinal: number, reason: string): void {
+    // The sibling above's statement with the other of §3.7's two ends in it,
+    // and the same predicate for the same reason: `attempts` is left alone,
+    // because this row's end is that there was no attempt left to make.
+    this.#database.run(
+      "UPDATE deliveries SET status = 'exhausted', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
       [new Date().toISOString(), reason, execution, ordinal],
     );
   }

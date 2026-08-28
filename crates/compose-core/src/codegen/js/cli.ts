@@ -137,9 +137,12 @@ import {
   TRACE_VERSION,
   closeHumanWaits,
   deliverHumanAnswer,
+  deliveriesOf,
   divergenceOf,
+  executionReport,
   humanWaitEnded,
   humanWaits,
+  intendDelivery,
   interruptOf,
   journalExists,
   journalPath,
@@ -332,6 +335,11 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
     execution,
     resuming: true,
     trigger: row.trigger,
+    // What this execution's request asked to be told when it ends, off the
+    // lifecycle row that recorded it (`docs/durability.md` §3.5). A `run` never
+    // has one; a resume of an `http` execution may, and finishing one here is
+    // the one place outside `serve` where such a row closes.
+    ...(row.callback === undefined ? {} : { callback: row.callback }),
   });
 }
 
@@ -346,6 +354,8 @@ interface Job {
   readonly resuming: boolean;
   /** What started it, for a fresh execution's lifecycle row. */
   readonly trigger?: string;
+  /** Where its `settled` webhook goes, for a `resume` that closes one. */
+  readonly callback?: string;
 }
 
 /**
@@ -385,6 +395,11 @@ async function execute(job: Job): Promise<number> {
     resumable: asking,
     ...(job.trigger === undefined ? {} : { trigger: job.trigger }),
     ...(job.resuming ? { resume: true } : {}),
+    // The webhook a `serve`-started execution finished here still owes, journaled
+    // **before** the lifecycle row closes — see [`owed`].
+    ...(job.callback === undefined
+      ? {}
+      : { closing: (produced: FlowRun | undefined, error: unknown) => owed(job, produced, error) }),
   });
   const prompting = asking
     ? answerPauses(execution, settling(running), {
@@ -489,6 +504,80 @@ async function execute(job: Job): Promise<number> {
   process.stderr.write(render(produced.trace));
   if (written !== undefined) process.stderr.write(`\ntrace: ${written}\n`);
   return 0;
+}
+
+/**
+ * Journal the `settled` webhook a resumed execution owes, **while its lifecycle
+ * row is still open** (`docs/durability.md` §3.7, §6.2, PRD resolved q35).
+ *
+ * `runFlow`'s `closing` hook, and the same one `serve` supplies for the same
+ * reason: an execution an `http` trigger started with a `callback:` is owed one
+ * push whichever process gets to the end of it, and this command is a process
+ * that can. The order is the whole of it. A row that closes with no delivery
+ * intent beside it is an execution `serve` will never look at again — `recover`
+ * enumerates open executions and finds none, the delivery ledger holds no
+ * pending row — so a caller who was handed a `202` and, by resolved q34's own
+ * reasoning, is *not* polling would simply never be told. Recorded first, the
+ * webhook survives this command exiting a millisecond later.
+ *
+ * **Recorded, not sent.** The schedule `docs/durability.md` §3.7 states runs for
+ * fifteen minutes and a command that exits when its run does cannot work one;
+ * `serve` picks up every `pending` row at start (§6.1), matches the URL against
+ * the trigger's `callback_allow:` and signs it with the identity that trigger
+ * declared — all of which is the app's to do, and none of which this command has
+ * an app for. So the row goes down and the sending waits, exactly as it does for
+ * the row a build that no longer declares an execution's trigger leaves behind.
+ *
+ * A settle is **once per execution**, and the journal is what says so across
+ * processes: a generation that journaled the intent and died before the row
+ * closed leaves an execution that is still open *and* already has its `settled`
+ * row, and announcing a second one here would tell a receiver that one execution
+ * finished twice.
+ */
+async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Promise<void> {
+  const url = job.callback;
+  if (url === undefined) return;
+  try {
+    const held = await deliveriesOf(job.execution);
+    if (held.some((record) => record.event === "settled")) return;
+    // A failure carries its trace on the chain and a completion carries it on
+    // the answer; a failure raised before the graph ran carries none, which is
+    // the report that goes without the version beside it.
+    const trace =
+      produced === undefined
+        ? (error as { trace?: readonly runtime.TraceEntry[] } | null)?.trace
+        : produced.trace;
+    await intendDelivery({
+      execution: job.execution,
+      event: "settled",
+      url,
+      body: JSON.stringify(
+        await executionReport({
+          id: job.execution,
+          flow: job.address,
+          // Off the row this resume read, so the report says what started the
+          // execution rather than what finished it.
+          trigger: job.trigger ?? "manual",
+          status: produced === undefined ? "failed" : "completed",
+          ...(produced === undefined ? { error: describe(error) } : { outputs: produced.outputs }),
+          ...(trace === undefined ? {} : { trace }),
+        }),
+      ),
+      // A settle reports no pauses: the row is closing.
+      pauses: [],
+    });
+  } catch (failure) {
+    // Not this run's failure — it produced whatever it produced, and the journal
+    // holds it — but not something to swallow either: what failed is the record,
+    // and a reader has no other way to learn that a webhook was lost.
+    process.stderr.write(
+      `\`${job.execution}\`'s \`settled\` webhook could not be journaled: ${describe(failure)}\n`,
+    );
+    return;
+  }
+  process.stderr.write(
+    `\`${job.execution}\`'s \`settled\` webhook is journaled for \`${url}\`: \`serve\` delivers it\n`,
+  );
 }
 
 // ---------------------------------------------------------------------------

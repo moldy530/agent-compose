@@ -1560,6 +1560,14 @@ const EVENTS: &[Criterion] = &[
                 "a_pending_delivery_the_allowlist_no_longer_admits_is_refused_rather_than_sent",
                 Status::Live,
             ),
+            // …and the cost of matching it, which the URL's author chooses: the
+            // callback URL comes out of the request payload, so an entry matched
+            // by anything that backtracks hands a caller the one thread that
+            // answers every route.
+            (
+                "a_long_callback_url_is_refused_without_wedging_the_app",
+                Status::Live,
+            ),
             // The check behind the check: every signing assertion above compares
             // against a digest this harness computed, which is worth something
             // only if this side is right.
@@ -1638,6 +1646,21 @@ const EVENTS: &[Criterion] = &[
             // declares the trigger" a promise about something that exists.
             (
                 "a_delivery_journaled_without_its_trigger_is_finished_by_a_build_that_declares_it",
+                Status::Live,
+            ),
+            // `serve` is not the only process that closes a lifecycle row, and a
+            // settle journaled after one closes is a settle no start can find:
+            // the hand resume records the intent before the row goes, and the
+            // next start delivers it.
+            (
+                "an_execution_finished_by_a_hand_resume_still_journals_the_settle_it_owes",
+                Status::Live,
+            ),
+            // …and the other end a delivery can reach without an attempt: a row
+            // whose schedule has no offset it has not already tried is exhausted
+            // rather than left owed for the life of the journal.
+            (
+                "a_pending_delivery_a_shorter_schedule_leaves_no_attempt_for_is_exhausted",
                 Status::Live,
             ),
         ],

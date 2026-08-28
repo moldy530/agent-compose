@@ -735,9 +735,17 @@ fn every_delivery_surface_emits_the_version() {
             "the completed and failed `--format json` records, and the trace file's envelope",
         ),
         (
-            "serve.ts",
+            "runtime.ts",
             1,
-            "the status route's report, which the completion webhook posts too",
+            "`executionReport`, the one writer of the document the status route serves and \
+             every lifecycle webhook posts",
+        ),
+        (
+            "serve.ts",
+            0,
+            "nothing of its own: the app adds the pauses to that report and writes none of \
+             the trace keys itself, so a second writer appearing here is a second document \
+             to keep in step",
         ),
     ] {
         let source = fs::read_to_string(

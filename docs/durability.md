@@ -510,7 +510,12 @@ nobody read (`docs/grammar.md` Decision D50).
   (`docs/grammar.md` §13.3, Decision D110, D127). Nothing is sent, nothing is
   retried, and the refusal is on the status route.
 * **`exhausted`** — the schedule ran out. A webhook is a courtesy the status
-  route backstops, not a contract worth an unbounded queue.
+  route backstops, not a contract worth an unbounded queue. A row is exhausted
+  the moment the schedule holds no offset it has not already had an attempt at,
+  which is ordinarily the last attempt failing and is also what a restart under a
+  **shorter** `AGENT_COMPOSE_CALLBACK_RETRY` than the one that wrote the row
+  meets: there is no attempt left to make, so the row is ended rather than left
+  `pending` for a start that would read and skip it for ever.
 
 Neither reopens or fails the execution: a run that produced its outputs produced
 them, and `status` on the lifecycle row says nothing about who was told.
@@ -549,9 +554,22 @@ takes a `closing` hook for it, called on exactly the paths that close the row,
 which is also what keeps §7's divergence silent: a row that stays open never
 reaches one.
 
+**And `serve` is not the only process that closes one.** `agent-compose resume`
+(§6.2) finishes an execution an `http` trigger started just as readily, so it
+supplies the same hook and journals the same intent: without it a hand-resumed
+execution would close with no delivery row beside it, which is the one shape no
+later start can repair — `recover` finds no open execution and the ledger holds
+no `pending` row, so the push is lost silently. What that command does *not* do
+is send: the schedule above outlives a command that exits when its run does, and
+matching `callback_allow:` and signing with the trigger's `callback_auth:` are
+the app's. So the row goes down and the next `serve` start delivers it, exactly
+as it does for the row a build that no longer declares the trigger left behind.
+
 **Where it is implemented.** `deliver`, `opening`, `attempts` and
 `attemptDelivery` in the emitted `src/serve.ts`, over the delivery interface of
-`src/journal.ts`. `attemptDelivery` is the one declaration in the emitted app
+`src/journal.ts`, with `owed` in `src/cli.ts` for the `resume` above and
+`runtime.executionReport` writing the report body both surfaces publish.
+`attemptDelivery` is the one declaration in the emitted app
 that reaches the network for a delivery, which is why §3's primitive walk names
 it as an exemption and
 `crates/compose-core/src/codegen/journal.rs`'s
@@ -770,6 +788,16 @@ terminal — or `AGENT_COMPOSE_INTERACTIVE=1` — answers it there, with the sam
 prompts, the same schema check and the same refusals a `run` uses. Its exit
 codes are `run`'s: `0`, `1`, `2`, and `3` for a resumed execution that reached a
 pause with nobody to ask.
+
+**And it settles a `serve` execution's callback.** An execution an `http` trigger
+started carries the webhook its request asked for on the lifecycle row (§3.5),
+and this command can be the process that reaches the end of one — a `serve` that
+died, an operator finishing it by hand. So when the row closes here the `settled`
+intent is journaled first, under the next ordinal, exactly as §3.7 requires of
+the process that closes a row. It is **recorded rather than sent**: the schedule
+outlives this command, so the next `serve` start delivers it (§6.1). A resume
+that re-parks, or that meets a divergence, journals nothing — the row stays open
+and the settle has not happened.
 
 **Where the execution id comes from.** A `run` prints it on stderr as its first
 line, before anything can fail:

@@ -157,9 +157,10 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
 import {
-  TRACE_VERSION,
   deliverHumanAnswer,
   deliveriesOf,
+  executionReport,
+  exhaustRecordedDelivery,
   humanWaits,
   intendDelivery,
   journaledExecution,
@@ -910,8 +911,21 @@ const DEFAULT_SYNC_TIMEOUT_MS = 60_000;
  * execution, and a build whose composition has moved under a journal has not
  * decided anything about the executions that journal holds. Put the composition
  * back and the next start recovers them.
+ *
+ * The deliveries are picked up **beside** the executions and never behind them
+ * (`docs/durability.md` §6.1, and [`resumeDeliveries`] for why they are two
+ * things): a journal read that throws is transient — the open path waits out a
+ * lock and breaks a stale one — so a start that let one failure carry the other
+ * would leave every `pending` row unattempted for the life of the process while
+ * the file it could not read a moment ago answers every other query.
  */
 async function recover(executions: Map<string, Execution>): Promise<void> {
+  await recoverExecutions(executions);
+  await resumeDeliveries();
+}
+
+/** The half of [`recover`] that puts open executions back on the board. */
+async function recoverExecutions(executions: Map<string, Execution>): Promise<void> {
   let open: readonly runtime.ExecutionRow[];
   try {
     open = await openExecutions();
@@ -946,7 +960,6 @@ async function recover(executions: Map<string, Execution>): Promise<void> {
     resumeInto(executions, flow, row, await announced(row.id));
     process.stderr.write(`recovered ${row.id} (${row.flow})\n`);
   }
-  await resumeDeliveries();
 }
 
 /**
@@ -1431,10 +1444,35 @@ function refusedUrl(trigger: string): string {
  * Exhaustion is recorded and is **never the execution's failure**: a webhook is
  * a courtesy the status route backstops, not a contract worth an unbounded
  * queue.
+ *
+ * A row whose recorded attempts already number as many as this schedule has
+ * offsets is exhausted **here**, without an attempt. It is the row a restart
+ * under a shorter `AGENT_COMPOSE_CALLBACK_RETRY` than the one that wrote it
+ * meets, and the loop below has nothing to do with it: there is no offset left
+ * to wait for and so no attempt to record. `docs/durability.md` §3.7 gives a
+ * delivery two ends and staying `pending` is neither, so the row is ended rather
+ * than left for the status route to keep reporting as owed at every start for
+ * the rest of the journal's life.
  */
 async function attempts(record: runtime.DeliveryRecord, trigger: HttpTrigger): Promise<void> {
   const schedule = retrySchedule();
   const intended = Date.parse(record.intendedAt);
+  if (record.attempts.length >= schedule.length) {
+    try {
+      await exhaustRecordedDelivery(
+        record.execution,
+        record.ordinal,
+        `the schedule this process runs under names ${schedule.length} attempt${
+          schedule.length === 1 ? "" : "s"
+        } and ${record.attempts.length} were already made`,
+      );
+    } catch (error) {
+      process.stderr.write(
+        `\`${record.id}\`'s exhaustion could not be journaled: ${message(error)}\n`,
+      );
+    }
+    return;
+  }
   for (let index = record.attempts.length; index < schedule.length; index += 1) {
     await pause(intended + (schedule[index] ?? 0) - Date.now());
     const outcome = await attemptDelivery(record, trigger);
@@ -1620,15 +1658,56 @@ function pause(milliseconds: number): Promise<void> {
  * compiler refuses a scheme spelled in another case: it would match nothing.
  */
 function admits(patterns: readonly string[], url: string): boolean {
-  return patterns.some((pattern) => {
-    const source = pattern.split("*").map(literally).join("[\\s\\S]*");
-    return new RegExp(`^${source}$`).test(url);
-  });
+  return patterns.some((pattern) => entryAdmits(pattern, url));
 }
 
-/** One run of an allowlist entry, as a regular expression matching itself. */
-function literally(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * One entry against one URL, scanned rather than compiled.
+ *
+ * **The URL is attacker-supplied**: it comes out of the request payload
+ * (`callback:` over grammar 4.1), which is the whole reason the allowlist is
+ * matched at the delivery rather than at the start. So the matcher has to be
+ * bounded in the length of what it is given, and a regular expression is not:
+ * `https://*.example.com/hooks*-callback` compiled into one — two wildcards
+ * with a literal after each, all of which grammar 13.3 admits — gives an engine
+ * a split point to try at every occurrence of the literal between them, and a
+ * URL naming a megabyte of them backtracks for minutes on the one thread that
+ * answers every route and works every delivery. A refused delivery is a
+ * courtesy; a wedged process is not.
+ *
+ * An entry is a run of literals separated by `*`, so a scan settles it: the
+ * head has to be a prefix, the tail a suffix, and each literal between them the
+ * **leftmost** occurrence after the one before. Leftmost is not a heuristic
+ * here — a `*` matches any run including the empty one, so consuming less can
+ * never lose a match that consuming more would have found — which is what makes
+ * this the same answer the expression gave, in one pass rather than in
+ * exponentially many.
+ */
+function entryAdmits(pattern: string, url: string): boolean {
+  const runs = pattern.split("*");
+  // No wildcard at all: the entry is the URL, and `split` handed back the
+  // whole of it.
+  if (runs.length === 1) return pattern === url;
+  const head = runs[0] ?? "";
+  const tail = runs[runs.length - 1] ?? "";
+  // The two anchors first, and the length check between them: `head` and `tail`
+  // may not claim the same characters, or `*` between them would have matched a
+  // negative run.
+  if (!url.startsWith(head)) return false;
+  if (url.length < head.length + tail.length) return false;
+  if (!url.endsWith(tail)) return false;
+  const limit = url.length - tail.length;
+  let at = head.length;
+  for (let index = 1; index < runs.length - 1; index += 1) {
+    const run = runs[index] ?? "";
+    // `**` in an entry is one wildcard written twice, and the empty run between
+    // them consumes nothing.
+    if (run === "") continue;
+    const found = url.indexOf(run, at);
+    if (found === -1 || found + run.length > limit) return false;
+    at = found + run.length;
+  }
+  return true;
 }
 
 /**
@@ -1701,87 +1780,34 @@ const UNITS: Readonly<Record<string, number>> = {
 /**
  * What both the status route and the callback report about an execution.
  *
- * `trace_version` travels **with** the trace and only with it (`docs/trace.md`):
- * a version key describing nothing would be a number a reader could pin against
- * no format at all. Two reports have nothing for it to describe — a run still
- * going, which has recorded nothing yet, and a run that **failed** carrying no
- * trace at all, which is a failure raised before the graph ran — and both carry
- * neither key. The gate is whether a trace exists, not whether it has entries in
- * it: a run that failed *inside* the graph having recorded nothing carries
- * `trace: []` and the version beside it, because an empty trace is a statement
- * about the run and an absent one is not. The rule a reader is given is the one
- * this expresses — wherever a `trace` appears, the version that describes it
- * appears beside it, and wherever one is absent so is the other — and it holds on
- * the two surfaces this function feeds, the status route and the completion
- * webhook, exactly as it does for `run`'s JSON record and the trace file.
+ * The document itself is `runtime.executionReport`'s, which is what keeps the
+ * webhook's body and the status route's answer the same document rather than
+ * two that agree today: `agent-compose resume` closes a `serve`-started
+ * execution too, and the `settled` webhook it journals carries this report
+ * without an app anywhere to serve it (`docs/durability.md` §6.2).
  *
- * `interrupts` is the third key that comes and goes, and it is on exactly the
- * report whose `status` is `interrupted`: every pause the execution is holding,
- * with what the human is shown, the schema their answer has to fit, and the URL
- * that delivers it (grammar 8.7). It is what makes a status poll enough to
- * *present* the question rather than only to notice that there is one. Ordered
- * by `wait_id` — `runtime.humanWaits`'s order — so that two runs of one
- * composition publish the same questions in the same order whatever order their
- * instances were scheduled in.
- *
- * `deliveries` is the fourth, and it is on the report of every execution that
- * has made one. It is what makes a **refused** delivery — a callback URL
- * `callback_allow:` admits nowhere — and an **exhausted** one visible rather
- * than silent, which is what resolved q33 and q35 ask of them: neither is the
- * execution's failure, so the run's own `status` says nothing about either and
- * this is the only place a reader can see them. No credential appears in it,
- * and neither does a delivered body: what is published is what happened.
+ * What is added here is the half only an app can say — the **pauses**, with the
+ * URL that answers each. `interrupts` is on exactly the report whose `status` is
+ * `interrupted`: every pause the execution is holding, with what the human is
+ * shown, the schema their answer has to fit, and the URL that delivers it
+ * (grammar 8.7). It is what makes a status poll enough to *present* the question
+ * rather than only to notice that there is one. Ordered by `wait_id` —
+ * `runtime.humanWaits`'s order — so that two runs of one composition publish the
+ * same questions in the same order whatever order their instances were scheduled
+ * in.
  */
-async function report(execution: Execution): Promise<Record<string, unknown>> {
+function report(execution: Execution): Promise<Record<string, unknown>> {
   const waits = execution.status === "running" ? humanWaits(execution.id) : [];
-  let delivered: readonly runtime.DeliveryRecord[] = [];
-  try {
-    delivered = await deliveriesOf(execution.id);
-  } catch {
-    // A journal this process cannot read is not a reason to refuse the report:
-    // what a reader is asking about is the run, and the rest of it is here.
-  }
-  return {
-    execution_id: execution.id,
+  return executionReport({
+    id: execution.id,
     flow: execution.flow,
     trigger: execution.trigger,
     status: statusOf(execution),
-    ...(waits.length === 0
-      ? {}
-      : { interrupts: waits.map((wait) => question(execution, wait)) }),
-    ...(delivered.length === 0 ? {} : { deliveries: delivered.map(delivery) }),
+    interrupts: waits.map((wait) => question(execution, wait)),
     ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
     ...(execution.error === undefined ? {} : { error: execution.error }),
-    ...(execution.trace === undefined
-      ? {}
-      : { trace_version: TRACE_VERSION, trace: execution.trace }),
-  };
-}
-
-/**
- * One callback delivery, as the status route publishes it.
- *
- * `snake_case` for [`question`]'s reason: these are document keys. The
- * **body** is not among them — it is the report a receiver was sent, which a
- * reader already has in front of them — and neither is anything
- * `callback_auth:` resolved.
- */
-function delivery(record: runtime.DeliveryRecord): Record<string, unknown> {
-  return {
-    delivery_id: record.id,
-    ordinal: record.ordinal,
-    event: record.event,
-    url: record.url,
-    status: record.status,
-    intended_at: record.intendedAt,
-    ...(record.settledAt === undefined ? {} : { settled_at: record.settledAt }),
-    attempts: record.attempts.map((attempt) => ({
-      at: attempt.at,
-      outcome: attempt.outcome,
-      ...(attempt.detail === undefined ? {} : { detail: attempt.detail }),
-    })),
-    ...(record.detail === undefined ? {} : { detail: record.detail }),
-  };
+    ...(execution.trace === undefined ? {} : { trace: execution.trace }),
+  });
 }
 
 function accepted(reply: FastifyReply, execution: Execution): unknown {

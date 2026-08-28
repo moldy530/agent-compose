@@ -8161,6 +8161,24 @@ export async function refuseRecordedDelivery(
   (await openJournal()).refuseRecorded(execution, ordinal, reason);
 }
 
+/**
+ * End a pending delivery whose schedule has no offset left in it, without an
+ * attempt (`docs/durability.md` §3.7).
+ *
+ * The row a restart under a **shorter** `AGENT_COMPOSE_CALLBACK_RETRY` than the
+ * one that wrote it meets: its recorded attempts already number as many as this
+ * process's schedule has offsets, so there is nothing to wait for and nothing to
+ * record — and a delivery has two ends, neither of which is staying `pending`
+ * while the status route reports it as owed.
+ */
+export async function exhaustRecordedDelivery(
+  execution: string,
+  ordinal: number,
+  reason: string,
+): Promise<void> {
+  (await openJournal()).exhaustRecorded(execution, ordinal, reason);
+}
+
 /** Record what one attempt did, and where the delivery stands after it. */
 export async function recordDeliveryAttempt(
   execution: string,
@@ -8187,6 +8205,104 @@ export async function deliveriesOf(execution: string): Promise<readonly Delivery
 export async function undeliveredDeliveries(): Promise<readonly DeliveryRecord[]> {
   if (!journalExists()) return [];
   return (await openJournal()).undelivered();
+}
+
+/** What a report is *of*, before the journal's own half is read into it. */
+export interface ReportedExecution {
+  readonly id: string;
+  readonly flow: string;
+  /** What started it: a trigger's name, or `manual` (`docs/durability.md` §3.5). */
+  readonly trigger: string;
+  readonly status: string;
+  /** The pauses it is holding, as the surface that can answer them presents them. */
+  readonly interrupts?: readonly unknown[];
+  readonly outputs?: Record<string, unknown>;
+  readonly error?: string;
+  readonly trace?: readonly TraceEntry[];
+}
+
+/**
+ * What the status route serves about an execution, and what every lifecycle
+ * webhook carries (grammar 13.3, PRD resolved q34).
+ *
+ * **One document, one writer.** The webhook's body is the status route's report
+ * — that is the wire grammar 13.3 states — and there are two places a report is
+ * made: `serve`, which answers the route and pushes the webhook, and
+ * `agent-compose resume`, which closes a `serve`-started execution by hand and
+ * journals the `settled` webhook it owes (`docs/durability.md` §6.2) with no app
+ * anywhere to serve one. Two writers would agree on the day they were written.
+ *
+ * `trace_version` travels **with** the trace and only with it (`docs/trace.md`):
+ * a version key describing nothing would be a number a reader could pin against
+ * no format at all. Two reports have nothing for it to describe — a run still
+ * going, which has recorded nothing yet, and a run that **failed** carrying no
+ * trace at all, which is a failure raised before the graph ran — and both carry
+ * neither key. The gate is whether a trace exists, not whether it has entries in
+ * it: a run that failed *inside* the graph having recorded nothing carries
+ * `trace: []` and the version beside it, because an empty trace is a statement
+ * about the run and an absent one is not. The rule a reader is given is the one
+ * this expresses — wherever a `trace` appears, the version that describes it
+ * appears beside it, and wherever one is absent so is the other — and it holds on
+ * the two surfaces this feeds, the status route and the completion webhook,
+ * exactly as it does for `run`'s JSON record and the trace file.
+ *
+ * `deliveries` is on the report of every execution that has made one. It is what
+ * makes a **refused** delivery — a callback URL `callback_allow:` admits nowhere
+ * — and an **exhausted** one visible rather than silent, which is what resolved
+ * q33 and q35 ask of them: neither is the execution's failure, so the run's own
+ * `status` says nothing about either and this is the only place a reader can see
+ * them. No credential appears in it, and neither does a delivered body: what is
+ * published is what happened.
+ */
+export async function executionReport(
+  execution: ReportedExecution,
+): Promise<Record<string, unknown>> {
+  let delivered: readonly DeliveryRecord[] = [];
+  try {
+    delivered = await deliveriesOf(execution.id);
+  } catch {
+    // A journal this process cannot read is not a reason to refuse the report:
+    // what a reader is asking about is the run, and the rest of it is here.
+  }
+  const waits = execution.interrupts ?? [];
+  return {
+    execution_id: execution.id,
+    flow: execution.flow,
+    trigger: execution.trigger,
+    status: execution.status,
+    ...(waits.length === 0 ? {} : { interrupts: waits }),
+    ...(delivered.length === 0 ? {} : { deliveries: delivered.map(reportedDelivery) }),
+    ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
+    ...(execution.error === undefined ? {} : { error: execution.error }),
+    ...(execution.trace === undefined
+      ? {}
+      : { trace_version: TRACE_VERSION, trace: execution.trace }),
+  };
+}
+
+/**
+ * One callback delivery, as a report publishes it.
+ *
+ * `snake_case` because these are document keys. The **body** is not among them —
+ * it is the report a receiver was sent, which a reader already has in front of
+ * them — and neither is anything `callback_auth:` resolved.
+ */
+function reportedDelivery(record: DeliveryRecord): Record<string, unknown> {
+  return {
+    delivery_id: record.id,
+    ordinal: record.ordinal,
+    event: record.event,
+    url: record.url,
+    status: record.status,
+    intended_at: record.intendedAt,
+    ...(record.settledAt === undefined ? {} : { settled_at: record.settledAt }),
+    attempts: record.attempts.map((attempt) => ({
+      at: attempt.at,
+      outcome: attempt.outcome,
+      ...(attempt.detail === undefined ? {} : { detail: attempt.detail }),
+    })),
+    ...(record.detail === undefined ? {} : { detail: record.detail }),
+  };
 }
 
 /** The graph state a node reads: the composition's channels, plus `$run`. */
