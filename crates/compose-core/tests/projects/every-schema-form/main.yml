@@ -17,6 +17,9 @@
 # spelling only `tsc` or a real request would notice. The second agent is one of
 # those: it exists so a `map` can dispatch to an agent that carries an attached
 # flow, which is the one node shape whose entry holds both dispatch carriers.
+# The `triggers:` block at the foot is another: the authenticated `http` surface
+# of grammar 13.3, whose emitted table is a type declaration in every other
+# golden and a populated value here.
 version: "0.1"
 
 state:
@@ -276,10 +279,19 @@ agent.shaper:
   description: Produces one of everything.
   model: model.m
   prompt: Produce a shape.
-  # A flow attached as a tool, which is the other half of the shape above: the
-  # agent's tool list carries it beside nothing else, so the emitted binding is
-  # readable as exactly what grammar 5.4 gives a `flow.*` on the wire.
-  tools: [flow.condense]
+  # A flow attached as a tool, which is the other half of the shape above, and
+  # all four runtime built-ins beside it (grammar 5.5, D123). The list is the one
+  # place two entry *shapes* meet — a bare address and a single-key mapping —
+  # and each built-in's emitted binding carries a schema and a bound this
+  # composition is the only golden to spell, so `tsc` and the pinned parse see
+  # every one of them.
+  tools:
+    - flow.condense
+    - builtin.read_file: { root: "${WORKSPACE}" }
+    - builtin.write_file: { root: "${WORKSPACE}" }
+    - builtin.list: { root: "${WORKSPACE}" }
+    # The bounded one: a working directory and a deadline, both required.
+    - builtin.bash: { root: "${WORKSPACE}/build", timeout: 30s }
   input:
     goal: { type: string, description: What to shape. }
   output:
@@ -399,3 +411,54 @@ flow.shape:
     - { from: notify, to: recall }
     - { from: recall, to: spread }
     - { from: spread, to: end }
+
+# The trigger surface of grammar 13.3, in the two spellings that make its
+# emitted table more than a type declaration.
+#
+# Every other project in the golden corpus declares an `http` trigger with no
+# `auth:`, `callback_auth:` or `callback_allow:`, so `src/triggers.ts` carries
+# the `InboundAuth` and `CallbackAuth` **types** and nothing that populates
+# them — and `tsc` type-checks a declaration nobody wrote a value for. The two
+# below are the values: an inbound `bearer` and an inbound `hmac` (the union's
+# two arms, which the emitter spells with different keys), an outbound block
+# carrying *both* schemes at once, and the allowlist that block makes mandatory.
+triggers:
+  signed_in:
+    type: http
+    flow: flow.shape
+    method: POST
+    path: /shape
+    respond: async
+    input:
+      goal: "payload.body.goal"
+      goals: "payload.body.goals"
+    callback: "payload.body.callback_url"
+    auth:
+      bearer:
+        token: ${SHAPE_TOKEN}
+    callback_auth:
+      bearer:
+        token: ${SHAPE_CALLBACK_TOKEN}
+        header: X-Delivery-Token
+        prefix: "Token "
+      hmac:
+        secret: ${SHAPE_CALLBACK_SECRET}
+    callback_allow:
+      - "https://hooks.example.com/*"
+
+  vendor_signed:
+    type: http
+    flow: flow.shape
+    method: POST
+    path: /shape/hook
+    respond: async
+    input:
+      goal: "payload.body.goal"
+      goals: "payload.body.goals"
+    auth:
+      hmac:
+        secret: ${SHAPE_SECRET}
+        header: X-Hub-Signature-256
+        algorithm: sha256
+        encoding: hex
+        prefix: "sha256="

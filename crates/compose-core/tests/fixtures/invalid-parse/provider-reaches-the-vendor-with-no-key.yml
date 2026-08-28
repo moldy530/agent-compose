@@ -1,0 +1,13 @@
+# rule: on a kind with a default endpoint, `api_key:` is required where no `base_url:` names a gateway (grammar 12.1, Decision D120)
+# code: missing-credential
+# message: provider definition `provider.claude` declares `kind: anthropic` and neither `api_key:` nor `base_url:`
+# at: 10:3
+# help: with no `base_url:` this connection reaches `https://api.anthropic.com`, where only a key authenticates: declare `api_key:`, or name the gateway that supplies one with `base_url:` — a provider carrying a `base_url:` and no key sends no authentication header at all (grammar 12.1, Decision D120)
+# note: the pair is what is refused, not either key. `provider.gateway` below
+# note: declares a `base_url:` and no key and is a legal keyless connection, so
+# note: the default `count: 1` is what holds the rule to the pair.
+provider.claude:
+  kind: anthropic
+provider.gateway:
+  kind: anthropic
+  base_url: ${LLM_GATEWAY}

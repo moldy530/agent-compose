@@ -1,0 +1,44 @@
+# rule: a provider's server tool may not take a name the agent's own tools take (grammar 12.1, 11.5, Decision D122)
+# code: tool-name-collision
+# message: `agent.a` attaches `tool.web_search`, whose name collides with the `web_search` server tool `provider.p` declares
+# at: main.yml:33:11
+# label: main.yml:17:7 the server tool is declared here
+# help: a server tool is appended to the `tools` of every request that connection serves, and the wire refuses an array carrying `web_search` twice: rename the attachment, or declare the suite on a provider this agent's model does not reach (grammar 12.1, 11.5, Decision D122)
+#
+# §11.5's rule reached from the other side. A suite belongs to the connection, so
+# the name it spends is not in the agent's own file at all — and the runtime
+# appends it to the `tools` of every request that provider serves, after the
+# agent's own, which is one array and one namespace.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+model.m:
+  provider: provider.p
+  id: some-model
+tool.web_search:
+  description: Search the web the long way round.
+  input:
+    query: { type: string }
+  output:
+    value: { type: string }
+  exec:
+    command: search-the-web
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools: [tool.web_search]
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

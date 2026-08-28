@@ -1,0 +1,13 @@
+# rule: an inbound `hmac:` reads its signature in one of a closed set of encodings (grammar 13.3, PRD resolved q32)
+# code: unknown-variant
+# message: `base64url` is not a valid `encoding`
+# at: 13:19
+# help: did you mean `base64`?
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        encoding: base64url

@@ -1,0 +1,11 @@
+# rule: `server_tools:` is declared on a kind whose wire carries them (grammar 12.1, Decision D122)
+# code: unsupported-server-tools
+# message: provider definition `provider.main` declares `kind: bedrock`, whose wire this compiler release does not carry server tools on
+# at: 9:3
+# help: server tools launched on `kind: anthropic`, `kind: openai`, `kind: openai_compatible` — a tool that runs on the provider's side rides the request that provider serves, and the other wires have not been taught the shape, so a config declared here would never reach one (grammar 12.1, Decision D122)
+provider.main:
+  kind: bedrock
+  region: us-east-1
+  server_tools:
+    - type: web_search_20250305
+      name: web_search

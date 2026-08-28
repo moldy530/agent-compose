@@ -144,15 +144,26 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   `stop_reason` / `finish_reason` is the one field a compiled agent's tool loop
   branches on, so a `reply` may override it only with a value the surface really
   sends *and* one the body can carry — see (16). Everything else, `raw`.
-* **A missing credential is a 401.** `x-api-key` on the Messages API,
-  `Authorization: Bearer …` / `api-key` on Chat Completions — absent, the answer
-  is 401 (`authentication_error` there, `code: "invalid_api_key"` here), not the
-  400 a malformed body draws, because 401 is the status both SDKs raise
-  `AuthenticationError` from. Authentication is settled before the body is, so
-  the refusal names the credential and nothing else — while the transcript still
-  records every failure the request had. See (12) for what "credential" means
-  here, and (11) for why 401 is safe: neither the failover set nor the SDK retry
-  set claims it.
+* **A missing or malformed credential is a 401** — where a credential is
+  required at all, and a malformed one is required to be well formed
+  everywhere. The status is not the 400 a malformed body draws, because 401 is
+  what both SDKs raise `AuthenticationError` from; authentication is settled
+  before the body is, so the refusal names the credential and nothing else,
+  while the transcript still records every failure the request had. (11) is why
+  401 is safe: neither the failover set nor the SDK retry set claims it.
+
+  **This server asks for a credential to be *there* on the Azure routes only**
+  (`api-key`, or a bearer token), and (12) is the whole argument. The short
+  form: `azure_openai` is the one kind whose `api_key:` grammar 12.1 still
+  requires outright, so a deployment route reached without a credential is a
+  codegen bug. On the Messages API and the direct Chat Completions route the
+  credential is *conditional* — an `anthropic` or `openai` provider that names a
+  `base_url:` may declare none, and `openai_compatible` always could — so a
+  request with no `x-api-key` and no `Authorization` is a legal wire shape
+  rather than a mistake, and refusing it would make this harness stricter than
+  the grammar. **A credential that is there is still checked for shape on every
+  route**: `x-api-key: ""` and an `authorization` that is not `Bearer <token>`
+  are refused, because absent is the keyless posture and empty is not.
 * **`tool_choice` requires `tools`**, on both surfaces, and **OpenAI refuses an
   empty `tools` array** (`Invalid 'tools': empty array. Expected an array with
   minimum length 1.`) — which is what a compiled graph sends for an agent with
@@ -167,6 +178,19 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   sent. An answer cut short at `max_tokens`, or one that was all `thinking`,
   reduces to nothing under that reading; a compiled graph must stop on the empty
   answer instead, and this is the rule that says which of the two happened.
+
+  It has a **second** source since Decision D122, and the remedy there is the
+  opposite one. A turn a *Responses* member answered can be nothing but items
+  this surface has no vocabulary for — a `web_search_call` and no `output_text`,
+  which is what a turn that ran only the provider's search looks like and what
+  an answer cut short at `max_output_tokens` looks like too. The model did
+  answer, so the loop does not stop; but a ladder that then falls to an
+  Anthropic member has to *render* that turn for this wire (see (19)) and has
+  nothing to render it into. The runtime drops the turn rather than sending an
+  empty message or padding it with prose the model never wrote — which is what
+  it already does with the Chat Completions turn of (18) that reduces to
+  nothing. Roles still alternate: a turn that empty carried no tool call, so it
+  is the last one, and the request ends on the user turn before it.
 
 ---
 
@@ -335,23 +359,87 @@ transcript entry.
 *If wrong* (some client retries 422s): the transcript still shows the refusal,
 and the run fails with the queue empty rather than passing.
 
-### 12. Request-header checks are presence checks
+### 12. Request-header checks are presence checks, and only where the grammar makes the header unconditional
 
-`x-api-key`, `authorization: Bearer …`, `api-key`, `content-type:
-application/json`. Values are never compared: the harness needs **no API keys**
-(PRD §7 M1), so any non-empty placeholder passes. What is being checked is that
-generated code sends the header at all, which a live call would otherwise be the
-first to discover.
+`content-type: application/json` is required on **every** request, and
+`anthropic-version` on every request to the Messages route — unconditionally
+both, with nothing relaxed by D120 below: `src/anthropic.rs`'s `check_headers`
+fails an absent `anthropic-version`, and both surfaces fail a `content-type`
+that is not JSON. `api-key` (or a bearer token) is required on the Azure routes.
+Values are never compared: the harness needs **no API keys** (PRD §7 M1), so any
+non-empty placeholder passes. What is being checked is that generated code sends
+the header at all, which a live call would otherwise be the first to discover.
 
-The three **credential** headers answer differently from the fourth. A missing
-credential is 401 and a missing or wrong `content-type` is 400 — the split the
-Certain list states, and the one both SDKs classify on (`AuthenticationError` is
-raised from the status alone). *Assumed*: that a **present but placeholder** key
-would also pass a live call, which is the whole basis of a keyless harness, and
-the exact error `code` on the Chat Completions 401 (`invalid_api_key`; a live
-missing-key 401 may carry `code: null`). *If wrong*: only a test asserting the
-string breaks — `tests/openai_wire.rs`'s
-`a_request_without_credentials_is_refused` is where it lives.
+**A credential's *presence* is required only where a composition must carry one;
+its *shape* is required everywhere.** Grammar 12.1's row is what decides the
+first half, and since Decision D120 it is not the same answer on every route:
+
+| route | credential must be there | credential must be well formed |
+|---|---|---|
+| `POST /v1/messages` | no — an `anthropic` provider naming a `base_url:` may declare no `api_key:`, and then a compiled graph sends no `x-api-key` at all | yes — a present `x-api-key` must be non-empty |
+| `POST /v1/chat/completions` | no — the same for `openai`, and `openai_compatible`, which reaches this route, always made `api_key:` optional | yes — a present `authorization` must be `<scheme> <token>`, with a token; `Bearer` is the vendor's spelling and any other scheme reads as the gateway's own (below) |
+| the Azure routes | **yes** — `azure_openai` requires `api_key:` outright, so a request without one is a codegen bug | yes — the same bearer rule, and `api-key` non-empty |
+
+The two relaxed cells are a **deliberate leniency**, and the only one in this
+file: a live `api.anthropic.com` answers an unauthenticated request 401, and
+this server does not. It is the right leniency because the server is not
+standing in for the vendor's host — it is standing in for whatever a
+composition's `base_url:` names, which is now routinely a gateway that injects
+the vendor credential server-side. Enforcing presence there would refuse the one
+deployment shape D120 exists to admit, and would do it in CI, where the mock is
+the *only* endpoint a compiled graph reaches.
+
+**Nothing else was relaxed with it.** A credential that *is* on the wire is held
+to the spelling the service accepts, because the keyless posture the runtime
+promises is a header that is absent, not one that is empty or malformed:
+`x-api-key: ""`, `authorization: Bearer ` and a raw key under `authorization:`
+are all requests that claim to authenticate and fail, and a live vendor answers
+each 401. Those are codegen bugs, they are decidable from one request, and the
+harness refuses them — `tests/anthropic_wire.rs`'s
+`an_empty_api_key_is_refused_while_a_gateway_token_is_served` and
+`tests/openai_wire.rs`'s
+`a_request_whose_credential_is_malformed_is_refused_on_the_direct_route` are
+where that is pinned.
+
+What the leniency does cost is the case that is *not* decidable from a request:
+a credential this server cannot tell apart from a token the composition declared
+itself. It arrives on each route in a different spelling, and both are served.
+
+On the **Messages** route it is the wrong *header*. `authorization: Bearer …`
+with no `x-api-key` beside it is the documented gateway composition
+(`docs/topics/models.md`, "Keyless providers behind a gateway", writes exactly
+that under `headers:`), so this server cannot tell it apart from codegen having
+put the vendor key in the wrong place.
+
+On **Chat Completions** it is the wrong *scheme*, and it is the same concession
+reached from the other side: the gateway's token rides the header the vendor
+also uses, and nothing says a gateway issues bearer tokens —
+`authorization: "Basic ${GW_TOKEN}"` under `headers:` on a keyless provider is
+an ordinary composition. So a present `authorization` is held to
+`<scheme> <token>` rather than to `Bearer` alone, and a non-`Bearer` scheme is
+served when it is the only credential on it. What stays refused is what one
+request still decides: `Bearer` with no token behind it (either spelling), a
+value with no scheme at all — the vendor key that lost its prefix, which
+authenticates nothing — and a non-`Bearer` scheme beside an `api-key`, which is
+two credentials on a route that reads neither and so is not the gateway reading.
+`tests/openai_wire.rs`'s
+`a_gateway_token_under_another_scheme_is_served_on_the_direct_route` pins the
+concession and the test above it pins the five shapes it does not reach.
+
+Both are covered where they *are* decidable — `compiled_graph_acceptance.rs`
+reads the recorded request against the spec that produced it, asserting the
+credential header is present when the spec declares a key and absent when it
+does not.
+
+A missing or malformed credential is 401 and a missing or wrong `content-type`
+is 400 — the split the Certain list states, and the one both SDKs classify on
+(`AuthenticationError` is raised from the status alone). *Assumed*: that a
+**present but placeholder** key would also pass a live call, which is the whole
+basis of a keyless harness, and the exact error `code` on the Chat Completions
+401 (`invalid_api_key`; a live missing-key 401 may carry `code: null`). *If
+wrong*: only a test asserting the string breaks —
+`tests/openai_wire.rs`'s `an_azure_request_without_a_subscription_key_is_refused`
+is where it lives.
 
 ### 13. OpenAI's strict-mode schema rules, and the sentences it refuses with
 
@@ -549,6 +637,163 @@ does not follow an invented tool name carries only declared names anyway.
 the first live run in which a model invents a tool name answers 400 on the
 request *after* the refusal, and the fix is one already written down: render that
 surface the way the Chat Completions path is rendered here.
+
+---
+
+### 19. The Responses surface is a wire, not a route
+
+`POST /v1/responses` is served by `src/responses.rs` rather than by
+`src/openai.rs`, and that is a decision rather than a filing convenience: four
+things differ from Chat Completions, and each is a shape a codegen bug takes —
+the conversation is a list of **items** (a `function_call` is its own item beside
+the message, and a result is a `function_call_output` keyed by `call_id`), the
+system prompt is the top-level `instructions`, a tool is **flat**
+(`{type: "function", name, parameters}`), and structured output is `text.format`
+rather than `response_format`. A module that tried to serve both would have to
+branch on the route at every one of those points.
+
+What the two **do** share is the error envelope and the credential rules, and
+those are shared in code: `openai::rejected` and `openai::unscripted` answer this
+route, and its header check is `openai::check_direct_headers` — the same function,
+including WIRE-NOTES (12)'s keyless-gateway reading. How a connection
+authenticates belongs to the connection, not to the wire (PRD 5.9).
+
+*What is assumed*: that `api.openai.com` answers a malformed Responses request in
+the Chat Completions envelope (`{"error": {message, type, param, code}}`) with
+`x-request-id` beside it. The published error documentation is written once for
+the API rather than per surface, so this is the reading it invites; if it is
+wrong, what differs is the *shape a client sees on a 400*, which no compiled
+graph branches on — the runtime classifies by status (PRD 5.9).
+
+**`stop` and `seed` are refused here.** They are grammar 12.2 `settings:` keys
+that Chat Completions takes and the Responses API does not, so a provider that
+speaks this wire and declares one has declared a knob nothing will read. The
+closed `REQUEST_KEYS` list refuses the request, which is the intended failure
+mode (see *Accepted-key lists*): the alternative is a run whose declared `stop`
+sequence silently never applies.
+
+A composition should never get this far, and since Decision D122's fork is the
+**compiler's** own — `kind: openai` plus a non-empty `server_tools:` is what
+decides the wire, not the endpoint — `agent-compose validate` refuses those two
+settings on such a provider with an `unknown-key` naming the wire. This route's
+refusal is therefore the second line rather than the first: what it now catches
+is a *codegen* bug that sent one anyway. `docs/topics/models.md` says so where an
+author meets the seam.
+
+**`store` is accepted and has no default here.** The real service defaults it to
+`true` on this route and to `false` on Chat Completions, and the emitted runtime
+pins neither, so no request this server sees carries the key and nothing here
+stands in for the difference. It is listed in `REQUEST_KEYS` because a
+composition that one day pins it must not be refused, and the retention
+consequence of moving wires is an author-facing fact rather than a wire shape —
+`docs/topics/models.md` carries it.
+
+### 20. `max_tokens` is `max_output_tokens` here, and the mock will not translate
+
+The emitted runtime translates two `settings:` keys on its way to this wire —
+`max_tokens` becomes `max_output_tokens`, and `reasoning_effort` becomes
+`reasoning: { effort }`. This server deliberately accepts **only** the translated
+spellings, so a runtime that stopped translating is refused rather than served a
+request whose bound the service would have ignored. That is a mock being stricter
+than nothing at all: the real service accepts neither `max_tokens` nor
+`reasoning_effort` on this route, so the refusal is the service's own.
+
+### 21. A Responses history is an echo, and a `function_call_output` carries no error flag
+
+Two concessions, both about the same list of items:
+
+*A tool **name** the current request does not declare* is **accepted** in the
+history here, where Chat Completions refuses it (see (18)). The reasoning is the
+one that surface's row gives, applied to a wire whose input items are an echo of
+the service's own output rather than a re-declaration: a `function_call` item was
+produced by the service and is being handed back, so there is nothing for the
+request's `tools` to have declared it as. *What is assumed* is that
+`api.openai.com` agrees. If it does not, the failure is the one Chat Completions
+already has a written remedy for — drop the undeclared call from the replayed
+items and send its refusal as a `user` message — and the runtime's Responses
+branch would adopt it.
+
+*A refusal carries no flag.* A `function_call_output` is closed to its `call_id`
+and its `output`, so a refused tool call's text **is** the output — the same
+concession Chat Completions makes, and for the same reason (Decision D119). What
+stays load-bearing is that the output is sent at all: an unanswered `call_id` is
+refused here in both directions, exactly as the other two wires are checked.
+
+### 22. Server tools are recorded and carried, never checked
+
+A `tools` array may carry entries the **provider** runs rather than the graph
+(grammar 12.1, Decision D122). This server tells them apart by `type:` —
+anything but `custom` on the Messages wire, anything but `function` on the two
+OpenAI ones — and then **records the type and carries the entry unchecked**, on
+all three routes.
+
+That is a deliberate hole in an otherwise strict server, and it is the same hole
+resolved q30 puts in the compiler: the whole point of the key is that a server
+tool the vendor ships tomorrow is usable the day it ships, so a mock that refused
+a config it did not recognise would refuse compositions that work. What it still
+checks is what it can decide from one request: the Messages wire requires the
+`name:` every tool entry there carries, and both wires refuse a **scripted** use
+of a server tool the request did not declare — a provider runs only the tools it
+was given.
+
+The Messages `name:` is a *presence* check here and deliberately not a value
+one, and the two tiers are why: this server cannot know which name the real API
+pairs with a dated type it may predate, while the **compiler** can for the types
+in its curated table, and does — `web_search_20250305` must be named
+`web_search` (grammar 12.1). A wrong name is therefore an
+`agent-compose validate` error rather than something this route catches, which
+is the right place for it: the run never happens.
+
+**Uniqueness is the exception, and it is checked.** A name this server cannot
+evaluate against a vocabulary it may predate is still a name it can compare with
+the *other* names in the same array, and the Messages API answers a request
+offering two tools under one name with a 400 whichever side runs them. So a
+server tool's `name:` goes into the same `seen` set a client tool's does: a suite
+declaring both dated `code_execution_*` revisions, or a `tool.web_search` beside
+`web_search_20250305`, is refused here exactly as the compiler refuses it
+(`tool-name-collision`) — which is what keeps the acceptance harness able to
+witness that rule rather than merely trusting it.
+
+The answer side is the mirror. A scripted `server_tools` entry becomes, on the
+Messages wire, a `server_tool_use` block and the `<name>_tool_result` that
+answers it; on Responses, one `<type>_call` item carrying `status` and — where
+the script named one — the `results` the service found. Both are **already
+answered**: the graph must replay them and must not dispatch anything, which is
+what `check_content` (Messages) and `check_input` (Responses) accept them back
+for.
+
+*What is assumed* is the shape of the result: the Messages wire's
+`<name>_tool_result` naming, and the Responses item's `results`/`action` members.
+Both are read from the vendors' published examples rather than confirmed against
+a live call, and neither is something a compiled graph reads — the runtime
+carries these blocks through its loop opaquely, which is exactly the property the
+acceptance suite asserts. A wrong member name here would therefore fail nothing
+that is not already failing.
+
+### 23. One Responses turn may hold more than one `message`, and `text.format` shapes the last
+
+The other side of (19)'s "the conversation is a list of items": a `message` is an
+item like any other, so a turn may carry several — a preamble the model wrote
+before a server tool ran, then the shaped answer after it, with the
+`<type>_call` of (22) between them. Neither of the other two wires can produce
+that shape: the Messages API answers a pinned request with a `tool_use` block
+whose `input` **is** the object, and Chat Completions has exactly one
+`choices[0].message.content`.
+
+So a `text.format` of type `json_schema` constrains the turn's **final** message
+and says nothing about what precedes it, and a reader that concatenates every
+`output_text` and parses the join parses something the format never shaped. The
+runtime reads the last message-bearing item for its structured answer and keeps
+the join only as the turn's text (`callResponses`, `shapedOutput`);
+`compiled_graph_acceptance.rs`'s
+`a_pinned_responses_turn_is_read_at_the_message_the_format_shaped` is what
+decides it, served with a **raw** response because `reply_answer` writes at most
+one `message` item per scripted answer and so cannot compose the shape.
+
+*What is assumed* is that the service is willing to send a preamble beside a
+shaped answer at all. If it never does, nothing is lost — a single-message turn
+reads identically — and if it does, the alternative is a `JSON.parse` of prose
+thrown inside the journaled model call, which a resume then replays.
 
 ---
 

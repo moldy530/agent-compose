@@ -1,0 +1,18 @@
+# rule: a delivery's bearer `header:` may not be one the delivery already writes itself (grammar 13.3, Decision D127)
+# code: invalid-value
+# message: `header` must not name an `X-AgentCompose-` delivery header, found "X-AgentCompose-Signature"
+# at: 14:17
+# help: every delivery already writes `X-AgentCompose-Event`, `-Delivery`, `-Ordinal` and `-Timestamp`, and a signed one writes `-Signature`; those names are the receiver's contract, so a token carried under one of them replaces or joins the value the receiver reads — name the header the receiver expects the token on (grammar 13.3, Decision D127)
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_auth:
+      bearer:
+        token: ${CALLBACK_TOKEN}
+        header: X-AgentCompose-Signature
+      hmac:
+        secret: ${CALLBACK_SECRET}
+    callback_allow:
+      - "https://hooks.example.com/*"

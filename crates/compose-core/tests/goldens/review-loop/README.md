@@ -15,6 +15,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 |---|---|
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
+| `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
 | `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
@@ -22,7 +23,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
 | `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
 | `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
-| `src/cli.ts` | this project's own command line, which `agent-compose run` and `agent-compose serve` launch |
+| `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |
 | `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
 
 ## Running a flow
@@ -102,6 +103,7 @@ run` and `agent-compose serve` launch:
 
 ```sh
 bun src/index.ts run flow.<name> --input goal=... [--session <key>] [--format json]
+bun src/index.ts resume <execution-id> [--format json]
 bun src/index.ts serve --port 8787
 ```
 
@@ -118,17 +120,49 @@ a payload whose one member is this argument, and what that expression answers is
 the partition the run addresses (grammar 13.2). Declared on no trigger, the
 argument is the identity.
 
+`resume` carries on an execution this project's journal holds open — a run the
+machine lost, or one that stopped at a `human` pause with nobody to ask. Every
+run is journaled as it goes, and the first line `run` writes to stderr is the id
+this verb takes (`execution: exec_…`); under `--format json` the same value is
+`execution_id`. The graph is re-executed from its entry with every recorded
+effect **consumed** — the model answers it got, the results its tools produced,
+what its stores read, what a person answered — and only the frontier, the first
+effect the journal does not hold, reaches the network. It takes no `--input` and
+no `--session`: the invocation it replays is the one the journal recorded.
+
 `serve` starts the app over the composition's declared `http` triggers and
 announces where it is listening as one JSON line on stdout. Beside them it
 mounts two routes of its own — `GET /executions/:id` for an execution's status
 and `POST /executions/:id/resume` — so those two are the app's and a trigger
-cannot declare either: the compiler refuses one that does. Executions are
-tracked in that process: durable execution and checkpointers are a later
-milestone, so a status route answers `404` for an id the process did not start —
-and every execution it *did* start, with its outputs and its trace, is held for
-the life of the process, so a long-running `serve` grows with the number of
-requests it has answered. Restarting it is the only way to reclaim that until
-the checkpointer arrives and an execution stops living in memory.
+cannot declare either: the compiler refuses one that does. On start it
+**recovers** every execution the journal holds open, before it accepts a
+connection, so a pause comes back under the same wait id and a resume URL
+prepared against the process that died still finds it; triggers are not
+re-fired, and a recovered execution that finishes delivers the `settled` webhook
+its request asked for, because the caller who was handed a `202` is waiting to
+be told rather than polling. Every callback delivery the journal still holds
+pending is picked up in the same pass. What is still tracked in the process
+alone is the *report*: a status
+route answers `404` for an id neither this process nor the journal knows, and
+every execution it has finished, with its outputs and its trace, is held for the
+life of the process — so a long-running `serve` grows with the number of
+requests it has answered, and restarting it is what reclaims that.
+
+**Who may call, and who a delivery says it is.** A trigger declaring `auth:`
+verifies its caller before it reads a payload, and the execution it starts
+carries that guard: its `GET /executions/:id` and `POST /executions/:id/resume`
+enforce the auth of the trigger that started it, in this process and in the one
+that recovers it after a restart. An execution a trigger with no `auth:` began
+keeps open routes. A trigger's `callback:` is a subscription to the execution's
+**lifecycle** rather than only to its end: one webhook per parking, listing every
+pause then open, and one when the execution settles, each carrying the report
+the status route serves under the `X-AgentCompose-*` headers the grammar
+tabulates. Deliveries are journaled and at-least-once — dedupe on
+`X-AgentCompose-Delivery`, order by `X-AgentCompose-Ordinal` — and a delivery
+that exhausts its bounded retry schedule is recorded and shown on the status
+route rather than failing the run. `AGENT_COMPOSE_CALLBACK_RETRY` shortens that
+schedule for a diagnostic run: a comma-separated list of durations
+(`0s,1s,2s`), refused at launch if it is not one.
 
 Stopping it stops the graph: `agent-compose serve` passes `SIGINT` and `SIGTERM`
 on to this project, which closes the app and exits, so a supervisor that signals

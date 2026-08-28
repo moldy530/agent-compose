@@ -40,6 +40,39 @@ export const environmentReferences: readonly EnvironmentReference[] = [
       "provider.p.base_url",
     ],
   },
+  {
+    name: "SHAPE_CALLBACK_SECRET",
+    sites: [
+      "triggers.signed_in.callback_auth.hmac.secret",
+    ],
+  },
+  {
+    name: "SHAPE_CALLBACK_TOKEN",
+    sites: [
+      "triggers.signed_in.callback_auth.bearer.token",
+    ],
+  },
+  {
+    name: "SHAPE_SECRET",
+    sites: [
+      "triggers.vendor_signed.auth.hmac.secret",
+    ],
+  },
+  {
+    name: "SHAPE_TOKEN",
+    sites: [
+      "triggers.signed_in.auth.bearer.token",
+    ],
+  },
+  {
+    name: "WORKSPACE",
+    sites: [
+      "agent.shaper.tools.builtin.read_file.root",
+      "agent.shaper.tools.builtin.write_file.root",
+      "agent.shaper.tools.builtin.list.root",
+      "agent.shaper.tools.builtin.bash.root",
+    ],
+  },
 ];
 
 /** Raised when the process starts without a variable the composition needs. */

@@ -694,6 +694,32 @@ triggers:
     );
 }
 
+/// Inbound `auth:` is orthogonal to the response mode: a synchronous trigger
+/// verifies its caller exactly as an asynchronous one does, and `auth:` is the
+/// one key of grammar 13.3's authentication surface that a `respond: sync`
+/// trigger can carry — the other two describe a `callback:`, which sync forbids.
+///
+/// The rest of the surface — every optional key of every block, written out and
+/// left out — is `tests/trigger_auth_surface.rs`, which carries it through
+/// resolution as well.
+#[test]
+fn an_authenticated_synchronous_trigger() {
+    accepts(
+        "sync-auth.yml",
+        r#"
+triggers:
+  intake:
+    type: http
+    flow: flow.demo
+    respond: sync
+    timeout: 30s
+    auth:
+      bearer:
+        token: ${WEBHOOK_TOKEN}
+"#,
+    );
+}
+
 /// `cron:` is anchored — five fields with nothing around them — but the
 /// separator between them is a *run* of whitespace in grammar 13.4 and in the
 /// published schema's `^\S+(\s+\S+){4}$` alike, so an aligned expression is

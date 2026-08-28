@@ -62,15 +62,22 @@
 // Store ops are effects, and both halves of that are here:
 //
 // * **reads are recorded** — every op that answers with stored data writes a
-//   `StoreRecord` onto the node's trace entry, carrying what it answered. That
-//   record is the history a replay is meant to consume instead of the live store;
-//   this release has no checkpointer to replay *from* (M3 owns durable
-//   execution), so the record is what a trace holds and what a later replay will
-//   read.
+//   `StoreRecord` onto the node's trace entry, carrying what it answered, and
+//   the op itself is written to this project's journal (`./journal.ts`). The
+//   second of those is what a replay consumes: a resumed execution answers a
+//   read out of the record instead of asking the live store, and does not apply
+//   a **write** a second time — the row the journal holds is the row the first
+//   generation wrote, `deduped` included (PRD resolved q29,
+//   `docs/durability.md` §3.3).
 // * **writes are at-least-once, keyed** — a store-op node's write carries the
 //   idempotency key of grammar 9.4, and this backend dedupes on it: a retry of
 //   the same effect site answers what the first attempt answered instead of
 //   writing twice.
+//
+//   The key is what a *receiver* dedupes on, and it stays load-bearing under
+//   durability for the one window a journal cannot close: an effect that
+//   happened and whose journal row did not land is re-executed on replay, and
+//   carries the key its first attempt carried.
 //
 //   In the SQLite-backed kinds the key and the op's own answer are written in
 //   the **same transaction** as the effect, so an attempt that failed half way
@@ -85,6 +92,15 @@
 //   the difference between a transactional store and a filesystem, and it is
 //   written down here rather than promised away.
 //
+// A store a **resumed** execution reads across the frontier therefore has to be
+// one that outlives the run. `scope: session` and `scope: global` are files on
+// disk and are exactly the world the recorded prefix left behind; a
+// `scope: execution` `kv`/`vector` store and anything a target bound to
+// `provider: memory` are not — their rows died with the process, and a replayed
+// write is not applied a second time, so a live read past the frontier would
+// answer out of an empty database. That is refused rather than answered, by
+// [`inProcessState`], and `docs/durability.md` §5 is normative for it.
+//
 // A store write an **agent** made through a synthesized tool (grammar 11.5)
 // carries no key and is not deduped. Grammar 9.4 names exactly two carriers — "a
 // detached `map` dispatch (§8.6 rule 7) and a store write (§11.4)" — and §11.4 is
@@ -95,14 +111,25 @@
 // # One process
 //
 // These backends are the local, zero-infra ones, and they assume the project is
-// one process: SQLite here is a WebAssembly build over `node:fs` with no
-// cross-process locking, so two `agent-compose run`s sharing a session-scoped
-// store are outside what this release promises — the second one's op fails the
-// node with `SQLite3Error: database is locked` rather than corrupting anything.
-// That is the same boundary PRD 5.10 draws — `--target local` is one process —
-// and production backends are M3. The emitted `README.md` says so where a reader
-// meets the data directory, because `agent-compose run` is the surface where
-// running two at once is the obvious thing to try.
+// one process: SQLite here is a WebAssembly build over `node:fs`, whose virtual
+// file system takes a lock by creating `<file>.lock` as a directory, so two
+// `agent-compose run`s sharing a session-scoped store are outside what this
+// release promises — the second one's op waits out `PRAGMA busy_timeout` and
+// then fails the node with `SQLite3Error: database is locked` rather than
+// corrupting anything. That is the same boundary PRD 5.10 draws — `--target
+// local` is one process — and production backends are M3. The emitted
+// `README.md` says so where a reader meets the data directory, because
+// `agent-compose run` is the surface where running two at once is the obvious
+// thing to try.
+//
+// **A lock does not die with its owner**, which is the same fact `./journal.ts`
+// is written around and matters here for the same reason: a `run` killed inside
+// a store write never reaches the `rmdir`, and the directory it leaves would
+// refuse every later open of that store — the resume of the very execution the
+// crash interrupted included, whose live ops past the frontier are promised the
+// world the recorded prefix left behind (`docs/durability.md` §5). So [`open`]
+// waits [`LOCK_WAIT_MS`] and then treats a lock still standing as a corpse,
+// exactly as the journal does and under the same rule that makes it sound.
 //
 // # Retention
 //
@@ -113,10 +140,12 @@
 // serving an at-least-once guarantee, and which therefore grows with the number
 // of keyed writes a store has ever taken. It cannot be trimmed by age here: a
 // key's row is what makes a retry of that effect site answer instead of writing
-// twice, and this release has no checkpointer that could say when an execution
-// is past replaying (M3 owns durable execution). So the ledger's lifetime is the
-// store file's, retention is deleting the directory, and the emitted `README.md`
-// says that where it says where the data lives.
+// twice, and an execution is past replaying only when its journal says so —
+// which is a question about a different file, and one journal compaction would
+// have to answer (out of durability v1's scope, `docs/durability.md` §12). So
+// the ledger's lifetime is the store file's, retention is deleting the
+// directory, and the emitted `README.md` says that where it says where the data
+// lives.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -124,8 +153,16 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { ReplayDivergence, dataRoot, journaled } from "./journal.ts";
+import type { EffectSlot } from "./journal.ts";
 import * as runtime from "./runtime.ts";
 import type { EmbedBinding, RunContext, StoreRecord } from "./runtime.ts";
+
+// Where a project's data lives is `./journal.ts`'s to say, because that module
+// is the leaf of the emitted import graph — this one imports `./runtime.ts` and
+// `./runtime.ts` imports it — and re-exported here because `./cli.ts` and every
+// ejected reader learned the name from this module.
+export { DATA_DIRECTORY, dataRoot } from "./journal.ts";
 
 // ---------------------------------------------------------------------------
 // What a binding says (grammar 11.1)
@@ -248,27 +285,14 @@ function writes(op: StoreOp): boolean {
 // ---------------------------------------------------------------------------
 // Where the data lives
 // ---------------------------------------------------------------------------
-
-/** The variable that moves a project's whole data directory. */
-export const DATA_DIRECTORY = "AGENT_COMPOSE_DATA_DIR";
-
-/**
- * The emitted project's root: the directory `src/` sits in.
- *
- * Derived from this module's own URL rather than from `process.cwd()`, because a
- * store's data must not depend on where a process happened to be started: `bun
- * src/index.ts run …` from the project directory and the same command from a
- * repository root have to address one store.
- */
-const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-
-/** Where this project keeps what its stores hold. */
-export function dataRoot(): string {
-  const override = process.env[DATA_DIRECTORY];
-  return override === undefined || override === ""
-    ? path.join(PROJECT_ROOT, ".agent-compose")
-    : path.resolve(override);
-}
+//
+// `DATA_DIRECTORY` and `dataRoot` are declared in `./journal.ts` and re-exported
+// at the head of this file. They moved there when the journal arrived, because
+// that module is the leaf of the emitted import graph and the two artifacts —
+// a project's stores and a project's journal — share one directory. Nothing
+// about the layout changed: `<project>/.agent-compose/`, moved whole by
+// `AGENT_COMPOSE_DATA_DIR`, derived from this project's own location rather
+// than from where a process happened to be started.
 
 /** One key, as a file name: reversible, and unable to climb out. */
 export function encodeKey(key: string): string {
@@ -358,8 +382,18 @@ function sqlite(): Promise<SqliteModule> {
  */
 const DATABASES = new Map<string, Promise<Database>>();
 
-/** What an execution has opened, so [`releaseExecution`] can let it go. */
-const PER_EXECUTION = new Map<string, Set<string>>();
+/**
+ * What an execution owns, so [`releaseExecution`] can let it go.
+ *
+ * Two sets rather than one, because the two are released differently — a
+ * database handle is closed, a directory of blobs is removed — and a single set
+ * would have to guess which a string was. `databases` holds [`handleKey`]s,
+ * `directories` holds absolute paths.
+ */
+const PER_EXECUTION = new Map<
+  string,
+  { readonly databases: Set<string>; readonly directories: Set<string> }
+>();
 
 /** Which database a store's op addresses. */
 function handleKey(store: StoreBinding, execution: runtime.ExecutionIdentity): string {
@@ -386,6 +420,76 @@ CREATE TABLE IF NOT EXISTS applied (
 );
 `;
 
+/**
+ * How long an op waits on a locked store file, and how long the retry inside
+ * [`migrated`] keeps trying for.
+ *
+ * `./journal.ts`'s own deadline to the millisecond, and deliberately so: the two
+ * files sit in one directory, are locked by one driver's virtual file system,
+ * and are left behind by one crash, so two different deadlines would be two
+ * different answers to one question.
+ */
+const LOCK_WAIT_MS = 5_000;
+
+/** How this driver's virtual file system spells a held lock. See the header. */
+const LOCK_DIRECTORY = ".lock";
+
+/** Remove a lock no live process is giving back. See the module header. */
+function breakStaleLock(file: string): boolean {
+  const lock = `${file}${LOCK_DIRECTORY}`;
+  if (!fs.existsSync(lock)) return false;
+  try {
+    fs.rmSync(lock, { recursive: true, force: true });
+    return true;
+  } catch {
+    // A lock this process cannot remove is one it cannot get past either; the
+    // open below fails with the driver's own message rather than with this.
+    return false;
+  }
+}
+
+/**
+ * One store file, open with its schema applied — waiting out a lock and, past
+ * the deadline, breaking the one a killed writer left behind.
+ *
+ * `./journal.ts`'s `migrated` for the other file in the same directory, and the
+ * duplication is the honest shaping: the modules are separate compiler
+ * constants with separate schemas, and the shared thing is a fact about the
+ * driver rather than a function either of them owns.
+ */
+async function migrated(
+  Database: SqliteModule["Database"],
+  file: string,
+): Promise<InstanceType<SqliteModule["Database"]>> {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let broke = false;
+  let delay = 10;
+  for (;;) {
+    const database = new Database(file);
+    try {
+      // **First**, so that every statement after it waits on a locked file
+      // rather than failing at once. A `PRAGMA` that arrives after the
+      // contended statement is a setting nobody read.
+      database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
+      database.exec(SCHEMA);
+      return database;
+    } catch (error) {
+      database.close();
+      if (Date.now() >= deadline) {
+        // The deadline is up. Either a lock is still there — in which case its
+        // owner is gone under the one-process rule the header states, and it
+        // goes, once — or this is a failure waiting cannot fix, and it is the
+        // caller's.
+        if (broke || !breakStaleLock(file)) throw error;
+        broke = true;
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 200);
+    }
+  }
+}
+
 /** The database a store's op runs against, opened and migrated on first use. */
 function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promise<Database> {
   const cacheKey = handleKey(store, execution);
@@ -394,18 +498,18 @@ function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promis
 
   const opening = (async () => {
     const { Database } = await sqlite();
-    let opened: Database;
     if (store.scope === "execution" || store.backend.provider === "memory") {
       // Nothing on disk: an execution-scoped store dies with the run, and
-      // `provider: memory` says so outright.
-      opened = new Database(":memory:");
-    } else {
-      const directory = path.join(dataRoot(), "stores");
-      fs.mkdirSync(directory, { recursive: true });
-      opened = new Database(path.join(directory, `${encodeKey(store.name)}.sqlite`));
+      // `provider: memory` says so outright. Nothing to contend over either —
+      // an in-memory database is this process's alone — so it is opened
+      // directly rather than through the deadline [`migrated`] keeps.
+      const opened = new Database(":memory:");
+      opened.exec(SCHEMA);
+      return opened;
     }
-    opened.exec(SCHEMA);
-    return opened;
+    const directory = path.join(dataRoot(), "stores");
+    fs.mkdirSync(directory, { recursive: true });
+    return await migrated(Database, path.join(directory, `${encodeKey(store.name)}.sqlite`));
   })();
   // Registered before the first `await` inside it, so a concurrent caller finds
   // this promise rather than opening a second handle. A failed open is dropped
@@ -415,18 +519,38 @@ function open(store: StoreBinding, execution: runtime.ExecutionIdentity): Promis
   void opening.catch(() => {
     if (DATABASES.get(cacheKey) === opening) DATABASES.delete(cacheKey);
   });
-  if (store.scope === "execution") remember(execution.id, cacheKey);
   return opening;
 }
 
-/** Note a resource this execution owns, so its end can release it. */
-function remember(execution: string, resource: string): void {
-  let held = PER_EXECUTION.get(execution);
+/**
+ * Note the resources one op's store makes this execution the owner of, so its
+ * end can release them (grammar 11.1's `scope: execution` — "dies with the
+ * run").
+ *
+ * Called from [`runStoreOp`] and **outside** the journaled seam, off
+ * `store.scope` alone, because inside it this is a registration a replay never
+ * performs: a resumed generation whose `put` is answered out of the journal
+ * never enters [`blobOp`], so an ownership noted there would be noted by the
+ * crashed generation and by nothing afterwards — and the run that *did* end
+ * would leave the partition on disk for ever. It costs an op that owns nothing
+ * two comparisons, and an op that does two set insertions.
+ */
+function remember(
+  store: StoreBinding,
+  execution: runtime.ExecutionIdentity,
+  scopeKey: string,
+): void {
+  if (store.scope !== "execution") return;
+  let held = PER_EXECUTION.get(execution.id);
   if (held === undefined) {
-    held = new Set();
-    PER_EXECUTION.set(execution, held);
+    held = { databases: new Set(), directories: new Set() };
+    PER_EXECUTION.set(execution.id, held);
   }
-  held.add(resource);
+  if (store.kind === "blob") {
+    held.directories.add(blobRoot(store, scopeKey));
+    return;
+  }
+  held.databases.add(handleKey(store, execution));
 }
 
 /**
@@ -436,35 +560,50 @@ function remember(execution: string, resource: string): void {
  * the generated `serve` app — runs many executions, so an execution-scoped store
  * that stayed open would be a leak *and* a lie: "dies with the run" is the
  * lifetime grammar 11.1 declares.
+ *
+ * `parked` says the run has **not** ended — its journal row is still open and a
+ * resume will replay it (`runtime.staysOpen`). What lives in this process goes
+ * either way, because this process is not what the resumed generation will read
+ * from; what lives **on disk** stays, because it is. A `scope: execution` `blob`
+ * store is a directory (see [`inProcessOnly`]), so removing it here would delete
+ * the very world a live `get` past the frontier is promised to find — a replayed
+ * `put` is never applied a second time, and nothing would compare unequal
+ * (`docs/durability.md` §5). The generation that *ends* the execution removes
+ * it, and reaches the same op site to re-register it on the way ([`remember`]).
+ * An execution nobody ever resumes leaves its partition behind, exactly as it
+ * leaves its row open.
  */
-export function releaseExecution(id: string): void {
+export function releaseExecution(id: string, parked = false): void {
+  IN_PROCESS_ONLY.delete(id);
   const held = PER_EXECUTION.get(id);
   if (held === undefined) return;
   PER_EXECUTION.delete(id);
-  for (const resource of held) {
+  for (const resource of held.databases) {
     const database = DATABASES.get(resource);
-    if (database !== undefined) {
-      DATABASES.delete(resource);
-      // The handle is behind a promise (see [`DATABASES`]), so the close is
-      // scheduled rather than performed: an op still in flight when the run
-      // ended is the one case, and letting it finish beats closing the file
-      // underneath it. Both rejections are swallowed — an open that failed has
-      // nothing to close, and a close that failed released it anyway.
-      void database.then(
-        (held) => {
-          try {
-            held.close();
-          } catch {
-            // A database that is already closed is one that is already released.
-          }
-        },
-        () => {},
-      );
-      continue;
-    }
-    // Anything else this execution owned is a directory of blobs.
+    // Absent where the ownership was noted at an op the journal answered, so
+    // nothing was ever opened ([`remember`]): there is no handle to close.
+    if (database === undefined) continue;
+    DATABASES.delete(resource);
+    // The handle is behind a promise (see [`DATABASES`]), so the close is
+    // scheduled rather than performed: an op still in flight when the run
+    // ended is the one case, and letting it finish beats closing the file
+    // underneath it. Both rejections are swallowed — an open that failed has
+    // nothing to close, and a close that failed released it anyway.
+    void database.then(
+      (open) => {
+        try {
+          open.close();
+        } catch {
+          // A database that is already closed is one that is already released.
+        }
+      },
+      () => {},
+    );
+  }
+  if (parked) return;
+  for (const directory of held.directories) {
     try {
-      fs.rmSync(resource, { recursive: true, force: true });
+      fs.rmSync(directory, { recursive: true, force: true });
     } catch {
       // Best effort: a temporary directory that outlives the process is a
       // nuisance, and failing a completed run over one would be worse.
@@ -522,14 +661,23 @@ export async function runStoreOp(
   // leaves nothing for the next one to trip over.
   const idempotencyKey = writes(op) ? site.idempotencyKey : undefined;
 
-  const answer = await perform(
-    store,
-    op,
-    params,
-    scopeKey,
-    execution,
-    idempotencyKey,
-    context.signal,
+  // What `scope: execution` makes this run the owner of, noted **outside** the
+  // seam below because a replayed op never enters it (see [`remember`]).
+  remember(store, execution, scopeKey);
+
+  // Both halves of PRD 5.8's replay discipline go through the journal, and this
+  // is where "replay consumes history, not the live store" stops being a
+  // description of the trace and becomes the mechanism: a replayed **read**
+  // answers what it answered, and a replayed **write** is not applied a second
+  // time — the row the journal holds is the row the first generation wrote,
+  // `deduped` included, so the trace entry a resumed run files is the entry the
+  // crashed one would have filed (`docs/durability.md` §3.3).
+  const answer = await journaled(
+    context.effects,
+    "store",
+    { store: store.address, op, scope: store.scope, partition: scopeKey, via: site.via, params },
+    () => perform(store, op, params, scopeKey, execution, idempotencyKey, context.signal),
+    (slot) => inProcessState(store, op, execution, slot),
   );
   record(context, {
     store: store.address,
@@ -542,6 +690,87 @@ export async function runStoreOp(
     ...(idempotencyKey === undefined ? {} : { idempotencyKey, deduped: answer.deduped }),
   });
   return answer.row;
+}
+
+// ---------------------------------------------------------------------------
+// A store the frontier cannot reach back into
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether this store's data lives **only in the process that opened it**.
+ *
+ * Exactly [`open`]'s `:memory:` arm: a `scope: execution` `kv`/`vector` store,
+ * and any store a target bound to `provider: memory`. A `blob` store is a
+ * directory either way, so its data outlives the process that wrote it even at
+ * `scope: execution` — which is what [`releaseExecution`] removes when the
+ * execution **ends**, and what a resumed generation removes on its way out
+ * ([`remember`]). A generation that only *parked* removes nothing, which is what
+ * leaves that directory there to be read across the resume
+ * (`docs/durability.md` §5).
+ */
+function inProcessOnly(store: StoreBinding): boolean {
+  if (store.kind === "blob") return false;
+  return store.scope === "execution" || store.backend.provider === "memory";
+}
+
+/**
+ * Per execution, the in-process stores whose recorded prefix **wrote** to them.
+ *
+ * Emptied by [`releaseExecution`] with everything else the execution owned.
+ */
+const IN_PROCESS_ONLY = new Map<string, Set<string>>();
+
+/**
+ * Refuse a live op on a store whose contents died with the generation that
+ * filled it (`docs/durability.md` §5).
+ *
+ * The frontier model says a live effect past it acts on the same world the
+ * recorded prefix left behind, and for a network, a filesystem or a store on
+ * disk it does. For a store that lives in the process it does not: the prefix's
+ * writes are answered out of the journal and so are **never re-applied**, and
+ * the resumed process holds a database that was created empty a moment ago. The
+ * first live read then answers `found: false` about something the execution
+ * wrote, routes down a branch the original would never have taken, and reports
+ * `completed`. Nothing compares unequal, so §7's two divergences see nothing.
+ *
+ * So this is the third, and it is decided here because here is the only place
+ * both facts are known: that the prefix wrote to this store (a replayed write,
+ * noted below), and that this op is past the frontier (`slot.held` is
+ * `undefined`). It is a [`ReplayDivergence`] because it has to travel exactly
+ * where one travels — past `retry:`, `on_error:`, `on_item_error:` and
+ * `detach:`, and without closing the execution's row — and it carries its own
+ * opening clause, because the composition is not what disagreed.
+ */
+function inProcessState(
+  store: StoreBinding,
+  op: StoreOp,
+  execution: runtime.ExecutionIdentity,
+  slot: EffectSlot,
+): void {
+  if (!inProcessOnly(store)) return;
+  if (slot.held !== undefined) {
+    // Replayed. A write in the prefix is what makes the store's contents
+    // unreconstructable; a read is not — it answered out of a store this
+    // generation's copy matches, empty for empty.
+    if (!writes(op)) return;
+    let held = IN_PROCESS_ONLY.get(execution.id);
+    if (held === undefined) {
+      held = new Set();
+      IN_PROCESS_ONLY.set(execution.id, held);
+    }
+    held.add(store.address);
+    return;
+  }
+  if (IN_PROCESS_ONLY.get(execution.id)?.has(store.address) !== true) return;
+  const lifetime =
+    store.backend.provider === "memory"
+      ? `\`provider: memory\` (${store.backend.from})`
+      : `\`scope: execution\``;
+  throw new ReplayDivergence(
+    slot,
+    `this execution's record holds a write to \`${store.address}\`, which is ${lifetime} — its rows live only in the process that opened it. That process is gone, and a replayed write is not applied a second time, so this op would answer out of an empty store rather than out of the world the record left behind. A store a resumed execution reads past the frontier has to outlive the run: \`scope: session\` or \`scope: global\` (\`docs/durability.md\` §5)`,
+    "this execution's record cannot be replayed",
+  );
 }
 
 /** One op's answer, and whether the backend had already applied its key. */
@@ -568,7 +797,7 @@ async function perform(
   signal: AbortSignal,
 ): Promise<Applied> {
   if (store.kind === "blob") {
-    return blobOp(store, op, params, scopeKey, execution, idempotencyKey);
+    return blobOp(store, op, params, scopeKey, idempotencyKey);
   }
   const database = await open(store, execution);
   // A `vector` write and a `vector` search both need a vector, and computing one
@@ -773,21 +1002,30 @@ function byUtf8Bytes(left: string, right: string): number {
   return a.length - b.length;
 }
 
+/**
+ * A `blob` store's partition on disk: everything one scope of it holds.
+ *
+ * Named rather than joined at its two call sites, because the two have to agree
+ * exactly: [`blobOp`] writes under it and [`remember`] registers it for removal
+ * when an execution-scoped run ends, and a directory removed by one path and
+ * written by another is a lifetime that only looks kept.
+ */
+function blobRoot(store: StoreBinding, scopeKey: string): string {
+  return path.join(dataRoot(), "blobs", encodeKey(store.name), scopeKey);
+}
+
 /** The `blob` rows of grammar 11.4's catalog, over a directory of files. */
 function blobOp(
   store: StoreBinding,
   op: StoreOp,
   params: StoreParams,
   scopeKey: string,
-  execution: runtime.ExecutionIdentity,
   idempotencyKey: string | undefined,
 ): Applied {
-  const root = path.join(dataRoot(), "blobs", encodeKey(store.name), scopeKey);
+  const root = blobRoot(store, scopeKey);
   const values = path.join(root, "values");
   const types = path.join(root, "types");
   const ledger = path.join(root, "applied");
-  // An execution-scoped blob store's whole partition goes when the run does.
-  if (store.scope === "execution") remember(execution.id, root);
 
   if (idempotencyKey !== undefined) {
     const marker = path.join(ledger, markerName(idempotencyKey));

@@ -1,0 +1,227 @@
+# Acceptance fixture: providers that hold no key, and one that does.
+#
+# Grammar 12.1 makes `api_key:` conditional on the two kinds with a default
+# endpoint (Decision D120): a provider that names a `base_url:` may declare none,
+# because the gateway that `base_url:` points at injects the vendor credential
+# server-side. What a compiled graph must then do is send **no** authentication
+# header at all — not an empty one — and that is a property of the *request*,
+# which no assertion about a flow's outputs can see.
+#
+# So this fixture is written to be read from the transcript. Four flows, one
+# node each:
+#
+#   * `flow.messages` — a keyless `anthropic` provider that declares a gateway
+#     token through `headers:`, so the recorded request must carry no
+#     `x-api-key` and must carry that token;
+#   * `flow.chat` — a keyless `openai` provider, so it must carry no
+#     `authorization`;
+#   * `flow.compatible` — a keyless `openai_compatible` provider, the kind whose
+#     row D120 did not move. The header rule is stated over the *connection*
+#     rather than over the kind, so it reaches this one too, and this is the only
+#     place the suite says so on a wire whose `api_key:` was optional all along;
+#   * `flow.keyed` — the same `anthropic` wire with `api_key:` declared, which is
+#     the other direction of the same rule and the only place the suite asserts
+#     that the Messages surface sends its credential when the spec has one.
+#
+# One flow per case rather than one flow with three nodes: what is being decided
+# is a single request's headers, and a flow whose second agent replayed the
+# first one's exchange would put the conversation channel between the assertion
+# and its subject.
+version: "0.1"
+
+state:
+  verdict:
+    enum: [approve, revise]
+    default: approve
+  feedback:
+    type: string
+    default: ""
+  summary:
+    type: string
+    default: ""
+
+# No `api_key:`. Legal because `base_url:` is declared, and the whole point of
+# the fixture: `${MOCK_BASE_URL}` is the gateway stand-in every fixture here
+# points at, and this one reaches it holding no vendor credential.
+#
+# It does hold a token of its *own*, and that is not decoration. A gateway that
+# injects the vendor key server-side still has to decide who is calling it, and
+# `headers:` is the answer grammar 12.1, `explain missing-credential` and
+# `docs/topics/models.md` all give — so the deployment D120 exists to admit is
+# routinely this pair of lines, not the `base_url:` alone. On this wire the two
+# ride under different names (the Messages API reads `x-api-key`), so one
+# recorded request shows both halves at once: the vendor credential absent, the
+# declared token present. `${MOCK_GATEWAY_TOKEN}` is deliberately a different value from
+# the `${MOCK_API_KEY}` the keyed provider below sends, so an assertion can say
+# which of the two a header came from rather than merely that one arrived.
+provider.claude_gateway:
+  kind: anthropic
+  base_url: ${MOCK_BASE_URL}
+  headers:
+    authorization: "Bearer ${MOCK_GATEWAY_TOKEN}"
+
+provider.openai_gateway:
+  kind: openai
+  base_url: ${MOCK_BASE_URL}
+
+# The same wire from the kind whose row D120 left alone: `openai_compatible`
+# paired an optional `api_key:` with a required `base_url:` before the decision
+# and still does. It is here because the *header* half of D120 is stated over the
+# connection, not over the kind — a provider that declares no key sends no
+# authentication header, whichever row it comes from — and this is the local
+# llama.cpp/ollama shape `docs/topics/models.md` names, which used to reach the
+# wire holding an empty `Bearer `.
+provider.local_gateway:
+  kind: openai_compatible
+  base_url: ${MOCK_BASE_URL}
+
+# The control: the same kind and the same endpoint, with the credential the
+# other three decline to hold.
+provider.claude_direct:
+  kind: anthropic
+  base_url: ${MOCK_BASE_URL}
+  api_key: ${MOCK_API_KEY}
+
+model.gateway_messages:
+  provider: provider.claude_gateway
+  id: claude-sonnet-4-6
+
+model.gateway_chat:
+  provider: provider.openai_gateway
+  id: gpt-4o
+
+model.local_chat:
+  provider: provider.local_gateway
+  id: qwen3-coder-30b
+
+model.keyed_messages:
+  provider: provider.claude_direct
+  id: claude-haiku-4-5
+
+agent.gateway_reviewer:
+  description: Reviews a goal through a keyless Messages connection.
+  model: model.gateway_messages
+  prompt: |
+    You are a meticulous technical reviewer.
+  input:
+    goal:
+      type: string
+  output:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+
+agent.gateway_summarizer:
+  description: Summarizes a review through a keyless Chat Completions connection.
+  model: model.gateway_chat
+  prompt: |
+    You summarize reviews in one line.
+  input:
+    notes:
+      type: string
+  output:
+    summary:
+      type: string
+
+agent.local_summarizer:
+  description: Summarizes a review through a keyless compatible connection.
+  model: model.local_chat
+  prompt: |
+    You summarize reviews in one line.
+  input:
+    notes:
+      type: string
+  output:
+    summary:
+      type: string
+
+agent.keyed_reviewer:
+  description: Reviews a goal through a Messages connection that holds a key.
+  model: model.keyed_messages
+  prompt: |
+    You are a meticulous technical reviewer.
+  input:
+    goal:
+      type: string
+  output:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+
+flow.messages:
+  description: "One node whose `anthropic` provider swaps `api_key:` for `headers:`."
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.gateway_reviewer
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }
+
+flow.chat:
+  description: "One agent node whose `openai` provider declares no `api_key:`."
+  inputs:
+    notes:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    summarize:
+      agent: agent.gateway_summarizer
+      input:
+        notes: "input.notes"
+  edges:
+    - { from: start, to: summarize }
+    - { from: summarize, to: end }
+
+flow.compatible:
+  description: "One agent node whose `openai_compatible` provider declares no `api_key:`."
+  inputs:
+    notes:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    summarize:
+      agent: agent.local_summarizer
+      input:
+        notes: "input.notes"
+  edges:
+    - { from: start, to: summarize }
+    - { from: summarize, to: end }
+
+flow.keyed:
+  description: "The same wire with `api_key:` declared: the header is still sent."
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.keyed_reviewer
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

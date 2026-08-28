@@ -90,15 +90,21 @@ impl Request {
 
     /// The headers an Anthropic client sends, with a placeholder key.
     ///
-    /// The harness needs no API keys (PRD §7 M1), but the *shape* of a
-    /// request still includes its auth headers, and this server checks them.
+    /// The harness needs no API keys (PRD §7 M1), but the *shape* of a request
+    /// still includes its auth headers. This is the **keyed** client, which is
+    /// what most tests want to be; the credential's *presence* is no longer
+    /// required on this surface, because a provider behind a gateway declares
+    /// none and sends none (WIRE-NOTES (12)) — its shape still is, so the
+    /// placeholder here is a non-empty one on purpose. `anthropic-version` is
+    /// required either way.
     #[must_use]
     pub fn anthropic_auth(self) -> Self {
         self.header("x-api-key", "mock-provider-key")
             .header("anthropic-version", "2023-06-01")
     }
 
-    /// The header an OpenAI client sends, with a placeholder key.
+    /// The header an OpenAI client sends, with a placeholder key. The keyed
+    /// client on the direct route, on the same terms as [`Self::anthropic_auth`].
     #[must_use]
     pub fn openai_auth(self) -> Self {
         self.header("authorization", "Bearer mock-provider-key")

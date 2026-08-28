@@ -79,6 +79,7 @@ export const environmentReferences: readonly EnvironmentReference[] = [
   {
     name: "REPO_ROOT",
     sites: [
+      "agent.fixer.tools.builtin.read_file.root",
       "flow.triage.node.verify.exec.cwd",
       "tool.repo_grep.exec.cwd",
     ],

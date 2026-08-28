@@ -10,8 +10,10 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::ast::common::{Address, Ident, Interpolated, Literal};
-use crate::ast::definition::{AgentAccess, ProviderKind, RouteCondition, StoreKind, StoreScope};
+use crate::ast::common::{Address, Duration, Ident, Interpolated, Literal};
+use crate::ast::definition::{
+    AgentAccess, Builtin, ProviderKind, RouteCondition, StoreKind, StoreScope,
+};
 use crate::diag::{Span, Spanned};
 
 use super::binding::InterpolatedEntry;
@@ -71,6 +73,13 @@ pub struct Agent {
     /// `tools:` — `tool.*` and `flow.*` addresses, in declaration order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Spanned<Address>>,
+    /// `tools:` — the `builtin.*` entries of the same list, in declaration
+    /// order (grammar 5.5, Decision D123).
+    ///
+    /// Omitted from the artifact when empty, which is what keeps a composition
+    /// that attaches none byte-identical to one written before the key existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub builtins: Vec<BuiltinTool>,
     /// `stores:` — `store.*` addresses, in declaration order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stores: Vec<Spanned<Address>>,
@@ -80,6 +89,27 @@ pub struct Agent {
     /// `max_tool_iterations:` — absent means the default, `8` (Decision D51).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tool_iterations: Option<i64>,
+}
+
+/// One `builtin.*` entry of an agent's `tools:` list, with the bounds it
+/// declared (grammar 5.5, Decision D123, PRD resolved q31).
+///
+/// The bounds are not defaults and not optional here: `root:` is required of
+/// every built-in and `timeout:` of `builtin.bash`, so an artifact that carries
+/// one carries what bounds it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BuiltinTool {
+    /// Which built-in, and the span of the entry key that named it.
+    pub tool: Spanned<Builtin>,
+    /// `root:` — the directory every path this tool touches must resolve
+    /// inside, and `builtin.bash`'s working directory.
+    pub root: Spanned<Interpolated>,
+    /// `timeout:` — how long `builtin.bash`'s command may run. Absent on the
+    /// file tools, which run no command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Spanned<Duration>>,
+    /// The whole entry, key and bounds together.
+    pub span: Span,
 }
 
 /// A `tool.*` definition: one implementation, two usage surfaces (grammar 6).
@@ -202,6 +232,32 @@ pub struct ProviderConfig {
     /// `headers:` — extra request headers, interpolable values.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<InterpolatedEntry>,
+    /// `server_tools:` — the provider-side tools appended to the `tools` of
+    /// every request this connection serves, in declaration order
+    /// (Decision D122).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub server_tools: Vec<ServerTool>,
+}
+
+/// One `server_tools:` entry, as the artifact carries it (grammar 12.1,
+/// Decision D122).
+///
+/// A wire object rather than a construct of this grammar: `type:` is the only
+/// key the compiler reads, and `config` is everything beside it — checked
+/// against the curated table when the type is in it, and carried untouched
+/// either way. The values are grammar 4.3 class 2, so each string reaches the
+/// artifact as an [`Interpolated`] node that records the references it embeds.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ServerTool {
+    /// `type:` — the key the provider's own vocabulary is looked up under.
+    #[serde(rename = "type")]
+    pub type_name: Spanned<String>,
+    /// Everything beside `type:`, sorted by key: a wire object is a set of
+    /// fields rather than a sequence, and the artifact is canonical.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, Spanned<crate::ast::deploy::PluginValue>>,
+    /// The entry's own span.
+    pub span: Span,
 }
 
 /// A `model.*` definition: a direct binding or a route, never both

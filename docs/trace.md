@@ -687,7 +687,7 @@ cost of one indirection for the part that is a run of its own.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `name` | string | always | The tool the model called, spelled as the request offered it — a `tool.*`'s local name, a `flow.*`'s (grammar §5.4), or a synthesized store tool's (grammar §11.5). |
+| `name` | string | always | The tool the model called, spelled as the request offered it — a `tool.*`'s local name, a `flow.*`'s (grammar §5.4), a synthesized store tool's (grammar §11.5), or a runtime built-in's (`bash`, `read_file`, `write_file`, `list` — grammar §5.5). |
 | `target` | string | when the agent offers a tool of that name | The component behind the name, as a typed address (grammar §2.2). Absent on the one call that has none: a name the agent does not offer, which is a model answering with a tool that was never on the wire. That call is recorded `"refused"` and handed back to the model with the names it does have (grammar D119). |
 | `outcome` | `"completed"` \| `"refused"` \| `"failed"` | always | What the loop did with the call. `"completed"` handed the model the tool's result. `"refused"` handed it the **refusal** instead: the tool's declared contract did not admit the call — arguments its schema refuses, on any of the three surfaces, or a name the agent never offered — and grammar D119 makes that a call the model is asked to make again, so the node did not end and records after it exist. `"failed"` is the tool's *execution* failing, which ended the node: the failure left the tool, the node's own `on_error:` decided the run (grammar §9.2), and the model saw nothing back. §5.1 names the one failure no `on_error:` decided: a `human` node inside the flow the call ran, on a run that could not answer it. |
 | `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a `"refused"` flow-as-tool call, which is arguments that failed the flow's own `inputs:` before an instance existed. A refused call spends **no** call ordinal (grammar §9.4, D119) — that ordinal counts invocations and this call reached no flow — so the instance path of the call that follows it is the one it would have had with no refusal ahead of it. |
@@ -703,6 +703,14 @@ bare dispatch record alone would leave a tool call whose result came from
 nowhere". It is carried for the one tool whose result is the composition's own
 declared data; a `tool.*`'s answer and a store tool's stay out, the second of
 them because §6 already carries it in `StoreRecord.answer`.
+
+A **runtime built-in**'s answer stays out with them, and that is the whole of
+what the built-ins changed here: a `bash`'s stdout and a `read_file`'s contents
+are a tool's answer under §11's rule, so what this format records is the call —
+`name`, `target: "builtin.bash"`, the outcome, and the error where there was
+one. The full answer is in the durability journal, which is private recovery
+data rather than a document a run hands out (`docs/durability.md` §3.2, §8, PRD
+resolved q31).
 
 A `"refused"` call's `error` is where an excerpt of those arguments can appear,
 and it is not an exception to the rule above but the same one read where the
@@ -1117,6 +1125,19 @@ The version number alone is a promise; two tests make it a checkable one:
   stay under the rule: a `tool.*`'s answer is an external system's, and a store
   tool's is already in `StoreRecord.answer`, so recording it twice would buy
   nothing.
+* **The execution journal.** A compiled project keeps a second record beside
+  this one, and the two are not the same artifact: the journal holds every
+  effect's full payload — model completions, tool results, what a store
+  answered, what a person answered — because a replay has to hand those back
+  rather than re-issue them (`docs/durability.md`). It shares this format's
+  keying (§8) and nothing else, it is private recovery data with the same
+  sensitivity as the project's stores, and no field of this format is derived
+  from it or carries any part of it. Everything §11 keeps out stays out; the
+  journal is where it goes instead. A **resumed** execution writes a fresh trace
+  document of its own, carrying the same `execution_id` and the same
+  deterministic identities, in which replayed and live work are deliberately
+  not distinguished — this format answers what the *execution* did, and that is
+  the same answer whichever process did it (`docs/durability.md` §9).
 * **What a human answered.** A `human` node's pause is recorded — that it began,
   how long it had, and how it ended (§3.4) — and the answer itself is not. It is
   the same rule as the one below for a model's completion and is stated

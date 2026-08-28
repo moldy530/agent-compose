@@ -523,6 +523,15 @@ export function sessionRefusal(address: string, stores: readonly string[]): stri
  * surface (PRD §9.21): `src/serve.ts`, whose `POST /executions/:id/resume`
  * delivers the answer, and `src/cli.ts`, when the `run` it is serving may ask
  * at the terminal it was launched from.
+ *
+ * # Every invocation is journaled
+ *
+ * PRD resolved q26–q29: the run's effects are written to this project's journal
+ * as they happen, and `resume: true` re-runs the graph consuming that record
+ * read-only up to the frontier. Journaling is unconditional — every target this
+ * compiler builds is process-local and binds the SQLite journal beside the
+ * project (resolved q27) — so a caller that says nothing about durability still
+ * gets it. `docs/durability.md` is normative.
  */
 export async function runFlow(
   address: string,
@@ -542,6 +551,63 @@ export async function runFlow(
      * route.
      */
     readonly resumable?: boolean;
+    /**
+     * What started this execution, for the journal's lifecycle row.
+     *
+     * `manual` where nothing says otherwise, which is every `agent-compose run`
+     * and every `manual` trigger; `src/serve.ts` passes the `http` trigger's own
+     * name. Recorded and never dispatched on — recovery replays executions, it
+     * does not re-fire triggers (PRD resolved q28).
+     */
+    readonly trigger?: string;
+    /**
+     * The completion webhook of an `async` `http` trigger, resolved against the
+     * request that started this execution (grammar 13.3).
+     *
+     * `src/serve.ts` passes it and nothing else does. It goes on the journal's
+     * lifecycle row because the process that finishes an execution need not be
+     * the one that started it: a `serve` that restarts mid-run recovers the
+     * execution and has to be able to call the caller back
+     * (`docs/durability.md` §6.1).
+     */
+    readonly callback?: string;
+    /**
+     * Whether this is a **resumed** generation of an execution the journal
+     * already holds (PRD resolved q29).
+     *
+     * `true` makes every effect site consult the journal before it calls the
+     * world: a recorded answer is returned byte for byte and nothing is
+     * re-issued, until the frontier — the first effect the journal does not
+     * hold — where the execution goes live again. `executionId` names which
+     * execution, and `inputs`/`sessionKey` must be the ones the journal
+     * recorded, which is why the two callers that resume read them back off the
+     * lifecycle row rather than composing them again.
+     */
+    readonly resume?: boolean;
+    /**
+     * Called once, **immediately before this run closes its lifecycle row**,
+     * and awaited.
+     *
+     * The one caller is `src/serve.ts`, and what it does with it is journal the
+     * `settled` webhook's intent while the row is still open
+     * (`docs/durability.md` §3.7): a delivery recorded after the row closed is
+     * one no restart can find — `recover` sees no open execution and the
+     * delivery ledger has no row — so a process killed in that window would owe
+     * a caller a push nothing would ever send. It is passed what the run
+     * produced, or the error that ended it, because the report a webhook
+     * carries is that answer and this is the last moment it exists inside the
+     * run.
+     *
+     * It is **not** called for a run whose row stays open — a `human` pause
+     * nobody could answer, a replay divergence — which is what keeps resolved
+     * q29's "a divergence fires nothing" a property of the structure rather
+     * than of a check somebody remembered to write.
+     *
+     * Its own failure is its own: a webhook that could not be recorded is not
+     * the run's outcome, and letting it through here would replace what a run
+     * really did with what a receiver's ledger could not hold.
+     */
+    readonly closing?: (produced: FlowRun | undefined, error: unknown) => Promise<void>;
   } = {},
 ): Promise<FlowRun> {
   const flow = flows[address];
@@ -565,14 +631,137 @@ export async function runFlow(
     throw new Error(sessionRefusal(address, flow.sessionStores));
   }
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
+  // Before the graph is streamed, so an execution the process dies in the middle
+  // of already has a row saying it was open (PRD resolved q28).
+  await runtime.openExecution({
+    execution: executionId,
+    flow: address,
+    trigger: options.trigger ?? "manual",
+    inputs: parsed,
+    sessionKey,
+    ...(options.callback === undefined ? {} : { callback: options.callback }),
+    ...(options.resume === true ? { resuming: true } : {}),
+  });
+  try {
+    const produced = await quiesceFlow(address, flow, parsed, ceiling, sessionKey, executionId, options);
+    // A run that reached quiescence may still be holding a divergence raised
+    // where nothing could throw it — a detached `map` delivery, which grammar 8.6
+    // rule 7 says the flow instance does not wait for. PRD resolved q29 makes a
+    // divergence un-absorbable by any policy at any nesting depth, and `detach:`
+    // is one, so it fails the resume here rather than being reported as a
+    // completion the record does not support.
+    const diverged = runtime.latchedDivergence(executionId);
+    if (diverged !== undefined) throw diverged;
+    // The last moment before the row closes, and what `closing` is for. Its own
+    // failure is swallowed rather than allowed to travel: it would report a run
+    // that produced its outputs as one that failed, over a webhook the status
+    // route backstops (see the option's own comment).
+    if (options.closing !== undefined) {
+      try {
+        await options.closing(produced, undefined);
+      } catch {
+        // Said by the hook, where a hook has something to say.
+      }
+    }
+    runtime.settleExecution(executionId);
+    return produced;
+  } catch (error) {
+    // Which of the three closing rows this is — `failed`, or none at all
+    // because the run is parked at a `human` pause and is exactly what a resume
+    // exists for — is `runtime.settleExecution`'s to decide, off the same
+    // `runtime.interruptOf` this function's own callers read.
+    //
+    // …which is also what decides whether anything is *closing*: the hook is
+    // the last moment before a row closes, and a row that stays open has not
+    // reached one. `runtime.staysOpen` is the predicate `settleExecution` is
+    // about to ask, asked here so the two cannot answer differently.
+    if (options.closing !== undefined && !runtime.staysOpen(executionId, error)) {
+      try {
+        await options.closing(undefined, error);
+      } catch {
+        // …and here it would replace the error the run really produced.
+      }
+    }
+    runtime.settleExecution(executionId, error);
+    throw error;
+  } finally {
+    runtime.closeExecution(executionId);
+  }
+}
+
+/** [`runFlow`]'s body, with the journal's lifecycle row already open. */
+async function quiesceFlow(
+  address: string,
+  flow: CompiledFlow,
+  parsed: Record<string, unknown>,
+  ceiling: number,
+  sessionKey: string,
+  executionId: string,
+  options: { readonly resumable?: boolean; readonly resume?: boolean },
+): Promise<FlowRun> {
   // Opened before the graph is streamed, so a status route asked the instant
   // after `start` answered already has somewhere to read this run's pauses from
   // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers
   // against the same execution id and is told apart by its instance path.
   runtime.openHumanWaits(executionId, options.resumable === true);
+  // `scope: execution` means what it says: whatever this run's own stores held
+  // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
+  // A `serve` process runs many executions, so a store that stayed open would
+  // be both a leak and a lifetime the composition did not declare. A pause the
+  // run was holding goes the same way and for the same reason: a wait that
+  // outlived its run would be one a resume could still be delivered to, with
+  // no graph left to receive it (grammar 8.7).
+  //
+  // **Unless the run has not ended.** An execution whose journal row stays open
+  // — parked at a `human` pause with nobody to answer it, or stopped by a
+  // divergence — is one a resume replays, and `runtime.staysOpen` is the very
+  // predicate `runtime.settleExecution` decides that by. What such a run owns
+  // *on disk* has to still be there when the resumed generation reads past the
+  // frontier: a replayed write is never applied a second time, so a partition
+  // this generation deleted would answer an empty `get` about something the
+  // execution wrote, with nothing comparing unequal to catch it
+  // (`docs/durability.md` §5).
+  const release = async (outcome: unknown): Promise<void> => {
+    runtime.releaseHumanWaits(executionId);
+    // And the deliveries nothing joined, on the two ways out where one still in
+    // flight can change what this function has to decide.
+    //
+    // A detached `map` delivery is journaled when it answers, so a generation
+    // that walks out from under one in flight leaves an effect with no record —
+    // which the generation that resumes this execution issues a second time
+    // (`docs/durability.md` §3.2). That is the **parked** half, and for a run
+    // that ended it costs nothing, because nothing will resume it.
+    //
+    // The **resuming** half is about the answer itself. A delivery is the one
+    // place a `runtime.ReplayDivergence` has nothing to be thrown to, so it is
+    // latched against the execution (PRD resolved q29) — and a latch is exactly
+    // what makes `runtime.staysOpen` true. A delivery still working through its
+    // permits when the graph quiesced can latch one *after* a reading taken
+    // here, and a reading taken before that is a run closed `completed` over a
+    // delivery the record describes and nobody made, or a `scope: execution`
+    // blob partition removed under the very resume §5 promises it to. So a
+    // generation that is consuming a record waits for them: a divergence can
+    // arise on no other kind (a first generation has no record to disagree
+    // with), which is why this is not a wait every run pays.
+    //
+    // Grammar 8.6 rule 7 is untouched either way: the join returned at
+    // dispatch, the trace entry was written without it, and this is `runFlow`
+    // on its way out of a run that has already stopped advancing.
+    if (runtime.staysOpen(executionId, outcome) || options.resume === true) {
+      await runtime.settleDetached(executionId);
+    }
+    // Read **after** the deliveries have settled, so it is the answer the whole
+    // execution gives rather than the one it gave at the instant the graph
+    // quiesced.
+    const parked = runtime.staysOpen(executionId, outcome);
+    stores.releaseExecution(executionId, parked);
+  };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way
-  // out is LangGraph stopping the run at the ceiling.
+  // out is LangGraph stopping the run at the ceiling. Its answer carries the
+  // run's own failure rather than throwing it, so the release reads that error
+  // on the settled path and the thrown one on the other — the same outcome
+  // either way, which is what a `finally` could not have been told.
   const { state, error } = await runtime
     .quiesce(
       flow,
@@ -585,17 +774,16 @@ export async function runFlow(
       },
       ceiling,
     )
-    // `scope: execution` means what it says: whatever this run's own stores held
-    // is released when the run ends, however it ended (PRD 5.8, grammar 11.1).
-    // A `serve` process runs many executions, so a store that stayed open would
-    // be both a leak and a lifetime the composition did not declare. A pause the
-    // run was holding goes the same way and for the same reason: a wait that
-    // outlived its run would be one a resume could still be delivered to, with
-    // no graph left to receive it (grammar 8.7).
-    .finally(() => {
-      stores.releaseExecution(executionId);
-      runtime.releaseHumanWaits(executionId);
-    });
+    .then(
+      async (reached) => {
+        await release(reached.error);
+        return reached;
+      },
+      async (thrown: unknown) => {
+        await release(thrown);
+        throw thrown;
+      },
+    );
   if (error !== undefined) {
     throw new runtime.FlowFailure(
       address,

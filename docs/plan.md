@@ -397,12 +397,21 @@ touched.
 | member | what it names |
 |---|---|
 | `"flow"` | a flow's declared `inputs:` and `outputs:` — its module signature (grammar 7.5), which is also its signature as an agent's tool |
-| `"trigger"` | a trigger's delivery surface: its type, its route and method, its response mode and timeout, its callback, its `session_key:`, and its `input:` bindings |
+| `"trigger"` | a trigger's delivery surface: its type, its route and method, its response mode and timeout, its callback, its authentication — `auth:`, `callback_auth:` and `callback_allow:` — its `session_key:`, and its `input:` bindings |
 
 Paths on a flow's record are rooted at `inputs` or at `outputs`, so a reader
 never has to ask which surface a change is on. A trigger's `name` is not on its
 record here either, for §4's reason: it repeats the key the trigger is declared
 under.
+
+A trigger's authentication is on this surface rather than among its components
+because it is part of what a caller meets: whether a route verifies anybody, and
+where a delivery may go, are the two questions an operator reading a diff asks
+about a webhook. So an `auth:` block appearing reads as an added key, and
+repointing a credential at another variable reads as
+`~ trigger.intake / callback_auth.bearer.token.env_ref: "CALLBACK_TOKEN" -> "DELIVERY_TOKEN"`
+— the reference moves, never a secret, because a secret is never in the spec
+(grammar 4.3, 13.3).
 
 ## 7. Validation
 
@@ -674,6 +683,18 @@ The class is not these three: it is every key `docs/grammar.md` gives a default 
 `context: isolated`, `as: item`, `on_item_error: fail`, `detach: false`,
 `respond: async`, `unique_items: false`, `agent_access: read_write`,
 `timezone: UTC` and the rest all read the same way.
+
+**One family is the exception, and it is deliberate.** The scheme parameters
+*inside* an `http` trigger's `auth:` and `callback_auth:` blocks — `header:`,
+`algorithm:`, `encoding:`, `prefix:` — are materialized into the artifact
+(grammar 13.3, Decision D125): a declared scheme lands resolved, because those
+four decide whether a credential verifies and a later reader re-deriving one
+differently would not fail a build, it would accept the wrong request. So
+`header: X-Signature` written out where the default already supplies it is the
+one default this command reports **nothing** about, and that is the plan telling
+the truth about two artifacts that really are identical. What is still the
+author's is the block's *presence*: a trigger with no `auth:` carries none, and
+adding one is an ordinary reported change.
 
 §3's rule that an absent `before` or `after` key means **not declared** is that
 representation seen from the format's side, and §3's example is worth reading

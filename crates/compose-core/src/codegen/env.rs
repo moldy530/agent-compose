@@ -57,6 +57,7 @@ use crate::ir::Ir;
 use crate::ir::binding::{Exec, Http, InterpolatedEntry};
 use crate::ir::definition::DefinitionBody;
 use crate::ir::flow::{NodeKind, ToolImplementation};
+use crate::ir::trigger::{InboundAuth, TriggerKind};
 
 use super::names;
 
@@ -71,9 +72,21 @@ impl References {
     /// Collect every reference in the composition.
     ///
     /// The walk is over the IR in its own canonical order — definitions by
-    /// address, then the deploy layer — so the sites recorded for a variable are
-    /// in a deterministic order without being sorted, and read in the order a
-    /// person would find them.
+    /// address, then the trigger table, then the deploy layer — so the sites
+    /// recorded for a variable are in a deterministic order without being
+    /// sorted, and read in the order a person would find them.
+    ///
+    /// **The trigger table is walked for the reason the rest of this module
+    /// exists.** An `http` trigger's `auth:` and `callback_auth:` carry four
+    /// `${ENV}` references (grammar 13.3), and the served app reads all four:
+    /// the token a caller's header is compared against, the secret a signature
+    /// is verified with, and the two a delivery identifies itself by. §4.3's
+    /// promise is that the variables a deployment needs are computable from the
+    /// artifact statically, so a runtime that read `process.env.WEBHOOK_TOKEN`
+    /// without this walk would let a deployment missing the variable start
+    /// clean — `readEnvironment()` reports only what `environmentReferences`
+    /// lists — and then refuse every real call, or deliver every callback
+    /// unsigned.
     #[must_use]
     pub fn of(ir: &Ir) -> Self {
         let mut references = Self::default();
@@ -106,6 +119,16 @@ impl References {
                         }
                     }
                     references.entries_of(&config.headers, &format!("{address}.headers"));
+                    // A server tool's config is grammar 4.3 class 2 like the
+                    // rest of a provider's non-secret keys, so a vector store id
+                    // or a gateway's container name can be an `${ENV}` the run
+                    // supplies (Decision D122).
+                    for (index, tool) in config.server_tools.iter().enumerate() {
+                        let site = format!("{address}.server_tools[{index}]");
+                        for (key, value) in &tool.config {
+                            references.plugin(&value.value, &format!("{site}.{key}"));
+                        }
+                    }
                 }
                 DefinitionBody::Tool(tool) => match &tool.implementation {
                     ToolImplementation::Exec { exec } => {
@@ -135,7 +158,53 @@ impl References {
                         }
                     }
                 }
-                DefinitionBody::Agent(_) | DefinitionBody::Store(_) | DefinitionBody::Model(_) => {}
+                DefinitionBody::Agent(agent) => {
+                    // A built-in's `root:` is grammar 4.3 class 2 like an
+                    // `exec:`'s `cwd:`, and for the same reason: where a graph
+                    // is allowed to read and write is a property of the machine
+                    // running it, not of the composition (Decision D123).
+                    for builtin in &agent.builtins {
+                        references.text(
+                            &builtin.root.value,
+                            &format!("{address}.tools.{}.root", builtin.tool.value.address()),
+                        );
+                    }
+                }
+                DefinitionBody::Store(_) | DefinitionBody::Model(_) => {}
+            }
+        }
+
+        if let Some(triggers) = &ir.triggers {
+            for (name, trigger) in &triggers.entries {
+                let TriggerKind::Http(http) = &trigger.kind else {
+                    continue;
+                };
+                let at = format!("triggers.{name}");
+                match &http.auth {
+                    Some(InboundAuth::Bearer(bearer)) => {
+                        references
+                            .record(&bearer.token.value.name, &format!("{at}.auth.bearer.token"));
+                    }
+                    Some(InboundAuth::Hmac(hmac)) => {
+                        references
+                            .record(&hmac.secret.value.name, &format!("{at}.auth.hmac.secret"));
+                    }
+                    None => {}
+                }
+                if let Some(callback) = &http.callback_auth {
+                    if let Some(bearer) = &callback.bearer {
+                        references.record(
+                            &bearer.token.value.name,
+                            &format!("{at}.callback_auth.bearer.token"),
+                        );
+                    }
+                    if let Some(hmac) = &callback.hmac {
+                        references.record(
+                            &hmac.secret.value.name,
+                            &format!("{at}.callback_auth.hmac.secret"),
+                        );
+                    }
+                }
             }
         }
 
@@ -386,6 +455,58 @@ tool.search:\n  description: Search.\n  input: { q: { type: string } }\n  output
         let references = References::of(&ir_of(
             "version: \"0.1\"\n\
 tool.t:\n  description: A tool.\n  input: {}\n  output: {}\n  exec:\n    command: echo\n    args: [\"$${NOT_A_REF}\"]\n",
+        ));
+        assert!(references.is_empty(), "{references:?}");
+    }
+
+    /// An authenticated trigger's four credentials are variables the deployment
+    /// needs (grammar 13.3, §4.3).
+    ///
+    /// The served app compares a caller's header against one of them and signs
+    /// its deliveries with another, so a deployment missing one starts clean and
+    /// then refuses every real call or delivers every callback unsigned. Naming
+    /// them here is what makes the launch check refuse first.
+    #[test]
+    fn an_authenticated_triggers_credentials_are_variables_the_deployment_needs() {
+        let references = References::of(&ir_of(
+            "version: \"0.1\"\n\
+flow.support:\n  outputs: {}\n  nodes:\n    approve:\n      human:\n        input: {}\n        output:\n          decision: { enum: [approve, reject] }\n  edges:\n    - { from: start, to: approve }\n    - { from: approve, to: end }\n\
+triggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"payload.body.callback_url\"\n    auth:\n      hmac:\n        secret: ${WEBHOOK_SECRET}\n    callback_auth:\n      bearer:\n        token: ${CALLBACK_TOKEN}\n      hmac:\n        secret: ${CALLBACK_SECRET}\n    callback_allow:\n      - \"https://hooks.example.com/*\"\n  open:\n    type: http\n    flow: flow.support\n    path: /open\n    auth:\n      bearer:\n        token: ${WEBHOOK_TOKEN}\n",
+        ));
+        assert_eq!(
+            references.names().collect::<Vec<_>>(),
+            [
+                "CALLBACK_SECRET",
+                "CALLBACK_TOKEN",
+                "WEBHOOK_SECRET",
+                "WEBHOOK_TOKEN"
+            ]
+        );
+        assert_eq!(
+            references.sites("WEBHOOK_SECRET"),
+            ["triggers.intake.auth.hmac.secret"]
+        );
+        assert_eq!(
+            references.sites("CALLBACK_TOKEN"),
+            ["triggers.intake.callback_auth.bearer.token"]
+        );
+        assert_eq!(
+            references.sites("CALLBACK_SECRET"),
+            ["triggers.intake.callback_auth.hmac.secret"]
+        );
+        assert_eq!(
+            references.sites("WEBHOOK_TOKEN"),
+            ["triggers.open.auth.bearer.token"]
+        );
+    }
+
+    /// A trigger declaring no credential contributes none.
+    #[test]
+    fn an_open_trigger_contributes_no_variable() {
+        let references = References::of(&ir_of(
+            "version: \"0.1\"\n\
+flow.support:\n  outputs: {}\n  nodes:\n    approve:\n      human:\n        input: {}\n        output:\n          decision: { enum: [approve, reject] }\n  edges:\n    - { from: start, to: approve }\n    - { from: approve, to: end }\n\
+triggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"payload.body.callback_url\"\n",
         ));
         assert!(references.is_empty(), "{references:?}");
     }

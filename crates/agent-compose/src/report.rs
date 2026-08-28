@@ -69,38 +69,68 @@ use annotate_snippets::renderer::DecorStyle;
 use annotate_snippets::{AnnotationKind, Group, Level, Origin, Renderer, Snippet};
 use compose_core::{Diagnostic, Severity, Span};
 
-/// The JSON report: `{"diagnostics": [ … ]}`, pretty-printed with a trailing
-/// newline.
+/// The JSON report: `{"diagnostics": [ … ], "warnings": [ … ]}`,
+/// pretty-printed with a trailing newline.
 ///
-/// The array holds the diagnostics exactly as `compose-core` declares them, in
-/// the order they are reported. A clean run writes `{"diagnostics": []}` rather
-/// than nothing at all, so a consumer parses one shape whatever the outcome.
+/// Both arrays hold diagnostics exactly as `compose-core` declares them, in the
+/// order they are reported, and both are always present: a clean run writes two
+/// empty arrays rather than nothing at all, so a consumer parses one shape
+/// whatever the outcome.
+///
+/// **The split is the verdict.** `diagnostics` holds what *rejects* the
+/// composition and `warnings` holds what does not, which is the one question a
+/// machine reader asks before it asks anything else — and asking it by
+/// partitioning here rather than by filtering on `severity` means a consumer
+/// cannot get the exit code and the report to disagree. Each entry still carries
+/// its own `severity`, so nothing is lost to the split; what is gained is that
+/// "is there anything in `diagnostics`" and "did this exit non-zero" are the
+/// same question.
 pub(crate) fn json(diagnostics: &[Diagnostic]) -> Result<String, serde_json::Error> {
     let mut report = serde_json::Map::new();
-    report.insert(
-        "diagnostics".to_string(),
-        serde_json::to_value(diagnostics)?,
-    );
+    report.insert("diagnostics".to_string(), errors_of(diagnostics)?);
+    report.insert("warnings".to_string(), warnings_of(diagnostics)?);
     let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(report))?;
     text.push('\n');
     Ok(text)
 }
 
-/// `build`'s JSON report: `{"diagnostics": [ … ], "drift": [ … ]}`.
+/// The diagnostics that reject the composition.
+fn errors_of(diagnostics: &[Diagnostic]) -> Result<serde_json::Value, serde_json::Error> {
+    let errors: Vec<&Diagnostic> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.is_error())
+        .collect();
+    serde_json::to_value(errors)
+}
+
+/// The diagnostics that do not.
+fn warnings_of(diagnostics: &[Diagnostic]) -> Result<serde_json::Value, serde_json::Error> {
+    let warnings: Vec<&Diagnostic> = diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.is_error())
+        .collect();
+    serde_json::to_value(warnings)
+}
+
+/// Whether any of these diagnostics rejects the composition.
+pub(crate) fn refuses(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics.iter().any(Diagnostic::is_error)
+}
+
+/// `build`'s JSON report:
+/// `{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ]}`.
 ///
-/// One shape for every outcome, the way [`json`] is: a clean build writes two
+/// One shape for every outcome, the way [`json`] is: a clean build writes three
 /// empty arrays rather than nothing, and a `--check` that found drift writes the
-/// same two keys with the second populated. A consumer parses one document and
+/// same three keys with the last populated. A consumer parses one document and
 /// branches on its contents instead of on which command produced it.
 pub(crate) fn build_json(
     diagnostics: &[Diagnostic],
     drift: &[crate::build::Drift],
 ) -> Result<String, serde_json::Error> {
     let mut report = serde_json::Map::new();
-    report.insert(
-        "diagnostics".to_string(),
-        serde_json::to_value(diagnostics)?,
-    );
+    report.insert("diagnostics".to_string(), errors_of(diagnostics)?);
+    report.insert("warnings".to_string(), warnings_of(diagnostics)?);
     report.insert(
         "drift".to_string(),
         serde_json::Value::Array(
@@ -177,7 +207,12 @@ pub(crate) fn build_verdict(
 
     // An invalid composition is reported as `validate` reports it: the emission
     // never happened, and the reason is the diagnostics above this line.
-    if !diagnostics.is_empty() {
+    //
+    // **Errors**, not diagnostics: a warning does not stop an emission, so a
+    // build that reported one has still written a project and its verdict is
+    // the one below, with the warnings counted onto it.
+    let errors = diagnostics.iter().filter(|d| d.is_error()).count();
+    if errors > 0 {
         if !target_only {
             return verdict(entrypoint, target, diagnostics, color);
         }
@@ -188,20 +223,29 @@ pub(crate) fn build_verdict(
                     format!(
                         "`{}` is valid and cannot be compiled for `{target}`: {}",
                         entrypoint.display(),
-                        plural(diagnostics.len(), "error")
+                        plural(errors, "error")
                     )
                     .as_str()
                 )
             )])
         );
     }
+    let noted = if diagnostics.is_empty() {
+        String::new()
+    } else {
+        format!(", with {}", plural(diagnostics.len(), "warning"))
+    };
 
     let out = out.display();
     let (level, title) = match (drift.is_empty(), wrote) {
         (true, Some(written)) => (
-            Level::NOTE.no_name(),
+            if diagnostics.is_empty() {
+                Level::NOTE.no_name()
+            } else {
+                Level::WARNING
+            },
             format!(
-                "wrote {} to `{out}` (target `{target}`){}",
+                "wrote {} to `{out}` (target `{target}`){noted}{}",
                 plural(written.files, "file"),
                 // A removal is the one thing a build does that the caller did not
                 // ask for by name, so it is said out loud rather than left for a
@@ -223,13 +267,17 @@ pub(crate) fn build_verdict(
             ),
         ),
         (true, None) => (
-            Level::NOTE.no_name(),
-            format!("`{out}` is up to date (target `{target}`)"),
+            if diagnostics.is_empty() {
+                Level::NOTE.no_name()
+            } else {
+                Level::WARNING
+            },
+            format!("`{out}` is up to date (target `{target}`){noted}"),
         ),
         (false, _) => (
             Level::ERROR,
             format!(
-                "`{out}` does not match `{}` (target `{target}`): {}",
+                "`{out}` does not match `{}` (target `{target}`): {}{noted}",
                 entrypoint.display(),
                 plural(drift.len(), "file")
             ),
@@ -362,30 +410,37 @@ pub(crate) fn verdict(
     let errors = diagnostics.iter().filter(|d| d.is_error()).count();
     let warnings = diagnostics.len() - errors;
     let entrypoint = entrypoint.display();
-    let (level, title) = if diagnostics.is_empty() {
-        (
+    // Three verdicts, not two, and the middle one is the whole point of having a
+    // warning severity at all: a composition with warnings and no errors **is
+    // valid** — it builds, it runs, and the exit code is `0` — so the line says
+    // so and then says what was reported. A warnings-only report that read "is
+    // not valid" would tell a reader their spec was refused by a compiler that
+    // had just accepted it.
+    let (level, title) = match (errors, warnings) {
+        (0, 0) => (
             Level::NOTE.no_name(),
             format!("`{entrypoint}` is valid (target `{target}`)"),
-        )
-    } else {
-        let mut counted = Vec::new();
-        if errors > 0 {
-            counted.push(plural(errors, "error"));
-        }
-        if warnings > 0 {
-            counted.push(plural(warnings, "warning"));
-        }
-        (
-            if errors > 0 {
-                Level::ERROR
-            } else {
-                Level::WARNING
-            },
+        ),
+        (0, warnings) => (
+            Level::WARNING,
             format!(
-                "`{entrypoint}` is not valid (target `{target}`): {}",
-                counted.join(", ")
+                "`{entrypoint}` is valid (target `{target}`), with {}",
+                plural(warnings, "warning")
             ),
-        )
+        ),
+        (errors, warnings) => {
+            let mut counted = vec![plural(errors, "error")];
+            if warnings > 0 {
+                counted.push(plural(warnings, "warning"));
+            }
+            (
+                Level::ERROR,
+                format!(
+                    "`{entrypoint}` is not valid (target `{target}`): {}",
+                    counted.join(", ")
+                ),
+            )
+        }
     };
     format!(
         "{}\n",

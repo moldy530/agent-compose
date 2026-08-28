@@ -22,7 +22,11 @@
 //!   object schema, and `tools` present whenever a tool block appears anywhere
 //!   in the conversation;
 //! * the **required envelope** — `model`, `messages`, `max_tokens`, the
-//!   `x-api-key` and `anthropic-version` headers, and a JSON content type;
+//!   `anthropic-version` header, and a JSON content type. Not the *presence* of
+//!   `x-api-key`: a keyless provider behind a gateway is a legal composition and
+//!   sends none (grammar 12.1, Decision D120), so its absence is a wire shape
+//!   rather than a codegen bug — WIRE-NOTES (12). Its *shape* is still checked,
+//!   because an empty `x-api-key` is neither posture;
 //! * the **sampling knobs** — grammar 12.2's `settings:` vocabulary, checked for
 //!   type *and* range, because the compiler range-checks them and nothing else
 //!   watches what reaches the wire.
@@ -69,6 +73,7 @@ pub(crate) struct Parsed {
     pub(crate) model: String,
     pub(crate) failures: Vec<ValidationFailure>,
     pub(crate) tools: Vec<String>,
+    pub(crate) server_tools: Vec<String>,
     pub(crate) structured_output: Option<StructuredOutput>,
 }
 
@@ -86,6 +91,7 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
             model: String::new(),
             failures: checker.into_failures(),
             tools: Vec::new(),
+            server_tools: Vec::new(),
             structured_output: None,
         };
     };
@@ -106,7 +112,7 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
     check_settings(&mut checker, body);
     check_system(&mut checker, body);
     let tools = check_tools(&mut checker, body);
-    let forced = check_tool_choice(&mut checker, body, &tools);
+    let forced = check_tool_choice(&mut checker, body, &tools.names);
     let uses_tool_blocks = check_messages(&mut checker, body);
     if uses_tool_blocks && !body.contains_key("tools") {
         checker.fail(
@@ -124,19 +130,44 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
     Parsed {
         model,
         failures: checker.into_failures(),
-        tools: tools.into_iter().collect(),
+        tools: tools.names,
+        server_tools: tools.server,
         structured_output,
     }
 }
 
 /// The headers the API requires. A generated client that forgets one is a
 /// codegen bug the first live call would find; this finds it in CI instead.
+///
+/// **`x-api-key` is no longer required to be *there***, and that is a decision
+/// rather than an omission: see WIRE-NOTES (12). A `base_url:` points a
+/// connection at whatever it names, and grammar 12.1 lets an `anthropic`
+/// provider that names one declare no `api_key:` at all (Decision D120) — a
+/// gateway injects the credential server-side and the compiled graph sends no
+/// authentication header. This server stands in for that endpoint as much as for
+/// the vendor's, so an unauthenticated request is a wire shape it has to accept.
+///
+/// **Only the presence requirement was dropped.** A credential that *is* on the
+/// wire is still held to its shape, because the keyless posture the runtime
+/// promises is a header that is *absent*, not one that is empty: `x-api-key: ""`
+/// is a request that claims to authenticate and fails, which a gateway may
+/// refuse before injecting anything and a forwarding gateway turns into a 401 at
+/// the vendor. So an empty `x-api-key` is the codegen bug this check is now for,
+/// and it is answered the way a live 401 is.
+///
+/// What this surface cannot decide is a credential sent under the *wrong*
+/// header. `authorization: Bearer …` on the Messages wire is the documented
+/// gateway shape (`docs/topics/models.md`, "Keyless providers behind a
+/// gateway"), so it is indistinguishable here from a proxy token a composition
+/// declared through `headers:`. Where it *is* decidable is the acceptance suite,
+/// which reads the recorded request against the spec that produced it — see
+/// `a_provider_with_no_key_sends_no_authentication_header_on_either_wire`.
 fn check_headers(checker: &mut Checker, headers: &BTreeMap<String, String>) {
     let present = |name: &str| headers.get(name).is_some_and(|value| !value.is_empty());
-    if !present("x-api-key") {
-        // A credential, not a field: answered 401 rather than 400 (see
-        // `rejected`), because that is the status the SDK's `AuthenticationError`
-        // comes from and generated code may well classify the two apart.
+    // A credential, not a field: answered 401 rather than 400 (see `rejected`),
+    // because that is the status the SDK's `AuthenticationError` comes from and
+    // generated code may well classify the two apart.
+    if headers.contains_key("x-api-key") && !present("x-api-key") {
         checker.credential(
             "headers.x-api-key",
             "x-api-key header is required: authentication failed.",
@@ -252,10 +283,11 @@ fn check_system(checker: &mut Checker, body: &Map<String, Value>) {
 
 /// The tool surface, returned in request order so a test can assert on which
 /// tools an agent's `tools:` and `stores:` lists put on the wire (11.5).
-fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> {
+fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
     let mut names = Vec::new();
+    let mut server = Vec::new();
     let Some(tools) = checker.optional("", body, "tools", Kind::Array) else {
-        return names;
+        return Tools { names, server };
     };
     let mut seen = BTreeSet::new();
     for (index, tool) in tools.as_array().into_iter().flatten().enumerate() {
@@ -266,6 +298,34 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
         else {
             continue;
         };
+        // A **server tool**: a tool the service runs on its own side, named by a
+        // `type:` out of Anthropic's own vocabulary (grammar 12.1, Decision
+        // D122). Its config keys are the vendor's, not this API's closed entry
+        // shape, and this server cannot know which are legal for a dated type it
+        // may predate — so the entry is recorded and carried, and only the one
+        // thing every tool entry needs is required: a `name`. `WIRE-NOTES` (22).
+        //
+        // That name goes into the same `seen` set a client tool's does, because
+        // the array is one namespace: the API refuses a request offering two
+        // tools under one name whichever side runs them, and a server that let
+        // `code_execution_20250522` sit beside `code_execution_20250825` would
+        // accept the one request the compiler's canonical-name pinning exists
+        // to stop (grammar 12.1, `check::providers`'s `suite_collisions`).
+        if let Some(kind) = tool.get("type").and_then(Value::as_str)
+            && kind != "custom"
+        {
+            server.push(kind.to_string());
+            if let Some(name) = checker.required_string(&pointer, tool, "name") {
+                let name = name.to_string();
+                if !seen.insert(name.clone()) {
+                    checker.fail(
+                        &at(&pointer, "name"),
+                        format!("tools: Duplicate tool name `{name}`."),
+                    );
+                }
+            }
+            continue;
+        }
         checker.closed(
             &pointer,
             tool,
@@ -310,7 +370,16 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Vec<String> 
         }
         names.push(name);
     }
-    names
+    Tools { names, server }
+}
+
+/// What a request's `tools` array holds, split by who runs them.
+pub(crate) struct Tools {
+    /// The client tools, by name, in request order — what the graph dispatches.
+    pub(crate) names: Vec<String>,
+    /// The server tools, by `type:`, in request order — what the provider runs
+    /// itself (grammar 12.1, Decision D122).
+    pub(crate) server: Vec<String>,
 }
 
 /// `tool_choice`, and the name of the tool it forces if it forces one.
@@ -579,6 +648,21 @@ fn check_content(
         let Some(kind) = checker.required(&pointer, block, "type") else {
             continue;
         };
+        // A **server-tool** block, replayed back to the wire that produced it
+        // (grammar 12.1, Decision D122): the `server_tool_use` the service filed
+        // and the `<name>_tool_result` it answered itself with. A compiled graph
+        // must send these back unaltered and must **not** answer them — the call
+        // already happened, on the provider's side — so what is checked here is
+        // that they arrived at all, and their innards are the vendor's rather
+        // than this closed block vocabulary. `WIRE-NOTES` (22).
+        if let Some(name) = kind.as_str()
+            && (name == "server_tool_use"
+                || name.ends_with("_tool_result") && name != "tool_result")
+        {
+            seen_other = true;
+            blocks.uses_tool_blocks = true;
+            continue;
+        }
         let Some(kind) = checker
             .one_of(
                 &at(&pointer, "type"),
@@ -902,6 +986,15 @@ fn reply_answer(
         }
     };
 
+    // Server-tool activity goes **in front** of whatever the model then said:
+    // the provider ran the tool inside this turn, so its record precedes the
+    // text or the calls that were written knowing what it found (grammar 12.1,
+    // Decision D122).
+    let content = match server_tool_blocks(sequence, request, &reply.server_tools) {
+        Ok(blocks) => blocks.into_iter().chain(content).collect::<Vec<Value>>(),
+        Err(refusal) => return refusal,
+    };
+
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -1108,6 +1201,70 @@ fn tool_use_block(sequence: u64, index: usize, name: &str, input: &Value) -> Val
         "name": name,
         "input": input,
     })
+}
+
+/// The blocks a scripted server-tool use becomes on the Messages wire
+/// (grammar 12.1, Decision D122).
+///
+/// **Two blocks per use, and both are the answer**: a `server_tool_use` saying
+/// what the service was asked, and the `<name>_tool_result` that answers it.
+/// The service ran the tool itself, so the result is already here — this is the
+/// shape a compiled graph must carry through its loop *without* dispatching
+/// anything, which is what the acceptance suite reads it for.
+///
+/// A use is held to the request the same way a scripted tool call is: a provider
+/// does not run a tool it was not given, so a `type:` this request's `tools`
+/// array does not declare is a `script-mismatch` rather than an answer. The
+/// tool's `name` comes off that same declaration — the Messages wire carries
+/// both, and the result block is named after the name rather than the dated
+/// type.
+fn server_tool_blocks(
+    sequence: u64,
+    request: &Value,
+    uses: &[crate::control::ServerToolUse],
+) -> Result<Vec<Value>, Answer> {
+    let mut blocks = Vec::new();
+    for (index, use_) in uses.iter().enumerate() {
+        let Some(name) = declared_server_tool(request, &use_.type_name) else {
+            return Err(mismatch(
+                sequence,
+                &format!(
+                    "the script runs the server tool `{}`, which this request does not declare: a \
+                     provider runs only the server tools its `tools` array carries. Declare it on \
+                     the provider's `server_tools:`, or script a `raw` response",
+                    use_.type_name
+                ),
+            ));
+        };
+        let id = use_
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("srvtoolu_mock_{sequence:08}_{index}"));
+        blocks.push(json!({
+            "type": "server_tool_use",
+            "id": id,
+            "name": name,
+            "input": use_.input.clone().unwrap_or_else(|| json!({})),
+        }));
+        blocks.push(json!({
+            "type": format!("{name}_tool_result"),
+            "tool_use_id": id,
+            "content": use_.result.clone().unwrap_or(Value::Null),
+        }));
+    }
+    Ok(blocks)
+}
+
+/// The `name` this request declared for a server tool of this `type`, if it
+/// declared one at all.
+fn declared_server_tool(request: &Value, type_name: &str) -> Option<String> {
+    request
+        .get("tools")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|tool| tool.get("type").and_then(Value::as_str) == Some(type_name))
+        .and_then(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 fn failure_answer(sequence: u64, failure: &Failure) -> Answer {
@@ -1341,11 +1498,24 @@ mod tests {
         assert_eq!(response.status, 400);
         assert_eq!(response.body["error"]["type"], "invalid_request_error");
 
-        // The api key is: a missing one is authentication, and it is answered
-        // 401 — the status the SDK raises `AuthenticationError` from.
+        // The *presence* of `x-api-key` is not among them: a provider that names
+        // a `base_url:` may declare no `api_key:` and then sends no header at
+        // all (grammar 12.1, Decision D120, WIRE-NOTES (12)), so its absence is
+        // a wire shape this server accepts rather than a codegen bug it reports.
         let mut anonymous = headers();
         anonymous.remove("x-api-key");
-        let parsed = parse(&anonymous, Some(&request));
+        assert!(
+            parse(&anonymous, Some(&request)).failures.is_empty(),
+            "a keyless request is a legal shape on this surface"
+        );
+
+        // Its *shape* still is. An empty header is neither posture — not the
+        // keyless request D120 admits and not a credential — so it is refused,
+        // and refused as a credential: 401, the status the SDK raises
+        // `AuthenticationError` from.
+        let mut empty = headers();
+        empty.insert("x-api-key".to_string(), String::new());
+        let parsed = parse(&empty, Some(&request));
         assert_eq!(parsed.failures[0].pointer, "headers.x-api-key");
         assert!(parsed.failures[0].authentication);
         let Answer::Respond(response) = rejected(1, &parsed.failures) else {

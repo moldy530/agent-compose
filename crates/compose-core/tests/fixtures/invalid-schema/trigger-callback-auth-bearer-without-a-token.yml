@@ -1,0 +1,12 @@
+# rule: an outbound `bearer:` scheme declares the token every delivery carries (grammar 13.3 / PRD resolved q33)
+# at: /triggers/intake/callback_auth/bearer
+# via: /$defs/bearerAuth/required
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_auth:
+      bearer: {}
+    callback_allow:
+      - "https://hooks.example.com/*"

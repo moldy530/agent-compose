@@ -1,0 +1,13 @@
+# rule: a `callback_auth:` block declares at least one scheme (grammar 13.3, PRD resolved q33)
+# code: missing-key
+# message: the `callback_auth` of trigger `intake` declares no scheme: a `callback_auth` carries `bearer`, `hmac`, or both
+# at: 11:5
+# help: `hmac` signs the delivered body and `bearer` sends a static token; a delivery that carries neither is what leaving `callback_auth:` out already means, and that posture needs no allowlist (grammar 13.3, PRD resolved q33)
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_auth: {}
+    callback_allow:
+      - "https://hooks.example.com/*"

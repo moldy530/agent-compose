@@ -62,6 +62,71 @@ export interface HttpTrigger {
   sessionKey?(payload: unknown): string;
   /** `callback:` — the completion webhook, on an `async` trigger. */
   callback?(payload: unknown): string;
+  /**
+   * `auth:` — how a caller of this trigger is verified, and with it the resume
+   * and status routes of every execution it starts (grammar 13.3, PRD resolved
+   * q32).
+   *
+   * Absent leaves all three routes open.
+   */
+  readonly auth?: InboundAuth;
+  /** `callback_auth:` — how a delivery identifies itself (grammar 13.3). */
+  readonly callbackAuth?: CallbackAuth;
+  /**
+   * `callback_allow:` — where a callback may point.
+   *
+   * Absent is the documented test posture: the trigger signs nothing and may
+   * POST anywhere. Present, it is matched when the URL is *read* — at the
+   * delivery, not at the start — because the URL comes out of the request
+   * payload and is attacker-controlled by construction (Decision D110, D127).
+   */
+  readonly callbackAllow?: readonly string[];
+}
+
+/**
+ * The inbound scheme a trigger enforces, with every grammar 13.3 default
+ * already applied.
+ *
+ * Resolved rather than recorded-as-written, unlike `path:` and `method:`: every
+ * parameter that decides whether a credential verifies carries the value the
+ * trigger enforces, because a verifier that re-derived a default and got it
+ * wrong would not fail a build — it would accept the wrong request.
+ */
+export type InboundAuth =
+  | {
+      readonly scheme: "bearer";
+      /** Matched case-insensitively; HTTP/2 lowercases every name (grammar 13.3). */
+      readonly header: string;
+      readonly prefix: string;
+      /** The **variable name** holding the expected token; never the token. */
+      readonly tokenEnv: string;
+    }
+  | {
+      readonly scheme: "hmac";
+      readonly header: string;
+      readonly algorithm: "sha1" | "sha256" | "sha512";
+      readonly encoding: "hex" | "base64";
+      readonly prefix: string;
+      /** The **variable name** holding the signing key; never the key. */
+      readonly secretEnv: string;
+    };
+
+/**
+ * The outbound identity a delivery carries (grammar 13.3, PRD resolved q33).
+ *
+ * At least one half is present, and both together are legal: a receiver that
+ * checks a token and a receiver that verifies a signature are two receivers.
+ * Outbound signing takes no parameters — HMAC-SHA256 in hex under
+ * `X-AgentCompose-Signature` — so one receiver-side recipe verifies every
+ * agent-compose deployment.
+ */
+export interface CallbackAuth {
+  readonly bearer?: {
+    readonly header: string;
+    readonly prefix: string;
+    readonly tokenEnv: string;
+  };
+  readonly hmac?: { readonly secretEnv: string };
 }
 
 /**

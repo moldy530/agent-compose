@@ -749,6 +749,7 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 |---|---|
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
+| `token`, `secret` | an `http` trigger's `auth:` and `callback_auth:` blocks (§13.3) |
 
 The table classifies these field *names* wherever they occur; it never makes one
 legal where its section's own key rules do not admit it. A `provider.*` takes
@@ -776,8 +777,9 @@ expressions on every surface; model `id` and every value inside `settings:`;
 `embed.model` (§11.2); every identifier and reference position (node ids,
 channel names, typed addresses, a store's `backend:` alias, a tool's
 `function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
-a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); a `blob put`'s
-`content_type:` (§11.4); and every enum-valued key.
+a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); the `header:` and
+`prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:` entry
+(§13.3); a `blob put`'s `content_type:` (§11.4); and every enum-valued key.
 
 Nothing is interpolated in class 3, so an unescaped token there is an error
 rather than text that silently survives into the output — the author who wrote
@@ -850,7 +852,7 @@ agent.reviewer:
 | `prompt` | string (non-empty) | **yes** | — | system instructions; literal text, no templating (D13) |
 | `output` | field map (result surface, §3.5) | **yes** | — | PRD 5.2; MUST have ≥ 1 property |
 | `input` | field map (input surface) | no | string-in | §5.3 |
-| `tools` | array of `tool.*` / `flow.*` | no | `[]` | PRD 5.5, 5.1 |
+| `tools` | array of `tool.*` / `flow.*`, and `builtin.*` entries | no | `[]` | PRD 5.5, 5.1; the built-ins are §5.5 |
 | `stores` | array of `store.*` | no | `[]` | PRD 5.8 |
 | `description` | string | no | — | documentation only; not LLM-facing (agents are not tools) |
 | `max_tool_iterations` | integer 1..50 | no | `8` | bounds the intra-agent tool loop — *turns* of it, so a refused call spends one exactly as a call that ran does (D51, D119) |
@@ -951,6 +953,118 @@ carries the sentence the model was handed as the `<message>` half of that
 format's `<error name>: <message>` shape. The model's copy is that sentence with
 no class in front of it; the record's is the same sentence under the envelope
 every error in a trace wears.
+
+### 5.5 Runtime built-in tools
+
+Four tools this runtime implements — a shell and three file operations — are
+attached from the same `tools:` list, one name at a time, each carrying the
+bounds it runs under:
+
+```yaml
+agent.fixer:
+  model: model.smart
+  prompt: Fix the failing test, then say what you changed.
+  tools:
+    - tool.repo_grep
+    - builtin.read_file:  { root: "${WORKSPACE}" }
+    - builtin.write_file: { root: "${WORKSPACE}" }
+    - builtin.list:       { root: "${WORKSPACE}" }
+    - builtin.bash:       { root: "${WORKSPACE}", timeout: 30s }
+  output:
+    summary: { type: string }
+```
+
+| Built-in | Arguments | Result | Bounds |
+|---|---|---|---|
+| `builtin.bash` | `command` | `stdout`, `stderr` | `root` (working directory), `timeout` |
+| `builtin.read_file` | `path` | `content` | `root` |
+| `builtin.write_file` | `path`, `content` | `bytes_written` | `root` |
+| `builtin.list` | `path` (default `.`), `glob` (default none) | `entries`, `truncated` | `root` |
+
+The set is **closed**: `builtin.<anything else>` is a compile error, and it grows
+by a resolved question rather than by a release adding a name (PRD resolved q31).
+
+**The entry shape.** A `tools:` entry is either a bare `tool.*`/`flow.*` address
+(§5.4) or a **single-key mapping** whose key is the built-in's name and whose
+value is its bounds. One entry attaches one built-in; a mapping carrying two keys
+is a compile error, and there is no key anywhere that grants the set. A built-in
+written as a bare address is a compile error naming the mapping form, because the
+bounds are not optional.
+
+**`root:` is required on every built-in**, on `builtin.bash` as much as on the
+file tools, and it must be **non-empty**: `root: ""` is a compile error, and a
+`root:` whose `${VAR}` resolves to the empty string fails the call, because an
+empty path is the directory the runtime happened to be started in and a bound
+nobody wrote is not a bound. It is interpolable (§4.3 class 2), resolved at
+process start, and resolved again as a real directory at each call — a `root:`
+naming a directory that does not exist fails the call. Every path argument is
+taken relative to it, and a path that **resolves** outside it is refused:
+resolution, not string comparison, so a `..` that climbs out and a symlink that
+points out are both refused, and a write to a file that does not exist yet
+resolves through its parent. A symlink whose target does not exist is refused
+rather than followed: there is nothing to resolve, so where it points cannot be
+checked, and a write through it would create the file it names. A `builtin.list`
+walk does not **descend** into a symlinked directory for the same bound's sake —
+the link is one entry of the listing, reported without the trailing `/` a
+directory gets, because a walk that followed it would answer with paths outside
+the root that no path check was asked of. `builtin.bash` runs with the resolved
+root as its working directory.
+
+**`timeout:` is required on `builtin.bash`** and is a §4.4 duration. It bounds
+one command; §9.2's node-level `timeout:` bounds the whole agent node, deadline
+included, and the two compose rather than replace one another. `timeout:` on a
+file tool is an unknown key — there is no command there to bound. What bounds a
+file tool is that node-level deadline: a `builtin.list` walk stops where it is
+when the node's `timeout:` runs out or the run is cancelled, rather than
+finishing a listing the graph has already stopped waiting for
+([D124](#d124-a-built-ins-deadline-kills-the-commands-process-group-not-just-the-shell)).
+
+`builtin.list`'s `glob` matches `*` and `?` within one path segment and `**`
+across them, which is the spelling most tools use. `**` matches *zero* or more
+segments, so a run of them accepts exactly what one accepts.
+
+What the deadline kills is the shell **and every process it started**, and what
+it ends is the **call**. The command runs in a process group of its own and the
+deadline kills the *group*, because the shell is almost never where the work is:
+`npm run build`, `a | b`, `(cd sub && make)` and a plain `some-server &` are all
+`bash` forking, and a kill aimed at the shell alone would leave every one of them
+running — still writing inside `root:` — after the node they belonged to had
+already failed. Under `retry:` that would be two generations of one command in
+one root ([D124](#d124-a-built-ins-deadline-kills-the-commands-process-group-not-just-the-shell)).
+
+What outlives the deadline is what **left the group deliberately**: a command
+that calls `setsid`, a shell that turned job control on (`set -m`), a daemon that
+double-forks away. Those are exactly the processes a hand-rolled `exec:` tool
+would have left behind too; the runtime stops reading what such a process holds
+rather than waiting on it, so the bound is the composition's however long the
+escapee lives. Cleaning up after one is the command's own business, and
+containing it is the distribution work's (below).
+
+**A built-in's name on the wire is its local name** — `bash`, `read_file`,
+`write_file`, `list` — exactly as an attached `tool.*`'s is, so a `tool.bash` on
+the same agent is a `tool-name-collision` (§11.5). Its **address** is what
+`docs/trace.md` §7.3 records as the call's target.
+
+**Failure and refusal follow §5.4's split unchanged.** Arguments the built-in's
+own schema refuses are handed back to the model
+([D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node)).
+Everything else — a nonzero exit, a command killed at the timeout, a path that
+resolved outside the root, a host with no `bash` on `PATH` — is an *execution*
+failure and fails the agent node, where §9's chain decides the run exactly as it
+does for an `exec:` tool.
+
+**What bounds a built-in is the root and the timeout, and nothing else.** The
+tools run with the privileges of the process running the graph, which is what a
+hand-rolled `exec:` tool has always done: a model holding `builtin.bash` holds
+arbitrary code execution on that host. Container and syscall isolation, and any
+refusal keyed on a deploy target, are the distribution work's and are stated here
+rather than implied (PRD resolved q31).
+
+Traces gain no surface: a built-in call is a `ToolCallRecord` like any other, and
+`docs/trace.md` §11 keeps its answer out of the format exactly as it keeps an
+`exec:` tool's. The **journal** holds the answer in full, which is what makes a
+resumed execution consume a recorded `bash` rather than run it again
+(`docs/durability.md` §3.2).
 
 ---
 
@@ -3399,6 +3513,11 @@ provider.local:
   kind: openai_compatible
   base_url: ${LOCAL_LLM_URL}
   api_key: ${LOCAL_LLM_KEY}
+
+provider.gateway:
+  kind: anthropic           # the same plugin, reached through a corporate
+  base_url: ${LLM_GATEWAY}  # gateway that injects the vendor key server-side:
+                            # no `api_key:`, and no auth header on the wire
 ```
 
 ### 12.1 Provider definitions
@@ -3413,15 +3532,16 @@ that name it.
 | `api_key` | env-ref value | per kind (below) | never a literal (§4.3) |
 | `base_url` | env-ref value | per kind (below) | never a literal (§4.3) |
 | `headers` | map name→string (interpolable) | optional on the kinds that take it | extra request headers |
+| `server_tools` | array of wire config objects | optional on the kinds that take it | tools the **provider** runs, appended to every request it serves (below) |
 | kind-specific keys | per plugin | per kind (below) | validated against the plugin's published schema |
 
 v0 provider kinds and the keys each one takes, `kind:` and `description:` aside:
 
 | `kind` | Required | Optional |
 |---|---|---|
-| `anthropic` | `api_key` | `base_url`, `headers` |
-| `openai` | `api_key` | `base_url`, `headers`, `organization` |
-| `openai_compatible` | `base_url` | `api_key`, `headers` |
+| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `server_tools` |
+| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one (below) | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization`, `server_tools` |
+| `openai_compatible` | `base_url` | `api_key`, `headers`, `server_tools` |
 | `azure_openai` | `base_url`, `api_key`, `api_version` | `headers` |
 | `bedrock` | `region` | `access_key_id`, `secret_access_key`, `session_token`, `profile` |
 | `vertex` | `project`, `location` | `credentials_json` |
@@ -3429,6 +3549,25 @@ v0 provider kinds and the keys each one takes, `kind:` and `description:` aside:
 `region`, `location`, `project`, `organization`, `profile`, and `api_version` are
 plain strings and MAY be interpolated; the credential keys listed in §4.3 MUST be
 env-ref values.
+
+**`api_key` is required where the connection points at the vendor.** `anthropic`
+and `openai` are the two kinds with a **default endpoint** — omit `base_url:` and
+the connection reaches `https://api.anthropic.com` or `https://api.openai.com` —
+and nothing but a key authenticates there. So on those two kinds, and on those
+two alone, `api_key:` is required when `base_url:` is absent and optional when it
+is present. A provider declaring neither is a compile error naming both repairs
+(`missing-credential`, Decision
+[D120](#d120-a-keyless-anthropic-or-openai-provider-names-its-endpoint)); a
+provider declaring a `base_url:` and no key is a **gateway** connection, and a
+compiled graph sends **no** authentication header at all for it — not an empty
+one — because the gateway injects the vendor credential server-side. A gateway
+that wants a token of its *own* takes it through `headers:`, whose values
+interpolate (§4.3 class 2), so `authorization: "Bearer ${PROXY_TOKEN}"` reaches
+the wire as a declared header rather than as a vendor credential. The other four
+kinds are unchanged: `azure_openai` has no default endpoint and keeps all three
+of its keys required, `openai_compatible` was already the fully flexible row, and
+the two SDK-reached kinds authenticate through their cloud's own credential
+chain.
 
 **A kind's row is closed.** Beyond `kind:` and `description:`, a provider MAY
 declare exactly the keys its own row names. A key that belongs to another kind's
@@ -3448,6 +3587,100 @@ The two SDK-reached kinds are where the rows differ most visibly from the rest:
 connection made through a cloud SDK has no bare endpoint to point at and no
 request the spec composes headers onto. A deployment that genuinely needs either
 is reaching a compatible HTTP endpoint, which is what `openai_compatible` is for.
+
+**`server_tools` is a provider-side tool suite.** A *server tool* runs on the
+provider's side, inside the model call: the compiled runtime dispatches nothing,
+and the results arrive woven into the assistant's turn. The key holds an array
+of config objects written in **that provider's own wire vocabulary**, and the
+runtime appends them to the `tools` of every request that provider serves, after
+the agent's own tools.
+
+```yaml
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+```
+
+Each entry MUST carry a string `type`, which is the key the provider's
+vocabulary is looked up under and is never interpolated. Every other key is the
+provider's, travels verbatim, and is grammar 4.3 class 2 — non-secret provider
+config, so its string values MAY interpolate. A key the curated table below
+types as anything but a string is read at compile time and takes a literal: an
+`${ENV}` there is a `type-mismatch` naming the rule, since interpolation
+produces a string and the wire is given the value. A key the table pins to a
+**single** value — the Messages wire's `name:`, and a nested object's `type:`
+(`user_location:`'s `approximate`, `cache_control:`'s `ephemeral`,
+`container:`'s `auto`) — takes that value: it is decided by the entry's own
+`type:` and the service refuses any other spelling, so an `${ENV}` there is
+`unexpected-env-ref` rather than a value read at process start. A closed set of
+*several* values is an ordinary class 2 string and interpolates
+(`search_context_size: ${SEARCH_DEPTH}`).
+
+**The array a request carries is one namespace.** A suite is appended to the
+`tools` of every request the connection serves, beside the agent's own tools, and
+the provider surfaces refuse a request offering two tools under one name. So two
+entries that reach the wire as one tool, and a server tool whose name an agent's
+attached or synthesized tool already takes, are a compile error
+(`tool-name-collision`) — §11.5's rule and §11.5's reason, reached from the
+connection's side. On the Messages wire the name is the one the table pairs with
+each dated `type`, which is what makes `code_execution_20250522` beside
+`code_execution_20250825` two types with one name; the within-a-suite half holds
+on every kind, since two entries of one array under one name are one tool twice
+by the author's own reckoning. The agent-side half is stated over the Messages
+wire **alone**: a Responses built-in is addressed by its `type` and a function
+tool by its `name`, Chat Completions nests a function tool's name inside its own
+object, and no table could say what a gateway keys its vocabulary on — so a
+`tool.*` whose name an `openai` or `openai_compatible` connection's suite also
+spells is not refused.
+
+The checking is **two-tier**, and the constraint behind it is that a server tool
+a vendor ships tomorrow must be usable the day it ships:
+
+- a `type` in the compiler's **curated table** for that kind is validated
+  strictly **against the fields that table models** — a mistyped value, a value
+  outside a stated range or a closed set, a missing required field, or a
+  constraint violation is an error naming the repair. On the Messages wire that
+  closed set includes the required `name`, which the API pairs with each dated
+  `type` and refuses a request that spells otherwise: `web_search_20250305` is
+  `web_search`, `web_fetch_20250910` is `web_fetch`, and either
+  `code_execution_*` is `code_execution`;
+- a `type` outside it is a **warning** (`unknown-server-tool`) naming exactly
+  what could not be verified, and the entry then travels to the wire as written.
+  The composition still builds and still runs;
+- a **key** outside the row of a `type` that is in the table is the same
+  warning one level down (`unknown-server-tool-field`), and travels the same
+  way. A row is keyed on `type` alone and is a snapshot of that tool taken at
+  the compiler's release, so a parameter the vendor adds afterwards would
+  otherwise block every author of a tool the table names — the treadmill again,
+  at field granularity, with no entry-level way out. The compiler cannot tell
+  such a key from a misspelling, so the diagnostic names the near miss where
+  there is one and claims nothing where there is not.
+
+The key is legal on the three kinds whose rows name it and is an error
+(`unsupported-server-tools`) on `azure_openai`, `bedrock` and `vertex`, whose
+wires this release has not been taught to carry it on. On `openai_compatible`
+every entry is second-tier: a gateway may honour any vocabulary at all.
+
+**The key can move the connection's wire, and §12.2's settings row moves with
+it.** An `openai` provider that declares `server_tools:` speaks the Responses
+API for all of its calls (D122), and two of §12.2's published `settings:` keys
+have no equivalent there: `stop:` and `seed:` are Chat Completions'. A model
+bound to such a provider that declares either is a compile error
+(`unknown-key`) naming the wire, rather than a request the service refuses on
+the first call — the same reasoning as the strict tier above. Both keys stay
+legal on an `openai` provider that declares no suite.
+
+**A suite belongs to a connection**, so every agent whose model resolves to that
+provider holds it; scoping a suite to one agent is done by defining a second
+provider. And because a failover route's members each name their own provider,
+which tools were on offer depends on which member answered — a route whose
+members declare different suites is a warning (`mismatched-server-tools`), not a
+refusal. Decision
+[D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers).
 
 ### 12.2 Model definitions
 
@@ -3625,6 +3858,9 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 | `respond` | `sync` \| `async` | no | `async` | |
 | `timeout` | duration | `sync` only | `60s` | the response budget; ILLEGAL with `respond: async` (explicit or defaulted) |
 | `callback` | CEL over `payload` → string | no | — | completion webhook; `async` only |
+| `auth` | block; exactly one of `bearer:`/`hmac:` | no | — | how an inbound call is authenticated; absent leaves the route open |
+| `callback_auth` | block; at least one of `bearer:`/`hmac:`, both legal | no | — | how a delivery identifies itself; requires `callback:`, and makes `callback_allow:` MANDATORY |
+| `callback_allow` | non-empty list of URL patterns, each naming a scheme and a host | with `callback_auth` | — | where a callback may point; requires `callback:` |
 
 `payload` shape: `payload.body` (decoded JSON object), `payload.query` (map of
 string), `payload.headers` (map of string, lowercase names), `payload.path`
@@ -3669,6 +3905,261 @@ a flow input field can accept it.
   (Decision [D81](#d81-timeout-is-illegal-on-an-async-http-trigger)).
 - Generated apps expose `start`, `resume`, and `status` routes; resume payloads
   are validated against the interrupting `human` node's output schema (PRD 5.11).
+
+**`auth:`, `callback_auth:` and `callback_allow:` are enforced by the generated
+app.** A served trigger declaring `auth:` verifies its caller before it reads a
+payload; a delivery carries the identity `callback_auth:` declares and goes only
+where `callback_allow:` admits it. Everything the rest of §13.3 states in the
+present tense is what a built project does, and the launch-time environment
+check refuses a deployment missing any credential these blocks name (§4.3).
+
+**Authenticating the caller: `auth:`.** v0's posture was "deploy behind your own
+gateway". Webhook-style events make the generated app the thing a vendor calls
+directly, so it verifies callers itself (PRD resolved q32). Auth is declared
+**per trigger, never server-wide**, for the reason a built-in is declared per
+node (§5.5): who may invoke this flow must be readable off the trigger that
+exposes it.
+
+```yaml
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    respond: async
+    callback: "payload.body.callback_url"
+    auth:                            # exactly ONE of bearer | hmac
+      hmac:
+        secret: ${WEBHOOK_SECRET}    # required; env-ref value form only
+        header: X-Hub-Signature-256  # default X-Signature
+        algorithm: sha256            # sha1 | sha256 | sha512; default sha256
+        encoding: hex                # hex | base64; default hex
+        prefix: "sha256="            # default "" (empty)
+    callback_auth:                   # at least one of bearer/hmac; BOTH legal
+      bearer:
+        token: ${CALLBACK_TOKEN}     # required; env-ref value form only
+        header: Authorization        # default Authorization
+        prefix: "Bearer "            # default "Bearer "
+      hmac:
+        secret: ${CALLBACK_SECRET}   # required; env-ref value form only
+    callback_allow:
+      - "https://hooks.example.com/*"
+```
+
+- **`bearer`** compares a static secret against a named header — `Authorization`
+  with a `Bearer ` prefix by default. The comparison is **constant-time**: a
+  byte-by-byte early return leaks the secret to a caller who can time it.
+- **`hmac`** verifies a signature over the **raw request body bytes**, before any
+  JSON decoding and after none of it — a re-serialized body is a different byte
+  string and would fail every signature a vendor computed. `algorithm:`,
+  `encoding:`, `header:` and `prefix:` together spell the GitHub-shaped family
+  most webhook vendors speak. This comparison is **constant-time** as well, and
+  the requirement is *not* the weaker one it looks like beside `bearer`'s: a
+  check that returned on the first differing byte would hand a caller who can
+  time it the expected digest for a body of their choosing, one byte at a time,
+  and a forged request signed with a digest recovered that way is accepted
+  without the caller ever holding the secret.
+- **The secrets are `${ENV}` references** and nothing else, in both blocks and
+  both directions: a literal is a compile error, because a secret never lives in
+  the spec text (§4.3, Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)).
+  A reference that resolves to the **empty string** refuses the app at launch,
+  naming the variable. §4.3's presence check counts an empty variable as set,
+  which is right for a `base_url:` and wrong for a credential: an empty expected
+  token compares equal to the empty token every anonymous caller can send, and an
+  HMAC key of no bytes signs a body anybody can sign — so an unexpanded `${TOKEN}`
+  in a launch wrapper is a route that is open and says nothing about it, which
+  the refusal turns into one sentence on the first start.
+- **Exactly one scheme.** A block declaring neither, and a block declaring both,
+  are both compile errors: one request carries one credential, and a route that
+  verified either would be exactly as open as its weaker half.
+- **`header:` is one header name** — letters, digits, `_` and `-`, the form a
+  provider's `headers:` keys take (§12.1) — and **`prefix:` carries no control
+  character**. Outbound both resolved values are written onto a request as they
+  stand, so a colon or a newline in either would forge a second header rather
+  than name or introduce this one; inbound the same two values are the name a
+  header is looked up by and the text expected ahead of the credential, and a
+  name or a prefix no caller could have sent matches nothing. Anything else is
+  `invalid-value`.
+- **A header name is matched case-insensitively.** The name is recorded with the
+  author's capitalisation and *looked up* without it: header names are
+  case-insensitive by definition, HTTP/2 lowercases every one on the wire, and
+  `payload.headers` above presents them lowercased for the same reason. So
+  `header: X-Hub-Signature-256` finds the header a vendor sent as
+  `x-hub-signature-256`, and an inbound check that compared the spelling would
+  reject every genuine delivery over HTTP/2 while passing a `curl` that happened
+  to preserve case. Outbound the resolved name is *written* as authored —
+  capitalisation is the receiver's to read, never to match.
+- Schemes whose signed payload is more than the body — Stripe's timestamped
+  `t.body` with a tolerance window — are **deferred**, not forgotten: each is a
+  vendor-specific shape, and genericizing them now is the support treadmill
+  resolved q30 refused. Vendor presets can grow later as a curated table on q30's
+  terms.
+
+**`auth:` covers three routes, not one.** The `resume` and `status` routes are
+per-execution, and resume *injects data into a parked run* — strictly more
+sensitive than starting one. So both enforce the auth of **the trigger that
+started that execution**: an execution an authenticated trigger began never
+answers an unauthenticated poll or resume, and an execution a no-auth trigger
+began keeps open routes (PRD resolved q32). `run` is untouched — no server, no
+caller to verify.
+
+**What an `hmac` trigger asks of those two routes** is worth spelling out,
+because the two schemes do not cost a client the same thing. A `bearer`
+trigger's three routes all take one header carrying one token. An `hmac`
+trigger's do not: the signature is over **that request's own raw body bytes**,
+so a `GET /executions/:id` of such an execution is signed over the *empty* body
+a `GET` carries — `HMAC(secret, "")`, written under the trigger's `header:`,
+`prefix:`, `algorithm:` and `encoding:` — and a `POST /executions/:id/resume` is
+signed over the resume payload exactly as sent, byte for byte, never over a
+re-serialization of it. That is the start route's rule applied to two more
+routes rather than a second rule; what makes it worth writing down is that "the
+auth of the trigger that started this execution" reads, for `hmac`, as a
+per-request signature a poller has to compute rather than as a credential it
+holds.
+
+**Identifying the delivery: `callback_auth:` and `callback_allow:`.** Outbound
+auth is opt-in and mirrors the inbound pair, so one verification recipe serves
+both directions. `bearer` sends a static token on every delivery; `hmac` signs
+the delivered body. Unlike `auth:`, **both together are legal** — a receiver that
+checks a token and a receiver that verifies a signature are two receivers, and
+one trigger may deliver to a receiver that does both (PRD resolved q33).
+
+**Declaring `callback_auth:` makes `callback_allow:` mandatory**, and that is a
+compile error rather than a warning
+(Decision [D126](#d126-callback_auth-makes-callback_allow-mandatory)). The
+callback URL comes from the trigger payload
+([D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing))
+and is attacker-controlled by construction, so a deployment careful enough to
+authenticate its deliveries must not hand them — credential and all — to whatever
+host a payload named. A URL outside the list is refused **when it is read**, at
+parking or at settle rather than at start, and recorded as a refused delivery
+rather than as anybody's failure.
+
+**A delivery follows no redirect**, which is the same guarantee read one step
+further. The list is matched against the URL the trigger produced, so a receiver
+answering `3xx` must not be able to pass this report — with its signature, and a
+`callback_auth: bearer` token written under the header name its author chose — on
+to a `Location:` the list admits nowhere: what a cross-origin redirect strips is
+a fixed list of standard credential headers, never a name a composition chose and
+never the body's signature. The quieter
+half is that a `301`, `302` or `303` rewrites the request to a bodyless `GET`, so
+an allowlisted receiver redirecting to itself would answer `2xx` to a request
+carrying no report at all. A `3xx` is a failed attempt like any other non-2xx
+status (`docs/durability.md` §3.7); a receiver that has moved is a `callback:`
+naming where it moved to.
+
+**A callback URL that carries userinfo is refused**, which is the same guarantee
+read one step *back*. The list is matched against the URL as text, and userinfo —
+the `user:pass@` an authority may put before its host — is where the text and the
+destination part company: `http://hooks.example.com:9000@attacker.test/hook`
+begins with `http://hooks.example.com:`, so the entry
+`http://hooks.example.com:*/hook` — what an author writes for a receiver whose
+port the operating system chose — admits it while the host the request reaches is
+`attacker.test`. So a URL with an `@` in its authority is a refused delivery like
+any other, recorded and never sent, and it is refused **whether or not the
+trigger declares a list**: the two JavaScript runtimes a built project runs under
+disagree about such a URL — one drops the userinfo and delivers to the host after
+the `@`, the other refuses to construct the request at all — and a wire contract
+that turned on which one `serve` found would be no contract. An `@` after the
+authority, in a path or a query, is an ordinary character and means nothing here.
+
+**A trigger with a `callback:` and no `callback_auth:` is a documented test
+posture**: it signs nothing, claims nothing, and may POST anywhere. That is the
+shape a localhost receiver wants, it needs no allowlist, and it is stated here
+because shipping it is a choice rather than an oversight. `http` URLs stay legal
+in the allowlist for the same reason. Private-IP and DNS-rebinding hardening is
+**out of v1 scope**: SSRF-hardened egress is the gateway's job in the deployments
+that need one.
+
+**Allowlist patterns** (Decision
+[D127](#d127-a-callback-allowlist-entry-is-a-wildcard-url-and-the-delivery-wire-is-fixed)):
+each entry is an absolute URL whose scheme is `http` or `https` and which names
+a host, with `*` meaning "any run of characters" — one wildcard kind, matched
+against the **whole** callback URL string, with no `**` distinction (a URL is
+not a path tree). An entry naming no scheme, an unsupported scheme, no host at
+all (`https:///deliveries`), or an empty or whitespace-bearing value is a
+compile error, and so is an **empty list**: an allowlist that admits
+nothing refuses every delivery, which is a webhook that can never fire. The
+scheme is written **lowercase**, because an entry is matched as written: a URL
+scheme is case-insensitive to a browser and `HTTPS://hooks.example.com/*` is
+still a string no lowercase callback URL matches, so it is refused with the
+spelling as the repair rather than admitted as an allowlist that admits nothing.
+`callback_auth:` or `callback_allow:` on a trigger with **no `callback:`** is a
+compile error too, the mirror of `timeout:` on an async trigger
+([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)): the key describes a
+delivery this trigger never makes.
+
+**Write the host out, and read a wildcard in it for what it is.** `*` is *any*
+run of characters, and it crosses `/` and `?` like any other — there is no
+delimiter it stops at. So a wildcard reaching the host constrains no host:
+`https://*.hooks.example.com/*` is matched by
+`https://attacker.test/collect?x=.hooks.example.com/y`, where the leading `*`
+consumed a host, a path and a query on its way to the literal after it, and
+`https://hooks.example.com*` is matched by
+`https://hooks.example.com.evil.test/collect`, where the trailing one simply
+continued the name. Both are **legal entries** that admit far more than their
+author means, so an allowlist that is a guarantee rather than a ceremony is one
+whose entries write their hosts out — `https://hooks.example.com/*`,
+`https://hooks.example.com:9000/*` — with a second subdomain getting a second
+entry.
+
+The compiler refuses the *shape* and not the *breadth*, and the difference is a
+question the PRD owns. `https://*.hooks.example.com/*` is the entry an author
+arriving from any other allowlist writes first, and there is a reading of `*`
+under which it means what they intend: a wildcard that stops at `.`, `:`, `@`
+and `/` inside the authority constrains the host to one label of a named tree,
+and neither match above survives it. That reading is a **second wildcard kind** —
+one meaning inside the authority, another after it — which is a language
+decision this grammar has not taken. Refusing the entry until it is taken would
+be taking it: on a trigger whose `callback_auth:` makes the list mandatory, the
+only other compiling repair is dropping the outbound auth, which is the posture
+[D126](#d126-callback_auth-makes-callback_allow-mandatory) exists to prevent. So
+the entry compiles, the reading it compiles under is stated here, and a resolved
+question that bounds the wildcard narrows a meaning rather than unbanning a
+shape (Decision [D127](#d127-a-callback-allowlist-entry-is-a-wildcard-url-and-the-delivery-wire-is-fixed)).
+
+**The delivery wire.** A callback fires on lifecycle events — every quiescence
+that opened new pauses, and settle — carrying the status route's report plus
+delivery metadata (PRD resolved q34, q35). A quiescence is the moment every
+branch of the execution has parked or finished, so a `map` over a flow with
+`human` nodes is **one** delivery listing all of its pauses rather than one per
+item. Every delivery carries these headers, and they are normative:
+
+| Header | Value |
+|---|---|
+| `X-AgentCompose-Event` | `parked` or `settled` |
+| `X-AgentCompose-Delivery` | the delivery id, `<execution_id>:<ordinal>` |
+| `X-AgentCompose-Ordinal` | the event ordinal, an integer |
+| `X-AgentCompose-Timestamp` | ISO-8601 |
+| `X-AgentCompose-Signature` | `sha256=<hex hmac-sha256 of the body>` — with `callback_auth.hmac` only |
+
+With `callback_auth.bearer`, the configured `header:` carries `prefix:` followed
+by the token — and that header may **not** be one the delivery already writes:
+the `X-AgentCompose-` namespace belongs to the wire contract, and a delivery is
+a POST of a JSON body to the host the allowlist admitted, so it writes
+`Content-Type`, `Content-Length` and `Host` on its own request too. A
+`callback_auth.bearer.header:` naming any of them is a compile error
+(`invalid-value`). A token written under a name the delivery already writes
+arrives joined to that value or in place of it: a receiver following this table
+then fails its signature check on every legitimate delivery — or passes on one
+whose signature it never read — and a receiver reading a `Content-Type` that is
+a credential answers 415 and never sees the report at all. The three transport
+names are matched **whole** (`X-Content-Type` and `Content-Type-Signature` are
+headers of the receiver's own and stay legal); the namespace is matched as a
+prefix, so a sixth `X-AgentCompose-` header on the wire needs no second rule. The
+reservation is **outbound only**: an inbound `auth:` may name
+`X-AgentCompose-Signature` freely, which is exactly how a trigger that *receives*
+another deployment's callbacks verifies them.
+
+Outbound `hmac:` takes **no** keys but `secret:`: signing is fixed at
+HMAC-SHA256 written in hex, so one receiver-side recipe verifies every
+agent-compose deployment. Deliveries are journaled and at-least-once with bounded
+retry, so a parking delivery and a settle delivery **can arrive out of order**:
+receivers order by `X-AgentCompose-Ordinal`, never by arrival, and dedupe on
+`X-AgentCompose-Delivery` (PRD resolved q35).
+
+The retry schedule, what a refused or exhausted delivery leaves behind, and what
+a restarted `serve` picks up are `docs/durability.md` §3.7's, which is normative
+for the delivery ledger the way §13.3 is normative for the wire.
 
 ### 13.4 `schedule` (RESERVED grammar — parsed and validated, no-op in v0)
 
@@ -3846,11 +4337,38 @@ its runtime effect is a documented no-op (PRD 5.10, 5.11).
 | `triggers.<t>.type: event` | parsed + validated, no-op | M3 |
 | `network:` on a placement | parsed, no-op | M3 |
 
-`human` nodes were on this list and have left it: the runtime landed in M2, so a
-compiled project really pauses, publishes the question, and resumes (§8.7). What
-is still deferred is not the construct but its **durability** — a wait is a
-parked promise in the serving process rather than a checkpoint, and survives no
-restart until durable execution arrives in M3.
+**Two constructs have left this list, and both left it by their runtime
+landing.**
+
+`human` nodes were here until M2: a compiled project really pauses, publishes
+the question, and resumes (§8.7), and its waits now survive a restart as well —
+a resumed execution re-parks under the same wait id and reads its answers out of
+the journal (`docs/durability.md`).
+
+**The three authentication keys were here until the http-native events pass**,
+and they are the ones that read differently from every other row, which is why
+their retraction is bound rather than remembered. A no-op `schedule` runs
+nothing, which is visible the first morning it does not fire; a no-op `auth:`
+would **serve every caller** and be indistinguishable, from outside, from a
+guarded route — a wrong claim about a security control is worse than a missing
+one, in both directions. So `crates/compose-core/tests/trigger_auth_surface.rs`
+now asserts the opposite of what it used to: that an authenticated trigger's
+material really does reach the generated project, that its credentials reach the
+environment manifest `src/env.ts` builds, and that the documents which once
+called the surface inert say it is enforced. A change that made these keys inert
+again fails there rather than shipping a `docs triggers` that promises a
+guarantee the app does not keep.
+
+The environment manifest is the half of that with no sentence to bind:
+`crates/compose-core/src/codegen/env.rs` walks `ir.triggers` beside the
+definitions and the deploy layer, so an authenticated trigger's four `${ENV}`
+references — `auth.bearer.token`, `auth.hmac.secret`,
+`callback_auth.bearer.token`, `callback_auth.hmac.secret` — are in the list
+`readEnvironment()` checks at process start. §4.3's promise is that the
+variables a deployment needs are computable from the artifact statically, and a
+runtime reading `process.env.WEBHOOK_TOKEN` that the walk did not know about
+would let a deployment missing the variable start clean and then refuse every
+real call.
 
 ---
 
@@ -6133,6 +6651,489 @@ a call that ended the node and whose answer the model never saw, and both halves
 are false of a refusal. `docs/trace.md` §10.3.3 is that reasoning in full.
 *PRD 5.1, 5.2, 5.3, 5.8, §9.14, §9.22, G3.*
 
+### D120. A keyless `anthropic` or `openai` provider names its endpoint
+
+On the two kinds with a default endpoint, `api_key:` is required when `base_url:`
+is absent and optional when it is present; a provider declaring neither is a
+compile error (`missing-credential`, §12.1). An absent key means the compiled
+runtime sends **no** authentication header — no `x-api-key`, no `authorization` —
+rather than an empty one. **Rationale**: §12.1's row made `api_key:` flatly
+required on both kinds, which refuses the shape a corporate deployment actually
+writes: model traffic goes through a gateway that injects the vendor credential
+server-side, and the employee running the graph holds no key at all. The only
+workaround was `kind: openai_compatible` with a re-pointed `model.*` — a
+different plugin, a different settings schema, and `thinking:` no longer
+type-checked — for a connection that is still talking to Claude. PRD 5.9's
+"swapping a project from hosted to local inference is a one-line provider edit"
+is the promise that row was breaking.
+
+Making the key **simply optional** was the obvious repair and is the rejected
+one. It admits `provider.x: { kind: anthropic }`, which validates, builds, ships,
+and 401s on its first live call against `https://api.anthropic.com` — moving a
+forgotten credential out of `validate` and into production. That is the failure
+this document's whole static layer exists to prevent, and G3 makes the
+diagnostic a product feature; trading it away to save one `if`/`then` is the
+wrong side of that trade. The conditional keeps the forgotten-key report exactly
+where it was and buys the gateway shape with a message that names both repairs —
+declare the key, or name the endpoint that supplies one.
+
+`base_url:` is the right discriminator because it is the only key in the
+definition that can say the traffic is not going to the vendor. It is not a
+proxy for intent: the runtime *resolves* an omitted `base_url:` to the vendor's
+own host, so "no `base_url:`" is literally "reaching Anthropic's or OpenAI's
+endpoint", where the key is not optional in any deployment. And a gateway that
+authenticates callers with a token of its own is already served: `headers:` is
+interpolable (§4.3 class 2), so `authorization: "Bearer ${PROXY_TOKEN}"` is a
+declared header that reaches the wire and reads as what it is, rather than an
+`api_key:` pretending to be a vendor credential.
+
+Sending **no header** rather than an empty one is the other half, and it is not
+cosmetic. `x-api-key: ""` and `authorization: Bearer ` are requests that *claim*
+to authenticate and fail, which a gateway is entitled to reject before it ever
+injects its own — and where the gateway forwards headers verbatim, an empty
+credential arrives at the vendor as a 401 that names authentication rather than
+as the absence the deployment intended. The rule is stated over the connection,
+not over the kind: whichever wire a compiled graph reaches, a provider that
+declares no `api_key:` sends no authentication header for it.
+
+The rule is decidable in one file — `kind:`, `api_key:` and `base_url:` are three
+literals in one mapping — so the published schema branches on it exactly as it
+branches on the required keys already
+([D106](#d106-a-provider-kinds-key-row-is-closed), Appendix B), and it is decided
+in the same pass as those keys, one report with the kind's own span beside it.
+The other four kinds keep their rows unchanged:
+`azure_openai` reaches a per-resource deployment that has no default endpoint to
+fall back to, so all three of its keys stay required;
+`openai_compatible` already made `api_key:` optional beside a required
+`base_url:`, which is the same posture arrived at from the other direction; and
+`bedrock` and `vertex` authenticate through their cloud's own credential chain
+with no header for this rule to be about. *PRD 5.9, G3.*
+
+### D121. Durability adds no grammar: journaling is unconditional and the target binds the backend
+
+Every invocation of every flow is **journaled**, with no key to turn it off and
+none to turn it on, and `--target local` binds a SQLite journal file beside the
+project. There is no `journal:` block, no deploy-file section, and no addition to
+the published schema. [`docs/durability.md`](durability.md) is normative for the
+record, its keys, and the replay that reads it back. **Rationale**: PRD resolved
+q27 makes the journal a *deploy-target slot*, exactly as `storage_backends` are —
+"the composition says nothing, the target binds it" — and every target this
+compiler release can build is process-local, so every one of them binds the same
+backend. A configuration surface is a choice expressed in grammar; with one
+backend there is no choice, and a key whose only legal value is its default is a
+key an author has to read and cannot use. resolved q27 also fixes the property
+that key would otherwise carry: durability is "durable by default, zero
+configuration, one file to delete".
+
+The deploy-level surface arrives with the **first non-local backend** — the
+Postgres journal a distributed target binds — which is the release where a
+choice exists to express, and it will land in §14 beside `storage_backends:`
+where it belongs. Reserving the key now would be reserving a shape nobody has
+had to write against a backend nobody has implemented, which is the one kind of
+forward-compatibility this document does not practise (§15's reserved
+constructs are all *fully specified*).
+
+Durability is **not** §14's checkpointing, and the two must not be read as one
+rule. "`local` is not durably checkpointed; every other target is" — the property
+`detach: true` keys off ([D59](#d59-checkpointing-is-a-target-property-and-detach-is-checked-per-target), §8.6 rule 7) — is
+about a LangGraph **checkpointer**, which PRD resolved q26 rules out as this
+project's durability mechanism in favour of journal + replay. `--target local` is
+still the un-checkpointed target, `detach: true` is still legal only there, and
+it is now also a durable one. *PRD 5.11, resolved q26–q29.*
+
+### D122. Server tools are provider-side config, checked in two tiers
+
+A provider MAY declare `server_tools:`, an array of config objects in that
+provider's own wire vocabulary, and the runtime appends them to the `tools` of
+every request that provider serves. Each entry requires a string `type:`;
+everything else is the provider's and travels verbatim, as grammar 4.3 class 2
+values. The compiler keeps a **curated table** of the server tools each kind is
+known to serve: an entry naming one is checked strictly against it, and anything
+the table cannot speak for is a **warning** that says so and is carried to the
+wire unchanged. **Rationale**: PRD resolved q30. The governing constraint is *no
+manual support treadmill* — a server tool the vendor ships tomorrow must be
+usable the day it ships, without waiting for a compiler release — and the two
+tiers are how that coexists with G3 diagnostics: the table buys a real error
+message for what it knows, and buys nothing at the cost of a warning for what it
+does not. A table that *gated* would be the treadmill; no table at all would
+make a misspelled `max_uses` a 400 on the first live call, with no span.
+
+**"Anything the table cannot speak for" is two things, not one.** A `type` it
+does not name (`unknown-server-tool`), and a **key** it does not name inside a
+`type` it does (`unknown-server-tool-field`). The second is the same rule read
+at field granularity, and it has to be, for the same reason: a row is keyed on
+`type` alone and is a snapshot of one tool at one release, vendors add
+parameters to tools they already ship, and a strict tier nobody can opt an entry
+out of would refuse them until a new binary shipped. What stays an **error** is
+everything the table genuinely knows: a field it models given the wrong kind of
+value, a value outside a stated range or closed set, a required field left out,
+two fields the vendor refuses together. A field the vendor documents whose
+interior the compiler's vocabulary cannot state — `file_search`'s recursive
+`filters` — is *in* the row as an unconstrained key, since a documented
+parameter warned about is a diagnostic that teaches nothing.
+
+**The runtime dispatches nothing.** A server tool executes on the provider's
+side, inside the model call, and its results arrive woven into the assistant's
+turn — which is why the array is a wire object rather than a construct of this
+grammar, and why a `server_tool_use` block is *not* a tool call the agent's loop
+answers. It is also why replay is untouched: the use happens inside the recorded
+model call (`docs/durability.md` §3.1).
+
+**Launch scope is `anthropic` and `openai`, plus `openai_compatible`
+unverified.** For Anthropic's Messages wire the table holds web search, web
+fetch and code execution; for OpenAI it holds the built-in suite of the
+**Responses** API — web search, file search, code interpreter, image generation
+— which Chat Completions does not carry. So an `openai` provider that declares
+`server_tools:` speaks the Responses API for **all** of its calls, and one that
+declares none keeps Chat Completions: one provider, one wire, because a
+connection that switched per request would make "what did this model see" depend
+on which agent asked. `openai_compatible` takes the key with every entry
+second-tier — a gateway may honour any vocabulary, and refusing would recreate
+the treadmill — and rides its Chat Completions `tools` array. `azure_openai`,
+`bedrock` and `vertex` refuse it outright rather than dropping it silently
+(D50).
+
+**Moving the wire moves what that wire has.** Two of §12.2's `settings:` keys
+are Chat Completions' and have no Responses spelling — `stop:` and `seed:` — so
+declaring a suite makes them a compile error on the models that connection
+serves rather than a 400 on the first call. Two others change spelling and the
+runtime translates them (`max_tokens` → `max_output_tokens`, `reasoning_effort`
+→ `reasoning: { effort }`). One thing changes that the compiler does not decide:
+the Responses API's service-side default for `store` is `true` where Chat
+Completions' is `false`, so the provider retains prompts and completions for a
+connection that has moved. The emitted request does not pin the key, because
+`store: false` makes the service refuse a replayed `reasoning` item and a tool
+loop replays every turn; `docs/topics/models.md` says so where an author meets
+the seam.
+
+**A suite belongs to a connection.** Every agent whose model resolves to that
+provider holds it, and scoping a suite to one agent is done by defining a second
+provider — providers are cheap. Failover capability is therefore per-chain-member
+by construction, so `validate` **warns** when a route's members declare differing
+suites: which tools were on offer depends on which member answered, and that is
+a legal thing to want (a fallback vendor that has no web search is still a
+fallback) as well as a real thing to know.
+
+**One name, one tool — §11.5's rule, reached from the connection.** The suite is
+appended to the same `tools` array the agent's own tools land in, and the
+provider surfaces refuse a request offering two tools under one name, so
+`tool-name-collision` is an **error** on two more pairs: two entries of one suite
+that reach the wire as one tool, and a server tool whose name an attached
+`tool.*`/`flow.*` or a synthesized store tool already takes on an agent whose
+model reaches that provider. The first is what the Messages wire's canonical
+`name:` pinning makes decidable — both dated `code_execution_*` revisions *are*
+`code_execution`, so the strict tier checking each entry in isolation would let
+the pair through to a 400 with no span, which is the failure that pinning exists
+to prevent. The second is stated over the Messages wire alone: it is the wire
+where a server tool and a client tool sit under one key, a Responses built-in is
+addressed by its `type` while a function tool carries a `name`, and no table
+could say what a gateway keys its vocabulary on. *PRD 5.9, resolved q30.*
+
+### D123. A built-in is one `tools:` entry carrying its own bounds
+
+The four runtime built-ins (§5.5) are attached from an agent's `tools:` list, one
+name per entry, spelled as a **single-key mapping** whose key is the built-in's
+address and whose value is the bounds that address requires — `root:` on all
+four, and `timeout:` on `builtin.bash` as well:
+
+```yaml
+tools:
+  - tool.repo_grep
+  - builtin.read_file: { root: "${WORKSPACE}" }
+  - builtin.bash:      { root: "${WORKSPACE}", timeout: 30s }
+```
+
+**Rationale**. PRD resolved q31 fixes three things this spelling has to carry at
+once, and they pull against the shapes that would otherwise be obvious. The
+opt-in is "one tool name at a time … never ambient, and never a single switch
+that grants the set, because *which capabilities does this agent hold* must be
+readable off the node that holds them"; the bounds are mandatory; and the set is
+closed and named. A key of its own — `builtins: [bash, read_file]` — would answer
+the first and lose the second, because a list of names has nowhere to put a root,
+and every alternative that puts the roots somewhere else (a sibling `builtin_
+root:`, a block above the list) separates the capability from its bound by
+exactly the distance a reader has to close to answer the only question that
+matters about it. Putting the bounds *in the entry* is what makes the answer
+local: the line that grants `bash` is the line that says where it runs and for
+how long.
+
+**The entry is where it is because the wire is one array.** A built-in is offered
+to the model beside the agent's `tool.*`s and its stores' synthesized tools —
+§11.5's one-name-one-tool rule reaches it unchanged, and a `tool.bash` on the same
+agent is a collision — so a second list would have made "what is this agent
+offered" a question with two places to look and one of them able to contradict
+the other. It also settles the ordering with no new rule: entries reach the wire
+in the order `tools:` declares, then the stores'.
+
+**Why a single-key mapping rather than a discriminator object.**
+`{ builtin: bash, root: … }` was the other candidate and reads worse in exactly
+the place this decision is about: the name of the capability stops being the
+entry's subject and becomes one field of it, three characters from a `root:` that
+looks like a sibling rather than a bound. The mapping form also gives the
+published schema a precise shape with no `if`/`then` — four named properties,
+`additionalProperties: false`, `minProperties`/`maxProperties` of 1 — so "one
+name at a time" is enforced by an editor before `validate` ever runs, and each
+name's own bounds are checked against its own row (Appendix B).
+
+**`root:` is required on `builtin.bash` too**, though q31 introduces it as the
+file tools'. The headline is "bounded by a mandatory root and a timeout", and a
+shell whose working directory defaulted to wherever the runtime happened to be
+started would be the ambient capability the whole decision refuses — read off no
+entry, different on a developer's machine and a deployment's.
+
+**Required means non-empty**, on all four, for exactly that reason and in two
+places. `root: ""` is a compile error, because it is a key present and a bound
+absent — `""` resolves to the process's own working directory, so an entry
+spelling it would grant precisely the ambient capability the paragraph above
+refuses, while *looking* bounded to a reader. And because the value is
+interpolable, the same hole is reachable through an environment variable that is
+set and empty: `${WORKSPACE}` satisfying the presence check of PRD 5.9 with
+nothing in it. The parser cannot see that one, so the runtime refuses an empty
+*resolved* root as an execution failure, under §9 like every other bound the
+call could not honour. One rule, checked wherever it can be broken. `timeout:` is
+required rather than defaulted for the same reason and with the same words: "a
+model holding bash is arbitrary code execution on the host running the graph,
+which is why every bound here is explicit". A default is a bound nobody wrote and
+nobody read.
+
+`timeout:` is **illegal on the file tools** rather than accepted and ignored,
+which is [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)'s
+rule reaching the smallest surface it has: there is no command there to bound, and
+a key that did nothing would teach a reader that the file tools were bounded in
+time when they are not. `root:`, by contrast, is one key with one meaning on all
+four — the directory this tool may not leave — which is what lets an author read
+four entries sharing a `${WORKSPACE}` as one grant.
+
+**What the bounds are not.** Neither is a parameter: the model names a `path:` and
+a `command:`, never a root and never a deadline, because a model that could widen
+its own bound would not be bounded. And a built-in takes no `retry:`/`timeout:`/
+`on_error:` of its own, exactly as a `tool.*` definition does not
+([D25](#d25-tool-defs-require-description-input-and-output-and-exactly-one-binding),
+§6.2): policy is a property of the use site, and the use site here is the agent
+node, whose §9.2 deadline bounds the whole loop that a `timeout:` bounds one
+command of.
+
+**Failure, refusal, trace and journal are all borrowed rather than invented.** A
+call the argument schema refuses bounces back to the model
+([D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node));
+a root escape, a nonzero exit, a timeout kill and a missing shell are execution
+failures that end the node under §9. The trace records a built-in call as the
+`ToolCallRecord` it is, with the built-in's address as the target and, per
+`docs/trace.md` §11, no result; the journal records the answer in full, so a
+resumed execution consumes a recorded `bash` instead of running it a second time
+(`docs/durability.md` §3.2). That last one is the property that makes a built-in
+worth having over a hand-rolled `exec:` tool at all — it is the same property,
+reached with none of the boilerplate. *PRD 5.5, 5.12, resolved q31, G3.*
+
+### D124. A built-in's deadline kills the command's process group, not just the shell
+
+`builtin.bash` runs its command in a **process group of its own**, and the
+`timeout:` kills the group. So does an abort — a §9.2 node deadline, or a
+cancelled run — and so does a stop signal delivered to the process running the
+graph while a command is in flight.
+
+**Rationale**. §5.5 promises that a command which outruns its `timeout:` "is
+killed", and the bound is one of the two things q31 says a built-in *has*: "a
+model holding bash is arbitrary code execution on the host running the graph,
+which is why every bound here is explicit". A kill aimed at the shell's own pid
+does not keep that promise, because the shell is almost never where the work is.
+`bash -c 'npm run build'` forks; so does a pipeline, a subshell, a command list.
+Kill the shell and every one of those children keeps running — and keeps writing
+inside the `root:` the attachment bounded it to — while the graph has already
+reported the call as failed and moved on. With `retry: 2` that is two generations
+of one command writing one root with the composition believing exactly one is
+live; with `on_error: skip` it is a downstream node reading files a "killed"
+command is still producing. The bound would be a message rather than a fact.
+
+**What this costs and why it is worth it.** A detached command is out of the
+**terminal's** reach as well as the shell's: its group is no longer the
+foreground one, so the `SIGINT` a person types no longer reaches it the way it
+reaches an `exec:` tool's child. That would have traded one orphan for another,
+so the runtime closes it directly — while a command is running, `SIGINT` and
+`SIGTERM` sweep the live groups and are then re-raised, leaving the exit
+behaviour, the exit status and `serve`'s own shutdown exactly as they were. The
+handlers exist only for as long as a command does.
+
+**What is still out of reach**, and is said rather than implied: a process that
+*left* the group on purpose — `setsid`, a shell that turned job control on
+(`set -m`), a daemon that double-forks. Those escape a hand-rolled `exec:` tool
+identically, and containing them is the distribution work's, beside the container
+and syscall isolation §5.5 defers there. The runtime stops **reading** what such a
+process holds rather than waiting on it, so the call is still bounded even when
+the process is not.
+
+**The same rule inside this process.** `builtin.list` is the one built-in whose
+work is the runtime's own — a walk over a directory the model named, matching a
+glob the model wrote — and both of those size it. An abort stops that walk where
+it is, for the reason it kills a process group: an activity the graph has stopped
+*waiting* for is not an activity that may go on working, and a compiled graph is
+embedded code, so a listing left running is a core taken from every other
+execution in the same process. The walk also hands the event loop back as it
+goes, because a deadline is a timer and a timer cannot fire inside work that
+never yields. *PRD resolved q31, §5.5, §9.2.*
+
+### D125. Inbound `auth:` is one scheme per trigger, with env-ref secrets
+
+An `http` trigger's `auth:` block declares **exactly one** of `bearer:` and
+`hmac:`; a block declaring neither and a block declaring both are each a compile
+error naming the repair, and both blocks' secrets take the env-ref value form
+alone (§13.3, §4.3).
+
+**Rationale**. PRD resolved q32 settles the two kinds and settles that auth is
+**per trigger**; what this entry fixes is the shape. *Exactly one* rather than a
+set, because one request carries one credential: a route that accepted either a
+bearer token or a signature would be exactly as open as its weaker half, and
+"which one did this caller use" is not a question the deployment gets to answer
+after the fact. It is the shape a `tool.*` implementation binding already takes
+([D25](#d25-tool-defs-require-description-input-and-output-and-exactly-one-binding)),
+and it is refused the same way — `missing-key` naming both spellings,
+`conflicting-keys` on the second — so an author meets one rule twice rather than
+two rules once each. *Env refs only* is [D41](#d41-env-ref-forms-and-the-secret-field-list)
+applied to two new field names: a `token:` or `secret:` written as a literal is
+a credential committed to a repository, which is the failure §4.3 exists to
+prevent, and the value form is what makes `validate` able to say so without ever
+holding the secret.
+
+**Why not vendor presets** — `auth: { github: … }`, `auth: { stripe: … }` —
+which is the shape an author coming from a webhook vendor's documentation would
+reach for first. That is the **support treadmill** resolved q30 refused for
+server tools, arriving through a second door: a preset is a promise to track a
+vendor's signing scheme across releases, and a vendor that changes one leaves
+every deployment pinned to a compiler release rather than to a configuration.
+The configurable `hmac:` covers the GitHub-shaped family — digest, encoding,
+header, prefix — which is what most vendors actually speak, and the schemes it
+cannot express (Stripe's timestamped `t.body` with a tolerance window) are named
+out of scope in §13.3 rather than half-modelled. Presets can grow later as a
+curated table on q30's own terms, and adding one then breaks nothing written
+against this shape. *PRD resolved q32, §13.3, §4.3, G3.*
+
+### D126. `callback_auth:` makes `callback_allow:` mandatory
+
+Declaring `callback_auth:` on an `http` trigger makes `callback_allow:` a
+required key of that trigger, reported as its own diagnostic class,
+`missing-callback-allowlist` (§13.3). Neither key is legal on a trigger with no
+`callback:`.
+
+**Rationale**. PRD resolved q33 ratifies the rule; this entry records that it is
+an **error rather than a warning**, and why the asymmetry with a plain callback
+is the right one. The callback URL is read from the request payload
+([D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)),
+so it is attacker-controlled by construction. A deployment that attaches a
+credential to its deliveries and does not say where they may go will hand that
+credential to whichever host a payload named — and a warning is precisely the
+wrong instrument for it, because the composition that ships is the one that
+validated. A trigger declaring **no** outbound auth is untouched: it signs
+nothing, claims nothing, may POST anywhere, and §13.3 says so in as many words,
+because the test posture is worth being able to write and worth recognising in
+review.
+
+The code is its own rather than a `missing-key` for the reason
+`missing-credential` is
+([D120](#d120-a-keyless-anthropic-or-openai-provider-names-its-endpoint)): what
+is absent is decided by a sibling value, and the repair is a choice of two —
+declare the allowlist, or drop the auth. The **no-`callback:`** half is
+[D81](#d81-timeout-is-illegal-on-an-async-http-trigger)'s posture rather than a
+new one: a key describing a delivery the trigger never makes changes nothing
+observable, and a key whose author expected it to do something gets a diagnostic
+rather than silence. *PRD resolved q33, §13.3, G3.*
+
+### D127. A callback allowlist entry is a wildcard URL, and the delivery wire is fixed
+
+A `callback_allow:` entry is an absolute `http`/`https` URL — the scheme spelled
+lowercase, as the match will read it — in which `*` matches any run of
+characters, matched against the whole callback URL; it names a host — the run
+from the scheme to the first `/`, `?` or `#` — and an entry where that run is
+empty is a compile error; the list is non-empty. Every delivery carries the
+`X-AgentCompose-*` headers §13.3 tabulates, over the `Content-Type`,
+`Content-Length` and `Host` any POST of a JSON body carries, and a
+`callback_auth.bearer.header:` naming one of those is a compile error; outbound
+`hmac:` signing is HMAC-SHA256 in hex with no keys of its own (§13.3).
+
+**Rationale**. *One wildcard kind*, unlike §5.5's `glob:`: `**` earns its
+existence where a path tree has a directory boundary to be significant about,
+and a URL has no such boundary — `*` against the whole string is what an author
+writing `https://hooks.example.com/*` already means, and a second wildcard would
+only invite the question of what it did differently. The cost of having no
+boundary is that a `*` **crosses `/` and `?`**, so a wildcard reaching the host
+constrains no host at all: `https://*.hooks.example.com/*` is satisfied by
+`https://attacker.test/collect?x=.hooks.example.com/y`, because the first `*` is
+free to consume a host, a path and a query on its way to the literal that
+follows, and `https://hooks.example.com*` by
+`https://hooks.example.com.evil.test/collect`, because a name is a prefix of
+longer ones. §13.3 states that where an author writes one, and *`validate` does
+not refuse it*, because refusing would be taking the language decision that
+question belongs to. A wildcard bounded to a single label inside the authority —
+stopping at `.`, `:`, `@` and `/` — would make that first entry mean what its
+author intends, and it is one wildcard with two meanings, which the PRD owns and
+CLAUDE.md's PRD discipline puts there before an implementation. Refusing looks
+like the conservative half and is not: the entry an author writes for a
+multi-tenant receiver has no compiling enumeration, so on a trigger whose
+`callback_auth:` makes the list mandatory
+([D126](#d126-callback_auth-makes-callback_allow-mandatory)) the only repair
+left is dropping the outbound auth — trading a broad allowlist for no allowlist
+and no signature, which is the posture D126 exists to prevent. And the direction
+of a later change is safe: bounding the wildcard narrows what an already
+compiling entry matches, so a resolved question refuses deliveries that were
+admitted rather than admitting deliveries that were refused.
+
+*A host, though*, because that much is not about breadth: the run from the
+scheme to the first `/`, `?` or `#` is what names a receiver, and
+`https:///deliveries` names none — an entry no callback URL was written to
+match, which is the same statically visible dead surface the empty list is. The
+rule is about the *entry*, not about matching: `*` crosses every delimiter
+wherever it is legal, because the alternative — a wildcard that stopped at one —
+is the second kind this entry leaves to the PRD.
+
+*Scheme-anchored*, because a match that could not name the scheme would
+let one entry admit URLs that merely begin with the same characters. *And
+spelled lowercase*, because the entry is compared to the URL as text: `HTTPS://`
+is the scheme a callback is delivered over written in a case the match will
+never see, so the entry admits nothing — the empty list's dead surface in a
+single entry, and the one refusal here whose message has to name the *spelling*
+rather than the two schemes, since telling that author their scheme is not one
+of two schemes, one of which is theirs, is a message with no repair in it.
+*`http` stays legal*: localhost development is the common first case, and
+refusing it would push every author to a workaround worse than the rule.
+*Non-empty*,
+because an allowlist satisfied by nothing refuses every delivery — a statically
+visible webhook that can never fire, and the same guaranteed-dead-end posture
+§7.6.3 takes. Matching itself is a
+**runtime** rule: the URL does not exist until the payload arrives, so `validate`
+owns entry shape and nothing more.
+
+*The delivery wire is normative in the grammar* rather than left to the emitter
+because it is the half a **receiver** implements, and a receiver is code nobody
+in this repository writes. PRD resolved q34 and q35 fix what a delivery carries
+and that retries make ordering by arrival wrong; naming the exact headers here
+is what lets a receiver be written against the language rather than against an
+observed release. Outbound signing takes no `algorithm:`/`encoding:` for the same
+reason: one recipe verifying every agent-compose deployment is worth more than a
+knob, and the inbound block is where a vendor's choices have to be matched
+because there the vendor made them.
+
+*And naming them normatively reserves them*: a `callback_auth.bearer.header:`
+inside the `X-AgentCompose-` namespace is refused, because the delivery is
+already writing there. Two values under one header name is not a configuration a
+receiver can read — it gets whichever its HTTP stack kept, or the pair joined —
+so the same sentence that lets a receiver be written against this table has to
+stop a trigger from contradicting it. The prefix rather than the five spellings,
+so a sixth header added to the wire needs no second rule; **outbound only**, so
+that an inbound `auth:` naming `X-AgentCompose-Signature` — a trigger receiving
+another deployment's callbacks — stays exactly as writable as one naming
+GitHub's.
+
+*And the reservation is about the collision, not the namespace*, so it covers
+the three headers a delivery writes without this table's help:
+`Content-Type: application/json`, the `Content-Length` that frames the report,
+and the `Host` the allowlist admitted. A token asked for under one of those is
+the same two-values-one-name failure read from the transport's side, and a worse
+one to debug, because the delivery is refused before any receiver code runs —
+415, a body framed by a credential's length, or a request that reached a
+different host entirely. Those three are matched **whole** rather than as a
+prefix, since `X-Content-Type` and `Content-Type-Signature` are the receiver's
+own names and a rule that swallowed them would refuse a configuration that
+collides with nothing. *PRD resolved q33, q34, q35, §13.3.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -6211,15 +7212,29 @@ as integers in their ranges, `content_type` as a string carrying no env ref
 requires and the ones it refuses, `metadata_schema` being `vector`'s alone
 (§11.1, D113) and the `provider:` a `vector` store's `embed:` block must name
 (§11.2, D116), provider key sets per `kind` — both halves, the required keys and
-the closed row the optional ones live in (§12.1, D106) — trigger
+the closed row the optional ones live in (§12.1, D106), including the one
+required key that is *conditional*, an `anthropic` or `openai` provider's
+`api_key:` where no `base_url:` names a gateway (§12.1, D120), which is a second
+`if`/`then` on the same object rather than a rule about another file — trigger
 keys per `type` (§13) including the `respond`/`timeout` and `respond`/`callback`
-pairings (§13.3), the map form rules and the `on_item_error` shape (§8.6) —
-including the confinement of `input:`/`writes:`/`detach:` to the homogeneous form
-(rule 7, D85) and the absence of any `context:` key, which is a `flow:` node's
-alone because a dispatch's history isolation is unconditional (rule 13, D105) —
+pairings, the scheme counts on both auth blocks — exactly one on `auth:`, at
+least one on `callback_auth:` — and the two conditionals the callback keys carry:
+`callback_auth:` or `callback_allow:` requiring a `callback:` for either to
+describe, and `callback_auth:` requiring `callback_allow:`, which is that same
+conditional-required-key shape a second time (§13.3, D126, D127), the map form
+rules and the `on_item_error` shape (§8.6) — including the confinement of
+`input:`/`writes:`/`detach:` to the homogeneous form (rule 7, D85) and the
+absence of any `context:` key, which is a `flow:` node's alone because a
+dispatch's history isolation is unconditional (rule 13, D105) —
 the field-map-only `input:` on the node kinds that name their
 fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
-direct-XOR-route split on model definitions (§12.2), the `human` timeout/route
+direct-XOR-route split on model definitions (§12.2), the built-in entries of an
+agent's `tools:` — one name per entry over the closed four, `root:` required on
+every one of them and `timeout:` required on `builtin.bash` and refused on the
+file tools (§5.5, D123), which is an `if`/`then` keyed on the entry's own
+*type* rather than on a sibling literal: a string is an address and a mapping is
+a built-in, so an editor underlines the missing `root:` rather than reporting
+that the entry is neither kind of thing — the `human` timeout/route
 pairing (§8.7) and the absence of node-level `timeout:`/`retry:` on a `human`
 node (§8.7, D52 — the other two levels of that exemption are resolution
 semantics, with nothing to reject), the `fail`/`skip`-only `on_error:` in
@@ -6234,12 +7249,13 @@ the presence of one unconditional-or-`else` edge leaving
 the reserved-root exclusions on node ids, edge endpoints, control targets, and a
 map's `as:` (§2.5), and the absence of `${ENV}` tokens on the surfaces where §4.3
 makes them illegal and a single string is the whole surface (`prompt:`, model
-`id:`, `embed.model:`, a trigger's `path:`/`cron:`/`timezone:`, and a
-`blob put`'s `content_type:` — §4.3 class 3, D92). The validator owns the rest of
-class 3: CEL surfaces need the expression grammar, and descriptions and schema
-literals would need the same `not` repeated on dozens of properties, which the
-one-directional invariant does not require — a file the schema lets through is
-still rejected by `validate`.
+`id:`, `embed.model:`, a trigger's `path:`/`cron:`/`timezone:`, the `header:` and
+`prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:`
+entry (§13.3), and a `blob put`'s `content_type:` — §4.3 class 3, D92). The
+validator owns the rest of class 3: CEL surfaces need the expression grammar,
+and descriptions and schema literals would need the same `not` repeated on
+dozens of properties, which the one-directional invariant does not require — a
+file the schema lets through is still rejected by `validate`.
 
 **Diagnostics.** Where a construct has variants, the schema branches on the
 literal that selects the variant — a node's kind key, a trigger's `type:`, a
@@ -6292,7 +7308,10 @@ agent.<name>:
   prompt: <text>                    # required
   output: <field map>               # required
   input: <field map>                # optional (default string-in)
-  tools: [tool.<t> | flow.<f>]
+  tools:                            # references, and built-ins with their bounds
+    - tool.<t> | flow.<f>
+    - builtin.read_file: { root: <dir> }        # also write_file, list
+    - builtin.bash:      { root: <dir>, timeout: <dur> }
   stores: [store.<s>]
   max_tool_iterations: <int>        # default 8
 
@@ -6327,6 +7346,8 @@ store.<name>:
 provider.<name>: { kind: ..., api_key: "${ENV}", base_url: "${ENV}", ... }
                  # keys beyond kind/description are per kind — 12.1's row is
                  # closed, and another kind's key is an error (D106)
+                 # anthropic/openai: api_key required unless base_url names a
+                 # gateway, and then no auth header is sent at all (D120)
 model.<name>:    { provider: provider.<p>, id: <string>, settings: {...} }
 model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 

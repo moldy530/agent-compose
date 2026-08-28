@@ -124,8 +124,12 @@ function outcomeOf(promise) {
 }
 
 /** Park one pause and answer the handle its outcome is read through. */
-function park(execution, instancePath, fields = {}) {
-  const context = { execution: { id: execution, session_key: "" }, node: "sign" };
+function park(execution, instancePath, fields = {}, effects = undefined) {
+  const context = {
+    execution: { id: execution, session_key: "" },
+    node: "sign",
+    ...(effects === undefined ? {} : { effects }),
+  };
   return outcomeOf(
     runtime.runHuman(
       descriptor(fields),
@@ -134,6 +138,37 @@ function park(execution, instancePath, fields = {}) {
       viewAt(instancePath, execution),
     ),
   );
+}
+
+/**
+ * An effect recorder that **cannot write**, holding nothing for this key.
+ *
+ * A settled pause is journaled where the run is journaling — the answer is the
+ * one payload `docs/trace.md` §11 keeps out of the trace, so the journal is the
+ * only account of it — and this is the one seam where the write can refuse: a
+ * disk with nothing left on it, or a lock another process is holding past
+ * `busy_timeout`. Handed a slot that holds nothing, so the pause really parks
+ * and the refusal happens at the settlement rather than at the claim.
+ *
+ * It is a stub rather than a real journal because what is under test is what
+ * `runHuman` does with a throw, and a real one made to throw on command would be
+ * the same stub with a database behind it.
+ */
+function refusing(error) {
+  return {
+    child: () => refusing(error),
+    claim: () => ({
+      key: "sign/0#human/0",
+      site: "sign/0",
+      kind: "human",
+      ordinal: 0,
+      held: undefined,
+      keep: () => {
+        throw error;
+      },
+      fail: () => {},
+    }),
+  };
 }
 
 /**
@@ -549,6 +584,75 @@ const observed = {};
     // A payload that does not fit a *settled* wait is refused as the settlement
     // rather than as a mismatch: which pause comes before what is in the body.
     mismatched: { ok: mismatched.ok, reason: mismatched.reason },
+    still_published: runtime.humanWaits(execution).map((wait) => wait.id),
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// …and a journal that **refuses the record** fails the node rather than leaving
+// the pause parked for ever.
+//
+// The wait is marked settled before its record is written — it has to be, or an
+// answer and an expiry could both land — so a write that threw out of the
+// settlement would leave a wait nothing may settle again holding a promise
+// nothing ever settles: `closeHumanWaits` and `releaseHumanWaits` both skip a
+// settled entry and a later delivery refuses it. The `human` node's `await`
+// would never return, the graph would never advance, and the run would neither
+// fail nor park nor end. So the write's error leaves through the parked promise:
+// the node fails with it, and the answer is not offered again, because the turn
+// was spent.
+{
+  const execution = "exec_unwritable";
+  runtime.openHumanWaits(execution, true);
+  const held = park(
+    execution,
+    ["review", "0"],
+    {},
+    refusing(new Error("the journal refused this record")),
+  );
+  await settle();
+
+  let delivery = null;
+  let threw = null;
+  try {
+    delivery = runtime.deliverHumanAnswer(execution, undefined, { decision: "approve" });
+  } catch (error) {
+    threw = error?.message ?? String(error);
+  }
+  await settle();
+
+  observed.unwritable_answer = {
+    delivery: { ok: delivery?.ok ?? null, threw },
+    settled: held.state,
+    reported: held.value,
+    still_published: runtime.humanWaits(execution).map((wait) => wait.id),
+    again: runtime.deliverHumanAnswer(execution, "review/0/sign/0", { decision: "approve" })
+      .reason,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// The same on the settlement nobody is waiting to be told about. This arm is
+// reached from a `setTimeout` callback, where a throw is an uncaught exception
+// rather than something a caller could report — so the run would die of the
+// write rather than fail of it, and a `serve` process would take every other
+// execution with it. The expiry is not routed either: a run that took
+// `on_timeout:` past a wait whose expiry the journal does not hold would re-park
+// on the resume and spend the budget a second time.
+{
+  const execution = "exec_unwritable_expiry";
+  runtime.openHumanWaits(execution, true);
+  const held = park(
+    execution,
+    ["review", "0"],
+    { timeoutMs: 5, onTimeout: "escalate" },
+    refusing(new Error("the journal refused this record")),
+  );
+  await until(() => held.state !== "pending");
+
+  observed.unwritable_expiry = {
+    settled: held.state,
+    reported: held.value,
     still_published: runtime.humanWaits(execution).map((wait) => wait.id),
   };
   runtime.releaseHumanWaits(execution);

@@ -1,0 +1,9 @@
+# rule: `callback_allow:` bounds a webhook, so it needs a `callback:` to bound (grammar 13.3 / PRD resolved q33)
+# at: /triggers/intake
+# via: /$defs/httpTrigger/allOf/1/then/required
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback_allow:
+      - "https://hooks.example.com/*"

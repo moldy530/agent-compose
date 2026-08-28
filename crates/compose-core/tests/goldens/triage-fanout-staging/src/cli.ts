@@ -5,8 +5,9 @@
 // is the single source of truth (PRD 5.12); to own this code instead, copy
 // the whole directory out and stop regenerating it.
 //
-// The project's own command line: what `agent-compose run` and
-// `agent-compose serve` launch (PRD 5.11, grammar 13.2).
+// The project's own command line: what `agent-compose run`,
+// `agent-compose resume` and `agent-compose serve` launch (PRD 5.11,
+// grammar 13.2).
 //
 // The compiler builds this directory and then runs it — `bun src/index.ts run
 // flow.review --input goal=…`, or `node src/index.ts` under the fallback — which
@@ -16,6 +17,7 @@
 //
 // ```text
 // src/index.ts run <flow> [--input k=v]... [--session <key>] [--format human|json]
+// src/index.ts resume <execution> [--format human|json]
 // src/index.ts serve [--host <host>] [--port <port>]
 // ```
 //
@@ -40,6 +42,29 @@
 // which fields it may rely on. The **human** report is not one of them: it is a
 // summary written for a terminal, and `docs/trace.md` says outright that nothing
 // should be parsed out of it.
+//
+// # Carrying on an execution the machine lost
+//
+// Every invocation is journaled as it runs (PRD resolved q26-q29,
+// `docs/durability.md`), and `resume <execution>` re-runs one from its entry
+// with every recorded effect **consumed** rather than re-issued: the model
+// answers it got, the results its tools produced, what its stores read, and what
+// a person answered. Only the frontier — the first effect the journal does not
+// hold — reaches the network.
+//
+// It takes **no `--input` and no `--session`**. The invocation a resume replays
+// is the one the lifecycle row recorded, and a second set of inputs would be one
+// execution's record replayed into another execution's run, which is the
+// divergence resolved q29 refuses. Everything else about it is `run`: the same
+// prompt loop for a pause it re-parks at, the same trace file, the same four
+// exit codes.
+//
+// The four ways it refuses each name what a reader has to look at rather than
+// what went wrong internally (PRD G3): no journal at all, an id the journal does
+// not hold, an execution that has already ended, and a flow this build no longer
+// declares. And a journal whose record does not describe **this** composition
+// fails the run naming the divergent step, rather than re-executing an effect
+// the record claims to hold.
 //
 // # Why `--input` values are coerced
 //
@@ -118,9 +143,17 @@ import {
   TRACE_VERSION,
   closeHumanWaits,
   deliverHumanAnswer,
+  deliveriesOf,
+  divergenceOf,
+  executionReport,
   humanWaitEnded,
   humanWaits,
+  intendDelivery,
   interruptOf,
+  journalExists,
+  journalPath,
+  journaledExecution,
+  openExecutions,
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
@@ -192,9 +225,10 @@ export async function main(argv: readonly string[]): Promise<number> {
   const [verb, ...rest] = argv;
   try {
     if (verb === "run") return await run(rest);
+    if (verb === "resume") return await resumeVerb(rest);
     if (verb === "serve") return await serveVerb(rest);
     throw new UsageError(
-      `\`${verb ?? ""}\` is not a verb of this project: it takes \`run\` or \`serve\` (see README.md)`,
+      `\`${verb ?? ""}\` is not a verb of this project: it takes \`run\`, \`resume\` or \`serve\` (see README.md)`,
     );
   } catch (error) {
     if (error instanceof UsageError) {
@@ -226,23 +260,152 @@ async function run(argv: readonly string[]): Promise<number> {
   const inputs = bindInputs(flow, options.repeated["input"] ?? []);
   const session = sessionOf(flow, options.single["session"] ?? "");
   const format = formatOf(options.single["format"]);
-  const asking = interactively();
   requireSession(address, flow, session);
 
   // Minted here rather than left to `runFlow`, because this command needs it on
   // both of its ways out: it is what makes the trace file's name unique (see
   // [`writeTrace`]), and a failed run has no `FlowRun` to read one back off.
   const execution = `exec_${globalThis.crypto.randomUUID()}`;
+  return await execute({ address, inputs, session, format, execution, resuming: false });
+}
+
+/**
+ * `resume <execution-id> [--format human|json]` — carry on an execution this
+ * project's journal holds open (PRD resolved q28, `docs/durability.md` §6).
+ *
+ * A `run` that crashed is not re-run: the graph is re-executed from its entry
+ * with every recorded effect **consumed** — the model answers it got, the
+ * results its tools produced, what its stores read and what a person answered —
+ * and only the frontier, the first effect the journal does not hold, reaches
+ * the network. So a resumed execution costs what is left of it and not what it
+ * had already paid for.
+ *
+ * Everything about the invocation comes off the lifecycle row: the flow, the
+ * inputs as the flow's `inputs:` parsed them, and the session identity. There
+ * are no `--input` or `--session` flags here, and that is a rule rather than an
+ * omission — a resume that took different inputs would be replaying one
+ * execution's record into another execution's run, which is the divergence
+ * resolved q29 refuses.
+ *
+ * It composes with the interactive surface exactly as `run` does: a resumed
+ * execution whose wait is **not** in the journal re-parks under its original
+ * wait id, and a terminal (or `AGENT_COMPOSE_INTERACTIVE=1`) answers it there.
+ */
+async function resumeVerb(argv: readonly string[]): Promise<number> {
+  const [execution, ...rest] = argv;
+  if (execution === undefined) {
+    throw new UsageError(
+      "`resume` takes an execution id: `resume <execution-id>` — a `run` prints it on stderr as `execution: exec_…`, and `serve` answers it as `execution_id`",
+    );
+  }
+  const options = parse("resume", rest, { format: "single" });
+  const format = formatOf(options.single["format"]);
+
+  if (!journalExists()) {
+    throw new UsageError(
+      `this project has never journaled an execution, so there is none to resume: \`${journalPath()}\` does not exist, and it is written by the \`run\` or \`serve\` that starts an execution`,
+    );
+  }
+  const row = await journaledExecution(execution);
+  if (row === undefined) {
+    const open = await openExecutions();
+    throw new UsageError(
+      `\`${execution}\` is not an execution in \`${journalPath()}\`: ${
+        open.length === 0
+          ? "it holds none open"
+          : `the executions it holds open are ${open.map((held) => `\`${held.id}\``).join(", ")}`
+      }`,
+    );
+  }
+  if (row.status !== "open") {
+    throw new UsageError(
+      `\`${execution}\` has already ${row.status}${
+        row.endedAt === undefined ? "" : ` (${row.endedAt})`
+      }, so there is nothing to resume: the journal keeps the record of an execution that ended, and re-running it would re-issue effects that record says already happened${
+        row.error === undefined ? "" : ` — it ended with ${row.error}`
+      }`,
+    );
+  }
+  const flow = flows[row.flow];
+  if (flow === undefined) {
+    throw new UsageError(
+      `\`${execution}\` was running \`${row.flow}\`, which this build does not declare: it names ${Object.keys(flows).join(", ")}. Build the composition that started it, or delete \`${journalPath()}\``,
+    );
+  }
+  requireSession(row.flow, flow, row.sessionKey);
+  return await execute({
+    address: row.flow,
+    inputs: row.inputs,
+    session: row.sessionKey,
+    format,
+    execution,
+    resuming: true,
+    trigger: row.trigger,
+    // What this execution's request asked to be told when it ends, off the
+    // lifecycle row that recorded it (`docs/durability.md` §3.5). A `run` never
+    // has one; a resume of an `http` execution may, and finishing one here is
+    // the one place outside `serve` where such a row closes.
+    ...(row.callback === undefined ? {} : { callback: row.callback }),
+  });
+}
+
+/** One invocation of a flow, whichever verb asked for it. */
+interface Job {
+  readonly address: string;
+  readonly inputs: Record<string, unknown>;
+  readonly session: string;
+  readonly format: Format;
+  readonly execution: string;
+  /** Whether the journal's record is consumed rather than only written. */
+  readonly resuming: boolean;
+  /** What started it, for a fresh execution's lifecycle row. */
+  readonly trigger?: string;
+  /** Where its `settled` webhook goes, for a `resume` that closes one. */
+  readonly callback?: string;
+}
+
+/**
+ * Run one flow and report it — the body `run` and `resume` share.
+ *
+ * They differ in where the invocation came from and in nothing else: the same
+ * prompt loop, the same trace file, the same four exit codes. Sharing it is
+ * what makes "a resumed execution that reaches an unanswered `human` wait
+ * prompts at the terminal exactly as an interactive `run` does" true by
+ * construction rather than by two implementations agreeing.
+ */
+async function execute(job: Job): Promise<number> {
+  const { address, format, execution } = job;
+  const asking = interactively();
+
+  // Where a reader finds the id: it is what `agent-compose resume` takes, and a
+  // run the machine loses has no other way to have said it. Written **first**,
+  // before anything can fail, so a run killed mid-flight has still printed it.
+  //
+  // Under `--format json` it is not written at all, and that is the format's
+  // own rule rather than an exception to this one: the whole answer is the
+  // document on stdout, `execution_id` is a field of it on both of a run's ways
+  // out, and a line on stderr would be a second surface carrying the same value
+  // — the thing that format exists not to have. A `json` run the machine loses
+  // before it answers is found through `resume`'s own listing instead, which
+  // names every execution the journal holds open.
+  if (format === "human") process.stderr.write(`execution: ${execution}\n`);
 
   // Started rather than awaited, because a run that pauses is one this command
   // may have to *answer* while it is still going: the prompt loop reads the same
   // wait board the graph is parked on (grammar 8.7), so the two run side by side
   // in one process. A run with no `human` node in it never prompts and never
   // reads stdin — [`answerPauses`] attaches to it at the first question.
-  const running = runFlow(address, inputs, {
+  const running = runFlow(address, job.inputs, {
     executionId: execution,
-    sessionKey: session,
+    sessionKey: job.session,
     resumable: asking,
+    ...(job.trigger === undefined ? {} : { trigger: job.trigger }),
+    ...(job.resuming ? { resume: true } : {}),
+    // The webhook a `serve`-started execution finished here still owes, journaled
+    // **before** the lifecycle row closes — see [`owed`].
+    ...(job.callback === undefined
+      ? {}
+      : { closing: (produced: FlowRun | undefined, error: unknown) => owed(job, produced, error) }),
   });
   const prompting = asking
     ? answerPauses(execution, settling(running), {
@@ -276,7 +439,19 @@ async function run(argv: readonly string[]): Promise<number> {
     // what class arrived.
     const interrupt = interruptOf(error);
     const status = interrupt === undefined ? "failed" : "interrupted";
-    const reason = interrupt === undefined ? describe(error) : describe(interrupt);
+    // A **divergence** is read off the chain for the reason an interrupt is: the
+    // wrapper says the run did not reach quiescence, which is true of every
+    // failure, and what a reader has to act on is the step the journal and this
+    // run disagree at (PRD resolved q29, `docs/durability.md` §7). It is still a
+    // failed run — exit `1`, `status: "failed"` — because nothing about the
+    // composition can absorb it; only the sentence changes.
+    const divergence = interrupt === undefined ? divergenceOf(error) : undefined;
+    const reason =
+      interrupt !== undefined
+        ? describe(interrupt)
+        : divergence !== undefined
+          ? describe(divergence)
+          : describe(error);
     const written = writeTrace(address, execution, status, trace, reason);
     if (format === "json") {
       // The same record the completed run answers with, `error` where its
@@ -335,6 +510,87 @@ async function run(argv: readonly string[]): Promise<number> {
   process.stderr.write(render(produced.trace));
   if (written !== undefined) process.stderr.write(`\ntrace: ${written}\n`);
   return 0;
+}
+
+/**
+ * Journal the `settled` webhook a resumed execution owes, **while its lifecycle
+ * row is still open** (`docs/durability.md` §3.7, §6.2, PRD resolved q35).
+ *
+ * `runFlow`'s `closing` hook, and the same one `serve` supplies for the same
+ * reason: an execution an `http` trigger started with a `callback:` is owed one
+ * push whichever process gets to the end of it, and this command is a process
+ * that can. The order is the whole of it. A row that closes with no delivery
+ * intent beside it is an execution `serve` will never look at again — `recover`
+ * enumerates open executions and finds none, the delivery ledger holds no
+ * pending row — so a caller who was handed a `202` and, by resolved q34's own
+ * reasoning, is *not* polling would simply never be told. Recorded first, the
+ * webhook survives this command exiting a millisecond later.
+ *
+ * **Recorded, not sent.** The schedule `docs/durability.md` §3.7 states runs for
+ * fifteen minutes and a command that exits when its run does cannot work one;
+ * `serve` picks up every `pending` row at start (§6.1), matches the URL against
+ * the trigger's `callback_allow:` and signs it with the identity that trigger
+ * declared — all of which is the app's to do, and none of which this command has
+ * an app for. So the row goes down and the sending waits, exactly as it does for
+ * the row a build that no longer declares an execution's trigger leaves behind.
+ *
+ * A settle is **once per execution**, and the journal is what says so across
+ * processes: a generation that journaled the intent and died before the row
+ * closed leaves an execution that is still open *and* already has its `settled`
+ * row, and announcing a second one here would tell a receiver that one execution
+ * finished twice.
+ */
+async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Promise<void> {
+  const url = job.callback;
+  if (url === undefined) return;
+  try {
+    const held = await deliveriesOf(job.execution);
+    if (held.some((record) => record.event === "settled")) return;
+    // A failure carries its trace on the chain and a completion carries it on
+    // the answer; a failure raised before the graph ran carries none, which is
+    // the report that goes without the version beside it.
+    const trace =
+      produced === undefined
+        ? (error as { trace?: readonly runtime.TraceEntry[] } | null)?.trace
+        : produced.trace;
+    await intendDelivery({
+      execution: job.execution,
+      // Which trigger's identity the app that finally sends this row is to sign
+      // it with, written beside the row for the reason `src/serve.ts` writes it:
+      // a delivery names its own trigger rather than depending on a lifecycle
+      // row being readable when it is picked up (`docs/durability.md` §3.7).
+      // A `run` names no trigger and never reaches here, because a `callback:`
+      // arrives only on a row a resume read.
+      ...(job.trigger === undefined ? {} : { trigger: job.trigger }),
+      event: "settled",
+      url,
+      body: JSON.stringify(
+        await executionReport({
+          id: job.execution,
+          flow: job.address,
+          // Off the row this resume read, so the report says what started the
+          // execution rather than what finished it.
+          trigger: job.trigger ?? "manual",
+          status: produced === undefined ? "failed" : "completed",
+          ...(produced === undefined ? { error: describe(error) } : { outputs: produced.outputs }),
+          ...(trace === undefined ? {} : { trace }),
+        }),
+      ),
+      // A settle reports no pauses: the row is closing.
+      pauses: [],
+    });
+  } catch (failure) {
+    // Not this run's failure — it produced whatever it produced, and the journal
+    // holds it — but not something to swallow either: what failed is the record,
+    // and a reader has no other way to learn that a webhook was lost.
+    process.stderr.write(
+      `\`${job.execution}\`'s \`settled\` webhook could not be journaled: ${describe(failure)}\n`,
+    );
+    return;
+  }
+  process.stderr.write(
+    `\`${job.execution}\`'s \`settled\` webhook is journaled for \`${url}\`: \`serve\` delivers it\n`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -811,7 +1067,7 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
   // HTTP framework and a project used as a library never loads it at all. Only
   // the app: `./triggers.ts` is the composition's own table and is imported
   // above, because `run` reads it too.
-  const { serve } = await import("./serve.ts");
+  const { BlankCredentialError, CallbackRetryError, serve } = await import("./serve.ts");
   if (httpTriggers.length === 0) {
     throw new UsageError(
       "this composition declares no `http` triggers, so the generated app exposes no routes: declare one in `triggers:` (grammar 13.3)",
@@ -840,6 +1096,19 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
     // unexamined), or one claiming a route the app mounts for itself. The
     // compiler refuses every collision it can decide; this is what the router
     // decides, reported as what it is.
+    // Another that is not about the address: the callback retry schedule an
+    // operator overrode with something that is not one. It is read before a
+    // route exists, so it arrives here — as the usage error it is, in its own
+    // words, rather than dressed as a port that would not bind (Decision D50,
+    // `docs/durability.md` §3.7).
+    if (error instanceof CallbackRetryError) throw new UsageError(error.message);
+    // And a third: a credential a trigger declares that resolved to the empty
+    // string. `src/env.ts` counts it as present (grammar 4.3), and for a
+    // credential it is not — an empty token admits every caller — so the app
+    // refuses to mount rather than serving an open route (grammar 13.3). It is
+    // the environment's to fix, like a missing variable, so it is a `2` and a
+    // sentence naming what to set.
+    if (error instanceof BlankCredentialError) throw new UsageError(error.message);
     if ((error as { code?: unknown } | null)?.code === "FST_ERR_DUPLICATED_ROUTE") {
       throw new UsageError(
         `the app could not mount its routes: ${describe(error)}. Two routes of this composition are one route to the router — an \`http\` trigger's \`path:\` and \`method:\`, or one of the app's own \`GET /executions/:id\` and \`POST /executions/:id/resume\` — so give one of them a path the other cannot be read as (grammar 13.3)`,

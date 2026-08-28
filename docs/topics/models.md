@@ -17,6 +17,16 @@ provider.local:
   base_url: ${LOCAL_LLM_URL}
   api_key: ${LOCAL_LLM_KEY}
 
+provider.gateway:
+  kind: anthropic
+  base_url: ${LLM_GATEWAY}
+  headers:
+    authorization: "Bearer ${PROXY_TOKEN}"
+
+model.gateway:
+  provider: provider.gateway
+  id: claude-sonnet-4-5
+
 model.smart:
   provider: provider.anthropic
   id: claude-sonnet-4-5
@@ -55,9 +65,9 @@ other key belongs to the rows its `kind` names.
 
 | `kind` | Required | Optional |
 |---|---|---|
-| `anthropic` | `api_key` | `base_url`, `headers` |
-| `openai` | `api_key` | `base_url`, `headers`, `organization` |
-| `openai_compatible` | `base_url` | `api_key`, `headers` |
+| `anthropic` | `api_key` — **or** a `base_url` naming the gateway that holds one | `api_key` (beside a `base_url`), `base_url`, `headers`, `server_tools` |
+| `openai` | `api_key` — **or** a `base_url` naming the gateway that holds one | `api_key` (beside a `base_url`), `base_url`, `headers`, `organization`, `server_tools` |
+| `openai_compatible` | `base_url` | `api_key`, `headers`, `server_tools` |
 | `azure_openai` | `base_url`, `api_key`, `api_version` | `headers` |
 | `bedrock` | `region` | `access_key_id`, `secret_access_key`, `session_token`, `profile` |
 | `vertex` | `project`, `location` | `credentials_json` |
@@ -73,6 +83,49 @@ through a cloud SDK has no bare endpoint and no request the spec composes
 headers onto. A deployment that genuinely needs either is reaching a compatible
 HTTP endpoint, which is what `openai_compatible` is for.
 
+## Keyless providers behind a gateway
+
+`anthropic` and `openai` are the two kinds with a **default endpoint**: omit
+`base_url:` and the connection reaches `https://api.anthropic.com` or
+`https://api.openai.com`, where nothing but a key authenticates. So on those two
+kinds `api_key:` is required when `base_url:` is absent and **optional when it is
+present** — which is the shape a corporate deployment writes, where a gateway
+injects the vendor credential server-side and nobody running the graph holds a
+key:
+
+```yaml
+provider.gateway:
+  kind: anthropic
+  base_url: ${LLM_GATEWAY}
+```
+
+A provider declaring **neither** is `missing-credential`, and the message names
+both repairs: add the key, or name the gateway.
+`agent-compose explain missing-credential` prints the worked pair.
+
+When the key is absent the compiled graph sends **no authentication header at
+all** — no `x-api-key`, no `authorization` — rather than an empty one, so the
+gateway sees a request that never claimed to authenticate. A gateway that wants
+a token of its *own* takes it through `headers:`, whose values interpolate, which
+is what the opening spec's `provider.gateway` shows:
+
+```yaml
+  headers:
+    authorization: "Bearer ${PROXY_TOKEN}"
+```
+
+The other four kinds keep the rows they had. `azure_openai` reaches a
+per-resource deployment with no default endpoint to fall back to, so all three
+of its keys stay required; `openai_compatible` already paired an optional
+`api_key` with a required `base_url`; and `bedrock` and `vertex` authenticate
+through their cloud's own credential chain.
+
+The **header** rule above still reaches one of them, because it is stated over
+the connection rather than over the kind: an `openai_compatible` provider that
+declares no `api_key:` — a local llama.cpp or ollama endpoint — now sends no
+`Authorization` header at all, where before it sent an empty `Bearer `. Same fix
+for the same reason, on a kind whose row did not move.
+
 **Credentials are never literals.** `api_key`, `api_secret`, `token`,
 `password`, `access_key_id`, `secret_access_key`, `session_token`,
 `credentials_json`, `url`, `base_url`, `endpoint`, `dsn` take the env-ref value
@@ -83,6 +136,218 @@ and `api_version` are plain strings and may be interpolated.
 Env refs survive **unresolved** into the artifact: `validate` and `build` check
 syntax only, so a build succeeds in CI holding no keys. Presence is checked at
 process start, and `run`/`serve` fail fast naming the missing variable.
+
+## Server tools
+
+A **server tool** runs on the provider's side, *inside* the model call: the
+compiled graph dispatches nothing, and what the tool found arrives woven into
+the assistant's turn. Web search is the one everybody meets first.
+
+`server_tools:` is an array of config objects written in **that provider's own
+wire vocabulary**, and the runtime appends it to the `tools` of every request the
+connection serves, after the agent's own:
+
+```yaml
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+      allowed_domains: ["docs.example.com"]
+```
+
+Every entry needs a `type:`, which is the vendor's own key for the tool and is
+never interpolated. Everything else is the vendor's and travels verbatim, and —
+like the rest of a provider's non-secret config — its **string** values may embed
+`${ENV}` references. Numbers and booleans may not, and the two tiers below are
+why: a field the compiler's table types is read at compile time, where there is
+nothing to read, and interpolation produces a string, which is not what
+`max_uses:` carries to the wire. `max_uses: ${SEARCH_BUDGET}` is therefore a
+`type-mismatch` whose help says so.
+
+One kind of string does not interpolate either, for the same reason read the
+other way round: a field the table pins to a **single** value. The Messages
+wire's `name:` is the one you will meet, and a nested object's `type:` — the
+`approximate` of a `user_location:`, the `ephemeral` of a `cache_control:` — is
+the same shape. That value is decided by the entry's own `type:` and the service
+refuses a request that spells it otherwise, so `name: ${WEB_SEARCH_NAME}` is an
+`unexpected-env-ref` naming the one value the field takes rather than a knob read
+at process start. A closed set of *several* values is an ordinary interpolable
+string: `search_context_size: ${SEARCH_DEPTH}` is a staging deployment searching
+shallowly, and validates.
+
+**The suite belongs to the connection.** Every agent whose model resolves to
+that provider holds it; to give one agent a search and not another, define a
+second provider. Providers are cheap.
+
+**One name, one tool.** The suite lands in the same `tools` array as the agent's
+own, and the provider surfaces refuse a request offering two tools under one
+name — so a name spent twice is `tool-name-collision`, the same code and the same
+reason as two colliding client tools (grammar 11.5). Two ways to spend one:
+
+```yaml triggers tool-name-collision
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: code_execution_20250522
+      name: code_execution
+    - type: code_execution_20250825
+      name: code_execution
+```
+
+Both dated revisions are `code_execution` — that is what the Messages wire pairs
+with either `type:` — so one of the two goes. That half holds on every kind: two
+entries of one array under one name are one tool twice by your own reckoning,
+whatever the wire keys on.
+
+The other way is an attachment, and that half is the **Messages wire's alone**:
+an `agent.*` holding `tool.web_search` whose model reaches an `anthropic`
+provider declaring `web_search_20250305` offers `web_search` twice, and the fix
+is to rename the attachment or to move the suite onto a provider that agent does
+not use. It is the one wire where a server tool and a client tool sit under the
+same key. On the Responses wire a built-in is addressed by its `type:` while a
+function tool carries a `name:`; on Chat Completions a function tool's name is
+nested inside its own object; and no table could say what a gateway keys its
+vocabulary on. So `tool.search_docs` beside an `openai_compatible` connection
+whose suite declares `name: search_docs` compiles — the entry's
+`unknown-server-tool` warning is the whole of what this release has to say about
+it.
+
+### Two tiers of checking, and why
+
+The compiler keeps a curated table of the server tools each kind is known to
+serve. A `type:` **in** it is checked strictly — the fields the table models,
+their types, their ranges, and the constraints the vendor states, like web
+search's allow-list and deny-list being mutually exclusive. A config the provider
+will refuse is otherwise a run that dies on its first model call with a 400 and
+no span.
+
+On the Messages wire that includes the `name:` beside the `type:`, which is not
+free text: Anthropic pairs each dated type with one fixed name and refuses a
+request whose two disagree. `web_search_20250305` is `web_search`,
+`web_fetch_20250910` is `web_fetch`, and both `code_execution_*` revisions are
+`code_execution`.
+
+A `type:` **outside** it is a warning and is carried to the wire as written:
+
+```yaml triggers unknown-server-tool
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search
+      name: web_search
+```
+
+That composition **builds and runs**. The warning names exactly what could not
+be verified — here, that `web_search` is the OpenAI spelling and the Messages
+wire takes the dated `web_search_20250305` — and the point of the second tier is
+the case where the spelling is right and this release is simply older than the
+tool: a server tool the vendor ships tomorrow is usable the day it ships.
+
+A **key** the table does not name, inside a `type:` it does, is the same
+warning one level down:
+
+```yaml triggers unknown-server-tool-field
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search_20250305
+      name: web_search
+      max_uses: 5
+      result_freshness: week
+```
+
+The table's row for a tool is a snapshot of it taken when this compiler was
+released, and vendors add parameters to tools they already ship. Refusing
+`result_freshness:` would be the treadmill at field granularity — and there is no
+way out of it from the spec, since renaming the `type:` to reach the unchecked
+tier would change which tool runs. So the key is carried, and the warning is the
+record that it was. Where the spelling is close to a field the table does name,
+the diagnostic says which (`max_usages` → `max_uses`), because nothing in the
+compiler can tell a typo from a parameter it predates.
+
+What stays an **error** is what the table genuinely knows: a field it models
+given the wrong kind of value, a value outside a range or closed set the vendor
+states, a required field left out (`file_search` with no `vector_store_ids:`),
+and two fields the vendor refuses together.
+
+`azure_openai`, `bedrock` and `vertex` refuse the key outright
+(`unsupported-server-tools`): their wires have not been taught the shape, so a
+suite declared there would be dropped on the floor rather than merely unchecked.
+
+### The OpenAI seam
+
+OpenAI's built-in tool suite lives on the **Responses API**, which Chat
+Completions does not carry. So an `openai` provider that declares
+`server_tools:` speaks `POST /v1/responses` for **all** of its calls, and one
+that declares none keeps Chat Completions exactly as before. One provider, one
+wire — a connection that switched per request would make "what did this model
+see" depend on which agent asked.
+
+Two `settings:` keys change spelling on that wire and the runtime translates
+them: `max_tokens` becomes `max_output_tokens`, and `reasoning_effort` becomes
+`reasoning: { effort }`. Two others have **no** Responses equivalent — `stop:`
+and `seed:` — and are a **compile error** on a model bound to a provider that
+declares a suite:
+
+```yaml triggers unknown-key
+version: "0.1"
+
+provider.searching:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+  server_tools:
+    - type: web_search
+
+model.smart:
+  provider: provider.searching
+  id: gpt-5
+  settings:
+    stop: ["\n\n"]
+```
+
+Which wire the connection speaks is the compiler's own decision — one key beside
+another decides it — so a knob that wire will not read is decidable here rather
+than on the first model call. If you need either, keep the suite off that
+provider and declare a second one for the agents that want a search.
+
+**One thing the compiler does not decide: retention.** The Responses API's
+service-side default for `store` is `true`, where Chat Completions' is `false`,
+so a connection that moves onto this wire has its prompts and completions
+retained by the provider where before they were not. The emitted request does
+not pin the key — `store: false` makes the service refuse a replayed `reasoning`
+item, and a tool loop replays every turn it takes — so a deployment with a
+retention policy declares the suite on a provider whose data it may retain, and
+leaves the rest of the graph on a connection that never moved.
+
+`openai_compatible` is unaffected on every count: a gateway keeps Chat
+Completions, its suite rides that request's own `tools` array verbatim, and
+every entry there is second-tier, because no table could be authoritative about
+what a gateway honours.
+
+### Failover
+
+A route's members each name their own provider, so which tools were on offer
+depends on which member answered. A route whose members declare **different**
+suites is a warning (`mismatched-server-tools`), not a refusal: a fallback vendor
+with no web search is still a fallback, and the compiler's job is to make the
+difference visible rather than to choose for you.
+
+Different means **field for field**, not tool for tool: two members that both
+declare web search and give it `max_uses: 1` and `max_uses: 99` offered the
+model materially different tools, and a copy-then-edit of one provider is
+exactly how that arrives.
 
 ## Models
 

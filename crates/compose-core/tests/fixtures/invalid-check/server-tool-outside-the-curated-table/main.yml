@@ -1,0 +1,18 @@
+# rule: a `server_tools:` entry outside the kind's curated table is warned about and carried (grammar 12.1, Decision D122)
+# code: unknown-server-tool
+# message: `provider.main` declares the server tool `web_search`, which is not one this compiler release knows `anthropic` serves: its config is unchecked and travels to the provider as written
+# at: main.yml:17:13
+# help: the `anthropic` server tools this release checks are `web_search_20250305`, `web_fetch_20250910`, `code_execution_20250522`, `code_execution_20250825`; anything else is carried unchecked, so a tool the vendor ships later works here the day it ships (grammar 12.1, Decision D122)
+#
+# The second tier of resolved q30's two: the compiler could not check this
+# config, says so, and the composition still builds. `web_search` is the OpenAI
+# spelling; the Messages wire takes the dated `web_search_20250305`, which is
+# the near miss the help line names.
+version: "0.1"
+
+provider.main:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  server_tools:
+    - type: web_search
+      name: web_search

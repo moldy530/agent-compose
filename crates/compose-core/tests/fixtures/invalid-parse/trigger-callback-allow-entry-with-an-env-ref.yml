@@ -1,0 +1,12 @@
+# rule: a `callback_allow:` entry is a pattern the composition carries, and nothing on it is interpolated (grammar 4.3 class 3, 13.3, Decision D92)
+# code: unexpected-env-ref
+# message: each entry of `callback_allow` never interpolates environment references, but it contains `${HOOK_HOST}`
+# at: 12:9
+# help: write `$${HOOK_HOST}` for a literal `${HOOK_HOST}`
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "https://${HOOK_HOST}/*"

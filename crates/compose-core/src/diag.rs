@@ -337,6 +337,13 @@ pub enum DiagnosticCode {
     UnknownVariant,
     /// Two keys that may not appear together both appear.
     ConflictingKeys,
+    /// A provider that would reach a vendor's own endpoint declares neither
+    /// `api_key:` nor the `base_url:` of a gateway that supplies one — the one
+    /// *conditional* required key (grammar 12.1, Decision D120). Its own class
+    /// rather than a [`MissingKey`](Self::MissingKey), for the reason
+    /// [`MissingSessionKey`](Self::MissingSessionKey) is: what is absent is
+    /// decided by a sibling value, and the repair is a choice of two.
+    MissingCredential,
 
     // --- lexical forms ----------------------------------------------------
     /// A string is not a legal identifier (grammar 2.1).
@@ -414,6 +421,23 @@ pub enum DiagnosticCode {
     // --- providers and models (grammar 12) --------------------------------
     /// A provider cannot serve what a model, an agent, or a store asks of it.
     MissingCapability,
+    /// A provider declares `server_tools:` on a kind whose wire this compiler
+    /// release does not carry them on (grammar 12.1, Decision D122).
+    UnsupportedServerTools,
+    /// **Warning.** A `server_tools:` entry names a `type:` the kind's curated
+    /// table does not have, so nothing about its config could be verified — it
+    /// travels to the wire verbatim (grammar 12.1, Decision D122).
+    UnknownServerTool,
+    /// **Warning.** A `server_tools:` entry names a tool the kind's curated
+    /// table has, and gives it a field that table does not name — a vendor
+    /// parameter newer than this release, or a misspelling; nothing here can
+    /// tell which. The value is unchecked and travels to the wire verbatim
+    /// (grammar 12.1, Decision D122).
+    UnknownServerToolField,
+    /// **Warning.** The members of a failover route declare different
+    /// `server_tools:` suites, so which tools the model is offered depends on
+    /// which member served the call (grammar 12.2, Decision D122).
+    MismatchedServerTools,
 
     // --- graph analyses (grammar 7.4–7.8, 8.6, 13.3) ----------------------
     /// A node has a pass on which its branch takes no outgoing edge: it has
@@ -448,6 +472,12 @@ pub enum DiagnosticCode {
     /// Two `manual` triggers name one flow and declare different `session_key:`
     /// expressions, which are two answers for one CLI entry (grammar 13.2).
     ConflictingSessionKey,
+    /// An `http` trigger declares `callback_auth:` and no `callback_allow:`
+    /// (grammar 13.3, PRD resolved q33). Its own class rather than a
+    /// [`MissingKey`](Self::MissingKey), for the reason
+    /// [`MissingCredential`](Self::MissingCredential) is: what is absent is
+    /// decided by a sibling value, and the repair is a choice of two.
+    MissingCallbackAllowlist,
 }
 
 impl DiagnosticCode {
@@ -480,6 +510,7 @@ impl DiagnosticCode {
         Self::ValueOutOfRange,
         Self::UnknownVariant,
         Self::ConflictingKeys,
+        Self::MissingCredential,
         Self::InvalidIdentifier,
         Self::InvalidReference,
         Self::InvalidDuration,
@@ -506,6 +537,10 @@ impl DiagnosticCode {
         Self::ToolNameCollision,
         Self::MissingSessionKey,
         Self::MissingCapability,
+        Self::UnsupportedServerTools,
+        Self::UnknownServerTool,
+        Self::UnknownServerToolField,
+        Self::MismatchedServerTools,
         Self::DeadEnd,
         Self::UnboundedCycle,
         Self::UnbalancedConvergence,
@@ -517,6 +552,7 @@ impl DiagnosticCode {
         Self::DetachedInterrupt,
         Self::DuplicateRoute,
         Self::ConflictingSessionKey,
+        Self::MissingCallbackAllowlist,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -543,6 +579,7 @@ impl DiagnosticCode {
             Self::ValueOutOfRange => "value-out-of-range",
             Self::UnknownVariant => "unknown-variant",
             Self::ConflictingKeys => "conflicting-keys",
+            Self::MissingCredential => "missing-credential",
             Self::InvalidIdentifier => "invalid-identifier",
             Self::InvalidReference => "invalid-reference",
             Self::InvalidDuration => "invalid-duration",
@@ -569,6 +606,10 @@ impl DiagnosticCode {
             Self::ToolNameCollision => "tool-name-collision",
             Self::MissingSessionKey => "missing-session-key",
             Self::MissingCapability => "missing-capability",
+            Self::UnsupportedServerTools => "unsupported-server-tools",
+            Self::UnknownServerTool => "unknown-server-tool",
+            Self::UnknownServerToolField => "unknown-server-tool-field",
+            Self::MismatchedServerTools => "mismatched-server-tools",
             Self::DeadEnd => "dead-end",
             Self::UnboundedCycle => "unbounded-cycle",
             Self::UnbalancedConvergence => "unbalanced-convergence",
@@ -580,6 +621,7 @@ impl DiagnosticCode {
             Self::DetachedInterrupt => "detached-interrupt",
             Self::DuplicateRoute => "duplicate-route",
             Self::ConflictingSessionKey => "conflicting-session-key",
+            Self::MissingCallbackAllowlist => "missing-callback-allowlist",
         }
     }
 }
@@ -812,7 +854,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::ConflictingSessionKey as usize + 1,
+            DiagnosticCode::MissingCallbackAllowlist as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

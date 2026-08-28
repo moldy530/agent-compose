@@ -1,0 +1,13 @@
+# rule: an inbound `hmac:` verifies with one of a closed set of digests (grammar 13.3, PRD resolved q32)
+# code: unknown-variant
+# message: `md5` is not a valid `algorithm`
+# at: 13:20
+# help: `algorithm` takes one of `sha1`, `sha256`, `sha512`
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        algorithm: md5

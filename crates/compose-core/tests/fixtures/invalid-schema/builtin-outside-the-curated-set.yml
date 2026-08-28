@@ -1,0 +1,10 @@
+# rule: the built-in set is closed and an editor says so (grammar 5.5 / D123)
+# at: /agent.reviewer/tools/0
+# via: /$defs/builtinTool/additionalProperties
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.grep: { root: "./work" }
+  output:
+    verdict: { enum: [approve, revise] }

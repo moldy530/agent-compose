@@ -61,6 +61,10 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "where an emitted project keeps local stores and trace files",
     ),
     (
+        "AGENT_COMPOSE_CALLBACK_RETRY",
+        "the schedule a served app retries a callback delivery on (`docs/durability.md` §3.7)",
+    ),
+    (
         "NO_COLOR",
         "any non-empty value turns styling off on every report (no-color.org)",
     ),

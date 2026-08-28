@@ -1,0 +1,13 @@
+# rule: `builtin.bash` takes a `root:` like the file tools do, and an empty one
+# rule: would give the shell the runtime's own working directory (grammar 5.5, D123)
+# code: invalid-value
+# message: `root` in `builtin.bash` in agent definition `agent.reviewer` must not be empty
+# at: 11:29
+# help: name the directory this tool is bounded to — `- builtin.bash: { root: ./workspace, timeout: 30s }`; an empty root would bound it to wherever the runtime was started instead (grammar 5.5)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.bash: { root: "", timeout: 30s }
+  output:
+    verdict: { enum: [approve, revise] }

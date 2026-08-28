@@ -66,9 +66,25 @@ try {
     writeFileSync(tracePath, JSON.stringify(trace, null, 1));
   }
   // The message and its cause chain, which is what a failing test reads.
-  process.stderr.write(`${error?.stack ?? String(error)}\n`);
+  //
+  // `name: message` is written **beside** the stack rather than left to it. A
+  // stack's header line is the engine's rendering, and an engine that renders it
+  // from something other than the instance's own `name` and `message` would make
+  // a failing assertion say the run reported nothing when it reported plainly —
+  // sending a reader after the composition instead of after the harness. What a
+  // test reads is a message this file composed.
+  const said = (raised) =>
+    raised instanceof Error ? `${raised.name}: ${raised.message}` : String(raised);
+  process.stderr.write(`${said(error)}\n${error?.stack ?? ""}\n`);
   for (let cause = error?.cause; cause !== undefined; cause = cause?.cause) {
-    process.stderr.write(`  cause: ${cause?.stack ?? String(cause)}\n`);
+    process.stderr.write(`  cause: ${said(cause)}\n`);
+  }
+  // Flushed before the exit, exactly as the emitted `src/cli.ts` flushes its own
+  // streams: `process.exit` truncates a pipe that is still holding bytes, and
+  // stdout and stderr are both pipes whenever a test is reading them.
+  for (const stream of [process.stdout, process.stderr]) {
+    if (stream.writableLength === 0) continue;
+    await new Promise((resolve) => stream.write("", () => resolve()));
   }
   process.exit(1);
 }

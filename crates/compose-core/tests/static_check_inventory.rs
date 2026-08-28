@@ -171,8 +171,17 @@ const M0: &[Check] = &[
     },
 ];
 
-/// The validator-owned rules `docs/grammar.md` Appendix B names that PRD §7 M0's
-/// sentence does not enumerate individually.
+/// The rules `docs/grammar.md` Appendix B names that PRD §7 M0's sentence does
+/// not enumerate individually.
+///
+/// All but one are the validator's; grammar 12.1's conditional credential (D120)
+/// is the parser's, because a provider's `kind:`, `api_key:` and `base_url:` are
+/// three literals in one mapping and the published schema enforces it — which
+/// obliges the parser to as well (`tests/parse_invalid.rs`'s
+/// `the_parser_rejects_everything_the_published_schema_rejects`). It is listed
+/// here rather than left out because this file is the inventory of *static
+/// checks*, and which pass decides one is the second column, not the entry
+/// criterion.
 ///
 /// Two rows are the exception and label themselves. Half of `duplicate-route` —
 /// the half about two triggers rather than about the routes the app mounts for
@@ -273,6 +282,99 @@ const GRAMMAR: &[Check] = &[
         codes: &["tool-name-collision"],
         evidence: Evidence::Fixture,
     },
+    // The built-ins of resolved q31, split across the two passes for the same
+    // reason the server-tool rows below are. Every **bound** is a key beside
+    // another key in one entry, so the whole of it is the parser's — which name,
+    // whether it takes a `root:`, whether it takes a `timeout:`, whether the
+    // entry attaches one tool or two. What the parser cannot decide is the only
+    // thing that needs another file: whether the *name* the built-in takes on
+    // the wire is one something else on this agent already takes.
+    Check {
+        rule: "a `builtin.*` entry names one of the four and carries the bounds that name requires (5.5, D123)",
+        pass: "parse/definition.rs",
+        codes: &[
+            "unknown-variant",
+            "missing-key",
+            "unknown-key",
+            "invalid-value",
+            "invalid-reference",
+            "invalid-duration",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // Two sites, as for a server tool and for the same reason: a built-in's
+        // name meets an attached `tool.*`/`flow.*` in the agent's own list, and
+        // meets a provider's suite only once the agent's model reaches that
+        // provider. A *store's* synthesized names cannot collide with a built-in
+        // at all — `<local>_<op>` is not a shape any of the four names has — and
+        // `check/bindings.rs` holds that premise as a test of its own rather
+        // than as a comment.
+        rule: "a built-in's name is one no other tool this agent offers takes (5.5, 11.5, D123)",
+        pass: "check/bindings.rs",
+        codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a provider with a default endpoint declares `api_key:` or a `base_url:` (12.1, D120)",
+        pass: "parse/definition.rs",
+        codes: &["missing-credential"],
+        evidence: Evidence::Fixture,
+    },
+    // The two-tier rule of resolved q30, split across the two passes it is
+    // decidable in. The **kind gate** is one literal beside another in one
+    // mapping, so it is the parser's, exactly as D120's credential rule is; the
+    // **contents** need the kind's curated table read for a warning as well as
+    // for an error, which is the same shape of work `settings:` already does
+    // here.
+    Check {
+        rule: "`server_tools:` is declared on a kind whose wire carries them (12.1, D122)",
+        pass: "parse/definition.rs",
+        codes: &["unsupported-server-tools"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a `server_tools:` entry in the kind's curated table is checked against it, and one outside it — tool or field — is carried with a warning (12.1, D122)",
+        pass: "check/providers.rs",
+        codes: &[
+            "unknown-server-tool",
+            "unknown-server-tool-field",
+            "missing-key",
+            "conflicting-keys",
+            "type-mismatch",
+            "unknown-variant",
+            "value-out-of-range",
+            // The two spellings of "this key is read at compile time, and an
+            // `${ENV}` reaches the wire as the string it expands to". A field
+            // the table types as a **non-string** cannot carry one at all
+            // (`type-mismatch`); a field it pins to a **single** string may
+            // only carry that string, since the value is decided by the
+            // entry's own `type:` and the service refuses any other
+            // (`unexpected-env-ref`). A closed set of more than one is a knob a
+            // deployment turns and interpolates like any class 2 value.
+            "unexpected-env-ref",
+        ],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a route's members declare one `server_tools:` suite (12.2, D122)",
+        pass: "check/providers.rs",
+        codes: &["mismatched-server-tools"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // §11.5's collision rule reached from the connection's side, which is
+        // why the citation carries both sections: the *reason* is §11.5's
+        // verbatim ("the model is offered two different things under one name")
+        // and the array the names share is §12.1's, since a suite is appended
+        // to the `tools` of every request the provider serves. Two sites,
+        // because a suite collides with itself in one provider definition and
+        // with a client tool only once an agent's model reaches that provider.
+        rule: "a `server_tools:` suite offers each name once, and none an agent's own tools take (12.1, 11.5, D122)",
+        pass: "check/providers.rs, check/bindings.rs",
+        codes: &["tool-name-collision"],
+        evidence: Evidence::Fixture,
+    },
     Check {
         rule: "a `method: GET` trigger does not read through `payload.body` (13.3, D117)",
         pass: "check/triggers.rs",
@@ -311,6 +413,45 @@ const GRAMMAR: &[Check] = &[
         rule: "two `manual` triggers naming one flow agree about `session_key:` (compiler rule over 13.2's remap and 13's per-flow CLI entry)",
         pass: "check/triggers.rs",
         codes: &["conflicting-session-key"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The inbound half of grammar 13.3's authentication surface. Two rules
+        // in one row because they are one shape read twice: an `auth:` block
+        // declares exactly one scheme, and both schemes' secrets take the
+        // env-ref value form §4.3 fixes for every credential in this grammar.
+        rule: "an inbound `auth:` block declares exactly one scheme, whose secret is an `${ENV}` reference (13.3, 4.3, D41, D125)",
+        pass: "parse/section.rs",
+        codes: &["missing-key", "conflicting-keys", "invalid-env-ref"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The shape of the two keys every scheme block shares. A row of its own
+        // rather than a clause on the two beside it, because it is the only
+        // rule here about what a *resolved* value does downstream: a delivery
+        // writes `header:` and `prefix:` onto its own request verbatim, so a
+        // colon or a carriage return in either forges a second header — and a
+        // name the delivery already writes, inside its own `X-AgentCompose-`
+        // namespace or among the `Content-Type`, `Content-Length` and `Host` any
+        // POST of a JSON body carries, collides with a header the same request
+        // already sends (D127).
+        rule: "an auth block's `header:` is one HTTP header name that no delivery already writes, and its `prefix:` carries no control character, inbound and outbound alike (13.3, 12.1, D127)",
+        pass: "parse/section.rs",
+        codes: &["invalid-value", "unexpected-env-ref"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The outbound half. `missing-callback-allowlist` is its own code for
+        // the reason `missing-credential` is: what is absent is decided by a
+        // sibling, and the repair is a choice of two.
+        rule: "a `callback_auth:` block declares a scheme, brings a non-empty `callback_allow:` of absolute http/https patterns each naming a host, and neither key stands without a `callback:` (13.3, D126, D127)",
+        pass: "parse/section.rs",
+        codes: &[
+            "missing-key",
+            "missing-callback-allowlist",
+            "conflicting-keys",
+            "invalid-value",
+        ],
         evidence: Evidence::Fixture,
     },
     Check {

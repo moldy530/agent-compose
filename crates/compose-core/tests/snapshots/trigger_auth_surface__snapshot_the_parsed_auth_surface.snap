@@ -1,0 +1,142 @@
+---
+source: crates/compose-core/tests/trigger_auth_surface.rs
+expression: "file.triggers.expect(\"the `triggers:` section is read\")"
+---
+TriggersSection {
+    triggers: [
+        Trigger {
+            name: "intake" @ 16:3..16:9,
+            flow: Some(
+                flow.support @ 18:11..18:23,
+            ),
+            session_key: None,
+            description: None,
+            kind: Some(
+                Http(
+                    HttpTrigger {
+                        path: Some(
+                            "/intake" @ 19:11..19:18,
+                        ),
+                        method: None,
+                        input: None,
+                        respond: None,
+                        timeout: None,
+                        callback: Some(
+                            cel("payload.body.callback_url") @ 20:15..20:42,
+                        ),
+                        auth: Some(
+                            Hmac(
+                                HmacAuth {
+                                    secret: Some(
+                                        env("${WEBHOOK_SECRET}") @ 23:17..23:34,
+                                    ),
+                                    header: Some(
+                                        "X-Hub-Signature-256" @ 24:17..24:36,
+                                    ),
+                                    algorithm: Some(
+                                        Sha512 @ 25:20..25:26,
+                                    ),
+                                    encoding: Some(
+                                        Base64 @ 26:19..26:25,
+                                    ),
+                                    prefix: Some(
+                                        "sha512=" @ 27:17..27:26,
+                                    ),
+                                },
+                            ) @ 22:7..27:26,
+                        ),
+                        callback_auth: Some(
+                            CallbackAuth {
+                                bearer: Some(
+                                    BearerAuth {
+                                        token: Some(
+                                            env("${CALLBACK_TOKEN}") @ 30:16..30:33,
+                                        ),
+                                        header: Some(
+                                            "X-Delivery-Token" @ 31:17..31:33,
+                                        ),
+                                        prefix: Some(
+                                            "Token " @ 32:17..32:25,
+                                        ),
+                                    },
+                                ),
+                                hmac: Some(
+                                    CallbackHmac {
+                                        secret: Some(
+                                            env("${CALLBACK_SECRET}") @ 34:17..34:35,
+                                        ),
+                                    },
+                                ),
+                            } @ 29:7..34:35,
+                        ),
+                        callback_allow: Some(
+                            CallbackAllow {
+                                patterns: [
+                                    "https://hooks.example.com/*" @ 36:9..36:38,
+                                    "http://localhost:9000/*" @ 37:9..37:34,
+                                ],
+                                span: 36:7..37:34,
+                            },
+                        ),
+                    },
+                ),
+            ),
+            span: 17:5..37:34,
+        },
+        Trigger {
+            name: "minimal" @ 39:3..39:10,
+            flow: Some(
+                flow.support @ 41:11..41:23,
+            ),
+            session_key: None,
+            description: None,
+            kind: Some(
+                Http(
+                    HttpTrigger {
+                        path: None,
+                        method: None,
+                        input: None,
+                        respond: None,
+                        timeout: None,
+                        callback: Some(
+                            cel("payload.body.callback_url") @ 42:15..42:42,
+                        ),
+                        auth: Some(
+                            Bearer(
+                                BearerAuth {
+                                    token: Some(
+                                        env("${WEBHOOK_TOKEN}") @ 45:16..45:32,
+                                    ),
+                                    header: None,
+                                    prefix: None,
+                                },
+                            ) @ 44:7..45:32,
+                        ),
+                        callback_auth: Some(
+                            CallbackAuth {
+                                bearer: None,
+                                hmac: Some(
+                                    CallbackHmac {
+                                        secret: Some(
+                                            env("${CALLBACK_SECRET}") @ 48:17..48:35,
+                                        ),
+                                    },
+                                ),
+                            } @ 47:7..48:35,
+                        ),
+                        callback_allow: Some(
+                            CallbackAllow {
+                                patterns: [
+                                    "https://hooks.example.com/*" @ 50:9..50:38,
+                                ],
+                                span: 50:7..50:38,
+                            },
+                        ),
+                    },
+                ),
+            ),
+            span: 40:5..50:38,
+        },
+    ],
+    span: 16:3..50:38,
+}

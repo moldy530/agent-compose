@@ -78,6 +78,7 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ValueOutOfRange => include_str!("codes/value-out-of-range.md"),
         DiagnosticCode::UnknownVariant => include_str!("codes/unknown-variant.md"),
         DiagnosticCode::ConflictingKeys => include_str!("codes/conflicting-keys.md"),
+        DiagnosticCode::MissingCredential => include_str!("codes/missing-credential.md"),
         DiagnosticCode::InvalidIdentifier => include_str!("codes/invalid-identifier.md"),
         DiagnosticCode::InvalidReference => include_str!("codes/invalid-reference.md"),
         DiagnosticCode::InvalidDuration => include_str!("codes/invalid-duration.md"),
@@ -104,6 +105,16 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ToolNameCollision => include_str!("codes/tool-name-collision.md"),
         DiagnosticCode::MissingSessionKey => include_str!("codes/missing-session-key.md"),
         DiagnosticCode::MissingCapability => include_str!("codes/missing-capability.md"),
+        DiagnosticCode::UnsupportedServerTools => {
+            include_str!("codes/unsupported-server-tools.md")
+        }
+        DiagnosticCode::UnknownServerTool => include_str!("codes/unknown-server-tool.md"),
+        DiagnosticCode::UnknownServerToolField => {
+            include_str!("codes/unknown-server-tool-field.md")
+        }
+        DiagnosticCode::MismatchedServerTools => {
+            include_str!("codes/mismatched-server-tools.md")
+        }
         DiagnosticCode::DeadEnd => include_str!("codes/dead-end.md"),
         DiagnosticCode::UnboundedCycle => include_str!("codes/unbounded-cycle.md"),
         DiagnosticCode::UnbalancedConvergence => include_str!("codes/unbalanced-convergence.md"),
@@ -115,6 +126,9 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::DetachedInterrupt => include_str!("codes/detached-interrupt.md"),
         DiagnosticCode::DuplicateRoute => include_str!("codes/duplicate-route.md"),
         DiagnosticCode::ConflictingSessionKey => include_str!("codes/conflicting-session-key.md"),
+        DiagnosticCode::MissingCallbackAllowlist => {
+            include_str!("codes/missing-callback-allowlist.md")
+        }
     }
 }
 

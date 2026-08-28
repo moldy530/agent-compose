@@ -10,8 +10,8 @@
 
 use serde::Serialize;
 
-use crate::ast::common::{Address, Cel, Duration, Ident};
-use crate::ast::trigger::{Respond, TriggerMethod};
+use crate::ast::common::{Address, Cel, Duration, EnvRef, Ident};
+use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
 use crate::diag::{Span, Spanned};
 
 use super::binding::Bindings;
@@ -40,6 +40,12 @@ pub struct Trigger {
 }
 
 /// The four trigger types (grammar 13), tagged by `type`.
+///
+/// The variants differ in size for the reason the AST's do, and are read the
+/// same way — built once per trigger, matched by reference from then on — so
+/// boxing the `http` one would add indirection to every consumer and buy
+/// nothing (see [`ast::trigger::TriggerKind`](crate::ast::trigger::TriggerKind)).
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TriggerKind {
@@ -75,6 +81,102 @@ pub struct HttpTrigger {
     /// `callback:` — a completion webhook; `async` only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callback: Option<Spanned<Cel>>,
+    /// `auth:` — how an inbound call is authenticated, and with it the resume
+    /// and status routes of every execution this trigger starts. Absent means
+    /// those three routes are open (grammar 13.3, PRD resolved q32).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<InboundAuth>,
+    /// `callback_auth:` — how a delivery identifies itself to its receiver.
+    /// Absent is the documented test posture: the deployment signs nothing and
+    /// may POST anywhere (grammar 13.3, PRD resolved q33).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_auth: Option<CallbackAuth>,
+    /// `callback_allow:` — the URL patterns a callback may point at; present
+    /// wherever [`Self::callback_auth`] is (grammar 13.3, PRD resolved q33).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_allow: Option<Vec<Spanned<String>>>,
+}
+
+/// The inbound `auth:` of an `http` trigger, **defaults applied**
+/// (grammar 13.3, PRD resolved q32).
+///
+/// Unlike `path:`, `method:` and `respond:`, which record what the author wrote
+/// and leave the default to whoever reads them, a declared scheme lands here
+/// complete: every parameter that decides whether a credential verifies —
+/// the header it arrives in, the digest, the encoding, the prefix — carries the
+/// value the trigger actually enforces. A verifier is the wrong place to
+/// re-derive a default, because getting one wrong there does not fail the build,
+/// it accepts the wrong request.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "scheme", rename_all = "snake_case")]
+pub enum InboundAuth {
+    /// `bearer:` — a static secret compared, in constant time, against a named
+    /// header.
+    Bearer(BearerAuth),
+    /// `hmac:` — a signature over the raw request body.
+    Hmac(HmacAuth),
+}
+
+/// A static-token scheme, inbound or outbound (grammar 13.3).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BearerAuth {
+    /// `token:` — the expected credential, an environment reference that
+    /// survives unresolved into the artifact (grammar 4.3).
+    pub token: Spanned<EnvRef>,
+    /// `header:` — resolved; the default is `Authorization`.
+    ///
+    /// Carries the author's capitalisation, and is **matched
+    /// case-insensitively** on the way in: header names are case-insensitive by
+    /// definition and HTTP/2 lowercases every one on the wire, so a verifier
+    /// comparing the spelling would refuse every genuine call (grammar 13.3).
+    /// Outbound the name is written as it stands.
+    pub header: String,
+    /// `prefix:` — resolved; the default is `Bearer `, trailing space included.
+    pub prefix: String,
+}
+
+/// The inbound `hmac:` scheme, resolved (grammar 13.3).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HmacAuth {
+    /// `secret:` — the signing key, an environment reference that survives
+    /// unresolved into the artifact (grammar 4.3).
+    pub secret: Spanned<EnvRef>,
+    /// `header:` — resolved; the default is `X-Signature`. Matched
+    /// case-insensitively, for the reason [`BearerAuth::header`] is.
+    pub header: String,
+    /// `algorithm:` — resolved; the default is `sha256`.
+    pub algorithm: HmacAlgorithm,
+    /// `encoding:` — resolved; the default is `hex`.
+    pub encoding: SignatureEncoding,
+    /// `prefix:` — resolved; the default is the empty string.
+    pub prefix: String,
+}
+
+/// The outbound `callback_auth:`, resolved (grammar 13.3, PRD resolved q33).
+///
+/// At least one of the two is present, and both together are legal.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CallbackAuth {
+    /// `bearer:` — a static token on every delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<BearerAuth>,
+    /// `hmac:` — a signature over the delivered body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<CallbackHmac>,
+}
+
+/// The outbound `hmac:` scheme (grammar 13.3).
+///
+/// One field, because outbound signing is not configurable: the delivery is
+/// signed with HMAC-SHA256, written in hex, and carried as
+/// `X-AgentCompose-Signature: sha256=<hex>`. Those are the wire contract's
+/// rather than the author's, so they are stated once in grammar 13.3 instead of
+/// repeated per trigger here.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CallbackHmac {
+    /// `secret:` — the signing key, an environment reference that survives
+    /// unresolved into the artifact (grammar 4.3).
+    pub secret: Spanned<EnvRef>,
 }
 
 /// A `schedule` trigger — reserved grammar (grammar 13.4).

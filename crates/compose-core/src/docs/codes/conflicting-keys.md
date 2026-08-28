@@ -13,6 +13,9 @@ Two keys that may not appear together both appear. The pairs are not arbitrary
 - `callback:` with `respond: sync`, where the response already carries the
   outputs, and `timeout:` with `respond: async`, where there is no response for
   a budget to bound;
+- `callback_auth:` or `callback_allow:` on a trigger with no `callback:`, where
+  each describes a delivery that never happens, and an inbound `auth:` declaring
+  both `bearer:` and `hmac:`, where one request carries one credential;
 - an inline node's `input:` beside the in-block key that would carry it —
   `body:` on a body-bearing method, `query:` on `GET`/`HEAD`;
 - two implementation bindings on one `tool.*`.

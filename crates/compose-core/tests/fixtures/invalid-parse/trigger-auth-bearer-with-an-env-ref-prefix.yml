@@ -1,0 +1,13 @@
+# rule: a `bearer:` `prefix:` is literal text, in either direction; nothing on it is interpolated (grammar 4.3 class 3, 13.3, Decision D92)
+# code: unexpected-env-ref
+# message: `prefix` never interpolates environment references, but it contains `${TOKEN_SCHEME}`
+# at: 13:17
+# help: write `$${TOKEN_SCHEME}` for a literal `${TOKEN_SCHEME}`
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      bearer:
+        token: ${WEBHOOK_TOKEN}
+        prefix: "${TOKEN_SCHEME}"

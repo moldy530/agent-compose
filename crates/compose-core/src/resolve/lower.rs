@@ -140,9 +140,34 @@ fn agent(source: &ast_def::AgentDef) -> Option<ir::definition::Agent> {
         output: field_map(source.output.as_ref()?)?,
         input: optional(source.input.as_ref(), field_map)?,
         tools: source.tools.clone(),
+        builtins: source
+            .builtins
+            .iter()
+            .map(builtin)
+            .collect::<Option<Vec<_>>>()?,
         stores: source.stores.clone(),
         description: source.description.clone(),
         max_tool_iterations: source.max_tool_iterations.as_ref().map(|value| value.value),
+    })
+}
+
+/// One `builtin.*` attachment, with its bounds required (grammar 5.5,
+/// Decision D123).
+///
+/// `root:` is required of every built-in and `timeout:` of `builtin.bash`, so an
+/// attachment missing either is dropped exactly as an agent missing its `model:`
+/// is: the parser has already reported it, and the artifact only ever holds a
+/// composition that declared everything it needs.
+fn builtin(source: &ast_def::BuiltinAttachment) -> Option<ir::definition::BuiltinTool> {
+    let timeout = source.timeout.clone();
+    if source.tool.value.runs_a_command() && timeout.is_none() {
+        return None;
+    }
+    Some(ir::definition::BuiltinTool {
+        tool: source.tool.clone(),
+        root: source.root.clone()?,
+        timeout,
+        span: source.span.clone(),
     })
 }
 
@@ -206,8 +231,26 @@ fn provider(source: &ast_def::ProviderDef) -> Option<ir::definition::Provider> {
             project: source.project.clone(),
             profile: source.profile.clone(),
             headers: source.headers.iter().map(interpolated_entry).collect(),
+            server_tools: source.server_tools.iter().filter_map(server_tool).collect(),
         },
         description: source.description.clone(),
+    })
+}
+
+/// One `server_tools:` entry (grammar 12.1, Decision D122).
+///
+/// An entry whose `type:` did not read is dropped, like every other required
+/// key this pass finds absent: the parser has already reported it, and a
+/// composition with a diagnostic produces no artifact.
+fn server_tool(source: &ast_def::ServerToolDef) -> Option<ir::definition::ServerTool> {
+    Some(ir::definition::ServerTool {
+        type_name: source.type_name.clone()?,
+        config: source
+            .config
+            .iter()
+            .map(|entry| (entry.key.value.clone(), entry.value.clone()))
+            .collect(),
+        span: source.span.clone(),
     })
 }
 
@@ -598,6 +641,12 @@ fn trigger(source: &ast_trigger::Trigger) -> Option<ir::Trigger> {
                 respond: http.respond.as_ref().map(|respond| respond.value),
                 timeout: http.timeout.clone(),
                 callback: http.callback.clone(),
+                auth: optional(http.auth.as_ref(), inbound_auth)?,
+                callback_auth: optional(http.callback_auth.as_ref(), callback_auth)?,
+                callback_allow: http
+                    .callback_allow
+                    .as_ref()
+                    .map(|allow| allow.patterns.clone()),
             })
         }
         ast_trigger::TriggerKind::Schedule(schedule) => {
@@ -623,6 +672,69 @@ fn trigger(source: &ast_trigger::Trigger) -> Option<ir::Trigger> {
         span: source.span.clone(),
         kind,
     })
+}
+
+/// Lower an inbound `auth:` block, applying grammar 13.3's defaults.
+///
+/// This is where the defaults land, rather than being left to whoever reads the
+/// artifact: a header name, a digest, an encoding and a prefix together decide
+/// whether a caller's credential verifies, and a reader that re-derived one of
+/// them differently would not fail a build — it would accept the wrong request
+/// (PRD resolved q32).
+fn inbound_auth(source: &Spanned<ast_trigger::AuthScheme>) -> Option<ir::trigger::InboundAuth> {
+    Some(match &source.value {
+        ast_trigger::AuthScheme::Bearer(bearer) => {
+            ir::trigger::InboundAuth::Bearer(bearer_auth(bearer)?)
+        }
+        ast_trigger::AuthScheme::Hmac(hmac) => {
+            ir::trigger::InboundAuth::Hmac(ir::trigger::HmacAuth {
+                secret: hmac.secret.clone()?,
+                header: text_or(hmac.header.as_ref(), ast_trigger::HmacAuth::DEFAULT_HEADER),
+                algorithm: hmac
+                    .algorithm
+                    .as_ref()
+                    .map_or(ast_trigger::HmacAlgorithm::DEFAULT, |value| value.value),
+                encoding: hmac
+                    .encoding
+                    .as_ref()
+                    .map_or(ast_trigger::SignatureEncoding::DEFAULT, |value| value.value),
+                prefix: text_or(hmac.prefix.as_ref(), ast_trigger::HmacAuth::DEFAULT_PREFIX),
+            })
+        }
+    })
+}
+
+/// Lower a `bearer:` block, inbound or outbound: one shape, one pair of defaults
+/// (grammar 13.3).
+fn bearer_auth(source: &ast_trigger::BearerAuth) -> Option<ir::trigger::BearerAuth> {
+    Some(ir::trigger::BearerAuth {
+        token: source.token.clone()?,
+        header: text_or(
+            source.header.as_ref(),
+            ast_trigger::BearerAuth::DEFAULT_HEADER,
+        ),
+        prefix: text_or(
+            source.prefix.as_ref(),
+            ast_trigger::BearerAuth::DEFAULT_PREFIX,
+        ),
+    })
+}
+
+/// Lower a `callback_auth:` block (grammar 13.3, PRD resolved q33).
+fn callback_auth(source: &Spanned<ast_trigger::CallbackAuth>) -> Option<ir::trigger::CallbackAuth> {
+    Some(ir::trigger::CallbackAuth {
+        bearer: optional(source.value.bearer.as_ref(), bearer_auth)?,
+        hmac: optional(source.value.hmac.as_ref(), |hmac| {
+            Some(ir::trigger::CallbackHmac {
+                secret: hmac.secret.clone()?,
+            })
+        })?,
+    })
+}
+
+/// A declared string, or the default the grammar gives it when it is absent.
+fn text_or(declared: Option<&Spanned<String>>, default: &str) -> String {
+    declared.map_or_else(|| default.to_owned(), |value| value.value.clone())
 }
 
 // --- the deploy layer -----------------------------------------------------

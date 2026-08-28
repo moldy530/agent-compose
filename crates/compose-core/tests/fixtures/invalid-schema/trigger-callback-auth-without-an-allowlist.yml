@@ -1,0 +1,11 @@
+# rule: declaring `callback_auth:` makes `callback_allow:` mandatory (grammar 13.3, D126 / PRD resolved q33)
+# at: /triggers/intake
+# via: /$defs/httpTrigger/allOf/2/then/required
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_auth:
+      hmac:
+        secret: ${CALLBACK_SECRET}

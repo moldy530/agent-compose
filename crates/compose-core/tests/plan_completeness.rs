@@ -79,17 +79,27 @@
 //!
 //! The property is a biconditional over the artifacts two corpora **produce**,
 //! and that is narrower than a biconditional over the grammar. Nearly every
-//! field of the IR is written `skip_serializing_if` — 126 of them across
+//! field of the IR is written `skip_serializing_if` — 135 of them across
 //! `crates/compose-core/src/ir/` — so a construct no spec of either corpus
 //! declares is no key of any artifact here: [`subjects`] never sees it,
 //! [`differing_keys`] never names it, and
 //! [`every_key_of_the_base_composition_is_moved_by_some_pair`] never asks for
-//! it. Of the 111 optional keys `schemas/agent-compose.schema.json` names, 39
-//! are declared by neither [`BASE`] nor any pair of either corpus. About half of
-//! those are a deploy backend's plugin config, which `docs/plan.md` §11 excuses
-//! from a plan outright; the rest are real — a model's `top_p:`, `seed:` and
-//! `thinking:`, a schema's `min_items:`, `multiple_of:` and its two exclusive
-//! bounds, a store op's `filter:`, `metadata:` and `top_k:`.
+//! it. `schemas/agent-compose.schema.json` names 164 distinct optional keys —
+//! every property some object in it declares and does not require — and dozens
+//! of them are declared by neither [`BASE`] nor any pair of either corpus. A
+//! large share are a deploy backend's plugin config and a provider's server-tool
+//! config, which `docs/plan.md` §11 excuses from a plan outright; the rest are
+//! real — a model's `top_p:`, `seed:` and `thinking:`, a schema's `min_items:`,
+//! `multiple_of:` and its two exclusive bounds, a store op's `filter:`,
+//! `metadata:` and `top_k:`, and the whole of an `http` trigger's authentication
+//! surface: `auth:`, `callback_auth:`, `callback_allow:` and the `header:`,
+//! `algorithm:`, `encoding:` and `prefix:` under them.
+//!
+//! The two counts are stated rather than asserted, so they are the one thing
+//! here that rots quietly: both are recomputable — `skip_serializing_if` over
+//! `crates/compose-core/src/ir/`, and the schema's properties minus each
+//! object's `required` — and a change that grows either without touching this
+//! paragraph leaves a reader budgeting against a number that has moved.
 //!
 //! It is stated per **construct** rather than per key name, which is what makes
 //! it easy to under-read: a `description:` is declared by every definition and
@@ -1630,6 +1640,30 @@ const CASES: &[Case] = &[
             "models.yml",
             "  provider: provider.local",
             "  provider: provider.anthropic",
+        )],
+        differs: true,
+    },
+    // A provider's server-tool suite is what the model is offered inside every
+    // call the connection serves (grammar 12.1, Decision D122), so tightening it
+    // changes what the graph can do without touching a node — exactly the kind
+    // of edit a plan exists to surface.
+    Case {
+        what: "a server tool's budget narrowed",
+        before: &[],
+        after: &[("providers.yml", "      max_uses: 3", "      max_uses: 1")],
+        differs: true,
+    },
+    // A built-in's `root:` is the whole of what bounds it (grammar 5.5,
+    // Decision D123), so moving it changes what an agent may reach without
+    // touching a node, a prompt or a schema — the same shape of edit as the one
+    // above, on the side of the wire this runtime dispatches.
+    Case {
+        what: "a built-in's root widened",
+        before: &[],
+        after: &[(
+            "agents/fixer.yml",
+            "    - builtin.read_file: { root: \"${REPO_ROOT}\" }",
+            "    - builtin.read_file: { root: \"${REPO_ROOT}/src\" }",
         )],
         differs: true,
     },

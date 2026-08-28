@@ -67,6 +67,87 @@ mod tests {
         assert!(emitted.ends_with(SOURCE), "the runtime is emitted verbatim");
     }
 
+    /// The compiler's endpoint table and the runtime's fallback are one fact
+    /// written twice, in two languages, and this is the seam between them.
+    ///
+    /// `ProviderKind::default_endpoint` is what makes the credential rule
+    /// decidable — "no `base_url:`" means "reaching the vendor" — and the
+    /// diagnostic quotes the host. If the emitted `baseUrl` ever fell back
+    /// somewhere else, `validate` would be requiring a key for an endpoint the
+    /// run does not reach, which is a rule about nothing. Held from the Rust
+    /// side because that is the side with the table (grammar 12.1,
+    /// Decision D120).
+    #[test]
+    fn the_default_endpoints_are_the_ones_the_emitted_runtime_falls_back_to() {
+        for kind in crate::ast::definition::ProviderKind::ALL {
+            let Some(endpoint) = kind.default_endpoint() else {
+                continue;
+            };
+            assert!(
+                SOURCE.contains(&format!(
+                    "if (provider.kind === \"{}\") return \"{endpoint}\";",
+                    kind.as_str()
+                )),
+                "the emitted runtime does not fall back to `{endpoint}` for `{}`",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// A key the composition never declared reaches the wire as no header, not
+    /// as an empty one (grammar 12.1, Decision D120).
+    ///
+    /// Stated over the emitted source because the runtime is a constant this
+    /// crate ships: the acceptance suite proves it on a live request, and this
+    /// is what fails first if the `?? ""` spelling comes back on either wire.
+    #[test]
+    fn neither_wire_defaults_an_absent_key_to_an_empty_header() {
+        assert!(
+            !SOURCE.contains("apiKey ?? \"\""),
+            "an absent `api_key:` is a dropped header, never an empty one"
+        );
+        assert_eq!(
+            SOURCE.matches(".apiKey").count(),
+            1,
+            "every wire reads the key through `credential`, which is the one place that \
+             decides whether a header is sent at all"
+        );
+        assert!(
+            SOURCE.contains("...credential(model.provider, \"x-api-key\")"),
+            "the Messages wire authenticates through `credential`"
+        );
+        assert!(
+            SOURCE.contains("credential(provider, azure ? \"api-key\" : \"authorization\")"),
+            "both OpenAI-shaped wires authenticate through `credential`"
+        );
+    }
+
+    /// A provider's declared `headers:` are composed **after** the credential
+    /// they may replace — the layering the keyless repair rides on.
+    ///
+    /// D120 drops the vendor credential and puts the gateway's own token in
+    /// `headers:` (grammar 12.1, `docs/topics/models.md`), so that map has to
+    /// reach the wire beside whatever `credential` composed and win wherever
+    /// the two spell the same name: a declared header is the author's word about
+    /// the connection, and the credential is this runtime's default for it.
+    /// `headerSet` decides that by position alone — later layers win — so the
+    /// argument order at the one call site in `send` *is* the rule.
+    ///
+    /// Pinned here because reordering it is silent everywhere else: a keyless
+    /// request's outputs do not change, and the acceptance suite's
+    /// `a_provider_with_no_key_sends_no_authentication_header_on_either_wire`
+    /// sees only the collision-free case, where an absent credential contributes
+    /// no entry for a later layer to overwrite.
+    #[test]
+    fn a_declared_header_is_composed_after_the_credential_it_may_replace() {
+        assert!(
+            SOURCE.contains(
+                "headerSet({ \"content-type\": \"application/json\" }, headers, model.provider.headers)"
+            ),
+            "`send` must compose a provider's `headers:` as the last layer, after the credential"
+        );
+    }
+
     /// The runtime is the same bytes for every composition: a project that
     /// declares nothing and one that declares everything differ in `graph.ts`,
     /// and this is what makes that true.

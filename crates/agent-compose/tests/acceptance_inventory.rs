@@ -1,5 +1,11 @@
-//! The M1 completion inventory: every criterion PRD §7 M1 promises, mapped to
-//! the acceptance test that decides it and to whether that test runs yet.
+//! The completion inventory: every criterion PRD §7 promises of a *running*
+//! compiled graph, mapped to the acceptance test that decides it and to whether
+//! that test runs yet.
+//!
+//! M1 is the bulk of it and is what the shape below is built around. M3's first
+//! bullet — durable execution — is here too, for the reason the file exists at
+//! all: it is a promise about what a compiled graph does when it runs, and the
+//! tests that decide it live in the same suite.
 //!
 //! `crates/compose-core/tests/static_check_inventory.rs` is the companion for M0, and this
 //! file is the same idea one milestone on: the PRD's own sentences, transcribed
@@ -52,6 +58,20 @@ enum Bullet {
     Harness,
     /// Not PRD §7 M1's own enumeration: CLAUDE.md's *Validation strategy*.
     Strategy,
+    /// PRD §7 M3's first bullet: "**Durable execution**: …".
+    Durability,
+    /// PRD §7 M3's second bullet, its runtime half: "**Built-in tools** … and
+    /// runtime bash/file tools opted into per agent node, bounded by root +
+    /// timeout (resolved q31)".
+    ///
+    /// The *other* half of that bullet — provider-executed server tools — is
+    /// filed under [`Self::Harness`], because what it changed was what a
+    /// scripted answer has to be able to carry. This half changed what a
+    /// compiled graph *does*, so it gets a heading of its own.
+    BuiltinTools,
+    /// PRD §7 M3's fourth bullet: "**HTTP-native events** (resolved q32–q36):
+    /// …".
+    HttpEvents,
 }
 
 /// Whether a criterion's tests run today.
@@ -154,6 +174,17 @@ const CODEGEN: &[Criterion] = &[
             // what a flow produced.
             (
                 "each_chat_completions_kind_authenticates_and_routes_the_way_its_row_says",
+                Status::Live,
+            ),
+            // The conditional half of the same row (grammar 12.1, Decision
+            // D120): a provider that names a `base_url:` may hold no key, and
+            // then the node fn must send no auth header rather than an empty
+            // one. Only the transcript can tell those apart, and the mock does
+            // not enforce it — a keyless request is a legal wire shape — so an
+            // emitter that dropped the header for every provider would pass
+            // every other test here, which is what the keyed third run closes.
+            (
+                "a_provider_with_no_key_sends_no_authentication_header_on_either_wire",
                 Status::Live,
             ),
             // The other thing that surface can answer with: a refusal, which
@@ -949,6 +980,78 @@ const HARNESS: &[Criterion] = &[Criterion {
             "a_scripted_delay_makes_completion_order_differ_from_item_order",
             Status::Live,
         ),
+        // The fixture list's own guard, which grew a second arm when the first
+        // fixture that validates with a *warning* arrived (Decision D122).
+        ("every_fixture_with_a_declared_warning_exists", Status::Live),
+        // Server tools (grammar 12.1, Decision D122, resolved q30), which are
+        // this bullet's criterion on both counts: they are what a scripted model
+        // response now has to be able to *carry*, and the Responses wire they
+        // move an `openai` provider onto is a surface the harness had to learn.
+        // Each is one claim a transcript decides.
+        (
+            "a_providers_server_tools_reach_the_messages_wire_verbatim",
+            Status::Live,
+        ),
+        (
+            "a_server_tool_block_is_neither_dispatched_nor_refused_by_the_loop",
+            Status::Live,
+        ),
+        (
+            "an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire",
+            Status::Live,
+        ),
+        // …and the turn shape only that wire can produce: a preamble `message`
+        // before the shaped one, which is what a server tool running mid-turn
+        // leaves behind.
+        (
+            "a_pinned_responses_turn_is_read_at_the_message_the_format_shaped",
+            Status::Live,
+        ),
+        (
+            "a_pinned_responses_turn_carrying_no_object_is_reported_as_no_structured_output",
+            Status::Live,
+        ),
+        // …and the third route the key reaches, which is on neither of those
+        // two wires: a gateway keeps Chat Completions and its suite rides that
+        // request's own `tools` array.
+        (
+            "a_gateways_server_tools_ride_its_chat_completions_tools_array",
+            Status::Live,
+        ),
+        (
+            "a_server_tool_outside_the_table_is_warned_about_and_still_reaches_the_wire",
+            Status::Live,
+        ),
+        // …and the same tier one level in: a key the row of a *known* tool does
+        // not name, which a compiler that refused it would block every author of
+        // that tool over until a new binary shipped.
+        (
+            "a_server_tool_field_outside_the_table_is_warned_about_and_still_reaches_the_wire",
+            Status::Live,
+        ),
+        ("a_failover_that_crosses_two_wires_composes", Status::Live),
+        // …and the half of that seam a first-call failover cannot reach: a
+        // *replayed* assistant turn, which each wire will only take back in its
+        // own vocabulary.
+        (
+            "a_failover_off_the_responses_wire_rewrites_the_turn_for_the_messages_one",
+            Status::Live,
+        ),
+        (
+            "a_failover_off_the_messages_wire_rewrites_the_turn_for_the_responses_one",
+            Status::Live,
+        ),
+        // …and the turn that rewriting has *nothing* to write: a Responses
+        // answer that is all server-tool items, which the rebuild must drop
+        // rather than send as the empty message the Messages API refuses.
+        (
+            "a_responses_turn_with_nothing_the_messages_wire_can_spell_is_not_replayed_empty",
+            Status::Live,
+        ),
+        (
+            "server_tools_on_a_kind_whose_wire_has_none_is_refused_by_name",
+            Status::Live,
+        ),
     ],
 }];
 
@@ -983,12 +1086,670 @@ const STRATEGY: &[Criterion] = &[
     },
 ];
 
+/// PRD §7 M3's first bullet, whose four clauses are the four claims durability
+/// makes: the record, what a resume does with it, the two recovery surfaces, and
+/// the failure that is not a re-execution.
+///
+/// The bullet is one sentence rather than an enumeration, so — like `HARNESS` —
+/// its phrases are held to it by containment rather than by splitting on `, `.
+/// The resolved questions behind it (q26–q29) are quoted in each test.
+const DURABILITY: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "a deploy-target-bound journal (SQLite locally, Postgres when distributed) records every effect",
+        tests: &[
+            // The two effect kinds a repeat is *visible* in, which is what makes
+            // "records every effect" a claim a test can decide rather than an
+            // inventory of call sites.
+            (
+                "a_replayed_prefix_re_issues_neither_its_store_write_nor_its_subprocess",
+                Status::Live,
+            ),
+            // …and the half a write cannot decide: a **read** is recorded too,
+            // and what it answers has to be what the generation that recorded it
+            // went on with, or the two generations compose different requests
+            // out of one composition (`docs/durability.md` §11.1).
+            (
+                "a_replayed_store_read_is_the_row_the_recording_generation_went_on_with",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "a resumed execution replays that record read-only up to the frontier",
+        tests: &[
+            // The core assertion of resolved q29, decided by the provider's own
+            // request log: the recorded calls do not reach it a second time.
+            (
+                "a_resumed_run_consumes_its_recorded_model_answers_instead_of_asking_again",
+                Status::Live,
+            ),
+            // …and the failure that is *not* a re-execution: a journal that no
+            // longer describes this composition stops the resume naming the step
+            // it disagrees at.
+            (
+                "a_resume_whose_journal_no_longer_describes_the_run_names_the_divergent_step",
+                Status::Live,
+            ),
+            // …and the one composition shape that could have made replay a
+            // different question and does not: a provider that runs **server
+            // tools** (Decision D122). The use happens inside the recorded model
+            // call, so it gets no record and no key of its own, and the resumed
+            // generation replays the whole turn — search and all.
+            (
+                "a_resumed_run_replays_a_server_tools_answer_without_asking_again",
+                Status::Live,
+            ),
+            // …and the same claim on the second block-carrying wire, whose
+            // service-minted item ids travel inside the recorded answer and so
+            // inside the next call's request identity (Decision D122).
+            (
+                "a_resumed_run_replays_a_responses_wire_answer_without_asking_again",
+                Status::Live,
+            ),
+            // …and the promise `docs/durability.md` §7 makes about the other
+            // direction, which the two above cannot decide because a matching
+            // suite replays whether or not the identity keys on it: a resume
+            // whose provider *lost* a server tool diverges at the first model
+            // call rather than replaying an answer produced under another tool
+            // surface (Decision D122, resolved q29).
+            (
+                "a_resume_whose_provider_lost_its_server_tools_diverges_at_the_first_model_call",
+                Status::Live,
+            ),
+            // …and the arm that buys, which is why `JOURNAL_VERSION` did not
+            // move for any of it: a composition declaring no suite omits the key
+            // entirely and derives the identity it always derived, so a journal
+            // written before the key existed still replays.
+            (
+                "a_composition_with_no_server_tools_keeps_the_identity_it_always_derived",
+                Status::Live,
+            ),
+            // …and the same argument on the second key `JOURNAL_VERSION` did not
+            // move for: a Messages-wire turn is replayed untagged, so a tool loop
+            // on that wire puts no `wire` key in the identity either
+            // (`docs/durability.md` §3.1).
+            (
+                "a_messages_wire_tool_loop_keeps_the_untagged_turns_it_always_derived",
+                Status::Live,
+            ),
+            // …the other divergence resolved q29 names, which is not a request
+            // that moved but an answer this composition no longer accepts.
+            (
+                "a_recorded_answer_that_fails_the_current_contract_is_a_divergence_not_a_retry",
+                Status::Live,
+            ),
+            // …and its other side, which is what keeps that from breaking a
+            // composition nobody touched: a mismatch the recording generation's
+            // own ladder already absorbed is replayed, not re-decided.
+            (
+                "a_recorded_answer_the_original_retried_past_is_retried_past_again",
+                Status::Live,
+            ),
+            // …and what tells those two apart, at the site that has more than
+            // one effect of a kind. Nothing about the records *around* the
+            // answer can: two different tools at one site defeat counting, and
+            // one tool called twice with the same arguments defeats counting
+            // plus request identity, so the record says which it was.
+            (
+                "a_contract_that_moved_on_one_of_two_tools_at_a_site_is_not_read_as_a_retry",
+                Status::Live,
+            ),
+            (
+                "a_contract_that_moved_on_a_repeated_call_at_a_site_is_not_read_as_a_retry",
+                Status::Live,
+            ),
+            // …and the one world a live effect past the frontier cannot assume
+            // the record left behind: a store whose rows died with the process.
+            (
+                "a_store_that_died_with_the_process_refuses_the_resume_it_cannot_answer",
+                Status::Live,
+            ),
+            // …and its opposite, which is the premise the refusal is carved out
+            // of: a store that *does* outlive the process has to be there, so a
+            // run that only parked leaves its own `blob` partition alone.
+            (
+                "a_parked_runs_own_blob_store_is_there_for_the_generation_that_resumes",
+                Status::Live,
+            ),
+            // …and the second divergence at the one record kind that reaches no
+            // result parse: an answer a person gave, under an `output:` the
+            // composition has since narrowed.
+            (
+                "a_recorded_human_answer_the_composition_no_longer_admits_is_a_divergence",
+                Status::Live,
+            ),
+            // …and the three nesting depths a divergence may not be absorbed at:
+            // a dispatched subflow under `on_item_error: skip`, the item retry
+            // the other form of that key gives, and a delivery nothing waits for.
+            (
+                "a_divergence_inside_a_dispatched_subflow_is_not_absorbed_by_on_item_error",
+                Status::Live,
+            ),
+            (
+                "a_divergence_inside_a_dispatched_item_is_not_retried_by_its_item_policy",
+                Status::Live,
+            ),
+            (
+                "a_divergence_in_a_detached_delivery_fails_the_resume_it_cannot_be_thrown_out_of",
+                Status::Live,
+            ),
+            // …and the other half of that depth, which is the one a delivery's
+            // *own* record has to carry: nothing joins it, so none of the
+            // `ModelCall` entries a joined call files are filed at all, and a
+            // replay that inferred the answering member from them would report a
+            // composition nobody touched as divergent — permanently, because a
+            // divergence never closes the row.
+            (
+                "a_detached_delivery_that_called_a_model_is_replayed_rather_than_reported_as_divergent",
+                Status::Live,
+            ),
+            // …and the two refusals that come *before* a replay: an id the
+            // journal does not hold, and a project with no journal at all.
+            (
+                "a_resume_that_cannot_find_its_execution_says_what_the_journal_holds",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::Durability,
+        phrase: "executions survive a process restart",
+        tests: &[
+            // The `run` half (resolved q28: "`run` journals but does not
+            // auto-resume"), including the wait id a second generation re-parks
+            // under.
+            (
+                "a_pause_killed_with_its_process_is_asked_again_under_the_same_wait_id",
+                Status::Live,
+            ),
+            // …and its other half, which is the promise a person can see: a
+            // pause somebody **answered** is replayed rather than put to them
+            // twice, dated by the generation that held it.
+            (
+                "an_answered_pause_is_replayed_rather_than_put_to_the_person_twice",
+                Status::Live,
+            ),
+            // …and the `serve` half, which recovers on its own.
+            (
+                "a_restarted_serve_recovers_its_open_executions_and_their_waits",
+                Status::Live,
+            ),
+            // …including the window recovering without waiting opens: an answer
+            // that arrives before the replay is back at its pause is told to
+            // send it again, rather than that there is nothing waiting for it.
+            (
+                "a_recovered_execution_still_catching_up_tells_a_resume_to_send_it_again",
+                Status::Live,
+            ),
+            // …and that the window is per **pause**: an execution holding two
+            // whose branches are not back at the same moment must not hand the
+            // second one's client the refusal the first one's arrival cleared.
+            (
+                "a_second_pause_still_being_replayed_to_is_told_to_send_its_answer_again",
+                Status::Live,
+            ),
+            // …including what an `async` caller was promised: the completion
+            // webhook is fired by the process that *finishes* the run, which is
+            // not the one that answered its `202`.
+            (
+                "a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for",
+                Status::Live,
+            ),
+            // …and the half of that promise a divergence would break twice
+            // over: a recovery that leaves the row open pushes nothing, so one
+            // execution is one completion whatever it took to reach it.
+            (
+                "a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one",
+                Status::Live,
+            ),
+            // …and the same promise where the failure is not a divergence at
+            // all: a recovery refused before the execution is opened leaves the
+            // row open while carrying nothing the class of the error could say
+            // so, so the push is decided by reading the row.
+            (
+                "a_recovery_that_cannot_take_the_recorded_inputs_delivers_no_webhook",
+                Status::Live,
+            ),
+            // …and what a run that stops on its own must not leave behind: a
+            // detached delivery made with no record is one the resume makes
+            // again.
+            (
+                "a_detached_delivery_in_flight_when_a_run_parks_is_not_delivered_twice",
+                Status::Live,
+            ),
+            // …and what a **resumed** run must not decide while one is still in
+            // flight: a delivery is the one place a divergence has nothing to be
+            // thrown to, so the predicate that keeps the row open is still being
+            // decided until the deliveries are done.
+            (
+                "a_resumed_generation_does_not_end_with_a_detached_delivery_still_in_flight",
+                Status::Live,
+            ),
+            // …and what "survives" has to mean when a build disagrees with the
+            // record: an execution a divergence stopped is still open, because a
+            // resume against a `failed` row is refused by name and `serve`
+            // replays every open execution at every start.
+            (
+                "a_diverged_resume_leaves_the_execution_open_for_the_composition_that_fits_it",
+                Status::Live,
+            ),
+            // …and what a crash must not be able to do to the one artifact
+            // recovery reads: seal it. A writer killed inside a write leaves the
+            // driver's lock directory behind, and nothing else removes it.
+            (
+                "a_lock_a_killed_writer_left_behind_does_not_seal_the_journal",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
+/// PRD §7 M3's second bullet, its runtime half: the four built-ins, what bounds
+/// them, and what a bound being crossed does.
+///
+/// One sentence rather than an enumeration, so — like `HARNESS` and
+/// `DURABILITY` — its phrases are held to it by containment. Three claims: that
+/// the tools exist and run, that the root bounds them, and that the timeout
+/// does. The failure and refusal rules are not separate phrases of the bullet —
+/// resolved q31 states them as "the standing rules" — so they hang off the two
+/// bounds they are reached through.
+const BUILTINS: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::BuiltinTools,
+        phrase: "runtime bash/file tools",
+        tests: &[
+            // All four, in one turn, each asserted on something only a real call
+            // could produce — including the one whose effect outlives the
+            // process.
+            (
+                "every_builtin_runs_inside_its_root_and_answers_the_model",
+                Status::Live,
+            ),
+            // …and the one of the four whose answer is a shape rather than a
+            // value: a listing's ordering, its glob, and the flag that says it
+            // stopped short.
+            (
+                "a_listing_matches_globs_in_order_and_says_when_it_stopped_short",
+                Status::Live,
+            ),
+            // …and the half of the loop that is not the tool running: a call the
+            // schema refuses is the model's to make again, which is what keeps a
+            // built-in's contract the same contract every other tool surface has
+            // (Decision D119).
+            (
+                "arguments_a_builtin_refuses_bounce_back_to_the_model",
+                Status::Live,
+            ),
+            // …and what a built-in buys over the `exec:` tool an author could
+            // have hand-rolled: the journal holds its answer, so a resumed
+            // execution consumes it rather than running the command again.
+            (
+                "a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again",
+                Status::Live,
+            ),
+            // …and the one thing q31 says about *where* the shell comes from:
+            // `PATH`, at the call, with a host that has none failing as an
+            // execution failure that names the requirement.
+            (
+                "a_host_with_no_bash_on_path_fails_the_call_naming_the_requirement",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::BuiltinTools,
+        phrase: "opted into per agent node, bounded by root",
+        tests: &[
+            // The bound, crossed the way a string comparison would catch…
+            (
+                "a_path_that_climbs_out_of_the_root_is_refused_and_fails_the_node",
+                Status::Live,
+            ),
+            // …and the way only resolution does, which is what resolved q31
+            // spells out ("symlinks and `..` count").
+            (
+                "a_symlink_that_points_out_of_the_root_is_refused",
+                Status::Live,
+            ),
+            // …and the two shapes of that same crossing where there is nothing
+            // at the path to resolve, which is where q31 says the *parent* is
+            // resolved instead: a link pointing at a file that does not exist
+            // yet, and a new file under a linked directory. Both are writes, and
+            // a write is the one built-in whose escape leaves something behind.
+            (
+                "a_write_through_a_dangling_symlink_is_refused",
+                Status::Live,
+            ),
+            (
+                "a_write_to_a_new_file_under_a_symlinked_directory_is_refused",
+                Status::Live,
+            ),
+            // …and the crossing that asks no path at all: a listing walks where
+            // the tree goes, so it is the root check's other half — the walk
+            // stops at a link rather than reporting what is behind it.
+            (
+                "a_listing_does_not_descend_into_a_symlinked_directory",
+                Status::Live,
+            ),
+            // …and the two ways a bound can fail to be a bound at all: a root
+            // that names no directory, and one the environment answered with
+            // nothing — which would leave the tool bounded to wherever the
+            // runtime was started, the ambient capability D123 refuses.
+            (
+                "a_root_that_names_no_directory_fails_the_call",
+                Status::Live,
+            ),
+            (
+                "a_root_that_resolves_to_nothing_fails_the_call",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::BuiltinTools,
+        phrase: "bounded by root + timeout",
+        tests: &[
+            // The deadline, reached — and reached at the *attachment's* value,
+            // since the fixture binds the same built-in at two.
+            (
+                "a_command_that_outruns_its_timeout_is_killed_and_fails_the_node",
+                Status::Live,
+            ),
+            // …and the other execution failure a shell has, which is where the
+            // node's own `on_error:` gets to decide the run.
+            (
+                "a_command_that_exits_nonzero_fails_the_node_under_its_on_error",
+                Status::Live,
+            ),
+            // …and what the deadline has to end besides the shell: the work the
+            // command *forked*, which is where a shell's work almost always is
+            // — a kill aimed at the shell alone leaves it writing inside `root:`
+            // after the node has already failed (D124).
+            (
+                "a_killed_command_takes_the_work_it_forked_with_it",
+                Status::Live,
+            ),
+            // …and the same bound reached the other way, where the *run* is what
+            // ends: a command detached far enough for the deadline to reach it is
+            // detached out of the terminal's reach, so stopping the run has to
+            // take it along — and has to still stop the run.
+            (
+                "a_run_asked_to_stop_takes_its_command_with_it",
+                Status::Live,
+            ),
+            // …and what is left when the group kill cannot reach it: the pipes an
+            // escapee holds, which a runtime that kept them would go on reading —
+            // and be held open by — long after the call failed.
+            (
+                "a_killed_commands_grandchild_does_not_hold_the_runtime_open",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
+/// PRD §7 M3's HTTP-native events bullet, whose five clauses are the five
+/// claims that pass makes: who may call, which routes the answer covers, what a
+/// delivery says it is and where it may go, when one fires, and what makes it
+/// survive a restart.
+///
+/// The bullet is one sentence rather than an enumeration, so — like `HARNESS`
+/// and `DURABILITY` — its phrases are held to it by containment rather than by
+/// splitting on `, `. The resolved questions behind it (q32–q35) are quoted in
+/// each test.
+const EVENTS: &[Criterion] = &[
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "declarative auth on `http` triggers — inbound `bearer`/`hmac`",
+        tests: &[
+            // Both schemes, every way each can be wrong, and the half a status
+            // code cannot say: the counting shim is what makes "no execution
+            // started" an assertion rather than an inference.
+            (
+                "an_authenticated_start_admits_the_credential_it_declares_and_refuses_every_other",
+                Status::Live,
+            ),
+            // …and the credential that is *present* and verifies nothing, which
+            // §4.3's presence check counts as set: an empty token is equal to
+            // the empty token an anonymous caller sends, so the app refuses to
+            // start rather than serving a route that looks guarded.
+            (
+                "a_credential_set_to_nothing_refuses_the_app_at_launch",
+                Status::Live,
+            ),
+            // …and the request carrying *two*, which is the case a parsed
+            // header map cannot report: the runtimes a generated project runs
+            // under disagree about which of two values under one name they
+            // keep, so a route deciding on one of them admits a request whose
+            // credential depends on the launch.
+            (
+                "a_credential_a_request_carried_twice_verifies_nothing",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "an execution's resume/status routes enforcing the auth of the trigger that started it",
+        tests: &[
+            (
+                "an_executions_status_and_resume_enforce_the_auth_of_the_trigger_that_started_it",
+                Status::Live,
+            ),
+            // …and the scheme for which "the same auth" is a different
+            // credential on every request: an `hmac` signature is over the body
+            // that arrived, so the status route signs the empty one a `GET`
+            // carries and the resume route signs the answer exactly as sent.
+            (
+                "a_signed_executions_status_and_resume_verify_over_each_requests_own_body",
+                Status::Live,
+            ),
+            // …and the half one process cannot decide: the trigger is on the
+            // journal's lifecycle row, so a `serve` restarted while somebody was
+            // thinking goes on refusing the same callers.
+            (
+                "a_delivery_a_restart_interrupted_completes_under_the_same_id",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "signed and allowlisted callbacks",
+        tests: &[
+            (
+                "a_delivery_carries_the_identity_its_trigger_declared_over_the_bytes_it_sent",
+                Status::Live,
+            ),
+            // …and what the allowlist does with a URL it admits nowhere, which
+            // is a recorded refusal rather than anybody's failure.
+            (
+                "a_callback_url_the_allowlist_admits_nowhere_is_refused_and_the_run_settles",
+                Status::Live,
+            ),
+            // …and the URL whose text the list admits and whose *host* it never
+            // named: everything before an `@` is userinfo, so an entry with a
+            // wildcard where the port goes matches a string that resolves
+            // somewhere else entirely.
+            (
+                "a_callback_url_that_hides_its_host_behind_userinfo_is_refused",
+                Status::Live,
+            ),
+            // The list is matched **whenever** the URL is read, which includes
+            // the reading a restart does of a row an earlier build wrote: a
+            // deployment that narrows its allowlist does not deliver what the
+            // narrower list admits nowhere.
+            (
+                "a_pending_delivery_the_allowlist_no_longer_admits_is_refused_rather_than_sent",
+                Status::Live,
+            ),
+            // …and the cost of matching it, which the URL's author chooses: the
+            // callback URL comes out of the request payload, so an entry matched
+            // by anything that backtracks hands a caller the one thread that
+            // answers every route.
+            (
+                "a_long_callback_url_is_refused_without_wedging_the_app",
+                Status::Live,
+            ),
+            // …and the hop after the one the list matched: an admitted receiver
+            // answering `3xx` would otherwise carry the report, its signature
+            // and its token wherever its `Location:` named.
+            (
+                "a_receiver_that_redirects_a_delivery_sends_it_nowhere_else",
+                Status::Live,
+            ),
+            // The check behind the check: every signing assertion above compares
+            // against a digest this harness computed, which is worth something
+            // only if this side is right.
+            (
+                "the_harnesss_own_hmac_answers_the_published_vector",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "lifecycle webhooks (parkings and settle)",
+        tests: &[
+            (
+                "a_parking_and_a_settle_reach_the_callback_in_ascending_ordinals",
+                Status::Live,
+            ),
+            // The other half of "every quiescence that opened **new** pauses":
+            // a recovered execution re-parks under the ids its predecessor
+            // published and announces nothing, and a replay that diverges
+            // announces nothing either.
+            (
+                "a_recovered_execution_delivers_the_completion_webhook_its_caller_waits_for",
+                Status::Live,
+            ),
+            (
+                "a_diverged_recovery_delivers_no_webhook_and_the_repair_delivers_one",
+                Status::Live,
+            ),
+            // …and the claim no single-pause flow can make: **one** webhook per
+            // quiescence, listing every pause it opened, however far apart in
+            // time the branches reached them (resolved q34).
+            (
+                "one_quiescence_that_opened_many_pauses_is_one_parked_delivery",
+                Status::Live,
+            ),
+            // …and the work a quiescence is **not** about: a detached dispatch
+            // runs its sink's nodes under this execution's id, and grammar 8.6
+            // rule 7 says nothing it does may delay the enclosing instance —
+            // the webhook included.
+            (
+                "a_parking_is_delivered_while_a_detached_dispatch_is_still_running",
+                Status::Live,
+            ),
+        ],
+    },
+    Criterion {
+        bullet: Bullet::HttpEvents,
+        phrase: "journal-backed at-least-once callback delivery",
+        tests: &[
+            (
+                "a_delivery_two_refusals_could_not_stop_lands_on_the_third_attempt",
+                Status::Live,
+            ),
+            // …and the bound on it: exhaustion is recorded and is never the
+            // execution's failure.
+            (
+                "a_delivery_no_attempt_lands_is_recorded_exhausted_and_leaves_the_run_alone",
+                Status::Live,
+            ),
+            // The same bound in wall-clock time, which the row above cannot
+            // reach: its receiver refuses promptly, and a schedule of five
+            // prompt refusals is bounded however long one attempt may take.
+            (
+                "a_receiver_that_never_answers_does_not_hold_a_delivery_open",
+                Status::Live,
+            ),
+            // The schedule itself is a setting somebody has to be able to trust:
+            // one that could not be read is refused at launch rather than
+            // ignored (Decision D50).
+            (
+                "a_callback_retry_schedule_that_is_not_one_refuses_the_app_at_launch",
+                Status::Live,
+            ),
+            // …and the ledger the deliveries live in is a *compatible* change to
+            // the journal, which is only true if a journal written before it
+            // still opens (`docs/durability.md` §11.2).
+            (
+                "a_journal_written_before_the_delivery_ledger_opens_and_serves_under_this_build",
+                Status::Live,
+            ),
+            // The event a build cannot deliver is journaled rather than dropped,
+            // which is what makes "the row stays `pending` for a build that
+            // declares the trigger" a promise about something that exists.
+            (
+                "a_delivery_journaled_without_its_trigger_is_finished_by_a_build_that_declares_it",
+                Status::Live,
+            ),
+            // `serve` is not the only process that closes a lifecycle row, and a
+            // settle journaled after one closes is a settle no start can find:
+            // the hand resume records the intent before the row goes, and the
+            // next start delivers it.
+            (
+                "an_execution_finished_by_a_hand_resume_still_journals_the_settle_it_owes",
+                Status::Live,
+            ),
+            // …and the other end a delivery can reach without an attempt: a row
+            // whose schedule has no offset it has not already tried is exhausted
+            // rather than left owed for the life of the journal.
+            (
+                "a_pending_delivery_a_shorter_schedule_leaves_no_attempt_for_is_exhausted",
+                Status::Live,
+            ),
+            // …and the bound on what picking one up may cost: a webhook is a
+            // courtesy the status route backstops, so a journal read that fails
+            // while the owed ones are enumerated leaves one delivery owed rather
+            // than a deployment that never binds its port.
+            (
+                "a_delivery_whose_execution_cannot_be_read_leaves_the_app_serving",
+                Status::Live,
+            ),
+            // …and the row a start has nothing to read the trigger off: a
+            // delivery names its own, so the settle journaled for a run that
+            // failed before it was journaled at all is still one a later start
+            // can finish rather than one it skips for ever.
+            (
+                "a_settle_journaled_for_an_execution_the_journal_never_held_is_still_delivered",
+                Status::Live,
+            ),
+        ],
+    },
+];
+
+/// The http-native events rows are phrases of PRD §7 M3's fourth bullet.
+///
+/// Containment and normalization, for the reason the two siblings above give:
+/// the bullet is one sentence about five things, and the PRD wraps its prose, so
+/// a clause a reader hears as one spans two lines in the file.
+#[test]
+fn the_http_events_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("**HTTP-native events**");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in EVENTS {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's http-native events bullet: {flattened}",
+            criterion.phrase
+        );
+    }
+}
+
 fn rows() -> impl Iterator<Item = &'static Criterion> {
     CODEGEN
         .iter()
         .chain(COMMANDS)
         .chain(HARNESS)
         .chain(STRATEGY)
+        .chain(DURABILITY)
+        .chain(BUILTINS)
+        .chain(EVENTS)
 }
 
 fn repository() -> PathBuf {
@@ -1015,6 +1776,38 @@ fn bullet(opening: &str) -> String {
         .into_iter()
         .find(|line| line.starts_with(&format!("- {opening}")))
         .unwrap_or_else(|| panic!("PRD §7 M1 has a bullet opening `{opening}`"))
+}
+
+/// The text of PRD §7 M3 — everything between its heading and the next section.
+fn distribution() -> Vec<String> {
+    let prd = fs::read_to_string(repository().join("prd.md")).expect("the PRD is readable");
+    prd.lines()
+        .skip_while(|line| !line.starts_with("**M3 —"))
+        .take_while(|line| !line.starts_with("## "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// One bullet of PRD §7 M3, **whole**.
+///
+/// M1's bullets each fit on a line; M3's do not, and a reader of this file
+/// should not have to know which. So a bullet is the line that opens it plus
+/// every wrapped continuation under it — the lines up to the next one that
+/// starts a bullet of its own — joined back into the sentence the PRD wrote.
+fn distribution_bullet(opening: &str) -> String {
+    let lines = distribution();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with(&format!("- {opening}")))
+        .unwrap_or_else(|| panic!("PRD §7 M3 has a bullet opening `{opening}`"));
+    let mut held = vec![lines[at].clone()];
+    for line in &lines[at + 1..] {
+        if line.starts_with("- ") || line.trim().is_empty() {
+            break;
+        }
+        held.push(line.clone());
+    }
+    held.join(" ")
 }
 
 /// A bullet's list of items: everything after the first `: ` (where the bullet
@@ -1155,6 +1948,44 @@ fn the_inventory_transcribes_the_prd_m1_bullets() {
         HARNESS[0].phrase,
         "the harness bullet and the inventory's transcription of it have diverged"
     );
+}
+
+/// M3's durability rows are the PRD's own phrases too.
+///
+/// Containment rather than a split, for `HARNESS`'s reason: the bullet is one
+/// sentence and not a list. It is normalized first because the PRD wraps its
+/// prose, so a phrase that reads as one clause spans two lines in the file —
+/// which is a fact about the margin rather than about the promise.
+#[test]
+fn the_durability_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("**Durable execution**");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in DURABILITY {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's durable-execution bullet: {flattened}",
+            criterion.phrase
+        );
+    }
+}
+
+/// The built-in rows are phrases of PRD §7 M3's second bullet.
+///
+/// Containment and normalization, for the reason the sibling above gives: the
+/// bullet is one sentence about two things — provider-executed server tools and
+/// runtime ones — and the PRD wraps its prose, so a clause a reader hears as one
+/// spans two lines in the file.
+#[test]
+fn the_builtin_rows_transcribe_the_prd_m3_bullet() {
+    let bullet = distribution_bullet("**Built-in tools**");
+    let flattened = bullet.split_whitespace().collect::<Vec<_>>().join(" ");
+    for criterion in BUILTINS {
+        assert!(
+            flattened.contains(criterion.phrase),
+            "`{}` is not a phrase of PRD §7 M3's built-in-tools bullet: {flattened}",
+            criterion.phrase
+        );
+    }
 }
 
 /// The rows CLAUDE.md contributes are its own phrases too.
@@ -1318,6 +2149,21 @@ fn every_bullet_contributes_criteria() {
         (Bullet::Commands, 4, "the commands bullet's four items"),
         (Bullet::Harness, 1, "the harness bullet's single claim"),
         (Bullet::Strategy, 2, "CLAUDE.md's two generated-code gates"),
+        (
+            Bullet::Durability,
+            3,
+            "the durable-execution bullet's three claims",
+        ),
+        (
+            Bullet::BuiltinTools,
+            3,
+            "the built-in tools bullet's runtime half: the tools, the root, the timeout",
+        ),
+        (
+            Bullet::HttpEvents,
+            5,
+            "the http-native events bullet's five claims",
+        ),
     ] {
         let count = rows()
             .filter(|criterion| criterion.bullet == bullet)

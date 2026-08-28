@@ -1,0 +1,14 @@
+# rule: a known `server_tools:` entry declares the fields its tool requires (grammar 12.1, Decision D122)
+# code: missing-key
+# message: missing required key `vector_store_ids` in server tool `file_search` of `provider.main`
+# at: main.yml:14:7
+#
+# `file_search` with no store to search is a request the Responses API refuses,
+# and the one required field in the launch scope that is not a `name:`.
+version: "0.1"
+
+provider.main:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+  server_tools:
+    - type: file_search

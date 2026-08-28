@@ -289,19 +289,24 @@ fn an_assistant_turn_with_no_content_is_refused() {
     );
 }
 
-/// A call with no `x-api-key` is refused **401 `authentication_error`**, the
-/// status the Messages API answers and the one `@anthropic-ai/sdk` raises
-/// `AuthenticationError` from.
+/// A call with **no `x-api-key`** is served, because a composition is entitled
+/// to send none.
 ///
-/// The harness needs no API *keys* (WIRE-NOTES §12 — values are never compared),
-/// but the header still has to be there, and a missing one is an authentication
-/// failure rather than a malformed request: answering 400 would teach generated
-/// code to classify the two the same way. 401 is outside PRD 5.9's failover set
-/// and outside the SDK's retry set, so nothing else changes shape.
+/// Grammar 12.1 makes the key conditional on this kind (Decision D120): a
+/// provider that names a `base_url:` may declare none, and a compiled graph then
+/// sends no authentication header at all. This server stands in for whatever
+/// that `base_url:` names — routinely a gateway that injects the vendor
+/// credential itself — so requiring the header would refuse the one shape D120
+/// exists to admit, in CI, where this is the only endpoint a graph reaches
+/// (WIRE-NOTES (12)). The vendor's own host would answer 401; that divergence is
+/// the deliberate one this file records.
+///
+/// What is *not* relaxed is the rest of the envelope, which the second half
+/// pins: dropping the credential check did not drop the request check beside it.
 #[test]
-fn a_request_without_an_api_key_is_refused_as_authentication() {
+fn a_request_without_an_api_key_is_served() {
     let provider = MockProvider::start().expect("a port");
-    provider.enqueue(Script::new(MODEL, Outcome::text("never served")));
+    provider.enqueue(Script::new(MODEL, Outcome::text("served without a key")));
 
     let response = provider
         .client()
@@ -315,23 +320,23 @@ fn a_request_without_an_api_key_is_refused_as_authentication() {
                 })),
         )
         .expect("the route answers");
-    assert_eq!(response.status, 401);
-    let body = response.json();
-    assert_eq!(body["type"], "error");
-    assert_eq!(body["error"]["type"], "authentication_error");
-    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
-
-    let recorded = provider.requests();
-    assert!(!recorded[0].is_valid());
-    assert_eq!(recorded[0].failures()[0].pointer, "headers.x-api-key");
+    assert_eq!(response.status, 200);
     assert_eq!(
-        provider.snapshot().queues[MODEL],
-        1,
-        "an unauthenticated call consumes nothing"
+        response.json()["content"][0]["text"],
+        "served without a key"
     );
 
-    // Authentication is settled before the body is: a request that is both
-    // unauthenticated and malformed is the 401, naming the credential only.
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert!(
+        !recorded[0].headers.contains_key("x-api-key"),
+        "the request really carried no credential: {:?}",
+        recorded[0].headers
+    );
+    assert!(provider.snapshot().is_drained(), "the call was served");
+
+    // The body is still checked, and so is `anthropic-version`: a keyless
+    // request is a legal shape, not an unchecked one.
     let response = provider
         .client()
         .send(
@@ -340,27 +345,97 @@ fn a_request_without_an_api_key_is_refused_as_authentication() {
                 .json(&json!({ "model": MODEL })),
         )
         .expect("the route answers");
-    assert_eq!(response.status, 401);
-    let message = response.json()["error"]["message"]
-        .as_str()
-        .expect("a message")
-        .to_string();
-    assert!(message.contains("x-api-key"), "{message}");
-    assert!(!message.contains("max_tokens"), "{message}");
+    assert_eq!(response.status, 400);
+    assert_eq!(response.json()["error"]["type"], "invalid_request_error");
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
     assert_eq!(
         provider.requests()[1]
             .failures()
             .iter()
             .map(|failure| failure.pointer.as_str())
             .collect::<Vec<_>>(),
-        ["headers.x-api-key", "max_tokens", "messages"],
+        ["max_tokens", "messages"],
         "the transcript still records everything that was wrong"
     );
 
-    // …and a request that carries its key is refused at 400 as it always was.
     let response = send(&provider.client(), &json!({ "model": MODEL }));
-    assert_eq!(response.status, 400);
-    assert_eq!(response.json()["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        response.status, 400,
+        "and a keyed request is refused the same way"
+    );
+}
+
+/// An **empty** `x-api-key` is refused 401, because it is neither posture the
+/// grammar admits.
+///
+/// This is the half of WIRE-NOTES (12) the keyless relaxation must not take with
+/// it: only the *presence* requirement was dropped, not the check. A keyless
+/// provider sends no header at all — the emitted runtime's `credential` drops it
+/// rather than emptying it, precisely so a gateway is never handed a request
+/// that claims to authenticate with nothing. `x-api-key: ""` is therefore a
+/// codegen bug on the way to a live 401, and the harness has to be the one to
+/// find it.
+///
+/// A **gateway token under `authorization`** is the other direction and is
+/// served: `docs/topics/models.md` documents exactly that composition
+/// (`headers: { authorization: "Bearer ${PROXY_TOKEN}" }` on a keyless
+/// `kind: anthropic`), so this surface cannot treat the header as a misplaced
+/// vendor credential without refusing the shape D120 exists to admit.
+#[test]
+fn an_empty_api_key_is_refused_while_a_gateway_token_is_served() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text("served for the gateway")));
+
+    let body = json!({
+        "model": MODEL,
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "go" }],
+    });
+    let response = provider
+        .client()
+        .send(
+            Request::post("/v1/messages")
+                .header("x-api-key", "")
+                .header("anthropic-version", "2023-06-01")
+                .json(&body),
+        )
+        .expect("the route answers");
+    assert_eq!(response.status, 401);
+    assert_eq!(response.json()["error"]["type"], "authentication_error");
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    assert_eq!(
+        provider.requests()[0]
+            .failures()
+            .iter()
+            .map(|failure| failure.pointer.as_str())
+            .collect::<Vec<_>>(),
+        ["headers.x-api-key"],
+        "the body was well formed: only the credential is wrong"
+    );
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "a request refused for its credential consumes nothing"
+    );
+
+    let response = provider
+        .client()
+        .send(
+            Request::post("/v1/messages")
+                .header("authorization", "Bearer proxy-token")
+                .header("anthropic-version", "2023-06-01")
+                .json(&body),
+        )
+        .expect("the route answers");
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.json()["content"][0]["text"],
+        "served for the gateway"
+    );
+    assert!(
+        provider.snapshot().queues.is_empty(),
+        "the gateway call is the one that consumed the script"
+    );
 }
 
 /// Every failover condition PRD 5.9 names, on the wire, with the status and body
@@ -619,6 +694,211 @@ fn every_answer_carries_a_request_id_including_the_errors() {
     assert_eq!(malformed.status, 400);
     assert_eq!(malformed.header("request-id"), Some("req_mock_00000004"));
     assert_eq!(malformed.json()["request_id"], "req_mock_00000004");
+}
+
+/// A provider's `server_tools:` ride the same `tools` array as the agent's own,
+/// arrive **verbatim**, and are recorded apart from what the graph dispatches
+/// (grammar 12.1, Decision D122).
+#[test]
+fn a_declared_server_tool_arrives_verbatim_and_is_recorded_as_one() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let web_search = json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 5,
+        "allowed_domains": ["docs.example.com"],
+    });
+    let mut tools = output_schema_tool();
+    tools
+        .as_array_mut()
+        .expect("a tool list")
+        .push(web_search.clone());
+    let response = send(
+        &provider.client(),
+        &structured_request(tools, "reviewer_output"),
+    );
+    assert_eq!(response.status, 200, "{}", response.json());
+
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert_eq!(recorded[0].tools, ["reviewer_output"]);
+    assert_eq!(recorded[0].server_tools, ["web_search_20250305"]);
+    // Verbatim, field for field: this is the assertion resolved q30's
+    // pass-through exists for.
+    assert_eq!(recorded[0].body()["tools"][1], web_search);
+}
+
+/// The `tools` array is one namespace, and a name in it twice is a 400 whichever
+/// side runs the tool (`WIRE-NOTES` (22)).
+///
+/// Both shapes the compiler's `tool-name-collision` rule now refuses are refused
+/// here too, which is what lets the acceptance harness witness that rule rather
+/// than take the compiler's word for it: two dated revisions of one server tool
+/// carry one canonical `name:`, and a client tool may take a name the
+/// connection's suite already spends.
+#[test]
+fn a_name_the_tools_array_already_carries_is_refused_whichever_side_runs_it() {
+    let provider = MockProvider::start().expect("a port");
+    let client = provider.client();
+
+    let mut both_revisions = output_schema_tool();
+    let array = both_revisions.as_array_mut().expect("a tool list");
+    array.push(json!({ "type": "code_execution_20250522", "name": "code_execution" }));
+    array.push(json!({ "type": "code_execution_20250825", "name": "code_execution" }));
+    let response = send(
+        &client,
+        &structured_request(both_revisions, "reviewer_output"),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("Duplicate tool name `code_execution`"),
+        "{}",
+        response.json()
+    );
+
+    let mut against_a_client_tool = output_schema_tool();
+    let array = against_a_client_tool.as_array_mut().expect("a tool list");
+    array.push(json!({
+        "name": "web_search",
+        "description": "Search the web the long way round.",
+        "input_schema": { "type": "object" },
+    }));
+    array.push(json!({ "type": "web_search_20250305", "name": "web_search" }));
+    let response = send(
+        &client,
+        &structured_request(against_a_client_tool, "reviewer_output"),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].failures().len(), 1);
+    assert_eq!(recorded[0].failures()[0].pointer, "tools.2.name");
+    assert_eq!(recorded[1].failures().len(), 1);
+    assert_eq!(recorded[1].failures()[0].pointer, "tools.2.name");
+}
+
+/// A scripted server-tool use comes back as the pair of blocks the Messages wire
+/// answers with — the use, and the result the service produced for it — ahead of
+/// whatever the model then said. Nothing here is for the graph to run.
+#[test]
+fn a_scripted_server_tool_use_arrives_already_answered() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })).with_server_tools(
+            vec![mock_provider::ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "agent-compose" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            )],
+        ),
+    ));
+
+    let mut tools = output_schema_tool();
+    tools.as_array_mut().expect("a tool list").push(json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+    }));
+    let body = send(
+        &provider.client(),
+        &structured_request(tools, "reviewer_output"),
+    )
+    .json();
+    let content = body["content"].as_array().expect("a content list");
+    assert_eq!(
+        content.len(),
+        3,
+        "use, result, then the answer: {content:?}"
+    );
+    assert_eq!(content[0]["type"], "server_tool_use");
+    assert_eq!(content[0]["name"], "web_search");
+    assert_eq!(content[1]["type"], "web_search_tool_result");
+    assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
+    assert_eq!(content[2]["type"], "tool_use");
+    assert_eq!(content[2]["name"], "reviewer_output");
+}
+
+/// The turn above, replayed back on the next request — which is what a tool loop
+/// does — is accepted with its server-tool blocks intact.
+#[test]
+fn a_replayed_turn_carrying_server_tool_blocks_is_accepted() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let mut tools = output_schema_tool();
+    tools.as_array_mut().expect("a tool list").push(json!({
+        "type": "web_search_20250305",
+        "name": "web_search",
+    }));
+    let request = json!({
+        "model": MODEL,
+        "max_tokens": 4096,
+        "system": "You are a meticulous technical reviewer.",
+        "messages": [
+            { "role": "user", "content": "look it up" },
+            {
+                "role": "assistant",
+                "content": [
+                    { "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": { "query": "x" } },
+                    { "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [] },
+                    { "type": "text", "text": "I looked it up." },
+                ],
+            },
+            { "role": "user", "content": "now answer" },
+        ],
+        "tools": tools,
+        "tool_choice": { "type": "tool", "name": "reviewer_output" },
+    });
+    let response = send(&provider.client(), &request);
+    assert_eq!(response.status, 200, "{}", response.json());
+    assert!(
+        provider.requests()[0].is_valid(),
+        "{:?}",
+        provider.requests()[0].failures()
+    );
+}
+
+/// A provider runs only the server tools it was given.
+#[test]
+fn a_server_tool_the_request_did_not_declare_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::text("looked it up").with_server_tools(vec![mock_provider::ServerToolUse::new(
+            "web_fetch_20250910",
+            json!({}),
+            json!({}),
+        )]),
+    ));
+
+    let request = json!({
+        "model": MODEL,
+        "max_tokens": 4096,
+        "messages": [{ "role": "user", "content": "hello" }],
+    });
+    let response = send(&provider.client(), &request);
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("web_fetch_20250910")),
+        "{}",
+        response.json()
+    );
 }
 
 /// The same script answered twice is the same bytes, which is what makes a

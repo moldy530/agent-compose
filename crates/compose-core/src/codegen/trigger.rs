@@ -35,9 +35,9 @@
 //! is a `string` on both sides, and a number in a decoded body is whatever the
 //! body says it is.
 
-use crate::ast::trigger::{Respond, TriggerMethod};
+use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
 use crate::ir::Ir;
-use crate::ir::trigger::{HttpTrigger, TriggerKind};
+use crate::ir::trigger::{CallbackAuth, HttpTrigger, InboundAuth, TriggerKind};
 
 use super::{names, policy};
 
@@ -112,6 +112,71 @@ export interface HttpTrigger {
   sessionKey?(payload: unknown): string;
   /** `callback:` — the completion webhook, on an `async` trigger. */
   callback?(payload: unknown): string;
+  /**
+   * `auth:` — how a caller of this trigger is verified, and with it the resume
+   * and status routes of every execution it starts (grammar 13.3, PRD resolved
+   * q32).
+   *
+   * Absent leaves all three routes open.
+   */
+  readonly auth?: InboundAuth;
+  /** `callback_auth:` — how a delivery identifies itself (grammar 13.3). */
+  readonly callbackAuth?: CallbackAuth;
+  /**
+   * `callback_allow:` — where a callback may point.
+   *
+   * Absent is the documented test posture: the trigger signs nothing and may
+   * POST anywhere. Present, it is matched when the URL is *read* — at the
+   * delivery, not at the start — because the URL comes out of the request
+   * payload and is attacker-controlled by construction (Decision D110, D127).
+   */
+  readonly callbackAllow?: readonly string[];
+}
+
+/**
+ * The inbound scheme a trigger enforces, with every grammar 13.3 default
+ * already applied.
+ *
+ * Resolved rather than recorded-as-written, unlike `path:` and `method:`: every
+ * parameter that decides whether a credential verifies carries the value the
+ * trigger enforces, because a verifier that re-derived a default and got it
+ * wrong would not fail a build — it would accept the wrong request.
+ */
+export type InboundAuth =
+  | {
+      readonly scheme: "bearer";
+      /** Matched case-insensitively; HTTP/2 lowercases every name (grammar 13.3). */
+      readonly header: string;
+      readonly prefix: string;
+      /** The **variable name** holding the expected token; never the token. */
+      readonly tokenEnv: string;
+    }
+  | {
+      readonly scheme: "hmac";
+      readonly header: string;
+      readonly algorithm: "sha1" | "sha256" | "sha512";
+      readonly encoding: "hex" | "base64";
+      readonly prefix: string;
+      /** The **variable name** holding the signing key; never the key. */
+      readonly secretEnv: string;
+    };
+
+/**
+ * The outbound identity a delivery carries (grammar 13.3, PRD resolved q33).
+ *
+ * At least one half is present, and both together are legal: a receiver that
+ * checks a token and a receiver that verifies a signature are two receivers.
+ * Outbound signing takes no parameters — HMAC-SHA256 in hex under
+ * `X-AgentCompose-Signature` — so one receiver-side recipe verifies every
+ * agent-compose deployment.
+ */
+export interface CallbackAuth {
+  readonly bearer?: {
+    readonly header: string;
+    readonly prefix: string;
+    readonly tokenEnv: string;
+  };
+  readonly hmac?: { readonly secretEnv: string };
 }
 
 /**
@@ -245,10 +310,86 @@ fn http_table(ir: &Ir) -> String {
                 names::string(&format!("`{spelling}` of the trigger `{name}`"))
             ));
         }
+        if let Some(auth) = trigger.auth {
+            text.push_str(&inbound(auth));
+        }
+        if let Some(auth) = trigger.callback_auth {
+            text.push_str(&outbound(auth));
+        }
+        if let Some(allow) = &trigger.callback_allow {
+            text.push_str("    callbackAllow: [\n");
+            for pattern in allow {
+                text.push_str(&format!("      {},\n", names::string(pattern)));
+            }
+            text.push_str("    ],\n");
+        }
         text.push_str("  },\n");
     }
     text.push_str("];\n");
     text
+}
+
+/// The inbound scheme, with grammar 13.3's defaults already resolved by the IR.
+///
+/// The credential is the **variable name** and never the value: env refs
+/// survive unresolved into generated code (grammar 4.3, PRD resolved q15), and
+/// the emitted app reads `process.env` at the moment it verifies. What makes
+/// that safe is [`super::env`]'s walk over this same table — a deployment
+/// missing the variable is refused at launch rather than on the first real
+/// call.
+fn inbound(auth: &InboundAuth) -> String {
+    match auth {
+        InboundAuth::Bearer(bearer) => format!(
+            "    auth: {{\n      scheme: \"bearer\",\n      header: {},\n      prefix: {},\n      tokenEnv: {},\n    }},\n",
+            names::string(&bearer.header),
+            names::string(&bearer.prefix),
+            names::string(&bearer.token.value.name)
+        ),
+        InboundAuth::Hmac(hmac) => format!(
+            "    auth: {{\n      scheme: \"hmac\",\n      header: {},\n      algorithm: {},\n      encoding: {},\n      prefix: {},\n      secretEnv: {},\n    }},\n",
+            names::string(&hmac.header),
+            names::string(algorithm(hmac.algorithm)),
+            names::string(encoding(hmac.encoding)),
+            names::string(&hmac.prefix),
+            names::string(&hmac.secret.value.name)
+        ),
+    }
+}
+
+/// The outbound identity a delivery carries — one half, the other, or both.
+fn outbound(auth: &CallbackAuth) -> String {
+    let mut text = String::from("    callbackAuth: {\n");
+    if let Some(bearer) = &auth.bearer {
+        text.push_str(&format!(
+            "      bearer: {{ header: {}, prefix: {}, tokenEnv: {} }},\n",
+            names::string(&bearer.header),
+            names::string(&bearer.prefix),
+            names::string(&bearer.token.value.name)
+        ));
+    }
+    if let Some(hmac) = &auth.hmac {
+        text.push_str(&format!(
+            "      hmac: {{ secretEnv: {} }},\n",
+            names::string(&hmac.secret.value.name)
+        ));
+    }
+    text.push_str("    },\n");
+    text
+}
+
+const fn algorithm(algorithm: HmacAlgorithm) -> &'static str {
+    match algorithm {
+        HmacAlgorithm::Sha1 => "sha1",
+        HmacAlgorithm::Sha256 => "sha256",
+        HmacAlgorithm::Sha512 => "sha512",
+    }
+}
+
+const fn encoding(encoding: SignatureEncoding) -> &'static str {
+    match encoding {
+        SignatureEncoding::Hex => "hex",
+        SignatureEncoding::Base64 => "base64",
+    }
 }
 
 /// One `manual` trigger, lowered to what the emitted table says about it.
@@ -287,6 +428,9 @@ struct Emitted<'ir> {
     input: Vec<(&'ir str, &'ir str)>,
     session_key: Option<&'ir str>,
     callback: Option<&'ir str>,
+    auth: Option<&'ir InboundAuth>,
+    callback_auth: Option<&'ir CallbackAuth>,
+    callback_allow: Option<Vec<&'ir str>>,
 }
 
 /// The declared `http` triggers, in the IR's canonical order.
@@ -343,6 +487,14 @@ fn triggers(ir: &Ir) -> Vec<Emitted<'_>> {
                 .callback
                 .as_ref()
                 .map(|callback| callback.value.as_str()),
+            auth: http.auth.as_ref(),
+            callback_auth: http.callback_auth.as_ref(),
+            callback_allow: http.callback_allow.as_ref().map(|patterns| {
+                patterns
+                    .iter()
+                    .map(|pattern| pattern.value.as_str())
+                    .collect()
+            }),
         });
     }
     found
@@ -453,6 +605,145 @@ flow.ask:
             .next()
             .expect("the route table comes first");
         assert!(!routes.contains("\"cli\""), "{emitted}");
+    }
+
+    /// The composition every authentication key is written out in, so the
+    /// emitted table can be read for what each one lands as.
+    const GUARDED: &str = r#"version: "0.1"
+
+flow.support:
+  outputs: {}
+  nodes:
+    approve:
+      human:
+        input: {}
+        output:
+          decision: { enum: [approve, reject] }
+  edges:
+    - { from: start, to: approve }
+    - { from: approve, to: end }
+
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        header: X-Hub-Signature-256
+        algorithm: sha512
+        encoding: base64
+        prefix: "sha512="
+    callback_auth:
+      bearer:
+        token: ${CALLBACK_TOKEN}
+        header: X-Delivery-Token
+        prefix: "Token "
+      hmac:
+        secret: ${CALLBACK_SECRET}
+    callback_allow:
+      - "https://hooks.example.com/*"
+      - "http://localhost:9000/*"
+
+  minimal:
+    type: http
+    flow: flow.support
+    path: /minimal
+    auth:
+      bearer:
+        token: ${WEBHOOK_TOKEN}
+"#;
+
+    /// Every parameter that decides whether a credential verifies reaches the
+    /// table, **resolved** (grammar 13.3, PRD resolved q32).
+    ///
+    /// A verifier is the wrong place to re-derive a default: getting one wrong
+    /// there does not fail a build, it accepts the wrong request. So the
+    /// undeclared half of `minimal`'s `bearer:` lands as `Authorization` and
+    /// `Bearer ` rather than as an absence for the app to fill in.
+    #[test]
+    fn an_authenticated_trigger_carries_its_scheme_resolved() {
+        let emitted = module(&ir_of(GUARDED)).contents;
+        assert!(
+            emitted.contains(
+                "    auth: {\n      scheme: \"hmac\",\n      header: \"X-Hub-Signature-256\",\n      \
+                 algorithm: \"sha512\",\n      encoding: \"base64\",\n      prefix: \"sha512=\",\n      \
+                 secretEnv: \"WEBHOOK_SECRET\",\n    },\n"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "    auth: {\n      scheme: \"bearer\",\n      header: \"Authorization\",\n      \
+                 prefix: \"Bearer \",\n      tokenEnv: \"WEBHOOK_TOKEN\",\n    },\n"
+            ),
+            "{emitted}"
+        );
+    }
+
+    /// Both outbound schemes together are legal, and the allowlist travels
+    /// with them (grammar 13.3, PRD resolved q33).
+    #[test]
+    fn a_signed_delivery_carries_both_schemes_and_its_allowlist() {
+        let emitted = module(&ir_of(GUARDED)).contents;
+        assert!(
+            emitted.contains(
+                "    callbackAuth: {\n      bearer: { header: \"X-Delivery-Token\", \
+                 prefix: \"Token \", tokenEnv: \"CALLBACK_TOKEN\" },\n      \
+                 hmac: { secretEnv: \"CALLBACK_SECRET\" },\n    },\n"
+            ),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains(
+                "    callbackAllow: [\n      \"https://hooks.example.com/*\",\n      \
+                 \"http://localhost:9000/*\",\n    ],\n"
+            ),
+            "{emitted}"
+        );
+    }
+
+    /// A credential reaches the table as the **variable name** it was written
+    /// as, never as a value (grammar 4.3, PRD resolved q15).
+    ///
+    /// `build` resolves nothing, so the emitted project is committable and the
+    /// same artifact runs in two deployments holding different secrets. What
+    /// makes that safe is [`super::env`]'s walk: the launch check refuses a
+    /// deployment missing one of these names.
+    #[test]
+    fn a_credential_reaches_the_table_as_a_name_and_never_as_a_value() {
+        let emitted = module(&ir_of(GUARDED)).contents;
+        for reference in [
+            "${WEBHOOK_SECRET}",
+            "${CALLBACK_TOKEN}",
+            "${CALLBACK_SECRET}",
+        ] {
+            assert!(
+                !emitted.contains(reference),
+                "the table interpolates nothing: {emitted}"
+            );
+        }
+        assert!(
+            emitted.contains("secretEnv: \"WEBHOOK_SECRET\""),
+            "{emitted}"
+        );
+    }
+
+    /// A trigger declaring none of the three carries none of the three.
+    #[test]
+    fn an_open_trigger_carries_no_authentication_keys() {
+        let emitted = module(&ir_of(PROJECT)).contents;
+        for key in ["auth:", "callbackAuth:", "callbackAllow:"] {
+            let routes = emitted
+                .split("export const httpTriggers")
+                .nth(1)
+                .expect("the route table is emitted");
+            assert!(
+                !routes.contains(key),
+                "an open trigger emits no `{key}`: {emitted}"
+            );
+        }
     }
 
     /// A sync trigger that declares no `timeout:` takes grammar 13.3's default.
