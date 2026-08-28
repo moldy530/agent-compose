@@ -1,0 +1,154 @@
+name: Auto release
+
+# A merge to `main` becomes a release, when the commits earned one.
+#
+# Squash merges use the PR title as the commit subject and PR titles are held
+# to Conventional Commits, so `main`'s first-parent history is a machine-
+# readable bump ledger: `feat:` earns a minor release, `fix:`/`perf:` a patch,
+# and a breaking change (`!` in the subject, or a `BREAKING CHANGE:` footer) a
+# major — read as a minor while the major is still 0, the pre-1.0 convention.
+# Anything else — docs, chore, ci, test, refactor, build — earns no release on
+# its own and rides along with the next one. GitHub's generated notes read
+# well for the same reason the ledger does: the subjects carry the changelog.
+#
+# The decision reads subjects only, never bodies: a squash body lists the
+# branch's inner commits, and an inner `feat:` bullet is not a released
+# feature. The one thing read out of bodies is the `BREAKING CHANGE:` footer,
+# which is defined to live there.
+#
+# When a bump is due, this calls the same `release-artifacts.yml` the tag path
+# and the dry run call — the tag's version is stamped into every build — and
+# publishes with `gh release create`, which also creates the tag. A tag
+# created by `GITHUB_TOKEN` fires no workflows, so `release.yml` does not run
+# a second copy; that path remains as the manual override (skip a number,
+# re-cut a failed release) and both paths stay the same build.
+#
+# Serialized, never cancelled: two merges racing would otherwise both read the
+# same "last tag" and earn the same number. The second run starts after the
+# first has created its tag, sees it, and counts only the newer commits.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    name: Decide
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The decision is over history since the last release tag, so it
+          # needs both: every commit, and every tag.
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Read the bump the commits earned
+        id: bump
+        run: |
+          last="$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD 2>/dev/null || true)"
+          if [ -z "$last" ]; then
+            base="0.0.0"
+            range="HEAD"
+          else
+            base="${last#v}"
+            range="$last..HEAD"
+          fi
+          subjects="$(git log --first-parent --format='%s' $range)"
+          bodies="$(git log --first-parent --format='%b' $range)"
+          bump=none
+          if printf '%s\n' "$subjects" | grep -Eq '^[a-z]+(\([^)]*\))?!:' \
+             || printf '%s\n' "$bodies" | grep -Eq '^BREAKING[ -]CHANGE:'; then
+            bump=breaking
+          elif printf '%s\n' "$subjects" | grep -Eq '^feat(\([^)]*\))?:'; then
+            bump=minor
+          elif printf '%s\n' "$subjects" | grep -Eq '^(fix|perf)(\([^)]*\))?:'; then
+            bump=patch
+          fi
+          major="${base%%.*}"; rest="${base#*.}"; minor="${rest%%.*}"; patch="${rest#*.}"
+          case "$bump" in
+            breaking)
+              if [ "$major" -eq 0 ]; then minor=$((minor+1)); patch=0; else major=$((major+1)); minor=0; patch=0; fi ;;
+            minor) minor=$((minor+1)); patch=0 ;;
+            patch) patch=$((patch+1)) ;;
+            none)
+              echo "since ${last:-the beginning}: nothing releasable; no tag"
+              echo "tag=" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+          esac
+          tag="v$major.$minor.$patch"
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "::error::the commits since $last earn $tag, but that tag already exists — resolve by hand (a stale tag from a failed release is the usual cause: delete or re-point it)"
+            exit 1
+          fi
+          echo "since ${last:-the beginning}: $bump -> $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  artifacts:
+    needs: decide
+    if: needs.decide.outputs.tag != ''
+    uses: ./.github/workflows/release-artifacts.yml
+    with:
+      expected-version: ${{ needs.decide.outputs.tag }}
+      # No cargo cache on this path: nothing a previous run left behind can
+      # reach a binary somebody downloads.
+      targets: >-
+        [
+          {"triple": "x86_64-unknown-linux-musl", "runner": "ubuntu-latest"},
+          {"triple": "aarch64-unknown-linux-musl", "runner": "ubuntu-latest"},
+          {"triple": "x86_64-apple-darwin", "runner": "macos-14"},
+          {"triple": "aarch64-apple-darwin", "runner": "macos-14"}
+        ]
+
+  publish:
+    name: Publish
+    needs: [decide, artifacts]
+    if: needs.decide.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      # The one write in the pipeline, and the only job that has it. Creating
+      # the release also creates the tag, at the commit this run is for.
+      contents: write
+    env:
+      VERSION: ${{ needs.artifacts.outputs.version }}
+      TAG: ${{ needs.decide.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Four archives and one file vouching for all of them, exactly as
+      # `release.yml` assembles them — the two publish jobs are deliberate
+      # twins, and an edit to one belongs in the other.
+      - name: Assemble, and checksum
+        run: |
+          cd dist
+          ls -l
+          found="$(find . -maxdepth 1 -name 'agent-compose-*.tar.gz' | wc -l)"
+          if [ "$found" -ne 4 ]; then
+            echo "::error::a release carries four archives; this run produced $found"
+            exit 1
+          fi
+          sha256sum agent-compose-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the release, and with it the tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --target "$GITHUB_SHA" \
+            --generate-notes \
+            dist/agent-compose-"$VERSION"-*.tar.gz dist/SHA256SUMS
