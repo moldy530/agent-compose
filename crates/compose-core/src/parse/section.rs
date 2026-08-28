@@ -897,6 +897,9 @@ fn callback_allow(
 /// The arms are ordered so each one is the *only* answer to some entry — an
 /// empty entry names the emptiness, a blank one names the whitespace — because
 /// an arm no entry reaches is a message no fixture pins and no reader has read.
+/// `HTTPS://…` has an arm of its own for that reason: it *is* a scheme a
+/// callback is delivered over, so the general refusal would be telling its
+/// author their scheme is not one of two schemes, one of which is theirs.
 fn allow_problem(pattern: &str) -> Option<String> {
     if pattern.is_empty() {
         return Some("is empty".to_string());
@@ -908,6 +911,20 @@ fn allow_problem(pattern: &str) -> Option<String> {
         return Some("names no scheme, and a callback URL is absolute".to_string());
     };
     if !matches!(scheme, "http" | "https") {
+        // A scheme is case-insensitive in a URL and an entry is *text*: it is
+        // matched against the callback URL as written, so `HTTPS://` admits
+        // only a payload that spelled it that way too — an entry refusing the
+        // deliveries its author meant to admit, which is the same statically
+        // visible dead surface the empty list is. Refused, then, and with the
+        // spelling as the repair rather than the two schemes as the rule.
+        if let Some(spelling) = ["http", "https"]
+            .into_iter()
+            .find(|known| known.eq_ignore_ascii_case(scheme))
+        {
+            return Some(format!(
+                "names the scheme `{scheme}`, and an entry is matched against the callback URL as written — write `{spelling}://`"
+            ));
+        }
         return Some(format!(
             "names the scheme `{scheme}`, and a callback is delivered over `http` or `https`"
         ));
@@ -933,7 +950,7 @@ fn allow_problem(pattern: &str) -> Option<String> {
 }
 
 /// What an entry is, for every refusal.
-const ALLOW_HELP: &str = "an entry is an absolute URL naming a host, with `*` standing for any run of characters, matched against the whole callback URL — `https://hooks.example.com/*`; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)";
+const ALLOW_HELP: &str = "an entry is an absolute URL naming a host, its scheme written lowercase, with `*` standing for any run of characters, matched against the whole callback URL — `https://hooks.example.com/*`; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)";
 
 /// A `callback_auth:`/`callback_allow:` on a trigger that delivers no webhook
 /// (grammar 13.3).

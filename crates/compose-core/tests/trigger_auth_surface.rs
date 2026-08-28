@@ -529,6 +529,9 @@ fn an_allowlist_entry_is_an_absolute_url_that_names_a_host() {
         "hooks.example.com/*",
         // A scheme no callback is delivered over.
         "ftp://hooks.example.com/*",
+        // …and one that *is* one of the two, spelled in a case the match will
+        // never see: an entry is compared to the URL as written.
+        "HTTPS://hooks.example.com/*",
         // A scheme and nothing at all after it…
         "https://",
         // …and the three ways a host can be missing from something that has an
@@ -567,6 +570,24 @@ fn an_allowlist_entry_is_an_absolute_url_that_names_a_host() {
             render(&parsed.diagnostics)
         );
     }
+
+    // A case-varied scheme gets a message of its own, and this is what it is
+    // for: `HTTPS` *is* one of the two schemes a callback is delivered over, so
+    // the general refusal would tell its author their scheme is not one of two
+    // schemes, one of which is theirs — a sentence with no repair in it. The
+    // spelling is the repair, and the message has to carry it.
+    let parsed = parse_str(&allowlist("HTTPS://hooks.example.com/*"), "main.yml");
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.ends_with(
+                "it names the scheme `HTTPS`, and an entry is matched against the callback URL \
+                 as written — write `https://`"
+            )),
+        "a scheme written in another case is refused by its spelling, got:\n{}",
+        render(&parsed.diagnostics)
+    );
 }
 
 /// The outbound `hmac:` takes `secret:` and nothing else (grammar 13.3,

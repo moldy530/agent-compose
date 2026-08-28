@@ -4031,7 +4031,11 @@ against the **whole** callback URL string, with no `**` distinction (a URL is
 not a path tree). An entry naming no scheme, an unsupported scheme, no host at
 all (`https:///deliveries`), or an empty or whitespace-bearing value is a
 compile error, and so is an **empty list**: an allowlist that admits
-nothing refuses every delivery, which is a webhook that can never fire.
+nothing refuses every delivery, which is a webhook that can never fire. The
+scheme is written **lowercase**, because an entry is matched as written: a URL
+scheme is case-insensitive to a browser and `HTTPS://hooks.example.com/*` is
+still a string no lowercase callback URL matches, so it is refused with the
+spelling as the repair rather than admitted as an allowlist that admits nothing.
 `callback_auth:` or `callback_allow:` on a trigger with **no `callback:`** is a
 compile error too, the mirror of `timeout:` on an async trigger
 ([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)): the key describes a
@@ -7024,9 +7028,16 @@ wherever it is legal, because the alternative — a wildcard that stopped at one
 is the second kind this entry leaves to the PRD.
 
 *Scheme-anchored*, because a match that could not name the scheme would
-let one entry admit URLs that merely begin with the same characters. *`http`
-stays legal*: localhost development is the common first case, and refusing it
-would push every author to a workaround worse than the rule. *Non-empty*,
+let one entry admit URLs that merely begin with the same characters. *And
+spelled lowercase*, because the entry is compared to the URL as text: `HTTPS://`
+is the scheme a callback is delivered over written in a case the match will
+never see, so the entry admits nothing — the empty list's dead surface in a
+single entry, and the one refusal here whose message has to name the *spelling*
+rather than the two schemes, since telling that author their scheme is not one
+of two schemes, one of which is theirs, is a message with no repair in it.
+*`http` stays legal*: localhost development is the common first case, and
+refusing it would push every author to a workaround worse than the rule.
+*Non-empty*,
 because an allowlist satisfied by nothing refuses every delivery — a statically
 visible webhook that can never fire, and the same guaranteed-dead-end posture
 §7.6.3 takes. Matching itself is a

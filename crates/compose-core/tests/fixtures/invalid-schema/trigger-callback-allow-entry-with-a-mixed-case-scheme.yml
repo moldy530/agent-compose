@@ -1,0 +1,10 @@
+# rule: a `callback_allow:` entry spells its scheme lowercase, since the entry is matched as written (grammar 13.3 / Decision D127)
+# at: /triggers/intake/callback_allow/0
+# via: /$defs/callbackAllow/items/allOf/1/pattern
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "HTTPS://hooks.example.com/*"

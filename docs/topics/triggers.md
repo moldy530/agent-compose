@@ -222,9 +222,11 @@ parking or settle, and recorded as a refused delivery, once the runtime reads th
 list at all.
 
 An entry is an absolute `http`/`https` URL with `*` standing for any run of
-characters, matched against the whole callback URL. `http` stays legal — a
-localhost receiver is the common first case. An empty list is an error: an
-allowlist admitting nothing refuses every delivery. Either key on a trigger with
+characters, matched against the whole callback URL. Write the scheme lowercase:
+the entry is compared as written, so `HTTPS://…` matches nothing and is refused
+with the spelling as the repair. `http` stays legal — a localhost receiver is
+the common first case. An empty list is an error: an allowlist admitting nothing
+refuses every delivery. Either key on a trigger with
 no `callback:` is an error too — it describes a delivery that never happens.
 
 **Write the host out.** `*` crosses `/` and `?` like any other character, so
