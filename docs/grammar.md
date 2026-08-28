@@ -4247,6 +4247,15 @@ caller** and is indistinguishable, from outside, from a guarded route. The keys
 are a declaration of what a deployment will enforce, so anything that needs the
 guarantee before M3 puts a gateway in front of the generated app.
 
+A wrong claim about a security control is worse than a missing one, and this one
+has to be retracted in the same change that makes it false — so it is bound to
+the compiler's behaviour rather than left to a reviewer's memory:
+`crates/compose-core/tests/trigger_auth_surface.rs` asserts that a built project
+carries **none** of an authenticated trigger's material, and enumerates every
+document repeating the claim — here, §13.3, both topics, and the
+`missing-callback-allowlist` explanation. The commit that teaches `serve` to
+verify a caller fails that test until those sentences go with it.
+
 `human` nodes were on this list and have left it: the runtime landed in M2, so a
 compiled project really pauses, publishes the question, and resumes (§8.7). What
 is still deferred is not the construct but its **durability** — a wait is a

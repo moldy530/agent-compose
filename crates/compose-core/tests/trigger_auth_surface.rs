@@ -371,6 +371,98 @@ fn a_delivery_header_is_refused_outbound_and_stays_legal_inbound() {
     );
 }
 
+/// The reserved claim, bound to the thing it claims — and the list of what to
+/// unwind when it stops holding.
+///
+/// `auth:`, `callback_auth:` and `callback_allow:` are reserved grammar
+/// (grammar 15): parsed, checked, carried into the IR, and read by **nothing**
+/// that is generated. That asymmetry is why five shipped documents say so in
+/// as many words — a no-op `schedule` runs nothing and is visibly inert, while
+/// a no-op `auth:` serves every caller and looks exactly like a guarded route,
+/// so a reader told otherwise is told something false about a security control.
+///
+/// The obligation runs the other way too: the change that makes these keys live
+/// must delete those sentences in the same commit, or the shipped binary tells
+/// an operator through `agent-compose docs triggers` and `agent-compose explain
+/// missing-callback-allowlist` that nothing is enforced while the served app
+/// enforces both. This test is what makes that a build failure rather than a
+/// reviewer's memory. When the runtime lands, the first half fails, and these
+/// are the five places to unwind:
+///
+/// * `docs/grammar.md` §13.3 ("reserved grammar in v0") and §15 (three rows)
+/// * `docs/topics/triggers.md` ("All three keys below are reserved in v0" and
+///   the closing "What `reserved` means")
+/// * `docs/topics/targets.md` (three rows)
+/// * `crates/compose-core/src/docs/codes/missing-callback-allowlist.md`
+///   ("This check is live; the matching it demands is not")
+#[test]
+fn the_auth_surface_is_reserved_grammar_and_every_document_saying_so_is_listed_here() {
+    let ir = resolve_clean("reserved", &source());
+    let generated = compose_core::emit(&ir);
+    // Every value that would have to reach the runtime for one of these keys to
+    // be enforced: the credentials, the header names, and the allowlist.
+    for material in [
+        "WEBHOOK_SECRET",
+        "WEBHOOK_TOKEN",
+        "CALLBACK_SECRET",
+        "CALLBACK_TOKEN",
+        "X-Hub-Signature-256",
+        "X-Delivery-Token",
+        "hooks.example.com",
+        "X-AgentCompose-",
+    ] {
+        for file in generated.files() {
+            assert!(
+                !file.contents.contains(material),
+                "`{}` carries `{material}`, so the authentication surface is no longer inert — \
+                 the documents this test names have to stop saying it is",
+                file.path
+            );
+        }
+    }
+
+    // …and the documents that say it. Each is checked for the sentence that
+    // would become false, so one deleted early fails here rather than silently.
+    let triggers = compose_core::docs::topic("triggers").expect("the `triggers` topic ships");
+    let targets = compose_core::docs::topic("targets").expect("the `targets` topic ships");
+    let allowlist = compose_core::docs::explanation(
+        compose_core::docs::codes::named("missing-callback-allowlist")
+            .expect("the code is registered"),
+    );
+    let grammar = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("the manifest directory has a grandparent")
+            .join("docs/grammar.md"),
+    )
+    .expect("the grammar is readable");
+    for (document, claim) in [
+        (grammar.as_str(), "are reserved grammar in v0"),
+        (
+            grammar.as_str(),
+            "| `triggers.<t>.auth` | parsed + validated, no-op",
+        ),
+        (triggers.body, "All three keys below are reserved in v0"),
+        (triggers.body, "## What `reserved` means"),
+        (
+            targets.body,
+            "| `triggers.<t>.callback_allow` | parsed + validated, no-op",
+        ),
+        (
+            allowlist,
+            "This check is live; the matching it demands is not",
+        ),
+    ] {
+        assert!(
+            document.contains(claim),
+            "a document that states the reserved posture no longer contains {claim:?} — \
+             if the runtime landed, unwind all five sites this test names; if it did not, \
+             the sentence has to come back"
+        );
+    }
+}
+
 /// `callback_allow:` without `callback_auth:` is legal too: an allowlist bounds
 /// where a webhook may go whether or not the delivery is signed, and the
 /// mandatory direction is only the other one.
