@@ -112,7 +112,7 @@ pub const TOPICS: &[Topic] = &[
     },
     Topic {
         name: "triggers",
-        summary: "`manual` and `http` entrypoints, respond modes, session keys, idempotency",
+        summary: "`manual`/`http` entrypoints, respond modes, webhook auth and signing, idempotency",
         body: include_str!("../../../../docs/topics/triggers.md"),
     },
     Topic {

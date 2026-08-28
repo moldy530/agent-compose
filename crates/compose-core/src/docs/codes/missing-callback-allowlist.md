@@ -4,8 +4,10 @@
 
 An `http` trigger that authenticates its outbound callbacks and does not say
 where they may go. `callback_auth:` is opt-in, and declaring it makes
-`callback_allow:` mandatory — the one place in this grammar where writing a key
-makes a second key required.
+`callback_allow:` mandatory. Writing one key to require a second is rare here
+but not unique: a `human:` node's `timeout:` and `on_timeout:` are declared
+together or not at all (`missing-key`), and an edge's `max_iterations:` is legal
+only where a `when:` is (`invalid-value`). What is unique is the reason.
 
 The reason is what a callback URL *is*. It comes from the request payload
 (`callback: "payload.body.callback_url"`), so whoever calls the trigger chooses
@@ -50,9 +52,15 @@ Two repairs, and either one is complete.
 
 **Declare the allowlist** — the receivers this trigger is allowed to deliver to,
 as absolute `http`/`https` URL patterns where `*` stands for any run of
-characters. A callback URL outside the list is refused when it is read, at
+characters. A callback URL outside the list will be refused when it is read, at
 parking or at settle, and recorded as a refused delivery rather than as anybody's
 failure.
+
+**This check is live; the matching it demands is not.** `callback_auth:` and
+`callback_allow:` are reserved grammar in v0 (grammar §15): parsed, checked, and
+carried into the IR, and read by nothing generated yet — a built app signs no
+delivery and refuses no URL. Declaring them says what the deployment will
+enforce; anything that needs the guarantee today keeps a gateway in front.
 
 **Or drop `callback_auth:`** when the trigger is a development or test entry
 point. Then the deployment signs nothing, claims nothing, and may POST wherever
@@ -86,5 +94,5 @@ triggers:
       - "https://hooks.example.com/*"
 ```
 
-Grammar: `docs/grammar.md` §13.3, §4.3, Decision D126. Topic:
+Grammar: `docs/grammar.md` §13.3, §4.3, §15, Decision D126. Topic:
 `agent-compose docs triggers`.

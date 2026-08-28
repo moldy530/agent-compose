@@ -153,9 +153,19 @@ validated against the interrupting `human` node's output schema.
 
 ## Authenticating an `http` trigger
 
-A generated app is the thing a webhook vendor calls directly, so it verifies
-callers itself. Auth is **per trigger, never server-wide**: who may invoke this
-flow is readable off the trigger that exposes it.
+**All three keys below are reserved in v0.** `auth:`, `callback_auth:` and
+`callback_allow:` are **fully specified, parsed, type-checked, and carried into
+the IR**, and nothing generated reads them yet: a served trigger declaring
+`auth:` is exactly as open as one declaring none, and a callback still POSTs
+wherever the payload pointed. Everything below is the contract the runtime is
+written against, not what `serve` enforces today — until it lands, a deployment
+that needs these guarantees puts a gateway in front. The closing section, "What
+`reserved` means", says the same thing once for every construct in this topic.
+
+A generated app is the thing a webhook vendor calls directly, so verifying
+callers is its job rather than a gateway's. Auth is **per trigger, never
+server-wide**: who may invoke this flow is readable off the trigger that exposes
+it.
 
 ```yaml
 auth:                            # exactly ONE of bearer | hmac
@@ -204,8 +214,10 @@ callback_allow:
 error, `missing-callback-allowlist`, not a warning. The callback URL comes from
 the payload and is attacker-controlled by construction, so a deployment careful
 enough to authenticate its deliveries must not hand them, credential and all, to
-whatever host a payload named. A URL outside the list is refused when it is read,
-at parking or settle, and recorded as a refused delivery.
+whatever host a payload named. That compile error is live today; the matching it
+demands is not — a URL outside the list will be refused when it is read, at
+parking or settle, and recorded as a refused delivery, once the runtime reads the
+list at all.
 
 An entry is an absolute `http`/`https` URL with `*` standing for any run of
 characters, matched against the whole callback URL. `http` stays legal — a
@@ -228,9 +240,8 @@ arrival**.
 
 ## `schedule` and `event` — reserved
 
-Both are **fully parsed, type-checked, and carried into the IR**, and execute as
-no-ops in v0. Using one is never an error; relying on its runtime effect is a
-documented no-op.
+Both are reserved in the sense the closing section gives: **fully parsed,
+type-checked, and carried into the IR**, and executed as no-ops in v0.
 
 ```yaml
 nightly:
@@ -285,4 +296,24 @@ variable, a `function:` target an `idempotency_key` field on its invocation
 context. It is delivery metadata, never part of the target's input schema, and
 never authored — there is nothing here for `validate` to reject.
 
-Normative source: `docs/grammar.md` §9.4, §13, §13.1–13.5
+## What `reserved` means
+
+Reserved constructs are **fully specified, parsed, type-checked, and carried
+into the IR**, and execute as no-ops in v0. Using one is never an error; relying
+on its runtime effect is a documented no-op.
+
+| Construct | Status in v0 |
+|---|---|
+| `triggers.<t>.type: schedule` | parsed + validated, no-op |
+| `triggers.<t>.type: event` | parsed + validated, no-op |
+| `triggers.<t>.auth` | parsed + validated, no-op — the route serves unauthenticated |
+| `triggers.<t>.callback_auth` | parsed + validated, no-op — deliveries carry no credential |
+| `triggers.<t>.callback_allow` | parsed + validated, no-op — no URL is refused |
+
+The three authentication keys are the ones worth reading twice: a no-op
+`schedule` runs nothing and is visibly inert, while a no-op `auth:` serves every
+caller and looks exactly like a guarded route. Read them as a declaration of
+what the deployment will enforce, and put a gateway in front of anything that
+needs the guarantee today.
+
+Normative source: `docs/grammar.md` §9.4, §13, §13.1–13.5, §15

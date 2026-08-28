@@ -218,6 +218,9 @@ on its runtime effect is a documented no-op.
 | `triggers.<t>.type: schedule` | parsed + validated, no-op |
 | `triggers.<t>.type: event` | parsed + validated, no-op |
 | `network:` on a placement | parsed, no-op |
+| `triggers.<t>.auth` | parsed + validated, no-op — the route serves unauthenticated |
+| `triggers.<t>.callback_auth` | parsed + validated, no-op — deliveries carry no credential |
+| `triggers.<t>.callback_allow` | parsed + validated, no-op — no callback URL is refused |
 
 `human` nodes were on this list and have left it: the runtime landed, so a
 compiled project really pauses and resumes — and their durability has left it

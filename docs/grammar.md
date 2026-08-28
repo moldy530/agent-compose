@@ -3906,6 +3906,14 @@ a flow input field can accept it.
 - Generated apps expose `start`, `resume`, and `status` routes; resume payloads
   are validated against the interrupting `human` node's output schema (PRD 5.11).
 
+**`auth:`, `callback_auth:` and `callback_allow:` are reserved grammar in v0**
+(§15): fully specified here, parsed, checked, and carried into the IR, and read
+by nothing the compiler generates yet. A served trigger declaring `auth:` is
+exactly as open as one declaring none, and a callback is still delivered to
+whatever URL the payload named. Everything the rest of §13.3 states in the
+present tense is what the M3 runtime is written against — a deployment that needs
+the guarantee before then keeps its gateway.
+
 **Authenticating the caller: `auth:`.** v0's posture was "deploy behind your own
 gateway". Webhook-style events make the generated app the thing a vendor calls
 directly, so it verifies callers itself (PRD resolved q32). Auth is declared
@@ -4031,7 +4039,8 @@ retry, so a parking delivery and a settle delivery **can arrive out of order**:
 receivers order by `X-AgentCompose-Ordinal`, never by arrival (PRD resolved q35).
 
 The runtime half of all of this — verifying, signing, matching, delivering — is
-M3's; §13.3 is the grammar it is written against.
+M3's; §13.3 is the grammar it is written against, and §15 lists the three keys
+among the constructs a v0 deployment must not rely on.
 
 ### 13.4 `schedule` (RESERVED grammar — parsed and validated, no-op in v0)
 
@@ -4208,6 +4217,16 @@ its runtime effect is a documented no-op (PRD 5.10, 5.11).
 | `triggers.<t>.type: schedule` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: event` | parsed + validated, no-op | M3 |
 | `network:` on a placement | parsed, no-op | M3 |
+| `triggers.<t>.auth` | parsed + validated, no-op — the route serves unauthenticated | M3 |
+| `triggers.<t>.callback_auth` | parsed + validated, no-op — deliveries carry no credential | M3 |
+| `triggers.<t>.callback_allow` | parsed + validated, no-op — no callback URL is refused | M3 |
+
+The last three rows are the ones that read differently from the rest, and §13.3
+says so where it specifies them. A no-op `schedule` runs nothing, which is
+visible the first morning it does not fire; a no-op `auth:` **serves every
+caller** and is indistinguishable, from outside, from a guarded route. The keys
+are a declaration of what a deployment will enforce, so anything that needs the
+guarantee before M3 puts a gateway in front of the generated app.
 
 `human` nodes were on this list and have left it: the runtime landed in M2, so a
 compiled project really pauses, publishes the question, and resumes (§8.7). What
