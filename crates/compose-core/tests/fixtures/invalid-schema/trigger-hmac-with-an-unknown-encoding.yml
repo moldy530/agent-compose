@@ -1,0 +1,11 @@
+# rule: an inbound `hmac:` reads its signature in one of a closed set of encodings (grammar 13.3 / PRD resolved q32)
+# at: /triggers/intake/auth/hmac/encoding
+# via: /$defs/inboundHmac/properties/encoding/enum
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    auth:
+      hmac:
+        secret: ${WEBHOOK_SECRET}
+        encoding: base64url

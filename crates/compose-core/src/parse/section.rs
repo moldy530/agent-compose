@@ -1110,6 +1110,7 @@ fn trigger_input(fields: &mut Fields<'_>, cx: &mut Cx) -> Option<crate::ast::bin
 #[cfg(test)]
 mod tests {
     use crate::ast::document::Document;
+    use crate::ast::trigger::{HmacAlgorithm, SignatureEncoding};
     use crate::parse_str;
 
     /// The `imports:` entries a file yields, with the drop count the resolver
@@ -1171,6 +1172,37 @@ mod tests {
         assert_eq!(
             imports("imports:\n  - models.yml\n  - models.yml\n"),
             (vec!["models.yml".to_string()], 0)
+        );
+    }
+
+    /// The keyword tables an inbound `hmac:` is read against are their closed
+    /// sets themselves: one row per variant, spelled as the variant spells
+    /// itself, in the order grammar 13.3 lists them.
+    ///
+    /// Both tables are hand-written pairs, and the published schema's two
+    /// `enum`s are held to `HmacAlgorithm::ALL` and `SignatureEncoding::ALL`
+    /// rather than to these rows (`schema_conformance`). A row added here alone
+    /// would therefore let `agent-compose validate` accept a keyword neither the
+    /// enum nor the published schema knows — an editor squiggling YAML that
+    /// compiles, which is the asymmetry Appendix B forbids — and the drift is
+    /// one no test standing outside this module can see.
+    #[test]
+    fn the_signature_keyword_tables_are_their_closed_sets() {
+        let algorithms: Vec<(&str, HmacAlgorithm)> = super::HMAC_ALGORITHMS.to_vec();
+        assert_eq!(
+            algorithms,
+            HmacAlgorithm::ALL
+                .iter()
+                .map(|algorithm| (algorithm.as_str(), *algorithm))
+                .collect::<Vec<_>>()
+        );
+        let encodings: Vec<(&str, SignatureEncoding)> = super::SIGNATURE_ENCODINGS.to_vec();
+        assert_eq!(
+            encodings,
+            SignatureEncoding::ALL
+                .iter()
+                .map(|encoding| (encoding.as_str(), *encoding))
+                .collect::<Vec<_>>()
         );
     }
 
