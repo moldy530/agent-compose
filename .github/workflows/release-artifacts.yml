@@ -17,8 +17,8 @@ name: Release artifacts
 #   * a Linux binary is **statically linked** (PRD 5.12's single-binary posture:
 #     it must survive an alpine container and an old glibc alike), and a macOS
 #     one links nothing the system does not ship;
-#   * `--version` names the crate version the archive is named for and the
-#     target it was built for;
+#   * `--version` names the version the tag names — stamped into the build, so
+#     the archive's name and the binary's answer cannot disagree with the tag;
 #   * `init` then `validate` — the first two steps of the discovery loop
 #     (PRD §7 M2), run through the binary that is about to be published.
 
@@ -33,8 +33,10 @@ on:
       expected-version:
         description: >-
           The release tag these artifacts claim to be (`v0.1.0`). When it is
-          set, the crate version must equal it or nothing is built. Empty on the
-          dry-run path, which claims no version.
+          set, the tag is the version: every leg stamps it into the workspace
+          before building, so pushing a tag is the whole release ceremony.
+          Empty on the dry-run path, which claims no version and builds the
+          crate version as committed.
         required: false
         default: ''
         type: string
@@ -55,9 +57,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The guard, and the single place the version is read. Everything downstream
-  # takes the number from here, so an artifact's name, the tag it was released
-  # under, and what `--version` prints cannot disagree.
+  # The single place the version is decided. Everything downstream takes the
+  # number from here, so an artifact's name, the tag it was released under, and
+  # what `--version` prints cannot disagree.
+  #
+  # A tag *names* the version rather than being held equal to a number the
+  # repository must already carry. The alternative — refusing when the tag and
+  # `Cargo.toml` disagreed — made every release a version-bump commit and a
+  # retag when they drifted, a ceremony with two moving parts where one number
+  # suffices; and because generated projects write the crate version into their
+  # file headers, each bump churned every golden fixture for no behavioural
+  # change. The one-number guarantee did not move, it changed enforcement: each
+  # build leg stamps the tag's version into the workspace before compiling, and
+  # the smoke test still refuses a binary whose `--version` is not the number
+  # its archive is named for (PRD §9.24, owner correction 2026-08-28).
   version:
     name: Version
     runs-on: ubuntu-latest
@@ -65,26 +78,29 @@ jobs:
       version: ${{ steps.crate.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      # `cargo metadata` rather than a hand-parse of `Cargo.toml`: the version
-      # lives in `[workspace.package]` and the package that names the binary
-      # inherits it, so the manifest a parse would reach for does not carry the
-      # number. It costs the pinned toolchain's install to read one string, and
-      # buys an answer that stays right when the manifests are rearranged.
-      - name: Read the crate version, and hold the tag to it
+      # On the tag path the tag is the answer, held only to being shaped like a
+      # version. On the dry-run path there is no tag, so the crate version is
+      # read as before — `cargo metadata` rather than a hand-parse, because the
+      # version lives in `[workspace.package]` and the package that names the
+      # binary inherits it.
+      - name: Decide the version these artifacts are
         id: crate
         env:
           EXPECTED: ${{ inputs.expected-version }}
         run: |
-          version="$(cargo metadata --format-version 1 --no-deps \
-            | jq -r '.packages[] | select(.name == "agent-compose") | .version')"
-          if [ -z "$version" ] || [ "$version" = "null" ]; then
-            echo "::error::could not read the \`agent-compose\` version out of cargo metadata"
-            exit 1
-          fi
-          claimed="${EXPECTED#v}"
-          if [ -n "$claimed" ] && [ "$claimed" != "$version" ]; then
-            echo "::error::the tag says $EXPECTED and Cargo.toml says $version. A release names one build: retag, or bump the crate version"
-            exit 1
+          if [ -n "$EXPECTED" ]; then
+            if ! printf '%s' "$EXPECTED" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::the tag $EXPECTED is not shaped like a release (vMAJOR.MINOR.PATCH), so there is no version to build"
+              exit 1
+            fi
+            version="${EXPECTED#v}"
+          else
+            version="$(cargo metadata --format-version 1 --no-deps \
+              | jq -r '.packages[] | select(.name == "agent-compose") | .version')"
+            if [ -z "$version" ] || [ "$version" = "null" ]; then
+              echo "::error::could not read the \`agent-compose\` version out of cargo metadata"
+              exit 1
+            fi
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "building agent-compose $version"
@@ -126,6 +142,32 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: ${{ matrix.target.triple }}
+
+      # The tag names the version, so the build carries it: patch the one
+      # `version =` line `[workspace.package]` holds (both crates inherit it),
+      # then bring `Cargo.lock` along so the `--locked` build below still
+      # vouches for every dependency — `--workspace --offline` rewrites only
+      # the workspace members' own entries and touches no registry. `perl -pi`
+      # rather than `sed -i`, because this step runs on BSD sed's runners too.
+      # The committed crate version stays a development placeholder the dry
+      # run builds under; nothing here is pushed anywhere.
+      - name: Stamp the version the tag names
+        if: inputs.expected-version != ''
+        run: |
+          lines="$(grep -c '^version = ' Cargo.toml)"
+          if [ "$lines" -ne 1 ]; then
+            echo "::error::expected exactly one workspace version line in Cargo.toml, found $lines — the stamp would be ambiguous"
+            exit 1
+          fi
+          perl -pi -e 's/^version = ".*"$/version = "$ENV{VERSION}"/' Cargo.toml
+          grep '^version = ' Cargo.toml
+          cargo update --workspace --offline
+          stamped="$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "agent-compose") | .version')"
+          if [ "$stamped" != "$VERSION" ]; then
+            echo "::error::stamping failed: the workspace says $stamped where the tag says $VERSION"
+            exit 1
+          fi
 
       # `qemu-aarch64-static` runs a *static* aarch64 binary directly — no
       # container, no `binfmt` registration, no privileged step — which is

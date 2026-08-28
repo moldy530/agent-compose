@@ -3,9 +3,11 @@ name: Release
 # A tagged commit becomes downloadable binaries (PRD §7 M2).
 #
 # Push `v<version>` and this builds the four artifacts, checks each one, and
-# publishes them with a `SHA256SUMS` over all four. The tag must equal the crate
-# version — `release-artifacts.yml`'s `version` job is the guard, and it names
-# both numbers when they disagree.
+# publishes them with a `SHA256SUMS` over all four. The tag *names* the
+# version: each build leg stamps it into the workspace before compiling, so
+# pushing the tag is the whole ceremony — no version-bump commit, no retag.
+# The smoke test still holds every binary's `--version` to the number its
+# archive is named for (PRD §9.24, owner correction 2026-08-28).
 #
 # The build steps are not written here. They are `release-artifacts.yml`, which
 # every pull request runs too (`release-dry-run.yml`), so the day a release is
