@@ -511,6 +511,10 @@ fn a_transport_header_is_refused_outbound_and_stays_legal_inbound() {
 ///
 /// The bullet is located rather than the document searched, because the failure
 /// is exactly a claim living under the *other* scheme.
+///
+/// What the runtime *does* about the requirement is the sibling below's, and the
+/// two are worth having separately: this one fails when a document stops asking,
+/// which is how the next implementer comes to write the wrong comparison.
 #[test]
 fn both_inbound_schemes_require_a_constant_time_comparison() {
     let grammar = fs::read_to_string(
@@ -541,10 +545,100 @@ fn both_inbound_schemes_require_a_constant_time_comparison() {
             assert!(
                 bullet(document, scheme).contains("constant"),
                 "{source}'s `{scheme}` bullet no longer requires a constant-time comparison, \
-                 and it is the only place the runtime is told to make one"
+                 and it is where the next implementer of this surface reads about one"
             );
         }
     }
+}
+
+/// …and the app **makes** one, on both schemes (grammar 13.3, Decision D125).
+///
+/// The requirement above is the only security property this surface has, and
+/// until the runtime landed prose was the whole of what held it. It is not any
+/// more, and a document nobody disagrees with is the weakest possible binding
+/// for a property whose loss is invisible: a later cleanup writes `return
+/// offered === expected` — the `TextEncoder` round trip reads as ceremony — and
+/// every gate in this repository stays green, because every other assertion
+/// about `auth:` is about *which* requests are refused and none is about how
+/// long a refusal took. What ships then leaks, byte by byte to a caller who can
+/// time it, the expected HMAC digest for a body of that caller's choosing, and
+/// a request forged with a digest recovered that way is accepted without the
+/// caller ever holding `${WEBHOOK_SECRET}`.
+///
+/// So it is read off the emitted app, at the seam rather than over the file:
+/// **both** of `verified`'s schemes have to reach the comparison, which is the
+/// asymmetry D125 is written about, and the comparison has to be the one
+/// `node:crypto` provides. A file-wide search for `timingSafeEqual` would be
+/// satisfied by the bearer half alone.
+#[test]
+fn both_inbound_schemes_compare_in_constant_time_in_the_generated_app() {
+    let ir = resolve_clean("constant-time", &source());
+    let generated = compose_core::emit(&ir);
+    let app = generated
+        .files()
+        .iter()
+        .find(|file| file.path == "src/serve.ts")
+        .expect("every project emits the app over its triggers")
+        .contents
+        .clone();
+
+    // The three routes' one guard, split at the digest: what is before
+    // `createHmac` is the `bearer` half and what is after it is the `hmac` half.
+    let verified = function_body(&app, "function verified(");
+    let digest = verified
+        .find("createHmac(")
+        .expect("`verified` computes the signature it verifies");
+    for (half, scheme) in [
+        (&verified[..digest], "bearer"),
+        (&verified[digest..], "hmac"),
+    ] {
+        assert!(
+            half.contains("equal("),
+            "`verified`'s `{scheme}` half compares the credential itself rather than through \
+             the constant-time comparison, so a caller who can time a refusal recovers what \
+             this trigger expects (grammar 13.3, D125)"
+        );
+    }
+
+    let equal = function_body(&app, "function equal(");
+    assert!(
+        equal.contains("timingSafeEqual("),
+        "the comparison both schemes reach no longer uses `node:crypto`'s constant-time one: \
+         a byte-by-byte early return leaks the token to a caller who can time it, and the \
+         expected digest for a body of that caller's choosing (grammar 13.3, D125)"
+    );
+    assert!(
+        !equal.contains("offered ===") && !equal.contains("=== offered"),
+        "the credential a caller offered is compared directly somewhere in `equal`, which is \
+         the leak `timingSafeEqual` is there to prevent however the call beside it reads"
+    );
+    assert!(
+        app.contains("import { createHmac, timingSafeEqual } from \"node:crypto\";"),
+        "`src/serve.ts` no longer takes its comparison from the runtime's own crypto module"
+    );
+}
+
+/// The body of one top-level declaration of an emitted module.
+///
+/// `compose-core`'s own `codegen::journal` and `tests/trace_format_inventory.rs`
+/// read the emitted modules the same way, and for the same reason: a rule about
+/// what one function does is only a rule if it is read off that function rather
+/// than off the file around it. The module is formatted, so a top-level
+/// declaration opens at column zero and closes on a line that is exactly `}`.
+fn function_body(source: &str, header: &str) -> String {
+    let mut lines = source.lines().skip_while(|line| !line.starts_with(header));
+    let opened = lines
+        .next()
+        .unwrap_or_else(|| panic!("`src/serve.ts` declares `{header}…`"));
+    let mut held = String::from(opened);
+    for line in lines {
+        held.push('\n');
+        held.push_str(line);
+        if line == "}" {
+            return held;
+        }
+    }
+    panic!("`{header}…` has no closing brace in the first column")
 }
 
 /// The enforced claim, bound to the thing that enforces it — and the list of
