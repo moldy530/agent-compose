@@ -1572,13 +1572,21 @@ pub fn settled(app: &Client, execution: &str) -> Value {
 /// a run — it lands some time after the event it reports, which is what
 /// at-least-once with a retry schedule means. A test that read either straight
 /// after a `202` would be asserting about scheduling luck.
+///
+/// `#[track_caller]` because the condition is the *caller's* closure and the
+/// message here cannot describe it: what a reader needs when this times out is
+/// the line that was waiting, not the line that counted.
+#[track_caller]
 pub fn until<T>(budget: Duration, wanted: impl Fn() -> Option<T>) -> T {
     let deadline = Instant::now() + budget;
     loop {
         if let Some(answer) = wanted() {
             return answer;
         }
-        assert!(Instant::now() < deadline, "this never became true");
+        assert!(
+            Instant::now() < deadline,
+            "what this call was waiting for never became true inside {budget:?}"
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
