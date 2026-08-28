@@ -397,12 +397,21 @@ touched.
 | member | what it names |
 |---|---|
 | `"flow"` | a flow's declared `inputs:` and `outputs:` — its module signature (grammar 7.5), which is also its signature as an agent's tool |
-| `"trigger"` | a trigger's delivery surface: its type, its route and method, its response mode and timeout, its callback, its `session_key:`, and its `input:` bindings |
+| `"trigger"` | a trigger's delivery surface: its type, its route and method, its response mode and timeout, its callback, its authentication — `auth:`, `callback_auth:` and `callback_allow:` — its `session_key:`, and its `input:` bindings |
 
 Paths on a flow's record are rooted at `inputs` or at `outputs`, so a reader
 never has to ask which surface a change is on. A trigger's `name` is not on its
 record here either, for §4's reason: it repeats the key the trigger is declared
 under.
+
+A trigger's authentication is on this surface rather than among its components
+because it is part of what a caller meets: whether a route verifies anybody, and
+where a delivery may go, are the two questions an operator reading a diff asks
+about a webhook. So an `auth:` block appearing reads as an added key, and
+repointing a credential at another variable reads as
+`~ trigger.intake / callback_auth.bearer.token.env_ref: "CALLBACK_TOKEN" -> "DELIVERY_TOKEN"`
+— the reference moves, never a secret, because a secret is never in the spec
+(grammar 4.3, 13.3).
 
 ## 7. Validation
 
