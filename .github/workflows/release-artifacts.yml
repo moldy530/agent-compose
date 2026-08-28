@@ -146,11 +146,15 @@ jobs:
       # The tag names the version, so the build carries it: patch the one
       # `version =` line `[workspace.package]` holds (both crates inherit it),
       # then bring `Cargo.lock` along so the `--locked` build below still
-      # vouches for every dependency — `--workspace --offline` rewrites only
-      # the workspace members' own entries and touches no registry. `perl -pi`
-      # rather than `sed -i`, because this step runs on BSD sed's runners too.
-      # The committed crate version stays a development placeholder the dry
-      # run builds under; nothing here is pushed anywhere.
+      # vouches for every dependency — `--workspace` rewrites only the
+      # workspace members' own entries and leaves every real dependency at its
+      # locked version. NOT `--offline`: re-resolving even the members alone
+      # reads the registry index, and a fresh runner has none — the flag only
+      # ever passed against a warm local cache, and it protected nothing, since
+      # the build below downloads the locked crates over the network anyway.
+      # `perl -pi` rather than `sed -i`, because this step runs on BSD sed's
+      # runners too. The committed crate version stays a development
+      # placeholder the dry run builds under; nothing here is pushed anywhere.
       - name: Stamp the version the tag names
         if: inputs.expected-version != ''
         run: |
@@ -161,7 +165,7 @@ jobs:
           fi
           perl -pi -e 's/^version = ".*"$/version = "$ENV{VERSION}"/' Cargo.toml
           grep '^version = ' Cargo.toml
-          cargo update --workspace --offline
+          cargo update --workspace
           stamped="$(cargo metadata --locked --format-version 1 --no-deps \
             | jq -r '.packages[] | select(.name == "agent-compose") | .version')"
           if [ "$stamped" != "$VERSION" ]; then
