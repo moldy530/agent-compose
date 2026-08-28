@@ -11,8 +11,10 @@
 // The driver is copied *into* the project before it is run, so the bare
 // `node-sqlite3-wasm` specifier below resolves exactly as the emitted
 // `src/journal.ts` resolves it: the same pinned driver, the same virtual file
-// system, the same locking (none). A second SQLite reached from this repository
-// would be a different implementation answering a question about this one.
+// system, the same file locking. A second SQLite reached from this repository
+// would be a different implementation answering a question about this one —
+// and, under `--query`, one contending with a live `serve` for a file whose
+// locking it did not share.
 //
 // It reads as well as writes, under `--query`: what a delivery row *says* is
 // the only place some claims can be read from — a build that does not declare an
@@ -39,6 +41,12 @@ const { Database } = loaded.default ?? loaded;
 
 const database = new Database(journal);
 try {
+  // **First**, exactly as `src/journal.ts` does it and for its reason: a
+  // `--query` runs against a journal a live `serve` is still writing, and a
+  // statement that arrives while that process holds the file fails outright
+  // unless this has already told SQLite to wait. Five seconds is the emitted
+  // module's own `LOCK_WAIT_MS`, so the reader is as patient as the writer.
+  database.exec("PRAGMA busy_timeout = 5000;");
   const sql = readFileSync(script, "utf8");
   if (mode === "--query") {
     process.stdout.write(`${JSON.stringify(database.all(sql))}\n`);
