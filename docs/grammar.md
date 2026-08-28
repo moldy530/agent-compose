@@ -3860,7 +3860,7 @@ defaulted `session_key:`, exists implicitly for every flow (§13 preamble).
 | `callback` | CEL over `payload` → string | no | — | completion webhook; `async` only |
 | `auth` | block; exactly one of `bearer:`/`hmac:` | no | — | how an inbound call is authenticated; absent leaves the route open |
 | `callback_auth` | block; at least one of `bearer:`/`hmac:`, both legal | no | — | how a delivery identifies itself; requires `callback:`, and makes `callback_allow:` MANDATORY |
-| `callback_allow` | non-empty list of URL patterns | with `callback_auth` | — | where a callback may point; requires `callback:` |
+| `callback_allow` | non-empty list of URL patterns, each with a literal host | with `callback_auth` | — | where a callback may point; requires `callback:` |
 
 `payload` shape: `payload.body` (decoded JSON object), `payload.query` (map of
 string), `payload.headers` (map of string, lowercase names), `payload.path`
@@ -4022,24 +4022,29 @@ that need one.
 each entry is an absolute URL whose scheme is `http` or `https`, with `*` meaning
 "any run of characters" — one wildcard kind, matched against the **whole**
 callback URL string, with no `**` distinction (a URL is not a path tree). An
-entry naming no scheme, an unsupported scheme, or an empty or whitespace-bearing
-value is a compile error, and so is an **empty list**: an allowlist that admits
+entry naming no scheme, an unsupported scheme, an empty or whitespace-bearing
+value, or a `*` anywhere in its **host** is a compile error, and so is an
+**empty list**: an allowlist that admits
 nothing refuses every delivery, which is a webhook that can never fire.
 `callback_auth:` or `callback_allow:` on a trigger with **no `callback:`** is a
 compile error too, the mirror of `timeout:` on an async trigger
 ([D81](#d81-timeout-is-illegal-on-an-async-http-trigger)): the key describes a
 delivery this trigger never makes.
 
-**Anchor the host against the scheme.** `*` is *any* run of characters, and it
-crosses `/` and `?` like any other — there is no delimiter it stops at. So a
-wildcard written before a host suffix constrains no host:
-`https://*.hooks.example.com/*` is matched by
+**The host is written out literally, and that is a compile error to get wrong.**
+`*` is *any* run of characters, and it crosses `/` and `?` like any other —
+there is no delimiter it stops at. So a wildcard reaching the host constrains no
+host: `https://*.hooks.example.com/*` is matched by
 `https://attacker.test/collect?x=.hooks.example.com/y`, where the leading `*`
-consumed a host, a path and a query on its way to the literal after it. Write
-the host as a literal from the scheme onwards — `https://hooks.example.com/*` —
-and give a second subdomain a second entry. A pattern whose first `*` falls
-inside the host is the one shape of this key that reads like a constraint and
-is not one.
+consumed a host, a path and a query on its way to the literal after it, and
+`https://hooks.example.com*` is matched by
+`https://hooks.example.com.evil.test/collect`, where the trailing one simply
+continued the name. Both are refused: an entry's host runs from the scheme to
+the first `/`, `?` or `#` and carries no `*` — `https://hooks.example.com/*`,
+`https://hooks.example.com:9000/*` — and a second subdomain gets a second entry.
+An allowlist made mandatory by
+[D126](#d126-callback_auth-makes-callback_allow-mandatory) and satisfiable by
+`https://*` would be a ceremony rather than a guarantee.
 
 **The delivery wire.** A callback fires on lifecycle events — every quiescence
 that opened new pauses, and settle — carrying the status route's report plus
@@ -6946,24 +6951,33 @@ rather than silence. *PRD resolved q33, §13.3, G3.*
 ### D127. A callback allowlist entry is a wildcard URL, and the delivery wire is fixed
 
 A `callback_allow:` entry is an absolute `http`/`https` URL in which `*` matches
-any run of characters, matched against the whole callback URL; the list is
-non-empty. Every delivery carries the `X-AgentCompose-*` headers §13.3
-tabulates, and outbound `hmac:` signing is HMAC-SHA256 in hex with no keys of
-its own (§13.3).
+any run of characters, matched against the whole callback URL; its host — the
+run from the scheme to the first `/`, `?` or `#` — is literal, and a `*` there
+is a compile error; the list is non-empty. Every delivery carries the
+`X-AgentCompose-*` headers §13.3 tabulates, and outbound `hmac:` signing is
+HMAC-SHA256 in hex with no keys of its own (§13.3).
 
 **Rationale**. *One wildcard kind*, unlike §5.5's `glob:`: `**` earns its
 existence where a path tree has a directory boundary to be significant about,
 and a URL has no such boundary — `*` against the whole string is what an author
 writing `https://hooks.example.com/*` already means, and a second wildcard would
 only invite the question of what it did differently. The cost of having no
-boundary is that a `*` **crosses `/` and `?`**, so a wildcard standing before a
-host suffix constrains no host at all: `https://*.hooks.example.com/*` is
-satisfied by `https://attacker.test/collect?x=.hooks.example.com/y`, because the
-first `*` is free to consume a host, a path and a query on its way to the
-literal that follows. An entry therefore has to anchor its host against the
-scheme, and §13.3 says so where an author reads it — the alternative, a wildcard
-that stopped at a delimiter, is the second wildcard kind this entry just
-refused. *Scheme-anchored*, because a match that could not name the scheme would
+boundary is that a `*` **crosses `/` and `?`**, so a wildcard reaching the host
+constrains no host at all: `https://*.hooks.example.com/*` is satisfied by
+`https://attacker.test/collect?x=.hooks.example.com/y`, because the first `*` is
+free to consume a host, a path and a query on its way to the literal that
+follows, and `https://hooks.example.com*` by
+`https://hooks.example.com.evil.test/collect`, because a name is a prefix of
+longer ones. *A literal host*, then, and refused at compile time rather than
+warned about in prose: [D126](#d126-callback_auth-makes-callback_allow-mandatory)
+makes the list mandatory precisely so an authenticated deployment cannot deliver
+wherever a payload said, and a mandatory list whose every entry may be
+`https://*` is a ceremony rather than that guarantee — the one shape of this key
+that reads like a constraint and is not one, refused in the pass that reads it.
+The rule is about the *entry*, not about matching: `*` still crosses every
+delimiter wherever it is legal, because the alternative — a wildcard that stopped
+at one — is the second wildcard kind this entry just refused. *Scheme-anchored*,
+because a match that could not name the scheme would
 let one entry admit URLs that merely begin with the same characters. *`http`
 stays legal*: localhost development is the common first case, and refusing it
 would push every author to a workaround worse than the rule. *Non-empty*,

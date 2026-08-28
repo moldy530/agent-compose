@@ -656,6 +656,21 @@ fn the_published_schema_accepts_the_whole_trigger_auth_surface() {
             "callback": "payload.body.callback_url",
             "callback_allow": ["https://hooks.example.com/*"],
         }),
+        // The allowlist shapes the host-literal rule must not take with it
+        // (Decision D127): a port, a query string, and an exact URL carrying no
+        // wildcard at all. The refusals are fixtures; a pattern written one
+        // character too tight refuses these instead, and only this direction
+        // sees it.
+        json!({
+            "type": "http",
+            "flow": "flow.f",
+            "callback": "payload.body.callback_url",
+            "callback_allow": [
+                "https://hooks.example.com:9000/*",
+                "https://hooks.example.com?tenant=*",
+                "https://hooks.example.com/webhooks/intake",
+            ],
+        }),
     ];
     for trigger in legal {
         let instance = json!({ "triggers": { "intake": trigger } });

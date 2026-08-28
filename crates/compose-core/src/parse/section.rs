@@ -858,7 +858,7 @@ fn callback_allow(
                     ),
                 )
                 .with_help(
-                    "an entry is an absolute URL with `*` standing for any run of characters, matched against the whole callback URL — `https://hooks.example.com/*`; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)",
+                    "an entry is an absolute URL with `*` standing for any run of characters, matched against the whole callback URL, and its host is written out literally from the scheme to the first `/` — `https://hooks.example.com/*`, with a second entry for a second subdomain; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)",
                 ),
             );
             continue;
@@ -878,10 +878,19 @@ fn callback_allow(
 /// above: an empty pattern and a pattern that is three spaces are both things an
 /// author writes, and only quoting shows the difference between them.
 ///
-/// The scheme is the whole of the check: a pattern is matched against the URL a
-/// payload supplied, and a match that could not name the scheme would let
-/// `https://hooks.example.com/*` admit `javascript:` or `file:` URLs beginning
-/// with the same characters.
+/// The scheme and the host are the whole of the check. A pattern is matched
+/// against the URL a payload supplied, so a match that could not name the
+/// scheme would let `https://hooks.example.com/*` admit `javascript:` or
+/// `file:` URLs beginning with the same characters — and a match whose *host*
+/// is not literal names no receiver at all, which is the one shape of this key
+/// that reads like a constraint and is not one (Decision D127). `*` is any run
+/// of characters and crosses `/` and `?` like any other, so
+/// `https://*.hooks.example.com/*` is satisfied by
+/// `https://attacker.test/collect?x=.hooks.example.com/y`, and
+/// `https://hooks.example.com*` by `https://hooks.example.com.evil.test/collect`.
+/// Refusing both is what makes [`require_callback_allow`] a guarantee rather
+/// than a ceremony: a mandatory list every entry of which may be a wildcard is
+/// a mandatory list of nothing.
 ///
 /// The arms are ordered so each one is the *only* answer to some entry — an
 /// empty entry names the emptiness, a blank one names the whitespace — because
@@ -904,7 +913,24 @@ fn allow_problem(pattern: &str) -> Option<String> {
     if rest.is_empty() {
         return Some("names a scheme and nothing else".to_string());
     }
-    None
+    // The host runs from the scheme to whichever of `/`, `?` and `#` ends it —
+    // the same three delimiters that end an authority in a URL, and the ones a
+    // `*` would otherwise cross unnoticed.
+    let host = rest.find(['/', '?', '#']).map_or(rest, |end| &rest[..end]);
+    match host.find('*') {
+        // A host written out and then extended: the repair is a character
+        // rather than a rewrite, so it gets a message that names the character.
+        Some(star) if star + 1 == host.len() && star > 0 && host.len() == rest.len() => {
+            Some(format!(
+                "ends its host {:?} with a `*` rather than with a `/`, so every host that one begins is admitted",
+                &host[..star]
+            ))
+        }
+        Some(_) => Some(format!(
+            "wildcards its host {host:?}, and a `*` there crosses `/` and bounds no host"
+        )),
+        None => None,
+    }
 }
 
 /// A `callback_auth:`/`callback_allow:` on a trigger that delivers no webhook

@@ -1,0 +1,10 @@
+# rule: a `callback_allow:` entry ends its host with a `/` rather than with a `*` (grammar 13.3 / Decision D127)
+# at: /triggers/intake/callback_allow/0
+# via: /$defs/callbackAllow/items/allOf/1/pattern
+triggers:
+  intake:
+    type: http
+    flow: flow.support
+    callback: "payload.body.callback_url"
+    callback_allow:
+      - "https://hooks.example.com*"

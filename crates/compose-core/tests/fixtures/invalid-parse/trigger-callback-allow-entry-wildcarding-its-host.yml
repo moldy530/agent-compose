@@ -1,6 +1,6 @@
-# rule: a `callback_allow:` entry names a receiver, and a bare scheme names none (grammar 13.3, PRD resolved q33)
+# rule: a `callback_allow:` entry writes its host out literally, from the scheme to the first `/` (grammar 13.3, Decision D127)
 # code: invalid-value
-# message: "https://" is not a `callback_allow` pattern of trigger `intake`: it names a scheme and nothing else
+# message: "https://*.hooks.example.com/*" is not a `callback_allow` pattern of trigger `intake`: it wildcards its host "*.hooks.example.com", and a `*` there crosses `/` and bounds no host
 # at: 12:9
 # help: an entry is an absolute URL with `*` standing for any run of characters, matched against the whole callback URL, and its host is written out literally from the scheme to the first `/` — `https://hooks.example.com/*`, with a second entry for a second subdomain; `http` stays legal, which is what makes localhost development work (grammar 13.3, PRD resolved q33)
 triggers:
@@ -9,4 +9,4 @@ triggers:
     flow: flow.support
     callback: "payload.body.callback_url"
     callback_allow:
-      - "https://"
+      - "https://*.hooks.example.com/*"

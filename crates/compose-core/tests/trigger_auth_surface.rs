@@ -479,6 +479,67 @@ fn an_allowlist_without_outbound_auth_is_legal() {
     );
 }
 
+/// An allowlist entry writes its host out literally, and every shape that reads
+/// like a constraint without being one is refused (grammar 13.3, Decision D127).
+///
+/// This is the rule that decides whether D126's mandatory allowlist is a
+/// guarantee or a ceremony. A `*` is any run of characters and crosses `/` and
+/// `?`, so one reaching the host bounds nothing: an author who wrote
+/// `https://*` — or either of the two shapes that merely look narrower — has
+/// said where a token-carrying delivery may go and has said nowhere, which is
+/// the state the mandatory rule exists to prevent.
+///
+/// Two fixtures pin the exact messages. What they cannot pin is the other half,
+/// and it is where a rule written one character too tight does its damage: a
+/// port, a query string, and an exact URL with no wildcard at all are all legal
+/// hosts, and refusing one of them makes a correct allowlist unwritable while
+/// every negative fixture still passes.
+#[test]
+fn an_allowlist_entry_writes_its_host_out_literally() {
+    let allowlist = |pattern: &str| {
+        format!(
+            "version: \"0.1\"\n{FLOW}\ntriggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"payload.body.callback_url\"\n    callback_allow:\n      - \"{pattern}\"\n"
+        )
+    };
+    for pattern in [
+        // Bounds nothing whatsoever.
+        "https://*",
+        // Satisfied by `https://attacker.test/collect?x=.hooks.example.com/y`.
+        "https://*.hooks.example.com/*",
+        // Satisfied by `https://hooks.example.com.evil.test/collect`: a name is
+        // a prefix of longer ones.
+        "https://hooks.example.com*",
+        // The same wildcard with a path written after it — still in the host,
+        // because the `*` before the `/` is what decides that.
+        "https://hooks.example.com*/deliveries",
+        "http://*.localhost:9000/*",
+    ] {
+        let parsed = parse_str(&allowlist(pattern), "main.yml");
+        assert!(
+            parsed.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("is not a `callback_allow` pattern of trigger `intake`")),
+            "`{pattern}` names no host and must be refused, got:\n{}",
+            render(&parsed.diagnostics)
+        );
+    }
+    for pattern in [
+        "https://hooks.example.com/*",
+        "https://hooks.example.com:9000/*",
+        "http://localhost:9000/*",
+        "https://hooks.example.com/webhooks/intake",
+        "https://hooks.example.com?tenant=*",
+        "https://hooks.example.com",
+    ] {
+        let parsed = parse_str(&allowlist(pattern), "main.yml");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "`{pattern}` names one host and is legal, got:\n{}",
+            render(&parsed.diagnostics)
+        );
+    }
+}
+
 /// The outbound `hmac:` takes `secret:` and nothing else (grammar 13.3,
 /// Decision D127).
 ///
