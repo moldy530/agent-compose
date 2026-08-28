@@ -2532,7 +2532,7 @@
       "type": "object",
       "properties": {
         "bearer": { "description": "A static secret compared, in constant time, against a named header.", "$ref": "#/$defs/bearerAuth" },
-        "hmac": { "description": "A signature over the raw request body - the GitHub-shaped family most webhook vendors speak.", "$ref": "#/$defs/inboundHmac" }
+        "hmac": { "description": "A signature over the raw request body, compared in constant time - the GitHub-shaped family most webhook vendors speak.", "$ref": "#/$defs/inboundHmac" }
       },
       "additionalProperties": false,
       "oneOf": [{ "required": ["bearer"] }, { "required": ["hmac"] }]
@@ -2555,7 +2555,7 @@
       "additionalProperties": false
     },
     "inboundHmac": {
-      "description": "The inbound hmac scheme: a signature over the RAW request body, verified with the digest, encoding and prefix the calling vendor uses (grammar 13.3 / PRD resolved q32).",
+      "description": "The inbound hmac scheme: a signature over the RAW request body, verified with the digest, encoding and prefix the calling vendor uses, and compared in constant time - an early return on the first differing byte hands a caller who can time it the expected signature (grammar 13.3 / PRD resolved q32).",
       "type": "object",
       "required": ["secret"],
       "properties": {

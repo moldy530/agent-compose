@@ -175,7 +175,11 @@ auth:                            # exactly ONE of bearer | hmac
 - **`bearer`** compares a static secret against a named header — `Authorization`
   with a `Bearer ` prefix by default — in **constant time**.
 - **`hmac`** verifies a signature over the **raw request body bytes**, which is
-  the GitHub-shaped family most vendors speak.
+  the GitHub-shaped family most vendors speak — and compares the digest it
+  computed against the one that arrived in **constant time** too. An early
+  return on the first differing byte hands a caller who can time it the expected
+  signature for a body they chose, and a request forged with it is accepted
+  without the caller ever holding the secret.
 - Both secrets are `${ENV}` references and nothing else: a literal is
   `invalid-env-ref`, because a secret never lives in the spec text.
 - A block declaring **neither** scheme and one declaring **both** are each a

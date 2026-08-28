@@ -3954,7 +3954,12 @@ triggers:
   JSON decoding and after none of it — a re-serialized body is a different byte
   string and would fail every signature a vendor computed. `algorithm:`,
   `encoding:`, `header:` and `prefix:` together spell the GitHub-shaped family
-  most webhook vendors speak.
+  most webhook vendors speak. This comparison is **constant-time** as well, and
+  the requirement is *not* the weaker one it looks like beside `bearer`'s: a
+  check that returned on the first differing byte would hand a caller who can
+  time it the expected digest for a body of their choosing, one byte at a time,
+  and a forged request signed with a digest recovered that way is accepted
+  without the caller ever holding the secret.
 - **The secrets are `${ENV}` references** and nothing else, in both blocks and
   both directions: a literal is a compile error, because a secret never lives in
   the spec text (§4.3, Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)).
