@@ -2,7 +2,7 @@
 # code: invalid-value
 # message: `header` must be an HTTP header name, found "X-Token: forged"
 # at: 14:17
-# help: a header name is letters, digits, `_`, and `-` — the form a provider's `headers:` keys take: the resolved name is written onto a request as it stands, so a space, a colon or a newline in it would forge a second header rather than name this one
+# help: a header name is letters, digits, `_`, and `-` — the form a provider's `headers:` keys take: outbound the resolved name is written onto the request as it stands, so a space, a colon or a newline in it would forge a second header rather than name this one, and inbound it is the name a caller's header is looked up by, which no such spelling ever is
 triggers:
   intake:
     type: http

@@ -648,19 +648,22 @@ fn header_shape(header: &Spanned<String>, cx: &mut Cx) -> bool {
             ),
         )
         .with_help(
-            "a header name is letters, digits, `_`, and `-` — the form a provider's `headers:` keys take: the resolved name is written onto a request as it stands, so a space, a colon or a newline in it would forge a second header rather than name this one",
+            "a header name is letters, digits, `_`, and `-` — the form a provider's `headers:` keys take: outbound the resolved name is written onto the request as it stands, so a space, a colon or a newline in it would forge a second header rather than name this one, and inbound it is the name a caller's header is looked up by, which no such spelling ever is",
         ),
     );
     false
 }
 
-/// Whether a `prefix:` is safe to write into a header value, ahead of the
-/// credential it introduces (grammar 13.3).
+/// Whether a `prefix:` is one a header value can carry, ahead of the credential
+/// it introduces (grammar 13.3).
 ///
 /// A prefix is legitimately empty and legitimately punctuated — `"Bearer "`,
 /// `"sha256="` — so the only shape it is held to is the one a header value
 /// cannot survive: a carriage return or a newline in it ends that field and
 /// begins another, which is `header:`'s injection again by the other half.
+/// Both directions, for one reason read twice: written ahead of the credential
+/// on a delivery, it forges a field; expected ahead of the credential a caller
+/// sent, it is a byte no caller could have put there, so it matches nothing.
 fn prefix_shape(prefix: &Spanned<String>, cx: &mut Cx) -> bool {
     if !prefix.value.chars().any(char::is_control) {
         return true;
@@ -675,7 +678,7 @@ fn prefix_shape(prefix: &Spanned<String>, cx: &mut Cx) -> bool {
             ),
         )
         .with_help(
-            "the prefix is written into the header ahead of the credential, so a carriage return or newline in it ends that field and begins another: keep it to visible characters and spaces, as in `Bearer ` or `sha256=`",
+            "the prefix stands between the header and the credential — written ahead of it outbound, expected ahead of it inbound — and a carriage return or newline is neither: outbound it ends that header field and begins another, inbound it is a byte no header value a caller sent can carry; keep it to visible characters and spaces, as in `Bearer ` or `sha256=`",
         ),
     );
     false

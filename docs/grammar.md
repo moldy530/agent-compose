@@ -3962,9 +3962,12 @@ triggers:
   verified either would be exactly as open as its weaker half.
 - **`header:` is one header name** — letters, digits, `_` and `-`, the form a
   provider's `headers:` keys take (§12.1) — and **`prefix:` carries no control
-  character**. Both resolved values are written onto a request as they stand, so
-  a colon or a newline in either would forge a second header rather than name or
-  introduce this one. Anything else is `invalid-value`.
+  character**. Outbound both resolved values are written onto a request as they
+  stand, so a colon or a newline in either would forge a second header rather
+  than name or introduce this one; inbound the same two values are the name a
+  header is looked up by and the text expected ahead of the credential, and a
+  name or a prefix no caller could have sent matches nothing. Anything else is
+  `invalid-value`.
 - **A header name is matched case-insensitively.** The name is recorded with the
   author's capitalisation and *looked up* without it: header names are
   case-insensitive by definition, HTTP/2 lowercases every one on the wire, and
