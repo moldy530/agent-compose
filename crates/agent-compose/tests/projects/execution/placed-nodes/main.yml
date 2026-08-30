@@ -99,6 +99,19 @@ triggers:
       paths: "payload.body.paths"
     respond: async
 
+  # `session_key:` is here for `docs/distributed.md` §3.2's payload: the
+  # execution identity a placed node runs under is the hub's to derive, and this
+  # is the trigger that gives one an identity to derive.
+  on_conversation:
+    type: http
+    flow: flow.conversation
+    path: /conversations
+    method: POST
+    input:
+      path: "payload.body.path"
+    session_key: "payload.body.session"
+    respond: async
+
 provider.mock:
   kind: anthropic
   api_key: ${MOCK_API_KEY}
@@ -135,6 +148,22 @@ tool.notarize:
   exec:
     command: "${OPS_BIN}/echo"
     args: ["notarized"]
+
+# Unplaced, so it runs on the hub — and it runs **before** the placed node in
+# `flow.conversation`, which is what gives that node's dispatch a conversation to
+# carry. `docs/distributed.md` §3.2's `history` is the field it travels in.
+agent.briefer:
+  description: Say in one line what is being released.
+  model: model.smart
+  prompt: |
+    Describe the release you are given in one line.
+  input:
+    path:
+      type: string
+  output:
+    brief:
+      type: string
+      min_length: 1
 
 agent.signer:
   description: Sign a release on the machine that holds the keys.
@@ -227,6 +256,39 @@ flow.retried:
         signature: signature
   edges:
     - { from: start, to: sign }
+    - { from: sign, to: end }
+
+# The payload of `docs/distributed.md` §3.2, made observable. An unplaced agent
+# runs on the hub and fills the shared `messages` channel (grammar §10.4); the
+# placed agent after it is dispatched, and what it is given has to be what the
+# same node unplaced would have been given — the turns, and the execution
+# identity the trigger's `session_key:` named. Placing a node decides which
+# *process* runs it (§4.3) and nothing else, so a flow whose second node reads
+# its first node's conversation reads it on either side of the wire.
+flow.conversation:
+  description: An unplaced agent, then a placed one that reads its turns.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    brief:
+      agent: agent.briefer
+      input:
+        path: "input.path"
+
+    sign:
+      agent: agent.signer
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: brief }
+    - { from: brief, to: sign }
     - { from: sign, to: end }
 
 flow.batch:

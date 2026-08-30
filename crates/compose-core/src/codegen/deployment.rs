@@ -147,10 +147,19 @@ const MODULE_DOC: &str = "\
 // against the claimed placements' lists, and the worker reads the list it is
 // reporting against out of the very tree the hub served it.
 //
-// `hubEnvironment` is what `readEnvironment()` checks at start (`./env.ts`), and
-// it is narrower than the composition's whole environment exactly when a
-// placement takes something off it — the least-privilege line PRD 5.10 draws and
-// §9.1 computes: the hub cannot leak what it never held.
+// `hubEnvironment` is the hub's own side of that partition, stated as names.
+// **It is not what `readEnvironment()` reads**: `./env.ts` carries the same
+// variables with the spec sites that wrote each one, because a launch that is
+// short a key should name where the key was asked for, and that is the list
+// `./index.ts` checks at start. This one is the manifest form — names only, like
+// a placement's — so a reader of the artifact, or of the tarball a worker
+// unpacked, can see what the hub holds beside what each placement holds without
+// reading two shapes. The two are one derivation filtered two ways
+// (`References::for_process`), and a test pins them equal.
+//
+// Both are narrower than the composition's whole environment exactly when a
+// placement takes something off the hub's — the least-privilege line PRD 5.10
+// draws and §9.1 computes: the hub cannot leak what it never held.
 ";
 
 const DECLARATIONS: &str = r#"
@@ -158,7 +167,16 @@ const DECLARATIONS: &str = r#"
 export interface PlacementManifest {
   /** The name a worker claims at join (`docs/distributed.md` §3.1). */
   readonly name: string;
-  /** `members:`, in the order the deploy file writes them (grammar §14.1). */
+  /**
+   * `members:`, in the order the deploy file writes them (grammar §14.1).
+   *
+   * For a **reader**, not for a caller: the scheduler queues work to a placement
+   * by name and never consults this list (`docs/distributed.md` §2), and the
+   * `environment` beside it is already the answer to what a worker must satisfy.
+   * It is here because a worker holds no YAML — the artifact is the only thing
+   * it is served — so "what did I just claim" is otherwise unanswerable on the
+   * machine that claimed it.
+   */
   readonly members: readonly string[];
   /**
    * The variables of every component that can execute in this placement's
@@ -195,6 +213,64 @@ agent.a:\n  model: model.m\n  prompt: Hello.\n  input: { q: { type: string } }\n
         assert!(
             emitted.contains("export const joinTokenEnv: string | undefined = undefined;"),
             "{emitted}"
+        );
+    }
+
+    /// `hubEnvironment` and `src/env.ts`'s list name the same variables.
+    ///
+    /// The artifact states the hub's manifest twice — once as names here, once
+    /// with the spec sites that wrote each one in `src/env.ts`, which is the
+    /// list `readEnvironment()` refuses on. Both come out of
+    /// `References::for_process(…, Hub)`, so they cannot disagree today; this is
+    /// what would notice if one of the two calls were changed and not the other,
+    /// which would leave a worker's unpacked tree stating a hub manifest the hub
+    /// itself does not check.
+    #[test]
+    fn the_hub_manifest_and_the_launch_check_name_one_list() {
+        let ir = crate::codegen::test_support::ir_of_mesh(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai\n  api_key: ${VENDOR_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+tool.sign:\n  description: Sign one artifact.\n  input: { path: { type: string } }\n  output: { signature: { type: string } }\n  exec:\n    command: codesign\n    env:\n      KEYCHAIN_PASSWORD: ${KEYCHAIN_PASSWORD}\n\
+agent.signer:\n  model: model.smart\n  prompt: Sign what you are given.\n  tools: [tool.sign]\n  input: { path: { type: string } }\n  output: { verdict: { type: string } }\n\
+flow.release:\n  inputs:\n    path: { type: string }\n  outputs: {}\n  nodes:\n    sign:\n      agent: agent.signer\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: sign }\n    - { from: sign, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.signer]\n",
+        );
+        let partition = Partition::of(&ir);
+        let held = References::for_process(&ir, &partition, &Process::Hub);
+        let hub: Vec<&str> = held.names().collect();
+        assert_eq!(hub, ["MESH_TOKEN"], "the worked example of §9.1");
+
+        let emitted = module(&ir, &partition).contents;
+        let manifest = emitted
+            .split_once("export const hubEnvironment: readonly string[] = [")
+            .expect("the module declares the hub's list")
+            .1
+            .split_once("];")
+            .expect("the list is closed")
+            .0;
+        let stated: Vec<String> = manifest
+            .lines()
+            .filter_map(|line| line.trim().strip_suffix(','))
+            .map(|entry| entry.trim_matches('"').to_string())
+            .collect();
+        assert_eq!(stated, hub, "{emitted}");
+
+        // …and the module `readEnvironment()` is generated from, which is the
+        // same filter under a different shape.
+        let checked = super::super::env::module(&ir, &held).contents;
+        for variable in &hub {
+            assert!(
+                checked.contains(&format!("name: \"{variable}\",")),
+                "`{variable}` is on the hub's manifest and not in its launch check: {checked}"
+            );
+        }
+        assert!(
+            !checked.contains("\"KEYCHAIN_PASSWORD\""),
+            "the hub never runs `tool.sign`, so its launch check may not ask for its \
+             secret: {checked}"
         );
     }
 }

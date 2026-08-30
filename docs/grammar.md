@@ -4327,7 +4327,7 @@ placements:
     members: [agent.embedder]
 ```
 
-**Four rules, each a compile error, and they are numbered because other
+**Five rules, each a compile error, and they are numbered because other
 documents cite them by number** (Decision
 [D129](#d129-placement-members-are-agents-and-tools-disjoint-and-colocated-with-what-attaches-them)):
 
@@ -4370,11 +4370,38 @@ documents cite them by number** (Decision
    A placed component's own placement governs it wherever it is reached without
    an attaching agent: a `function:` node (§8.4), an `agent:` node, or a flow
    instantiated by a `flow:` node (§8.5), all of which the hub schedules.
+5. **A placed component reaches only stores every process shares.** A placement
+   moves where a component *executes* and moves nothing else — so a `store.*` on
+   a **process-local** backend is one the worker running that component and the
+   hub each hold their own copy of. `memory`, `sqlite`, `sqlite_vec` and
+   `local_fs` (§14.3) are a heap, a file and a directory inside the process that
+   opened them; the networked providers beside them are addressed by a URL, so a
+   hub and a worker pointed at one are pointed at the same data. Reaching a
+   process-local one from a placement is an error naming the store and the
+   backend the active target resolved it to (§11.3).
+
+   It is refused for **every** `scope:`, not only `global`. A
+   `scope: execution` store is the sharpest case, because one execution is
+   exactly what a hub and a worker are collaborating on: a `store:` node on the
+   hub reading what a placed agent wrote would read nothing, with no error
+   anywhere. What decides the refusal is the backend, never the scope.
+
+   What is walked is each placed **agent**: its own `stores:`, and every store a
+   `flow.*` in its `tools:` reaches (§7.7 clauses 3 and 4), because a flow-as-tool
+   call runs its instance inside the agent's loop and a `store:` node in it runs
+   on the worker too. A placed `tool.*` reaches no store — it is a process or a
+   request — so it is left alone. The repair is a `storage_backends:` entry
+   binding the store to a networked provider (§14.3), or taking the component out
+   of the placement so it runs on the hub beside the store.
+   `docs/distributed.md` §1 is where this comes from: "executions share nothing
+   by construction — global-scope stores are already external backends" is the
+   premise the whole distributed model rests on, and this rule is that sentence
+   enforced rather than assumed.
 
 And one thing that is **not** a rule, because it is what happens when no rule
 applies: **a component in no placement executes on the hub.** That is the
 default and is never a diagnostic — `placements:` names the exceptions — which
-is why the numbered list above stops at four.
+is why the numbered list above stops at five.
 
 `--target local` needs no placement at all, and admits them: a `local` target
 with placements is the hub and its workers on one machine, which is how a mesh

@@ -24,6 +24,20 @@ import { z } from "zod";
  */
 const codePoints = (value: string): number => [...value].length;
 
+/** `agent.briefer` — its declared input (grammar 5.3). */
+export const agentBrieferInput = z.object({
+  path: z.string(),
+}).strict();
+export type AgentBrieferInput = z.infer<typeof agentBrieferInput>;
+
+/**
+ * `agent.briefer` — the structured output the model is constrained to, and what routing reads (PRD 5.2, 5.3).
+ */
+export const agentBrieferOutput = z.object({
+  brief: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type AgentBrieferOutput = z.infer<typeof agentBrieferOutput>;
+
 /** `agent.signer` — its declared input (grammar 5.3). */
 export const agentSignerInput = z.object({
   path: z.string(),
@@ -51,6 +65,20 @@ export const flowBatchOutputs = z.object({
   signatures: z.array(z.string()).max(8),
 }).strict();
 export type FlowBatchOutputs = z.infer<typeof flowBatchOutputs>;
+
+/** `flow.conversation` — the module's parameters (grammar 7.5). */
+export const flowConversationInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowConversationInputs = z.infer<typeof flowConversationInputs>;
+
+/**
+ * `flow.conversation` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowConversationOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowConversationOutputs = z.infer<typeof flowConversationOutputs>;
 
 /** `flow.direct` — the module's parameters (grammar 7.5). */
 export const flowDirectInputs = z.object({

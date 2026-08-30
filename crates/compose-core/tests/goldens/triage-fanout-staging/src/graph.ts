@@ -746,6 +746,7 @@ const flowTriageNodeScan: runtime.NodeDescriptor = {
           placement: "patchers",
           node: "flow.triage.scan",
           execution: view.run.execution.id,
+          itemIndex: view.run.execution.item_index,
           path: runtime.instancePath(view, "scan"),
           inputs: input,
           signal: context.signal,
@@ -857,6 +858,7 @@ const flowTriageNodeDispatchMap: runtime.MapDescriptor = {
           placement: "patchers",
           node: "agent.fixer",
           execution: site.execution.id,
+          itemIndex: site.execution.item_index,
           path: site.path,
           inputs: input,
           signal: context.signal,
@@ -1798,7 +1800,13 @@ export function createBuilder() {
 export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
   "agent.fixer":
     async (input, context, site) => {
-      const answer = await runtime.callAgent(agentFixer, input, [], context, { path: site.path });
+      const answer = await runtime.callAgent(
+        agentFixer,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
       return {
         output: answer.output,
         history: answer.history,

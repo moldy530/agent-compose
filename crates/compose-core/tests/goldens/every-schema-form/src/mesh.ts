@@ -251,6 +251,25 @@ export interface PlacedAnswer {
 export interface PlacedSite {
   readonly path: readonly string[];
   readonly execution: runtime.ExecutionIdentity;
+  /**
+   * The conversation turns an `agent:` node is given (grammar §10.4), where the
+   * node takes any — §3.2's `history`.
+   *
+   * Absent for every dispatch that is not an `agent:` node, and for a
+   * `map`-dispatched agent, which grammar §8.6 rule 10 runs on a fresh
+   * conversation of its own (D105). Absent is **empty**, and never "work it out
+   * here": a worker has no `messages` channel to read.
+   */
+  readonly history?: readonly runtime.Turn[];
+  /**
+   * Grammar §9.3's level 1 for this instance — §3.2's `policy`.
+   *
+   * What crosses into a subflow an attached `flow.*` starts (D79), which is the
+   * half a placed agent would otherwise lose: its tool loop would instantiate
+   * that subflow under a different retry/timeout ladder from the one the same
+   * agent unplaced instantiates it under.
+   */
+  readonly policy?: runtime.InstancePolicy;
 }
 
 /**
@@ -277,14 +296,31 @@ export type PlacedRun = (
  * node runner ([`executeLocally`]), where the only honest answer to "run this
  * placed node" is to run it.
  */
-type PlacedExecutor = (options: {
+type PlacedExecutor = (options: DispatchOptions) => Promise<PlacedAnswer>;
+
+/**
+ * What a placed node's call site knows about the node it is dispatching.
+ *
+ * The four after `inputs` are §3.2's four OPTIONAL payload fields, and they are
+ * options rather than something the far side derives for the reason §3.2 gives:
+ * each is a fact the **hub** holds about this node execution that the node would
+ * have read for itself had it run here, so a worker that defaulted one would be
+ * running a different node (§4.3, PRD 5.6).
+ */
+interface DispatchOptions {
   readonly placement: string;
   readonly node: string;
   readonly execution: string;
   readonly path: readonly string[];
   readonly inputs: unknown;
+  /** Grammar §4.1's `execution.item_index`, where a `map` encloses this node. */
+  readonly itemIndex?: number;
+  /** [`PlacedSite.history`]. */
+  readonly history?: readonly runtime.Turn[];
+  /** [`PlacedSite.policy`]. */
+  readonly policy?: runtime.InstancePolicy;
   readonly signal?: AbortSignal;
-}) => Promise<PlacedAnswer>;
+}
 
 /** See [`executeLocally`]. */
 let executor: PlacedExecutor | undefined;
@@ -406,14 +442,7 @@ export class DispatchSuperseded extends Error {
  * the opposite of a `human` node's rule (D102) and is why `runtime.pausesUnder`
  * is left alone and only `runtime.quiescent` learns about placement waits.
  */
-export async function dispatchPlaced(options: {
-  readonly placement: string;
-  readonly node: string;
-  readonly execution: string;
-  readonly path: readonly string[];
-  readonly inputs: unknown;
-  readonly signal?: AbortSignal;
-}): Promise<PlacedAnswer> {
+export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAnswer> {
   // A process that executes placed nodes answers this itself ([`executeLocally`]),
   // and is asked before anything is journaled: a worker holds no board, and the
   // journal of this execution is the hub's alone (§3.3, §8 rule 3).
@@ -430,6 +459,13 @@ export async function dispatchPlaced(options: {
     node: options.node,
     site,
     inputs: options.inputs,
+    // §3.2's OPTIONAL payload fields, journaled beside `inputs` and for its
+    // reason: the row **is** the dispatch (§8 rule 3), so the poll answer is
+    // read out of the row at hand-over rather than out of this process's memory,
+    // and a hub restarted mid-dispatch hands over what its predecessor would.
+    ...(options.itemIndex === undefined ? {} : { itemIndex: options.itemIndex }),
+    ...(options.history === undefined ? {} : { history: options.history }),
+    ...(options.policy === undefined ? {} : { policy: options.policy }),
     status: "parked",
     parkedAt: new Date().toISOString(),
   });
@@ -774,12 +810,26 @@ async function join(request: FastifyRequest, reply: FastifyReply): Promise<unkno
       });
     }
   }
-  if ((reported !== undefined) !== current) {
+  // **One direction only.** A join carrying the current hash and no report is
+  // refused: there is a manifest it could have read and it did not, and
+  // dispatching to it would skip the check §9.2 exists for. The other direction
+  // is **not** a refusal, and that is §3.1's stale-hash row applied to the whole
+  // request: a report made against an artifact this hub is not serving is a
+  // report about the wrong manifest, so it is ignored the way the stale hash
+  // beside it is — the join succeeds, the answer carries the current artifact,
+  // and the worker fetches and joins again.
+  //
+  // Refusing that pair instead would make the two rows unsatisfiable together
+  // for the one worker that meets both: a redeployment leaves a worker holding a
+  // stale hash **and** a report, and §3.1 requires the report to be present on a
+  // current-hash join — so it cannot pre-decide which case it is in, and a
+  // refusal would leave it answering a refused join with another join, which §5
+  // and §10.1 both forbid.
+  if (current && reported === undefined) {
     return reply.code(400).send({
       artifact: ARTIFACT_HASH,
-      error: current
-        ? "a join whose `artifact_hash` is the artifact this hub serves must carry `env_ok`: the report is against the manifest in the artifact the worker holds (docs/distributed.md §3.1)"
-        : "a join whose `artifact_hash` is not the artifact this hub serves must omit `env_ok`: the report is against the manifest in the artifact the worker holds, and this worker does not hold it (docs/distributed.md §3.1)",
+      error:
+        "a join whose `artifact_hash` is the artifact this hub serves must carry `env_ok`: the report is against the manifest in the artifact the worker holds (docs/distributed.md §3.1)",
     });
   }
 
@@ -839,20 +889,67 @@ async function poll(
   const session = touched(request);
   if (session === undefined) return reply.code(410).send(gone());
 
-  const deadline = Date.now() + holdMs;
-  for (;;) {
-    // The session's own request keeps it alive for the whole hold, not only for
-    // the instant it arrived: a hold that outlived the window would let the
-    // sweep declare the very worker whose poll it is holding gone.
-    session.seen = Date.now();
-    // Read before the board is looked at, compared after this poll is
-    // subscribed: see [`boardMoved`].
-    const seen = boardMoved;
-    const dispatch = await taken(session);
-    if (dispatch !== undefined) return reply.code(200).send(dispatch);
-    const left = deadline - Date.now();
-    if (left <= 0) return reply.code(204).send();
-    await held(Math.min(left, holdMs), seen, reply);
+  // **Whether the worker is still on the other end of this poll**, latched once
+  // for the whole handler.
+  //
+  // A hold ends for two reasons and only one of them means "ask again": the hold
+  // expired, or the connection closed. A worker that was SIGKILLed — or a poll an
+  // intermediary dropped — is the second, and a hub that went round its loop
+  // anyway would do two wrong things with one dead socket. It would refresh
+  // `session.seen` for a request that has demonstrably ended, extending §6.3's
+  // "90 seconds since the last request on a session" by up to a whole hold; and
+  // it would `claimDispatch` parked work for a socket nothing can be written to,
+  // marking the row `dispatched` against a session that will never settle it —
+  // so the node waits out the liveness window before anything supersedes it and
+  // loses an attempt to a dispatch it never received.
+  //
+  // **Both events, because the two runtimes emit different ones.** A hangup
+  // during a hold raises `aborted` on the *request* under Bun and `close` on the
+  // *response* under Node, and this module is the compiler's constant under
+  // both. The request's `close` is deliberately not among them, and that is the
+  // asymmetry: a `GET` has no body, so under Node its request stream is complete
+  // the moment the headers are parsed and `close` fires at once — a hold
+  // watching it would end immediately on every poll an idle mesh makes.
+  // `aborted` fires only on a premature end, which is the property wanted.
+  //
+  // The latch resolves whatever hold is in flight as well as being read at the
+  // top of the loop, because the failure this exists for is work parking
+  // *inside* the hold a dead poll was in: a wake that only came at the hold's
+  // own deadline would leave the whole rest of that hold claimable.
+  let hungUp = false;
+  const holds = new Set<() => void>();
+  const hangUp = (): void => {
+    hungUp = true;
+    for (const wake of [...holds]) wake();
+  };
+  request.raw.once("aborted", hangUp);
+  reply.raw.once("close", hangUp);
+  try {
+    const deadline = Date.now() + holdMs;
+    for (;;) {
+      // `socket.destroyed` beside the latch, for a runtime that emits neither
+      // event: it is never true of a connection a hold is still open on, and it
+      // is what both runtimes agree about after a hangup.
+      if (hungUp || reply.raw.socket?.destroyed === true) return reply.code(204).send();
+      // The session's own request keeps it alive for the whole hold, not only
+      // for the instant it arrived: a hold that outlived the window would let
+      // the sweep declare the very worker whose poll it is holding gone.
+      session.seen = Date.now();
+      // Read before the board is looked at, compared after this poll is
+      // subscribed: see [`boardMoved`].
+      const seen = boardMoved;
+      const dispatch = await taken(session);
+      if (dispatch !== undefined) return reply.code(200).send(dispatch);
+      const left = deadline - Date.now();
+      if (left <= 0) return reply.code(204).send();
+      await held(Math.min(left, holdMs), seen, holds);
+    }
+  } finally {
+    // Off with the handler: `close` fires on an ordinary answer too, once the
+    // response has been written, and a listener left behind would be one per
+    // poll on a connection the runtime warns about at ten.
+    request.raw.removeListener("aborted", hangUp);
+    reply.raw.removeListener("close", hangUp);
   }
 }
 
@@ -883,12 +980,23 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
       local.taken = true;
       announceWaits(claimed.execution);
     }
+    // §3.2's `session_key`, read off the execution's own lifecycle row rather
+    // than off the dispatch: it is a fact about the execution, not about this
+    // node, and §5's first rule is that everything is read out of the journal at
+    // the moment it is needed. A worker that had to default it would fail a
+    // `scope: session` store with a diagnostic telling the operator to pass a
+    // `--session` the run already passed.
+    const sessionKey = journal.execution(claimed.execution)?.sessionKey ?? "";
     return {
       dispatch_id: claimed.id,
       execution_id: claimed.execution,
       node: claimed.node,
       instance_path: claimed.site,
       inputs: claimed.inputs,
+      ...(sessionKey === "" ? {} : { session_key: sessionKey }),
+      ...(claimed.itemIndex === undefined ? {} : { item_index: claimed.itemIndex }),
+      ...(claimed.history === undefined ? {} : { history: claimed.history }),
+      ...(claimed.policy === undefined ? {} : { policy: claimed.policy }),
       // What a redispatched node replays to the frontier before going live
       // (§3.2, §7.2). Read out of the journal at the moment it is handed over,
       // which is §5's first rule: nothing is held from an earlier session.
@@ -932,20 +1040,21 @@ function wireEffect(record: JournalRecord): Record<string, unknown> {
 }
 
 /**
- * Wait out the rest of a hold, or until the board moves.
+ * Wait out the rest of a hold, until the board moves, or until the worker hangs
+ * up.
  *
  * `seen` is the board's generation as of **before** the caller looked at it, so
  * a dispatch parked between that look and this subscription resolves the hold at
  * once rather than a whole hold later (see [`boardMoved`]).
  *
- * The disconnect is watched on the **reply** rather than on the request, and the
- * difference is not cosmetic: a `GET` carries no body, so its request stream is
- * complete the moment the headers are parsed and its `close` fires immediately —
- * a hold watching it would spin for its whole duration on every poll an idle
- * mesh makes. The response is what stays open while the hold does, so its
- * `close` is the client hanging up.
+ * `hangUps` is [`poll`]'s own set of "wake whatever hold is in flight", and this
+ * puts itself in it for the duration: a worker that hung up is a hold with
+ * nobody to answer, so the process is not left holding one timer per abandoned
+ * connection — and the loop above gets to notice inside the hold rather than at
+ * its deadline. Which *events* mean a hangup is [`poll`]'s to decide, because
+ * the two runtimes emit different ones and one of them is a trap.
  */
-function held(milliseconds: number, seen: number, reply: FastifyReply): Promise<void> {
+function held(milliseconds: number, seen: number, hangUps: Set<() => void>): Promise<void> {
   if (boardMoved !== seen) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
@@ -954,10 +1063,7 @@ function held(milliseconds: number, seen: number, reply: FastifyReply): Promise<
       done = true;
       clearTimeout(timer as Parameters<typeof clearTimeout>[0]);
       pollers.delete(finish);
-      // Off with the hold rather than with the request, because one poll waits
-      // more than once: a listener per round would be one per stir on a
-      // connection the runtime warns about at ten.
-      reply.raw.removeListener("close", finish);
+      hangUps.delete(finish);
       resolve();
     };
     const timer: unknown = setTimeout(finish, milliseconds);
@@ -965,23 +1071,23 @@ function held(milliseconds: number, seen: number, reply: FastifyReply): Promise<
       (timer as { unref: () => void }).unref();
     }
     pollers.add(finish);
-    // A worker that hung up is a hold with nobody to answer, so the process is
-    // not left holding one timer per abandoned connection.
-    reply.raw.once("close", finish);
+    hangUps.add(finish);
   });
 }
 
 /**
  * `POST /workers/effects` (§3.3).
  *
- * §3.3's table has three rows — `204`, `401`, `410` — and they are the three
- * conditions it is *about*: the batch was journaled, the credential did not
- * verify, the session is unknown. A body that is not a batch at all is outside
- * them, and this answers those two cases `400` and `409` rather than inventing a
- * meaning for one of the three: a `204` over a batch nothing was written for
- * would tell a worker its effects are in the journal when they are not, and the
- * redispatch of §7.2 would then hand the next attempt a history short of the
- * frontier — the one failure that whole route exists to prevent.
+ * §3.3's table is five rows and this is each of them: `204` when the batch is
+ * journaled, `401` for a credential that did not verify, `410` for a session
+ * this hub does not know, `400` for a body that is not a batch — a missing
+ * `dispatch_id`, a missing `effects` array, or a record short of a field or
+ * naming a `site` outside the dispatch's — and `409` for a `dispatch_id` this
+ * hub cannot attribute. The last two are refusals rather than a `204` because a
+ * `204` over a batch nothing was written for would tell a worker its effects are
+ * in the journal when they are not, and the redispatch of §7.2 would then hand
+ * the next attempt a history short of the frontier — the one failure that whole
+ * route exists to prevent.
  *
  * **A batch is taken whatever the dispatch's state is**, superseded included.
  * §3.3 keys records by effect key and scopes them to their execution, "not by

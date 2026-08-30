@@ -20,8 +20,10 @@ import * as mesh from "./mesh.ts";
 import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
+  agentBrieferOutput,
   agentSignerOutput,
   flowBatchInputs,
+  flowConversationInputs,
   flowDirectInputs,
   flowReleaseInputs,
   flowRetriedInputs,
@@ -54,6 +56,29 @@ const flowBatchShape: runtime.Shape = {
     "paths": {
       "items": "string"
     }
+  }
+};
+
+/** `flow.conversation` — the `input` root inside it (grammar 7.5). */
+const flowConversationShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.conversation` node `brief` — the `brief.output` root its guards read.
+ */
+const flowConversationNodeBriefShape: runtime.Shape = {
+  "properties": {
+    "brief": "string"
+  }
+};
+
+/** `flow.conversation` node `sign` — the `sign.output` root its guards read. */
+const flowConversationNodeSignShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
   }
 };
 
@@ -173,6 +198,34 @@ async function toolSign(args: unknown, context: runtime.RunContext): Promise<unk
 }
 
 /**
+ * `agent.briefer` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
+ */
+const agentBriefer: runtime.AgentBinding = {
+  address: "agent.briefer",
+  prompt: "Describe the release you are given in one line.\n",
+  model: modelSmart,
+  output: {
+    name: "briefer_output",
+    description: "The structured output `agent.briefer` must produce.",
+    schema: {
+      "additionalProperties": false,
+      "properties": {
+        "brief": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "brief"
+      ],
+      "type": "object"
+    },
+  },
+  tools: [],
+  maxToolIterations: 8,
+};
+
+/**
  * `agent.signer` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
  */
 const agentSigner: runtime.AgentBinding = {
@@ -251,6 +304,7 @@ const flowBatchNodeFanMap: runtime.MapDescriptor = {
           placement: "mac",
           node: "agent.signer",
           execution: site.execution.id,
+          itemIndex: site.execution.item_index,
           path: site.path,
           inputs: input,
           signal: context.signal,
@@ -317,6 +371,117 @@ const flowBatchBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.conversation ---
+
+/** `flow.conversation` node `brief` — `agent.briefer` (grammar 8.1). */
+const flowConversationNodeBrief: runtime.NodeDescriptor = {
+  flow: "flow.conversation",
+  node: "brief",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowConversationShape, state: stateShape, output: flowConversationNodeBriefShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await runtime.callAgent(
+      agentBriefer,
+      input,
+      runtime.historyTurns(view.state["messages"] as unknown[]),
+      context,
+      { path: runtime.instancePath(view, "brief"), policy: view.run.policy },
+    );
+    return {
+      output: runtime.parseResult(agentBrieferOutput, answer.output, "the answer of `agent.briefer`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [],
+  edges: [
+    { to: "sign" },
+  ],
+};
+
+/** `flow.conversation` node `sign` — `agent.signer` (grammar 8.1). */
+const flowConversationNodeSign: runtime.NodeDescriptor = {
+  flow: "flow.conversation",
+  node: "sign",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowConversationShape, state: stateShape, output: flowConversationNodeSignShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.conversation.sign",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "sign"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+    });
+    return {
+      output: runtime.parseResult(agentSignerOutput, answer.output, "the answer of `agent.signer`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.conversation` — its nodes, its `start` edges, and the compiled graph.
+ */
+function flowConversation() {
+  return new StateGraph(State)
+    .addNode("brief", (state: GraphState) => runtime.runNode(flowConversationNodeBrief, state), {
+      ends: ["sign"],
+    })
+    .addNode("sign", (state: GraphState) => runtime.runNode(flowConversationNodeSign, state), {
+      ends: [END],
+    })
+    .addEdge(START, "brief")
+    .compile();
+}
+
+/**
+ * `flow.conversation`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowConversationGraph = flowConversation();
+
+/**
+ * `flow.conversation` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowConversationBinding: runtime.SubflowBinding = {
+  address: "flow.conversation",
+  outputs: ["signature"],
+  recursionLimit: 27,
+  stream: (initial, options) =>
+    flowConversationGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowConversationGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.direct ---
 
 /** `flow.direct` node `sign` — `tool.sign` (grammar 8.4). */
@@ -340,6 +505,7 @@ const flowDirectNodeSign: runtime.NodeDescriptor = {
           placement: "mac",
           node: "flow.direct.sign",
           execution: view.run.execution.id,
+          itemIndex: view.run.execution.item_index,
           path: runtime.instancePath(view, "sign"),
           inputs: input,
           signal: context.signal,
@@ -406,8 +572,11 @@ const flowReleaseNodeSign: runtime.NodeDescriptor = {
       placement: "mac",
       node: "flow.release.sign",
       execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
       path: runtime.instancePath(view, "sign"),
       inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
       signal: context.signal,
     });
     return {
@@ -506,8 +675,11 @@ const flowRetriedNodeSign: runtime.NodeDescriptor = {
       placement: "mac",
       node: "flow.retried.sign",
       execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
       path: runtime.instancePath(view, "sign"),
       inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
       signal: context.signal,
     });
     return {
@@ -630,6 +802,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowBatchGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.conversation": {
+    address: "flow.conversation",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 27,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowConversationInputs, inputs, "the `inputs:` of `flow.conversation`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowConversationGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowConversationGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.direct": {
@@ -1076,7 +1264,29 @@ export function createBuilder() {
 export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
   "agent.signer":
     async (input, context, site) => {
-      const answer = await runtime.callAgent(agentSigner, input, [], context, { path: site.path });
+      const answer = await runtime.callAgent(
+        agentSigner,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
+  "flow.conversation.sign":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentSigner,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
       return {
         output: answer.output,
         history: answer.history,
@@ -1088,7 +1298,13 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
     async (input, context) => ({ output: await toolSign(input, context) }),
   "flow.release.sign":
     async (input, context, site) => {
-      const answer = await runtime.callAgent(agentSigner, input, [], context, { path: site.path });
+      const answer = await runtime.callAgent(
+        agentSigner,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
       return {
         output: answer.output,
         history: answer.history,
@@ -1098,7 +1314,13 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
     },
   "flow.retried.sign":
     async (input, context, site) => {
-      const answer = await runtime.callAgent(agentSigner, input, [], context, { path: site.path });
+      const answer = await runtime.callAgent(
+        agentSigner,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
       return {
         output: answer.output,
         history: answer.history,

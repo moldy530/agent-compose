@@ -431,9 +431,26 @@ fn the_worker_half_reaches_the_generated_project_in_the_files_a_worker_reads() {
             "`src/graph.ts` registers no activity for `{site}`, and the hub dispatches it"
         );
     }
+    // …and the activity a worker runs is the one the node would have run here.
+    // `site.history` and `site.policy` are §3.2's OPTIONAL payload fields, and
+    // they are what makes that true rather than nearly true: the same `agent:`
+    // node unplaced is given `runtime.historyTurns(view.state["messages"])` and
+    // `view.run.policy`, so a registry entry that passed `[]` and no policy
+    // would answer from the input object alone and instantiate an attached
+    // `flow.*` under a different retry/timeout ladder — a placement changing
+    // what a node *means*, which §4.3 and PRD 5.6 both forbid.
     assert!(
-        graph.contains("runtime.callAgent(agentSigner, input, [], context, { path: site.path })"),
+        graph.contains(
+            "const answer = await runtime.callAgent(\n        agentSigner,\n        input,\n        \
+             site.history ?? [],\n        context,\n        { path: site.path, policy: site.policy },\n      );"
+        ),
         "the registered activity is not the one the node would have run locally: {graph}"
+    );
+    assert!(
+        graph.contains("history: runtime.historyTurns(view.state[\"messages\"] as unknown[]),")
+            && graph.contains("policy: view.run.policy,"),
+        "the hub dispatches a placed `agent:` node without the history and the level-1 policy \
+         the same node unplaced is given, so placing it changes what it does: {graph}"
     );
 
     // The runner: a constant of the release, and the entry the manifest names.
@@ -663,6 +680,19 @@ fn every_document_says_the_runtime_landed() {
     let distributed = fs::read_to_string(repository().join("docs/distributed.md"))
         .expect("the protocol document is readable");
     let targets = compose_core::docs::topic("targets").expect("the `targets` topic ships");
+    // A module header is a document, and these two are the ones the unwind
+    // missed: `codegen` is the pass that now emits `src/mesh.ts`, and
+    // `ast::deploy` is where a reader meets `hub:`/`placements:` first.
+    let modules = [
+        "crates/compose-core/src/codegen/mod.rs",
+        "crates/compose-core/src/ast/deploy.rs",
+    ]
+    .map(|path| {
+        (
+            path,
+            fs::read_to_string(repository().join(path)).expect("the module is readable"),
+        )
+    });
 
     for (document, claim) in [
         (grammar.as_str(), "The keys are live grammar in both halves"),
@@ -680,6 +710,14 @@ fn every_document_says_the_runtime_landed() {
             targets.body,
             "**`placements` left it by being re-cut, and its runtime landed afterwards.**",
         ),
+        (
+            modules[0].1.as_str(),
+            "`hub:`/`placements:` are **not** on that list any more.",
+        ),
+        (
+            modules[1].1.as_str(),
+            "**not** reserved, and no longer awaiting a\n//! runtime either",
+        ),
     ] {
         assert!(
             document.contains(claim),
@@ -692,16 +730,30 @@ fn every_document_says_the_runtime_landed() {
     // …and none of them still says the opposite. The three spellings the
     // awaiting-runtime posture had, so a paragraph that came back says so here
     // rather than in a deployment that never starts a worker.
+    //
+    // **The two Rust module headers are read the same way**, and they are here
+    // because the unwind missed them once: a reader who opens the module that
+    // now emits `src/mesh.ts` and is told at the top that this pass emits
+    // nothing for the deploy layer's mesh keys does not go looking for the hub
+    // eight lines above the sentence — and the dead file reference beside it
+    // takes them to a `File not found`. A module header is a document.
     for (name, document) in [
         ("docs/grammar.md", grammar.as_str()),
         ("docs/distributed.md", distributed.as_str()),
         ("the `targets` topic", targets.body),
+        (modules[0].0, modules[0].1.as_str()),
+        (modules[1].0, modules[1].1.as_str()),
     ] {
         for stale in [
             "the protocol is not built yet",
             "lands\nwith the runtime",
             "there is no `worker` verb",
             "placement_surface_inertness",
+            // The two spellings the Rust headers carried, which no shipped
+            // document ever had: `mod.rs` said the pass emitted nothing for the
+            // mesh keys, and both said the protocol arrived later.
+            "lands with the\n//! `worker` verb",
+            "the\n//! protocol that reads them lands with the `worker` verb",
         ] {
             assert!(
                 !document.contains(stale),

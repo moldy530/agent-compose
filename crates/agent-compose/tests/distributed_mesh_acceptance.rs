@@ -523,6 +523,73 @@ fn a_placed_node_runs_on_a_worker_and_its_answer_reaches_the_graph() {
     );
 }
 
+/// A placed agent reads the conversation the node before it left, across the
+/// wire (§3.2, §4.3).
+///
+/// `flow.conversation` is one flow and two processes again, the other way round
+/// from `flow.release`: `brief` is an **unplaced** `agent.briefer`, so it runs on
+/// the hub and its turns go into the shared `messages` channel (grammar §10.4);
+/// `sign` is placed, so it is dispatched — and what it is handed has to be what
+/// the same node unplaced would have been handed. §4.3 fixes why: "a placement
+/// decides which *process* runs a node rather than which code exists where", and
+/// PRD 5.6 says it as "zero change to the logical definition".
+///
+/// The assertion is made where it cannot be faked: the **provider's transcript**.
+/// The worker's own model call carries `agent.signer`'s prompt and, in the same
+/// body, the turn the hub's agent produced. A dispatch that dropped the history
+/// would leave a body with the prompt and not the turn, and the run would still
+/// succeed — which is exactly why this is asserted against the request rather
+/// than against the outputs.
+#[test]
+fn a_placed_agent_is_dispatched_with_the_conversation_the_hubs_own_agent_left() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    // One call on the hub, then the placed agent's three on the worker. All on
+    // one model, so the queue is drawn from in flow order.
+    mesh.provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "brief": "a release of release.dmg" })),
+    ));
+    mesh.provider.enqueue_all(signing("signed-after-the-brief"));
+    let _worker = mesh.worker("conversation");
+
+    let execution = mesh.start_execution(
+        "/conversations",
+        &json!({ "path": "release.dmg", "session": "release-42" }),
+    );
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"], "signed-after-the-brief",
+        "the placed node's answer is what the graph wrote: {outputs:#}"
+    );
+
+    let requests = mesh.provider.requests();
+    let carried: Vec<&str> = requests
+        .iter()
+        .filter(|request| request.body_text.contains("Sign the path you are given"))
+        .map(|request| request.body_text.as_str())
+        .collect();
+    assert!(
+        !carried.is_empty(),
+        "the placed agent made no model call, so nothing here is about it: {requests:#?}"
+    );
+    assert!(
+        carried
+            .iter()
+            .any(|body| body.contains("a release of release.dmg")),
+        "the placed agent was dispatched without the turns `agent.briefer` left in the shared \
+         `messages` channel, so it answered from its input object alone — placing the node \
+         changed what it does (docs/distributed.md §3.2, §4.3): {carried:#?}"
+    );
+
+    let snapshot = mesh.provider.snapshot();
+    assert!(
+        snapshot.is_drained(),
+        "the two agents did not make the four calls they were scripted: {snapshot:#?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. The cold start
 // ---------------------------------------------------------------------------

@@ -310,6 +310,11 @@ line({
     recorded_at: "2026-08-30T00:00:00.000Z",
   },
 });
+// A node that takes a while, for the one test that needs the worker to still be
+// busy when the next poll is answered. Zero — the default — is the shape every
+// other test wants: a dispatch that ends as soon as it has said what it did.
+const linger = Number(process.env.FIXTURE_RUNNER_LINGER_MS ?? "0");
+if (linger > 0) await new Promise((resolve) => setTimeout(resolve, linger));
 line({ type: "result", output: { signature: "from the fixture runner" } });
 "#;
 
@@ -325,14 +330,25 @@ const MANIFEST: &str = r#"{
 
 /// The artifact this file's hub serves: its files, and the hash that names it.
 fn artifact() -> (String, Vec<u8>) {
+    artifact_named("fixture")
+}
+
+/// A **second** artifact, so a redeployment has something to redeploy to.
+///
+/// One byte of `package.json` apart, which is enough: the hash is over the
+/// tree's content, so two trees that differ anywhere are two artifacts (§4).
+fn redeployed_artifact() -> (String, Vec<u8>) {
+    artifact_named("fixture-redeployed")
+}
+
+/// One artifact, named so that two of them hash differently.
+fn artifact_named(name: &str) -> (String, Vec<u8>) {
+    let manifest = format!("{{ \"name\": \"{name}\", \"private\": true }}\n");
     let files: Vec<(&str, &[u8])> = vec![
         ("manifest.json", MANIFEST.as_bytes()),
         ("runner.ts", RUNNER.as_bytes()),
         // Carried so the tree looks like one a build wrote; never read here.
-        (
-            "package.json",
-            b"{ \"name\": \"fixture\", \"private\": true }\n",
-        ),
+        ("package.json", manifest.as_bytes()),
     ];
     let hash = compose_core::codegen::artifact::hash_of(files.iter().copied());
     let mut blocks = Vec::new();
@@ -732,25 +748,32 @@ fn every_join_refusal_stops_the_worker_after_exactly_one_join() {
     }
 }
 
-/// The one refusal a **different body** can answer, and it is answered once.
+/// A worker holding a **stale** artifact joins once, is answered with the
+/// current one, and fetches it (§3.1, §4, §5).
 ///
-/// §3.1's rule that `env_ok` is present exactly on a join whose `artifact_hash`
-/// is the artifact the hub serves is a rule about the request, and a worker
-/// cannot know whether the hash it holds is still the current one until it has
-/// asked — a redeployment is exactly the case where it is not. So a `400` on a
-/// join that carried a hash earns **one** further join carrying neither, which
-/// is the shape §3.1 gives a cold start; and the redeployment that follows is
-/// the fetch of §4.
+/// The redeployment case, from the worker's side. It holds an artifact and
+/// cannot know the hub has replaced it, so it sends the hash and the report
+/// together — which is what §3.1 requires of the case where the hash *is*
+/// current. The hub ignores a report about an artifact it is not serving and
+/// answers with the one it is; the worker treats that as `Stop::Redeployed`,
+/// fetches, materialises, and joins again carrying the new hash.
+///
+/// What is asserted is the join count and the shape of each. **Two joins, and
+/// neither of them answers a refusal**: §3.1 makes every refusal terminal and
+/// §10.1 calls the `410`-versus-refusal decision the whole of a worker's error
+/// handling, so a worker that answered a `400` with a second join would be
+/// outside both. The hub's ignore-rule is what makes that possible, and this is
+/// where the two halves meet.
 #[test]
-fn a_join_refused_over_the_report_rule_is_answered_once_by_a_join_that_carries_neither() {
+fn a_worker_holding_a_stale_artifact_joins_once_and_is_answered_with_the_current_one() {
     let hub = FixtureHub::start();
     let (hash, tarball) = artifact();
     // Take a worker as far as holding an artifact.
     hub.script("/workers/join", accepted(&hash, "wrk_provisioning"));
-    hub.script("/workers/artifact", Reply::bytes(200, tarball.clone()));
+    hub.script("/workers/artifact", Reply::bytes(200, tarball));
     hub.script("/workers/join", accepted(&hash, "wrk_ready"));
     hub.always("/workers/poll", Reply::empty(204));
-    let mut first = Worker::start(&hub, "report-rule-holder");
+    let mut first = Worker::start(&hub, "stale-holder");
     hub.until("materialised and polled", |asked| {
         asked.iter().any(|request| request.path == "/workers/poll")
     });
@@ -761,19 +784,12 @@ fn a_join_refused_over_the_report_rule_is_answered_once_by_a_join_that_carries_n
     let _ = first.child.kill();
     let _ = first.child.wait();
 
-    // The redeployment. The hub now serves a different artifact, so the join
-    // this worker makes — hash **and** report, because it holds one — is the
-    // `400` §3.1 gives that pair.
+    // The redeployment: a hub serving a **different** artifact.
     let hub = FixtureHub::start();
-    hub.script(
-        "/workers/join",
-        Reply::json(
-            400,
-            &json!({ "artifact": "sha256:whatever", "error": "a join whose `artifact_hash` is not the artifact this hub serves must omit `env_ok`" }),
-        ),
-    );
-    hub.always("/workers/join", accepted(&hash, "wrk_after"));
-    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    let (current, redeployed) = redeployed_artifact();
+    assert_ne!(current, hash, "the two artifacts hash differently");
+    hub.always("/workers/join", accepted(&current, "wrk_after"));
+    hub.always("/workers/artifact", Reply::bytes(200, redeployed));
     hub.always("/workers/poll", Reply::empty(204));
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_agent-compose"));
@@ -798,19 +814,44 @@ fn a_join_refused_over_the_report_rule_is_answered_once_by_a_join_that_carries_n
     );
     let mut child = command.spawn().expect("the worker starts");
 
-    hub.until("polled after the refusal", |asked| {
+    hub.until("fetched the current artifact and polled", |asked| {
         asked.iter().any(|request| request.path == "/workers/poll")
     });
     let joins = hub.asked_at("/workers/join");
-    assert!(
-        joins[0].body.get("artifact_hash").is_some() && joins[0].body.get("env_ok").is_some(),
-        "a worker holding an artifact reports against it (§3.1, §4): {:#}",
+    assert_eq!(
+        joins.len(),
+        2,
+        "a worker that holds a stale artifact joins once to be told so and once to report \
+         against what it fetched: {joins:#?}"
+    );
+    assert_eq!(
+        joins[0].body["artifact_hash"],
+        json!(hash),
+        "the first join does not carry the hash this worker holds (§3.1, §4): {:#}",
         joins[0].body
     );
     assert!(
-        joins[1].body.get("artifact_hash").is_none() && joins[1].body.get("env_ok").is_none(),
-        "the join after the refusal carries neither, which is the shape a cold start has: {:#}",
+        joins[0].body.get("env_ok").is_some(),
+        "the first join withholds the report §3.1 requires of a current hash, which a worker \
+         cannot know it does not have: {:#}",
+        joins[0].body
+    );
+    assert_eq!(
+        joins[1].body["artifact_hash"],
+        json!(current),
+        "the second join does not report against the artifact this hub serves: {:#}",
         joins[1].body
+    );
+    assert!(
+        joins[1].body.get("env_ok").is_some(),
+        "the second join carries no report, so the hub has nothing to check (§9.2): {:#}",
+        joins[1].body
+    );
+    let fetches = hub.asked_at("/workers/artifact");
+    assert_eq!(
+        fetches.len(),
+        1,
+        "the worker did not fetch the artifact the join named, or fetched it twice: {fetches:#?}"
     );
 
     #[cfg(unix)]
@@ -1112,6 +1153,92 @@ fn a_node_runner_that_says_nothing_settles_its_dispatch_as_a_failure() {
             .as_str()
             .is_some_and(|said| said.contains("9")),
         "the failure does not name what the runner did: {settled:#}\n{}",
+        worker.transcript()
+    );
+}
+
+/// A dispatch answered while a node is running is **queued**, and the poll goes
+/// on (§2, §3.2, §3.4).
+///
+/// §2 requires the poll to continue while a node runs — "the poll is the
+/// heartbeat" — and a session that stops making requests is declared gone at the
+/// liveness window, which supersedes whatever it was holding (§6.3). So the one
+/// thing a worker must not do with a second dispatch is **wait** for the first.
+///
+/// A hub hands one over legitimately: §3.4 makes a dispatch the hub superseded
+/// on the node's own `timeout:` no longer *unsettled*, so answering the next poll
+/// is not a breach of §2's "MUST NOT answer a session's poll with a dispatch
+/// while that session has a dispatch it has not settled" — and a worker cannot
+/// tell that apart from a hub that did breach it. Both are a real journaled
+/// dispatch it is owed a result for, so both are queued and neither is dropped.
+///
+/// Two halves are asserted, and a blocking recovery fails both: the results
+/// arrive, in order, for **both** dispatches; and polls keep arriving while the
+/// first node runs. The fixture runner lingers so that "while the first node
+/// runs" is a window a test can count requests in.
+#[test]
+fn a_second_dispatch_is_queued_and_the_poll_never_stops() {
+    let hub = FixtureHub::start();
+    let (hash, tarball) = artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script("/workers/poll", dispatch("dsp_first"));
+    hub.script("/workers/poll", dispatch("dsp_second"));
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let worker = Worker::with_environment(
+        &hub,
+        "queued-dispatch",
+        &[("FIXTURE_RUNNER_LINGER_MS".to_string(), "2000".to_string())],
+    );
+
+    let asked = hub.until("settled both dispatches", |asked| {
+        asked
+            .iter()
+            .filter(|request| request.path == "/workers/result")
+            .count()
+            >= 2
+    });
+    let settled: Vec<&str> = asked
+        .iter()
+        .filter(|request| request.path == "/workers/result")
+        .filter_map(|request| request.body["dispatch_id"].as_str())
+        .collect();
+    assert_eq!(
+        settled,
+        ["dsp_first", "dsp_second"],
+        "the queued dispatch was dropped, or the two ran out of order:\n{}",
+        worker.transcript()
+    );
+
+    // The window: from the poll that was answered `dsp_second` to the result
+    // that settled `dsp_first`. A worker that waited for the node in hand makes
+    // no request at all in it, which at §2's window is a session the hub
+    // declares gone — and the second dispatch superseded with it.
+    let took_second = asked
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.path == "/workers/poll")
+        .nth(1)
+        .map(|(index, _)| index)
+        .expect("the worker polled twice");
+    let settled_first = asked
+        .iter()
+        .position(|request| {
+            request.path == "/workers/result" && request.body["dispatch_id"] == "dsp_first"
+        })
+        .expect("the first dispatch was settled");
+    let polls = asked[took_second + 1..settled_first]
+        .iter()
+        .filter(|request| request.path == "/workers/poll")
+        .count();
+    assert!(
+        polls >= 2,
+        "the worker made {polls} polls between taking the second dispatch and settling the \
+         first: the poll is the heartbeat, and a thread blocked on a slow runner stops it \
+         (docs/distributed.md §2, §3.2):\n{asked:#?}\n{}",
         worker.transcript()
     );
 }

@@ -392,6 +392,25 @@ export interface DispatchRow {
   readonly site: string;
   /** What the node's input phase built (§3.2's `inputs`). */
   readonly inputs: unknown;
+  /**
+   * The innermost enclosing `map`'s source-item index (§3.2's `item_index`),
+   * where one encloses this node.
+   *
+   * This and the two below are the facts the hub holds about a node execution
+   * that the node would have read for itself had it run on the hub, and they are
+   * on the row for `inputs`' reason: the row **is** the dispatch (§8 rule 3), so
+   * everything the poll answer carries is read out of it at hand-over and never
+   * out of a process's memory. A hub restarted mid-dispatch hands the same
+   * payload over as the one it replaced.
+   */
+  readonly itemIndex?: number;
+  /**
+   * The conversation turns an `agent:` node is given (§3.2's `history`,
+   * grammar §10.4), where the node takes any.
+   */
+  readonly history?: unknown;
+  /** Grammar §9.3's level 1 for this instance (§3.2's `policy`), where one is set. */
+  readonly policy?: unknown;
   readonly status: DispatchStatus;
   /** The session holding it, while one is. */
   readonly session?: string;
@@ -685,6 +704,9 @@ CREATE TABLE IF NOT EXISTS dispatches (
   node          TEXT NOT NULL,
   site          TEXT NOT NULL,
   inputs        TEXT NOT NULL,
+  item_index    INTEGER,
+  history       TEXT,
+  policy        TEXT,
   status        TEXT NOT NULL,
   session       TEXT,
   outcome       TEXT,
@@ -705,6 +727,24 @@ CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_
 CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
 CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
 `;
+
+/**
+ * How park order breaks a tie (`docs/distributed.md` §6.2).
+ *
+ * `parked_at` is an ISO instant with millisecond resolution, and a fan-out parks
+ * its instances from one synchronous burst — sixteen `dispatchPlaced` calls
+ * inside one tick all carry the same instant. §6.2 says dispatch resumes "in
+ * park order", so the tiebreak has to be the order they went on the board, and
+ * the only column that is is the implicit `rowid`: rows here are inserted and
+ * never deleted, so it is exactly monotonic insertion order.
+ *
+ * The tiebreak it replaced was `wait ASC`, which is a **string** — `<instance
+ * path>/<ordinal>` — so instance 10 sorted before instance 2 and a one-worker
+ * pool ran a `map`'s items 0, 1, 10, 11, …, 2, 3. §6.4's undispatched-is-a-pause
+ * row leans on park order for fairness: the item that has waited longest, and
+ * whose `timeout:` has been running longest, is the one taken next.
+ */
+const INSERTION_ORDER = "rowid ASC";
 
 /** The journal as a SQLite file — the only backend `--target local` binds. */
 class SqliteJournal implements Journal {
@@ -934,8 +974,9 @@ class SqliteJournal implements Journal {
     if (held !== undefined) return held;
     this.#database.run(
       `INSERT INTO dispatches
-         (execution, wait, id, placement, node, site, inputs, status, parked_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (execution, wait, id, placement, node, site, inputs,
+          item_index, history, policy, status, parked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (execution, wait) DO NOTHING`,
       [
         row.execution,
@@ -945,6 +986,13 @@ class SqliteJournal implements Journal {
         row.node,
         row.site,
         canonical(row.inputs),
+        row.itemIndex ?? null,
+        // SQL `NULL` rather than the four characters `null` for an absent one:
+        // the read below has to tell a dispatch that carries no history apart
+        // from one whose history is the JSON value `null`, which is §3.2's
+        // difference between omitting a key and sending it.
+        row.history === undefined ? null : canonical(row.history),
+        row.policy === undefined ? null : canonical(row.policy),
         "parked",
         row.parkedAt,
       ],
@@ -967,7 +1015,7 @@ class SqliteJournal implements Journal {
 
   dispatchesOf(execution: string): readonly DispatchRow[] {
     const rows = this.#database.all(
-      "SELECT * FROM dispatches WHERE execution = ? ORDER BY parked_at ASC, wait ASC",
+      `SELECT * FROM dispatches WHERE execution = ? ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
       [execution],
     ) as Row[];
     return rows.map((row) => dispatchOf(row));
@@ -975,7 +1023,7 @@ class SqliteJournal implements Journal {
 
   unsettledDispatches(): readonly DispatchRow[] {
     const rows = this.#database.all(
-      "SELECT * FROM dispatches WHERE status IN ('parked', 'dispatched') ORDER BY parked_at ASC, execution ASC, wait ASC",
+      `SELECT * FROM dispatches WHERE status IN ('parked', 'dispatched') ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
     ) as Row[];
     return rows.map((row) => dispatchOf(row));
   }
@@ -997,10 +1045,20 @@ class SqliteJournal implements Journal {
       outcome.kind === "value"
         ? canonical(outcome.value)
         : canonical({ name: outcome.name, message: outcome.message });
+    // **Read first, and the read is what answers.** The `WHERE` clause is still
+    // the guard — a row already ended keeps the outcome it has — but a status
+    // read *after* the write cannot tell a row this call settled from one an
+    // earlier result settled, and the contract above is that it can. The read
+    // and the write are one synchronous step in this driver, which is the
+    // property [`park`] already relies on.
+    const before = this.dispatchOf(id);
     this.#database.run(
       "UPDATE dispatches SET status = 'settled', outcome = ?, payload = ?, settled_at = ? WHERE id = ? AND status IN ('parked', 'dispatched')",
       [outcome.kind, payload, new Date().toISOString(), id],
     );
+    if (before === undefined || (before.status !== "parked" && before.status !== "dispatched")) {
+      return false;
+    }
     const held = this.dispatchOf(id);
     return held?.status === "settled" && held.settledAt !== undefined;
   }
@@ -1042,6 +1100,9 @@ function dispatchOf(row: Row): DispatchRow {
   const dispatchedAt = row["dispatched_at"];
   const settledAt = row["settled_at"];
   const detail = row["detail"];
+  const itemIndex = row["item_index"];
+  const history = row["history"];
+  const policy = row["policy"];
   return {
     execution: String(row["execution"]),
     wait: String(row["wait"]),
@@ -1050,6 +1111,13 @@ function dispatchOf(row: Row): DispatchRow {
     node: String(row["node"]),
     site: String(row["site"]),
     inputs: JSON.parse(String(row["inputs"])) as unknown,
+    ...(itemIndex === null || itemIndex === undefined ? {} : { itemIndex: Number(itemIndex) }),
+    ...(history === null || history === undefined
+      ? {}
+      : { history: JSON.parse(String(history)) as unknown }),
+    ...(policy === null || policy === undefined
+      ? {}
+      : { policy: JSON.parse(String(policy)) as unknown }),
     status: String(row["status"]) as DispatchStatus,
     ...(session === null || session === undefined ? {} : { session: String(session) }),
     ...(outcome === null || outcome === undefined || payload === null || payload === undefined

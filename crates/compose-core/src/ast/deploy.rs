@@ -4,13 +4,14 @@
 //! it is disjoint from spec files (Decision D3). `event_sources` is reserved
 //! grammar: parsed and validated in v0, executed in M3 (grammar 15).
 //!
-//! `hub:` and `placements:` are **not** reserved. They are the live static
-//! surface of the distributed claims model (PRD resolved q37–q44): a placement
-//! is a logical name a worker claims at an authenticated join, and the hub is
-//! the process that owns the graph. Every rule about them is enforced now; the
-//! protocol that reads them lands with the `worker` verb, and
-//! `crates/compose-core/tests/placement_surface_inertness.rs` is what says so
-//! in executable form (grammar 14.1, 14.2, `docs/distributed.md`).
+//! `hub:` and `placements:` are **not** reserved, and no longer awaiting a
+//! runtime either. They are the live surface of the distributed claims model
+//! (PRD resolved q37–q44): a placement is a logical name a worker claims at an
+//! authenticated join, and the hub is the process that owns the graph. Every
+//! rule about them is enforced by `validate`, a build emits the hub these keys
+//! describe, and `agent-compose worker` is the spoke that joins it;
+//! `crates/compose-core/tests/placement_surface_landing.rs` is what says so in
+//! executable form (grammar 14.1, 14.2, `docs/distributed.md`).
 
 use crate::diag::{Span, Spanned};
 
@@ -199,6 +200,28 @@ impl BackendProvider {
             Self::Memory | Self::Sqlite | Self::Redis | Self::Postgres => StoreKind::Kv,
             Self::SqliteVec | Self::Chroma | Self::Pgvector | Self::Qdrant => StoreKind::Vector,
             Self::LocalFs | Self::S3 | Self::Gcs => StoreKind::Blob,
+        }
+    }
+
+    /// Whether this backend lives **inside** the process that opens it.
+    ///
+    /// A heap, a file and a directory: two processes that open "the same" one of
+    /// these open two, so what one writes the other cannot read. The rest are
+    /// network services addressed by a URL, so a hub and a worker pointed at one
+    /// are pointed at the same data — which is the premise
+    /// `docs/distributed.md` §1 states as "global-scope stores are already
+    /// external backends" and grammar 14.1 turns into a rule about placements.
+    #[must_use]
+    pub const fn is_process_local(self) -> bool {
+        match self {
+            Self::Memory | Self::Sqlite | Self::SqliteVec | Self::LocalFs => true,
+            Self::Redis
+            | Self::Postgres
+            | Self::Chroma
+            | Self::Pgvector
+            | Self::Qdrant
+            | Self::S3
+            | Self::Gcs => false,
         }
     }
 }

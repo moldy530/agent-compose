@@ -119,6 +119,21 @@ interface Dispatch {
   readonly node: string;
   readonly instance_path: string;
   readonly inputs: unknown;
+  /**
+   * §3.2's four OPTIONAL fields: what the hub holds about this node execution
+   * that the node would have read for itself had it run there.
+   *
+   * **None of them is derived here.** §3.2 says so outright — "they are the
+   * hub's to derive, and the worker MUST NOT invent them" — and each default a
+   * worker could reach for is a placed node quietly meaning something else: an
+   * empty `session_key` sends a `scope: session` store's diagnostic after a
+   * `--session` the run already passed, and an empty `history` answers from the
+   * input object alone with nothing said.
+   */
+  readonly session_key?: string;
+  readonly item_index?: number;
+  readonly history?: readonly unknown[];
+  readonly policy?: unknown;
   readonly effect_history?: readonly Record<string, unknown>[];
 }
 
@@ -288,6 +303,16 @@ class WorkerJournalReach extends Error {
 // ---------------------------------------------------------------------------
 
 /**
+ * §3.2's `session_key` for the one execution this process runs a node of.
+ *
+ * Set once from the dispatch, before anything runs. A module-scope value rather
+ * than a parameter because it is a property of the *execution*, and this process
+ * has exactly one: a placed component that reaches another placed component of
+ * its own placement ([`runPlaced`]) is still inside it.
+ */
+let sessionKey = "";
+
+/**
  * Run one placed node here, under a context and an effect site of its own.
  *
  * Installed as `./mesh.ts`'s local executor, which is what makes **nesting**
@@ -304,6 +329,9 @@ async function runPlaced(options: {
   readonly execution: string;
   readonly path: readonly string[];
   readonly inputs: unknown;
+  readonly itemIndex?: number;
+  readonly history?: readonly runtime.Turn[];
+  readonly policy?: runtime.InstancePolicy;
   readonly signal?: AbortSignal;
 }): Promise<PlacedAnswer> {
   const run = placedNodes[options.node];
@@ -322,11 +350,18 @@ async function runPlaced(options: {
   const toolDispatches: runtime.DispatchRecord[] = [];
   const execution: runtime.ExecutionIdentity = {
     id: options.execution,
-    // Not on the wire, and §3.2 carries no field for it. A placed component
-    // that reaches a `scope: session` store therefore addresses the empty
-    // partition here, which is the one thing this runner cannot do faithfully;
-    // it is named rather than papered over.
-    session_key: "",
+    // §3.2's `session_key`, as the hub read it off the execution's lifecycle
+    // row — not a default, because grammar §4.1's session key is what a
+    // `scope: session` store partitions by, and a placed component that
+    // addressed the empty partition would fail its first `memory_get` with a
+    // diagnostic telling the operator to pass a `--session` they already did.
+    //
+    // Held for the **process** rather than passed per call: this runner runs one
+    // dispatch of one execution, and a placed component that reaches another
+    // placed component of its own placement (see this function's own doc)
+    // reaches it inside that same execution.
+    session_key: sessionKey,
+    ...(options.itemIndex === undefined ? {} : { item_index: options.itemIndex }),
   };
   const context: runtime.RunContext = {
     execution,
@@ -344,7 +379,12 @@ async function runPlaced(options: {
       return effects === undefined ? {} : { effects };
     })(),
   };
-  const answer = await run(options.inputs, context, { path: options.path, execution });
+  const answer = await run(options.inputs, context, {
+    path: options.path,
+    execution,
+    ...(options.history === undefined ? {} : { history: options.history }),
+    ...(options.policy === undefined ? {} : { policy: options.policy }),
+  });
   return {
     output: answer.output,
     ...(answer.history === undefined ? {} : { history: answer.history }),
@@ -453,6 +493,9 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Before anything runs, because [`runPlaced`] reads it (§3.2).
+  sessionKey = dispatch.session_key ?? "";
+
   const history: JournalRecord[] = [];
   for (const entry of dispatch.effect_history ?? []) {
     const record = recordOf(entry, dispatch.execution_id);
@@ -481,6 +524,17 @@ async function main(): Promise<void> {
       execution: dispatch.execution_id,
       path: dispatch.instance_path === "" ? [] : dispatch.instance_path.split("/"),
       inputs: dispatch.inputs,
+      // Taken as given: §3.2 makes each of these the hub's to derive, and the
+      // types are the wire's rather than this module's to re-check — a payload
+      // that carried something else came from a hub of another release, which
+      // §4.1's handshake refuses at join and not here.
+      ...(typeof dispatch.item_index === "number" ? { itemIndex: dispatch.item_index } : {}),
+      ...(dispatch.history === undefined
+        ? {}
+        : { history: dispatch.history as readonly runtime.Turn[] }),
+      ...(dispatch.policy === undefined
+        ? {}
+        : { policy: dispatch.policy as runtime.InstancePolicy }),
     });
     line = {
       type: "result",

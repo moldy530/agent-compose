@@ -101,7 +101,7 @@
 //!
 //! A store bound to a **production** backend is the only one. Grammar
 //! 14.3's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
-//! the rest land in M3 — so [`backend_of`] resolves the alias at compile time
+//! the rest land in M3 — so `ir::deploy::backend_of` resolves the alias at compile time
 //! and the emitted binding carries the provider it resolved to; `src/stores.ts`
 //! is where a store bound to one says so, naming the backend, where the
 //! resolution came from, and the milestone. Under `--target local` no alias and
@@ -119,7 +119,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated};
-use crate::ast::definition::{Builtin, ProviderKind, StoreKind};
+use crate::ast::definition::{Builtin, ProviderKind};
 use crate::ast::flow::FlowContext;
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
@@ -619,7 +619,7 @@ fn stores(ir: &Ir, names: &Names) -> String {
         let local = address
             .split_once('.')
             .map_or(address.as_str(), |(_, rest)| rest);
-        let backend = backend_of(ir, store);
+        let backend = crate::ir::deploy::backend_of(ir, store);
         text.push('\n');
         text.push_str(&names::doc(
             "",
@@ -628,7 +628,7 @@ fn stores(ir: &Ir, names: &Names) -> String {
                  (grammar 11.1, 11.3).",
                 store.kind.as_str(),
                 store.scope.as_str(),
-                backend.provider,
+                backend.provider.as_str(),
                 backend.from
             )],
         ));
@@ -679,74 +679,13 @@ fn stores(ir: &Ir, names: &Names) -> String {
         text.push_str("  backend: {\n");
         text.push_str(&format!(
             "    provider: {},\n",
-            names::string(backend.provider)
+            names::string(backend.provider.as_str())
         ));
         text.push_str(&format!("    from: {},\n", names::string(&backend.from)));
         text.push_str("  },\n");
         text.push_str("};\n");
     }
     text
-}
-
-/// Which backend a store resolved to under the active target, and why.
-struct Backend {
-    provider: &'static str,
-    from: String,
-}
-
-/// Grammar 11.3's resolution order, run at compile time.
-///
-/// `--target local` substitutes local storage for **every** store
-/// unconditionally, so under it no alias and no per-kind default is consulted at
-/// all (PRD 5.8, Decision D87) — which is what makes a project with production
-/// infrastructure in `deploy/staging.yml` still buildable and runnable with none.
-/// Under any other target the order is the grammar's: explicit alias, then the
-/// per-kind `defaults:`, then the target built-in, which is the same local
-/// storage because it is the only backend this compiler release implements.
-fn backend_of(ir: &Ir, store: &crate::ir::definition::Store) -> Backend {
-    let built_in = match store.kind {
-        StoreKind::Kv => "sqlite",
-        StoreKind::Vector => "sqlite_vec",
-        StoreKind::Blob => "local_fs",
-    };
-    if ir.target == crate::DEFAULT_TARGET {
-        return Backend {
-            provider: built_in,
-            from: "the `local` target substitutes local storage for every store unconditionally"
-                .to_string(),
-        };
-    }
-    let backends = ir.deploy.storage_backends.as_ref();
-    if let Some(alias) = &store.backend
-        && let Some(config) =
-            backends.and_then(|backends| backends.aliases.get(alias.value.as_str()))
-    {
-        return Backend {
-            provider: config.provider.as_str(),
-            from: format!(
-                "the alias `{}`, defined by the `{}` target",
-                alias.value, ir.target
-            ),
-        };
-    }
-    if let Some(config) = backends.and_then(|backends| backends.defaults.get(store.kind.as_str())) {
-        return Backend {
-            provider: config.provider.as_str(),
-            from: format!(
-                "the `{}` default of the `{}` target",
-                store.kind.as_str(),
-                ir.target
-            ),
-        };
-    }
-    Backend {
-        provider: built_in,
-        from: format!(
-            "the built-in for `kind: {}`, which the `{}` target does not override",
-            store.kind.as_str(),
-            ir.target
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2062,8 +2001,11 @@ fn activity(
                  placement: {placement},\n      \
                  node: {node_address},\n      \
                  execution: view.run.execution.id,\n      \
+                 itemIndex: view.run.execution.item_index,\n      \
                  path: runtime.instancePath(view, {node}),\n      \
                  inputs: input,\n      \
+                 history: runtime.historyTurns(view.state[\"messages\"] as unknown[]),\n      \
+                 policy: view.run.policy,\n      \
                  signal: context.signal,\n    \
                  }});\n    \
                  return {{\n      \
@@ -2091,6 +2033,7 @@ fn activity(
                  placement: {placement},\n          \
                  node: {node_address},\n          \
                  execution: view.run.execution.id,\n          \
+                 itemIndex: view.run.execution.item_index,\n          \
                  path: runtime.instancePath(view, {node}),\n          \
                  inputs: input,\n          \
                  signal: context.signal,\n        \
@@ -2682,6 +2625,7 @@ fn dispatch_run(
              placement: {placement},\n{indent}    \
              node: {target_name},\n{indent}    \
              execution: site.execution.id,\n{indent}    \
+             itemIndex: site.execution.item_index,\n{indent}    \
              path: site.path,\n{indent}    \
              inputs: input,\n{indent}    \
              signal: context.signal,\n{indent}  \
@@ -3979,16 +3923,26 @@ fn control_name_raw(target: &ControlTarget) -> String {
 /// `function:` node, and the component's own address for a `map` dispatch
 /// target, which is the address `dispatch_run` puts on the wire.
 ///
-/// # What a worker does not get, and where that is decided
+/// # What a worker is given, and why it is given rather than derived
 ///
-/// The activity is handed the dispatch's inputs and nothing else, because
-/// `docs/distributed.md` §3.2 fixes the payload and it carries no conversation
-/// history and no instance policy. So a placed `agent:` node runs on an **empty**
-/// history where a local one would see the `messages` channel's turns
-/// (grammar §10.4) — a `map`-dispatched agent already runs on an empty one by
-/// grammar §8.6's own rule (D105), so the two agree there. It is a difference the
-/// wire would have to grow an OPTIONAL field to close (§10.2), which is a change
-/// to the protocol document rather than to this emitter.
+/// The activity is handed the dispatch's inputs **and the four facts §3.2 carries
+/// beside them**: the execution's session key and item index, the conversation
+/// history an `agent:` node takes, and grammar §9.3's level-1 policy. Each is a
+/// fact the hub holds about this node execution that the node would have read for
+/// itself had it run there, and the worker has no way to compute any of them — it
+/// holds no `messages` channel, no `$run`, and no lifecycle row.
+///
+/// That is what makes a placement a decision about *which process* rather than
+/// about what a node means (§4.3, §2, PRD 5.6's "zero change to the logical
+/// definition"). Placing an `agent:` node without them would silently drop the
+/// turns grammar §10.4 fills the shared channel with, and would instantiate a
+/// `flow.*` in the agent's `tools:` under a different retry/timeout ladder from
+/// the one the same agent unplaced instantiates it under (D79).
+///
+/// A `map`-dispatched target sends neither `history` nor `policy`, and that is
+/// not a gap: grammar §8.6 rule 10 runs a dispatched instance on a fresh
+/// conversation with level 1 absent (D105), which is what the local lowering
+/// does too.
 fn placed_source(ir: &Ir, names: &Names) -> String {
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -4075,14 +4029,22 @@ fn map_targets(map: &Map) -> Vec<String> {
 
 /// One placed `agent.*`, run where it was placed.
 ///
-/// An **empty** history and no instance policy, which is the payload §3.2
-/// carries — see [`placed_source`]. Everything else is the local lowering's own
-/// call, down to the answer being left unparsed: the hub holds it to the node's
-/// declared surface when it feeds it back into the graph.
+/// The history and the level-1 policy are the **dispatch's** — §3.2's `history`
+/// and `policy`, which the hub derived from the node's own call site and put on
+/// the wire (see [`placed_source`]). Absent is empty and absent is "none set",
+/// which is exactly what a `map`-dispatched agent sends: grammar §8.6 rule 10
+/// runs a dispatched instance on a fresh conversation with level 1 absent
+/// (D105), so the same lowering serves both without a branch.
+///
+/// Everything else is the local lowering's own call, down to the answer being
+/// left unparsed: the hub holds it to the node's declared surface when it feeds
+/// it back into the graph.
 fn placed_agent(names: &Names, address: &str) -> String {
     format!(
         "    async (input, context, site) => {{\n      \
-         const answer = await runtime.callAgent({binding}, input, [], context, {{ path: site.path }});\n      \
+         const answer = await runtime.callAgent(\n        {binding},\n        input,\n        \
+         site.history ?? [],\n        context,\n        \
+         {{ path: site.path, policy: site.policy }},\n      );\n      \
          return {{\n        \
          output: answer.output,\n        \
          history: answer.history,\n        \

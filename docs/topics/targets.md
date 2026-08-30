@@ -214,8 +214,8 @@ tool — rather than load assignment.
 | `hub.join_token` | the bearer credential a worker joins with, as an `${ENV}` reference — required wherever `placements:` is non-empty |
 | `hub.public_url` | the absolute `http`/`https` base every ingress URL derives from; no wildcard, because this is your URL rather than an allowlist pattern |
 
-Five rules, each a compile error — grammar §14.1's four about a placement, in
-its numbering, and then §14.2's about the token:
+Six rules, each a compile error — grammar §14.1's five about a placement, in its
+numbering, and then §14.2's about the token:
 
 - **§14.1 rule 1** — `members:` is required, non-empty, and names each component
   once.
@@ -234,6 +234,16 @@ its numbering, and then §14.2's about the token:
   untouched: a placed tool reached from a `function:` node, or anything inside a
   flow instantiated by a `flow:` node, keeps its own placement, and there its own
   placement is the whole answer.
+- **rule 5** — a placed component reaches only stores **every process shares**. A
+  placement moves where a component executes and nothing else, so a `store.*` on
+  a process-local backend — `memory`, `sqlite`, `sqlite_vec`, `local_fs` — is one
+  the worker and the hub each hold their own copy of: the write succeeds, the
+  hub's read answers empty, and the flow carries on with data that is not there.
+  Refused for **every** scope, because what decides it is the backend. The repair
+  is a `storage_backends:` entry binding the store to a networked provider, or
+  taking the component out of the placement. Resolved **per target**, so a
+  composition that is fine under a target whose alias is `chroma` is refused
+  under `local`, where the store really is a file.
 - **§14.2** — `hub.join_token` is required wherever placements are, and takes an
   `${ENV}` reference, never a literal. **Holding it is being trusted with the
   mesh**: the whole artifact, the right to claim any placement, and the journal's

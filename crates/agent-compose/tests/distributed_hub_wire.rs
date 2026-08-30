@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mock_provider::{Client, MockProvider, Request, Response};
+use mock_provider::{Client, MockProvider, Outcome, Request, Response, Script};
 use serde_json::{Value, json};
 
 #[path = "compiled_graph_acceptance/harness.rs"]
@@ -42,6 +42,9 @@ const TOKEN_VARIABLE: &str = "MESH_JOIN_TOKEN";
 /// The fixture, and the target that gives it a mesh.
 const FIXTURE: &str = "placed-nodes";
 const TARGET: &str = "mesh";
+
+/// The model every agent in the fixture routes to.
+const SONNET: &str = "claude-sonnet-4-6";
 
 /// A hold and a window short enough for a test and still in §2's relationship.
 ///
@@ -65,8 +68,9 @@ const PATIENCE: Duration = Duration::from_secs(20);
 struct Hub {
     /// Held so the app outlives the test that started it.
     _served: harness::Served,
-    /// Held so the fixture's `${MOCK_BASE_URL}` resolves to something.
-    _provider: MockProvider,
+    /// Held so the fixture's `${MOCK_BASE_URL}` resolves to something, and
+    /// scripted by the one test whose flow runs an agent on the hub.
+    provider: MockProvider,
     /// Held so the built project — and its journal — outlive the app.
     _scratch: Option<harness::Scratch>,
     client: Client,
@@ -283,7 +287,7 @@ fn hub_into(out: &Path, extra: &[(String, String)]) -> Option<Hub> {
     let base_url = served.base_url.clone();
     Some(Hub {
         _served: served,
-        _provider: provider,
+        provider,
         _scratch: None,
         client,
         base_url,
@@ -382,16 +386,30 @@ fn every_join_refusal_is_the_status_and_the_shape_the_document_gives_it() {
         "a refusal echoed a credential"
     );
 
-    // `env_ok` against an artifact the worker does not hold, and its absence on
-    // one it does: one rule, two `400`s (§3.1, §9.2).
-    let guessed = hub.joining(&[
-        ("artifact_hash", json!(format!("sha256:{}", "0".repeat(64)))),
-        ("env_ok", json!(["KEYCHAIN_PASSWORD"])),
-    ]);
-    assert_eq!(guessed.status, 400, "{}", body_of(&guessed));
+    // `env_ok` absent on a join whose hash **is** the current one: the `400`
+    // §3.1 gives that pair, because there is a manifest this worker could have
+    // read and did not (§9.2).
     let silent = hub.joining(&[("artifact_hash", json!(hash))]);
     assert_eq!(silent.status, 400, "{}", body_of(&silent));
     assert!(body_of(&silent).contains("env_ok"), "{}", body_of(&silent));
+
+    // …and the other direction is **not** a refusal. A report sent with a stale
+    // hash is a report about a manifest this hub is not serving, so §3.1 has the
+    // hub ignore it and answer with the current artifact — which is what keeps
+    // "a refused join is terminal" satisfiable for a worker that has just been
+    // redeployed under: it cannot know its hash is stale until it has asked, and
+    // a refusal here would leave it with no body a second join could send.
+    let stale = hub.joining(&[
+        ("artifact_hash", json!(format!("sha256:{}", "0".repeat(64)))),
+        ("env_ok", json!(["KEYCHAIN_PASSWORD"])),
+    ]);
+    assert_eq!(stale.status, 200, "{}", body_of(&stale));
+    assert_eq!(
+        stale.json()["artifact"]["hash"],
+        json!(hash),
+        "the answer does not name the artifact this hub serves: {}",
+        body_of(&stale)
+    );
 }
 
 /// The **order** of §3.1's rows, which is as normative as the rows.
@@ -767,6 +785,102 @@ fn a_function_node_over_a_placed_tool_dispatches_and_its_answer_is_held_to_the_c
     );
 }
 
+/// §3.2's four OPTIONAL payload fields: the hub derives them, and a dispatch
+/// carries them.
+///
+/// They are the whole of what keeps "a placement decides which *process* runs a
+/// node" (§4.3) from being "a placement decides what a node **does**", and each
+/// is a fact a worker cannot compute:
+///
+///  * `session_key` — grammar §4.1's `execution.session_key`, off the
+///    execution's own lifecycle row. Without it a placed component reaching a
+///    `scope: session` store would address the empty partition and fail with a
+///    diagnostic telling the operator to pass a `--session` the run passed.
+///  * `history` — the turns of the shared `messages` channel (grammar §10.4).
+///    `flow.conversation` runs an **unplaced** agent first, on the hub, so by
+///    the time `sign` is dispatched the channel holds that agent's turns. A
+///    payload without them is a node answering from its input object alone.
+///  * `item_index` and `policy` — absent here, and asserted absent: §3.2 makes
+///    each optional, "a dispatch that has none of them omits all four", and a
+///    hub that sent `null` would be sending a value rather than omitting a key.
+///
+/// The counterpart at the emitter is
+/// `compose-core`'s `placement_surface_landing.rs`, which holds the two
+/// lowerings — placed and local — to one description; this is the same claim
+/// made against a served hub, over the wire, with an execution behind it.
+#[test]
+fn a_dispatch_carries_the_execution_identity_and_the_conversation_the_node_would_have_read() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    // The hub's own agent: `agent.briefer` is unplaced, so this call is made
+    // here rather than on a worker, and its answer is what fills `messages`.
+    hub.provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "brief": "a release of dist/app" })),
+    ));
+
+    let worker = hub.worker();
+    let execution = hub.start(
+        "/conversations",
+        &json!({ "path": "dist/app", "session": "release-42" }),
+    );
+
+    let dispatch = worker.dispatch(&hub);
+    assert_eq!(dispatch["execution_id"], json!(execution));
+    assert_eq!(dispatch["node"], json!("flow.conversation.sign"));
+    assert_eq!(
+        dispatch["session_key"],
+        json!("release-42"),
+        "the dispatch does not carry the execution's session key: {dispatch:#}"
+    );
+
+    let turns = dispatch["history"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the dispatch carries no conversation: {dispatch:#}"));
+    assert!(
+        !turns.is_empty(),
+        "the placed node was dispatched with an empty history where the same node unplaced \
+         would have seen `agent.briefer`'s turns (grammar §10.4): {dispatch:#}"
+    );
+    assert!(
+        turns
+            .iter()
+            .any(|turn| turn["text"].as_str().unwrap_or_default().contains("brief")),
+        "the turns are not the ones the hub's own agent produced: {dispatch:#}"
+    );
+
+    assert_eq!(
+        dispatch.get("item_index"),
+        None,
+        "no `map` encloses this node, so §3.2's key is omitted rather than sent as null: \
+         {dispatch:#}"
+    );
+    assert_eq!(
+        dispatch.get("policy"),
+        None,
+        "nothing instantiated this flow with a `policy:`, so §3.2's key is omitted: {dispatch:#}"
+    );
+
+    let id = dispatch["dispatch_id"]
+        .as_str()
+        .expect("a dispatch id")
+        .to_string();
+    assert_eq!(
+        worker
+            .settle(&hub, &id, &json!({ "signature": "signed-after-the-brief" }))
+            .status,
+        204
+    );
+    let report = hub.until(&execution, "completed", |report| {
+        report["status"] == json!("completed")
+    });
+    assert_eq!(
+        report["outputs"],
+        json!({ "signature": "signed-after-the-brief" })
+    );
+}
+
 /// A placed node with no worker **parks**, on the board and in the report
 /// (§6.1), and a join is what wakes it (§6.2).
 #[test]
@@ -933,6 +1047,91 @@ fn a_poll_in_flight_is_answered_when_the_work_parks_rather_than_when_its_hold_en
         "the poll waited {waited:?} of a {hold:?} hold for work that parked after 400ms: a \
          dispatch woke nobody, and §2's latency floor became the hold"
     );
+}
+
+/// A poll whose client hung up takes no dispatch, and stops being a heartbeat.
+///
+/// A hold ends for two reasons and only one of them means "ask again": the hold
+/// expired, or **the connection closed**. A worker that was `SIGKILL`ed, or a
+/// poll an intermediary dropped, is the second — and a hub that went round its
+/// loop anyway would do two wrong things with one dead socket. It would refresh
+/// `session.seen` for a request that has demonstrably ended, extending §6.3's
+/// "90 seconds since the last request on a session" by up to a whole hold; and
+/// it would `claimDispatch` parked work for a socket nothing can be written to,
+/// marking the row `dispatched` against a session that will never settle it. The
+/// node then waits out the liveness window before anything supersedes it, and
+/// loses an attempt to a dispatch it never received.
+///
+/// The hold here is deliberately long: the failure needs work to park **inside**
+/// the hold the dead poll was in, which is exactly the window the guard covers,
+/// and a 300 ms hold leaves no room to arrange it. The window is long too, so a
+/// hub that did claim the row is not rescued by the sweep before the second
+/// worker asks.
+#[test]
+fn a_poll_whose_client_hung_up_claims_no_dispatch() {
+    let Some(project) = harness::scratch_project("mesh-hangup") else {
+        return;
+    };
+    let held = harness::Scratch::at(project);
+    let Some(hub) = hub_into(
+        held.path(),
+        &[
+            (
+                "AGENT_COMPOSE_MESH_POLL_HOLD_MS".to_string(),
+                "6000".to_string(),
+            ),
+            (
+                "AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS".to_string(),
+                "30000".to_string(),
+            ),
+        ],
+    ) else {
+        return;
+    };
+
+    // One session that polls and goes away. The socket is written and then
+    // **shut down** rather than left to a client's own budget, because what is
+    // being reproduced is a process that stopped existing: an abandoned read
+    // leaves the connection open and the hub answering into it, which is a
+    // different thing and not the one §6.3 is about.
+    let gone = hub.worker();
+    let address = hub
+        .base_url
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    {
+        use std::io::Write;
+        let mut socket =
+            std::net::TcpStream::connect(&address).expect("the hub accepts a connection");
+        write!(
+            socket,
+            "GET /workers/poll HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {TOKEN}\r\n\
+             X-Worker-Session: {}\r\n\r\n",
+            gone.session
+        )
+        .expect("the poll is written");
+        socket.flush().expect("the poll is flushed");
+        // Long enough that the hub is certainly holding it.
+        std::thread::sleep(Duration::from_millis(500));
+        socket
+            .shutdown(std::net::Shutdown::Both)
+            .expect("the socket closes");
+    }
+    // …and long enough for the hub to notice.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // …and the work parks while that hold is still running.
+    let execution = hub.start("/releases", &json!({ "path": "dist/app" }));
+
+    // A live worker gets it. If the dead session's loop claimed it instead, this
+    // is `204` until the liveness window closes — thirty seconds, which is past
+    // this suite's patience, so the failure reads as "no dispatch reached this
+    // worker" rather than as a timeout nobody can place.
+    let live = hub.worker();
+    let dispatch = live.dispatch(&hub);
+    assert_eq!(dispatch["execution_id"], json!(execution));
+    assert_eq!(dispatch["node"], json!("flow.release.sign"));
 }
 
 /// An unknown session is `410` at every session-carrying route, and at those

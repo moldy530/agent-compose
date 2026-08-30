@@ -195,6 +195,21 @@ export const httpTriggers: readonly HttpTrigger[] = [
     },
   },
   {
+    name: "on_conversation",
+    flow: "flow.conversation",
+    path: "/conversations",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+    sessionKey: (payload) => text("payload.body.session", roots(payload), "`session_key` of the trigger `on_conversation`"),
+  },
+  {
     name: "on_direct_sign",
     flow: "flow.direct",
     path: "/direct-signings",

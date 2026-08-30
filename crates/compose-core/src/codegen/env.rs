@@ -94,6 +94,21 @@ impl Process {
 /// with it.
 const DEPLOY_OWNER: &str = "deploy:";
 
+/// The owner key one `storage_backends:` entry's references are filed under.
+///
+/// A key of its own rather than [`DEPLOY_OWNER`], because a backend is the one
+/// deploy-layer surface a **placement** can also reach: a store an agent
+/// attaches is opened in that agent's process, so the credential that opens it
+/// is spent there. §9.1's fifth clause still holds — a deploy-layer variable is
+/// the hub's — and this only ever *adds* processes, never moves one off the
+/// hub's list, exactly as the unplaced-agent clause does for a component.
+///
+/// `site` is the spec address `References::backend` records the reference under,
+/// so the two cannot name different entries.
+fn backend_owner(site: &str) -> String {
+    format!("{DEPLOY_OWNER}{site}")
+}
+
 /// Which processes each reference-holding surface can execute in
 /// (`docs/distributed.md` §9.1).
 ///
@@ -117,6 +132,14 @@ const DEPLOY_OWNER: &str = "deploy:";
 /// `exec:`/`http:` node bindings inside it — every node of one flow runs
 /// wherever that flow's instance runs — and [`DEPLOY_OWNER`] for the trigger
 /// table and the deploy layer, which are the hub's by §9.1's fifth clause.
+///
+/// One deploy-layer surface has an owner of its own, [`backend_owner`]: a
+/// `storage_backends:` entry is the hub's like the rest of that layer, **and**
+/// every placement whose components open a store bound to it, because the
+/// credential that opens a store is spent in the process that opens it. The
+/// fifth clause is not weakened by that — nothing moves off the hub's list —
+/// exactly as being reached from a placed agent's loop adds a placement to an
+/// unplaced agent's variables without moving them.
 #[derive(Debug, Default)]
 pub struct Partition {
     /// Owner key to the processes it can execute in.
@@ -143,6 +166,26 @@ impl Partition {
         runs.entry(DEPLOY_OWNER.to_string())
             .or_default()
             .insert(Process::Hub);
+        // …and each `storage_backends:` entry is the hub's too, unconditionally
+        // and for the same clause. The pass below **adds** the placements whose
+        // components open a store bound to it; nothing takes it off the hub's
+        // list, so an entry no store binds keeps the membership it always had.
+        if let Some(backends) = ir.deploy.storage_backends.as_ref() {
+            for kind in backends.defaults.keys() {
+                runs.entry(backend_owner(&format!(
+                    "deploy.storage_backends.defaults.{kind}"
+                )))
+                .or_default()
+                .insert(Process::Hub);
+            }
+            for alias in backends.aliases.keys() {
+                runs.entry(backend_owner(&format!(
+                    "deploy.storage_backends.aliases.{alias}"
+                )))
+                .or_default()
+                .insert(Process::Hub);
+            }
+        }
 
         // Membership — §9.1's first clause — and unconditional hub
         // dispatchability, its second.
@@ -237,6 +280,13 @@ impl Partition {
                         for attached in &agent.tools {
                             carry(&attached.value.to_string(), true);
                         }
+                        // A store an agent attaches is opened by the synthesized
+                        // tool its own loop calls (grammar §11.5), so it is
+                        // opened wherever the agent runs. Not placeable: a
+                        // `store.*` is not a `members:` entry (grammar §14.1).
+                        for attached in &agent.stores {
+                            carry(&attached.value.to_string(), false);
+                        }
                     }
                     DefinitionBody::Flow(flow) => {
                         for node in &flow.nodes {
@@ -251,12 +301,43 @@ impl Partition {
                                         carry(&target.value.to_string(), true);
                                     }
                                 }
+                                // A `store:` node is opened by whichever process
+                                // runs this flow's instance (grammar §11.4).
+                                NodeKind::Store { store, .. } => {
+                                    carry(&store.value.to_string(), false);
+                                }
                                 _ => {}
                             }
                         }
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // A storage backend follows the stores it binds. Run **after** the
+        // closure, because what a backend is reached by is decided by which
+        // processes reached the store, and nothing is downstream of a backend
+        // for the fixed point to carry further.
+        //
+        // A store an agent attaches runs in that agent's process, so its
+        // backend's credential is spent there and a manifest without it is a
+        // worker that joins clean (§9.2 cannot refuse over a variable the
+        // manifest does not name) and fails at its first store op — precisely
+        // the failure §9.1 exists to prevent. Grammar §14.1 rule 5 refuses the
+        // *process-local* case outright; this is the other half, for the
+        // networked backends that rule admits.
+        for (address, definition) in &ir.definitions {
+            let DefinitionBody::Store(store) = &definition.body else {
+                continue;
+            };
+            let Some(site) = crate::ir::deploy::backend_of(ir, store).site else {
+                continue;
+            };
+            let held = runs.get(address).cloned().unwrap_or_default();
+            let into = runs.entry(backend_owner(&site)).or_default();
+            for process in held {
+                into.insert(process);
             }
         }
 
@@ -480,6 +561,25 @@ impl References {
             }
         }
 
+        // **Before** the deploy layer's own gate, because a backend is filed
+        // under an owner of its own: the credential that opens a store is spent
+        // in every process that opens it, which is the hub and every placement
+        // whose components reach it (§9.1, [`backend_owner`]).
+        if let Some(backends) = &ir.deploy.storage_backends {
+            for (kind, config) in &backends.defaults {
+                let site = format!("deploy.storage_backends.defaults.{kind}");
+                if wanted(&backend_owner(&site)) {
+                    references.backend(config, &site);
+                }
+            }
+            for (alias, config) in &backends.aliases {
+                let site = format!("deploy.storage_backends.aliases.{alias}");
+                if wanted(&backend_owner(&site)) {
+                    references.backend(config, &site);
+                }
+            }
+        }
+
         if !wanted(DEPLOY_OWNER) {
             return references;
         }
@@ -530,14 +630,6 @@ impl References {
             }
         }
 
-        if let Some(backends) = &ir.deploy.storage_backends {
-            for (kind, config) in &backends.defaults {
-                references.backend(config, &format!("deploy.storage_backends.defaults.{kind}"));
-            }
-            for (alias, config) in &backends.aliases {
-                references.backend(config, &format!("deploy.storage_backends.aliases.{alias}"));
-            }
-        }
         if let Some(sources) = &ir.deploy.event_sources {
             for (name, source) in &sources.entries {
                 let at = format!("deploy.event_sources.{name}");
@@ -896,6 +988,83 @@ placements:\n  one:\n    members: [agent.left]\n  two:\n    members: [agent.righ
         assert!(
             !hub.contains(&"VENDOR_KEY".to_string()),
             "both agents are placed, so the hub calls no model: {hub:?}"
+        );
+    }
+
+    /// A store's **backend credential** follows the store, to the hub and to
+    /// every placement that opens it (§9.1).
+    ///
+    /// The failure this prevents is the one §9.2's join-time check exists for,
+    /// arrived at from the deploy layer: `agent.archivist` is placed on `vault`
+    /// and attaches `store.docs`, whose alias resolves to a networked backend
+    /// with a `${CHROMA_URL}`. The worker opens that store in its own tool loop,
+    /// so a manifest without the variable lets it join clean — §3.1's `403`
+    /// cannot fire over a name the manifest does not carry — and fail at its
+    /// first `docs_search` on a machine that has no `CHROMA_URL`.
+    ///
+    /// Both halves are asserted, because §9.1's fifth clause is not weakened by
+    /// this: a deploy-layer variable stays the **hub's** whatever else reaches
+    /// it, exactly as an unplaced agent's does. The placement is added, never
+    /// substituted.
+    #[test]
+    fn a_stores_backend_credential_belongs_to_the_hub_and_to_every_placement_that_opens_it() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai\n  api_key: ${VENDOR_KEY}\n\
+provider.embed:\n  kind: openai\n  api_key: ${EMBED_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+store.docs:\n  kind: vector\n  scope: global\n  backend: docs_db\n  embed:\n    model: text-embedding-3-small\n    provider: provider.embed\n\
+agent.archivist:\n  model: model.smart\n  prompt: File it.\n  stores: [store.docs]\n  input: { q: { type: string } }\n  output: { a: { type: string } }\n\
+flow.archive:\n  inputs:\n    q: { type: string }\n  outputs: {}\n  nodes:\n    file:\n      agent: agent.archivist\n      input:\n        q: \"input.q\"\n  edges:\n    - { from: start, to: file }\n    - { from: file, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  vault:\n    members: [agent.archivist]\n\
+storage_backends:\n  aliases:\n    docs_db:\n      provider: chroma\n      url: ${CHROMA_URL}\n",
+        );
+
+        let vault = manifest(&ir, &partition, &Process::Placement("vault".to_string()));
+        assert!(
+            vault.contains(&"CHROMA_URL".to_string()),
+            "the worker opens `store.docs` in the placed agent's own tool loop and does not hold \
+             the credential that opens it: {vault:?}"
+        );
+        let hub = manifest(&ir, &partition, &Process::Hub);
+        assert!(
+            hub.contains(&"CHROMA_URL".to_string()),
+            "§9.1's fifth clause: a deploy-layer variable is the hub's, and a placement reaching \
+             it adds a process rather than moving one: {hub:?}"
+        );
+        assert!(
+            !hub.contains(&"VENDOR_KEY".to_string()),
+            "the only agent is placed, so the hub calls no model: {hub:?}"
+        );
+    }
+
+    /// A backend entry no store binds keeps the membership it always had.
+    ///
+    /// The over-narrowing guard for the clause above: filing a backend under an
+    /// owner of its own could have dropped one that nothing resolves to off
+    /// every list, and a variable belonging to no process is one no launch check
+    /// and no join ever asks about.
+    #[test]
+    fn a_backend_no_store_binds_is_still_the_hubs() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai\n  api_key: ${VENDOR_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+agent.plain:\n  model: model.smart\n  prompt: Answer.\n  input: { q: { type: string } }\n  output: { a: { type: string } }\n\
+flow.ask:\n  inputs:\n    q: { type: string }\n  outputs: {}\n  nodes:\n    ask:\n      agent: agent.plain\n      input:\n        q: \"input.q\"\n  edges:\n    - { from: start, to: ask }\n    - { from: ask, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  vault:\n    members: [agent.plain]\n\
+storage_backends:\n  defaults:\n    kv:\n      provider: redis\n      url: ${REDIS_URL}\n",
+        );
+        let hub = manifest(&ir, &partition, &Process::Hub);
+        assert!(hub.contains(&"REDIS_URL".to_string()), "{hub:?}");
+        let vault = manifest(&ir, &partition, &Process::Placement("vault".to_string()));
+        assert!(
+            !vault.contains(&"REDIS_URL".to_string()),
+            "no store binds that default, so no placement opens it: {vault:?}"
         );
     }
 

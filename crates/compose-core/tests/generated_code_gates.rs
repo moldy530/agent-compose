@@ -2303,6 +2303,115 @@ fn the_artifact_hash_is_the_same_in_both_languages() {
     );
 }
 
+/// The dispatch board's park order, its two settle verbs, and the payload it
+/// carries (`docs/distributed.md` §3.2, §3.4, §6.2).
+///
+/// Three properties a served hub cannot show, driven against `src/journal.ts`
+/// directly — a compiler constant, byte-identical in every project, so this is
+/// what every project runs:
+///
+///   * **park order is insertion order under a tie.** §6.2's "dispatch resumes
+///     in park order" is what a joining worker's scan follows and what §6.4's
+///     undispatched-is-a-pause row leans on for fairness. `parked_at` has
+///     millisecond resolution and a fan-out parks every instance from one
+///     synchronous burst, so they share it; the tiebreak that decides them has
+///     to be the order they went on the board. Twelve waits, because the
+///     tiebreak this replaced was a **string** compare over `<instance
+///     path>/<ordinal>` — `sign/10` sorts before `sign/2` — so a corpus of four
+///     would agree with either rule, and no fixture a served hub runs fans out
+///     wide enough to tell them apart.
+///
+///   * **`settleDispatch` answers whether *this* call settled it.** Its contract
+///     says so and the difference is invisible over the wire, because
+///     `/workers/result` reads the row's status before it calls: a re-posted
+///     result is `204` either way. A future caller that trusted the answer to
+///     tell a first settle from a re-post would take a second result's outcome
+///     as newly journaled — and the row must keep the outcome it has, which is
+///     asserted beside it.
+///
+///   * **§3.2's four OPTIONAL payload fields are on the row**, and a row parked
+///     without them carries none. That is what lets the poll answer omit the
+///     keys rather than send `null`, and it is why a hub restarted mid-dispatch
+///     hands over what its predecessor would (§8 rule 3: no dispatch state
+///     anywhere but the journal).
+#[test]
+fn the_dispatch_board_resumes_in_park_order_and_settles_once() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("placed-nodes"), root, "dispatch-board");
+
+    let output = runner("dispatch-board.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the dispatch board did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    let order = &observed["parkOrder"];
+    assert_eq!(
+        order["order"], order["wanted"],
+        "the board does not resume in park order: a one-worker pool would run a `map`'s items \
+         0, 1, 10, 11, …, 2, 3, and the item that has waited longest — whose `timeout:` has been \
+         running longest — is not the one taken next (docs/distributed.md §6.2)"
+    );
+    assert_eq!(
+        order["ofExecution"], order["wanted"],
+        "`dispatchesOf` promises park order too, and a status report reads it"
+    );
+
+    let settlement = &observed["settlement"];
+    assert_eq!(
+        settlement["first"],
+        json!(true),
+        "the call that settled the dispatch did not say so"
+    );
+    assert_eq!(
+        settlement["again"],
+        json!(false),
+        "a row an earlier result already settled answers `true`, so a caller cannot tell a first \
+         settle from a re-post (docs/distributed.md §3.4)"
+    );
+    assert_eq!(
+        settlement["outcome"]["value"]["signature"],
+        json!("s"),
+        "the second settle overwrote the outcome the first one journaled"
+    );
+    assert_eq!(
+        settlement["afterSupersede"],
+        json!(false),
+        "a superseded row answers `true`, which is the `409` case reading as the `204` one"
+    );
+    assert_eq!(settlement["supersededStatus"], json!("superseded"));
+    assert_eq!(
+        settlement["unknown"],
+        json!(false),
+        "a `dispatch_id` this journal never held answers `true`"
+    );
+
+    let payload = &observed["payload"];
+    assert_eq!(payload["itemIndex"], json!(3));
+    assert_eq!(
+        payload["history"],
+        json!([{ "role": "assistant", "text": "a release of release.dmg" }]),
+        "the conversation a placed `agent:` node is dispatched with did not survive the journal"
+    );
+    assert_eq!(payload["policy"], json!({ "timeoutMs": 30_000 }));
+    for field in ["itemIndex", "history", "policy"] {
+        assert_eq!(
+            payload["absent"][field],
+            json!("absent"),
+            "a row parked without §3.2's `{field}` reads back carrying one, so the poll answer \
+             would send a value where the document omits a key"
+        );
+    }
+}
+
 /// Gate 2f: a command that never reads its input still completes.
 ///
 /// Grammar 8.2 sends a scalar `input:` to the child's standard input, and no

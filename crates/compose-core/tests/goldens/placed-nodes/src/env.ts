@@ -35,6 +35,18 @@ export const environmentReferences: readonly EnvironmentReference[] = [
     ],
   },
   {
+    name: "MOCK_API_KEY",
+    sites: [
+      "provider.mock.api_key",
+    ],
+  },
+  {
+    name: "MOCK_BASE_URL",
+    sites: [
+      "provider.mock.base_url",
+    ],
+  },
+  {
     name: "OPS_BIN",
     sites: [
       "tool.notarize.exec.command",

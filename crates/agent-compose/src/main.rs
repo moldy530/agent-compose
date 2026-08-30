@@ -355,7 +355,7 @@ enum Command {
         /// The variable the join token is read from — the one `hub.join_token:` names
         #[arg(long, value_name = "VAR")]
         token_env: String,
-        /// Where this worker keeps the artifacts it materializes [default: ~/.agent-compose/worker]
+        /// Where this worker keeps the artifacts it materialises [default: ~/.agent-compose/worker]
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
     },

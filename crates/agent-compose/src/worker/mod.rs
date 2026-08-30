@@ -42,6 +42,16 @@
 //! implementation from deciding otherwise, so there is no capacity anywhere in
 //! this module.
 //!
+//! One node runs at a time, and that is the capacity. A dispatch answered while
+//! one is running is **queued**, never waited on: waiting would stop the poll,
+//! and a poll that stops is a worker the hub declares gone (§6.3). The hub hands
+//! one over legitimately once it has superseded the running dispatch on that
+//! node's `timeout:` — §3.4 makes a superseded dispatch not-unsettled, so §2's
+//! "MUST NOT answer a session's poll with a dispatch while that session has a
+//! dispatch it has not settled" is not breached and this worker cannot tell that
+//! from a hub that breached it. Both are answered the same way, because both are
+//! a real journaled dispatch this worker is owed a result for.
+//!
 //! # What each status means, once
 //!
 //! | where | status | what this worker does |
@@ -57,18 +67,18 @@
 //! reading them the other way round would either hammer a hub that has refused
 //! this worker or fail a mesh a hub restart should have healed.
 //!
-//! # The one place this worker joins after a refusal
+//! # This worker never joins after a refusal
 //!
-//! §3.1 makes a refused join terminal because "a second join would be refused
-//! identically". One `400` is not: the rule that `env_ok` must be present
-//! exactly on a join whose `artifact_hash` is the artifact the hub serves is a
-//! rule about *this request's body*, and a worker cannot know whether the hash it
-//! holds is still current until it has asked — a redeployment is precisely the
-//! case where it is not. So a `400` on a join that carried a hash is answered by
-//! **one** further join carrying neither, which is the shape §3.1 gives a cold
-//! start and is answered with the artifact this hub is serving. A second refusal
-//! is terminal like any other, and nothing here ever makes a third attempt.
-//! `crates/agent-compose/tests/distributed_worker_protocol.rs` holds both halves.
+//! Not once, and not for any status: §3.1 makes a refused join terminal because
+//! "a second join would be refused identically", and every row of its table is
+//! such a condition. The one that looks like an exception is not, and the reason
+//! is on the hub's side of the same section: a worker holding an artifact cannot
+//! know whether the hub still serves it, so it sends the hash and the report
+//! together every time — and a report that turns out to be against a **stale**
+//! hash is *ignored* rather than refused. So the join succeeds, the answer names
+//! the current artifact, and the provisioning cycle above is entered. There is no
+//! body a second join could send that the first did not.
+//! `crates/agent-compose/tests/distributed_worker_protocol.rs` holds that.
 
 mod artifact;
 mod node;
@@ -273,9 +283,15 @@ fn serve(
     let sessions = Arc::new(sessions);
     let mut backoff = Backoff::new();
     std::thread::scope(|scope| -> Result<(), Stop> {
-        // At most one, because §2 hands a session one dispatch at a time and
-        // §13 forbids this implementation from deciding otherwise.
+        // At most one **running**, because §2 hands a session one dispatch at a
+        // time and §13 forbids this implementation from deciding otherwise.
         let mut running: Option<std::thread::ScopedJoinHandle<'_, Result<(), Stop>>> = None;
+        // …and whatever the hub handed over anyway, in the order it arrived.
+        // Taken at the top of the next turn of this loop, which is **before**
+        // the next poll, so a dispatch answered to a free session starts with no
+        // latency added and one answered to a busy one starts the moment the
+        // node in hand ends. See the `200` arm.
+        let mut waiting: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
         loop {
             if running
                 .as_ref()
@@ -284,25 +300,39 @@ fn serve(
                 let held = running.take().expect("the handle was just seen");
                 settled(held.join())?;
             }
+            if running.is_none()
+                && let Some(dispatch) = waiting.pop_front()
+            {
+                let sessions = Arc::clone(&sessions);
+                let tree = tree.clone();
+                let runner = runner.clone();
+                let hub = Arc::clone(hub);
+                running =
+                    Some(scope.spawn(move || {
+                        node::execute(&hub, &sessions, &tree, bun, &runner, &dispatch)
+                    }));
+            }
             match hub.poll(&session.id, POLL_HOLD) {
                 Answer::Said(said) if said.status == 200 => {
                     backoff.reset();
-                    let dispatch = said.json();
-                    if running.is_some() {
-                        // A dispatch answered to a session that has not settled
-                        // the one it holds is a hub in breach of §2. It is
-                        // still a real dispatch, journaled, so it is run rather
-                        // than dropped — after the one in hand.
-                        let held = running.take().expect("the handle was just seen");
-                        settled(held.join())?;
-                    }
-                    let sessions = Arc::clone(&sessions);
-                    let tree = tree.clone();
-                    let runner = runner.clone();
-                    let hub = Arc::clone(hub);
-                    running = Some(scope.spawn(move || {
-                        node::execute(&hub, &sessions, &tree, bun, &runner, &dispatch)
-                    }));
+                    // **Queued, and the poll goes on.** A dispatch answered to a
+                    // session that has not settled the one it holds is ordinarily
+                    // a hub in breach of §2 — but it is also what a conformant hub
+                    // does once §3.4 has superseded the running dispatch on the
+                    // node's `timeout:`, because a superseded dispatch is no
+                    // longer *unsettled* and this worker has no way to know that
+                    // happened. Either way it is a real dispatch, journaled, and
+                    // this worker is owed a result for it, so it is queued rather
+                    // than dropped.
+                    //
+                    // What this must not do is **wait** for the node in hand. The
+                    // poll is the heartbeat (§3.2) and §2 requires it to continue
+                    // while a node runs: a thread blocked on a slow runner makes
+                    // no request for the whole of it, so at ninety seconds the hub
+                    // declares this session gone and supersedes the second
+                    // dispatch too — a second attempt burned for a condition that
+                    // was the hub's own dispatch decision.
+                    waiting.push_back(said.json());
                 }
                 Answer::Said(said) if said.status == 204 => backoff.reset(),
                 Answer::Said(said) if said.status == 410 => {
@@ -443,13 +473,18 @@ impl Sessions {
     }
 
     /// `POST /workers/join`, with §3.1's refusals on it.
+    ///
+    /// **Every refusal is terminal, and there is no second join anywhere in
+    /// here.** §3.1 says so and §10.1 calls the `410`-versus-refusal decision
+    /// "the whole of what a worker's error handling has to decide"; what makes
+    /// that satisfiable for a worker holding an artifact is the hub's side of the
+    /// same section — a report sent with a hash that turned out to be stale is
+    /// **ignored** rather than refused, so the one refusal a different body could
+    /// have cleared does not exist.
     fn join(&self, held: &mut Option<Held>) -> Result<Held, Stop> {
         let mut backoff = Backoff::new();
-        // The one re-join a refusal may earn, and only the `400` the module
-        // header describes. Spent at most once per join.
-        let mut reported = self.joining.artifact.is_some();
         loop {
-            let body = self.body(reported);
+            let body = self.body();
             match self.hub.join(&body) {
                 Answer::Said(said) if said.status == 200 => {
                     let answered = said.json();
@@ -462,7 +497,7 @@ impl Sessions {
                     // §4 step 1, and §5's redeployment rule read from this side:
                     // a session issued against an artifact this worker does not
                     // hold is one it may not execute out of.
-                    if Some(&serving) != self.joining.artifact.as_ref() || !reported {
+                    if Some(&serving) != self.joining.artifact.as_ref() {
                         return Err(self.stop(Stop::Redeployed(serving)));
                     }
                     let Some(id) = answered.get("worker_session").and_then(Value::as_str) else {
@@ -478,11 +513,6 @@ impl Sessions {
                     };
                     *held = Some(session.clone());
                     return Ok(session);
-                }
-                Answer::Said(said) if said.status == 400 && reported => {
-                    // See the module header: the one refusal a *different* body
-                    // can answer, spent once.
-                    reported = false;
                 }
                 Answer::Said(said) if (400..500).contains(&said.status) => {
                     return Err(self.stop(Stop::Refused(format!(
@@ -504,20 +534,23 @@ impl Sessions {
 
     /// The join body (§3.1).
     ///
-    /// `artifact_hash` and `env_ok` are **omitted entirely** where this worker
-    /// holds no artifact, or where it is asking what the hub serves: §3.1 fixes
-    /// that as an absent key and not a `null`, and §4.1 says the absence states
-    /// something — this worker holds no artifact the hub's manifest is about.
-    fn body(&self, reported: bool) -> Value {
+    /// One shape, sent every time: the hash and the report where this worker
+    /// holds an artifact, and **neither key at all** where it does not. §3.1
+    /// fixes the absence as an absent key and not a `null`, and §4.1 says the
+    /// absence states something — this worker holds no artifact the hub's
+    /// manifest is about.
+    ///
+    /// A worker holding one cannot know whether the hub still serves it, so it
+    /// sends what §3.1 requires of the case where it does and lets the hub
+    /// decide: a report that turns out to be against a stale artifact is ignored
+    /// there, and the answer carries the current one.
+    fn body(&self) -> Value {
         let mut body = json!({
             "protocol": PROTOCOL,
             "compiler": compose_core::codegen::COMPILER_VERSION,
             "runtime": self.joining.runtime,
             "claims": self.joining.claims,
         });
-        if !reported {
-            return body;
-        }
         if let (Some(hash), Some(env_ok), Some(object)) = (
             self.joining.artifact.as_ref(),
             self.joining.env_ok.as_ref(),

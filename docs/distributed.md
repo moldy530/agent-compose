@@ -75,7 +75,12 @@ q38).
 
 **One execution lives on one hub, always.** Executions share nothing by
 construction — global-scope stores are already external backends — so the unit of
-horizontal scaling is the execution, never the node. Scaling out later means
+horizontal scaling is the execution, never the node. That clause is a premise the
+rest of this document rests on, and grammar §14.1 rule 5 is where it is
+**enforced**: a placed component may not reach a store on a process-local
+backend, whatever its scope, because a heap, a SQLite file and a directory are
+one per process and a worker writing one would write somewhere no other process
+can read. Scaling out later means
 sharding executions across hubs over the Postgres journal slot (resolved q27),
 which §8 is written to keep possible.
 
@@ -356,8 +361,21 @@ artifact the hub is serving, which gives one rule with two cases:
 - a join whose `artifact_hash` is the artifact the hub currently serves MUST
   carry `env_ok`, and it is checked;
 - any other join — a cold start, which omits `artifact_hash` too, or one holding
-  a stale hash — MUST omit it. A worker does not guess a manifest it has not
-  read.
+  a stale hash — SHOULD omit it, because a worker does not guess a manifest it
+  has not read; and a hub that is sent one anyway **MUST ignore it** rather than
+  refuse the join.
+
+**The second half of that rule is an obligation on the hub, and it is what keeps
+the first half satisfiable.** A worker cannot know whether the hash it holds is
+still current until it has asked — a redeployment is exactly the case where it is
+not — so a worker holding an artifact sends the hash and the report together,
+every time. Were the pair refused when the hash turned out to be stale, that
+worker would be refused for sending what the first clause requires and refused
+again for omitting it, and its only way out would be answering a refused join
+with another join, which §5 and §10.1 forbid. Ignoring the report costs nothing:
+it is a report about a manifest this hub is not serving, the answer carries the
+current artifact, and the worker fetches, materialises and joins again — the
+provisioning cycle it was going to enter anyway.
 
 A hub compares an **absent** `artifact_hash` the way it compares a stale one: it
 is not the hash being served, so it takes that same branch. Nothing here needs a
@@ -391,8 +409,8 @@ joined: §5 fixes the rule — the hub ends those sessions when it rotates, and 
 | the compiler version or runtime does not match | `409` | names both sides of whichever half differs (§4.1) |
 | a claim names no placement in the active target | `400` | names the claim, and lists the target's placement names |
 | `env_ok` is present and a claimed placement's manifest is unsatisfied | `403` | names the **variables**, never their values, never whether the hub holds them |
-| `env_ok` is present on a join whose `artifact_hash` is not the current one — an absent hash included, since an absent hash is never the current one — or absent on one whose is | `400` | names the rule above: the report is against the manifest in the artifact the worker holds |
-| the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§3.5, §4) — the rule PRD resolved q40's amendment fixes |
+| `env_ok` is **absent** on a join whose `artifact_hash` is the current one | `400` | names the rule above: there is a manifest this worker could have read, and dispatching to it would skip the check §9.2 exists for |
+| the worker's artifact hash is stale, or absent — and an `env_ok` sent beside either | — | not a refusal: the join succeeds, the report is ignored, and the answer carries the current artifact for the worker to fetch (§3.5, §4) — the rule PRD resolved q40's amendment fixes |
 
 The order matters, and it is the order of the rows: a worker that cannot be
 authenticated is told nothing, a worker whose wire this hub does not speak is
@@ -400,13 +418,19 @@ told that before anything about the deployment, and the placement and manifest
 answers — which describe the target — are given only to a worker that has got
 that far.
 
-**A refused join is terminal.** Every row above names a condition another join
-would meet identically — a credential that does not verify, a wire this hub does
-not speak, a release that does not match, a claim that names no placement, a
-manifest that is not satisfied, a report made against the wrong artifact. So a
-worker refused at join **stops**: it exits non-zero, naming the refusal as it was
-given, and starting it again is an operator's act — or its supervisor's, whose
-backoff is that supervisor's business. The bounded backoff of §2 covers the
+**A refused join is terminal, without exception.** Every row above names a
+condition another join would meet identically — a credential that does not
+verify, a wire this hub does not speak, a release that does not match, a claim
+that names no placement, a manifest that is not satisfied, a report a worker
+could have made and did not. So a worker refused at join **stops**: it exits
+non-zero, naming the refusal as it was given, and starting it again is an
+operator's act — or its supervisor's, whose backoff is that supervisor's
+business.
+
+That the list has no exception in it is a property of the table rather than a
+hope, and the ignore-rule above is what buys it: the one condition a *second*
+join could have cleared — a report sent with a hash that turned out to be
+stale — is not a refusal at all. The bounded backoff of §2 covers the
 other case and only it: a join that never *completed* — a connection refused, a
 socket closed, a `5xx` — which is a transport failure and says nothing about
 whether this worker belongs here.
@@ -437,6 +461,10 @@ Carries the session. Long-polls for up to one hold (§2).
     "node": "flow.release.sign",
     "instance_path": "flow.release#0.sign",
     "inputs": { "…": "…" },
+    "session_key": "…",
+    "item_index": 0,
+    "history": [ { "role": "assistant", "text": "…" } ],
+    "policy": { "timeoutMs": 30000 },
     "effect_history": [ { "…": "…" } ]
   }
   ```
@@ -445,6 +473,33 @@ Carries the session. Long-polls for up to one hold (§2).
   key, so the worker computes the same keys the hub would. `effect_history` is
   the journaled record of effects this node instance already issued, and is what
   a redispatched node replays to the frontier before going live (§7).
+
+  **The four fields between them are what makes a placed node the same node.**
+  Each is OPTIONAL — a dispatch that has none of them omits all four — and each
+  is a fact the *hub* holds about this node execution that the node would have
+  read for itself had it run there. §4.3 fixes what they are for: "a placement
+  decides which *process* runs a node rather than which code exists where", and
+  §2 restates it as PRD 5.6's promise that "the *logical definition* does not
+  change". A payload short of one of them is a node that quietly means something
+  else on a worker, which is the one thing this whole document is written against.
+
+  | | what it carries | absent when |
+  |---|---|---|
+  | `session_key` | grammar §4.1's `execution.session_key`, so a `scope: session` store on the worker addresses the partition the run named | the execution has none |
+  | `item_index` | the source-item index of the innermost enclosing `map` (grammar §4.1) | no `map` encloses this node |
+  | `history` | the turns of the shared `messages` channel an `agent:` node would have been given (grammar §10.4) | the node takes none — every dispatch that is not an `agent:` node, and a `map`-dispatched agent, which grammar §8.6 rule 10 already runs on a fresh conversation (D105) |
+  | `policy` | grammar §9.3's level 1 for this instance — the `policy:` of the `flow:` node that instantiated the enclosing flow, which crosses into a subflow an attached `flow.*` starts (D79) | nothing set one |
+
+  They are **the hub's to derive, and the worker MUST NOT invent them**: a worker
+  that defaulted `session_key` to the empty string would fail a `scope: session`
+  store with a diagnostic telling the operator to pass a `--session` they already
+  passed, and one that defaulted `history` to empty would answer from the input
+  object alone with no diagnostic at all.
+
+  Adding them to a `1` that had already shipped without them would be §10.2's
+  first compatible change — an OPTIONAL field a peer of the previous version
+  ignores — which is why the shape is written this way rather than as a second
+  version of the route.
 
 - **`204`** when the hold expired with no work **for this session** — which
   includes every hold while the session has a dispatch it has not settled (§2).
@@ -473,8 +528,26 @@ that dispatch's node fails an attempt.
 
 ### 3.3 `POST /workers/effects`
 
-Carries the session. A batch of effect records the worker produced while
-executing a dispatch, in the order it produced them.
+Carries the session and the `dispatch_id`. A batch of effect records the worker
+produced while executing that dispatch, in the order it produced them:
+
+```json
+{
+  "dispatch_id": "dsp_…",
+  "effects": [ { "key": "…", "…": "…" } ]
+}
+```
+
+Both fields are REQUIRED, and `dispatch_id` is REQUIRED for a reason that reads
+at first like a contradiction of the rule three paragraphs down: the records are
+keyed by effect key and scoped to their **execution**, "not by session, and not
+by dispatch", so the dispatch is not what *identifies* them — it is what tells
+the hub whose execution they are, and inside which instance path. **The hub
+reads both off the dispatch row it already holds**, never off the batch, and a
+record whose `site` falls outside that dispatch's `instance_path` is refused.
+That is §8's single writer stated as a route: no session can write an effect
+into an execution it was never dispatched, and no worker names an execution at
+all.
 
 **The hub is the single writer, and this route is what preserves that: workers
 SEND, the hub INSERTS.** No worker ever touches the journal, which is why SQLite
@@ -492,6 +565,15 @@ guess.
 | the batch is journaled | `204` | empty. Every record in it was inserted or was already held |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and send this batch again under the new session |
+| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field or naming a `site` outside the dispatch's | `400` | names what a batch and a record carry |
+| the `dispatch_id` names no dispatch this hub holds | `409` | names the dispatch. The batch is discarded, as at §3.4 |
+
+The last two rows are not about the batch's *contents* the way the first three
+are about its fate, and they are written out because a `204` over a batch nothing
+was written for would be the sharpest failure this route has: a worker told its
+effects are journaled when they are not hands the redispatch of §7.2 an
+`effect_history` short of the frontier, and the node re-issues an effect the
+journal was owed.
 
 **A batch answered `410` is re-sent, never dropped.** The records are keyed by
 effect key and scoped to their execution (§7.1) — not by session, and not by
@@ -571,8 +653,19 @@ A `401` here is terminal in the sense §3.1 gives it: this route takes the join'
 own credential, so joining again cannot improve it. There is no `410` on this
 route, because there is no session on it to be unknown.
 
-A hub MUST keep serving an artifact while any execution that was dispatched
-under it is unfinished, and MAY drop it afterwards. A worker meeting `404` for
+A hub MUST keep serving an artifact **it holds** while any execution that was
+dispatched under it is unfinished, and MAY drop it afterwards. The qualifier is
+load-bearing and is what the second table row is written against: a hub that
+holds two artifacts may not drop the older one out from under an execution
+still running on it, because a worker mid-transfer would then have a `404` and
+nothing to fetch. It does **not** oblige a hub to hold two. A hub that serves
+exactly one — which is what a v1 build is, and §12 names that limit — meets this
+rule for the artifact it has and answers `404` for the one it replaced, which is
+not a stranded worker: the `404` sends it back to a join, the join is answered
+with the current artifact, and the fetch it then makes is one this hub can serve.
+That is §5's redeployment rule arriving by the other door.
+
+A worker meeting `404` for
 the hash its join returned re-joins rather than retrying the fetch: the join is
 what re-derives the current hash, and re-deriving it anywhere else would be a
 second answer to what this deployment is running. That re-join is over a *hash*,
@@ -1066,7 +1159,20 @@ Which gives, concretely:
   moves them off the hub's. An unplaced `tool.*` a `function:` node names is the
   same case for the same reason;
 - a variable referenced from the deploy layer itself — a storage backend, an
-  event source, `hub.join_token:` — belongs to the hub's;
+  event source, `hub.join_token:` — belongs to the hub's. A **storage backend**
+  is the one entry of that layer a placement can also reach, and it reads like a
+  conflict with the executes-in rule above until the two are read the way the
+  unplaced-agent clause is read: the credential that opens a store is spent in
+  whichever process opens it, so a backend's variables belong to the hub's
+  manifest **and** to the manifest of every placement whose components reach a
+  store bound to it — an agent's `stores:`, and the `store:` nodes of a `flow.*`
+  it attaches. That **adds** placements; it never moves a deploy-layer variable
+  off the hub's list. Without the addition a worker joins clean — §3.1's `403`
+  cannot fire over a name the manifest does not carry — and fails at its first
+  store op on a machine with no credential, which is the failure §9.2's check
+  exists to catch. Grammar §14.1 rule 5 refuses the case no manifest could
+  repair, where the backend is process-local and the two processes would hold
+  two stores rather than one;
 - a variable reachable in two processes belongs to both. Two placed agents
   attaching one unplaced tool is the ordinary case, and the tool's secrets go to
   both placements.
@@ -1287,8 +1393,9 @@ describes.
 What `validate` enforces: everything grammar §14.1 and §14.2 state — a
 placement's name and members, the `flow.*` deferral, disjointness, repeated
 members, the colocation rule for an attached tool and for what an attached flow
-reaches, the conditional join token, and the `public_url:` shape. A deploy file
-that breaks one of those is a compile error.
+reaches, the shared-store rule §1 states the premise of, the conditional join
+token, and the `public_url:` shape. A deploy file that breaks one of those is a
+compile error.
 
 What a **build** emits for a target that declares `placements:`: the hub. The
 five routes of §3 on the served app, the artifact server of §3.5 over a content
@@ -1309,6 +1416,16 @@ What is **not** built, and is named rather than missing: per-placement artifact
 slicing (§4.3), multi-hub (§8), worker-to-worker edges and Windows workers
 (§11) — and the two questions of §13, which are held to their conservative
 defaults there.
+
+**A hub of this release serves exactly one artifact: its own tree.** That is the
+fourth named absence, and it is named here because §3.5's table has a row for a
+*previous* artifact a hub still holds and this hub holds none — an older hash is
+`404`, naming the one being served. Nothing is stranded by it: §3.5's `404`
+sends a worker back to a join, and the join answers with the artifact this hub
+does have. What it costs is one round trip on a rollback where a hub holding two
+would have cost none. Holding a second is additive — a hash is already the whole
+of what the route is addressed by — so it needs no wire change when a release
+wants it.
 
 Three suites are what make that claim checkable rather than asserted:
 `crates/agent-compose/tests/distributed_hub_wire.rs` speaks §3 to a served hub

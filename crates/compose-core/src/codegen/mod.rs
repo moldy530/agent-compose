@@ -118,13 +118,18 @@
 //! with an activity that throws naming the construct and the milestone that
 //! lands it ([`graph`]). Nothing answers a plausible value.
 //!
-//! The same posture covers the two places the deploy layer reaches past this
-//! release: a store bound to a production backend (grammar 14.3's `redis`,
+//! The same posture covers the one place the deploy layer still reaches past
+//! this release: a store bound to a production backend (grammar 14.3's `redis`,
 //! `pgvector`, `s3`, …) says so at the op rather than answering out of the wrong
-//! store, and `hub:`/`placements:` are live static grammar this pass emits
-//! nothing for — the worker protocol `docs/distributed.md` fixes lands with the
-//! `worker` verb, and `tests/placement_surface_inertness.rs` is what says so.
-//! Both land in M3.
+//! store.
+//!
+//! `hub:`/`placements:` are **not** on that list any more. This pass emits the
+//! hub `docs/distributed.md` fixes: [`mesh`] is the five `/workers/*` routes and
+//! the dispatch board behind them, [`deployment`] the placements and the
+//! environment partition of §9.1, [`artifact`] the tree's content hash and file
+//! list, and [`graph`] lowers a placed component's node to a dispatch and its
+//! activity into the registry `src/worker-node.ts` runs on the other side.
+//! `tests/placement_surface_landing.rs` is what says so in executable form.
 
 pub mod artifact;
 pub mod cel;

@@ -14,16 +14,34 @@
 // against the claimed placements' lists, and the worker reads the list it is
 // reporting against out of the very tree the hub served it.
 //
-// `hubEnvironment` is what `readEnvironment()` checks at start (`./env.ts`), and
-// it is narrower than the composition's whole environment exactly when a
-// placement takes something off it — the least-privilege line PRD 5.10 draws and
-// §9.1 computes: the hub cannot leak what it never held.
+// `hubEnvironment` is the hub's own side of that partition, stated as names.
+// **It is not what `readEnvironment()` reads**: `./env.ts` carries the same
+// variables with the spec sites that wrote each one, because a launch that is
+// short a key should name where the key was asked for, and that is the list
+// `./index.ts` checks at start. This one is the manifest form — names only, like
+// a placement's — so a reader of the artifact, or of the tarball a worker
+// unpacked, can see what the hub holds beside what each placement holds without
+// reading two shapes. The two are one derivation filtered two ways
+// (`References::for_process`), and a test pins them equal.
+//
+// Both are narrower than the composition's whole environment exactly when a
+// placement takes something off the hub's — the least-privilege line PRD 5.10
+// draws and §9.1 computes: the hub cannot leak what it never held.
 
 /** One placement, and the environment a worker claiming it has to satisfy. */
 export interface PlacementManifest {
   /** The name a worker claims at join (`docs/distributed.md` §3.1). */
   readonly name: string;
-  /** `members:`, in the order the deploy file writes them (grammar §14.1). */
+  /**
+   * `members:`, in the order the deploy file writes them (grammar §14.1).
+   *
+   * For a **reader**, not for a caller: the scheduler queues work to a placement
+   * by name and never consults this list (`docs/distributed.md` §2), and the
+   * `environment` beside it is already the answer to what a worker must satisfy.
+   * It is here because a worker holds no YAML — the artifact is the only thing
+   * it is served — so "what did I just claim" is otherwise unanswerable on the
+   * machine that claimed it.
+   */
   readonly members: readonly string[];
   /**
    * The variables of every component that can execute in this placement's
