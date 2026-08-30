@@ -1062,7 +1062,10 @@ tools run with the privileges of the process running the graph, which is what a
 hand-rolled `exec:` tool has always done: a model holding `builtin.bash` holds
 arbitrary code execution on that host. Container and syscall isolation, and any
 refusal keyed on a deploy target, are the distribution work's and are stated here
-rather than implied (PRD resolved q31).
+rather than implied (PRD resolved q31). That work has not answered it: resolved
+q37–q44 settled the topology, the binding surface and the wire without taking
+containment up, so it stays open and is filed as such in
+[`docs/distributed.md`](distributed.md) §13.
 
 Traces gain no surface: a built-in call is a `ToolCallRecord` like any other, and
 `docs/trace.md` §11 keeps its answer out of the format exactly as it keeps an
@@ -4334,8 +4337,9 @@ documents cite them by number** (Decision
    repeated `tools:` entry is (§5.4).
 2. **v1 members are `agent.*` and `tool.*`.** A `flow.*` member is refused with
    a message naming the deferral: a flow is a subgraph the hub schedules, and
-   placing one is out of v1's scope, named (PRD resolved q44). Place the nodes
-   it reaches instead.
+   placing one would ship the scheduler to the worker — the peer-partition shape
+   PRD resolved q37 rejects — so it is outside the v1 scope resolved q44 fixes.
+   Place the nodes it reaches instead.
 3. **Placements are DISJOINT.** One component named by two placements is an
    error naming both: two claims are two answers to which worker runs it, and
    the choice is the author's rather than the hub's.
@@ -7328,10 +7332,18 @@ addresses.
 component declared about itself, and under hub-and-spoke the mode is implied by
 whether the component is claimed at all: a placed component runs on a worker
 process, an unplaced one runs on the hub, and there is no third answer for a
-keyword to select. `network:` recorded a sandbox intent the v1 containment story
-does not have — PRD resolved q31 puts containment beyond the process boundary
-out of scope, and resolved q44 names it out again — so it would have been a key
-that read like a security control and was not.
+keyword to select. `network:` recorded a sandbox intent no resolved containment
+story backs. PRD resolved q31 fixes v1 containment at a mandatory root plus a
+timeout — a builtin runs with the runtime's own privileges — and defers the rest,
+"containers/seccomp and any deploy-target-level restriction (refusing bash on a
+distributed placement is a placement fact)", to the distribution work; the
+distribution resolutions q37–q44 settled the topology, the binding surface and
+the wire without taking that question up. So the key would have read like a
+security control that nothing enforced and no resolution had specified. What
+happens to the question itself is filed as open in
+[`docs/distributed.md`](distributed.md) §13, and its answer, when it comes, is an
+addition to the claims model rather than a reason to have kept a reserved key
+ahead of it.
 
 **Why re-shaping was available at all.** Reserved grammar is fully specified,
 parsed, type-checked and carried into the IR *and executes as a no-op* (§15).
@@ -7346,7 +7358,7 @@ is the asymmetry §15 draws around the authentication keys.
 A component in **no** placement executes on the hub. That is stated in §14.1 as
 the default rather than enforced as a rule, because there is nothing to enforce:
 `placements:` names the exceptions, and a project that names none is a
-single-process deployment. *PRD 5.10, resolved q37, q38, q40, q44.*
+single-process deployment. *PRD 5.10, resolved q31, q37, q38, q40, q44.*
 
 ### D129. Placement members are agents and tools, disjoint, and colocated with what attaches them
 
@@ -7367,9 +7379,10 @@ scheduler, journal and wait board. Placing one would mean shipping the scheduler
 to the worker — a second scheduler and, behind it, a second journal, which is
 the peer-partition shape PRD resolved q37 rejects — or quietly placing every node
 the flow reaches, which is a different feature wearing one address. PRD resolved
-q44 names flow placement out of v1, so the refusal is a **deferral** and its
-message says so: the composition is well-formed, and what the author asked for is
-a feature this release does not have. Telling that author "expected an `agent.*`
+q44 fixes what v1 distributed ships and flow placement is not among it, so the
+refusal is a **deferral** and its message says so: the composition is
+well-formed, and what the author asked for is a feature this release does not
+have. Telling that author "expected an `agent.*`
 or `tool.*` reference" would read as a spelling correction for a decision the PRD
 took deliberately, which is why the `flow.` prefix is intercepted before the
 address is read.
