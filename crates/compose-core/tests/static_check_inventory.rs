@@ -254,19 +254,6 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
-        // The other rule that needs both files, and the third input is the
-        // target's `storage_backends:`. A placement moves where a component
-        // executes and nothing else, so a store it reaches on a process-local
-        // backend — a heap, a file, a directory — is one the worker and the hub
-        // each hold their own copy of, with no error anywhere to say so
-        // (`docs/distributed.md` §1's "global-scope stores are already external
-        // backends", as a rule rather than a premise).
-        rule: "a placed component reaches only stores every process shares (14.1, 14.3, docs/distributed.md §1)",
-        pass: "check/placements.rs, over check/reach.rs and ir/deploy.rs",
-        codes: &["process-local-store"],
-        evidence: Evidence::Fixture,
-    },
-    Check {
         rule: "the effective write map is injective (8.0, D93)",
         pass: "check/channels.rs",
         codes: &["conflicting-writes"],

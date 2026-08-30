@@ -494,11 +494,6 @@ pub enum DiagnosticCode {
     /// absent is decided by a sibling section, and the repair is a choice of
     /// two.
     MissingJoinToken,
-    /// A placed component reaches a `store.*` whose backend is **process-local**
-    /// — a heap, a SQLite file, a directory — so the worker running it would
-    /// read and write data no other process in the deployment can see
-    /// (grammar 14.1, `docs/distributed.md` §1).
-    ProcessLocalStore,
 }
 
 impl DiagnosticCode {
@@ -577,7 +572,6 @@ impl DiagnosticCode {
         Self::UnsupportedPlacement,
         Self::ConflictingPlacement,
         Self::MissingJoinToken,
-        Self::ProcessLocalStore,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -650,7 +644,6 @@ impl DiagnosticCode {
             Self::UnsupportedPlacement => "unsupported-placement",
             Self::ConflictingPlacement => "conflicting-placement",
             Self::MissingJoinToken => "missing-join-token",
-            Self::ProcessLocalStore => "process-local-store",
         }
     }
 }
@@ -883,7 +876,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::ProcessLocalStore as usize + 1,
+            DiagnosticCode::MissingJoinToken as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

@@ -75,12 +75,7 @@ q38).
 
 **One execution lives on one hub, always.** Executions share nothing by
 construction — global-scope stores are already external backends — so the unit of
-horizontal scaling is the execution, never the node. That clause is a premise the
-rest of this document rests on, and grammar §14.1 rule 5 is where it is
-**enforced**: a placed component may not reach a store on a process-local
-backend, whatever its scope, because a heap, a SQLite file and a directory are
-one per process and a worker writing one would write somewhere no other process
-can read. Scaling out later means
+horizontal scaling is the execution, never the node. Scaling out later means
 sharding executions across hubs over the Postgres journal slot (resolved q27),
 which §8 is written to keep possible.
 
@@ -1170,9 +1165,7 @@ Which gives, concretely:
   off the hub's list. Without the addition a worker joins clean — §3.1's `403`
   cannot fire over a name the manifest does not carry — and fails at its first
   store op on a machine with no credential, which is the failure §9.2's check
-  exists to catch. Grammar §14.1 rule 5 refuses the case no manifest could
-  repair, where the backend is process-local and the two processes would hold
-  two stores rather than one;
+  exists to catch;
 - a variable reachable in two processes belongs to both. Two placed agents
   attaching one unplaced tool is the ordinary case, and the tool's secrets go to
   both placements.
@@ -1393,8 +1386,7 @@ describes.
 What `validate` enforces: everything grammar §14.1 and §14.2 state — a
 placement's name and members, the `flow.*` deferral, disjointness, repeated
 members, the colocation rule for an attached tool and for what an attached flow
-reaches, the shared-store rule §1 states the premise of, the conditional join
-token, and the `public_url:` shape. A deploy file that breaks one of those is a
+reaches, the conditional join token, and the `public_url:` shape. A deploy file that breaks one of those is a
 compile error.
 
 What a **build** emits for a target that declares `placements:`: the hub. The

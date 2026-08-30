@@ -199,7 +199,6 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
 const EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE: &[&str] = &[
     "conflicting-placement",
     "missing-join-token",
-    "process-local-store",
     "unsupported-placement",
 ];
 

@@ -324,9 +324,7 @@ impl Partition {
         // backend's credential is spent there and a manifest without it is a
         // worker that joins clean (§9.2 cannot refuse over a variable the
         // manifest does not name) and fails at its first store op — precisely
-        // the failure §9.1 exists to prevent. Grammar §14.1 rule 5 refuses the
-        // *process-local* case outright; this is the other half, for the
-        // networked backends that rule admits.
+        // the failure §9.1 exists to prevent.
         for (address, definition) in &ir.definitions {
             let DefinitionBody::Store(store) = &definition.body else {
                 continue;

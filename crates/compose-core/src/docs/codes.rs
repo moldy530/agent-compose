@@ -132,7 +132,6 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::UnsupportedPlacement => include_str!("codes/unsupported-placement.md"),
         DiagnosticCode::ConflictingPlacement => include_str!("codes/conflicting-placement.md"),
         DiagnosticCode::MissingJoinToken => include_str!("codes/missing-join-token.md"),
-        DiagnosticCode::ProcessLocalStore => include_str!("codes/process-local-store.md"),
     }
 }
 

@@ -202,28 +202,6 @@ impl BackendProvider {
             Self::LocalFs | Self::S3 | Self::Gcs => StoreKind::Blob,
         }
     }
-
-    /// Whether this backend lives **inside** the process that opens it.
-    ///
-    /// A heap, a file and a directory: two processes that open "the same" one of
-    /// these open two, so what one writes the other cannot read. The rest are
-    /// network services addressed by a URL, so a hub and a worker pointed at one
-    /// are pointed at the same data — which is the premise
-    /// `docs/distributed.md` §1 states as "global-scope stores are already
-    /// external backends" and grammar 14.1 turns into a rule about placements.
-    #[must_use]
-    pub const fn is_process_local(self) -> bool {
-        match self {
-            Self::Memory | Self::Sqlite | Self::SqliteVec | Self::LocalFs => true,
-            Self::Redis
-            | Self::Postgres
-            | Self::Chroma
-            | Self::Pgvector
-            | Self::Qdrant
-            | Self::S3
-            | Self::Gcs => false,
-        }
-    }
 }
 
 /// The `event_sources:` section — reserved grammar (grammar 14.4).

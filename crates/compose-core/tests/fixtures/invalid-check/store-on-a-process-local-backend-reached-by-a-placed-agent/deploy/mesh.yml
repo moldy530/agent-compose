@@ -1,8 +1,0 @@
-version: "0.1"
-
-hub:
-  join_token: ${MESH_JOIN_TOKEN}
-
-placements:
-  vault:
-    members: [agent.archivist]
