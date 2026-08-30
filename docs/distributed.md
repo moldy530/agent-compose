@@ -1432,6 +1432,38 @@ fan-out queued onto a pool of one.
 where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in
 `src/mesh.ts`, and neither in the composition's own lowering.
 
+**Five clauses of this document were amended while that runtime landed**, and
+they are listed here rather than left to a diff: a document the implementation
+edited is a document the implementation is measured against, so which sentences
+moved has to be as readable as the sentences are.
+
+- **§3.1's stale-hash row**, and the "without exception" clause that rests on it.
+  A worker holding an artifact cannot know whether the hub still serves it, so it
+  sends the hash and the report together; refusing that pair made the two halves
+  of the `env_ok` rule unsatisfiable together for exactly the worker a
+  redeployment produces, and its only way out would have been answering a refused
+  join with another join. The row now says such a report is **ignored** rather
+  than refused.
+- **§3.2's four OPTIONAL payload fields** — `session_key`, `item_index`,
+  `history`, `policy`. Each is a fact about the node execution the hub holds and
+  a worker cannot derive, and a payload short of one is a placed node that
+  quietly means something else (§4.3).
+- **§3.3's request shape**, which this document had left unwritten: a batch is
+  `{ dispatch_id, effects }`, and the two refusals that follow from naming it.
+  The dispatch is what tells the hub whose execution the records are and inside
+  which instance path — §8's single writer, stated as a route.
+- **§3.5's "an artifact it holds"**, which scopes a MUST that a hub of this
+  release could not otherwise meet: it serves exactly one artifact, and the
+  paragraph above says what that costs.
+- **§9.1's storage-backend clause**: a backend's variables belong to the hub's
+  manifest *and* to every placement that reaches a store bound to it, because the
+  credential that opens a store is spent in whichever process opens it.
+
+None of the five changes what a peer may rely on at this version (§10.1), and
+none is a change §10.3 would bump for: the first is a relaxation, the second and
+third name shapes rather than replace them, and no implementation of protocol 1
+older than this release exists to be made wrong by any of them.
+
 This document is what both halves are held to — **except the rows of §13**,
 which are the clauses it does not settle. Those are not wire this document fixes,
 and the code they govern is held to the PRD's answer to each rather than to the
