@@ -52,6 +52,20 @@ export const flowBatchOutputs = z.object({
 }).strict();
 export type FlowBatchOutputs = z.infer<typeof flowBatchOutputs>;
 
+/** `flow.direct` — the module's parameters (grammar 7.5). */
+export const flowDirectInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowDirectInputs = z.infer<typeof flowDirectInputs>;
+
+/**
+ * `flow.direct` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowDirectOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowDirectOutputs = z.infer<typeof flowDirectOutputs>;
+
 /** `flow.release` — the module's parameters (grammar 7.5). */
 export const flowReleaseInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),

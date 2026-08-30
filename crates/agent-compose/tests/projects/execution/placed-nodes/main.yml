@@ -81,6 +81,15 @@ triggers:
       path: "payload.body.path"
     respond: async
 
+  on_direct_sign:
+    type: http
+    flow: flow.direct
+    path: /direct-signings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
   on_batch:
     type: http
     flow: flow.batch
@@ -170,6 +179,31 @@ flow.release:
     - { from: start, to: sign }
     - { from: sign, to: stamp }
     - { from: stamp, to: end }
+
+# The third way a graph reaches a placed component, and the one grammar §14.1
+# leaves alone: a `function:` node names a `tool.*` **directly**, so the tool's
+# own placement is the whole of the answer — there is no attaching agent to
+# disagree with. It is a different lowering from an `agent:` node's, because a
+# tool's result is held to its `output:` on the way back in.
+flow.direct:
+  description: Sign a release with no agent in the way.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    sign:
+      function: tool.sign
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
 
 flow.retried:
   description: The same sign-off, under a retry the hub can spend on it.

@@ -172,6 +172,15 @@ export class MeshCredentialError extends Error {
  * exactly this map and nothing else. Every session-carrying route answers `410`
  * for an id this table does not hold, which is the one status that means "join
  * again" (§3).
+ *
+ * **§5's redeployment rule needs no code of its own here, and that is a property
+ * of v1 rather than an omission.** "A hub that begins serving a new artifact
+ * under a stable name MUST forget every session issued under the one it
+ * replaced" — and a v1 hub serves exactly one artifact, its own tree, so
+ * beginning to serve another *is* replacing this process. The sessions go with
+ * it, the workers meet `410` on their next request, and the join that follows is
+ * answered with the new artifact. A hub that learned to serve two would need the
+ * rule written out; nothing here may quietly become that hub without it.
  */
 interface Session {
   readonly id: string;
@@ -197,8 +206,22 @@ const sessions = new Map<string, Session>();
 /** Whoever is waiting for a poll to have something to answer with. */
 const pollers = new Set<() => void>();
 
+/**
+ * How many times the board has moved in this process.
+ *
+ * Read **before** a poll looks at the board and compared **after** it has
+ * subscribed, which is what closes the window between the two: a dispatch parked
+ * in that gap wakes nobody, and without the counter the poll would then wait out
+ * its whole hold — twenty-five seconds of latency, in production, for work that
+ * was ready the instant the poll asked. The stir is a broadcast rather than a
+ * queue because §2 queues to a **placement**: which session a wake is for is
+ * decided by re-scanning the board, never by who was woken.
+ */
+let boardMoved = 0;
+
 /** Wake every held poll, because the board may have something for it now. */
 function stirPolls(): void {
+  boardMoved += 1;
   for (const wake of [...pollers]) wake();
 }
 
@@ -753,11 +776,14 @@ async function poll(
     // the instant it arrived: a hold that outlived the window would let the
     // sweep declare the very worker whose poll it is holding gone.
     session.seen = Date.now();
+    // Read before the board is looked at, compared after this poll is
+    // subscribed: see [`boardMoved`].
+    const seen = boardMoved;
     const dispatch = await taken(session);
     if (dispatch !== undefined) return reply.code(200).send(dispatch);
     const left = deadline - Date.now();
     if (left <= 0) return reply.code(204).send();
-    await held(Math.min(left, holdMs), request);
+    await held(Math.min(left, holdMs), seen, reply);
   }
 }
 
@@ -803,7 +829,18 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
   return undefined;
 }
 
-/** Whether this session is holding a dispatch it has not settled (§2). */
+/**
+ * Whether this session is holding a dispatch it has not settled (§2).
+ *
+ * Read against the rows this process has handed out rather than against a
+ * counter, so a restart re-derives it from what it re-attaches to rather than
+ * from something it remembered. What it is **not** written against is a worker
+ * that keeps two polls in flight: §2 requires "exactly one poll in flight from
+ * the moment it joins", and a session that breaks that could interleave two
+ * checks around one claim. That is a worker in breach of the wire rather than a
+ * race this hub arbitrates, and the cost is bounded — the second dispatch is a
+ * real dispatch, journaled, and settled or superseded like any other.
+ */
 function holding(session: string): boolean {
   for (const row of rows.values()) {
     if (row.session === session && row.status === "dispatched" && awaiting.has(row.id)) return true;
@@ -825,8 +862,22 @@ function wireEffect(record: JournalRecord): Record<string, unknown> {
   };
 }
 
-/** Wait out the rest of a hold, or until the board moves. */
-function held(milliseconds: number, request: FastifyRequest): Promise<void> {
+/**
+ * Wait out the rest of a hold, or until the board moves.
+ *
+ * `seen` is the board's generation as of **before** the caller looked at it, so
+ * a dispatch parked between that look and this subscription resolves the hold at
+ * once rather than a whole hold later (see [`boardMoved`]).
+ *
+ * The disconnect is watched on the **reply** rather than on the request, and the
+ * difference is not cosmetic: a `GET` carries no body, so its request stream is
+ * complete the moment the headers are parsed and its `close` fires immediately —
+ * a hold watching it would spin for its whole duration on every poll an idle
+ * mesh makes. The response is what stays open while the hold does, so its
+ * `close` is the client hanging up.
+ */
+function held(milliseconds: number, seen: number, reply: FastifyReply): Promise<void> {
+  if (boardMoved !== seen) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
     const finish = (): void => {
@@ -837,7 +888,7 @@ function held(milliseconds: number, request: FastifyRequest): Promise<void> {
       // Off with the hold rather than with the request, because one poll waits
       // more than once: a listener per round would be one per stir on a
       // connection the runtime warns about at ten.
-      request.raw.removeListener("close", finish);
+      reply.raw.removeListener("close", finish);
       resolve();
     };
     const timer: unknown = setTimeout(finish, milliseconds);
@@ -847,11 +898,28 @@ function held(milliseconds: number, request: FastifyRequest): Promise<void> {
     pollers.add(finish);
     // A worker that hung up is a hold with nobody to answer, so the process is
     // not left holding one timer per abandoned connection.
-    request.raw.once("close", finish);
+    reply.raw.once("close", finish);
   });
 }
 
-/** `POST /workers/effects` (§3.3). */
+/**
+ * `POST /workers/effects` (§3.3).
+ *
+ * §3.3's table has three rows — `204`, `401`, `410` — and they are the three
+ * conditions it is *about*: the batch was journaled, the credential did not
+ * verify, the session is unknown. A body that is not a batch at all is outside
+ * them, and this answers those two cases `400` and `409` rather than inventing a
+ * meaning for one of the three: a `204` over a batch nothing was written for
+ * would tell a worker its effects are in the journal when they are not, and the
+ * redispatch of §7.2 would then hand the next attempt a history short of the
+ * frontier — the one failure that whole route exists to prevent.
+ *
+ * **A batch is taken whatever the dispatch's state is**, superseded included.
+ * §3.3 keys records by effect key and scopes them to their execution, "not by
+ * session, and not by dispatch", precisely so the journal takes them from
+ * whichever session hands them over — and a superseded attempt's effects are
+ * exactly the ones its retry must replay rather than re-issue.
+ */
 async function effects(request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   if (!authenticated(request)) return reply.code(401).send();
   const session = touched(request);

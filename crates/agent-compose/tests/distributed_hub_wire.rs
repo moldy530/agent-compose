@@ -70,6 +70,8 @@ struct Hub {
     /// Held so the built project — and its journal — outlive the app.
     _scratch: Option<harness::Scratch>,
     client: Client,
+    /// Where it is listening, for a test that needs a client of its own.
+    base_url: String,
 }
 
 impl Hub {
@@ -278,11 +280,13 @@ fn hub_into(out: &Path, extra: &[(String, String)]) -> Option<Hub> {
     let client = Client::new(&served.base_url)
         .expect("the hub's address parses")
         .with_timeout(Duration::from_secs(30));
+    let base_url = served.base_url.clone();
     Some(Hub {
         _served: served,
         _provider: provider,
         _scratch: None,
         client,
+        base_url,
     })
 }
 
@@ -721,6 +725,48 @@ fn a_placed_node_runs_on_a_worker_and_the_rest_of_the_flow_runs_on_the_hub() {
     assert_eq!(unknown.status, 409, "{}", body_of(&unknown));
 }
 
+/// A `function:` node over a placed tool dispatches too, and its answer is held
+/// to the tool's `output:` on the way back in (grammar §14.1, §6.1).
+///
+/// The third way a graph reaches a placed component, and the one grammar §14.1
+/// leaves alone — "there its own placement is the whole of the answer" — so it
+/// lowers to a different call site from an `agent:` node's, with the contract
+/// around it rather than beside it. A worker that answered something the tool's
+/// `output:` refuses fails the node, which is what makes the parse a boundary
+/// check on a value that crossed the network rather than a formality.
+#[test]
+fn a_function_node_over_a_placed_tool_dispatches_and_its_answer_is_held_to_the_contract() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/direct-signings", &json!({ "path": "dist/app" }));
+
+    let dispatch = worker.dispatch(&hub);
+    assert_eq!(dispatch["node"], json!("flow.direct.sign"));
+    assert_eq!(dispatch["instance_path"], json!("sign/0"));
+    let id = dispatch["dispatch_id"]
+        .as_str()
+        .expect("a dispatch id")
+        .to_string();
+
+    // An answer the tool's `output:` refuses is the node's failure, not the
+    // hub's: `signature` is a string, and this is not one.
+    assert_eq!(
+        worker.settle(&hub, &id, &json!({ "signature": 17 })).status,
+        204,
+        "the hub takes the result and lets the node decide about it"
+    );
+    let failed = hub.until(&execution, "failed", |report| {
+        report["status"] == json!("failed")
+    });
+    let said = failed["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("tool.sign"),
+        "the failure does not name what refused the answer: {failed:#}"
+    );
+}
+
 /// A placed node with no worker **parks**, on the board and in the report
 /// (§6.1), and a join is what wakes it (§6.2).
 #[test]
@@ -820,6 +866,72 @@ fn a_placement_wait_fires_the_parked_lifecycle_webhook() {
         receiver.of_event("parked").len(),
         1,
         "the parking was announced more than once"
+    );
+}
+
+/// A poll already in flight is answered **when the work parks**, not when its
+/// hold runs out (§2).
+///
+/// The hold is what bounds an *empty* answer, and §2 states the cost of the
+/// transport as "a small latency floor on dispatch — one round trip after the
+/// hold is answered". A hub whose held poll waited out its hold before noticing
+/// a dispatch would turn that floor into the hold itself: twenty-five seconds,
+/// in production, for work that was ready the instant the poll asked. So this
+/// hub is given a hold long enough that waiting one out is unmistakable, and the
+/// dispatch has to arrive in a fraction of it.
+#[test]
+fn a_poll_in_flight_is_answered_when_the_work_parks_rather_than_when_its_hold_ends() {
+    let Some(project) = harness::scratch_project("mesh-latency") else {
+        return;
+    };
+    let held = harness::Scratch::at(project);
+    let hold = Duration::from_secs(6);
+    let Some(hub) = hub_into(
+        held.path(),
+        &[
+            (
+                "AGENT_COMPOSE_MESH_POLL_HOLD_MS".to_string(),
+                hold.as_millis().to_string(),
+            ),
+            (
+                "AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS".to_string(),
+                "30000".to_string(),
+            ),
+        ],
+    ) else {
+        return;
+    };
+    let worker = hub.worker();
+
+    // A poll on a thread of its own, with a client of its own: the hold blocks,
+    // which is the whole point of it.
+    let base = hub.base_url.clone();
+    let session = worker.session.clone();
+    let polling = std::thread::spawn(move || {
+        let client = Client::new(&base)
+            .expect("the hub's address parses")
+            .with_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        let answered = client
+            .send(
+                Hub::authorized("GET", "/workers/poll").header("x-worker-session", session.clone()),
+            )
+            .expect("the hub answered");
+        (answered, started.elapsed())
+    });
+
+    // Long enough that the poll is certainly held, short enough that the hold
+    // has most of itself left.
+    std::thread::sleep(Duration::from_millis(400));
+    let execution = hub.start("/releases", &json!({ "path": "dist/app" }));
+
+    let (answered, waited) = polling.join().expect("the polling thread");
+    assert_eq!(answered.status, 200, "{}", body_of(&answered));
+    assert_eq!(answered.json()["execution_id"], json!(execution));
+    assert!(
+        waited < hold / 2,
+        "the poll waited {waited:?} of a {hold:?} hold for work that parked after 400ms: a \
+         dispatch woke nobody, and §2's latency floor became the hold"
     );
 }
 

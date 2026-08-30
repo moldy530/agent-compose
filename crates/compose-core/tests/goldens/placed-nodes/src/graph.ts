@@ -22,6 +22,7 @@ import * as stores from "./stores.ts";
 import {
   agentSignerOutput,
   flowBatchInputs,
+  flowDirectInputs,
   flowReleaseInputs,
   flowRetriedInputs,
   toolNotarizeInput,
@@ -53,6 +54,20 @@ const flowBatchShape: runtime.Shape = {
     "paths": {
       "items": "string"
     }
+  }
+};
+
+/** `flow.direct` — the `input` root inside it (grammar 7.5). */
+const flowDirectShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.direct` node `sign` — the `sign.output` root its guards read. */
+const flowDirectNodeSignShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
   }
 };
 
@@ -302,6 +317,75 @@ const flowBatchBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.direct ---
+
+/** `flow.direct` node `sign` — `tool.sign` (grammar 8.4). */
+const flowDirectNodeSign: runtime.NodeDescriptor = {
+  flow: "flow.direct",
+  node: "sign",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowDirectShape, state: stateShape, output: flowDirectNodeSignShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => ({
+    output: runtime.parseResult(
+      toolSignOutput,
+      (
+        await mesh.dispatchPlaced({
+          placement: "mac",
+          node: "flow.direct.sign",
+          execution: view.run.execution.id,
+          path: runtime.instancePath(view, "sign"),
+          inputs: input,
+          signal: context.signal,
+        })
+      ).output,
+      "the result of `tool.sign`",
+    ),
+  }),
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.direct` — its nodes, its `start` edges, and the compiled graph. */
+function flowDirect() {
+  return new StateGraph(State)
+    .addNode("sign", (state: GraphState) => runtime.runNode(flowDirectNodeSign, state), {
+      ends: [END],
+    })
+    .addEdge(START, "sign")
+    .compile();
+}
+
+/**
+ * `flow.direct`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowDirectGraph = flowDirect();
+
+/**
+ * `flow.direct` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowDirectBinding: runtime.SubflowBinding = {
+  address: "flow.direct",
+  outputs: ["signature"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowDirectGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowDirectGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.release ---
 
 /** `flow.release` node `sign` — `agent.signer` (grammar 8.1). */
@@ -546,6 +630,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowBatchGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.direct": {
+    address: "flow.direct",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowDirectInputs, inputs, "the `inputs:` of `flow.direct`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowDirectGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowDirectGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.release": {
