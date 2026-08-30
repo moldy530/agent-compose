@@ -4370,6 +4370,7 @@ documents cite them by number** (Decision
    A placed component's own placement governs it wherever it is reached without
    an attaching agent: a `function:` node (§8.4), an `agent:` node, or a flow
    instantiated by a `flow:` node (§8.5), all of which the hub schedules.
+
 And one thing that is **not** a rule, because it is what happens when no rule
 applies: **a component in no placement executes on the hub.** That is the
 default and is never a diagnostic — `placements:` names the exceptions — which
