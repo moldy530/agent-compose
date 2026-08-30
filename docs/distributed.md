@@ -279,7 +279,13 @@ Field by field, because every refusal below is decided by one of them:
   a worker's logs name the mesh it is *in* and not only one it was refused from.
 - **`claims`** are the deploy layer's placement names.
 - **`artifact_hash`** is what the worker already has on disk, which lets an
-  unchanged worker skip the download.
+  unchanged worker skip the download. It is the join's **one OPTIONAL field**,
+  and it is optional in one direction only: a worker that holds no artifact at
+  all — a cold start, the first minute of a new machine's life — **omits the key
+  altogether**, and sends neither `null` nor `""` nor a placeholder hash.
+  `protocol`, `compiler`, `runtime` and `claims` are REQUIRED of every join, cold
+  start included; `env_ok` has the conditional rule below; and §4.1 is why the
+  hash is the member of the handshake triple that may be missing.
 - **`env_ok`** is the worker's report of which variables **of the manifest in
   the artifact it holds** are set in its environment — **names only, never
   values**, and never the environment's other names (§9). Its presence is
@@ -293,8 +299,15 @@ artifact the hub is serving, which gives one rule with two cases:
 
 - a join whose `artifact_hash` is the artifact the hub currently serves MUST
   carry `env_ok`, and it is checked;
-- any other join — a cold start with no artifact at all, or one holding a stale
-  hash — MUST omit it. A worker does not guess a manifest it has not read.
+- any other join — a cold start, which omits `artifact_hash` too, or one holding
+  a stale hash — MUST omit it. A worker does not guess a manifest it has not
+  read.
+
+A hub compares an **absent** `artifact_hash` the way it compares a stale one: it
+is not the hash being served, so it takes that same branch. Nothing here needs a
+rule of its own for the cold start, and an implementation MUST NOT invent one —
+"no artifact" and "the wrong artifact" want the same answer, which is the one the
+next paragraph gives.
 
 A join that omits `env_ok` is a **provisioning join**: it is answered normally,
 with a session and the current artifact, and the hub **MUST NOT dispatch to that
@@ -317,7 +330,7 @@ remembers nothing of the first — the second re-derives all of it.
 | the compiler version or runtime does not match | `409` | names both sides of whichever half differs (§4.1) |
 | a claim names no placement in the active target | `400` | names the claim, and lists the target's placement names |
 | `env_ok` is present and a claimed placement's manifest is unsatisfied | `403` | names the **variables**, never their values, never whether the hub holds them |
-| `env_ok` is present on a join whose `artifact_hash` is not the current one, or absent on one whose is | `400` | names the rule above: the report is against the manifest in the artifact the worker holds |
+| `env_ok` is present on a join whose `artifact_hash` is not the current one — an absent hash included, since an absent hash is never the current one — or absent on one whose is | `400` | names the rule above: the report is against the manifest in the artifact the worker holds |
 | the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§3.5, §4) |
 
 The order matters, and it is the order of the rows: a worker that cannot be
@@ -533,22 +546,38 @@ download.
 
 ### 4.1 The handshake triple
 
-A join agrees on three values, and all three are compared — so all three are on
-the wire, in the join §3.1 fixes:
+A join agrees on three values, and all three are on the wire, in the join §3.1
+fixes. Two of them are compared on every join; the third is compared whenever the
+worker has one to send, and the paragraphs after the table are that asymmetry:
 
 | | what it pins | where it is written |
 |---|---|---|
-| **artifact hash** | the generated project, exactly | `artifact_hash` in the request; `artifact.hash` in the answer |
+| **artifact hash** | the generated project, exactly | `artifact_hash` in the request, **when the worker holds one**; `artifact.hash` in the answer |
 | **compiler version** | the `agent-compose` release that generated it | `compiler` in the request, and in the answer |
 | **runtime** | Bun, and its major version | `runtime` in the request, as `"<name> <version>"` |
 
-A field the request omits is a comparison the hub cannot make, which is why all
-three are REQUIRED rather than helpful: PRD resolved q40 makes the refusal the
-point of the handshake, and a refusal that names both sides is only writable
-from a request that carries one of them.
+A field the request omits is a comparison the hub cannot make, which is why
+**`compiler` and `runtime` are REQUIRED on every join** rather than helpful: PRD
+resolved q40 makes the refusal the point of the handshake, and a refusal that
+names both sides is only writable from a request that carries one of them.
+
+**The artifact hash is the one member a join may leave out**, and leaving it out
+states something rather than omitting it: this worker holds no artifact. A cold
+start has no hash to send, so it omits the key — §3.1 fixes that as an absent
+key and not a `null` — and a hub reads an absent hash exactly as it reads a stale
+one, because both mean "not the artifact I serve" and both are answered the same
+way. That takes nothing from the handshake, because of the asymmetry the next
+paragraphs turn on: the hash is the member the hub can **repair**, and the two it
+can only refuse on are the two required of every join, cold start included. So a
+provisioning join is still a join the version check runs on, and a worker of the
+wrong release is refused before it downloads anything.
 
 A hash mismatch is not a refusal — the answer carries the current artifact and
-the worker fetches it.
+the worker fetches it. An **absent** hash is that same case at its limit and is
+refused no more than the mismatch is; a hub that answered a first join `400`
+because it named no artifact would make a fresh machine unable to bootstrap into
+the mesh at all, since fetching (§3.5) is downstream of the join that names what
+to fetch.
 
 That is narrower than resolved q40 reads at a glance — "a mismatch is a refused
 join naming both" — and the reconciliation is in q40's own next clause:
