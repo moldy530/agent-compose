@@ -547,8 +547,23 @@ point of the handshake, and a refusal that names both sides is only writable
 from a request that carries one of them.
 
 A hash mismatch is not a refusal — the answer carries the current artifact and
-the worker fetches it. A **compiler-version or runtime mismatch is a refused
-join** (`409`, §3.1), and the refusal names both sides:
+the worker fetches it.
+
+That is narrower than resolved q40 reads at a glance — "a mismatch is a refused
+join naming both" — and the reconciliation is in q40's own next clause:
+*redeployment is automatic on the next join*. The two are one decision. An
+artifact hash is the single member of the triple the hub can **fix in the answer
+it is already sending**, so fixing it is what "automatic" means, and refusing it
+would break the resolution rather than honour it — it would also strand §3.1's
+provisioning join, which is a join made with no artifact at all. The two members
+the hub cannot fix — the release a worker binary was built from, the runtime
+installed on its machine — are the refusals, and they are what "naming both" is
+about. Read it the way §4.2 reads Bun against resolved q18: a *scoped reading*
+of the resolution, written down so the next reader does not have to re-derive
+it.
+
+A **compiler-version or runtime mismatch is a refused join** (`409`, §3.1), and
+the refusal names both sides:
 
 > refused: this hub was built by agent-compose 0.4.1 and the worker runs 0.3.9 —
 > upgrade the worker, or point it at a hub of its own release
