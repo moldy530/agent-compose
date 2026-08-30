@@ -154,6 +154,27 @@ itself down to one node, which is what makes `dispatch_id` idempotency (§3.4)
 and the mid-node disconnect rule (§7.3) statements about a session rather than
 about a scheduler nobody wrote.
 
+**So `max_concurrency:` bounds admission and does not deliver parallelism.** A
+`map` declares how many instances the *graph* may have in flight (grammar §8.6);
+when the node it dispatches is placed, how many of them are **running** at once
+is the number of live sessions claiming that placement, and never more. A
+`max_concurrency: 8` over an `agent.signer` placed on `mac`, with one worker on
+the Mac, runs one at a time: the map admits eight, the placement delivers one,
+and the other seven are queued to the placement — §2 queues work to a placement
+and never to a worker (§6.3) — with no session free to hand them to. An
+implementation MAY hold those seven as placement waits on the board (§6.1) or in
+an admission queue of its own; what is normative is that they are
+**undispatched**, which is §6.4's first row.
+
+Undispatched is a pause rather than a failure, but it is not free of the clock:
+a node's `timeout:` chain runs from dispatch (§6.5), so an item that waits out
+its timeout behind a busy worker fails on it exactly as one waiting for a
+machine that is switched off does. Both halves of that are the author's to size.
+Eight signings at once needs eight workers claiming `mac`; a graph that should
+not admit more work than the mesh can run writes the `max_concurrency:` those
+workers can serve; and a `timeout:` on a placed node is a bound on **queueing
+plus execution**, not on execution alone.
+
 A worker's `POST`s do not wait behind its poll: effect batches (§3.3) and
 results (§3.4) are issued as they happen, concurrently with the held `GET`. "One
 outstanding `GET`" bounds the polling, not the connection count.
@@ -817,6 +838,12 @@ placement worth sleeping on therefore wants a `retry:`, because a worker that
 vanishes *while running the node* fails that attempt. Which row a given silence
 falls in is decided by nothing but whether that session was holding a dispatch,
 and §6.3 is where that is read off.
+
+The first row is not only the machine that is switched off. A node whose
+placement has live workers and no **free** one — the seventh item of a
+`max_concurrency: 8` fan-out onto a one-worker pool (§2) — is undispatched too,
+and is governed identically: it costs nothing while it waits, and its `timeout:`
+is running the whole time.
 
 ### 6.5 Bounding needs no new grammar
 
