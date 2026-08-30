@@ -88,12 +88,13 @@ satisfies a claim is decided by whoever shows up, and several workers claiming
 one name form a **pool** the hub dispatches across.
 
 The static surface is grammar §14.1 and §14.2, and its rules are enforced by
-`validate` today: a placement is a named entry whose `members:` are `agent.*` and
-`tool.*` addresses that resolve; placements are disjoint; an attached tool
-colocates with the agent that attaches it; `hub.join_token:` is required wherever
-placements are. **A component in no placement executes on the hub.** That is the
-default, and it is why a project with no `placements:` is an ordinary
-single-process deployment.
+`validate` today: a placement is a named entry whose `members:` are distinct
+`agent.*` and `tool.*` addresses that resolve; placements are disjoint; whatever
+an agent attaches colocates with it — an attached tool, and everything an
+attached flow reaches, since a flow-as-tool call runs inside the same tool loop;
+`hub.join_token:` is required wherever placements are. **A component in no
+placement executes on the hub.** That is the default, and it is why a project
+with no `placements:` is an ordinary single-process deployment.
 
 ### 1.2 What the hub's load is made of
 
@@ -157,8 +158,16 @@ MAY make them configurable and MUST keep that relationship.
 
 ## 3. The wire contract
 
-Four routes. Every one of them is authenticated, and every one after the join
+Five routes. Every one of them is authenticated, and every one after the join
 carries the session the join returned.
+
+| route | method | what it is |
+|---|---|---|
+| `/workers/join` | `POST` | claim placements, agree the handshake triple, receive a session |
+| `/workers/poll` | `GET` | long-poll for a dispatch |
+| `/workers/effects` | `POST` | hand journaled effects back to the hub |
+| `/workers/result` | `POST` | settle a dispatch |
+| `/workers/artifact/{hash}` | `GET` | fetch the generated project by hash |
 
 **Authentication.** A worker presents the deploy target's join token as
 `Authorization: Bearer <token>`, read from the environment variable
@@ -166,16 +175,25 @@ carries the session the join returned.
 sides: the hub reads it to verify, the worker reads it to offer, and neither
 holds it in the artifact. There is one scheme and one kind.
 
+**The session.** Every route after the join carries the `worker_session` the
+join returned, in the `X-Worker-Session` header, **in addition to** the bearer
+token: the token says which mesh, the session says which worker. The one
+exception is stated at §3.5 and stated there because it is an exception.
+
 ### 3.1 `POST /workers/join`
 
 ```json
 {
-  "token": "<presented in the Authorization header, not the body>",
   "claims": ["mac", "gpu"],
   "artifact_hash": "<the hash this worker already holds, if any>",
   "env_ok": ["SIGNING_KEY", "NOTARY_PASSWORD"]
 }
 ```
+
+The credential is **not** in the body. It is the `Authorization` header above,
+and only there: a wire contract with a field that both exists and does not is
+two implementations waiting to disagree, and a token in a request body is a
+token in whatever logs that body.
 
 Answer:
 
@@ -199,7 +217,7 @@ worker already has on disk, which lets an unchanged worker skip the download.
 | the token does not verify | `401` | no detail. A refused credential is told nothing about why |
 | a claim names no placement in the active target | `400` | names the claim, and lists the target's placement names |
 | a claimed placement's env manifest is unsatisfied | `403` | names the **variables**, never their values, never whether the hub holds them |
-| the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§4) |
+| the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§3.5, §4) |
 | the compiler version or runtime does not match | `409` | names both sides of whichever half differs (§4) |
 
 The token check MUST be a constant-time comparison, for the reason grammar §13.3
@@ -270,6 +288,36 @@ A result the hub cannot attribute — an unknown or already-superseded
 moved on, and re-driving it from a stale result is exactly the divergence
 `docs/durability.md` §7 refuses.
 
+### 3.5 `GET /workers/artifact/{hash}`
+
+The tarball §4 describes, at the `url` the join returned. `{hash}` is the
+content hash, written the way §3.1's answer writes it (`sha256:…`), and the
+route is **hash-addressed**: one hash names one body, forever, so a proxy or a
+worker may cache it without a validator.
+
+**Authentication is the bearer token alone.** This is the one route that does
+*not* require a session, and the exception is deliberate: a worker whose session
+has aged out re-joins and fetches, and a fetch is a large, resumable, cacheable
+transfer that should not be coupled to a session's lifetime. A worker SHOULD
+present its session when it has one; a hub MUST NOT require it.
+
+| condition | status | body |
+|---|---|---|
+| the token does not verify | `401` | no detail, as everywhere (§3.1) |
+| the hash is the artifact this hub serves | `200` | the tarball, `Content-Type: application/gzip`, `Content-Length` set |
+| the hash is a **previous** artifact this hub still holds | `200` | the same, so a worker mid-rollback is not stranded |
+| the hash is well-formed and unknown here | `404` | names the hash, and the hash this hub currently serves |
+| the hash is malformed | `400` | names what a hash looks like |
+
+A hub MUST keep serving an artifact while any execution that was dispatched
+under it is unfinished, and MAY drop it afterwards. A worker meeting `404` for
+the hash its join returned re-joins rather than retrying the fetch: the join is
+what re-derives the current hash, and re-deriving it anywhere else would be a
+second answer to what this deployment is running.
+
+Range requests are OPTIONAL. A hub that serves them MUST honour
+`Accept-Ranges: bytes` semantics; a worker MUST work without them.
+
 ---
 
 ## 4. The artifact
@@ -280,8 +328,8 @@ rather than a drift (PRD resolved q40).
 
 The artifact is a **tarball of the generated project** — the same tree
 `build` writes — served **hash-addressed** from the hub under worker
-authentication. Its hash is over the tree's content, so two hubs built from one
-composition serve one artifact.
+authentication, on the route §3.5 fixes. Its hash is over the tree's content, so
+two hubs built from one composition serve one artifact.
 
 A worker:
 
@@ -519,20 +567,50 @@ The per-placement manifest is **computable statically**: placements bind
 components, components bind `${ENV}` references, and the walk that collects them
 is the one `src/env.ts` is already built from (grammar §4.3, PRD 5.9).
 
-The partition is exactly this:
+**The partition follows where a component *executes*, not what `members:`
+says.** That distinction is the whole of this section, because the two differ:
+grammar §14.1 rule 4 makes an attached tool run in its agent's process whether or
+not it names a placement, so `members:` under-describes the set of things a
+worker runs. A manifest derived from raw membership would ask the hub to hold a
+secret it never uses and would leave a worker's manifest missing one it does.
 
-- a variable referenced by a component that is a member of placement `P` belongs
-  to `P`'s manifest;
-- a variable referenced by a component in **no** placement belongs to the
-  **hub's** manifest;
+A process's manifest is therefore the variables referenced by every component
+that **can execute in it**, and a component executes in a process exactly when:
+
+- **it is a member of that placement** — the direct case;
+- **it is dispatched with no placement of its own, and the process is the
+  hub** — the default of §1.1;
+- **an agent that runs in that process attaches it** — an attached `tool.*`, and
+  every `agent.*` and `tool.*` an attached `flow.*` reaches, all of which run
+  inside the agent's tool loop (grammar §5.4, §14.1 rule 4).
+
+Which gives, concretely:
+
+- a variable referenced by a member of placement `P` belongs to `P`'s manifest;
+- a variable referenced by a tool that only ever runs inside placed agents'
+  processes belongs to **their placements'** manifests — and to the hub's only
+  if some unplaced agent or `function:` node also reaches it;
+- a variable referenced by a component that runs on the hub — in no placement,
+  and reached by nothing placed — belongs to the **hub's** manifest;
 - a variable referenced from the deploy layer itself — a storage backend, an
   event source, `hub.join_token:` — belongs to the hub's;
-- a variable referenced by components in two different placements belongs to
-  both.
+- a variable reachable in two processes belongs to both. Two placed agents
+  attaching one unplaced tool is the ordinary case, and the tool's secrets go to
+  both placements.
+
+Worked, because this is the case the rule exists for: `tool.sign` carries
+`KEYCHAIN_PASSWORD` in its `exec.env`, `agent.signer` attaches it, and the deploy
+file places `agent.signer` in `mac` and nothing else. `validate` accepts that —
+§14.1 rule 4's first row, the tool claims nothing and runs where the agent runs.
+`KEYCHAIN_PASSWORD` belongs to **`mac`'s** manifest and **not** to the hub's: the
+hub never runs `tool.sign`, so requiring the secret there would be a false
+requirement, and omitting it from `mac`'s would let a machine without a keychain
+join clean (§9.2) and fail on its first dispatch.
 
 This is §7 M3's least-privilege line in its sharpest form: blast-radius
 containment falls out of the manifest, because **the hub cannot leak what it
-never held**.
+never held** — which is a claim about what the hub *runs*, and is only true if
+the partition is computed that way.
 
 ### 9.2 The join-time check is self-reported presence
 
@@ -594,12 +672,13 @@ reason about.
 **The static surface is live. The protocol is not built yet.**
 
 What `validate` enforces now: everything grammar §14.1 and §14.2 state — a
-placement's name and members, the `flow.*` deferral, disjointness, the
-attached-tool colocation rule, the conditional join token, and the `public_url:`
-shape. A deploy file that breaks one of those is a compile error today.
+placement's name and members, the `flow.*` deferral, disjointness, repeated
+members, the colocation rule for an attached tool and for what an attached flow
+reaches, the conditional join token, and the `public_url:` shape. A deploy file
+that breaks one of those is a compile error today.
 
-What does not exist yet: the worker verb, the four routes of §3, the artifact
-server of §4, placement waits on the board, and effect streaming. **Nothing a
+What does not exist yet: the worker verb, the five routes of §3, the artifact
+server of §3.5, placement waits on the board, and effect streaming. **Nothing a
 placement or a `hub:` block declares reaches the project a build emits.**
 
 That middle state is deliberate and it is bound rather than remembered:
