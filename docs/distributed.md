@@ -664,11 +664,44 @@ it, not held from the one before.
 implementation detail: the wake is an event the hub already receives, so a mesh
 with nothing to do costs one held request per worker and nothing else.
 
-### 6.3 Heartbeat loss re-parks
+### 6.3 Heartbeat loss ends the session, and its dispatch fails
 
-When a session passes the liveness window (§2), everything **queued to that
-worker and not yet dispatched** re-parks, and the next join claiming that
-placement takes it.
+**The hub declares a session gone, and the declaration is the liveness window of
+§2 expiring**: 90 seconds with no request on that session — no poll, no effect
+batch, no result. That is the only detector this protocol has, and the hub is
+the only side that may fire it: a worker never declares itself gone, it re-joins
+(§5).
+
+What the declaration costs depends on the one thing a session can be holding.
+§2's pull model queues work to a **placement**, never to a worker, and hands it
+over one dispatch at a time, so a session holds at most one piece of work: the
+dispatch it has not settled. Two cases, and they are the whole rule.
+
+- **The session had no unsettled dispatch.** Nothing re-parks, because nothing
+  was ever this worker's. The placement's open placement-waits stay on the board
+  untouched, and the next join claiming that placement takes them in park order
+  (§6.2). This is the sleeping laptop, and it costs the execution nothing.
+- **The session had an unsettled dispatch.** The hub **abandons** it: the
+  dispatch is settled as failed, and the node's attempt fails with it, under that
+  node's `retry:`/`on_error:` chain exactly as §7.3 says — the liveness window is
+  what *detects* the mid-node disconnect §7.3 describes, and this paragraph is
+  where that detection is filed. Effects the worker had already streamed home
+  stay in the journal and are handed to the next attempt as its `effect_history`
+  (§7.2). Where `retry:` grants that attempt, it re-enters dispatch and **parks
+  on the board if no worker is claiming the placement** (§6.2) — which is the
+  sense in which heartbeat loss re-parks.
+
+A revived worker that comes back and posts a result for an abandoned dispatch is
+answered `409` and discards it (§3.4): that is the "already-superseded" case, and
+abandoning the dispatch is what supersedes it. Effect batches it still holds are
+a different matter and are still accepted — they are keyed by effect key and
+scoped to their execution, not to a session or a dispatch (§3.3) — so a batch
+in flight when the lid closed is journaled rather than lost.
+
+PRD resolved q39 puts this as "heartbeat loss re-parks what was queued to the
+vanished worker", and §2's pull model is what makes that phrase concrete rather
+than ambiguous: the only work ever queued *to a worker* is the dispatch it is
+holding, so the clause resolves to the second case above and leaves nothing over.
 
 ### 6.4 Undispatched is a pause; mid-node is a failure
 
@@ -678,11 +711,13 @@ what an author writes:
 | | what it is | what governs it |
 |---|---|---|
 | **no worker has taken the node yet** | a **pause** — this is what parking is | nothing, until the node's `timeout:` chain fires from dispatch |
-| **a worker took it and disconnected mid-node** | an **attempt failure** | the node's `retry:` / `on_error:` chain, like any execution failure (§7) |
+| **a worker took it and disconnected mid-node** | an **attempt failure**, declared by the hub when the liveness window passes (§6.3) | the node's `retry:` / `on_error:` chain, like any execution failure (§7) |
 
 A closed laptop is a pause, not a failure — for the undispatched case. A
 placement worth sleeping on therefore wants a `retry:`, because a worker that
-vanishes *while running the node* fails that attempt.
+vanishes *while running the node* fails that attempt. Which row a given silence
+falls in is decided by nothing but whether that session was holding a dispatch,
+and §6.3 is where that is read off.
 
 ### 6.5 Bounding needs no new grammar
 
@@ -733,6 +768,14 @@ A worker that disconnects mid-node fails that **attempt**, under the node's
 `retry:`/`on_error:` chain like any execution failure. The effects it had already
 streamed home are in the journal, so the retry replays them rather than
 re-issuing them: a model call already paid for is not paid for twice.
+
+**What detects the disconnect is the liveness window of §2, and the hub is the
+side that declares it** — §6.3 states that rule and this section is its
+consequence. A disconnect is therefore never observed as such: it is a session
+that stopped making requests while holding a dispatch, which the hub abandons,
+which fails the attempt. A worker that comes back afterwards learns so from the
+`409` its result meets (§3.4), and takes part in the retry only by joining like
+anyone else.
 
 ### 7.4 What LangGraph is here
 
