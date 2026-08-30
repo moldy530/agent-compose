@@ -50,6 +50,7 @@ says only what is *different* about the distributed case.
 10. [Protocol stability](#10-protocol-stability)
 11. [Out of v1 scope](#11-out-of-v1-scope)
 12. [What is built today](#12-what-is-built-today)
+13. [What this document does not settle](#13-what-this-document-does-not-settle)
 
 ---
 
@@ -131,8 +132,9 @@ process, and the same auth story. A worker holds one outstanding `GET` at a time
 and the hub answers it when there is work for that worker or when the hold
 expires.
 
-**A worker polls while it is busy, and runs one dispatch at a time.** Both
-halves are normative, and together they are the whole of the concurrency story:
+**A worker polls while it is busy, and holds one dispatch at a time.** Both
+halves are normative; they do not have the same authority behind them, and the
+paragraph after them says which is which:
 
 - A worker keeps exactly one poll in flight from the moment it joins until it
   stops. It does **not** suspend polling while a node runs: a four-minute build
@@ -147,24 +149,49 @@ halves are normative, and together they are the whole of the concurrency story:
   heartbeats and nothing else, however much work is queued for the placement it
   claims.
 
-Concurrency comes from **more sessions, never from more dispatches on one**:
-several workers claiming one name form a pool (§1.1), and a machine that should
-run two nodes at once runs two workers. That keeps a worker's own model of
-itself down to one node, which is what makes `dispatch_id` idempotency (§3.4)
-and the mid-node disconnect rule (§7.3) statements about a session rather than
-about a scheduler nobody wrote.
+**The second clause is a decision this document makes, not one a resolved PRD
+entry hands it**, and it is worth marking as such because it is the only rule in
+§2 that is not forced by the transport. What the resolutions do fix is where a
+placement's parallelism comes from: several workers claiming one name form a
+pool the hub dispatches across (PRD resolved q38, §1.1), and the project's
+standing answer to "more throughput" is more processes rather than a cleverer
+one (resolved q37 says it of hubs). None of them fixes how many dispatches a
+single *session* may hold. v1 fixes it at one, because one is what makes
+`dispatch_id` idempotency (§3.4), the mid-node disconnect rule (§7.3) and
+heartbeat loss (§6.3) statements about a session rather than about a per-worker
+scheduler nobody has written. **Raising it is a question for the PRD**
+(§13) rather than a hub's configuration knob: it changes what heartbeat loss
+costs an execution (§6.3). The wire is shaped so that whatever the answer is, it
+arrives additively — a worker declaring a capacity at join is an OPTIONAL
+request field whose absence means one, which §10.2 makes a compatible change.
 
-**So `max_concurrency:` bounds admission and does not deliver parallelism.** A
-`map` declares how many instances the *graph* may have in flight (grammar §8.6);
-when the node it dispatches is placed, how many of them are **running** at once
-is the number of live sessions claiming that placement, and never more. A
-`max_concurrency: 8` over an `agent.signer` placed on `mac`, with one worker on
-the Mac, runs one at a time: the map admits eight, the placement delivers one,
-and the other seven are queued to the placement — §2 queues work to a placement
-and never to a worker (§6.3) — with no session free to hand them to. An
-implementation MAY hold those seven as placement waits on the board (§6.1) or in
-an admission queue of its own; what is normative is that they are
-**undispatched**, which is §6.4's first row.
+Concurrency in v1 therefore comes from **more sessions, never from more
+dispatches on one**: several workers claiming one name form a pool (§1.1), and a
+machine that should run two nodes at once runs two workers.
+
+**So `max_concurrency:` bounds admission, and a placed node's parallelism is the
+size of its pool.** A `map` declares how many instances the *graph* may have in
+flight (grammar §8.6); when the node it dispatches is placed, how many of them
+are **running** at once is the number of live sessions claiming that placement,
+and never more. A `max_concurrency: 8` over an `agent.signer` placed on `mac`,
+with one worker on the Mac, runs one at a time: the map admits eight, the
+placement delivers one, and the other seven are queued to the placement — §2
+queues work to a placement and never to a worker (§6.3) — with no session free to
+hand them to. An implementation MAY hold those seven as placement waits on the
+board (§6.1) or in an admission queue of its own; what is normative is that they
+are **undispatched**, which is §6.4's first row.
+
+That is the same posture PRD 5.6's placement-synergy bullet takes, read through
+the shape that replaced the one it was written against: *map instances are the
+natural unit for `runtime: isolated` — one worker per sandbox with zero change to
+the logical definition*. The unit of isolation there is a worker too, and "one
+worker per sandbox" is "eight at once is eight workers" in the vocabulary of the
+address-keyed sketch resolved q38 retired (grammar D128). What the bullet
+promises is kept exactly: the *logical definition* does not change — one `map`
+runs eight-wide against a pool of eight and one-wide against a pool of one, with
+no edit to the graph. What the spec deliberately cannot express is how many
+workers show up, because resolved q38 put machines and their addresses outside
+the spec on purpose.
 
 Undispatched is a pause rather than a failure, but it is not free of the clock:
 a node's `timeout:` chain runs from dispatch (§6.5), so an item that waits out
@@ -610,18 +637,33 @@ because it named no artifact would make a fresh machine unable to bootstrap into
 the mesh at all, since fetching (§3.5) is downstream of the join that names what
 to fetch.
 
-That is narrower than resolved q40 reads at a glance — "a mismatch is a refused
-join naming both" — and the reconciliation is in q40's own next clause:
-*redeployment is automatic on the next join*. The two are one decision. An
-artifact hash is the single member of the triple the hub can **fix in the answer
-it is already sending**, so fixing it is what "automatic" means, and refusing it
-would break the resolution rather than honour it — it would also strand §3.1's
-provisioning join, which is a join made with no artifact at all. The two members
-the hub cannot fix — the release a worker binary was built from, the runtime
-installed on its machine — are the refusals, and they are what "naming both" is
-about. Read it the way §4.2 reads Bun against resolved q18: a *scoped reading*
-of the resolution, written down so the next reader does not have to re-derive
-it.
+That is narrower than resolved q40, and the narrowing is **a divergence from the
+literal text of a resolved entry rather than a reading of it**. q40 names two
+things pinned in the handshake — artifact hash and compiler version — and says
+"a mismatch is a refused join naming both"; this section refuses on compiler
+version and runtime, and *repairs* a hash mismatch instead of refusing it.
+
+The engineering is not what is in doubt, and the argument for it is in q40's own
+next clause: *redeployment is automatic on the next join*. The artifact hash is
+the single member of the triple the hub can **fix in the answer it is already
+sending**, so fixing it is what "automatic" means. Refusing it would also strand
+§3.1's provisioning join, which is a join made with no artifact at all: no fresh
+machine could bootstrap into a mesh, because fetching (§3.5) is downstream of the
+join that names what to fetch. The two members the hub cannot fix — the release a
+worker binary was built from, the runtime installed on its machine — are the
+refusals.
+
+What is in doubt is the paperwork, and this document does not get to do it. The
+project's discipline puts an amendment to a resolved entry through the PRD, not
+through a downstream document's reconciliation paragraph — which is the
+difference between this clause and §4.2's Bun exception, where the scoping is
+written into resolved q40 itself. **So the divergence is recorded rather than
+assumed away** (§13): the runtime work carries q40's mismatch clause back for a
+ratified amendment — the hash is repaired; the compiler version and the runtime
+are refused — before a hub ships the behaviour above. Until that lands, an
+implementer reading q40 alone and writing a hub that answers `409` to an
+unfamiliar `artifact_hash` locks every fresh worker out of the mesh permanently,
+which is the failure this paragraph exists to prevent.
 
 A **compiler-version or runtime mismatch is a refused join** (`409`, §3.1), and
 the refusal names both sides:
@@ -819,9 +861,22 @@ in flight when the lid closed reaches the journal on the re-send and the retry
 replays it instead of re-issuing it (§7.2).
 
 PRD resolved q39 puts this as "heartbeat loss re-parks what was queued to the
-vanished worker", and §2's pull model is what makes that phrase concrete rather
-than ambiguous: the only work ever queued *to a worker* is the dispatch it is
-holding, so the clause resolves to the second case above and leaves nothing over.
+vanished worker". The phrase is written in the vocabulary of a push model, where
+a worker holds a queue of its own; this protocol pulls, and §2 queues work to a
+**placement** rather than to a worker, so what the clause names is the one thing
+a session can be holding. At v1's capacity of one that is the unsettled
+dispatch, and it does re-park — by the second case above: the attempt fails, and
+where `retry:` grants another the node re-enters dispatch and parks on the board
+if nothing is claiming the placement. What the re-park costs is an attempt, and
+that price is the one resolved q39 and q42 set together when they made mid-node a
+failure rather than a pause (§6.4).
+
+**This is the rule §2's open capacity question would move.** A session allowed to
+hold more than one dispatch makes "what was queued" a plural, and the choice
+between abandoning all of it and handing back the part no effect record vouches
+for is a choice about what a closed laptop costs an execution — which is why §2
+sends the capacity to the PRD (§13) instead of leaving it to a hub's
+configuration.
 
 ### 6.4 Undispatched is a pause; mid-node is a failure
 
@@ -1163,7 +1218,10 @@ the previous version behave **wrongly** rather than be refused:
 * changing a route's path or method, or *when* it may legally be called —
   including whether a poll may be outstanding while a dispatch is unsettled
   (§2), which an older worker would answer with silence the hub would read as
-  death;
+  death. §2's other clause is the opposite case and belongs to §10.2: a hub that
+  learned to hold more than one dispatch on a session still answers one at a time
+  to a worker that declares no capacity, so nothing an older peer does becomes
+  wrong;
 * changing which side writes the journal (§3.3), or where an idempotency key
   comes from (§3.3, §3.4);
 * changing what a status code means at a route — a `410` that stopped meaning
@@ -1192,12 +1250,23 @@ Named, so that each is a decision rather than a gap (PRD resolved q44):
 | **worker-to-worker edges** | every edge goes through the hub, which is what keeps one scheduler and one journal |
 | **per-placement artifact slicing** | §4.3: an optimisation with a per-placement build, hash and reachability bill |
 | **Windows workers** | owner call, 2026-08-29. Linux and macOS in v1 |
-| **containment beyond the process boundary** | a worker runs the artifact with its own privileges, exactly as a hand-rolled `exec:` tool does today. Containers and seccomp are a deployment's business, not this protocol's |
 
 Two of those are worth reading as a pair: **no worker-to-worker edges** and
 **one execution on one hub** are the same decision seen from two sides, and
 together they are why there is exactly one scheduler and exactly one journal to
 reason about.
+
+**Containment is not on this list, and the omission is deliberate.** A worker
+runs the artifact with its own privileges, exactly as a hand-rolled `exec:` tool
+does today — v1 ships no sandbox and no per-placement restriction — but that is
+where the campaign arrived rather than something a resolution named out. PRD
+resolved q31 fixed v1 containment at root plus timeout and deferred the rest —
+containers, seccomp, and "any deploy-target-level restriction (refusing bash on a
+distributed placement is a placement fact)" — *to this work*; resolved q37–q44
+then settled the topology, the binding surface and the wire without taking the
+question up, and q44's out-list does not contain it. So it is an open question,
+filed as one in §13 — not a decision this document, or the grammar beside it, may
+cite as settled.
 
 ---
 
@@ -1223,3 +1292,24 @@ to unwind — including teaching the environment manifest about §9.1's partitio
 which is the half of the surface with no sentence of its own.
 
 This document is what that runtime will be held to.
+
+---
+
+## 13. What this document does not settle
+
+Three questions are **open**, and each one is here because a normative document
+may fix a wire and may not fix a design decision the PRD has not made. The
+project's discipline is that a new design question lands in the PRD's Open
+Questions and is resolved there before the affected area is implemented; these
+are that list, staged, and the runtime work carries them over before it writes
+the code each one governs.
+
+| | what is unsettled | what stands in the meantime |
+|---|---|---|
+| **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it, and the wire admits any other answer additively (an OPTIONAL capacity at join, §10.2) |
+| **the artifact-hash half of resolved q40** (§4.1) | q40 reads "pinned by artifact hash and compiler version in the handshake; a mismatch is a refused join naming both", and §4.1 repairs a hash mismatch rather than refusing it, because a cold start has no hash to send and a refusal would make bootstrap impossible. The amendment q40 needs is that clause reading on the compiler version and the runtime | §4.1's behaviour, recorded there as a divergence rather than presented as a reading |
+| **containment beyond the process boundary** (§11) | resolved q31 fixed v1 containment at root plus timeout and deferred containers, seccomp and "any deploy-target-level restriction (refusing bash on a distributed placement is a placement fact)" **to the distribution work**. The distribution resolutions did not take it up, and q44's out-list does not name it, so nothing has decided whether a placement may carry a sandbox or a capability restriction | no such key exists, in the grammar or on the wire; a worker runs the artifact with its own privileges. Grammar D128 retires the reserved `network:` key on the ground that no *resolved* containment story backs it, which is a statement about today rather than about what a later resolution may add |
+
+None of the three blocks the runtime: each names what stands until the PRD
+answers it, and each is written so the answer is additive rather than a re-cut.
+What they do block is an implementation deciding any of them quietly.
