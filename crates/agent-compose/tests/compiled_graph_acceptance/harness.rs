@@ -1406,6 +1406,28 @@ impl Served {
         }
     }
 
+    /// End the app **and the command that launched it**, now, and reap both.
+    ///
+    /// [`Drop`] does this when a test ends; this is for the one test that has to
+    /// do it in the middle: a hub replaced behind its own name has to release
+    /// the port before its replacement can bind it
+    /// (`docs/distributed.md` §5). Idempotent, so the drop that follows is a
+    /// no-op.
+    pub fn stop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        #[cfg(unix)]
+        if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+            // SAFETY: this process's own child, unreaped until the `wait`
+            // below, so its group is still its own.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+    }
+
     /// Wait for the command to exit and answer with its status.
     pub fn wait(&mut self) -> std::process::ExitStatus {
         let status = self.child.wait().expect("the command is waited on");
@@ -1495,6 +1517,24 @@ pub fn serve_target_into(
     target: &str,
     environment: &[(String, String)],
 ) -> Option<Served> {
+    serve_target_on(out, entrypoint, target, 0, environment)
+}
+
+/// The same again, on a **port the caller names**.
+///
+/// Which is what replacing a hub behind its own name needs, and nothing else
+/// does: `docs/distributed.md` §5's third rule is that a worker addresses a hub
+/// **name** and "replacing the process behind that URL is invisible to it", so a
+/// restart that moved the port would be testing a reconfiguration rather than a
+/// restart. `0` is what every other caller passes, and takes a port the
+/// operating system picks.
+pub fn serve_target_on(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    port: u16,
+    environment: &[(String, String)],
+) -> Option<Served> {
     // The toolchain check `scratch_project` makes on the caller's behalf, made
     // here too: this entry point is handed a directory rather than asking for
     // one, and a run with no Bun has nothing to serve.
@@ -1503,7 +1543,7 @@ pub fn serve_target_into(
     command
         .arg("serve")
         .arg(entrypoint)
-        .args(["--port", "0"])
+        .args(["--port", &port.to_string()])
         .args(["--target", target])
         .arg("--out")
         .arg(out)
