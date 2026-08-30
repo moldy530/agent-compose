@@ -3,7 +3,7 @@
 ## What it protects
 
 Two answers to one question: which worker runs this piece of work. The code
-covers the two ways a composition can hold both answers at once.
+covers every way a composition can hold both answers at once.
 
 **Two placements naming one component.** Placements are disjoint. A worker
 claiming `mac` and a worker claiming `gpu` are different machines by
@@ -32,9 +32,18 @@ The last row is the one an author is most likely to write. A `mac`-only tool
 attached to an agent nobody placed runs on the hub, where the signing keys are
 not — a placement written, accepted, and silently ignored.
 
-What is **not** refused is a placed tool reached without an agent. A
-`function:` node names a `tool.*` directly, and there its own placement is the
-whole of the answer. That is the case a placed tool exists for.
+**A placement reached through a flow the agent attaches.** The same table, one
+indirection out. A `flow.*` in a `tools:` list cannot itself be placed — placing
+a flow is deferred — but a flow-as-tool call starts an instance *inside the same
+tool loop*, so every agent and tool that instance reaches runs in the attaching
+agent's process too. A `mac` tool reached only that way is the last row again,
+with a flow standing between the two lines.
+
+What is **not** refused is anything the hub schedules. A `function:` node names
+a `tool.*` directly, and there its own placement is the whole of the answer —
+that is the case a placed tool exists for. The same goes for a flow instantiated
+by a `flow:` node rather than attached as a tool: the hub schedules its nodes,
+so each placement inside it is honoured.
 
 ## A spec that triggers it
 
@@ -98,7 +107,10 @@ on the agent alone and the tool follows it.
 
 **Or reach the tool from a `function:` node.** A tool invoked by the graph
 rather than by a model is dispatched on its own, and its placement is then the
-whole answer — no agent's process to disagree with.
+whole answer — no agent's process to disagree with. Where the conflict came
+through a `flow.*` in the agent's `tools:`, the same repair is a `flow:` node:
+the hub schedules the instance's nodes, so every placement inside it is honoured
+instead of being folded into the caller's process.
 
 For the disjointness half, the repair is the same shape: name the component in
 one of the two placements. If it genuinely needs to run on either machine,
