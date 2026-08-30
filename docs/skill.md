@@ -60,6 +60,7 @@ compiled project.
 | `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>` |
 | `resume <path> <execution>` | build, then carry on a journaled execution — replaying its recorded effects rather than re-issuing them |
 | `serve <path>` | build, then serve the project's `http` triggers |
+| `worker --hub <url> --claim <name> --token-env <VAR>` | join a hub and run the nodes placed on the names it claims; takes no spec |
 | `docs [<topic>]` | the topic index, or one topic |
 | `explain <code>` | the expanded account of one diagnostic code |
 | `schema` | the published JSON Schema, for an editor's `$schema` |

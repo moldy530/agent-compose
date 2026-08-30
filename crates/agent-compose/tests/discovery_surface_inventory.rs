@@ -226,21 +226,26 @@ fn required_arguments(verb: &str) -> usize {
         .count()
 }
 
-/// How many positional arguments one written invocation supplies.
+/// How many argument slots one written invocation fills.
 ///
-/// The leading run of words after the verb that are not flags, an optional
-/// group, or a trailing comment — because that is where a positional goes in
-/// every form these documents write, and stopping at the first flag keeps
-/// `agent-compose build --check` from counting `--check` as the path it is
-/// missing. A placeholder counts: `<path>` is a document saying *a path goes
-/// here*, which is the thing being checked.
+/// Every word after the verb that is not a flag, an optional group, or part of
+/// a trailing comment. A placeholder counts: `<path>` is a document saying *a
+/// path goes here*, which is the thing being checked.
+///
+/// It counts a **value after a flag** as well as a positional, because
+/// [`required_arguments`] counts both too — clap's usage line writes a required
+/// option's value in the same `<…>` form it writes a positional in, and
+/// `worker` is the verb whose required arguments are all options. What it does
+/// not count is the flag itself, which is what keeps `agent-compose build
+/// --check` from reading `--check` as the path it is missing.
 fn supplied_arguments(words: &[String]) -> usize {
     words
         .iter()
         .skip(1)
-        .take_while(|word| {
+        .take_while(|word| word.as_str() != "#")
+        .filter(|word| {
             let word = word.as_str();
-            !word.starts_with('-') && !word.starts_with('[') && word != "#"
+            !word.starts_with('-') && !word.starts_with('[')
         })
         .count()
 }
@@ -798,7 +803,9 @@ fn a_verb_is_not_documented_by_a_longer_one_that_starts_with_it() {
 /// [`every_grammar_section_is_claimed_by_a_topic`] applies to the grammar.
 #[test]
 fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
-    const ACT: &[&str] = &["validate", "plan", "build", "resume", "run", "serve"];
+    const ACT: &[&str] = &[
+        "validate", "plan", "build", "resume", "run", "serve", "worker",
+    ];
     const TEACH: &[&str] = &["docs", "explain", "init", "schema", "skill"];
 
     let mut claimed: Vec<String> = ACT

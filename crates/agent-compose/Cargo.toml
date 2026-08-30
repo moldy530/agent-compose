@@ -25,8 +25,33 @@ clap = { workspace = true }
 # It is also the renderer rustc's diagnostics use, which is the bar PRD G3 sets.
 annotate-snippets = "0.12"
 # `--format json`. `Diagnostic` is `Serialize` in `compose-core`, so all this
-# writes is the enclosing object.
+# writes is the enclosing object — and, since the `worker` verb landed, every
+# body of `docs/distributed.md` §3's wire.
 serde_json = "1"
+# The HTTP client behind `agent-compose worker`. The verb is a complete protocol
+# client (`docs/distributed.md` §3): it long-polls a hub, streams effect batches
+# home and fetches an artifact, so this binary needs a client where it needed
+# none before. Chosen for three properties the protocol asks for by name:
+#
+#   * **blocking**, so the worker is threads and not an async runtime — §2 gives
+#     it one held `GET` and one running node, which is two threads;
+#   * **TLS**, because a worker dials *out* to a hub over whatever network is
+#     between them (§1: "a Mac behind NAT with a dynamic IP joins the way a CI
+#     runner joins"), and an `https://` hub URL is the ordinary case;
+#   * **per-request timeouts**, which a 25-second hold that must not be cut
+#     short and a `POST` that must not hang for ever need to set differently.
+#
+# It is the one dependency the shipped binary gains for this milestone, and it
+# carries `rustls` rather than the platform's TLS so the single static binary of
+# PRD 5.12 stays single and static.
+ureq = "3"
+# Gunzip, for the artifact `/workers/artifact/{hash}` serves — §3.5 fixes its
+# `Content-Type: application/gzip`, and that is the *body's* encoding rather than
+# the transfer's, so no HTTP client decodes it. Already in the tree through
+# `ureq`'s own `gzip` feature; named here because this crate calls it directly.
+# The **tar** beside it is read by hand (`worker::artifact`), the way `src/mesh.ts`
+# writes it by hand and for the same reason.
+flate2 = "1"
 
 [target.'cfg(unix)'.dependencies]
 # Signal delivery, which `run` and `serve` need and `std` has no API for: both
