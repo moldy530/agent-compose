@@ -1,0 +1,13 @@
+# rule: a placement member is a reference, and a reference is never an environment token (grammar 14.1, 4.3, Decision D129)
+# code: invalid-reference
+# message: expected an `agent.*` or `tool.*` reference for a placement member, found `${SIGNING_AGENT}`
+# at: 13:9
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  mac:
+    members:
+      - "${SIGNING_AGENT}"
