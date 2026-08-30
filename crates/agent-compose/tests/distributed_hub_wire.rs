@@ -339,6 +339,26 @@ fn every_join_refusal_is_the_status_and_the_shape_the_document_gives_it() {
     assert_eq!(said["protocol"], json!(1), "{}", body_of(&ahead));
     assert_eq!(said["worker_protocol"], json!(99), "{}", body_of(&ahead));
 
+    // …and a version this hub cannot **compare** is the same refusal, without
+    // naming an end that is behind. §3.1 asks the body for "both versions, and
+    // which end is behind"; a `protocol` that is absent or is not a number
+    // answers the first and not the second, and reporting the hub as the old one
+    // over a field a client spelled wrong sends an operator to the wrong machine.
+    for spelled in [json!("1"), json!(null)] {
+        let unspeakable = hub.joining(&[("protocol", spelled.clone())]);
+        assert_eq!(
+            unspeakable.status,
+            409,
+            "`protocol` {spelled}: {}",
+            body_of(&unspeakable)
+        );
+        assert!(
+            !body_of(&unspeakable).contains("this hub is behind"),
+            "`protocol` {spelled} was answered as this hub being behind: {}",
+            body_of(&unspeakable)
+        );
+    }
+
     // The handshake triple's two required members, each naming both sides (§4.1).
     let stale = hub.joining(&[("compiler", json!("0.3.9"))]);
     assert_eq!(stale.status, 409, "{}", body_of(&stale));
@@ -367,6 +387,29 @@ fn every_join_refusal_is_the_status_and_the_shape_the_document_gives_it() {
     let said = unknown.json();
     assert_eq!(said["claim"], json!("gpu"));
     assert_eq!(said["placements"], json!(["mac"]));
+
+    // …and a join that does not name what it claims at all is refused on the
+    // same row. `claims` is REQUIRED of every join, cold start included (§3.1's
+    // field list), and reading an absent or mis-typed value as "claims nothing"
+    // would answer a *dispatchable* session no work can reach: every hold it
+    // takes is answered `204`, the placement's work parks behind a worker both
+    // ends believe is healthy, and nothing anywhere says why.
+    let unnamed = hub.join(&json!({
+        "protocol": 1,
+        "compiler": compiler_version(),
+        "runtime": "bun 1.2.3",
+    }));
+    assert_eq!(unnamed.status, 400, "{}", body_of(&unnamed));
+    assert_eq!(unnamed.json()["placements"], json!(["mac"]));
+    for spelled in [json!("mac"), json!([]), json!(["mac", 7])] {
+        let mistyped = hub.joining(&[("claims", spelled.clone())]);
+        assert_eq!(
+            mistyped.status,
+            400,
+            "`claims` {spelled}: {}",
+            body_of(&mistyped)
+        );
+    }
 
     // The manifest, checked against the artifact the worker says it holds, and
     // naming **variables, never values** (§9).

@@ -888,11 +888,7 @@ async function join(request: FastifyRequest, reply: FastifyReply): Promise<unkno
     return reply.code(409).send({
       protocol: PROTOCOL_VERSION,
       worker_protocol: protocol ?? null,
-      error: `this hub speaks protocol ${PROTOCOL_VERSION} and the worker speaks ${describeVersion(protocol)}: ${
-        typeof protocol === "number" && protocol < PROTOCOL_VERSION
-          ? "the worker is behind"
-          : "this hub is behind"
-      } — upgrade the one that is`,
+      error: `this hub speaks protocol ${PROTOCOL_VERSION} and the worker speaks ${describeVersion(protocol)}: ${behind(protocol)}`,
     });
   }
 
@@ -917,10 +913,32 @@ async function join(request: FastifyRequest, reply: FastifyReply): Promise<unkno
 
   // 4. The claims, which describe the target and are told only to a worker that
   //    got this far.
-  const claims = Array.isArray(body["claims"])
-    ? (body["claims"] as unknown[]).map((claim) => String(claim))
-    : [];
   const known = placements.map((placement) => placement.name);
+  const offered = body["claims"];
+  // **REQUIRED of every join, cold start included** (§3.1's field list), and
+  // this is the whole of what "required" buys. Reading an absent, mis-typed or
+  // empty value as "claims nothing" would issue a *dispatchable* session that no
+  // work can ever reach: [`taken`] matches a row against `session.claims`, so
+  // every hold that session takes is answered `204`, the placement's work parks
+  // behind a worker both ends believe is healthy, and no request anywhere
+  // carries a diagnostic. §3.1's posture is the opposite of that — every join
+  // that cannot work is refused with a body naming why — so a join that did not
+  // say what it claims is refused where one naming an unknown placement is, at
+  // that row's status and with that row's body. The `agent-compose worker` this
+  // repository ships refuses the same join before it sends it ("a worker claims
+  // at least one placement"), so no conforming client meets this.
+  if (
+    !Array.isArray(offered) ||
+    offered.length === 0 ||
+    (offered as readonly unknown[]).some((claim) => typeof claim !== "string")
+  ) {
+    return reply.code(400).send({
+      claims: offered ?? null,
+      placements: known,
+      error: `a join names the placements this worker claims: \`claims\` is required of every join and is a non-empty list of placement names, and this target declares ${known.map((name) => `\`${name}\``).join(", ")}`,
+    });
+  }
+  const claims = offered as readonly string[];
   for (const claim of claims) {
     if (known.includes(claim)) continue;
     return reply.code(400).send({
@@ -1014,6 +1032,27 @@ function runs(reported: string): boolean {
 /** A version a refusal has to name, however the request spelled it. */
 function describeVersion(value: unknown): string {
   return value === undefined || value === null ? "nothing" : String(value);
+}
+
+/**
+ * Which end of a protocol mismatch is behind — and the third answer, for the
+ * request where neither is.
+ *
+ * §3.1 asks this refusal to name "both versions, and which end is behind", and
+ * two branches cannot say the true thing about a **malformed** field: a join
+ * that omits `protocol`, or sends `"1"` as a string, is not evidence that this
+ * hub is old, and telling an operator to upgrade the hub over a request field
+ * their client spelled wrong sends them to the wrong machine. The version is a
+ * number on the wire (§3.1's body), so anything else is a client that did not
+ * send one this hub can compare, and the refusal says so.
+ */
+function behind(protocol: unknown): string {
+  if (!Number.isInteger(protocol)) {
+    return "the worker did not send a version this hub can compare — `protocol` is REQUIRED of every join, as the whole number of the wire contract it speaks";
+  }
+  return (protocol as number) < PROTOCOL_VERSION
+    ? "the worker is behind — upgrade it"
+    : "this hub is behind — upgrade it";
 }
 
 /** `GET /workers/poll` (§3.2). */
@@ -1344,13 +1383,25 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   // **`409`, not `410`.** §3.4: the hub knows this worker and does not want this
   // result — the execution has moved past it, and re-driving it from a stale
   // result is the divergence `docs/durability.md` §7 refuses.
-  if (row === undefined || row.status === "superseded") {
+  //
+  // A **parked** row takes the same branch, and by §3.4's own definition rather
+  // than by observation: what a result settles is a dispatch that is unsettled,
+  // and unsettled is "still in flight, and the one piece of work a session may
+  // be holding". A row nobody was handed is neither. Nothing on this wire can
+  // reach it — a `dispatch_id` leaves this hub through [`taken`], which claims
+  // the row to `dispatched` before it is written into the poll answer, and
+  // `claimDispatch` has no path back — so this is a guard over the definition
+  // and not over a case: settling a row no attempt exists for would journal an
+  // outcome against work that never started.
+  if (row === undefined || row.status === "superseded" || row.status === "parked") {
     return reply.code(409).send({
       dispatch_id: id,
       error:
         row === undefined
           ? `no dispatch \`${id}\``
-          : `\`${id}\` was superseded by this hub and the execution has moved past it: ${row.detail ?? "the session holding it stopped making requests"}`,
+          : row.status === "parked"
+            ? `\`${id}\` is parked on this hub's board and has been handed to no session, so there is no attempt of it for a result to settle`
+            : `\`${id}\` was superseded by this hub and the execution has moved past it: ${row.detail ?? "the session holding it stopped making requests"}`,
     });
   }
   // A dispatch a result already settled: accepted and dropped, which is what
