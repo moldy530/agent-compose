@@ -1,0 +1,13 @@
+# rule: placing a flow is deferred (grammar 14.1, Decision D129, PRD resolved q44)
+# code: unsupported-placement
+# message: `flow.triage` may not be a placement member: placing a flow is deferred
+# at: 13:15
+# help: v1 places `agent.*` and `tool.*` — the leaves that hold a machine's capability — while a flow is a subgraph the hub schedules; place the nodes it reaches instead (grammar 14.1, PRD resolved q44)
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  mac:
+    members: [flow.triage]

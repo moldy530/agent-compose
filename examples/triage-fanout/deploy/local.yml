@@ -12,13 +12,20 @@
 #     `source: bug_reports` needs no `event_sources:` entry, because `local` runs
 #     no consumer process. That is what lets this project validate and run with
 #     no infrastructure installed while still shipping a staging target.
-#   * the file is OPTIONAL — deleting it changes nothing but the placements
-#     below, which are reserved no-ops in v0 anyway.
+#   * the file is OPTIONAL — deleting it leaves a single-process deployment, and
+#     nothing in the composition changes.
+#
+# `hub:` and `placements:` are admitted here like anywhere else, and they are
+# what a mesh looks like on one laptop: this process is the hub, and a
+# `agent-compose worker --join … --claims patchers` beside it is the spoke. The
+# same two keys deploy to real machines in deploy/staging.yml, one placement
+# holding more members (grammar 14.1, 14.2).
 version: "0.1"
 
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
 placements:
-  agent.fixer:
-    runtime: colocated
-    description: Isolated under staging; in-process locally, where there is one process.
-  flow.triage:
-    runtime: colocated
+  patchers:
+    members: [agent.fixer]
+    description: The machine holding a checkout; on a laptop, this one.

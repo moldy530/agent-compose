@@ -478,6 +478,22 @@ pub enum DiagnosticCode {
     /// [`MissingCredential`](Self::MissingCredential) is: what is absent is
     /// decided by a sibling value, and the repair is a choice of two.
     MissingCallbackAllowlist,
+
+    // --- placements (grammar 14.1, 14.2) ----------------------------------
+    /// A `placements:` entry names a member this release cannot place: a
+    /// `flow.*`, whose placement is deferred (grammar 14.1, PRD resolved q44).
+    UnsupportedPlacement,
+    /// Two placements claim one component, or a placed `tool.*` is attached to
+    /// an agent placed somewhere else — either way, two answers to which worker
+    /// runs one piece of work (grammar 14.1, Decision D129).
+    ConflictingPlacement,
+    /// A target declares `placements:` and no `hub.join_token:` (grammar 14.2,
+    /// PRD resolved q38). Its own class rather than a
+    /// [`MissingKey`](Self::MissingKey), for the reason
+    /// [`MissingCallbackAllowlist`](Self::MissingCallbackAllowlist) is: what is
+    /// absent is decided by a sibling section, and the repair is a choice of
+    /// two.
+    MissingJoinToken,
 }
 
 impl DiagnosticCode {
@@ -553,6 +569,9 @@ impl DiagnosticCode {
         Self::DuplicateRoute,
         Self::ConflictingSessionKey,
         Self::MissingCallbackAllowlist,
+        Self::UnsupportedPlacement,
+        Self::ConflictingPlacement,
+        Self::MissingJoinToken,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -622,6 +641,9 @@ impl DiagnosticCode {
             Self::DuplicateRoute => "duplicate-route",
             Self::ConflictingSessionKey => "conflicting-session-key",
             Self::MissingCallbackAllowlist => "missing-callback-allowlist",
+            Self::UnsupportedPlacement => "unsupported-placement",
+            Self::ConflictingPlacement => "conflicting-placement",
+            Self::MissingJoinToken => "missing-join-token",
         }
     }
 }
@@ -854,7 +876,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::MissingCallbackAllowlist as usize + 1,
+            DiagnosticCode::MissingJoinToken as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

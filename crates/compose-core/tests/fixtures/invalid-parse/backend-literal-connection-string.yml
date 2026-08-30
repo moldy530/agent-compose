@@ -1,4 +1,4 @@
-# rule: backend connection strings are env-ref values, never literals (grammar 14.2, 4.3)
+# rule: backend connection strings are env-ref values, never literals (grammar 14.3, 4.3)
 # code: invalid-env-ref
 # message: `url` in backend alias `docs_db` takes an environment reference, found the literal `https://chroma.internal:8000`
 # at: 12:12

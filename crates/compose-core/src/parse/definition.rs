@@ -569,7 +569,7 @@ fn embed_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<EmbedBlock> {
         .require("model", cx)
         .and_then(|node| lexical::non_empty_text(node, "`model`", cx));
     // `provider:` is REQUIRED: a storage backend never computes vectors, and
-    // there is nothing for an omission to resolve to — §14.2's storage
+    // there is nothing for an omission to resolve to — §14.3's storage
     // vocabulary publishes no embedding capability, and under `--target local`
     // no alias and no per-kind default is consulted at all (Decision D116).
     let provider = fields

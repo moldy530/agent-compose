@@ -29,8 +29,13 @@ use super::files::Composition;
 use super::index::Index;
 use super::references::Cx;
 
-/// Namespaces a placement key accepts (grammar 14.1).
-const COMPONENTS: &[Namespace] = &[Namespace::Agent, Namespace::Tool, Namespace::Flow];
+/// Namespaces a placement `members:` entry accepts (grammar 14.1).
+///
+/// `flow.*` is refused by the parser with a message naming the deferral
+/// (Decision D129), so nothing that reaches here can be one — but the list
+/// stated for `Cx::address` is what a *resolution* failure's message reads
+/// from, and it must name the namespaces this position really accepts.
+const COMPONENTS: &[Namespace] = &[Namespace::Agent, Namespace::Tool];
 
 /// Check the deploy layer against the composition it deploys.
 pub(crate) fn check(composition: &Composition, index: &Index<'_>, diagnostics: &mut Diagnostics) {
@@ -59,7 +64,9 @@ pub(crate) fn check(composition: &Composition, index: &Index<'_>, diagnostics: &
     if let Some(section) = deploy.file.placements.as_ref() {
         let mut cx = Cx { index, diagnostics };
         for placement in &section.placements {
-            cx.address(&placement.address, COMPONENTS);
+            for member in &placement.members {
+                cx.address(member, COMPONENTS);
+            }
         }
     }
 
@@ -137,7 +144,7 @@ pub(crate) fn check(composition: &Composition, index: &Index<'_>, diagnostics: &
     }
 }
 
-/// Check one store-to-alias binding against grammar 14.2's capability rule.
+/// Check one store-to-alias binding against grammar 14.3's capability rule.
 ///
 /// The rule is one line — a `vector` store bound to a non-vector-capable
 /// provider is a compile error (PRD 5.8) — and it has two halves, because a
@@ -193,7 +200,7 @@ fn capability(
             format!("`{}` is defined here, in `{file}`", alias.name.value),
         )
         .with_help(format!(
-            "`{}` declares `kind: {}`, and a backend serves exactly one kind: the `{}` providers are {} (grammar 14.2)",
+            "`{}` declares `kind: {}`, and a backend serves exactly one kind: the `{}` providers are {} (grammar 14.3)",
             definition.address.value,
             kind.value.as_str(),
             kind.value.as_str(),

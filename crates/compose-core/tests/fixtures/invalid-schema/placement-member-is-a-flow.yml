@@ -1,0 +1,9 @@
+# rule: v1 places agent.* and tool.*; placing a flow is deferred (grammar 14.1 / PRD resolved q44)
+# at: /placements/mac/members/0
+# via: /$defs/placement/properties/members/items/pattern
+version: "0.1"
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+placements:
+  mac:
+    members: [flow.release]

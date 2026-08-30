@@ -15,9 +15,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::ast::common::{Address, Ident};
+use crate::ast::common::{Address, EnvRef, Ident};
 use crate::ast::definition::StoreKind;
-use crate::ast::deploy::{BackendProvider, EventSourceKind, Network, PluginValue, Runtime};
+use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue};
 use crate::diag::{Span, Spanned};
 
 use super::Section;
@@ -31,8 +31,12 @@ pub struct Deploy {
     /// none, and a target that has one is required to have it (Decision D87).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// `placements:` — reserved grammar, keyed by the component address, which
-    /// resolves in the composition (grammar 14.1).
+    /// `hub:` — the process that owns the graph: its join credential and its
+    /// ingress base (grammar 14.2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hub: Option<Hub>,
+    /// `placements:` — keyed by the name a worker claims at join, each naming
+    /// the components that claim runs (grammar 14.1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placements: Option<Section<Placement>>,
     /// `storage_backends:` — absent means the section was not declared, which
@@ -43,21 +47,41 @@ pub struct Deploy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_backends: Option<StorageBackends>,
     /// `event_sources:` — reserved grammar, keyed by the logical name an
-    /// `event` trigger's `source:` names (grammar 14.3).
+    /// `event` trigger's `source:` names (grammar 14.4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_sources: Option<Section<EventSource>>,
 }
 
-/// Where a component runs (grammar 14.1, Decision D47).
+/// The `hub:` block (grammar 14.2, Decision D130).
+///
+/// Both keys are the deployment's own rather than a component's, so this is a
+/// struct beside [`Section`] rather than one of them — the shape
+/// [`StorageBackends`] takes for the same reason.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Hub {
+    /// `join_token:` — the bearer credential a worker joins with, unresolved
+    /// (grammar 4.3): a name the deployment supplies, never a value the
+    /// artifact carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join_token: Option<Spanned<EnvRef>>,
+    /// `public_url:` — the absolute base every ingress URL derives from (PRD
+    /// resolved q44 invariant 4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<Spanned<String>>,
+    /// The section's own span.
+    pub span: Span,
+}
+
+/// One named placement: the claim, and the components it runs (grammar 14.1,
+/// Decision D128).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Placement {
-    /// The component address, repeated from the key with its own span.
-    pub address: Spanned<Address>,
-    /// `runtime:` — own instance/container, or in-process.
-    pub runtime: Runtime,
-    /// `network:` — reserved; absent means the default, `all`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<Network>,
+    /// The claim's name, repeated from the key with its own span.
+    pub name: Spanned<Ident>,
+    /// `members:` — the components this claim runs, in declaration order. One
+    /// placement's members are the author's list rather than a set the artifact
+    /// re-derives, so the order is the file's (see the module docs on order).
+    pub members: Vec<Spanned<Address>>,
     /// `description:` — documentation only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<Spanned<String>>,
@@ -65,7 +89,7 @@ pub struct Placement {
     pub span: Span,
 }
 
-/// The `storage_backends:` section (grammar 14.2).
+/// The `storage_backends:` section (grammar 14.3).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct StorageBackends {
     /// `defaults:` — the per-kind fallback, consulted when a store names no
@@ -79,7 +103,7 @@ pub struct StorageBackends {
     pub span: Span,
 }
 
-/// A backend configuration (grammar 14.2).
+/// A backend configuration (grammar 14.3).
 ///
 /// An open plugin-config object (Decision D50): `provider` is a closed
 /// vocabulary and the connection fields of grammar 4.3 are `${ENV}` value-form
@@ -111,7 +135,7 @@ pub struct BackendConfig {
     pub span: Span,
 }
 
-/// One event source: a logical name bound to infrastructure (grammar 14.3).
+/// One event source: a logical name bound to infrastructure (grammar 14.4).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EventSource {
     /// The logical name, repeated from the key with its own span.

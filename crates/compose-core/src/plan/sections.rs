@@ -164,9 +164,29 @@ pub(super) fn components(before: &Ir, after: &Ir) -> Vec<ComponentChange> {
             &format!("placement.{name}"),
             old.map(|held| (semantic(held), held.span.clone())),
             new.map(|held| (semantic(held), held.span.clone())),
-            &["address"],
+            REPEATED_NAME,
         );
     }
+
+    // The `hub:` block is a singleton rather than a section of named entries,
+    // so it is one subject at the address `hub` — the shape `defaults` takes in
+    // topology, for the same reason. Nothing inside it repeats its key.
+    entry(
+        &mut found,
+        ComponentKind::Hub,
+        "hub",
+        before
+            .deploy
+            .hub
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        after
+            .deploy
+            .hub
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        &[],
+    );
 
     let sources: BTreeSet<&str> = names(before.deploy.event_sources.as_ref())
         .chain(names(after.deploy.event_sources.as_ref()))

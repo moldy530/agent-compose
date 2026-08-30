@@ -9,5 +9,5 @@ state:
   draft: { type: string }
 
 placements:
-  agent.fixer:
-    runtime: isolated
+  mac:
+    members: [agent.fixer]

@@ -1,0 +1,13 @@
+# rule: `hub.join_token:` takes an `${ENV}` reference, never a literal (grammar 14.2, 4.3)
+# code: invalid-env-ref
+# message: `hub.join_token` takes an environment reference, found the literal `s3cr3t-mesh-token`
+# at: 9:15
+# help: the spec never contains credentials or connection strings: write `${NAME}`
+version: "0.1"
+
+hub:
+  join_token: "s3cr3t-mesh-token"
+
+placements:
+  mac:
+    members: [agent.signer]

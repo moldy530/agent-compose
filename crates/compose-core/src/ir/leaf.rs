@@ -69,7 +69,7 @@ use crate::ast::common::{
 use crate::ast::definition::{
     AgentAccess, Builtin, ProviderKind, RouteCondition, StoreKind, StoreScope,
 };
-use crate::ast::deploy::{BackendProvider, EventSourceKind, Network, PluginValue, Runtime};
+use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue};
 use crate::ast::document::Reduce;
 use crate::ast::flow::{FlowContext, StoreOp};
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
@@ -148,12 +148,10 @@ serialize_as_keyword!(
     FlowContext,
     HmacAlgorithm,
     HttpMethod,
-    Network,
     ProviderKind,
     Reduce,
     Respond,
     RouteCondition,
-    Runtime,
     ScalarKind,
     SignatureEncoding,
     StoreKind,
@@ -289,7 +287,7 @@ impl Serialize for Literal {
 /// A plugin-config value is data too, with one difference that is the whole
 /// point of the type: its strings are grammar 4.3 class 2, so each one is
 /// written as an [`Interpolated`] node carrying the references it embeds rather
-/// than as a bare string (grammar 14.2, 14.3).
+/// than as a bare string (grammar 14.3, 14.4).
 impl Serialize for PluginValue {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {

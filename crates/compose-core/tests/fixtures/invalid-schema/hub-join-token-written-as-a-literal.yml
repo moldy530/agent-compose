@@ -1,0 +1,9 @@
+# rule: hub.join_token takes an ${ENV} reference, never a literal (grammar 14.2, 4.3)
+# at: /hub/join_token
+# via: /$defs/envRef/pattern
+version: "0.1"
+hub:
+  join_token: "s3cr3t-mesh-token"
+placements:
+  mac:
+    members: [agent.signer]
