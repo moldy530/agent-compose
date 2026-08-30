@@ -32,6 +32,14 @@ The last row is the one an author is most likely to write. A `mac`-only tool
 attached to an agent nobody placed runs on the hub, where the signing keys are
 not — a placement written, accepted, and silently ignored.
 
+It is the last row even where the agent *looks* like it can only ever run inside
+somebody else's process — an agent named by a flow that a placed agent attaches,
+and by nothing else. Every flow a composition declares is runnable on its own,
+whether or not a `manual` trigger names it, so that flow is one the hub can start
+directly and the `agent:` node inside it is dispatched by the hub when it does.
+The repair is the same as any other last row: name the agent in the placement
+too.
+
 **A placement reached through a flow the agent attaches.** The same table, one
 indirection out. A `flow.*` in a `tools:` list cannot itself be placed — placing
 a flow is deferred — but a flow-as-tool call starts an instance *inside the same

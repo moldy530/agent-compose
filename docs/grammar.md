@@ -4348,7 +4348,13 @@ The rules, each a compile error (Decision
      tool whose placement differs from that of an agent attaching it is an
      error, and so is a placed tool attached to an agent with **no** placement,
      which would run on the hub. A tool with the same placement, or with none,
-     is fine.
+     is fine. An agent's **own** placement is the whole of what decides this,
+     including for an agent that appears only inside a flow some other agent
+     attaches: manual invocation is universal — every flow a composition
+     declares is runnable on its own, named by a `manual` trigger or not
+     ([D64](#d64-implicit-manual-invocation-is-a-cli-property-not-a-declared-trigger))
+     — so that flow is one the hub can start directly, and the `agent:` node
+     inside it is dispatched by the hub's scheduler when it does.
    - an attached **`flow.*`** starts an instance in that same loop (§5.4). The
      flow carries no placement of its own — placing one is deferred — but every
      `agent.*` and `tool.*` its instance **reaches** (§7.7 clauses 1 and 2) runs

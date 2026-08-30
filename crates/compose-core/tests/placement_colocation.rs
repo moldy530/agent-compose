@@ -352,6 +352,88 @@ fn a_placed_agent_reached_through_an_attached_flow_is_refused() {
     );
 }
 
+/// An agent reached **only** through an attached flow is still hub-resident.
+///
+/// This is the shape that reads as a counterexample to the direct table's last
+/// row and is not one. `agent.outer` is placed; it attaches `flow.review`, whose
+/// `agent:` node names `agent.inner`; `agent.inner` attaches the placed
+/// `tool.xcodebuild` and is named nowhere else. Every call *through
+/// `agent.outer`* does run all three on a `mac` worker, which is what makes the
+/// composition look coherent.
+///
+/// It is refused because manual invocation is universal: `agent-compose run
+/// <spec> flow.review` starts that flow directly — the emitted registry is every
+/// flow a composition declares, not every triggered one (PRD 5.11, Decision
+/// D64) — and the hub then dispatches `agent.inner` itself, calling
+/// `tool.xcodebuild` on the hub, where the signing keys are not. Reading the
+/// attaching agent's *reachable* hosts instead of its own placement would accept
+/// this and leave that execution silently misplaced.
+///
+/// The row-4 message is quoted here as it renders, because the claim it makes —
+/// "`agent.inner` … has no placement, so it runs on the hub" — is the sentence
+/// this case exists to hold true.
+#[test]
+fn an_agent_reached_only_through_an_attached_flow_is_still_hub_resident() {
+    let spec = format!(
+        r#"{BACKEND}{}flow.review:
+  description: Review the requested scheme.
+  inputs:
+    scheme: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    sign:
+      agent: agent.inner
+      input:
+        scheme: "input.scheme"
+  edges:
+    - {{ from: start, to: sign }}
+    - {{ from: sign, to: end }}
+{}"#,
+        agent("inner", "tool.xcodebuild"),
+        agent("outer", "flow.review")
+    );
+    refuses(
+        "attached-flow-inner-agent",
+        &spec,
+        &mesh("  mac:\n    members: [agent.outer, tool.xcodebuild]\n"),
+        "`tool.xcodebuild` is a member of placement `mac`, and `agent.inner` that attaches it \
+         has no placement, so it runs on the hub",
+    );
+}
+
+/// …and naming it in the placement is the repair, which has to keep working.
+///
+/// The refusal above is only worth having if the composition an author writes
+/// next validates: three components in one placement, the whole chain on one
+/// worker however it is entered — through `agent.outer`'s tool loop, or by the
+/// hub running `flow.review` on its own.
+#[test]
+fn placing_that_inner_agent_too_is_the_repair() {
+    let spec = format!(
+        r#"{BACKEND}{}flow.review:
+  description: Review the requested scheme.
+  inputs:
+    scheme: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    sign:
+      agent: agent.inner
+      input:
+        scheme: "input.scheme"
+  edges:
+    - {{ from: start, to: sign }}
+    - {{ from: sign, to: end }}
+{}"#,
+        agent("inner", "tool.xcodebuild"),
+        agent("outer", "flow.review")
+    );
+    accepts(
+        "attached-flow-inner-agent-placed",
+        &spec,
+        &mesh("  mac:\n    members: [agent.outer, agent.inner, tool.xcodebuild]\n"),
+    );
+}
+
 /// The boundary: a `flow:` **node** is not an attachment.
 ///
 /// The hub schedules the nodes of a flow instantiated by a `flow:` node, so
