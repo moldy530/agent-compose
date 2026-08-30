@@ -1,93 +1,45 @@
 //! The distributed surface, end to end through the static passes — and the bind
-//! that says its runtime has not landed (grammar 14.1, 14.2,
+//! that says its runtime **landed** (grammar 14.1, 14.2,
 //! `docs/distributed.md`, PRD resolved q37–q44).
 //!
-//! `hub:` and `placements:` are **live static grammar**: every rule about them
-//! is enforced by `validate` today, and every one of them is carried into the
-//! artifact. What does not exist yet is the protocol — the worker verb, the five
-//! routes of `docs/distributed.md` §3, the artifact server among them, placement
-//! waits on the board, and effect streaming. This file is that middle state written down
-//! in executable form, and it is the sibling of
-//! `tests/trigger_auth_surface.rs`, which holds the *opposite* state for a
-//! surface whose runtime did land.
+//! `hub:` and `placements:` are live grammar in both halves: every rule about
+//! them is enforced by `validate`, every one of them is carried into the
+//! artifact, and the protocol they describe is built — a build emits the hub
+//! (`docs/distributed.md` §3's five routes, the dispatch board, the artifact
+//! server) and `agent-compose worker` is the spoke that joins it. This file is
+//! that posture written down in executable form, and it is the sibling of
+//! `tests/trigger_auth_surface.rs`, which holds the same shape for the surface
+//! whose runtime landed before it.
 //!
-//! Three things are pinned, and each fails a different way.
+//! It is the **turned-around** form of a file that used to assert the opposite.
+//! While the runtime was being built this was `placement_surface_inertness.rs`
+//! and its claim was that no placement or hub material reached a generated
+//! project; the claim that replaced it is not "it is there" but **where each
+//! piece is**, because half a protocol in the wrong module is worse than none.
+//!
+//! Four things are pinned, and each fails a different way.
 //!
 //! * **The surface parses and resolves, and reaches the artifact.** Over-
 //!   rejection is what a negative corpus cannot catch, and a key silently
 //!   dropped on the way to the IR is what a positive one cannot: a placement
 //!   that stopped being carried would leave `plan` blind to a deployment change
 //!   and leave the runtime nothing to read.
-//! * **None of it reaches the generated project.** Not the placement names, not
-//!   the join token's variable, not the public base. A build that started
-//!   emitting half a protocol is worse than one that emits none of it, because
-//!   the half would look like a mesh that works.
-//! * **Every shipped document says so.** A reader told "the rules are enforced"
-//!   must also be told "nothing runs yet", or they will deploy a mesh and wait
-//!   for a worker that has nowhere to join. And no shipped document may describe
-//!   a shape `validate` refuses: the re-cut left the *whole* surface live, so a
-//!   document still carrying the retired one is not a stale paragraph but an
-//!   instruction to write a deploy file that does not compile.
-//!
-//! # The unwind list — what the runtime pass must flip
-//!
-//! When the worker protocol lands, this file is turned around the way
-//! `trigger_auth_surface.rs` was. These are the exact points, and nothing else
-//! in the repository enumerates them:
-//!
-//! 1. **`docs/grammar.md` §14.2's awaiting-runtime sentence** — "The keys are
-//!    live static grammar today: every rule above is enforced by `validate`, and
-//!    the `worker` verb that reads them lands with the runtime." It becomes a
-//!    statement that the runtime enforces them.
-//! 2. **`docs/grammar.md` §15's `placements` paragraph**, which names this file
-//!    as what holds the middle state honest.
-//! 3. **The `targets` topic's row and its status paragraph** — "The rules above
-//!    are enforced today; the protocol is not built yet." and the reserved-summary
-//!    paragraph that explains why `placements` left the reserved list by being
-//!    re-cut rather than by a runtime landing.
-//! 4. **`docs/distributed.md` §12**, "What is built today", which is the whole
-//!    section that stops being true.
-//! 5. **The environment-manifest partition in
-//!    `crates/compose-core/src/codegen/env.rs`** — the half with no sentence to
-//!    bind. `References::of` walks the definitions, the trigger table and the
-//!    deploy layer's `storage_backends:`/`event_sources:`, and deliberately does
-//!    **not** walk `hub:`. Per PRD resolved q41 the runtime pass must teach it
-//!    the per-placement partition of `docs/distributed.md` §9.1 — which the
-//!    protocol leans on twice over, since the partition ships *in the artifact*
-//!    and is what makes a join's `env_ok` computable at all (§3.1) — and the
-//!    shape of that partition is the part worth reading before writing it: a
-//!    process's manifest is the variables of every component that can **execute
-//!    in it**, which is not the same as the components `members:` lists. A tool
-//!    an agent attaches runs in that agent's process whether or not it names a
-//!    placement (grammar 14.1 rule 4), and so does everything an attached
-//!    `flow.*` reaches — so those variables belong to the *agent's* placement,
-//!    and to the hub's as well wherever the component reached has a hub
-//!    dispatch of its own, which every unplaced `agent.*` has and an unplaced
-//!    `tool.*` has exactly when a `function:` node names it. A tool nothing
-//!    unplaced reaches is the case that leaves the hub's list entirely.
-//!    `hub.join_token:` and the rest of the deploy layer belong to the hub's.
-//!    Until then a hub credential in `src/env.ts` would be a launch check for a
-//!    value nothing reads.
-//! 6. **`docs/distributed.md` §13, "What this document does not settle"** — not
-//!    sentences to flip but work to do before the code they govern is written.
-//!    A session's dispatch capacity and containment beyond the process boundary
-//!    are open design questions the runtime pass carries to the PRD's Open
-//!    Questions and implements against the resolution, never against the
-//!    placeholder §13 records.
-//!
-//! # Where the unwind has got to
-//!
-//! **The hub half has landed and the worker half has not.** `src/mesh.ts`,
-//! `src/deployment.ts` and `src/artifact.ts` are emitted, a placed node is
-//! dispatch-and-await, and the environment manifest is partitioned per
-//! `docs/distributed.md` §9.1 — so items 5 and the *emission* half of this
-//! file's second claim are done, and the two tests that asserted them have been
-//! turned around below rather than deleted. What has **not** landed is the
-//! `worker` verb, its node-runner, and the multi-process acceptance suite; the
-//! documents therefore still say the protocol is not built, item 4's §12 is
-//! still true of the half a reader can deploy, and the doc-pinning tests below
-//! are untouched. The pass that lands the worker turns *those* around and
-//! finishes this file the way `trigger_auth_surface.rs` was finished.
+//! * **The mesh reaches the generated project, in the modules that hold it.**
+//!   The *composition's* mesh facts belong to `src/deployment.ts` and
+//!   `manifest.json`, which the hub and a worker read one answer out of (§9.1);
+//!   the *protocol's* belong to `src/mesh.ts` and `src/worker-node.ts`, which
+//!   are constants of the compiler release. A route compiled into the emitted
+//!   graph, or a placement name compiled into the hub, would be a wire whose
+//!   shape depended on the composition — and §10.1 promises the routes to a
+//!   release rather than to a deployment.
+//! * **A composition that places nothing carries none of it.** The counterpart,
+//!   and the one that catches a leak.
+//! * **Every shipped document says the runtime landed.** A reader told the rules
+//!   are enforced and left with a sentence saying nothing runs would deploy a
+//!   mesh and never start a worker. And no shipped document may describe a shape
+//!   `validate` refuses: the re-cut left the *whole* surface live, so a document
+//!   still carrying the retired one is not a stale paragraph but an instruction
+//!   to write a deploy file that does not compile.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -441,6 +393,102 @@ fn the_mesh_reaches_the_generated_project_in_the_modules_that_hold_it() {
     );
 }
 
+/// …and the **worker** half reaches it too, in the two files a worker reads.
+///
+/// The hub's side of the seam is `mesh.dispatchPlaced`; this is the other side.
+/// `src/graph.ts` registers what each placed call site *does*, keyed by the
+/// address a dispatch names, `src/worker-node.ts` is the process that runs one,
+/// and `manifest.json` is what the `agent-compose worker` binary reads before it
+/// can report `env_ok` — the one thing in the artifact that has to be legible
+/// without a JavaScript runtime (§3.1, §9.1).
+#[test]
+fn the_worker_half_reaches_the_generated_project_in_the_files_a_worker_reads() {
+    let ir = resolve_clean("worker");
+    let generated = compose_core::emit(&ir);
+    let file = |path: &str| {
+        generated
+            .file(path)
+            .unwrap_or_else(|| panic!("a mesh project emits `{path}`"))
+            .contents
+            .as_str()
+    };
+
+    // One registry entry per placed call site, under the address the dispatch
+    // carries: the two `agent:` nodes, the `function:` node, and nothing else.
+    let graph = file("src/graph.ts");
+    assert!(
+        graph.contains("export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {"),
+        "`src/graph.ts` registers no placed node, so a worker handed one would have nothing to \
+         run (docs/distributed.md §3.2)"
+    );
+    for site in [
+        "\"flow.release.sign\":",
+        "\"flow.release.stamp\":",
+        "\"flow.release.describe\":",
+    ] {
+        assert!(
+            graph.contains(site),
+            "`src/graph.ts` registers no activity for `{site}`, and the hub dispatches it"
+        );
+    }
+    assert!(
+        graph.contains("runtime.callAgent(agentSigner, input, [], context, { path: site.path })"),
+        "the registered activity is not the one the node would have run locally: {graph}"
+    );
+
+    // The runner: a constant of the release, and the entry the manifest names.
+    let runner = file("src/worker-node.ts");
+    assert!(
+        runner.contains("import { placedNodes } from \"./graph.ts\";"),
+        "the node runner does not read the registry beside it"
+    );
+    assert!(
+        !runner.contains("mac_signing_pool") && !runner.contains("MESH_INERTNESS_TOKEN"),
+        "the node runner names this composition, and it is a constant of the compiler release"
+    );
+
+    // The manifest, and the one property that makes §9.1's "one answer under one
+    // artifact hash" true of two files rather than only of one derivation.
+    let manifest: serde_json::Value =
+        serde_json::from_str(file("manifest.json")).expect("`manifest.json` is JSON");
+    assert_eq!(manifest["node_runner"], "src/worker-node.ts");
+    let deployment = file("src/deployment.ts");
+    for placement in manifest["placements"]
+        .as_array()
+        .expect("the manifest lists the placements")
+    {
+        let name = placement["name"].as_str().expect("a placement name");
+        let listed = deployment
+            .split_once(&format!("name: \"{name}\","))
+            .unwrap_or_else(|| panic!("`src/deployment.ts` carries no manifest for `{name}`"))
+            .1;
+        let environment = listed
+            .split_once("environment: [")
+            .expect("the manifest names an environment")
+            .1
+            .split_once("],")
+            .expect("the environment list ends")
+            .0;
+        for variable in placement["environment"]
+            .as_array()
+            .expect("a placement's environment is a list")
+        {
+            let variable = variable.as_str().expect("a variable name");
+            assert!(
+                environment.contains(&format!("\"{variable}\"")),
+                "`manifest.json` and `src/deployment.ts` disagree about `{name}`: the hub checks \
+                 a join's `env_ok` against one and the worker computes it from the other, and \
+                 §9.1 makes them one answer under one artifact hash"
+            );
+        }
+        assert_eq!(
+            environment.matches('"').count() / 2,
+            placement["environment"].as_array().expect("a list").len(),
+            "`src/deployment.ts` names variables for `{name}` that `manifest.json` does not"
+        );
+    }
+}
+
 /// The material a mesh contributes reaches the project, and nothing else does.
 ///
 /// The counterpart of the test above, kept as a scan because it is the one that
@@ -480,8 +528,11 @@ fn a_composition_with_no_placements_carries_no_mesh_of_its_own() {
                 "`{path}` carries `{material}` for a composition that places nothing"
             );
         }
+        // The **call**, not the word: `src/graph.ts`'s registry doc names
+        // `mesh.dispatchPlaced` to say what it is the other side of, and a
+        // scan that failed for saying so would be a scan nobody could explain.
         assert!(
-            !contents.contains("dispatchPlaced"),
+            !contents.contains("mesh.dispatchPlaced({"),
             "`{path}` dispatches a node for a composition that places none"
         );
     }
@@ -496,6 +547,23 @@ fn a_composition_with_no_placements_carries_no_mesh_of_its_own() {
     assert!(
         deployment.contains("export const joinTokenEnv: string | undefined = undefined;"),
         "a composition with no `hub:` names no join token: {deployment}"
+    );
+    let manifest = &generated
+        .file("manifest.json")
+        .expect("every project emits its manifest")
+        .contents;
+    assert!(
+        manifest.contains("\"placements\": [\n  ]"),
+        "a composition with no placements declares none, and says so rather than leaving the \
+         file out — a worker reads this to learn what to report at join: {manifest}"
+    );
+    let graph = &generated
+        .file("src/graph.ts")
+        .expect("every project emits its graph")
+        .contents;
+    assert!(
+        graph.contains("export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {};"),
+        "a composition that places nothing registers no placed node"
     );
 }
 
@@ -577,14 +645,19 @@ fn the_environment_manifest_is_partitioned_per_process() {
     );
 }
 
-/// Every shipped document says the runtime has not landed.
+/// Every shipped document says the runtime landed.
 ///
 /// The sentences are located rather than the documents searched, because the
-/// failure this catches is a document that quietly stops saying it: a reader
-/// told the rules are enforced and not told the protocol is missing deploys a
-/// mesh and waits.
+/// failure this catches is a document that quietly says the opposite: a reader
+/// told the protocol is not built does not run `agent-compose worker`, and a
+/// mesh with no worker is a graph that parks for ever.
+///
+/// The `worker` verb is checked in the two documents that are a reader's index
+/// of the surface — the grammar's deploy section and the `targets` topic — and
+/// `agent-compose docs cli` carries its flags, which
+/// `crates/agent-compose/tests/discovery_surface_inventory.rs` is what holds.
 #[test]
-fn every_document_says_the_protocol_is_not_built_yet() {
+fn every_document_says_the_runtime_landed() {
     let grammar =
         fs::read_to_string(repository().join("docs/grammar.md")).expect("the grammar is readable");
     let distributed = fs::read_to_string(repository().join("docs/distributed.md"))
@@ -592,37 +665,49 @@ fn every_document_says_the_protocol_is_not_built_yet() {
     let targets = compose_core::docs::topic("targets").expect("the `targets` topic ships");
 
     for (document, claim) in [
-        (
-            grammar.as_str(),
-            "the `worker` verb that reads them lands\nwith the runtime",
-        ),
-        (
-            grammar.as_str(),
-            "**`placements:` left it by being re-cut**",
-        ),
+        (grammar.as_str(), "The keys are live grammar in both halves"),
+        (grammar.as_str(), "live grammar with a runtime behind them"),
+        (distributed.as_str(), "**Both halves are built.**"),
         (
             distributed.as_str(),
-            "**The static surface is live. The protocol is not built yet.**",
-        ),
-        (
-            distributed.as_str(),
-            "**Nothing a\nplacement or a `hub:` block declares reaches the project a build emits.**",
+            "What **`agent-compose worker`** is: the spoke.",
         ),
         (
             targets.body,
-            "**The rules above are enforced today; the protocol is not built yet.**",
+            "**The rules above are enforced, and the protocol behind them is built.**",
         ),
         (
             targets.body,
-            "**`placements` left it by being re-cut, which is the one departure that is not a\nruntime landing.**",
+            "**`placements` left it by being re-cut, and its runtime landed afterwards.**",
         ),
     ] {
         assert!(
             document.contains(claim),
-            "a document that states the awaiting-runtime posture no longer contains {claim:?} — \
-             the sentence has to come back, or the runtime has to land and this whole file has to \
-             be turned around"
+            "a document that states the landed posture no longer contains {claim:?} — the \
+             sentence has to come back, or the runtime has to be taken out and this whole file \
+             turned around again"
         );
+    }
+
+    // …and none of them still says the opposite. The three spellings the
+    // awaiting-runtime posture had, so a paragraph that came back says so here
+    // rather than in a deployment that never starts a worker.
+    for (name, document) in [
+        ("docs/grammar.md", grammar.as_str()),
+        ("docs/distributed.md", distributed.as_str()),
+        ("the `targets` topic", targets.body),
+    ] {
+        for stale in [
+            "the protocol is not built yet",
+            "lands\nwith the runtime",
+            "there is no `worker` verb",
+            "placement_surface_inertness",
+        ] {
+            assert!(
+                !document.contains(stale),
+                "{name} still says {stale:?}, and `agent-compose worker` ships in this release"
+            );
+        }
     }
 }
 

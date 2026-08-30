@@ -2,9 +2,10 @@
 
 **Protocol version:** 1 — carried on every join, and §10 fixes what it pins and
 when it bumps
-**Status:** Normative for the hub/worker protocol a compiled project speaks. The
-static surface it describes — `hub:` and `placements:` — is enforced today; the
-runtime is being built against this document.
+**Status:** Normative for the hub/worker protocol a compiled project speaks. Both
+halves are built — the static surface it describes (`hub:` and `placements:`) is
+enforced by `validate`, a build emits the hub, and `agent-compose worker` is the
+spoke. §12 says what that means, file by file.
 **Companion artifacts:** [`docs/durability.md`](durability.md) (the journal this
 writes into, and the replay it extends over the wire),
 [`docs/grammar.md`](grammar.md) §14.1, §14.2 (the deploy-layer surface), §9.4
@@ -256,6 +257,12 @@ carries the session the join returned.
 `hub.join_token:` names (grammar §14.2, §4.3). The token is the same on both
 sides: the hub reads it to verify, the worker reads it to offer, and neither
 holds it in the artifact. There is one scheme and one kind.
+
+**The worker process is told that variable's name by its invocation**, not by
+the artifact — the artifact is what the hub serves *after* a join, so a worker
+that had to read the name out of one could not have joined to get it. Nothing on
+the wire turns on this: the name is a deployment's fact on both sides, and what
+travels is the token.
 
 **The session.** Every route after the join carries the `worker_session` the
 join returned, in the `X-Worker-Session` header, **in addition to** the bearer
@@ -1274,29 +1281,53 @@ cite as settled.
 
 ## 12. What is built today
 
-**The static surface is live. The protocol is not built yet.**
+**Both halves are built.** The static surface is live, and so is the protocol it
+describes.
 
-What `validate` enforces now: everything grammar §14.1 and §14.2 state — a
+What `validate` enforces: everything grammar §14.1 and §14.2 state — a
 placement's name and members, the `flow.*` deferral, disjointness, repeated
 members, the colocation rule for an attached tool and for what an attached flow
 reaches, the conditional join token, and the `public_url:` shape. A deploy file
-that breaks one of those is a compile error today.
+that breaks one of those is a compile error.
 
-What does not exist yet: the worker verb, the five routes of §3, the artifact
-server of §3.5, placement waits on the board, and effect streaming. **Nothing a
-placement or a `hub:` block declares reaches the project a build emits.**
+What a **build** emits for a target that declares `placements:`: the hub. The
+five routes of §3 on the served app, the artifact server of §3.5 over a content
+hash the tree carries, the dispatch board with placement waits on it (§6), the
+liveness sweep of §6.3, idempotent effect ingestion (§3.3), and the environment
+partition of §9.1 — emitted into the artifact, so the hub checking a join's
+`env_ok` and a worker computing one read one answer under one hash. A placed
+component's node is dispatch-and-await rather than a call (§7).
 
-That middle state is deliberate and it is bound rather than remembered:
-`crates/compose-core/tests/placement_surface_inertness.rs` asserts that no
-placement or hub material reaches a generated project, pins the sentences in this
-document and in the grammar that say so, and enumerates what the runtime pass has
-to unwind — including teaching the environment manifest about §9.1's partition,
-which is the half of the surface with no sentence of its own.
+What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
+--token-env <VAR> [--data-dir <path>]`, a complete protocol client — the
+provisioning cycle of §4, one held poll at a time with a node running beside it
+(§2), effect batches as they happen, results, §2's backoff for transport
+failures, and the status discipline of §3 and §5. It executes each dispatch by
+spawning the node runner the artifact carries, one process per dispatch.
 
-This document is what that runtime will be held to — **except the rows of §13**,
+What is **not** built, and is named rather than missing: per-placement artifact
+slicing (§4.3), multi-hub (§8), worker-to-worker edges and Windows workers
+(§11) — and the two questions of §13, which are held to their conservative
+defaults there.
+
+Three suites are what make that claim checkable rather than asserted:
+`crates/agent-compose/tests/distributed_hub_wire.rs` speaks §3 to a served hub
+clause by clause; `crates/agent-compose/tests/distributed_worker_protocol.rs`
+holds the worker to every status this document gives it, against a hub that is a
+fixture; and `crates/agent-compose/tests/distributed_mesh_acceptance.rs` runs a
+real hub and real workers and asks whether a distributed execution works — the
+steady state, a cold start, parking and wake, a mid-node disconnect and the
+replay that follows it, a hub restart, the refusals a worker stops on, and a
+fan-out queued onto a pool of one.
+`crates/compose-core/tests/placement_surface_landing.rs` holds the surface to
+where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in
+`src/mesh.ts`, and neither in the composition's own lowering.
+
+This document is what both halves are held to — **except the rows of §13**,
 which are the clauses it does not settle. Those are not wire this document fixes,
-and the runtime pass is held to the PRD's answer to each rather than to the
-placeholder §13 records.
+and the code they govern is held to the PRD's answer to each rather than to the
+placeholder §13 records; until there is one, the defaults §13 records stand and
+nothing implements past them.
 
 ---
 
@@ -1313,13 +1344,18 @@ the affected area is implemented. These two are that list *staged*, which is as
 far as this document can take them: entering a question in the PRD's Open
 Questions, and resolving it there, is a change to `prd.md` and a reviewed
 decision of its own — never something a downstream document performs by
-describing it. **Before the runtime pass writes the code a row governs, that
-row's question must be in the PRD's Open Questions and resolved there, and the
-code written against the resolution rather than against the cell below.** An
-implementation that reads a "what stands in the meantime" cell as wire has
-decided a PRD question in a downstream document, which is the thing this section
-exists to prevent; `crates/compose-core/tests/placement_surface_inertness.rs`
-carries the same duty in its unwind list.
+describing it. **Before any code goes past a row's default, that row's question
+must be in the PRD's Open Questions and resolved there, and the code written
+against the resolution rather than against the cell below.** An implementation
+that reads a "what stands in the meantime" cell as wire has decided a PRD
+question in a downstream document, which is the thing this section exists to
+prevent.
+
+The runtime that landed was written to those defaults and no further, and the
+absences are held rather than remembered:
+`crates/compose-core/src/codegen/mesh.rs` greps the emitted hub for a capacity of
+any spelling and for a containment surface of any spelling, and fails if either
+appears. Raising a default is what needs the PRD; keeping one needs a test.
 
 Both rows are the same shape: **gaps**. No resolved entry speaks to either, each
 is filled here conservatively, and the wire admits any answer additively, so what
