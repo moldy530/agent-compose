@@ -179,13 +179,21 @@ pub(crate) fn run(options: &Options) -> ExitCode {
     }
 
     let hub = Arc::new(Hub::new(&options.hub, &token));
+    // **One backoff for the whole provisioning cycle, not one per pass.** §2's
+    // schedule is a doubling interval, and it only doubles if it survives the
+    // thing it is pacing: a hub whose join keeps naming a hash its artifact
+    // route answers `404` for — a tree edited under a running hub, a build that
+    // half-wrote — sends this loop round join-then-fetch indefinitely, and a
+    // fresh `Backoff` each pass would peg that at one second for ever. Reset on
+    // a provision that worked, so a real redeployment still costs one second.
+    let mut backoff = Backoff::new();
     loop {
         match serve(options, &hub, &bun, &data_dir, &runtime) {
             Ok(()) => return ExitCode::from(CLEAN),
             Err(Stop::Refused(detail)) => return fail(&detail),
             Err(Stop::Redeployed(hash)) => {
                 // The four filesystem steps of §4, over the hash the join named.
-                if let Err(reason) = provision(&hub, &bun, &data_dir, &hash) {
+                if let Err(reason) = provision(&hub, &bun, &data_dir, &hash, &mut backoff) {
                     return fail(&reason);
                 }
             }
@@ -194,8 +202,13 @@ pub(crate) fn run(options: &Options) -> ExitCode {
 }
 
 /// Fetch, verify, materialise and install one artifact (§4 steps 2–4).
-fn provision(hub: &Hub, bun: &Path, data_dir: &Path, hash: &str) -> Result<(), String> {
-    let mut backoff = Backoff::new();
+fn provision(
+    hub: &Hub,
+    bun: &Path,
+    data_dir: &Path,
+    hash: &str,
+    backoff: &mut Backoff,
+) -> Result<(), String> {
     let tarball = loop {
         match hub.artifact(hash, None) {
             Answer::Said(said) if said.status == 200 => break said.body,
@@ -208,7 +221,11 @@ fn provision(hub: &Hub, bun: &Path, data_dir: &Path, hash: &str) -> Result<(), S
                 // to what §3.5 says. A hub that answers `404` for the hash its
                 // own join keeps naming is broken rather than redeployed, and a
                 // re-join with no interval in front of it would be a spin
-                // against it. A real redeployment costs one second here, once.
+                // against it. The interval is the *caller's* — see [`run`] — so
+                // a hub stuck in that state is met with §2's doubling rather
+                // than with one second for ever; a real redeployment costs one
+                // second here, once, because the provision that follows resets
+                // it.
                 backoff.wait(&format!(
                     "the artifact fetch answered 404: {}. Re-joining, because the join is what \
                      re-derives the current hash (docs/distributed.md §3.5)",
@@ -232,7 +249,11 @@ fn provision(hub: &Hub, bun: &Path, data_dir: &Path, hash: &str) -> Result<(), S
         }
     };
     let tree = artifact::materialise(data_dir, hash, &tarball)?;
-    artifact::install(bun, &tree)
+    artifact::install(bun, &tree)?;
+    // A cycle that ended in an artifact on disk: whatever the interval had
+    // climbed to was about a hub that is now answering.
+    backoff.reset();
+    Ok(())
 }
 
 /// One provisioning-and-steady-state cycle: join, and then poll until something
