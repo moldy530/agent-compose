@@ -1,6 +1,7 @@
 # agent-compose — Distributed Execution
 
-**Protocol version:** 1
+**Protocol version:** 1 — carried on every join, and §10 fixes what it pins and
+when it bumps
 **Status:** Normative for the hub/worker protocol a compiled project speaks. The
 static surface it describes — `hub:` and `placements:` — is enforced today; the
 runtime is being built against this document.
@@ -46,8 +47,9 @@ says only what is *different* about the distributed case.
 7. [Dispatch and replay](#7-dispatch-and-replay)
 8. [Leases and single-writer-ness](#8-leases-and-single-writer-ness)
 9. [Environment manifests, and the trust model](#9-environment-manifests-and-the-trust-model)
-10. [Out of v1 scope](#10-out-of-v1-scope)
-11. [What is built today](#11-what-is-built-today)
+10. [Protocol stability](#10-protocol-stability)
+11. [Out of v1 scope](#11-out-of-v1-scope)
+12. [What is built today](#12-what-is-built-today)
 
 ---
 
@@ -126,7 +128,34 @@ WebSocket, and no new runtime dependency.**
 The hub already serves HTTP — triggers, the status route, the resume route — and
 the worker routes are more of that surface, under the same server, the same
 process, and the same auth story. A worker holds one outstanding `GET` at a time
-and the hub answers it when there is work or when the hold expires.
+and the hub answers it when there is work for that worker or when the hold
+expires.
+
+**A worker polls while it is busy, and runs one dispatch at a time.** Both
+halves are normative, and together they are the whole of the concurrency story:
+
+- A worker keeps exactly one poll in flight from the moment it joins until it
+  stops. It does **not** suspend polling while a node runs: a four-minute build
+  is four minutes of holds that return empty, and the session stays inside the
+  liveness window the whole time. Without this clause the window below would
+  presume a working worker gone, re-park its queue, and leave it with a result
+  to post against a session the hub has forgotten — a path no section of this
+  document describes because no implementation may reach it.
+- The hub MUST NOT answer a session's poll with a dispatch while that session
+  has a dispatch it has not settled. A busy worker's polls are therefore
+  heartbeats and nothing else, however much work is queued for the placement it
+  claims.
+
+Concurrency comes from **more sessions, never from more dispatches on one**:
+several workers claiming one name form a pool (§1.1), and a machine that should
+run two nodes at once runs two workers. That keeps a worker's own model of
+itself down to one node, which is what makes `dispatch_id` idempotency (§3.4)
+and the mid-node disconnect rule (§7.3) statements about a session rather than
+about a scheduler nobody wrote.
+
+A worker's `POST`s do not wait behind its poll: effect batches (§3.3) and
+results (§3.4) are issued as they happen, concurrently with the held `GET`. "One
+outstanding `GET`" bounds the polling, not the connection count.
 
 The alternative was a WebSocket or an SSE stream, and long-poll wins on three
 counts that matter more than elegance here. It survives every proxy, load
@@ -145,14 +174,17 @@ Both are acceptable for a graph whose nodes are model calls.
 
 | | value |
 |---|---|
-| poll hold | 25 seconds (the hub answers `204` at the end of a hold with no work) |
+| poll hold | 25 seconds (the hub answers `204` at the end of a hold with no work for this session) |
 | session liveness window | 90 seconds since the last request on a session |
-| worker re-poll after `204` | immediately |
+| worker re-poll after `204` | immediately, whether or not it is executing a dispatch |
 | worker re-join after a transport failure | bounded exponential backoff, starting at 1 second and capped at 30 |
 
 A hold shorter than most intermediary idle timeouts and a liveness window
 several holds wide are the two properties those numbers have; an implementation
-MAY make them configurable and MUST keep that relationship.
+MAY make them configurable and MUST keep that relationship. Note what the window
+is measured against: **the last request on a session**, not the last dispatch.
+A node that runs longer than the window is ordinary and costs nothing, because
+the polls continue underneath it.
 
 ---
 
@@ -184,6 +216,9 @@ exception is stated at §3.5 and stated there because it is an exception.
 
 ```json
 {
+  "protocol": 1,
+  "compiler": "0.4.1",
+  "runtime": "bun 1.1.34",
   "claims": ["mac", "gpu"],
   "artifact_hash": "<the hash this worker already holds, if any>",
   "env_ok": ["SIGNING_KEY", "NOTARY_PASSWORD"]
@@ -199,26 +234,75 @@ Answer:
 
 ```json
 {
+  "protocol": 1,
+  "compiler": "0.4.1",
   "worker_session": "wrk_9f1c8a3e…",
   "artifact": { "hash": "sha256:…", "url": "/workers/artifact/sha256:…" },
   "poll_url": "/workers/poll"
 }
 ```
 
-`claims` are the deploy layer's placement names. `env_ok` is the worker's own
-report of which variables of its placements' manifests are set in its
-environment — **names only, never values** (§9). `artifact_hash` is what the
-worker already has on disk, which lets an unchanged worker skip the download.
+Field by field, because every refusal below is decided by one of them:
+
+- **`protocol`** is the version of *this document* the worker speaks, and it is
+  REQUIRED. It is not part of the handshake triple and is checked before it:
+  the triple is about the code both sides run, `protocol` is about the wire
+  carrying it (§10).
+- **`compiler`** and **`runtime`** are the worker's two halves of that triple —
+  the `agent-compose` release the worker was built from, and the JavaScript
+  runtime it will execute the artifact under, as `"<name> <version>"` exactly as
+  that runtime reports itself. Both are REQUIRED, because a refusal that names
+  both sides (§4.1) cannot name a value the request never sent. The
+  answer echoes the hub's `protocol` and `compiler` on the joins it accepts, so
+  a worker's logs name the mesh it is *in* and not only one it was refused from.
+- **`claims`** are the deploy layer's placement names.
+- **`artifact_hash`** is what the worker already has on disk, which lets an
+  unchanged worker skip the download.
+- **`env_ok`** is the worker's report of which variables **of the manifest in
+  the artifact it holds** are set in its environment — **names only, never
+  values**, and never the environment's other names (§9). Its presence is
+  decided by `artifact_hash`, and the next paragraph is that rule.
+
+**When `env_ok` is sent, and why it is not always computable.** The manifest
+travels *inside* the artifact — it is the per-placement partition §9.1 fixes,
+emitted into the generated project, so both ends read one answer out of one
+artifact hash. A worker therefore knows its manifest exactly when it holds the
+artifact the hub is serving, which gives one rule with two cases:
+
+- a join whose `artifact_hash` is the artifact the hub currently serves MUST
+  carry `env_ok`, and it is checked;
+- any other join — a cold start with no artifact at all, or one holding a stale
+  hash — MUST omit it. A worker does not guess a manifest it has not read.
+
+A join that omits `env_ok` is a **provisioning join**: it is answered normally,
+with a session and the current artifact, and the hub **MUST NOT dispatch to that
+session**. The worker fetches (§3.5), materialises (§4), and joins again — and
+*that* join carries the hash and the report, and is where the `403` fires. The
+check therefore still catches the machine it exists for, the one whose keychain
+was never set up (§9.2), one round trip later and still before any node runs.
+
+Nothing about this is a privileged first connection (§5): both are the same
+request on the same route, either may be the first a hub ever sees, a worker
+that already holds the current artifact makes only the second kind, and the hub
+remembers nothing of the first — the second re-derives all of it.
 
 **Refusals**, and the shape of each:
 
 | condition | status | body |
 |---|---|---|
 | the token does not verify | `401` | no detail. A refused credential is told nothing about why |
+| `protocol` names a version this hub does not speak | `409` | names both versions, and which end is behind (§10) |
+| the compiler version or runtime does not match | `409` | names both sides of whichever half differs (§4.1) |
 | a claim names no placement in the active target | `400` | names the claim, and lists the target's placement names |
-| a claimed placement's env manifest is unsatisfied | `403` | names the **variables**, never their values, never whether the hub holds them |
+| `env_ok` is present and a claimed placement's manifest is unsatisfied | `403` | names the **variables**, never their values, never whether the hub holds them |
+| `env_ok` is present on a join whose `artifact_hash` is not the current one, or absent on one whose is | `400` | names the rule above: the report is against the manifest in the artifact the worker holds |
 | the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§3.5, §4) |
-| the compiler version or runtime does not match | `409` | names both sides of whichever half differs (§4) |
+
+The order matters, and it is the order of the rows: a worker that cannot be
+authenticated is told nothing, a worker whose wire this hub does not speak is
+told that before anything about the deployment, and the placement and manifest
+answers — which describe the target — are given only to a worker that has got
+that far.
 
 The token check MUST be a constant-time comparison, for the reason grammar §13.3
 gives about inbound trigger credentials: a caller who can time a refusal
@@ -246,13 +330,18 @@ Carries the session. Long-polls for up to one hold (§2).
   the journaled record of effects this node instance already issued, and is what
   a redispatched node replays to the frontier before going live (§7).
 
-- **`204`** when the hold expired with no work.
+- **`204`** when the hold expired with no work **for this session** — which
+  includes every hold while the session has a dispatch it has not settled (§2).
+  A busy worker keeps polling and keeps being answered `204`, however deep the
+  queue for the placement it claims; that is the mechanism, not a degenerate
+  case of it.
 
 **Polling is the heartbeat.** There is no separate liveness route, and there MUST
-NOT be one: the property §6 needs is "is this worker able to take work", and a
-poll is the only request that answers it. A session with no request inside the
-liveness window is presumed gone, and its **queued but undispatched** work
-re-parks (§6).
+NOT be one: the property §6 needs is "is this worker still there", and a poll is
+the only request that answers it — for an idle worker and a busy one alike,
+which is why §2 requires the poll to continue while a node runs. A session with
+no request inside the liveness window is presumed gone, and its **queued but
+undispatched** work re-parks (§6).
 
 ### 3.3 `POST /workers/effects`
 
@@ -339,27 +428,57 @@ A worker:
 3. materialises it under its own data directory, keyed by hash, so the previous
    artifact survives a rollback;
 4. installs dependencies with `bun install`;
-5. executes dispatches out of that tree.
+5. **joins again**, now carrying that hash and — read out of the tree it just
+   unpacked — the `env_ok` report §3.1 requires of a worker holding the current
+   artifact;
+6. executes dispatches out of that tree.
+
+Step 5 is why a fetch is followed by a join rather than by a poll: the manifest
+lives in the artifact (§9.1), so the report the hub checks is one the worker
+could not make until this moment. A worker that already held the current hash
+finds step 1 equal, skips 2 through 4, and is dispatchable on the join it made
+in the first place — which is the ordinary steady state, one join and no
+download.
 
 ### 4.1 The handshake triple
 
-A join agrees on three values, and all three are compared:
+A join agrees on three values, and all three are compared — so all three are on
+the wire, in the join §3.1 fixes:
 
-| | what it pins |
-|---|---|
-| **artifact hash** | the generated project, exactly |
-| **compiler version** | the `agent-compose` release that generated it |
-| **runtime** | Bun, and its major version |
+| | what it pins | where it is written |
+|---|---|---|
+| **artifact hash** | the generated project, exactly | `artifact_hash` in the request; `artifact.hash` in the answer |
+| **compiler version** | the `agent-compose` release that generated it | `compiler` in the request, and in the answer |
+| **runtime** | Bun, and its major version | `runtime` in the request, as `"<name> <version>"` |
+
+A field the request omits is a comparison the hub cannot make, which is why all
+three are REQUIRED rather than helpful: PRD resolved q40 makes the refusal the
+point of the handshake, and a refusal that names both sides is only writable
+from a request that carries one of them.
 
 A hash mismatch is not a refusal — the answer carries the current artifact and
 the worker fetches it. A **compiler-version or runtime mismatch is a refused
-join**, and the refusal names both sides:
+join** (`409`, §3.1), and the refusal names both sides:
 
 > refused: this hub was built by agent-compose 0.4.1 and the worker runs 0.3.9 —
 > upgrade the worker, or point it at a hub of its own release
 
 > refused: a worker executes the generated artifact under Bun 1.x and this one
 > runs node v22.3.0 — install Bun, or run this placement on a machine that has it
+
+The hub compares `runtime`'s **name and major version** and nothing finer, and
+reports the whole string it was given: a worker on Bun 1.2 where the hub's
+artifact was built against Bun 1.1 is not a mismatch, and a worker on Node is
+one however new it is. What pins the required major is the compiler release —
+the same release that pins the LangGraph version — so the two halves of the
+triple's second and third rows move together and a worker satisfying `compiler`
+satisfies the major it implies.
+
+The **protocol version is not one of these three**, and §10 is where it lives.
+The triple is a statement about the code both ends run; `protocol` is a
+statement about the wire that carries it, and a hub may go on speaking to
+workers of an older release long after it stops accepting their artifacts, or
+the other way round.
 
 ### 4.2 Bun, and resolved q18
 
@@ -437,6 +556,13 @@ A joining worker's claims are scanned against the open placement-waits, and
 dispatch resumes **in park order**. This is the same scan-and-resume that
 recovery runs for `human` waits (resolved q28) and that resolved q35 runs for
 undelivered callbacks.
+
+The join that wakes is a join the hub may **dispatch** to, which excludes the
+provisioning join of §3.1: a worker that has not yet reported against its
+manifest has not been confirmed able to run the work, so its wake is the re-join
+a moment later, after it has the artifact. Nothing is lost by waiting — the wait
+is on the board, and park order is read from the journal at the join that takes
+it, not held from the one before.
 
 **There is no polling anywhere in this**, and that is a property rather than an
 implementation detail: the wake is an event the hub already receives, so a mesh
@@ -567,6 +693,14 @@ The per-placement manifest is **computable statically**: placements bind
 components, components bind `${ENV}` references, and the walk that collects them
 is the one `src/env.ts` is already built from (grammar §4.3, PRD 5.9).
 
+Because it is computed at build time it **ships in the artifact**, and that is
+load-bearing rather than incidental. One partition is emitted into the generated
+project, so the hub reading it and a worker reading it are reading one answer
+under one artifact hash — there is no second derivation to disagree, and the
+handshake that pins the artifact (§4.1) pins the manifest with it. It is also
+what makes §3.1's `env_ok` computable at all: a worker knows which variables to
+report exactly when it holds the artifact naming them.
+
 **The partition follows where a component *executes*, not what `members:`
 says.** That distinction is the whole of this section, because the two differ:
 grammar §14.1 rule 4 makes an attached tool run in its agent's process whether or
@@ -619,11 +753,28 @@ variable named (§3.1) — the same posture the serve launch check takes
 (resolved q32).
 
 **What that check is, precisely: self-reported presence, not authenticated
-capability.** The worker sends the *names* it has, and the hub compares them
-against the manifest it computed. Proving the worker holds the right *value*
-would mean sending the value, which is the one thing this whole section exists to
-forbid. The check catches the misconfiguration it is for — a machine joined
-before its keychain was set up — and claims nothing more.
+capability.** The worker sends, of the manifest §9.1 partitions, the *names* it
+has; the hub compares them against the manifest it computed. Proving the worker
+holds the right *value* would mean sending the value, which is the one thing this
+whole section exists to forbid. The check catches the misconfiguration it is
+for — a machine joined before its keychain was set up — and claims nothing more.
+
+**The report is scoped to the manifest at both ends**, and that is a privacy
+property as much as a protocol one: `env_ok` is a subset of a list the hub
+already computed, never an inventory of what else the machine happens to hold.
+A worker that shipped the names of its whole environment would be telling the
+hub about every unrelated credential on the box — the opposite of what §9.1
+buys.
+
+Which is what fixes *when* the report can be made. The manifest is emitted into
+the artifact, so a worker can name its own placements' variables exactly when it
+holds the artifact the hub serves, and §3.1's rule follows from that and not
+from a preference: a join carrying the current hash carries `env_ok` and is
+checked; a join without one omits it, is answered with the artifact, and is
+dispatched nothing until the worker has fetched, materialised and joined again.
+The refusal therefore lands on the second join of a cold start and on the first
+of every join after — never on a machine that could not yet have known what to
+report.
 
 ### 9.3 The trust model, stated plainly
 
@@ -648,7 +799,85 @@ than one they have to look up.
 
 ---
 
-## 10. Out of v1 scope
+## 10. Protocol stability
+
+`PROTOCOL_VERSION` is what a join pins. Every join carries the version the worker
+speaks (§3.1), and a hub that does not speak it refuses the join by version,
+naming both, rather than accepting a worker it will misunderstand. This is
+`docs/durability.md` §11's discipline applied to a wire instead of a file, and
+the one difference is worth stating: a journal is read by a later build of the
+same program, while this protocol has **two** programs on it at once, so the
+compatible-change list below is what lets a hub and a worker of adjacent
+releases talk at all.
+
+### 10.1 What an implementation may rely on
+
+At a given `PROTOCOL_VERSION`:
+
+* the routes of §3 — their paths, their methods, and every field this document
+  names, under the name and with the meaning given here;
+* where the credential goes (`Authorization: Bearer`) and what the session
+  header is called;
+* that a join is unprivileged and repeatable (§5): any join may be the first,
+  and a worker may re-join at any time without losing anything it has not been
+  told about;
+* that effect insertion is idempotent by effect key (§3.3) and that result
+  settlement is idempotent by `dispatch_id` (§3.4) — the two properties that
+  make at-least-once dispatch safe on both directions of the wire;
+* that a dispatch's `instance_path` is the flattened path grammar §9.4 keys
+  effects by, so a worker derives the keys the hub would;
+* the status this document gives each refusal, and the rule that a refusal
+  naming a variable names **names** (§9).
+
+An implementation MUST NOT rely on the *text* of any refusal, which is written
+for a person and is improved between releases; nor on the internal shape of a
+`worker_session` or a `dispatch_id`, which are the issuing hub's and are opaque
+to everyone else; nor on the layout of the artifact, which belongs to the
+compiler release and is pinned by the triple (§4.1) rather than by this version.
+
+### 10.2 What is a compatible change
+
+Made **without** a version bump: adding an OPTIONAL field to a request or an
+answer, which a peer of the previous version ignores; adding a route a worker
+may decline to use; widening a refusal body; improving refusal text; lengthening
+the poll hold (§2), which a worker learns by waiting.
+
+And the clause that carries the most weight: **a change to the artifact is not a
+change to this protocol.** This wire moves a payload it does not define — node
+inputs, effect records, the journal's shape — and all of it is pinned by the
+handshake triple and refused at join when it differs. Such a change is
+`docs/durability.md` §11's business and the compiler version's, not
+`PROTOCOL_VERSION`'s, which is exactly why the triple is checked separately from
+the version (§4.1).
+
+### 10.3 What requires a version bump
+
+`PROTOCOL_VERSION` MUST be incremented for any change that would make a peer of
+the previous version behave **wrongly** rather than be refused:
+
+* removing or renaming a field, or changing what one means;
+* changing a route's path or method, or *when* it may legally be called —
+  including whether a poll may be outstanding while a dispatch is unsettled
+  (§2), which an older worker would answer with silence the hub would read as
+  death;
+* changing which side writes the journal (§3.3), or where an idempotency key
+  comes from (§3.3, §3.4);
+* changing what a status code means at a route — a `409` that stopped meaning
+  "re-join" is the sharpest case, because §5 tells workers to act on it;
+* shortening the **liveness window** of §2. Lengthening it is compatible;
+  shortening it is not, because the first thing an older worker learns about the
+  new one is that its work was re-parked underneath it.
+
+A bump is a statement that workers of the older release cannot join this hub,
+and §3.1's `409` is what enforces it. Because a worker and a hub are built from
+one compiler release, the ordinary upgrade path never meets this: the triple
+refuses the mixed pair first, and `PROTOCOL_VERSION` is what remains for the
+case the triple stops covering — a worker binary somebody upgrades separately,
+or a second implementation of this document.
+
+---
+
+## 11. Out of v1 scope
 
 Named, so that each is a decision rather than a gap (PRD resolved q44):
 
@@ -667,7 +896,7 @@ reason about.
 
 ---
 
-## 11. What is built today
+## 12. What is built today
 
 **The static surface is live. The protocol is not built yet.**
 

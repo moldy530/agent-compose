@@ -42,15 +42,17 @@
 //!    are enforced today; the protocol is not built yet." and the reserved-summary
 //!    paragraph that explains why `placements` left the reserved list by being
 //!    re-cut rather than by a runtime landing.
-//! 4. **`docs/distributed.md` §11**, "What is built today", which is the whole
+//! 4. **`docs/distributed.md` §12**, "What is built today", which is the whole
 //!    section that stops being true.
 //! 5. **The environment-manifest partition in
 //!    `crates/compose-core/src/codegen/env.rs`** — the half with no sentence to
 //!    bind. `References::of` walks the definitions, the trigger table and the
 //!    deploy layer's `storage_backends:`/`event_sources:`, and deliberately does
 //!    **not** walk `hub:`. Per PRD resolved q41 the runtime pass must teach it
-//!    the per-placement partition of `docs/distributed.md` §9.1, and the shape
-//!    of that partition is the part worth reading before writing it: a
+//!    the per-placement partition of `docs/distributed.md` §9.1 — which the
+//!    protocol leans on twice over, since the partition ships *in the artifact*
+//!    and is what makes a join's `env_ok` computable at all (§3.1) — and the
+//!    shape of that partition is the part worth reading before writing it: a
 //!    process's manifest is the variables of every component that can **execute
 //!    in it**, which is not the same as the components `members:` lists. A tool
 //!    an agent attaches runs in that agent's process whether or not it names a
