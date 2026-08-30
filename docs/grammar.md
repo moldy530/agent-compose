@@ -278,7 +278,7 @@ error of the form "expected an `agent.*` reference, found `tool.web_search`"
 | `human.on_timeout` | flow-local node id, `end` | same positions as `on_error.fallback` |
 | edge `from` / `to` | flow-local node id, `start`, `end` | |
 | `triggers.<t>.flow` | `flow.*` | |
-| `placements` keys | `agent.*`, `tool.*`, `flow.*` | deploy layer |
+| `placements.<name>.members[]` | `agent.*`, `tool.*` | deploy layer; a placement's **name** is an identifier (§2.1) and not a reference, and a `flow.*` member is refused (§14.1 rule 2) |
 
 ### 2.4 Flow-local node ids and pseudo-nodes
 

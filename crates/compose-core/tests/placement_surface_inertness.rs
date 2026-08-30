@@ -24,7 +24,10 @@
 //!   the half would look like a mesh that works.
 //! * **Every shipped document says so.** A reader told "the rules are enforced"
 //!   must also be told "nothing runs yet", or they will deploy a mesh and wait
-//!   for a worker that has nowhere to join.
+//!   for a worker that has nowhere to join. And no shipped document may describe
+//!   a shape `validate` refuses: the re-cut left the *whole* surface live, so a
+//!   document still carrying the retired one is not a stale paragraph but an
+//!   instruction to write a deploy file that does not compile.
 //!
 //! # The unwind list — what the runtime pass must flip
 //!
@@ -65,6 +68,12 @@
 //!    `hub.join_token:` and the rest of the deploy layer belong to the hub's.
 //!    Until then a hub credential in `src/env.ts` would be a launch check for a
 //!    value nothing reads.
+//! 6. **`docs/distributed.md` §13, "What this document does not settle"** — not
+//!    sentences to flip but work to do before the code they govern is written.
+//!    A session's dispatch capacity, the artifact-hash half of PRD resolved q40,
+//!    and containment beyond the process boundary are open design questions the
+//!    runtime pass carries to the PRD's Open Questions and implements against the
+//!    resolution, never against the placeholder §13 records.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -444,6 +453,59 @@ fn no_document_files_placements_as_reserved_grammar() {
                 !document.contains(row),
                 "{name} still files `{row}` among the reserved constructs, and `placements:` has \
                  live static rules `validate` enforces"
+            );
+        }
+    }
+}
+
+/// The grammar's normative index of reference positions agrees with the member
+/// rule `validate` enforces.
+///
+/// §2.3 is the single place a reader — or an agent, which the `targets` topic
+/// points at the grammar as its normative source — looks up what a position
+/// accepts, and §14.1 rule 2 is what refuses a member. They are two statements of
+/// one fact and drifted apart once already: the re-cut left §2.3 carrying a row
+/// for the retired address-keyed shape, which named `placements` *keys* as a
+/// reference position and offered `flow.*` among the namespaces it took. Both
+/// halves of that row are now compile errors — `invalid-identifier` on the key
+/// and `unsupported-placement` on the member — so a reader following it writes a
+/// deploy file the compiler refuses twice over.
+///
+/// The rule is not "no document mentions `flow.*` near a placement": §14.1, D129
+/// and the topic all say a `flow.*` member is refused, and saying so is the
+/// point — the row this test guards says it too, in its notes. What is checked is
+/// narrower and is the shape a reader scans rather than reads: no table row that
+/// names a `placements` position may **offer** `flow.*` in the cell that lists
+/// what the position accepts.
+#[test]
+fn the_reference_position_index_agrees_with_the_member_rule() {
+    let grammar =
+        fs::read_to_string(repository().join("docs/grammar.md")).expect("the grammar is readable");
+    let targets = compose_core::docs::topic("targets").expect("the `targets` topic ships");
+
+    assert!(
+        grammar.contains("| `placements.<name>.members[]` | `agent.*`, `tool.*` |"),
+        "§2.3's reference-position table no longer names `placements.<name>.members[]` and what \
+         it accepts, so the grammar's normative index of reference positions has stopped covering \
+         the one position the deploy layer has"
+    );
+
+    for (name, document) in [
+        ("docs/grammar.md", grammar.as_str()),
+        ("the `targets` topic", targets.body),
+    ] {
+        for row in document.lines().filter(|line| line.starts_with('|')) {
+            let mut cells = row.split('|').skip(1);
+            let (Some(position), Some(accepts)) = (cells.next(), cells.next()) else {
+                continue;
+            };
+            if !position.contains("placements") {
+                continue;
+            }
+            assert!(
+                !accepts.contains("`flow.*`"),
+                "{name} has a table row offering `flow.*` where a placement member goes, and \
+                 §14.1 rule 2 refuses one: {row}"
             );
         }
     }
