@@ -316,9 +316,19 @@ const PUBLIC_URL_HELP: &str = "the base is an absolute URL naming a host, its sc
 /// code rather than a `missing-key` is what `missing-credential` and
 /// `missing-callback-allowlist` are: whether the key is required is decided by
 /// a **sibling section's** contents, and the repair is a choice of two.
+///
+/// `written` is whether the file carries a `hub:` key **at all**, which is not
+/// the same question as whether `hub` parsed: a `hub:` that is not a mapping is
+/// refused by [`hub`] and reaches here as `None`. Telling the two apart is the
+/// same distinction [`HubSection::declares_join_token`] draws one level in — the
+/// author of `hub: "https://hub.example"` has already been told what is wrong
+/// with it, and "declare `hub: { join_token: ${SOME_VAR} }`" is advice about a
+/// block they wrote, so stating it would be a second diagnostic for one mistake
+/// whose repair line is false about the file in front of the reader.
 pub(crate) fn require_join_token(
     placements: Option<&PlacementsSection>,
     hub: Option<&HubSection>,
+    written: bool,
     document: &Span,
     cx: &mut Cx,
 ) {
@@ -327,6 +337,9 @@ pub(crate) fn require_join_token(
         return;
     }
     if hub.is_some_and(|hub| hub.declares_join_token) {
+        return;
+    }
+    if hub.is_none() && written {
         return;
     }
     // The `hub:` block is where the key belongs, so a file that has one is
@@ -606,6 +619,129 @@ pub(crate) fn plugin_value(node: &Node, subject: &str, cx: &mut Cx) -> Spanned<P
 #[cfg(test)]
 mod tests {
     use super::url_problem;
+    use crate::diag::{Diagnostic, DiagnosticCode};
+    use crate::parse::parse_str;
+
+    /// Every diagnostic one deploy file draws.
+    fn diagnose(source: &str) -> Vec<Diagnostic> {
+        parse_str(source, "deploy/mesh.yml").diagnostics
+    }
+
+    /// The `missing-join-token` diagnostic, and the assertion that it is alone.
+    ///
+    /// Alone is half of what each case below is about: the rule's whole job is
+    /// to be the one thing a reader is told about one mistake.
+    #[track_caller]
+    fn missing_join_token(source: &str) -> Diagnostic {
+        let mut diagnostics = diagnose(source);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["missing-join-token"],
+            "this source is written to draw the requiredness rule and nothing else"
+        );
+        diagnostics.remove(0)
+    }
+
+    /// Where the rule anchors, and how it counts, in the shape an author who
+    /// has never written a `hub:` block produces (grammar 14.2 rule 2).
+    ///
+    /// The negative fixture corpus pins the message, the code and the position;
+    /// what it cannot pin is the **label**, and the label is the half that says
+    /// which placements the rule is about. Both arms of the count are here
+    /// because a file with one placement and a file with several are the two
+    /// files anybody writes, and "1 placements declared here" is the kind of
+    /// slip a corpus asserting only the primary message never sees.
+    #[test]
+    fn the_rule_anchors_on_the_document_when_no_hub_block_is_written() {
+        let one = missing_join_token(
+            "version: \"0.1\"\nplacements:\n  mac:\n    members: [agent.signer]\n",
+        );
+        assert_eq!(one.span.start.line, 1, "the whole document is the anchor");
+        assert_eq!(one.span.start.column, 1);
+        assert_eq!(
+            one.labels
+                .iter()
+                .map(|label| label.message.as_str())
+                .collect::<Vec<_>>(),
+            ["one placement declared here"]
+        );
+
+        let several = missing_join_token(
+            "version: \"0.1\"\nplacements:\n  mac:\n    members: [agent.signer]\n  gpu:\n    members: [agent.embedder]\n",
+        );
+        assert_eq!(several.span.start.line, 1);
+        assert_eq!(
+            several
+                .labels
+                .iter()
+                .map(|label| label.message.as_str())
+                .collect::<Vec<_>>(),
+            ["2 placements declared here"]
+        );
+    }
+
+    /// …and on the block itself when there is one to point at.
+    ///
+    /// The two anchors are the same choice a missing `version:` makes: the
+    /// reader is sent to the line the key belongs on, and a file with no such
+    /// line is sent to itself.
+    #[test]
+    fn the_rule_anchors_on_the_hub_block_when_one_is_written() {
+        let reported = missing_join_token(
+            "version: \"0.1\"\nhub:\n  public_url: \"https://hub.example\"\nplacements:\n  mac:\n    members: [agent.signer]\n",
+        );
+        assert_eq!(
+            reported.span.start.line, 3,
+            "the anchor is the `hub:` block's body, not the document"
+        );
+    }
+
+    /// A `hub:` that is not a mapping is one mistake and gets one diagnostic.
+    ///
+    /// `hub` cannot be read, so the requiredness rule would otherwise see the
+    /// same `None` a file with no `hub:` at all produces and tell its author to
+    /// "declare `hub: { join_token: ${SOME_VAR} }`" — advice about a block that
+    /// is already on the screen. This is the cascade
+    /// [`HubSection::declares_join_token`](crate::ast::deploy::HubSection)
+    /// suppresses one level in, at the level above it.
+    #[test]
+    fn a_hub_that_is_not_a_mapping_is_not_also_told_to_declare_one() {
+        let diagnostics = diagnose(
+            "version: \"0.1\"\nhub: \"https://hub.example\"\nplacements:\n  mac:\n    members: [agent.signer]\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["wrong-type"],
+            "a malformed `hub:` draws the shape error and nothing else"
+        );
+    }
+
+    /// …and so is a `join_token:` written as a literal (grammar 4.3).
+    ///
+    /// The sibling case, kept beside the one above because the two are one
+    /// rule about cascades and drift apart the moment they are only tested
+    /// apart: whatever is wrong with the token the author wrote, they are not
+    /// also told they wrote none.
+    #[test]
+    fn a_literal_join_token_is_not_also_reported_as_a_missing_one() {
+        let diagnostics = diagnose(
+            "version: \"0.1\"\nhub:\n  join_token: \"s3cret\"\nplacements:\n  mac:\n    members: [agent.signer]\n",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [DiagnosticCode::InvalidEnvRef],
+            "a refused token draws the env-ref rule and nothing else"
+        );
+    }
 
     /// Every arm of the refusal, and the base that reaches it.
     ///

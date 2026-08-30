@@ -417,8 +417,17 @@ fn deploy_file(
     }
 
     // A rule about two sections of one file, so it is stated once both have
-    // been read (grammar 14.2, Decision D130).
-    deploy::require_join_token(file.placements.as_ref(), file.hub.as_ref(), &root.span, cx);
+    // been read (grammar 14.2, Decision D130). The key's *presence* is passed
+    // separately from what parsing made of it: a `hub:` that is not a mapping
+    // is refused already, and telling its author to declare the block they
+    // wrote would be a second diagnostic for one mistake.
+    deploy::require_join_token(
+        file.placements.as_ref(),
+        file.hub.as_ref(),
+        mapping.contains_key("hub"),
+        &root.span,
+        cx,
+    );
 
     // Stated only where its premise can still be true: a file the caller is
     // holding as an import is refused for being imported at all, and one it is
