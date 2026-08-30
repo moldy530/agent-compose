@@ -78,13 +78,13 @@ other, never both (Decision [D3](#d3-spec-files-and-deploy-files-are-disjoint-do
 | Kind | Selected by | May contain |
 |---|---|---|
 | **Spec file** | reachable from the entrypoint's `imports:`, or being the entrypoint | `version`, `imports` (entrypoint only), `defaults`, `state`, `triggers`, typed-address definition keys |
-| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `placements`, `storage_backends`, `event_sources` |
+| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `event_sources` |
 
-A spec file that declares `placements`, `storage_backends`, or `event_sources`
-is a compile error, and a deploy file that declares definitions, `imports`,
-`state`, `triggers`, or `defaults` is a compile error. This is the mechanical
-enforcement of the PRD 5.8 per-target invariant: only the deploy layer forks per
-environment.
+A spec file that declares `hub`, `placements`, `storage_backends`, or
+`event_sources` is a compile error, and a deploy file that declares definitions,
+`imports`, `state`, `triggers`, or `defaults` is a compile error. This is the
+mechanical enforcement of the PRD 5.8 per-target invariant: only the deploy layer
+forks per environment.
 
 The **entrypoint** is the spec file named on the command line (conventionally
 `main.yml`). It is the only file that MAY declare `imports:`.
@@ -751,6 +751,7 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `token`, `secret` | an `http` trigger's `auth:` and `callback_auth:` blocks (§13.3) |
+| `join_token` | the deploy layer's `hub:` block (§14.2) |
 
 The table classifies these field *names* wherever they occur; it never makes one
 legal where its section's own key rules do not admit it. A `provider.*` takes
@@ -780,7 +781,9 @@ channel names, typed addresses, a store's `backend:` alias, a tool's
 `function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
 a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); the `header:` and
 `prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:` entry
-(§13.3); a `blob put`'s `content_type:` (§11.4); and every enum-valued key.
+(§13.3); `hub.public_url:` (§14.2), which is shape-checked here and is part of
+what a deployment *is*; a `blob put`'s `content_type:` (§11.4); and every
+enum-valued key.
 
 Nothing is interpolated in class 3, so an unescaped token there is an error
 rather than text that silently survives into the output — the author who wrote
