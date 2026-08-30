@@ -73,7 +73,15 @@
 //!    A session's dispatch capacity, the artifact-hash half of PRD resolved q40,
 //!    and containment beyond the process boundary are open design questions the
 //!    runtime pass carries to the PRD's Open Questions and implements against the
-//!    resolution, never against the placeholder §13 records.
+//!    resolution, never against the placeholder §13 records. The middle one is
+//!    the sharpest, because it is the only row where a resolved entry says
+//!    something and the document argues for the opposite: q40 reads "a mismatch
+//!    is a refused join naming both" and §4.1 argues a hash mismatch should be
+//!    repaired. So it is the one row with **no** default to build against — the
+//!    join's hash branch waits for the amendment, and the rest of §3.1 does not.
+//!    `the_unsettled_clauses_are_marked_where_they_are_stated` below is what
+//!    keeps that marking from quietly turning back into a rule; when the PRD
+//!    answers, the markers come out and that test goes with them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -423,6 +431,59 @@ fn every_document_says_the_protocol_is_not_built_yet() {
             "a document that states the awaiting-runtime posture no longer contains {claim:?} — \
              the sentence has to come back, or the runtime has to land and this whole file has to \
              be turned around"
+        );
+    }
+}
+
+/// The clauses `docs/distributed.md` does not settle are marked **where they are
+/// stated**, not only where §13 lists them.
+///
+/// §12 says the runtime will be held to that document, so every sentence in it
+/// reads as a rule unless something says otherwise. One of them is not a rule:
+/// §4.1's artifact-hash behaviour contradicts the literal text of PRD resolved
+/// q40, which is a design decision `prd.md` owns and a downstream document may
+/// not make by writing the opposite in a normative voice.
+///
+/// The failure this catches is the marking wearing off while the behaviour stays
+/// — a later edit tightening §4.1's prose, or §3.1's refusal table losing its
+/// note — after which the runtime is written against an unratified clause, CI is
+/// green, and the repository holds two ratified-looking statements that disagree
+/// about what a hub answers an unfamiliar `artifact_hash`.
+///
+/// So three markers are pinned: the one at the statement (§4.1), the one on the
+/// wire contract that carries it (§3.1's table), and §12's exclusion of §13's
+/// rows from what the runtime is held to. When the PRD answers, all three come
+/// out together and this test goes with them — which is unwind-list item 6.
+#[test]
+fn the_unsettled_clauses_are_marked_where_they_are_stated() {
+    let distributed = fs::read_to_string(repository().join("docs/distributed.md"))
+        .expect("the protocol document is readable");
+
+    for (section, marker) in [
+        (
+            "§4.1, at the statement itself",
+            "**The hash half of the triple is the one clause of this document that is not\nsettled \
+             wire, and what follows is written as the proposal it is.**",
+        ),
+        (
+            "§3.1, on the refusal table that carries it",
+            "**The last row is the one line of this contract that is not settled wire.**",
+        ),
+        (
+            "§12, excluding it from what the runtime is held to",
+            "held to — **except the rows of §13**",
+        ),
+        (
+            "§13, making the list a gate rather than a note",
+            "**So this section is a gate, not a note.**",
+        ),
+    ] {
+        assert!(
+            distributed.contains(marker),
+            "`docs/distributed.md` no longer marks its unsettled clause in {section}: {marker:?}. \
+             Either the marker comes back, or PRD resolved q40 has been amended — in which case \
+             the amendment is what §4.1 states, all four markers come out, and this test goes with \
+             them (unwind-list item 6)"
         );
     }
 }

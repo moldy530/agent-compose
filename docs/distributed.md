@@ -133,14 +133,15 @@ and the hub answers it when there is work for that worker or when the hold
 expires.
 
 **A worker polls while it is busy, and holds one dispatch at a time.** Both
-halves are normative; they do not have the same authority behind them, and the
-paragraph after them says which is which:
+halves are normative for v1; they do not have the same authority behind them —
+the first is forced by the transport, the second is this document's own choice
+and §13 is where it is filed — and the paragraph after them says which is which:
 
 - A worker keeps exactly one poll in flight from the moment it joins until it
   stops. It does **not** suspend polling while a node runs: a four-minute build
   is four minutes of holds that return empty, and the session stays inside the
   liveness window the whole time. Without this clause the window below would
-  presume a working worker gone, abandon the dispatch it is in the middle of
+  presume a working worker gone, supersede the dispatch it is in the middle of
   (§6.3), and leave it with a result to post against a session the hub has
   forgotten — an attempt failed, and a build's four minutes thrown away, for a
   worker that was never in trouble.
@@ -386,6 +387,12 @@ joined: §5 fixes the rule — the hub ends those sessions when it rotates, and 
 | `env_ok` is present on a join whose `artifact_hash` is not the current one — an absent hash included, since an absent hash is never the current one — or absent on one whose is | `400` | names the rule above: the report is against the manifest in the artifact the worker holds |
 | the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§3.5, §4) |
 
+**The last row is the one line of this contract that is not settled wire.** It is
+§4.1's divergence from PRD resolved q40, staged as an open question in §13, and
+it is written here as the behaviour §4.1 argues for rather than as a rule this
+document fixes. Every row above it is settled, and the difference is not a
+formality: the runtime pass closes §13's row before it implements this one.
+
 The order matters, and it is the order of the rows: a worker that cannot be
 authenticated is told nothing, a worker whose wire this hub does not speak is
 told that before anything about the deployment, and the placement and manifest
@@ -502,23 +509,32 @@ an effect the replay of §7 cannot skip.
 Carries the session and the `dispatch_id`. The node's outcome: its output, or
 its failure.
 
-**Idempotent by `dispatch_id`.** A result for a dispatch the hub has already
-settled is accepted and dropped, which is what makes at-least-once dispatch (§7)
-safe on the return path as well as the outbound one.
+**Idempotent by `dispatch_id`.** A second result for a dispatch an earlier one
+already **settled** is accepted and dropped, which is what makes at-least-once
+dispatch (§7) safe on the return path as well as the outbound one.
 
-A result the hub cannot attribute — an unknown or already-superseded
-`dispatch_id` — is answered `409` and the worker discards it: the execution has
-moved on, and re-driving it from a stale result is exactly the divergence
-`docs/durability.md` §7 refuses. The commonest way a `dispatch_id` becomes
-superseded is §6.3: the hub gave up on the session this dispatch was issued to,
-and the node has been through its `retry:` chain since.
+**A dispatch ends in one of two states, and this document gives them two verbs**
+— they are not synonyms and the table below turns on the difference. A dispatch
+is **settled** when a result posted for it is what ended it, and **superseded**
+when the hub ended it without one, which §6.3's declaration is the only way of
+doing. A dispatch in neither state is **unsettled**: still in flight, and the one
+piece of work a session may be holding (§2). So a re-posted result never matches
+two rows: `204` says the hub holds this dispatch's own result, `409` says the hub
+ended this dispatch without one and the execution has moved past it.
+
+A result the hub cannot attribute — an unknown or superseded `dispatch_id` — is
+answered `409` and the worker discards it: the execution has moved on, and
+re-driving it from a stale result is exactly the divergence
+`docs/durability.md` §7 refuses. The only way a `dispatch_id` becomes superseded
+is §6.3: the hub gave up on the session this dispatch was issued to, and the node
+has been through its `retry:` chain since.
 
 | condition | status | body |
 |---|---|---|
-| the dispatch settles, or was already settled | `204` | empty |
+| this result settles the dispatch, or a result already settled it | `204` | empty |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and post this result again under the new session |
-| the `dispatch_id` is unknown or already superseded | `409` | names the dispatch. The result is discarded |
+| the `dispatch_id` is unknown, or the hub superseded the dispatch (§6.3) | `409` | names the dispatch. The result is discarded |
 
 **`410` and `409` are different failures and a worker MUST NOT treat them
 alike.** `410` says *the hub does not know you*, and the result is still owed:
@@ -526,7 +542,7 @@ join, and post it again under the new session — the hub attributes it by
 `dispatch_id`, which the new session does not change. `409` says *the hub knows
 you and does not want this*, and the result is dead. A worker whose re-posted
 result meets `409` has its answer and stops re-posting; a worker that read the
-two as one would either abandon a result the hub was waiting for or re-drive an
+two as one would either drop a result the hub was waiting for or re-drive an
 execution that has moved past it.
 
 ### 3.5 `GET /workers/artifact/{hash}`
@@ -630,18 +646,24 @@ can only refuse on are the two required of every join, cold start included. So a
 provisioning join is still a join the version check runs on, and a worker of the
 wrong release is refused before it downloads anything.
 
-A hash mismatch is not a refusal — the answer carries the current artifact and
-the worker fetches it. An **absent** hash is that same case at its limit and is
-refused no more than the mismatch is; a hub that answered a first join `400`
-because it named no artifact would make a fresh machine unable to bootstrap into
+**The hash half of the triple is the one clause of this document that is not
+settled wire, and what follows is written as the proposal it is.** The proposal:
+a hash mismatch is not a refusal — the answer carries the current artifact and
+the worker fetches it — and an **absent** hash is that same case at its limit,
+refused no more than the mismatch is, because a hub that answered a first join
+`400` for naming no artifact would make a fresh machine unable to bootstrap into
 the mesh at all, since fetching (§3.5) is downstream of the join that names what
 to fetch.
 
 That is narrower than resolved q40, and the narrowing is **a divergence from the
 literal text of a resolved entry rather than a reading of it**. q40 names two
 things pinned in the handshake — artifact hash and compiler version — and says
-"a mismatch is a refused join naming both"; this section refuses on compiler
-version and runtime, and *repairs* a hash mismatch instead of refusing it.
+"a mismatch is a refused join naming both"; the paragraph above refuses on
+compiler version and runtime, and *repairs* a hash mismatch instead of refusing
+it. **`prd.md` is the single source of truth for design decisions, so this
+document does not get to overrule a resolved entry by stating the opposite in a
+normative voice** — which is why the paragraph above is a proposal and not a
+rule, and why §13 carries it as an open question rather than a footnote.
 
 The engineering is not what is in doubt, and the argument for it is in q40's own
 next clause: *redeployment is automatic on the next join*. The artifact hash is
@@ -657,13 +679,23 @@ What is in doubt is the paperwork, and this document does not get to do it. The
 project's discipline puts an amendment to a resolved entry through the PRD, not
 through a downstream document's reconciliation paragraph — which is the
 difference between this clause and §4.2's Bun exception, where the scoping is
-written into resolved q40 itself. **So the divergence is recorded rather than
-assumed away** (§13): the runtime work carries q40's mismatch clause back for a
-ratified amendment — the hash is repaired; the compiler version and the runtime
-are refused — before a hub ships the behaviour above. Until that lands, an
-implementer reading q40 alone and writing a hub that answers `409` to an
-unfamiliar `artifact_hash` locks every fresh worker out of the mesh permanently,
-which is the failure this paragraph exists to prevent.
+written into resolved q40 itself. **So the divergence is a gate rather than a
+note** (§13), and the gate has two halves. Before any hub implements either
+reading, q40's mismatch clause goes to the PRD's Open Questions and is resolved
+there — the hash is repaired; the compiler version and the runtime are refused —
+and the hub is written against *that* resolution. And until it lands, neither
+reading is available: shipping the proposal above would decide a PRD question in
+a downstream document, and an implementer reading q40 alone and writing a hub
+that answers `409` to an unfamiliar `artifact_hash` locks every fresh worker out
+of the mesh permanently. §12 is where that exclusion is stated against the
+runtime pass, and §13's row is what the pass has to close first.
+
+Moving the question into the PRD is not this document's act either: an amendment
+to a resolved entry is a change to `prd.md`, and a change to `prd.md` is a
+reviewed decision of its own rather than a paragraph a downstream document writes
+on its behalf. What this document can do is record the divergence precisely
+enough that the amendment is a transcription, and refuse to present it as settled
+in the meantime — which is what §13 does.
 
 A **compiler-version or runtime mismatch is a refused join** (`409`, §3.1), and
 the refusal names both sides:
@@ -755,8 +787,8 @@ issued under the one it replaced. That ending is the ending of §6.3 and costs t
 same: the next request on such a session meets `410`, the worker joins again, and
 *that* join is answered with the new artifact — which it fetches, materialises,
 and re-joins under, by §4's five steps. An unsettled dispatch on an ended session
-is abandoned exactly as §6.3 abandons one, so its node's attempt fails under that
-node's `retry:`/`on_error:` chain and the retry is dispatched under the new
+is superseded exactly as §6.3 supersedes one, so its node's attempt fails under
+that node's `retry:`/`on_error:` chain and the retry is dispatched under the new
 artifact rather than the old.
 
 This is the mechanism behind §4's "redeployment is automatic on the next join",
@@ -778,7 +810,7 @@ A hub MAY end those sessions the moment it rotates and MUST have ended them
 before it dispatches anything of the new artifact. Going on **serving** the
 previous artifact at §3.5 is not in tension with that, and the two together are
 deliberate: a hash stays fetchable after the sessions issued under it are gone,
-which is what lets the worker of an abandoned dispatch come back rather than be
+which is what lets the worker of a superseded dispatch come back rather than be
 stranded mid-rollback.
 
 ---
@@ -840,11 +872,12 @@ dispatch it has not settled. Two cases, and they are the whole rule.
   was ever this worker's. The placement's open placement-waits stay on the board
   untouched, and the next join claiming that placement takes them in park order
   (§6.2). This is the sleeping laptop, and it costs the execution nothing.
-- **The session had an unsettled dispatch.** The hub **abandons** it: the
-  dispatch is settled as failed, and the node's attempt fails with it, under that
-  node's `retry:`/`on_error:` chain exactly as §7.3 says — the liveness window is
-  what *detects* the mid-node disconnect §7.3 describes, and this paragraph is
-  where that detection is filed. Effects the worker had already streamed home
+- **The session had an unsettled dispatch.** The hub **supersedes** it — §3.4's
+  second terminal state, the one no result ended, and never the settled one — and
+  the node's attempt fails with it, under that node's `retry:`/`on_error:` chain
+  exactly as §7.3 says — the liveness window is what *detects* the mid-node
+  disconnect §7.3 describes, and this paragraph is where that detection is
+  filed. Effects the worker had already streamed home
   stay in the journal and are handed to the next attempt as its `effect_history`
   (§7.2). Where `retry:` grants that attempt, it re-enters dispatch and **parks
   on the board if no worker is claiming the placement** (§6.2) — which is the
@@ -852,13 +885,15 @@ dispatch it has not settled. Two cases, and they are the whole rule.
 
 A revived worker meets both halves of §3 in order, and the order is the point.
 Its first request carries a session the hub has forgotten, so it is answered
-`410` and the worker joins again. The result it then posts for the abandoned
-dispatch is answered `409` and discarded (§3.4) — the "already-superseded" case,
-and abandoning the dispatch is what supersedes it. The effect batches it still
-holds are a different matter and **are** journaled: they are keyed by effect key
-and scoped to their execution, not to a session or a dispatch (§3.3), so a batch
-in flight when the lid closed reaches the journal on the re-send and the retry
-replays it instead of re-issuing it (§7.2).
+`410` and the worker joins again. The result it then posts for that dispatch is
+answered `409` and discarded (§3.4) — the superseded row, because this
+declaration is what superseded it. It is never the `204` row: that one is a
+dispatch a **result** ended, and this is one the hub ended without one, which is
+the whole of why §3.4 gives the two endings two verbs. The effect batches it
+still holds are a different matter and **are** journaled: they are keyed by
+effect key and scoped to their execution, not to a session or a dispatch (§3.3),
+so a batch in flight when the lid closed reaches the journal on the re-send and
+the retry replays it instead of re-issuing it (§7.2).
 
 PRD resolved q39 puts this as "heartbeat loss re-parks what was queued to the
 vanished worker". The phrase is written in the vocabulary of a push model, where
@@ -873,7 +908,7 @@ failure rather than a pause (§6.4).
 
 **This is the rule §2's open capacity question would move.** A session allowed to
 hold more than one dispatch makes "what was queued" a plural, and the choice
-between abandoning all of it and handing back the part no effect record vouches
+between superseding all of it and handing back the part no effect record vouches
 for is a choice about what a closed laptop costs an execution — which is why §2
 sends the capacity to the PRD (§13) instead of leaving it to a hub's
 configuration.
@@ -953,10 +988,10 @@ re-issuing them: a model call already paid for is not paid for twice.
 **What detects the disconnect is the liveness window of §2, and the hub is the
 side that declares it** — §6.3 states that rule and this section is its
 consequence. A disconnect is therefore never observed as such: it is a session
-that stopped making requests while holding a dispatch, which the hub abandons,
-which fails the attempt. A worker that comes back afterwards learns so from the
-`409` its re-posted result meets (§3.4, §6.3), and takes part in the retry only
-by joining like anyone else.
+that stopped making requests while holding a dispatch, which the hub supersedes
+(§3.4), which fails the attempt. A worker that comes back afterwards learns so
+from the `409` its re-posted result meets (§3.4, §6.3), and takes part in the
+retry only by joining like anyone else.
 
 ### 7.4 What LangGraph is here
 
@@ -1229,7 +1264,7 @@ the previous version behave **wrongly** rather than be refused:
   join refusal that started meaning it is the same case from the other side;
 * shortening the **liveness window** of §2. Lengthening it is compatible;
   shortening it is not, because the first thing an older worker learns about the
-  new one is a `409` on the result of a dispatch abandoned underneath it (§6.3).
+  new one is a `409` on the result of a dispatch superseded underneath it (§6.3).
 
 A bump is a statement that workers of the older release cannot join this hub,
 and §3.1's `409` is what enforces it. Because a worker and a hub are built from
@@ -1291,25 +1326,50 @@ document and in the grammar that say so, and enumerates what the runtime pass ha
 to unwind — including teaching the environment manifest about §9.1's partition,
 which is the half of the surface with no sentence of its own.
 
-This document is what that runtime will be held to.
+This document is what that runtime will be held to — **except the rows of §13**,
+which are the clauses it does not settle. Those are not wire this document fixes,
+and the runtime pass is held to the PRD's answer to each rather than to the
+placeholder §13 records.
 
 ---
 
 ## 13. What this document does not settle
 
 Three questions are **open**, and each one is here because a normative document
-may fix a wire and may not fix a design decision the PRD has not made. The
-project's discipline is that a new design question lands in the PRD's Open
-Questions and is resolved there before the affected area is implemented; these
-are that list, staged, and the runtime work carries them over before it writes
-the code each one governs.
+may fix a wire and may not fix a design decision the PRD has not made. `prd.md`
+is the single source of truth for design decisions; this document is downstream
+of it, and §12's "held to" stops at this table.
+
+**So this section is a gate, not a note.** The project's discipline is that a new
+design question lands in the PRD's Open Questions and is resolved there before
+the affected area is implemented. These three are that list *staged*, which is as
+far as this document can take them: entering a question in the PRD's Open
+Questions, and resolving it there, is a change to `prd.md` and a reviewed
+decision of its own — never something a downstream document performs by
+describing it. **Before the runtime pass writes the code a row governs, that
+row's question must be in the PRD's Open Questions and resolved there, and the
+code written against the resolution rather than against the cell below.** An
+implementation that reads a "what stands in the meantime" cell as wire has
+decided a PRD question in a downstream document, which is the thing this section
+exists to prevent; `crates/compose-core/tests/placement_surface_inertness.rs`
+carries the same duty in its unwind list.
+
+The three rows are not the same shape, and the difference decides how hard each
+gate bites. The first and third are **gaps** — no resolved entry speaks to them,
+each is filled here conservatively, and the wire admits any answer additively, so
+what the PRD owes is a decision rather than a correction. The second is a
+**contradiction**: a resolved entry says one thing and §4.1 argues for another,
+so until the PRD is amended there is no reading of it a hub may implement at all.
 
 | | what is unsettled | what stands in the meantime |
 |---|---|---|
-| **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it, and the wire admits any other answer additively (an OPTIONAL capacity at join, §10.2) |
-| **the artifact-hash half of resolved q40** (§4.1) | q40 reads "pinned by artifact hash and compiler version in the handshake; a mismatch is a refused join naming both", and §4.1 repairs a hash mismatch rather than refusing it, because a cold start has no hash to send and a refusal would make bootstrap impossible. The amendment q40 needs is that clause reading on the compiler version and the runtime | §4.1's behaviour, recorded there as a divergence rather than presented as a reading |
+| **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it — a v1 default this document proposes, which no resolved entry contradicts and none has weighed. The wire admits any other answer additively (an OPTIONAL capacity at join, §10.2), so the runtime may build against one; **raising** it is what the PRD has to answer first |
+| **the artifact-hash half of resolved q40** (§4.1) | q40 reads "pinned by artifact hash and compiler version in the handshake; a mismatch is a refused join naming both", and §4.1 repairs a hash mismatch rather than refusing it, because a cold start has no hash to send and a refusal would make bootstrap impossible. The amendment q40 needs is that clause reading on the compiler version and the runtime | **nothing on the wire**: §4.1 records its behaviour as the proposal the amendment should ratify, not as a rule a hub may implement before it does, and q40's literal reading is the one that locks fresh workers out. This is the row that blocks — no hub implements the join's hash branch either way until the amendment lands |
 | **containment beyond the process boundary** (§11) | resolved q31 fixed v1 containment at root plus timeout and deferred containers, seccomp and "any deploy-target-level restriction (refusing bash on a distributed placement is a placement fact)" **to the distribution work**. The distribution resolutions did not take it up, and q44's out-list does not name it, so nothing has decided whether a placement may carry a sandbox or a capability restriction | no such key exists, in the grammar or on the wire; a worker runs the artifact with its own privileges. Grammar D128 retires the reserved `network:` key on the ground that no *resolved* containment story backs it, which is a statement about today rather than about what a later resolution may add |
 
-None of the three blocks the runtime: each names what stands until the PRD
-answers it, and each is written so the answer is additive rather than a re-cut.
-What they do block is an implementation deciding any of them quietly.
+Two of the three do not block the runtime: each names a default that stands until
+the PRD answers, and each answer arrives additively rather than as a re-cut. The
+middle row **does** block, and deliberately — a contradiction has no conservative
+default to stand on, so the join's hash branch waits for its amendment while the
+rest of §3.1 is built. What all three block is an implementation deciding any of
+them quietly.
