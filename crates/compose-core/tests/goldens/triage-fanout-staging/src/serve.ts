@@ -2192,6 +2192,7 @@ function report(execution: Execution): Promise<Record<string, unknown>> {
     interrupts: waits.map((wait) => question(execution, wait)),
     placements: placed.map((wait) => ({
       wait_id: wait.id,
+      dispatch_id: wait.dispatch,
       placement: wait.placement,
       node: wait.node,
       instance_path: wait.site,

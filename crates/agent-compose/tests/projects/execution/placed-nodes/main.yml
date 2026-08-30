@@ -1,0 +1,217 @@
+# Acceptance fixture: nodes that execute somewhere else.
+#
+# `docs/distributed.md` fixes a hub/worker protocol, and this composition is what
+# a hub of it looks like: a deploy layer with a `hub:` and one placement, and
+# three constructs that reach a placed component in the three ways a graph can —
+# an `agent:` node, a `function:` node over a placed tool, and a `map` whose
+# dispatch target is placed.
+#
+# What each one is here for:
+#
+#   * `flow.release` is the steady state. `sign` dispatches `agent.signer` to
+#     whichever worker claims `mac`; `stamp` is a `function:` node over an
+#     **unplaced** tool, so it runs on the hub in the same execution — which is
+#     what makes "a placement decides which process runs a node" observable
+#     rather than asserted, since one run does both.
+#   * `flow.retried` is the mid-node disconnect (§6.3, §7.3): the same dispatch
+#     under a `retry:`, so a superseded attempt is followed by another that parks
+#     again and can be answered. Without a `retry:` the supersede would be the
+#     end of the run and there would be nothing to observe about the re-park.
+#   * `flow.batch` is §2's queueing clause: a `map` admitting four items onto a
+#     placement whose pool is whatever showed up. The map declares how many
+#     instances the *graph* may have in flight; how many are **running** is the
+#     number of live sessions claiming `mac`, and the rest are undispatched.
+#
+# `agent.signer` attaches `tool.sign` and both are members of `mac`, which is
+# grammar §14.1 rule 4's second row: the same answer written twice. `tool.sign`'s
+# `${KEYCHAIN_PASSWORD}` is `docs/distributed.md` §9.1's own worked example — it
+# belongs to `mac`'s manifest and not to the hub's, because the hub never runs
+# the tool.
+#
+# Nothing here scripts a model call for the placed agent, and that is the point:
+# a placed node's answer arrives over `/workers/result`, so the hub calls no
+# provider for it at all. `tool.notarize` is the hub's own work, and it is an
+# `exec:` for the same reason — one run, two processes, no network.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+  on_error: fail
+
+state:
+  signature:
+    description: What the worker signed, as it came back over the wire.
+    type: string
+    default: ""
+  ticket:
+    description: What the hub's own node produced, in the same execution.
+    type: string
+    default: ""
+  signatures:
+    description: One entry per dispatched item, in source-item order.
+    type: array
+    max_items: 8
+    items: { type: string }
+    reduce: append
+
+triggers:
+  # `respond: async` throughout: a placed node parks until a worker takes it, so
+  # every execution here outlives its request by construction.
+  on_release:
+    type: http
+    flow: flow.release
+    path: /releases
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_retried_release:
+    type: http
+    flow: flow.retried
+    path: /retried-releases
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_batch:
+    type: http
+    flow: flow.batch
+    path: /batches
+    method: POST
+    input:
+      paths: "payload.body.paths"
+    respond: async
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+# The placed tool: its secret is the one §9.1 works through, and it never reaches
+# the hub's manifest because the hub never runs it.
+tool.sign:
+  description: Sign one path with the machine's keychain.
+  input:
+    path: { type: string }
+  output:
+    signature: { type: string }
+  exec:
+    command: "${OPS_BIN}/echo"
+    args: ['{"signature":"signed"}']
+    env:
+      KEYCHAIN_PASSWORD: ${KEYCHAIN_PASSWORD}
+
+# The hub's own: unplaced, and reached from a `function:` node, where a tool's
+# own placement would be the whole answer if it had one (grammar §14.1).
+tool.notarize:
+  description: Submit a signed path for notarization.
+  input:
+    path: { type: string }
+  output:
+    ticket: { type: string }
+  exec:
+    command: "${OPS_BIN}/echo"
+    args: ["notarized"]
+
+agent.signer:
+  description: Sign a release on the machine that holds the keys.
+  model: model.smart
+  prompt: |
+    Sign the path you are given and report what the signature is.
+  tools: [tool.sign]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+flow.release:
+  description: Sign a release on a worker, and notarize it on the hub.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+    ticket:
+      type: string
+  nodes:
+    sign:
+      agent: agent.signer
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+
+    stamp:
+      function: tool.notarize
+      input:
+        path: "input.path"
+      writes:
+        ticket: ticket
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: stamp }
+    - { from: stamp, to: end }
+
+flow.retried:
+  description: The same sign-off, under a retry the hub can spend on it.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    sign:
+      agent: agent.signer
+      # Two attempts, and no backoff worth waiting for: what is being exercised
+      # is that a superseded dispatch fails **an attempt** rather than the run
+      # (§6.3), so the second attempt has to be reachable inside a test.
+      retry: { max: 2, backoff: 1ms }
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+
+flow.batch:
+  description: Fan out over several paths, each signed on a worker.
+  inputs:
+    paths:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    signatures:
+      type: array
+      max_items: 8
+      items: { type: string }
+  nodes:
+    fan:
+      map:
+        over: input.paths
+        as: path
+        node: agent.signer
+        max_concurrency: 4
+        input:
+          path: "path"
+        writes:
+          signature: signatures
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

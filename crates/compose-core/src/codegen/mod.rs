@@ -1031,6 +1031,32 @@ pub(crate) mod test_support {
     /// Panics when the composition does not resolve, naming what was reported:
     /// a test whose input is invalid is a broken test, not a finding.
     pub fn ir_of(source: &str) -> Ir {
+        placed(source, None)
+    }
+
+    /// The same, with a deploy layer, resolved under the target `mesh`.
+    ///
+    /// What the environment partition's tests need and [`ir_of`] cannot give:
+    /// `placements:` is a deploy-layer section, so a composition without one
+    /// resolves to an artifact with nothing to partition (grammar §14.1).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the composition does not resolve **or does not validate**.
+    /// The deploy layer's own rules — disjointness, the colocation of an
+    /// attached tool — are what a partition is computed over, so a fixture the
+    /// validator would refuse is a fixture whose answer means nothing.
+    pub fn ir_of_mesh(source: &str, deploy: &str) -> Ir {
+        let ir = placed(source, Some(deploy));
+        let diagnostics = crate::check(&ir);
+        assert!(
+            diagnostics.is_empty(),
+            "the test composition does not validate: {diagnostics:#?}"
+        );
+        ir
+    }
+
+    fn placed(source: &str, deploy: Option<&str>) -> Ir {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let directory = std::env::temp_dir().join(format!(
             "agent-compose-codegen-{}-{}",
@@ -1040,7 +1066,14 @@ pub(crate) mod test_support {
         std::fs::create_dir_all(&directory).expect("a scratch directory");
         let entrypoint = directory.join("main.yml");
         std::fs::write(&entrypoint, source).expect("the entrypoint is writable");
-        let resolution = crate::resolve(&entrypoint);
+        let resolution = if let Some(deploy) = deploy {
+            std::fs::create_dir_all(directory.join("deploy")).expect("a deploy directory");
+            std::fs::write(directory.join("deploy/mesh.yml"), deploy)
+                .expect("the deploy file is writable");
+            crate::resolve_with_target(&entrypoint, "mesh")
+        } else {
+            crate::resolve(&entrypoint)
+        };
         let _ = std::fs::remove_dir_all(&directory);
         assert!(
             resolution.diagnostics.is_empty(),

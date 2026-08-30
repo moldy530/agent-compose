@@ -136,6 +136,14 @@ pub const FIXTURES: &[&str] = &[
     "http-trigger",
     "keyless-gateway",
     "model-failover",
+    // The one fixture whose subject is a *target* rather than a composition:
+    // `deploy/mesh.yml` places two of its components, and every test that drives
+    // it is in `tests/distributed_hub_wire.rs`, served under that target
+    // (`docs/distributed.md` §3). Under `local` — which is what
+    // `the_acceptance_fixtures_validate_clean` resolves it as, and which it has
+    // no deploy file for — it places nothing and is an ordinary single-process
+    // project, which is exactly the claim grammar §14 makes about the layer.
+    "placed-nodes",
     "provider-kinds",
     "server-tools",
     "stores",
@@ -326,6 +334,15 @@ impl Scratch {
         ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("a scratch directory");
+        Self(path)
+    }
+
+    /// Take ownership of a directory somebody else made.
+    ///
+    /// What a test needs when one directory outlives **two** processes — a hub
+    /// restarted against its own journal is the case — so the removal happens
+    /// when the test ends rather than when the first of them does.
+    pub fn at(path: PathBuf) -> Self {
         Self(path)
     }
 
@@ -1459,6 +1476,25 @@ pub fn serve_entrypoint_into(
     entrypoint: &Path,
     environment: &[(String, String)],
 ) -> Option<Served> {
+    serve_target_into(out, entrypoint, DEFAULT_TARGET, environment)
+}
+
+/// The built-in target, which `serve` takes when none is named (grammar §14).
+const DEFAULT_TARGET: &str = "local";
+
+/// The same again, resolved for a **named target**.
+///
+/// Which is what the worker protocol needs from this harness and nothing else
+/// does: `hub:` and `placements:` are deploy-layer sections, so a mesh is a
+/// *target* of a composition rather than a composition — the same fixture served
+/// under `local` places nothing and mounts no `/workers/*` route at all
+/// (`docs/distributed.md` §1.1, §3).
+pub fn serve_target_into(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    environment: &[(String, String)],
+) -> Option<Served> {
     // The toolchain check `scratch_project` makes on the caller's behalf, made
     // here too: this entry point is handed a directory rather than asking for
     // one, and a run with no Bun has nothing to serve.
@@ -1468,6 +1504,7 @@ pub fn serve_entrypoint_into(
         .arg("serve")
         .arg(entrypoint)
         .args(["--port", "0"])
+        .args(["--target", target])
         .arg("--out")
         .arg(out)
         .stdout(Stdio::piped())
@@ -1554,6 +1591,30 @@ pub fn serve_refused_with(
         .arg(&out);
     seal(&mut command, environment);
     Some(command.output().expect("the command runs"))
+}
+
+/// The same again, for a **named target** and a directory the caller owns.
+///
+/// The mesh's two launch checks are what this is for — a `hub.join_token:` that
+/// resolved to nothing, and a poll hold that is not shorter than the liveness
+/// window — and both are properties of a target that declares `placements:`
+/// (`docs/distributed.md` §2, §3).
+pub fn serve_refused_target(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    environment: &[(String, String)],
+) -> Output {
+    let mut command = agent_compose();
+    command
+        .arg("serve")
+        .arg(entrypoint)
+        .args(["--port", "0"])
+        .args(["--target", target])
+        .arg("--out")
+        .arg(out);
+    seal(&mut command, environment);
+    command.output().expect("the command runs")
 }
 
 /// Run one SQL script against a built project's journal, through the driver the

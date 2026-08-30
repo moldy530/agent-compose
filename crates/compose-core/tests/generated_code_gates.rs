@@ -664,6 +664,26 @@ const REDUCTIONS: &[Reduction] = &[
             "messages": []
         }"#,
     },
+    Reduction {
+        // The mesh golden's state model, which is the graph's and nothing to do
+        // with where its nodes run: `signature` and `ticket` are plain
+        // `last_wins` defaults written by two nodes in two *processes*, and
+        // `signatures` is the `append` channel a fan-out onto a placement fills.
+        // What this pins is that a placed node's answer reaches a channel the
+        // same way a local one's does — the seam is the activity, and grammar
+        // 10.3's write map never learns about it.
+        golden: "placed-nodes",
+        writes: r#"[
+            { "signature": "signed", "signatures": "one" },
+            { "ticket": "notarized", "signatures": "two" }
+        ]"#,
+        expected: r#"{
+            "signature": "signed",
+            "ticket": "notarized",
+            "signatures": ["one", "two"],
+            "messages": []
+        }"#,
+    },
 ];
 
 /// One case of the schema-lowering corpus.

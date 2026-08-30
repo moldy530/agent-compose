@@ -746,7 +746,176 @@ export function readEnvironment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::test_support::ir_of;
+    use crate::codegen::test_support::{ir_of, ir_of_mesh};
+
+    /// The variables one process of a deployment needs, sorted.
+    fn manifest(ir: &Ir, partition: &Partition, process: &Process) -> Vec<String> {
+        References::for_process(ir, partition, process)
+            .names()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A composition and a deploy layer, partitioned.
+    fn partitioned(source: &str, deploy: &str) -> (Ir, Partition) {
+        let ir = ir_of_mesh(source, deploy);
+        let partition = Partition::of(&ir);
+        (ir, partition)
+    }
+
+    /// **`docs/distributed.md` §9.1's first worked example**, which is the case
+    /// the partition rule exists for.
+    ///
+    /// > `tool.sign` carries `KEYCHAIN_PASSWORD` in its `exec.env`, `agent.signer`
+    /// > attaches it, and the deploy file places `agent.signer` in `mac` and
+    /// > nothing else. `validate` accepts that — §14.1 rule 4's first row, the
+    /// > tool claims nothing and runs where the agent runs. `KEYCHAIN_PASSWORD`
+    /// > belongs to **`mac`'s** manifest and **not** to the hub's: the hub never
+    /// > runs `tool.sign`, so requiring the secret there would be a false
+    /// > requirement, and omitting it from `mac`'s would let a machine without a
+    /// > keychain join clean (§9.2) and fail on its first dispatch.
+    ///
+    /// Both halves are asserted, because each is a different failure: the hub's
+    /// is a deployment that refuses to start over a value it never reads, and
+    /// `mac`'s is the machine §9.2's join-time check exists to catch getting in.
+    #[test]
+    fn the_keychain_password_of_a_placed_agents_attached_tool_is_that_placements_alone() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai\n  api_key: ${VENDOR_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+tool.sign:\n  description: Sign one artifact.\n  input: { path: { type: string } }\n  output: { signature: { type: string } }\n  exec:\n    command: codesign\n    env:\n      KEYCHAIN_PASSWORD: ${KEYCHAIN_PASSWORD}\n\
+agent.signer:\n  model: model.smart\n  prompt: Sign what you are given.\n  tools: [tool.sign]\n  input: { path: { type: string } }\n  output: { verdict: { type: string } }\n\
+flow.release:\n  inputs:\n    path: { type: string }\n  outputs: {}\n  nodes:\n    sign:\n      agent: agent.signer\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: sign }\n    - { from: sign, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.signer]\n",
+        );
+
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Placement("mac".to_string())),
+            ["KEYCHAIN_PASSWORD", "VENDOR_KEY"],
+            "the worker runs the agent and the tool it attaches, so it needs both their secrets"
+        );
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Hub),
+            ["MESH_TOKEN"],
+            "the hub runs neither the agent nor its tool: all it holds is the mesh's own \
+             credential (§9.1's fifth clause)"
+        );
+    }
+
+    /// **§9.1's second worked example**, "from the other side, because the
+    /// symmetric mistake is the expensive one".
+    ///
+    /// > `agent.outer` is placed in `mac` and attaches `flow.review`, whose one
+    /// > `agent:` node names `agent.inner`, which is unplaced and reads
+    /// > `${INNER_KEY}`. Every call *through `agent.outer`* runs `agent.inner`
+    /// > on the `mac` worker, so `INNER_KEY` belongs to `mac`'s manifest — and it
+    /// > belongs to the **hub's** as well, because `agent-compose run main.yml
+    /// > flow.review` starts that flow on the hub and the hub dispatches
+    /// > `agent.inner` itself.
+    ///
+    /// The clause that produces the second half is the unconditional one: an
+    /// unplaced `agent.*` is dispatched by the hub whatever else reaches it
+    /// (grammar Decision D64). A partition that read "reached by something
+    /// placed" as "therefore not the hub's" would pass `readEnvironment()` and
+    /// fail at the first direct run's first model call.
+    #[test]
+    fn a_key_an_attached_flow_reaches_belongs_to_the_worker_and_to_the_hub() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.outer:\n  kind: openai\n  api_key: ${OUTER_KEY}\n\
+provider.inner:\n  kind: openai\n  api_key: ${INNER_KEY}\n\
+model.outer:\n  provider: provider.outer\n  id: some-model\n\
+model.inner:\n  provider: provider.inner\n  id: some-model\n\
+agent.inner:\n  model: model.inner\n  prompt: Review it.\n  input: { finding: { type: string } }\n  output: { note: { type: string } }\n\
+flow.review:\n  description: Have the reviewer look at one finding.\n  inputs:\n    finding: { type: string }\n  outputs: {}\n  nodes:\n    look:\n      agent: agent.inner\n      input:\n        finding: \"input.finding\"\n  edges:\n    - { from: start, to: look }\n    - { from: look, to: end }\n\
+agent.outer:\n  model: model.outer\n  prompt: Ask the reviewer.\n  tools: [flow.review]\n  input: { finding: { type: string } }\n  output: { verdict: { type: string } }\n\
+flow.release:\n  inputs:\n    finding: { type: string }\n  outputs: {}\n  nodes:\n    ask:\n      agent: agent.outer\n      input:\n        finding: \"input.finding\"\n  edges:\n    - { from: start, to: ask }\n    - { from: ask, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.outer]\n",
+        );
+
+        let mac = manifest(&ir, &partition, &Process::Placement("mac".to_string()));
+        assert!(
+            mac.contains(&"INNER_KEY".to_string()),
+            "every call through `agent.outer` runs `agent.inner` in the worker's own tool loop: \
+             {mac:?}"
+        );
+        assert!(mac.contains(&"OUTER_KEY".to_string()), "{mac:?}");
+
+        let hub = manifest(&ir, &partition, &Process::Hub);
+        assert!(
+            hub.contains(&"INNER_KEY".to_string()),
+            "`agent.inner` is unplaced, so the hub dispatches it whenever `flow.review` is \
+             started directly — being reached from a placed agent's tool loop adds a placement, \
+             it never moves the variable off the hub's list (§9.1): {hub:?}"
+        );
+        assert!(
+            !hub.contains(&"OUTER_KEY".to_string()),
+            "`agent.outer` is placed, so the hub never spends its provider's credential: {hub:?}"
+        );
+    }
+
+    /// The rule that is unconditional is unconditional in both directions.
+    ///
+    /// An unplaced `tool.*` a `function:` node names is the hub's (§9.1),
+    /// **and** the placement's of every agent that attaches it — two placed
+    /// agents attaching one unplaced tool is "the ordinary case, and the tool's
+    /// secrets go to both placements".
+    #[test]
+    fn a_tool_two_placements_reach_and_the_hub_dispatches_belongs_to_all_three() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai\n  api_key: ${VENDOR_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+tool.shared:\n  description: Look something up.\n  input: { q: { type: string } }\n  output: { hit: { type: string } }\n  exec:\n    command: lookup\n    env:\n      SHARED_TOKEN: ${SHARED_TOKEN}\n\
+agent.left:\n  model: model.smart\n  prompt: Ask.\n  tools: [tool.shared]\n  input: { q: { type: string } }\n  output: { a: { type: string } }\n\
+agent.right:\n  model: model.smart\n  prompt: Ask again.\n  tools: [tool.shared]\n  input: { q: { type: string } }\n  output: { a: { type: string } }\n\
+flow.both:\n  inputs:\n    q: { type: string }\n  outputs: {}\n  nodes:\n    left:\n      agent: agent.left\n      input:\n        q: \"input.q\"\n    right:\n      agent: agent.right\n      input:\n        q: \"input.q\"\n    direct:\n      function: tool.shared\n      input:\n        q: \"input.q\"\n  edges:\n    - { from: start, to: left }\n    - { from: left, to: right }\n    - { from: right, to: direct }\n    - { from: direct, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  one:\n    members: [agent.left]\n  two:\n    members: [agent.right]\n",
+        );
+
+        for placement in ["one", "two"] {
+            let held = manifest(&ir, &partition, &Process::Placement(placement.to_string()));
+            assert!(
+                held.contains(&"SHARED_TOKEN".to_string()),
+                "`{placement}` attaches `tool.shared` and does not hold its secret: {held:?}"
+            );
+        }
+        let hub = manifest(&ir, &partition, &Process::Hub);
+        assert!(
+            hub.contains(&"SHARED_TOKEN".to_string()),
+            "a `function:` node names `tool.shared` directly, and the hub's scheduler is what \
+             starts that node: {hub:?}"
+        );
+        assert!(
+            !hub.contains(&"VENDOR_KEY".to_string()),
+            "both agents are placed, so the hub calls no model: {hub:?}"
+        );
+    }
+
+    /// A composition with no `placements:` partitions to exactly what it always
+    /// had — the whole environment, on the hub.
+    ///
+    /// The over-narrowing guard: every clause above takes something *off* the
+    /// hub's list, and a rule that took too much would leave a single-process
+    /// deployment starting without a variable it needs.
+    #[test]
+    fn a_composition_that_places_nothing_gives_the_hub_the_whole_environment() {
+        let ir = ir_of(PROJECT);
+        let partition = Partition::of(&ir);
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Hub),
+            References::of(&ir).names().collect::<Vec<_>>(),
+            "with nothing placed, the hub is the only process there is"
+        );
+        assert_eq!(partition.processes().count(), 1);
+    }
 
     const PROJECT: &str = "version: \"0.1\"\n\
 provider.p:\n  kind: openai_compatible\n  api_key: ${LLM_KEY}\n  base_url: ${LLM_URL}\n\

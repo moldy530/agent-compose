@@ -220,8 +220,19 @@ export interface PlacedAnswer {
 
 /** One placement wait, as a status report publishes it. */
 export interface PlacementWait {
-  /** `<instance path>/<ordinal>` — the identity §6.1 fixes. */
+  /**
+   * `<instance path>/<ordinal>` — the identity §6.1 fixes.
+   *
+   * **Deterministic**, which is the whole of what §6.1 asks of it: a resumed
+   * execution re-parks under the identity it parked under before, so a report
+   * taken from one process names the same wait as a report taken from the one
+   * that replaced it. The `dispatch_id` beside it is not — it is the issuing
+   * hub's own handle (§10.1) — which is why the two are separate fields rather
+   * than one.
+   */
   readonly id: string;
+  /** `dsp_…` — what a poll answers with and a result is attributed by (§3.4). */
+  readonly dispatch: string;
   readonly execution: string;
   readonly placement: string;
   readonly node: string;
@@ -457,24 +468,20 @@ export function placementWaits(execution: string): readonly PlacementWait[] {
   const found: PlacementWait[] = [];
   for (const [id, held] of awaiting) {
     if (held.execution !== execution) continue;
-    found.push({ id, execution, ...describe(id, held) });
+    const row = rows.get(id);
+    found.push({
+      // The journal's identity, not this process's handle: see [`PlacementWait`].
+      id: row?.wait ?? held.site,
+      dispatch: id,
+      execution,
+      placement: row?.placement ?? "",
+      node: row?.node ?? "",
+      site: held.site,
+      parkedAt: row?.parkedAt ?? "",
+      status: held.taken ? "dispatched" : "parked",
+    });
   }
   return found.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
-}
-
-/** What a report says about one held dispatch, read off the row behind it. */
-function describe(
-  id: string,
-  held: Awaiting,
-): Omit<PlacementWait, "id" | "execution"> {
-  const row = rows.get(id);
-  return {
-    placement: row?.placement ?? "",
-    node: row?.node ?? "",
-    site: held.site,
-    parkedAt: row?.parkedAt ?? "",
-    status: held.taken ? "dispatched" : "parked",
-  };
 }
 
 /**
