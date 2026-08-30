@@ -72,6 +72,40 @@ const SIGNING_FLOW: &str = r#"flow.sign:
     - { from: build, to: end }
 "#;
 
+/// A flow whose `map` fans out over the schemes it was handed, dispatching
+/// whatever a case names.
+///
+/// The `map` is the other half of grammar 7.7 clause 2, and it reaches a
+/// component by a construct the `agent:`/`function:` nodes above do not: a
+/// dispatch target rather than a node's own address. Both target namespaces a
+/// placement may hold — `agent.*` and `tool.*` — take the same `scheme:` input,
+/// so one flow serves both cases and the only difference between them is the
+/// address under test.
+fn fanout(target: &str) -> String {
+    format!(
+        r#"flow.fan:
+  description: Build every requested scheme.
+  inputs:
+    schemes:
+      type: array
+      max_items: 4
+      items: {{ type: string }}
+  outputs: {{}}
+  nodes:
+    build:
+      map:
+        over: "input.schemes"
+        node: {target}
+        max_concurrency: 2
+        input:
+          scheme: "item"
+  edges:
+    - {{ from: start, to: build }}
+    - {{ from: build, to: end }}
+"#
+    )
+}
+
 /// A scratch project of this test's own, cleaned out before use.
 fn project(name: &str, spec: &str, deploy: &str) -> PathBuf {
     let directory = std::env::temp_dir()
@@ -431,6 +465,73 @@ fn placing_that_inner_agent_too_is_the_repair() {
         "attached-flow-inner-agent-placed",
         &spec,
         &mesh("  mac:\n    members: [agent.outer, agent.inner, tool.xcodebuild]\n"),
+    );
+}
+
+/// A `map` inside an attached flow reaches its **tool** targets, and they are
+/// held to the rule too.
+///
+/// Grammar 7.7 clause 2 is the dispatch half of the reachability relation, and a
+/// `map` is the only construct that names a component without a node of its own
+/// carrying the address. The instance still runs in the attaching agent's tool
+/// loop, so a `mac` tool fanned out from a flow an unplaced agent attaches would
+/// run on the hub — a placement written, accepted, and silently ignored, which
+/// is the failure the whole rule exists for, one construct further out.
+///
+/// Without this case the tool arm of the walk's `map` dispatch is unguarded: the
+/// composition below is accepted with the arm deleted, and nothing else in the
+/// repository dispatches a placed component from a flow an agent attaches.
+#[test]
+fn a_placed_tool_dispatched_by_a_map_inside_an_attached_flow_is_refused() {
+    refuses(
+        "map-tool",
+        &format!(
+            "{BACKEND}{}{}",
+            fanout("tool.xcodebuild"),
+            agent("reviewer", "flow.fan")
+        ),
+        &mesh("  mac:\n    members: [tool.xcodebuild]\n"),
+        "`tool.xcodebuild` is a member of placement `mac`, and `agent.reviewer` that reaches it \
+         through the attached `flow.fan` has no placement, so it runs on the hub",
+    );
+}
+
+/// …and its **agent** targets, which reach the walk by the other arm.
+///
+/// The two arms are separate lines of the traversal and fail separately: the
+/// agent arm also has to record the target, not merely follow what that agent
+/// attaches. `agent.signer` attaches nothing here, so the report can only come
+/// from the dispatch site itself.
+#[test]
+fn a_placed_agent_dispatched_by_a_map_inside_an_attached_flow_is_refused() {
+    refuses(
+        "map-agent",
+        &format!(
+            "{BACKEND}{}{}{}",
+            agent("signer", ""),
+            fanout("agent.signer"),
+            agent("reviewer", "flow.fan")
+        ),
+        &mesh("  mac:\n    members: [agent.signer]\n"),
+        "`agent.signer` is a member of placement `mac`, and `agent.reviewer` that reaches it \
+         through the attached `flow.fan` has no placement, so it runs on the hub",
+    );
+}
+
+/// …and the agreeing arrangement stays writable, which is the half a negative
+/// corpus cannot hold: a fan-out inside an attached flow is the ordinary shape
+/// of "do this on the Mac, for each of these", and a rule one token too tight
+/// here makes it unwritable.
+#[test]
+fn a_map_inside_an_attached_flow_may_reach_the_agents_own_placement() {
+    accepts(
+        "map-agreeing",
+        &format!(
+            "{BACKEND}{}{}",
+            fanout("tool.xcodebuild"),
+            agent("reviewer", "flow.fan")
+        ),
+        &mesh("  mac:\n    members: [agent.reviewer, tool.xcodebuild]\n"),
     );
 }
 
