@@ -237,6 +237,7 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
         }
     }
     body.push_str(&registry_source(ir, names, &registry, &mut imported));
+    body.push_str(&placed_source(ir, names));
 
     contents.push_str("\nimport { END, START, StateGraph } from \"@langchain/langgraph\";\n");
     contents.push_str("\nimport * as mesh from \"./mesh.ts\";\n");
@@ -3959,6 +3960,163 @@ fn control_name_raw(target: &ControlTarget) -> String {
         ControlTarget::End => "__end__".to_string(),
     }
 }
+
+/// `placedNodes`: what each placed call site **does**, for the process that
+/// executes it (`docs/distributed.md` §3.2, §7.4).
+///
+/// The other half of the seam whose hub side is `mesh.dispatchPlaced`. Every
+/// site that dispatches gets an entry here under the address the dispatch names,
+/// and the entry is the activity the node would have run had nothing been placed
+/// — so the two are lowered from one description and cannot drift into two
+/// behaviours for one node.
+///
+/// # Why it is keyed by the dispatch's address rather than by the placement
+///
+/// Because §2 queues work to a placement and hands over a *node*: the dispatch
+/// carries `node`, and a placement holds as many of these as its members are
+/// reached by. The three keys are the three ways a graph reaches a placed
+/// component (grammar §14.1): `<flow>.<node>` for an `agent:` node and for a
+/// `function:` node, and the component's own address for a `map` dispatch
+/// target, which is the address `dispatch_run` puts on the wire.
+///
+/// # What a worker does not get, and where that is decided
+///
+/// The activity is handed the dispatch's inputs and nothing else, because
+/// `docs/distributed.md` §3.2 fixes the payload and it carries no conversation
+/// history and no instance policy. So a placed `agent:` node runs on an **empty**
+/// history where a local one would see the `messages` channel's turns
+/// (grammar §10.4) — a `map`-dispatched agent already runs on an empty one by
+/// grammar §8.6's own rule (D105), so the two agree there. It is a difference the
+/// wire would have to grow an OPTIONAL field to close (§10.2), which is a change
+/// to the protocol document rather than to this emitter.
+fn placed_source(ir: &Ir, names: &Names) -> String {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut push = |key: String, body: String, seen: &mut BTreeSet<String>| {
+        if seen.insert(key.clone()) {
+            entries.push((key, body));
+        }
+    };
+    for (address, definition) in &ir.definitions {
+        let DefinitionBody::Flow(flow) = &definition.body else {
+            continue;
+        };
+        for node in &flow.nodes {
+            let id = node.id.value.as_str();
+            match &node.kind {
+                NodeKind::Agent { agent }
+                    if placement_of(ir, &agent.value.to_string()).is_some() =>
+                {
+                    push(
+                        format!("{address}.{id}"),
+                        placed_agent(names, &agent.value.to_string()),
+                        &mut seen,
+                    );
+                }
+                NodeKind::Function { function }
+                    if placement_of(ir, &function.value.to_string()).is_some() =>
+                {
+                    push(
+                        format!("{address}.{id}"),
+                        placed_tool(names, &function.value.to_string()),
+                        &mut seen,
+                    );
+                }
+                NodeKind::Map { map } => {
+                    for target in map_targets(map) {
+                        if placement_of(ir, &target).is_none() {
+                            continue;
+                        }
+                        let Some(definition) = ir.definitions.get(&target) else {
+                            continue;
+                        };
+                        let body = match &definition.body {
+                            DefinitionBody::Agent(_) => placed_agent(names, &target),
+                            DefinitionBody::Tool(_) => placed_tool(names, &target),
+                            _ => continue,
+                        };
+                        push(target.clone(), body, &mut seen);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut text = String::from(PLACED_DOC);
+    if entries.is_empty() {
+        text.push_str("export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {};\n");
+        return text;
+    }
+    text.push_str("export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {\n");
+    // Sorted, so the emitted record is ordered by what it holds rather than by
+    // the order the flows happened to be walked in ([`super`]'s ordering rule).
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    for (key, body) in entries {
+        text.push_str(&format!("  {}:\n{body}", names::string(&key)));
+    }
+    text.push_str("};\n");
+    text
+}
+
+/// Every address one `map` node dispatches to, in declaration order.
+fn map_targets(map: &Map) -> Vec<String> {
+    match &map.dispatch {
+        MapDispatch::Homogeneous { node, .. } => vec![node.value.to_string()],
+        MapDispatch::Routed {
+            routes, default, ..
+        } => routes
+            .iter()
+            .chain(default.as_deref())
+            .map(|route| route.node.value.to_string())
+            .collect(),
+    }
+}
+
+/// One placed `agent.*`, run where it was placed.
+///
+/// An **empty** history and no instance policy, which is the payload §3.2
+/// carries — see [`placed_source`]. Everything else is the local lowering's own
+/// call, down to the answer being left unparsed: the hub holds it to the node's
+/// declared surface when it feeds it back into the graph.
+fn placed_agent(names: &Names, address: &str) -> String {
+    format!(
+        "    async (input, context, site) => {{\n      \
+         const answer = await runtime.callAgent({binding}, input, [], context, {{ path: site.path }});\n      \
+         return {{\n        \
+         output: answer.output,\n        \
+         history: answer.history,\n        \
+         models: answer.models,\n        \
+         toolDispatches: answer.toolDispatches,\n      \
+         }};\n    \
+         }},\n",
+        binding = names.value(address)
+    )
+}
+
+/// One placed `tool.*`, run where it was placed.
+fn placed_tool(names: &Names, address: &str) -> String {
+    format!(
+        "    async (input, context) => ({{ output: await {}(input, context) }}),\n",
+        names.value(address)
+    )
+}
+
+const PLACED_DOC: &str = "\n\
+/**\n \
+* What each placed call site does, for the process that **executes** it\n \
+* (`docs/distributed.md` §3.2, §7.4).\n \
+*\n \
+* The other side of `mesh.dispatchPlaced`. A hub journals a dispatch and waits;\n \
+* the worker that takes it runs `./worker-node.ts`, which looks the dispatch's\n \
+* `node` up here and runs exactly the activity this node would have run had\n \
+* nothing been placed. One lowering, two processes — which is what keeps a\n \
+* placed node from meaning something different from an unplaced one.\n \
+*\n \
+* Keyed by the address a dispatch names: `<flow>.<node>` for an `agent:` or\n \
+* `function:` node, and the component's own address for a `map` dispatch target\n \
+* (grammar §14.1's three ways a graph reaches a placed component).\n \
+*/\n";
 
 /// Which placement claims this component, if one does (grammar §14.1).
 ///

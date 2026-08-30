@@ -269,6 +269,7 @@ const README_BODY: &str = r#"
 
 | path | what it holds |
 |---|---|
+| `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
 | `src/artifact.ts` | what this tree **is**: a content hash over its own files, the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, and the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1) |
@@ -284,6 +285,7 @@ const README_BODY: &str = r#"
 | `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
 | `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |
 | `src/index.ts` | the project's public surface, the one caller of `readEnvironment()`, and the entry point the command line hangs off |
+| `src/worker-node.ts` | the worker half of the worker protocol: one placed node, executed out of this tree by `agent-compose worker`, with the dispatch on standard input and its effects and result as NDJSON on standard output (`docs/distributed.md` §3.2) |
 
 ## Running a flow
 

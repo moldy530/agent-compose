@@ -235,6 +235,71 @@ export interface PlacedAnswer {
   readonly toolDispatches?: readonly runtime.DispatchRecord[];
 }
 
+/**
+ * Where a placed node's activity sits, as the process that runs it addresses it.
+ *
+ * The same two facts an ordinary dispatched instance carries
+ * (`runtime.DispatchSite`): the frames grammar §9.4 keys effects by, and the
+ * execution identity the node's own bindings read.
+ */
+export interface PlacedSite {
+  readonly path: readonly string[];
+  readonly execution: runtime.ExecutionIdentity;
+}
+
+/**
+ * What a placed component's node **does**, where it is executed rather than
+ * dispatched.
+ *
+ * `./graph.ts` exports one of these per placed call site, keyed by the address
+ * a dispatch names, and `./worker-node.ts` is what calls them
+ * (`docs/distributed.md` §3.2). The hub never does: on this side of the wire a
+ * placed node is [`dispatchPlaced`], and the registry is carried in the artifact
+ * because the artifact is what a worker is served (§4).
+ */
+export type PlacedRun = (
+  input: unknown,
+  context: runtime.RunContext,
+  site: PlacedSite,
+) => Promise<PlacedAnswer>;
+
+/**
+ * How a process that is **executing** placed nodes answers a dispatch.
+ *
+ * `undefined` in a hub, which is every process that mounts these routes: a
+ * dispatch there goes on the board and waits for a worker. Set in a worker's
+ * node runner ([`executeLocally`]), where the only honest answer to "run this
+ * placed node" is to run it.
+ */
+type PlacedExecutor = (options: {
+  readonly placement: string;
+  readonly node: string;
+  readonly execution: string;
+  readonly path: readonly string[];
+  readonly inputs: unknown;
+  readonly signal?: AbortSignal;
+}) => Promise<PlacedAnswer>;
+
+/** See [`executeLocally`]. */
+let executor: PlacedExecutor | undefined;
+
+/**
+ * Run placed nodes **here** instead of dispatching them.
+ *
+ * Called once, by `./worker-node.ts`, and by nothing else. What it is for is
+ * nesting: grammar §14.1 rule 4 colocates whatever an agent attaches, so a
+ * placed agent whose attached `flow.*` reaches another placed component reaches
+ * one of *this worker's own* placement — and the node the compiler lowered for
+ * it is [`dispatchPlaced`], because a component is lowered once for both sides
+ * of the wire (§4.3: the whole artifact is everywhere, so a placement decides
+ * which process runs a node rather than which code exists where). Without this
+ * seam that inner node would ask a worker to find a mesh to join, from inside
+ * the placement it is already holding.
+ */
+export function executeLocally(run: PlacedExecutor): void {
+  executor = run;
+}
+
 /** One placement wait, as a status report publishes it. */
 export interface PlacementWait {
   /**
@@ -343,6 +408,10 @@ export async function dispatchPlaced(options: {
   readonly inputs: unknown;
   readonly signal?: AbortSignal;
 }): Promise<PlacedAnswer> {
+  // A process that executes placed nodes answers this itself ([`executeLocally`]),
+  // and is asked before anything is journaled: a worker holds no board, and the
+  // journal of this execution is the hub's alone (§3.3, §8 rule 3).
+  if (executor !== undefined) return await executor(options);
   const site = options.path.join("/");
   if (!mounted) throw new PlacementUnreachable(options.node, options.placement);
   const journal = await openJournal();
@@ -945,6 +1014,14 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
     // record the journal already holds is accepted and dropped, which is what
     // makes a batch safe to re-send after a transport failure.
     journal.append(record);
+    // …and the one field an insert cannot carry, because it is written *after*
+    // the row: `refused` says the generation that produced this answer had its
+    // own contract refuse it (`docs/durability.md` §5, `./journal.ts`'s
+    // `refuseRecorded`). A worker sends the record a second time with the mark
+    // on it, the insert above drops the duplicate, and this is what makes the
+    // mark stick — without which the retry of §7.3 would read an unmarked record
+    // and call the node's own mismatch a replay divergence.
+    if (record.refused) journal.refuse(record.execution, record.key);
   }
   return reply.code(204).send();
 }

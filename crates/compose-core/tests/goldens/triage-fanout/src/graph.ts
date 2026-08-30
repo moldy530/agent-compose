@@ -1758,3 +1758,19 @@ async function quiesceFlow(
 export function createBuilder() {
   return new StateGraph(State);
 }
+
+/**
+ * What each placed call site does, for the process that **executes** it
+ * (`docs/distributed.md` §3.2, §7.4).
+ *
+ * The other side of `mesh.dispatchPlaced`. A hub journals a dispatch and waits;
+ * the worker that takes it runs `./worker-node.ts`, which looks the dispatch's
+ * `node` up here and runs exactly the activity this node would have run had
+ * nothing been placed. One lowering, two processes — which is what keeps a
+ * placed node from meaning something different from an unplaced one.
+ *
+ * Keyed by the address a dispatch names: `<flow>.<node>` for an `agent:` or
+ * `function:` node, and the component's own address for a `map` dispatch target
+ * (grammar §14.1's three ways a graph reaches a placed component).
+ */
+export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {};

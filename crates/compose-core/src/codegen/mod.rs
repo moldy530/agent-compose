@@ -46,6 +46,7 @@
 //! tsconfig.json         strict, NodeNext, no build step
 //! README.md             what this directory is, how to run it, how to eject
 //! .gitignore            the two paths a generated project acquires
+//! manifest.json         what a worker reads out of the tree (distributed §9.1)
 //! src/artifact.ts       this tree's content hash and file list (distributed §4)
 //! src/cel.ts            the CEL evaluator the routers embed (PRD 5.5)
 //! src/deployment.ts     the placements, and the env partition (distributed §9.1)
@@ -60,13 +61,14 @@
 //! src/serve.ts          the generated app over them (PRD 5.11)
 //! src/cli.ts            the project's own `run`/`serve` command line
 //! src/index.ts          the project's public surface, and its entry point
+//! src/worker-node.ts    one placed node, run on a worker (distributed §3.2)
 //! ```
 //!
-//! Six of those are **constants**: `src/cel.ts`, `src/mesh.ts`,
-//! `src/runtime.ts`, `src/stores.ts`, `src/serve.ts` and `src/cli.ts` are
-//! byte-identical in every project a compiler release builds, which is what keeps
-//! a golden diff about the composition rather than about the machinery beside it.
-//! The rest are the composition, lowered.
+//! Seven of those are **constants**: `src/cel.ts`, `src/mesh.ts`,
+//! `src/runtime.ts`, `src/stores.ts`, `src/serve.ts`, `src/cli.ts` and
+//! `src/worker-node.ts` are byte-identical in every project a compiler release
+//! builds, which is what keeps a golden diff about the composition rather than
+//! about the machinery beside it. The rest are the composition, lowered.
 //!
 //! `src/artifact.ts` is emitted **last and over the rest**, because what it
 //! carries is a hash of them (`docs/distributed.md` §4, and see [`artifact`]).
@@ -142,6 +144,7 @@ pub mod serve;
 pub mod state;
 pub mod stores;
 pub mod trigger;
+pub mod worker;
 
 use crate::diag::{Diagnostic, DiagnosticCode};
 use crate::ir::Ir;
@@ -250,6 +253,8 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
         trigger::module(ir),
         serve::module(ir),
         cli::module(ir),
+        worker::module(ir),
+        worker::manifest(ir, &partition),
         project::index(ir),
     ];
     // **Last, and over everything above.** The artifact's identity is a hash of
@@ -973,6 +978,7 @@ flow.f:
             [
                 ".gitignore",
                 "README.md",
+                "manifest.json",
                 "package.json",
                 "src/artifact.ts",
                 "src/cel.ts",
@@ -989,6 +995,7 @@ flow.f:
                 "src/state.ts",
                 "src/stores.ts",
                 "src/triggers.ts",
+                "src/worker-node.ts",
                 "tsconfig.json",
             ]
         );

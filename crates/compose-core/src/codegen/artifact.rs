@@ -61,17 +61,37 @@ pub const SELF: &str = "src/artifact.ts";
 /// [`SELF`] is skipped, for the reason the module docs give.
 #[must_use]
 pub fn hash(files: &[GeneratedFile]) -> String {
-    let mut listing = Vec::new();
-    let mut paths: Vec<&GeneratedFile> = files.iter().filter(|file| file.path != SELF).collect();
-    paths.sort_by(|left, right| left.path.cmp(&right.path));
-    for file in paths {
-        listing.push(format!(
-            "{}\0{}",
-            file.path,
-            digest(file.contents.as_bytes())
-        ));
-    }
-    format!("sha256:{}", digest(listing.join("\n").as_bytes()))
+    hash_of(
+        files
+            .iter()
+            .map(|file| (file.path.as_str(), file.contents.as_bytes())),
+    )
+}
+
+/// The same, over a tree read back as **bytes** rather than emitted.
+///
+/// This is the reading half of the rule, and it is the same function so that
+/// there is no second one: `docs/distributed.md` §4 step 2 makes a worker
+/// "verify the hash it computed against the hash it asked for before unpacking
+/// anything", and a worker that hashed unpacked entries by a rule of its own
+/// would be checking its download against a second answer to what this artifact
+/// is. `src/mesh.ts`'s `contentHash` is the third implementation, in the third
+/// language, and `the_artifact_hash_is_the_same_in_both_languages` is what holds
+/// it to these.
+///
+/// [`SELF`] is skipped wherever it appears, for the reason the module docs give.
+#[must_use]
+pub fn hash_of<'a>(files: impl Iterator<Item = (&'a str, &'a [u8])>) -> String {
+    let mut listing: Vec<(&str, String)> = files
+        .filter(|(path, _)| *path != SELF)
+        .map(|(path, bytes)| (path, digest(bytes)))
+        .collect();
+    listing.sort_by(|left, right| left.0.cmp(right.0));
+    let written: Vec<String> = listing
+        .into_iter()
+        .map(|(path, digest)| format!("{path}\0{digest}"))
+        .collect();
+    format!("sha256:{}", digest(written.join("\n").as_bytes()))
 }
 
 /// One SHA-256, as lowercase hex.
