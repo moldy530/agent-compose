@@ -951,7 +951,10 @@ that **can execute in it**, and a component executes in a process exactly when:
 
 - **it is a member of that placement** — the direct case;
 - **it is dispatched with no placement of its own, and the process is the
-  hub** — the default of §1.1;
+  hub** — the default of §1.1, and unconditional: what *else* reaches that
+  component narrows nothing, because dispatch is the hub's scheduler starting a
+  node and every flow a composition declares is startable on the hub (grammar
+  Decision D64);
 - **an agent that runs in that process attaches it** — an attached `tool.*`, and
   every `agent.*` and `tool.*` an attached `flow.*` reaches, all of which run
   inside the agent's tool loop (grammar §5.4, §14.1 rule 4).
@@ -962,8 +965,15 @@ Which gives, concretely:
 - a variable referenced by a tool that only ever runs inside placed agents'
   processes belongs to **their placements'** manifests — and to the hub's only
   if some unplaced agent or `function:` node also reaches it;
-- a variable referenced by a component that runs on the hub — in no placement,
-  and reached by nothing placed — belongs to the **hub's** manifest;
+- a variable referenced by an **unplaced `agent.*`** belongs to the **hub's**
+  manifest, and belongs there whether or not something placed also reaches it.
+  Manual invocation is universal — every flow a composition declares is runnable
+  on its own (grammar Decision D64, which §14.1 rule 4 rests on too) — and every
+  construct that reaches an agent is a node of some flow, so an unplaced agent
+  always has a hub dispatch to be. Being reached from a placed agent's tool loop
+  as well **adds** that agent's placement to its variables' membership; it never
+  moves them off the hub's. An unplaced `tool.*` a `function:` node names is the
+  same case for the same reason;
 - a variable referenced from the deploy layer itself — a storage backend, an
   event source, `hub.join_token:` — belongs to the hub's;
 - a variable reachable in two processes belongs to both. Two placed agents
@@ -979,10 +989,29 @@ hub never runs `tool.sign`, so requiring the secret there would be a false
 requirement, and omitting it from `mac`'s would let a machine without a keychain
 join clean (§9.2) and fail on its first dispatch.
 
+Worked from the other side, because the symmetric mistake is the expensive one:
+`agent.outer` is placed in `mac` and attaches `flow.review`, whose one `agent:`
+node names `agent.inner`, which is unplaced and reads `${INNER_KEY}`. Every call
+*through `agent.outer`* runs `agent.inner` on the `mac` worker, so `INNER_KEY`
+belongs to `mac`'s manifest — and it belongs to the **hub's** as well, because
+`agent-compose run main.yml flow.review` starts that flow on the hub and the hub
+dispatches `agent.inner` itself. A partition that read "reached by something
+placed" as "therefore not the hub's" would emit a hub manifest without
+`INNER_KEY`: `readEnvironment()` passes at start, and the first direct run of
+`flow.review` fails at the first model call — the failure this section exists to
+make impossible, arrived at from the opposite direction to the one above. The
+rule that prevents it is the second clause of the executes-in list — dispatched
+with no placement of its own, on the hub — and that clause is unconditional for
+exactly this reason. `validate` accepts this composition, which is the other half
+of why the manifest has to: nothing refuses it, so nothing else stands between
+`INNER_KEY` and the hub's list.
+
 This is §7 M3's least-privilege line in its sharpest form: blast-radius
 containment falls out of the manifest, because **the hub cannot leak what it
 never held** — which is a claim about what the hub *runs*, and is only true if
-the partition is computed that way.
+the partition is computed that way. The two worked cases are the two directions
+of that one sentence: the hub's list is narrowed by what the hub **cannot run**,
+never by what some placement also happens to reach.
 
 ### 9.2 The join-time check is self-reported presence
 
