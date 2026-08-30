@@ -321,6 +321,11 @@ request on the same route, either may be the first a hub ever sees, a worker
 that already holds the current artifact makes only the second kind, and the hub
 remembers nothing of the first — the second re-derives all of it.
 
+**The session this answer issues is issued against the artifact this answer
+names**, which is what makes a redeployment reach a worker that has already
+joined: §5 fixes the rule — the hub ends those sessions when it rotates, and the
+`410` sends the worker back through this route.
+
 **Refusals**, and the shape of each:
 
 | condition | status | body |
@@ -394,7 +399,9 @@ Carries the session. Long-polls for up to one hold (§2).
 - **`410`** when the session is unknown (§3): the worker joins again and resumes
   polling under the session that join returns. A hub that has just been replaced
   behind its name answers every worker this way, once each, and that is the whole
-  of what a hub restart costs (§5).
+  of what a hub restart costs (§5). A hub that has just **rotated its artifact**
+  answers the workers of the superseded one the same way, and for the same
+  reason: the re-join is where they are told what to run (§5).
 
 - **`401`** when the token does not verify, with no detail, as everywhere
   (§3.1) — and terminal in the same sense: the credential is the one the join
@@ -517,7 +524,10 @@ Range requests are OPTIONAL. A hub that serves them MUST honour
 
 **The hub ships the whole generated project.** Workers hold no checkout and no
 YAML; redeployment is automatic on the next join, and version skew is a refusal
-rather than a drift (PRD resolved q40).
+rather than a drift (PRD resolved q40). What makes the *next join* happen for a
+worker already joined is §5's rule that a redeployment ends the sessions issued
+under the artifact it replaced; without that half, "on the next join" would be a
+promise the wire never keeps.
 
 The artifact is a **tarball of the generated project** — the same tree
 `build` writes — served **hash-addressed** from the hub under worker
@@ -675,6 +685,39 @@ join (§3.1). The two cases are told apart by the status and by nothing else,
 which is why §3 gives `410` exactly one meaning and gives that meaning to no
 other status.
 
+**A redeployment ends the sessions issued under the artifact it replaces.** A
+session is issued against the artifact hash the join answered with, and a hub
+that begins serving a new artifact under a stable name MUST forget every session
+issued under the one it replaced. That ending is the ending of §6.3 and costs the
+same: the next request on such a session meets `410`, the worker joins again, and
+*that* join is answered with the new artifact — which it fetches, materialises,
+and re-joins under, by §4's five steps. An unsettled dispatch on an ended session
+is abandoned exactly as §6.3 abandons one, so its node's attempt fails under that
+node's `retry:`/`on_error:` chain and the retry is dispatched under the new
+artifact rather than the old.
+
+This is the mechanism behind §4's "redeployment is automatic on the next join",
+and without it there would be no next join to be automatic on: a worker that has
+joined re-joins when a `410` tells it to, or when a fetch meets §3.5's `404`, and
+nothing else in this document ever tells it to. It also gives the poll the
+invariant it is read against — **a hub MUST NOT dispatch to a session issued
+under an artifact it no longer serves** — which is why the dispatch of §3.2
+carries no hash of its own: a session that can receive a dispatch is, by
+construction, a session of the current artifact, and there is nothing left for a
+worker to re-check. A hub that kept those sessions
+alive instead would hand a worker holding the old tree a dispatch planned against
+the new one — an `instance_path` and inputs from one graph, executed by another,
+with the effect keys of §3.3 derived from the wrong one. That silent skew is what
+resolved q40's "version skew is a refusal rather than a drift" forbids, and this
+rule is what makes it a `410` instead.
+
+A hub MAY end those sessions the moment it rotates and MUST have ended them
+before it dispatches anything of the new artifact. Going on **serving** the
+previous artifact at §3.5 is not in tension with that, and the two together are
+deliberate: a hash stays fetchable after the sessions issued under it are gone,
+which is what lets the worker of an abandoned dispatch come back rather than be
+stranded mid-rollback.
+
 ---
 
 ## 6. Parking and wake
@@ -717,6 +760,13 @@ batch, no result. That is the only detector this protocol has, and the hub is
 the only side that may fire it: a worker never declares itself gone, it re-joins
 (§5). Declaring it **ends** the session — the hub forgets it, so any later
 request carrying it meets `410` and the worker joins again (§3, §5).
+
+Liveness is the only thing this protocol *detects*, and it is not the only thing
+that ends a session: a redeployment ends the sessions of the artifact it replaced
+(§5), which says nothing about the worker and is not a declaration about it. The
+two share their whole cost model — the `410`, the re-join, and the treatment of
+an unsettled dispatch below — which is why §5 states that rule by pointing here
+rather than by writing a second one.
 
 What the declaration costs depends on the one thing a session can be holding.
 §2's pull model queues work to a **placement**, never to a worker, and hands it
@@ -1014,6 +1064,10 @@ At a given `PROTOCOL_VERSION`:
   make at-least-once dispatch safe on both directions of the wire;
 * that a dispatch's `instance_path` is the flattened path grammar §9.4 keys
   effects by, so a worker derives the keys the hub would;
+* that a session is bound to the artifact it was issued under (§5): a hub that
+  rotates its artifact ends those sessions, so every dispatch a worker is
+  answered is a dispatch of the artifact it is holding, and a worker need not
+  re-check one;
 * the status this document gives each refusal, and the rule that a refusal
   naming a variable names **names** (§9);
 * that `410` at a session-carrying route means the session is unknown and a join
