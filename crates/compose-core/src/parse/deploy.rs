@@ -102,13 +102,24 @@ fn members_of(
     }
     let mut members = Vec::new();
     for item in items {
-        let Some(text) = lexical::text(
-            item,
-            &format!("each entry of the `members` of {subject}"),
-            cx,
-        ) else {
+        // A reference position, read the way [`lexical::reference`] reads one:
+        // the string is taken and the address is the only judgement passed on
+        // it. Reading it as literal text instead would add the env-ref rule to
+        // that judgement, and `members: [${SOME_AGENT}]` would draw two
+        // diagnostics — "not an `agent.*` or `tool.*` reference" *and* "never
+        // interpolates environment references" — for the one mistake that
+        // `tools: [${SOME_TOOL}]` draws one for. `lexical::reference` is not
+        // called only because the `flow.` prefix is intercepted below, before
+        // the address is read, and that interception needs the string.
+        let Yaml::String(value) = &item.value else {
+            cx.wrong_type(
+                item,
+                "a placement member",
+                &lexical::reference_expectation(MEMBERS),
+            );
             continue;
         };
+        let text = Spanned::new(value.clone(), item.span.clone());
         if text.value.starts_with("flow.") {
             cx.push(
                 Diagnostic::error(
