@@ -46,8 +46,11 @@
 //! tsconfig.json         strict, NodeNext, no build step
 //! README.md             what this directory is, how to run it, how to eject
 //! .gitignore            the two paths a generated project acquires
+//! src/artifact.ts       this tree's content hash and file list (distributed §4)
 //! src/cel.ts            the CEL evaluator the routers embed (PRD 5.5)
-//! src/env.ts            every `${ENV}` reference, and the process-start check
+//! src/deployment.ts     the placements, and the env partition (distributed §9.1)
+//! src/env.ts            the hub's `${ENV}` references, and the launch check
+//! src/mesh.ts           the hub half of the worker protocol (distributed §3)
 //! src/runtime.ts        what a node does when it runs (grammar 8, 9)
 //! src/stores.ts         the local store backends (PRD 5.8, grammar 11)
 //! src/schemas.ts        every schema in the composition, as Zod (grammar 3.8)
@@ -59,11 +62,14 @@
 //! src/index.ts          the project's public surface, and its entry point
 //! ```
 //!
-//! Five of those are **constants**: `src/cel.ts`, `src/runtime.ts`,
-//! `src/stores.ts`, `src/serve.ts` and `src/cli.ts` are byte-identical in every
-//! project a compiler release builds, which is what keeps a golden diff about
-//! the composition rather than about the machinery beside it. The rest are the
-//! composition, lowered.
+//! Six of those are **constants**: `src/cel.ts`, `src/mesh.ts`,
+//! `src/runtime.ts`, `src/stores.ts`, `src/serve.ts` and `src/cli.ts` are
+//! byte-identical in every project a compiler release builds, which is what keeps
+//! a golden diff about the composition rather than about the machinery beside it.
+//! The rest are the composition, lowered.
+//!
+//! `src/artifact.ts` is emitted **last and over the rest**, because what it
+//! carries is a hash of them (`docs/distributed.md` §4, and see [`artifact`]).
 //!
 //! `src/` is **compiler-owned**: `build` removes files under it that it did not
 //! emit, and `build --check` reports them as drift. Nothing outside `src/` is
@@ -118,11 +124,14 @@
 //! `worker` verb, and `tests/placement_surface_inertness.rs` is what says so.
 //! Both land in M3.
 
+pub mod artifact;
 pub mod cel;
 pub mod cli;
+pub mod deployment;
 pub mod env;
 pub mod graph;
 pub mod journal;
+pub mod mesh;
 pub mod names;
 pub mod pattern;
 pub mod policy;
@@ -216,16 +225,23 @@ impl GeneratedProject {
 pub fn emit(ir: &Ir) -> GeneratedProject {
     let mut names = names::Names::of(ir);
     graph::declare(&mut names, ir);
-    let environment = env::References::of(ir);
+    // The environment `readEnvironment()` checks is the **hub's own list**, which
+    // is the whole composition's exactly when nothing is placed
+    // (`docs/distributed.md` §9.1): a variable a placement takes off it is one
+    // this process cannot leak, because it never held it.
+    let partition = env::Partition::of(ir);
+    let environment = env::References::for_process(ir, &partition, &env::Process::Hub);
 
-    GeneratedProject::new(vec![
+    let mut files = vec![
         project::package_json(ir),
         project::tsconfig_json(ir),
         project::readme(ir),
         project::gitignore(ir),
         cel::module(ir),
+        deployment::module(ir, &partition),
         env::module(ir, &environment),
         journal::module(ir),
+        mesh::module(ir),
         runtime::module(ir),
         stores::module(ir),
         schema::module(ir, &names),
@@ -235,7 +251,13 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
         serve::module(ir),
         cli::module(ir),
         project::index(ir),
-    ])
+    ];
+    // **Last, and over everything above.** The artifact's identity is a hash of
+    // the tree, so the file that carries it is the one file the hash cannot
+    // cover and the one file that has to be written after the rest exists (see
+    // [`artifact`]).
+    files.push(artifact::module(ir, &files));
+    GeneratedProject::new(files)
 }
 
 /// What this target cannot express, over a composition the validator accepted.
@@ -952,12 +974,15 @@ flow.f:
                 ".gitignore",
                 "README.md",
                 "package.json",
+                "src/artifact.ts",
                 "src/cel.ts",
                 "src/cli.ts",
+                "src/deployment.ts",
                 "src/env.ts",
                 "src/graph.ts",
                 "src/index.ts",
                 "src/journal.ts",
+                "src/mesh.ts",
                 "src/runtime.ts",
                 "src/schemas.ts",
                 "src/serve.ts",

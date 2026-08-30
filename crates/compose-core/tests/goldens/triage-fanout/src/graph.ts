@@ -16,6 +16,7 @@
 
 import { END, START, StateGraph } from "@langchain/langgraph";
 
+import * as mesh from "./mesh.ts";
 import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
@@ -1641,6 +1642,11 @@ async function quiesceFlow(
   // (`docs/durability.md` §5).
   const release = async (outcome: unknown): Promise<void> => {
     runtime.releaseHumanWaits(executionId);
+    // …and the placement waits, for the same reason one level out: a dispatch
+    // nothing is waiting for is work a worker could still take, whose result
+    // would be posted against a node execution that is gone
+    // (`docs/distributed.md` §6.1, `./mesh.ts`).
+    mesh.releasePlacementWaits(executionId);
     // And the deliveries nothing joined, on the two ways out where one still in
     // flight can change what this function has to decide.
     //

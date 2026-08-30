@@ -977,6 +977,7 @@ import { pathToFileURL } from "node:url";
 
 import { readEnvironment } from "./env.ts";
 
+export * from "./deployment.ts";
 export * from "./env.ts";
 export * from "./graph.ts";
 export * from "./schemas.ts";

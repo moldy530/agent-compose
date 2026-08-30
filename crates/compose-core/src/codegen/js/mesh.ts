@@ -1,0 +1,1243 @@
+//
+// The hub: the five `/workers/*` routes, the dispatch board behind them, and the
+// seam a placed node reaches the mesh through (`docs/distributed.md`, PRD
+// resolved q37–q44).
+//
+// This module is the whole of what "the hub" means in that document. It is
+// byte-identical in every project this compiler release builds, like
+// `./runtime.ts` and `./serve.ts`; what differs between two deployments is
+// `./deployment.ts`, which carries the placements a worker may claim and the
+// environment partition §9.1 fixes, and `./artifact.ts`, which carries the tree's
+// identity.
+//
+// # Why it is here and not in `./serve.ts`
+//
+// The routes join the serve surface — §2 puts them "under the same server, the
+// same process, and the same auth story" — but the machinery behind them is a
+// scheduler and a board, not a request handler. Keeping it beside the app would
+// make the one module a reader goes to for "what does a trigger do" also the
+// module they have to read past for "how does a dispatch get superseded".
+//
+// # The shape, in one paragraph
+//
+// Work queues to a **placement**, never to a worker (§2, §6.3). A placed node
+// calls [`dispatchPlaced`], which puts a row on the journal's dispatch board and
+// waits; a worker claiming that placement long-polls, is handed at most one
+// unsettled dispatch, streams its effects home, and posts a result. Everything
+// durable is the journal's — §8 rule 3 forbids dispatch state anywhere else — and
+// everything in memory here is either advisory (the session table, §5) or a
+// promise this process is holding for a node it is running.
+//
+// # What is deliberately absent
+//
+// * **No heartbeat route.** A poll is the liveness signal and §3.2 says there
+//   MUST NOT be a second one.
+// * **No capacity knob.** A session holds exactly one unsettled dispatch. §13
+//   files raising that as a question for the PRD rather than a hub's setting, so
+//   there is no field, no option and no environment variable for it here; the
+//   wire reserves an OPTIONAL join field for whatever the answer turns out to be
+//   and this hub neither sends nor reads one.
+// * **No containment.** §13's second open row; a worker runs the artifact with
+//   its own privileges, and nothing here says otherwise.
+// * **No worker-to-worker anything.** Every edge goes through this process.
+
+import { Buffer } from "node:buffer";
+import { createHash, timingSafeEqual } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
+
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+
+import { ARTIFACT_FILES, ARTIFACT_HASH, COMPILER_VERSION } from "./artifact.ts";
+import { joinTokenEnv, placements } from "./deployment.ts";
+import {
+  type DispatchRow,
+  type EffectKind,
+  type JournalOutcome,
+  type JournalRecord,
+  openJournal,
+  replayedFailure,
+} from "./journal.ts";
+import { registerParkedWork } from "./runtime.ts";
+import type * as runtime from "./runtime.ts";
+
+// ---------------------------------------------------------------------------
+// The constants a join agrees on (§3.1, §4.1, §10)
+// ---------------------------------------------------------------------------
+
+/**
+ * The version of `docs/distributed.md` this hub speaks (§10).
+ *
+ * Carried on every join and compared before anything about the deployment.
+ * `compose_core::codegen::mesh::PROTOCOL_VERSION` is the compiler's copy of this
+ * number and a test reads this line back to keep the two from drifting — the
+ * same cross-language pin the trace format and the journal version already have.
+ */
+export const PROTOCOL_VERSION = 1;
+
+/**
+ * The runtime a worker executes this artifact under, as §4.1 compares it: a
+ * name and a major version, and nothing finer.
+ *
+ * "Workers are Bun-only" (§4.2) is a scoped exception to PRD resolved q18's Node
+ * fallback — the fallback is about a generated project somebody runs by hand,
+ * and this is the surface *around* the artifact. What pins the major is the
+ * compiler release, so a worker satisfying `compiler` satisfies this.
+ */
+const WORKER_RUNTIME = { name: "bun", major: 1 };
+
+/** How long a poll is held before it is answered `204` (§2). */
+const POLL_HOLD_MS = 25_000;
+
+/** How long a session may go without a request before the hub gives up on it (§2). */
+const LIVENESS_WINDOW_MS = 90_000;
+
+/** The variable that shortens the poll hold, for a test or a diagnostic run. */
+const POLL_HOLD = "AGENT_COMPOSE_MESH_POLL_HOLD_MS";
+
+/** The variable that shortens the liveness window, for the same reason. */
+const LIVENESS_WINDOW = "AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS";
+
+/**
+ * What the two timings resolve to in this process.
+ *
+ * §2 makes them configurable and fixes the one relationship an implementation
+ * MUST keep: "a hold shorter than most intermediary idle timeouts and a liveness
+ * window several holds wide". A window that is not wider than a hold would
+ * declare a worker gone while its own poll was still being held — the hub
+ * killing the very request that proves the worker is there — so the pair is
+ * refused at launch rather than served, which is the posture `./serve.ts` takes
+ * to a retry schedule that is not one.
+ */
+export function meshTimings(): { readonly holdMs: number; readonly windowMs: number } {
+  const holdMs = duration(POLL_HOLD, POLL_HOLD_MS);
+  const windowMs = duration(LIVENESS_WINDOW, LIVENESS_WINDOW_MS);
+  if (holdMs >= windowMs) {
+    throw new MeshTimingError(
+      `\`${POLL_HOLD}=${holdMs}\` is not shorter than \`${LIVENESS_WINDOW}=${windowMs}\`: a poll held past the liveness window would let the hub declare the very worker whose request it is holding gone (docs/distributed.md §2)`,
+    );
+  }
+  return { holdMs, windowMs };
+}
+
+/** One timing override, in whole milliseconds. */
+function duration(variable: string, fallback: number): number {
+  const written = process.env[variable];
+  if (written === undefined || written.trim() === "") return fallback;
+  const parsed = Number(written.trim());
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new MeshTimingError(
+      `\`${variable}=${written}\` is not a whole number of milliseconds above zero`,
+    );
+  }
+  return parsed;
+}
+
+/** What a mesh timing variable was set to and could not mean. */
+export class MeshTimingError extends Error {
+  constructor(detail: string) {
+    super(detail);
+    this.name = "MeshTimingError";
+  }
+}
+
+/** What `hub.join_token:` named and this process cannot use. */
+export class MeshCredentialError extends Error {
+  constructor(variable: string) {
+    super(
+      `\`${variable}\` is the join token of this target's \`hub:\` and is set to the empty string: an empty credential admits every worker into the mesh, so this app refuses to serve until it is given a value (docs/distributed.md §3, grammar §14.2)`,
+    );
+    this.name = "MeshCredentialError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sessions (§5)
+// ---------------------------------------------------------------------------
+
+/**
+ * One worker session, held **in memory only**.
+ *
+ * §5 makes sessions advisory: "every re-join re-derives everything from the
+ * journal", so nothing here is state the protocol depends on and a restart loses
+ * exactly this map and nothing else. Every session-carrying route answers `410`
+ * for an id this table does not hold, which is the one status that means "join
+ * again" (§3).
+ */
+interface Session {
+  readonly id: string;
+  /** The placement names this worker claimed (§3.1). */
+  readonly claims: readonly string[];
+  /**
+   * Whether the hub may hand this session a dispatch.
+   *
+   * `false` for a **provisioning join** — one that carried no `env_ok`, because
+   * the worker does not yet hold the artifact whose manifest it would report
+   * against (§3.1). Such a session is answered normally and dispatched nothing;
+   * the worker fetches, materialises and joins again, and that join is where the
+   * `403` fires and where dispatch becomes possible.
+   */
+  readonly dispatchable: boolean;
+  /** When this session last made a request — what the window is measured from. */
+  seen: number;
+}
+
+/** Every session this process has issued and not forgotten. */
+const sessions = new Map<string, Session>();
+
+/** Whoever is waiting for a poll to have something to answer with. */
+const pollers = new Set<() => void>();
+
+/** Wake every held poll, because the board may have something for it now. */
+function stirPolls(): void {
+  for (const wake of [...pollers]) wake();
+}
+
+// ---------------------------------------------------------------------------
+// The dispatch board, from the node's side (§6, §7)
+// ---------------------------------------------------------------------------
+
+/** What a placed node's dispatch answered, once a worker settled it. */
+export interface PlacedAnswer {
+  /** The node's result object, which its `writes:` map into channels. */
+  readonly output: unknown;
+  /** What it contributes to the shared conversation history (grammar §10.4). */
+  readonly history?: readonly unknown[];
+  /** Which member of its route served each model call (PRD 5.9). */
+  readonly models?: readonly runtime.ModelCall[];
+  /** The subflows a model invoked (PRD §9.20). */
+  readonly toolDispatches?: readonly runtime.DispatchRecord[];
+}
+
+/** One placement wait, as a status report publishes it. */
+export interface PlacementWait {
+  /** `<instance path>/<ordinal>` — the identity §6.1 fixes. */
+  readonly id: string;
+  readonly execution: string;
+  readonly placement: string;
+  readonly node: string;
+  readonly site: string;
+  /** When it went on the board, which is also the park order (§6.2). */
+  readonly parkedAt: string;
+  /** Whether a session is holding it, or it is still waiting for one. */
+  readonly status: "parked" | "dispatched";
+}
+
+/** One dispatch this process is holding a node's promise for. */
+interface Awaiting {
+  readonly execution: string;
+  readonly site: string;
+  readonly settle: (outcome: JournalOutcome) => void;
+  /** Whether a worker is holding it, for [`parkedWork`]. */
+  taken: boolean;
+}
+
+/** The dispatches this process is awaiting, by `dispatch_id`. */
+const awaiting = new Map<string, Awaiting>();
+
+/** Next placement-wait ordinal per execution and instance path (§6.1). */
+const ordinals = new Map<string, Map<string, number>>();
+
+/** Who is told when one execution's placement waits move. */
+const waitWatchers = new Map<string, Set<() => void>>();
+
+/**
+ * Whether this process can dispatch at all — that is, whether an app has mounted
+ * the routes a worker joins through.
+ *
+ * `agent-compose run` builds no app, so a placed node reached there has no mesh
+ * to reach: the run is refused at the node with [`PlacementUnreachable`], which
+ * is the shape `runtime.HumanInterrupt` already has for a pause a run has no way
+ * to answer. The alternative — parking on a board nothing will ever poll — is a
+ * command that never returns.
+ */
+let mounted = false;
+
+/** A placed node reached by a run with no mesh to dispatch it into. */
+export class PlacementUnreachable extends Error {
+  readonly placement: string;
+
+  constructor(node: string, placement: string) {
+    super(
+      `\`${node}\` is placed on \`${placement}\`, and this invocation has no mesh for a worker to join: a placed node executes on whichever worker claims its placement, so it needs a served hub with a worker beside it rather than a single process (docs/distributed.md §1, §3)`,
+    );
+    this.name = "PlacementUnreachable";
+    this.placement = placement;
+  }
+}
+
+/** The hub gave up on the session holding a dispatch, and the attempt fails (§6.3). */
+export class DispatchSuperseded extends Error {
+  constructor(node: string, placement: string, detail: string) {
+    super(`\`${node}\` on \`${placement}\`: ${detail}`);
+    this.name = "DispatchSuperseded";
+  }
+}
+
+/**
+ * Run one placed node **somewhere else**: journal the dispatch, wait for a
+ * worker to settle it, and answer as if the node had run here (§3.2, §7).
+ *
+ * The whole of what makes this a *dispatch-and-await* rather than a call is the
+ * journal row. Three things read it and each is a rule of the document:
+ *
+ *  * a **resumed hub** reaches this node again and finds the row its predecessor
+ *    left, under the identity §6.1 fixes — settled, and the answer is consumed
+ *    rather than the work redone; superseded, and the failure is replayed so the
+ *    node's `retry:` ladder does now what it did then; still open, and this
+ *    process goes on holding it;
+ *  * a **worker** is handed the row's inputs and its `effect_history`, and
+ *    replays to the frontier before going live (§7.2);
+ *  * the **liveness sweep** supersedes it where the session holding it stopped
+ *    making requests (§6.3), which fails this attempt under the node's own
+ *    `retry:`/`on_error:` chain exactly as a local failure would.
+ *
+ * The node's `timeout:` is **not** held still while this waits. §6.5 makes the
+ * chain run from dispatch and §2 says so outright — "a `timeout:` on a placed
+ * node is a bound on queueing plus execution, not on execution alone" — which is
+ * the opposite of a `human` node's rule (D102) and is why `runtime.pausesUnder`
+ * is left alone and only `runtime.quiescent` learns about placement waits.
+ */
+export async function dispatchPlaced(options: {
+  readonly placement: string;
+  readonly node: string;
+  readonly execution: string;
+  readonly path: readonly string[];
+  readonly inputs: unknown;
+  readonly signal?: AbortSignal;
+}): Promise<PlacedAnswer> {
+  const site = options.path.join("/");
+  if (!mounted) throw new PlacementUnreachable(options.node, options.placement);
+  const journal = await openJournal();
+  const wait = `${site}/${nextOrdinal(options.execution, site)}`;
+  const row = journal.park({
+    execution: options.execution,
+    wait,
+    id: `dsp_${globalThis.crypto.randomUUID()}`,
+    placement: options.placement,
+    node: options.node,
+    site,
+    inputs: options.inputs,
+    status: "parked",
+    parkedAt: new Date().toISOString(),
+  });
+
+  // A row a previous generation already finished with. Consumed rather than
+  // redone, which is `docs/durability.md` §5's replay discipline reaching the one
+  // effect this module owns.
+  if (row.status === "settled") return answerOf(row);
+  if (row.status === "superseded") {
+    throw new DispatchSuperseded(
+      options.node,
+      options.placement,
+      row.detail ?? "the hub ended this dispatch without a result",
+    );
+  }
+  // …and a row some dead process had handed to a session: sessions are this
+  // process's only (§5), so one it did not issue is one nobody is holding.
+  const taken = row.status === "dispatched" && sessions.has(row.session ?? "");
+  if (row.status === "dispatched" && !taken) journal.reparkDispatch(row.id);
+  rows.set(row.id, row);
+
+  return await new Promise<PlacedAnswer>((resolve, reject) => {
+    const held: Awaiting = {
+      execution: options.execution,
+      site,
+      taken,
+      settle: (outcome) => {
+        finish();
+        if (outcome.kind === "error") reject(replayedFailure(outcome));
+        else resolve(outcome.value as PlacedAnswer);
+      },
+    };
+    const abort = (): void => {
+      // The node's own deadline ran out (§6.5: the chain runs from dispatch, so
+      // queueing is inside the budget). The hub is done with the dispatch, so
+      // the row is ended rather than left for a worker to take work nothing
+      // will read the answer of.
+      const reason =
+        options.signal?.reason instanceof Error
+          ? options.signal.reason.message
+          : "the node execution ended";
+      journal.supersedeDispatch(row.id, `the hub stopped waiting for this dispatch: ${reason}`);
+      rows.delete(row.id);
+      held.settle({ kind: "error", name: "DispatchSuperseded", message: reason });
+    };
+    const finish = (): void => {
+      awaiting.delete(row.id);
+      options.signal?.removeEventListener("abort", abort);
+      announceWaits(options.execution);
+    };
+    if (options.signal?.aborted === true) {
+      abort();
+      return;
+    }
+    options.signal?.addEventListener("abort", abort, { once: true });
+    awaiting.set(row.id, held);
+    announceWaits(options.execution);
+    // A worker may already be holding a poll: this is a wait that has just gone
+    // on the board, and §6.2's wake is "a joining worker's claims are scanned
+    // against the open placement-waits" — which a held poll re-runs when stirred.
+    stirPolls();
+  });
+}
+
+/** The next placement-wait ordinal at one instance path (§6.1). */
+function nextOrdinal(execution: string, site: string): number {
+  let counters = ordinals.get(execution);
+  if (counters === undefined) {
+    counters = new Map();
+    ordinals.set(execution, counters);
+  }
+  const ordinal = counters.get(site) ?? 0;
+  counters.set(site, ordinal + 1);
+  return ordinal;
+}
+
+/** What a settled row answers a node with. */
+function answerOf(row: DispatchRow): PlacedAnswer {
+  const outcome = row.outcome;
+  if (outcome === undefined) {
+    throw new Error(`\`${row.id}\` is settled and carries no outcome`);
+  }
+  if (outcome.kind === "error") throw replayedFailure(outcome);
+  return outcome.value as PlacedAnswer;
+}
+
+/**
+ * Drop everything one execution's placement waits held, however the run ended.
+ *
+ * The counterpart of `runtime.releaseHumanWaits`, called from the same place and
+ * for the same reason: a dispatch nothing is waiting for would still be work a
+ * worker could take, and its result would be posted against a node execution
+ * that is gone. What is **not** touched is a row this process is not holding a
+ * promise for — a hub that is being restarted leaves those exactly as they are,
+ * which is what lets the process that replaces it pick them up (§5).
+ */
+export function releasePlacementWaits(execution: string): void {
+  ordinals.delete(execution);
+  const ended = "the execution this dispatch belonged to ended";
+  for (const [id, held] of [...awaiting]) {
+    if (held.execution !== execution) continue;
+    rows.delete(id);
+    // Settled as a failure rather than left pending: the promise belongs to a
+    // node execution nothing is waiting for any more, and a promise nobody
+    // resolves is a `serve` process holding one per abandoned branch.
+    held.settle({ kind: "error", name: "DispatchSuperseded", message: ended });
+    void openJournal()
+      .then((journal) => {
+        journal.supersedeDispatch(id, ended);
+      })
+      .catch(() => {
+        // A journal this process cannot write is not a reason to fail a run that
+        // has already stopped: the row stays as it is and a later start reads it.
+      });
+  }
+  announceWaits(execution);
+}
+
+/**
+ * The placement waits one execution is holding, in park order.
+ *
+ * Read off **this process's** awaiting map rather than off the journal, for the
+ * reason `runtime.humanWaits` is read off the board: a report is about the run
+ * this process is holding, and the journal's rows include ones a predecessor
+ * left that nothing here is waiting for.
+ */
+export function placementWaits(execution: string): readonly PlacementWait[] {
+  const found: PlacementWait[] = [];
+  for (const [id, held] of awaiting) {
+    if (held.execution !== execution) continue;
+    found.push({ id, execution, ...describe(id, held) });
+  }
+  return found.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+}
+
+/** What a report says about one held dispatch, read off the row behind it. */
+function describe(
+  id: string,
+  held: Awaiting,
+): Omit<PlacementWait, "id" | "execution"> {
+  const row = rows.get(id);
+  return {
+    placement: row?.placement ?? "",
+    node: row?.node ?? "",
+    site: held.site,
+    parkedAt: row?.parkedAt ?? "",
+    status: held.taken ? "dispatched" : "parked",
+  };
+}
+
+/**
+ * The rows this process has parked, by `dispatch_id`.
+ *
+ * A read-through cache of the journal for the two synchronous readers that
+ * cannot await one — the parked-work counter `runtime.quiescent` calls and the
+ * status report. The journal stays the authority: nothing is decided from this
+ * map that is not also written there.
+ */
+const rows = new Map<string, DispatchRow>();
+
+/**
+ * Be told when one execution's placement waits move; answers the unsubscribe.
+ *
+ * `./serve.ts` subscribes beside `runtime.watchHumanPauses`, so a quiescence
+ * whose only open wait is "waiting for the Mac" fires the `parked` lifecycle
+ * webhook exactly as one waiting for a human does (§6.6, PRD resolved q34).
+ */
+export function watchPlacementWaits(execution: string, listener: () => void): () => void {
+  let watchers = waitWatchers.get(execution);
+  if (watchers === undefined) {
+    watchers = new Set();
+    waitWatchers.set(execution, watchers);
+  }
+  const held = watchers;
+  held.add(listener);
+  return () => {
+    held.delete(listener);
+    if (held.size === 0 && waitWatchers.get(execution) === held) waitWatchers.delete(execution);
+  };
+}
+
+/** Tell this execution's watchers that its set of placement waits moved. */
+function announceWaits(execution: string): void {
+  const watchers = waitWatchers.get(execution);
+  if (watchers === undefined) return;
+  for (const watcher of [...watchers]) watcher();
+}
+
+/**
+ * How many placement waits `execution` is holding at or inside `site`.
+ *
+ * Registered with `runtime.registerParkedWork` at module scope, so
+ * `runtime.quiescent` counts a node waiting on a worker as parked rather than as
+ * work still advancing — which is what makes §6.6's webhook fire for a placement
+ * and what stops a `parked` delivery from being taken while a sibling branch is
+ * still running.
+ */
+registerParkedWork((execution, site) => {
+  let parked = 0;
+  for (const held of awaiting.values()) {
+    if (held.execution !== execution) continue;
+    if (held.site === site || held.site.startsWith(`${site}/`)) parked += 1;
+  }
+  return parked;
+});
+
+// ---------------------------------------------------------------------------
+// The routes (§3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mount the five routes of §3 on the served app, where this target has
+ * placements to mount them for.
+ *
+ * A composition that places nothing mounts nothing: there is no mesh, no session
+ * table and no board, and the app is exactly the app it was before this module
+ * existed. That is also why a trigger may claim a `/workers/*` path on such a
+ * target and not on a mesh one — where the routes are mounted, a colliding
+ * trigger makes the app refuse to start with `FST_ERR_DUPLICATED_ROUTE`, which
+ * is what two colliding triggers already do (`./serve.ts`, grammar §13.3).
+ */
+export function mountWorkerRoutes(app: FastifyInstance): void {
+  if (placements.length === 0) return;
+  if (joinTokenEnv === undefined) {
+    // Unreachable over a composition `validate` accepted — grammar §14.2 makes
+    // `hub.join_token:` required wherever placements are — and said rather than
+    // assumed, because an unauthenticated mesh is the one failure this whole
+    // module has no way to report later.
+    throw new Error(
+      "this target declares `placements:` and no `hub.join_token:`, so there is no credential to authenticate a worker with (grammar §14.2)",
+    );
+  }
+  if (credential() === "") throw new MeshCredentialError(joinTokenEnv);
+  // Read before a route exists, so a pair that cannot be served is a command
+  // that could not be run rather than a window nobody notices.
+  const timings = meshTimings();
+  mounted = true;
+
+  // Registered **before** `./serve.ts`'s own recovery hook, so the rows a dead
+  // process left `dispatched` are back on the board before the replays that
+  // reach them start (§5: sessions are this process's, so a row naming one it
+  // never issued is a row nobody is holding).
+  app.addHook("onReady", async () => {
+    await reparkOrphans();
+  });
+
+  app.post("/workers/join", async (request, reply) => join(request, reply));
+  app.get("/workers/poll", async (request, reply) => poll(request, reply, timings.holdMs));
+  app.post("/workers/effects", async (request, reply) => effects(request, reply));
+  app.post("/workers/result", async (request, reply) => result(request, reply));
+  app.get("/workers/artifact/:hash", async (request, reply) => artifact(request, reply));
+
+  sweeping(timings.windowMs);
+}
+
+/**
+ * Put every dispatch a dead process was holding back on the board.
+ *
+ * §5's third rule, applied to the one piece of state a session can be holding: a
+ * `dispatched` row names a session, sessions live in memory, and this process
+ * has issued none yet — so every such row is one nobody is holding and the next
+ * worker claiming its placement should be given it.
+ */
+async function reparkOrphans(): Promise<void> {
+  try {
+    const journal = await openJournal();
+    for (const row of journal.unsettledDispatches()) {
+      if (row.status === "dispatched") journal.reparkDispatch(row.id);
+    }
+  } catch (error) {
+    // A journal this process cannot read is not a reason to refuse to serve:
+    // the app starts, and the rows are picked up by whatever start can read it.
+    process.stderr.write(`this project's dispatch board could not be read: ${message(error)}\n`);
+  }
+}
+
+/** `POST /workers/join` (§3.1). */
+async function join(request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+  // 1. The credential. A refused one is told nothing about why.
+  if (!authenticated(request)) return reply.code(401).send();
+
+  const body = (request.body ?? {}) as Record<string, unknown>;
+
+  // 2. The wire, before anything about the deployment (§3.1, §10).
+  const protocol = body["protocol"];
+  if (protocol !== PROTOCOL_VERSION) {
+    return reply.code(409).send({
+      protocol: PROTOCOL_VERSION,
+      worker_protocol: protocol ?? null,
+      error: `this hub speaks protocol ${PROTOCOL_VERSION} and the worker speaks ${describeVersion(protocol)}: ${
+        typeof protocol === "number" && protocol < PROTOCOL_VERSION
+          ? "the worker is behind"
+          : "this hub is behind"
+      } — upgrade the one that is`,
+    });
+  }
+
+  // 3. The handshake triple's two required members (§4.1). The hash is the
+  //    member the hub can *repair*, so it is not checked here at all.
+  const compiler = body["compiler"];
+  if (compiler !== COMPILER_VERSION) {
+    return reply.code(409).send({
+      compiler: COMPILER_VERSION,
+      worker_compiler: compiler ?? null,
+      error: `refused: this hub was built by agent-compose ${COMPILER_VERSION} and the worker runs ${describeVersion(compiler)} — upgrade the worker, or point it at a hub of its own release`,
+    });
+  }
+  const runtime = typeof body["runtime"] === "string" ? (body["runtime"] as string) : undefined;
+  if (runtime === undefined || !runs(runtime)) {
+    return reply.code(409).send({
+      runtime: `${WORKER_RUNTIME.name} ${WORKER_RUNTIME.major}.x`,
+      worker_runtime: runtime ?? null,
+      error: `refused: a worker executes the generated artifact under ${WORKER_RUNTIME.name.replace(/^./, (first) => first.toUpperCase())} ${WORKER_RUNTIME.major}.x and this one runs ${describeVersion(body["runtime"])} — install ${WORKER_RUNTIME.name}, or run this placement on a machine that has it`,
+    });
+  }
+
+  // 4. The claims, which describe the target and are told only to a worker that
+  //    got this far.
+  const claims = Array.isArray(body["claims"])
+    ? (body["claims"] as unknown[]).map((claim) => String(claim))
+    : [];
+  const known = placements.map((placement) => placement.name);
+  for (const claim of claims) {
+    if (known.includes(claim)) continue;
+    return reply.code(400).send({
+      claim,
+      placements: known,
+      error: `\`${claim}\` names no placement of this target: it declares ${known.map((name) => `\`${name}\``).join(", ")}`,
+    });
+  }
+
+  // 5. `env_ok` — checked against the manifest in the artifact the worker holds,
+  //    which is the only artifact whose manifest it could have read (§9.2).
+  const held = typeof body["artifact_hash"] === "string" ? body["artifact_hash"] : undefined;
+  const current = held === ARTIFACT_HASH;
+  const reported = Array.isArray(body["env_ok"])
+    ? (body["env_ok"] as unknown[]).map((name) => String(name))
+    : undefined;
+  if (reported !== undefined && current) {
+    const missing = unsatisfied(claims, reported);
+    if (missing.length > 0) {
+      return reply.code(403).send({
+        // **Names, never values, and never whether the hub holds them** (§9).
+        variables: missing,
+        error: `this worker reports none of ${missing.map((name) => `\`${name}\``).join(", ")}, which the placements it claims need`,
+      });
+    }
+  }
+  if ((reported !== undefined) !== current) {
+    return reply.code(400).send({
+      artifact: ARTIFACT_HASH,
+      error: current
+        ? "a join whose `artifact_hash` is the artifact this hub serves must carry `env_ok`: the report is against the manifest in the artifact the worker holds (docs/distributed.md §3.1)"
+        : "a join whose `artifact_hash` is not the artifact this hub serves must omit `env_ok`: the report is against the manifest in the artifact the worker holds, and this worker does not hold it (docs/distributed.md §3.1)",
+    });
+  }
+
+  const session: Session = {
+    id: `wrk_${globalThis.crypto.randomUUID()}`,
+    claims,
+    // A provisioning join is answered normally and dispatched nothing (§3.1).
+    dispatchable: current,
+    seen: Date.now(),
+  };
+  sessions.set(session.id, session);
+  // §6.2's wake: a join that may be dispatched to is what a parked placement
+  // wait has been waiting for, and the held polls re-scan the board.
+  if (session.dispatchable) stirPolls();
+  return reply.code(200).send({
+    protocol: PROTOCOL_VERSION,
+    compiler: COMPILER_VERSION,
+    worker_session: session.id,
+    artifact: { hash: ARTIFACT_HASH, url: `/workers/artifact/${ARTIFACT_HASH}` },
+    poll_url: "/workers/poll",
+  });
+}
+
+/** Which of the claimed placements' variables this report does not name (§9.2). */
+function unsatisfied(claims: readonly string[], reported: readonly string[]): readonly string[] {
+  const missing: string[] = [];
+  for (const claim of claims) {
+    const manifest = placements.find((placement) => placement.name === claim);
+    if (manifest === undefined) continue;
+    for (const variable of manifest.environment) {
+      if (!reported.includes(variable) && !missing.includes(variable)) missing.push(variable);
+    }
+  }
+  return missing;
+}
+
+/** Whether a worker's `runtime` is one this artifact executes under (§4.1). */
+function runs(reported: string): boolean {
+  const [name, version] = reported.trim().split(/\s+/, 2);
+  if ((name ?? "").toLowerCase() !== WORKER_RUNTIME.name) return false;
+  const major = Number((version ?? "").split(".")[0]);
+  return Number.isInteger(major) && major === WORKER_RUNTIME.major;
+}
+
+/** A version a refusal has to name, however the request spelled it. */
+function describeVersion(value: unknown): string {
+  return value === undefined || value === null ? "nothing" : String(value);
+}
+
+/** `GET /workers/poll` (§3.2). */
+async function poll(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  holdMs: number,
+): Promise<unknown> {
+  if (!authenticated(request)) return reply.code(401).send();
+  const session = touched(request);
+  if (session === undefined) return reply.code(410).send(gone());
+
+  const deadline = Date.now() + holdMs;
+  for (;;) {
+    // The session's own request keeps it alive for the whole hold, not only for
+    // the instant it arrived: a hold that outlived the window would let the
+    // sweep declare the very worker whose poll it is holding gone.
+    session.seen = Date.now();
+    const dispatch = await taken(session);
+    if (dispatch !== undefined) return reply.code(200).send(dispatch);
+    const left = deadline - Date.now();
+    if (left <= 0) return reply.code(204).send();
+    await held(Math.min(left, holdMs), request);
+  }
+}
+
+/**
+ * The dispatch this session may be handed, if the board has one.
+ *
+ * Three rules of §2 and §6.2 in one function, and the order is each of them:
+ * a session that has not settled its dispatch is answered nothing however deep
+ * the queue; a provisioning session is answered nothing at all; and what is left
+ * is scanned **in park order**, over the placements this session claims.
+ */
+async function taken(session: Session): Promise<Record<string, unknown> | undefined> {
+  if (!session.dispatchable) return undefined;
+  if (holding(session.id)) return undefined;
+  const journal = await openJournal();
+  for (const row of journal.unsettledDispatches()) {
+    if (row.status !== "parked") continue;
+    if (!session.claims.includes(row.placement)) continue;
+    // A row this process is not awaiting is one whose node is not running here
+    // — a predecessor's, on an execution nothing has replayed yet. Left alone:
+    // handing it out would dispatch work no node is waiting for the answer to.
+    if (!awaiting.has(row.id)) continue;
+    const claimed = journal.claimDispatch(row.id, session.id);
+    if (claimed === undefined) continue;
+    rows.set(claimed.id, claimed);
+    const local = awaiting.get(claimed.id);
+    if (local !== undefined) {
+      local.taken = true;
+      announceWaits(claimed.execution);
+    }
+    return {
+      dispatch_id: claimed.id,
+      execution_id: claimed.execution,
+      node: claimed.node,
+      instance_path: claimed.site,
+      inputs: claimed.inputs,
+      // What a redispatched node replays to the frontier before going live
+      // (§3.2, §7.2). Read out of the journal at the moment it is handed over,
+      // which is §5's first rule: nothing is held from an earlier session.
+      effect_history: journal.effectsUnder(claimed.execution, claimed.site).map(wireEffect),
+    };
+  }
+  return undefined;
+}
+
+/** Whether this session is holding a dispatch it has not settled (§2). */
+function holding(session: string): boolean {
+  for (const row of rows.values()) {
+    if (row.session === session && row.status === "dispatched" && awaiting.has(row.id)) return true;
+  }
+  return false;
+}
+
+/** One journaled effect, as the wire carries it. */
+function wireEffect(record: JournalRecord): Record<string, unknown> {
+  return {
+    key: record.key,
+    site: record.site,
+    kind: record.kind,
+    ordinal: record.ordinal,
+    request: record.request,
+    outcome: record.outcome,
+    refused: record.refused,
+    recorded_at: record.recordedAt,
+  };
+}
+
+/** Wait out the rest of a hold, or until the board moves. */
+function held(milliseconds: number, request: FastifyRequest): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer as Parameters<typeof clearTimeout>[0]);
+      pollers.delete(finish);
+      // Off with the hold rather than with the request, because one poll waits
+      // more than once: a listener per round would be one per stir on a
+      // connection the runtime warns about at ten.
+      request.raw.removeListener("close", finish);
+      resolve();
+    };
+    const timer: unknown = setTimeout(finish, milliseconds);
+    if (typeof (timer as { unref?: () => void }).unref === "function") {
+      (timer as { unref: () => void }).unref();
+    }
+    pollers.add(finish);
+    // A worker that hung up is a hold with nobody to answer, so the process is
+    // not left holding one timer per abandoned connection.
+    request.raw.once("close", finish);
+  });
+}
+
+/** `POST /workers/effects` (§3.3). */
+async function effects(request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+  if (!authenticated(request)) return reply.code(401).send();
+  const session = touched(request);
+  if (session === undefined) return reply.code(410).send(gone());
+
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const id = typeof body["dispatch_id"] === "string" ? body["dispatch_id"] : undefined;
+  const batch = Array.isArray(body["effects"]) ? (body["effects"] as unknown[]) : undefined;
+  if (id === undefined || batch === undefined) {
+    return reply
+      .code(400)
+      .send({ error: "a batch names its `dispatch_id` and carries an `effects` array" });
+  }
+  const journal = await openJournal();
+  const row = journal.dispatchOf(id);
+  if (row === undefined) {
+    return reply.code(409).send({ dispatch_id: id, error: `no dispatch \`${id}\`` });
+  }
+  for (const entry of batch) {
+    const record = recordOf(row, entry);
+    if (record === undefined) {
+      return reply.code(400).send({
+        dispatch_id: id,
+        error:
+          "every record carries a `key`, a `site` at or inside the dispatch's `instance_path`, a `kind`, an `ordinal`, a canonical `request` and an `outcome`",
+      });
+    }
+    // **Workers SEND, the hub INSERTS** (§3.3), idempotently by effect key: a
+    // record the journal already holds is accepted and dropped, which is what
+    // makes a batch safe to re-send after a transport failure.
+    journal.append(record);
+  }
+  return reply.code(204).send();
+}
+
+/** One record off the wire, or `undefined` where it is not one. */
+function recordOf(row: DispatchRow, entry: unknown): JournalRecord | undefined {
+  if (entry === null || typeof entry !== "object") return undefined;
+  const held = entry as Record<string, unknown>;
+  const key = held["key"];
+  const site = held["site"];
+  const kind = held["kind"];
+  const ordinal = held["ordinal"];
+  const request = held["request"];
+  const outcome = held["outcome"];
+  if (typeof key !== "string" || typeof site !== "string" || typeof request !== "string") {
+    return undefined;
+  }
+  if (typeof kind !== "string" || !["model", "tool", "store", "human"].includes(kind)) {
+    return undefined;
+  }
+  if (typeof ordinal !== "number" || !Number.isInteger(ordinal)) return undefined;
+  // **The execution is the hub's, never the batch's.** A worker names a dispatch
+  // and the hub reads the execution off the row, so no session can write an
+  // effect into an execution it was never dispatched — and the site is held to
+  // the dispatch's own instance path for the same reason (§8's single writer).
+  if (site !== row.site && !site.startsWith(`${row.site}/`)) return undefined;
+  const settled = outcomeOf(outcome);
+  if (settled === undefined) return undefined;
+  const at = held["recorded_at"];
+  return {
+    execution: row.execution,
+    key,
+    site,
+    kind: kind as EffectKind,
+    ordinal,
+    request,
+    outcome: settled,
+    refused: held["refused"] === true,
+    recordedAt: typeof at === "string" ? at : new Date().toISOString(),
+  };
+}
+
+/** One outcome off the wire, or `undefined` where it is not one. */
+function outcomeOf(value: unknown): JournalOutcome | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const held = value as Record<string, unknown>;
+  if (held["kind"] === "value") return { kind: "value", value: held["value"] };
+  if (held["kind"] === "error") {
+    return {
+      kind: "error",
+      name: typeof held["name"] === "string" ? held["name"] : "Error",
+      message: typeof held["message"] === "string" ? held["message"] : "",
+    };
+  }
+  return undefined;
+}
+
+/** `POST /workers/result` (§3.4). */
+async function result(request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+  if (!authenticated(request)) return reply.code(401).send();
+  const session = touched(request);
+  if (session === undefined) return reply.code(410).send(gone());
+
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const id = typeof body["dispatch_id"] === "string" ? body["dispatch_id"] : undefined;
+  if (id === undefined) {
+    return reply.code(400).send({ error: "a result names the `dispatch_id` it settles" });
+  }
+  const journal = await openJournal();
+  const row = journal.dispatchOf(id);
+  // **`409`, not `410`.** §3.4: the hub knows this worker and does not want this
+  // result — the execution has moved past it, and re-driving it from a stale
+  // result is the divergence `docs/durability.md` §7 refuses.
+  if (row === undefined || row.status === "superseded") {
+    return reply.code(409).send({
+      dispatch_id: id,
+      error:
+        row === undefined
+          ? `no dispatch \`${id}\``
+          : `\`${id}\` was superseded by this hub and the execution has moved past it: ${row.detail ?? "the session holding it stopped making requests"}`,
+    });
+  }
+  // A dispatch a result already settled: accepted and dropped, which is what
+  // makes at-least-once dispatch safe on the return path too.
+  if (row.status === "settled") return reply.code(204).send();
+
+  const outcome: JournalOutcome =
+    body["error"] === undefined || body["error"] === null
+      ? {
+          kind: "value",
+          value: {
+            output: body["output"],
+            ...(body["history"] === undefined ? {} : { history: body["history"] }),
+            ...(body["models"] === undefined ? {} : { models: body["models"] }),
+            ...(body["tool_dispatches"] === undefined
+              ? {}
+              : { toolDispatches: body["tool_dispatches"] }),
+          },
+        }
+      : {
+          kind: "error",
+          name: String((body["error"] as Record<string, unknown>)["name"] ?? "Error"),
+          message: String((body["error"] as Record<string, unknown>)["message"] ?? ""),
+        };
+  journal.settleDispatch(id, outcome);
+  rows.delete(id);
+  const held = awaiting.get(id);
+  if (held !== undefined) held.settle(outcome);
+  return reply.code(204).send();
+}
+
+/** `GET /workers/artifact/{hash}` (§3.5). */
+async function artifact(request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
+  // **The bearer token alone.** This is the one route that does not require a
+  // session, and the exception is deliberate: a worker whose session has aged
+  // out re-joins and fetches, and a fetch should not be coupled to a lifetime.
+  if (!authenticated(request)) return reply.code(401).send();
+  const asked = (request.params as { hash?: string }).hash ?? "";
+  if (!/^sha256:[0-9a-f]{64}$/.test(asked)) {
+    return reply.code(400).send({
+      error: `\`${asked}\` is not an artifact hash: one is \`sha256:\` and 64 lowercase hexadecimal digits`,
+    });
+  }
+  if (asked !== ARTIFACT_HASH) {
+    // v1 hubs serve exactly one artifact — their own tree — so an unknown hash
+    // names the one this hub has, which is what a worker re-joins over (§3.5).
+    return reply.code(404).send({
+      hash: asked,
+      artifact: ARTIFACT_HASH,
+      error: `this hub does not hold \`${asked}\`; it serves \`${ARTIFACT_HASH}\``,
+    });
+  }
+  const body = tarball();
+  return reply
+    .code(200)
+    .header("content-type", "application/gzip")
+    .header("content-length", String(body.length))
+    .send(body);
+}
+
+// ---------------------------------------------------------------------------
+// The credential, the session header, and the sweep
+// ---------------------------------------------------------------------------
+
+/** The join token this deployment verifies against. */
+function credential(): string {
+  return joinTokenEnv === undefined ? "" : (process.env[joinTokenEnv] ?? "");
+}
+
+/** Whether this request carried the deploy target's join token (§3). */
+function authenticated(request: FastifyRequest): boolean {
+  const expected = credential();
+  if (expected === "") return false;
+  const offered = headerOnce(request, "authorization");
+  if (offered === undefined || !offered.startsWith("Bearer ")) return false;
+  return equal(offered.slice("Bearer ".length), expected);
+}
+
+/**
+ * The one value this request carried under `name`, or `undefined` where it
+ * carried none or more than one.
+ *
+ * Read off the arrival list rather than the parsed map, and refusing a repeat,
+ * for the reason `./serve.ts` gives at its own `headerValues`: the two runtimes a
+ * project runs under disagree about which of two `authorization` headers wins,
+ * so a request whose credential depends on who resolved that disagreement has
+ * not presented one.
+ */
+function headerOnce(request: FastifyRequest, name: string): string | undefined {
+  const arrived = request.raw.rawHeaders;
+  const wanted = name.toLowerCase();
+  let found: string | undefined;
+  for (let index = 0; index + 1 < arrived.length; index += 2) {
+    if ((arrived[index] ?? "").toLowerCase() !== wanted) continue;
+    if (found !== undefined) return undefined;
+    found = arrived[index + 1] ?? "";
+  }
+  return found;
+}
+
+/**
+ * Whether two credentials are equal, compared in **constant time**.
+ *
+ * The same discipline grammar §13.3 requires of an inbound trigger credential
+ * and for the same reason, restated here rather than reached for across a module
+ * boundary: `./serve.ts` imports this module, so a helper borrowed from it would
+ * close an import cycle for eight lines of comparison. A byte-by-byte early
+ * return leaks the join token to a caller who can time it, and holding the whole
+ * mesh is what that token is (§9.3).
+ */
+function equal(offered: string, expected: string): boolean {
+  if (expected.length === 0) return false;
+  const left = new TextEncoder().encode(offered);
+  const right = new TextEncoder().encode(expected);
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+/** The session this request carries, marked as having been heard from. */
+function touched(request: FastifyRequest): Session | undefined {
+  const named = headerOnce(request, "x-worker-session");
+  const session = named === undefined ? undefined : sessions.get(named);
+  if (session !== undefined) session.seen = Date.now();
+  return session;
+}
+
+/** The body every `410` on a session-carrying route answers with (§3). */
+function gone(): Record<string, unknown> {
+  return {
+    error:
+      "this hub does not know that worker session: join again, and make this request again under the session that join returns (docs/distributed.md §3, §5)",
+  };
+}
+
+/** Whether the liveness sweep is already scheduled in this process. */
+let sweeper: unknown;
+
+/**
+ * Run the liveness sweep of §6.3 on a repeating, unreferenced timer.
+ *
+ * A timer rather than a check on the next request, and that is the whole of why
+ * it exists: the failure this detects is a worker that **stops making
+ * requests**, so an execution whose only worker died has nothing left to arrive
+ * and trigger a check. Unreferenced, so a process with nothing else to do still
+ * exits.
+ */
+function sweeping(windowMs: number): void {
+  if (sweeper !== undefined) return;
+  const tick = (): void => {
+    void sweep(windowMs).catch((error: unknown) => {
+      process.stderr.write(`the mesh liveness sweep could not run: ${message(error)}\n`);
+    });
+  };
+  const every = Math.max(250, Math.floor(windowMs / 4));
+  const timer: unknown = setInterval(tick, every);
+  if (typeof (timer as { unref?: () => void }).unref === "function") {
+    (timer as { unref: () => void }).unref();
+  }
+  sweeper = timer;
+}
+
+/**
+ * Forget every session that has gone quiet, and supersede what each was holding
+ * (§6.3).
+ *
+ * The two cases are §6.3's two, and the difference is the whole of what a closed
+ * laptop costs. A session with **no** unsettled dispatch costs nothing: the
+ * placement's open waits stay on the board and the next join takes them in park
+ * order. A session **holding** one supersedes it, which fails the node's attempt
+ * under its own `retry:`/`on_error:` chain — and where `retry:` grants another,
+ * the node re-enters dispatch and parks again if nothing is claiming the
+ * placement, which is the sense in which heartbeat loss re-parks.
+ */
+async function sweep(windowMs: number): Promise<void> {
+  const stale: string[] = [];
+  const now = Date.now();
+  for (const session of sessions.values()) {
+    if (now - session.seen > windowMs) stale.push(session.id);
+  }
+  if (stale.length === 0) return;
+  for (const id of stale) sessions.delete(id);
+  const journal = await openJournal();
+  for (const [id, row] of [...rows]) {
+    if (row.session === undefined || !stale.includes(row.session)) continue;
+    if (row.status !== "dispatched") continue;
+    const detail = `the session holding this dispatch made no request for ${windowMs}ms, so the hub gave up on it (docs/distributed.md §6.3)`;
+    journal.supersedeDispatch(id, detail);
+    rows.delete(id);
+    const held = awaiting.get(id);
+    if (held === undefined) continue;
+    awaiting.delete(id);
+    held.settle({ kind: "error", name: "DispatchSuperseded", message: detail });
+  }
+  stirPolls();
+}
+
+// ---------------------------------------------------------------------------
+// The tarball (§3.5, §4)
+// ---------------------------------------------------------------------------
+
+/** The emitted project's root: the directory `src/` sits in. */
+const PROJECT_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+/** The served body, built once. See [`buildTarball`]. */
+let packed: Buffer | undefined;
+
+/**
+ * The artifact as §3.5 serves it: a gzipped tar of exactly the files this build
+ * emitted.
+ *
+ * Built by hand rather than by a dependency, because §2's "no new runtime
+ * dependency" is a rule about this whole surface and a tar writer is sixty lines
+ * of a format that has not moved since 1988. Every header field that is not the
+ * name, the size and the mode is written as a constant — no modification time,
+ * no owner, no group — which is what makes two hubs built from one composition
+ * serve byte-identical tarballs as well as one hash.
+ */
+function tarball(): Buffer {
+  packed ??= buildTarball();
+  return packed;
+}
+
+function buildTarball(): Buffer {
+  const blocks: Buffer[] = [];
+  for (const relative of ARTIFACT_FILES) {
+    const bytes = fs.readFileSync(path.join(PROJECT_ROOT, relative));
+    blocks.push(tarHeader(relative, bytes.length), pad(bytes));
+  }
+  // Two zero blocks end an archive, and the reader that would accept one is not
+  // one this has to be written for.
+  blocks.push(Buffer.alloc(1024));
+  // The gzip header this writes carries no modification time — the runtime
+  // leaves it zero — which is the other half of what makes two hubs built from
+  // one composition serve identical bytes.
+  return zlib.gzipSync(Buffer.concat(blocks), { level: 9 });
+}
+
+/** One ustar header block. */
+function tarHeader(name: string, size: number): Buffer {
+  const header = Buffer.alloc(512);
+  const written = Buffer.from(name, "utf8");
+  if (written.length > 100) {
+    throw new Error(`\`${name}\` is longer than a tar header holds, so it cannot be served`);
+  }
+  written.copy(header, 0);
+  header.write("0000644\0", 100, "ascii"); // mode
+  header.write("0000000\0", 108, "ascii"); // uid
+  header.write("0000000\0", 116, "ascii"); // gid
+  header.write(`${size.toString(8).padStart(11, "0")}\0`, 124, "ascii");
+  header.write("00000000000\0", 136, "ascii"); // mtime, fixed: see [`tarball`]
+  header.write("        ", 148, "ascii"); // checksum, computed below
+  header.write("0", 156, "ascii"); // a regular file
+  header.write("ustar\0", 257, "ascii");
+  header.write("00", 263, "ascii");
+  let checksum = 0;
+  for (const byte of header) checksum += byte;
+  header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+  return header;
+}
+
+/** One file's bytes, padded to the 512-byte block a tar entry is. */
+function pad(bytes: Buffer): Buffer {
+  const remainder = bytes.length % 512;
+  if (remainder === 0) return bytes;
+  return Buffer.concat([bytes, Buffer.alloc(512 - remainder)]);
+}
+
+/**
+ * The content hash of a materialised tree, computed the way
+ * `compose_core::codegen::artifact` computes it.
+ *
+ * Exported because §4 step 2 makes a worker "verify the hash it computed against
+ * the hash it asked for before unpacking anything", and both ends have to agree
+ * about the answer to the byte. `src/artifact.ts` is the one entry outside the
+ * digest, for the reason that module gives: a file carrying the hash of a tree it
+ * is part of has no fixed point.
+ */
+export function contentHash(files: ReadonlyMap<string, Uint8Array>): string {
+  const listing: string[] = [];
+  for (const name of [...files.keys()].sort()) {
+    if (name === "src/artifact.ts") continue;
+    const bytes = files.get(name);
+    if (bytes === undefined) continue;
+    listing.push(`${name}\0${createHash("sha256").update(bytes).digest("hex")}`);
+  }
+  return `sha256:${createHash("sha256").update(listing.join("\n")).digest("hex")}`;
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

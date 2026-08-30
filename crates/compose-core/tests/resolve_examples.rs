@@ -113,15 +113,12 @@ fn no_target_named_resolves_local() {
     // backend section at all, so the artifact carries none either.
     assert!(ir.deploy.storage_backends.is_none());
     // `hub:` and `placements:` are live static grammar `local` admits like any
-    // other target: the artifact carries the sections it was declared with,
-    // spans and all (D87, grammar 14.1, 14.2).
-    let placements = ir
-        .deploy
-        .placements
-        .as_ref()
-        .expect("`deploy/local.yml` declares `placements:`");
-    assert!(!placements.is_empty());
-    assert_eq!(placements.span.source.as_str(), "deploy/local.yml");
+    // other target (D87, grammar 14.1, 14.2), and this file declares the first
+    // and not the second: a placed component is dispatched to whichever worker
+    // claims its placement (`docs/distributed.md` §3), so a target whose runs are
+    // single-process leaves `placements:` to `deploy/staging.yml`. An absent
+    // section is no key at all, which is what the artifact carries.
+    assert!(ir.deploy.placements.is_none());
     let hub = ir
         .deploy
         .hub

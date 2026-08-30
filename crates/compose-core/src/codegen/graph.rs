@@ -239,7 +239,8 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     body.push_str(&registry_source(ir, names, &registry, &mut imported));
 
     contents.push_str("\nimport { END, START, StateGraph } from \"@langchain/langgraph\";\n");
-    contents.push_str("\nimport * as runtime from \"./runtime.ts\";\n");
+    contents.push_str("\nimport * as mesh from \"./mesh.ts\";\n");
+    contents.push_str("import * as runtime from \"./runtime.ts\";\n");
     contents.push_str("import * as stores from \"./stores.ts\";\n");
     imported.sort();
     imported.dedup();
@@ -2044,6 +2045,61 @@ fn activity(
         });
 
     match &node.kind {
+        // **A placed component is dispatched, not called** (grammar §14.1,
+        // `docs/distributed.md` §7). The node keeps everything else it has — its
+        // input phase, its `retry:`/`timeout:` chain, its writes and its edges —
+        // and only the activity changes: the hub journals a dispatch, parks it
+        // until a worker claiming the placement takes it, and feeds the answer
+        // back into the graph as if the node had run here.
+        NodeKind::Agent { agent } if placement_of(ir, &agent.value.to_string()).is_some() => {
+            let placement = placement_of(ir, &agent.value.to_string())
+                .expect("the guard above found a placement");
+            let schema = output_schema.expect("an agent node has an output surface");
+            format!(
+                "  run: async (input, context, view) => {{\n    \
+                 const answer = await mesh.dispatchPlaced({{\n      \
+                 placement: {placement},\n      \
+                 node: {node_address},\n      \
+                 execution: view.run.execution.id,\n      \
+                 path: runtime.instancePath(view, {node}),\n      \
+                 inputs: input,\n      \
+                 signal: context.signal,\n    \
+                 }});\n    \
+                 return {{\n      \
+                 output: runtime.parseResult({schema}, answer.output, {subject}),\n      \
+                 history: answer.history,\n      \
+                 models: answer.models,\n      \
+                 toolDispatches: answer.toolDispatches,\n    \
+                 }};\n  }},\n",
+                placement = names::string(&placement),
+                node_address = names::string(&format!("{address}.{id}")),
+                node = names::string(id),
+                subject = names::string(&format!("the answer of `{}`", agent.value))
+            )
+        }
+        NodeKind::Function { function }
+            if placement_of(ir, &function.value.to_string()).is_some() =>
+        {
+            let placement = placement_of(ir, &function.value.to_string())
+                .expect("the guard above found a placement");
+            let schema = output_schema.expect("a function node has an output surface");
+            format!(
+                "  run: async (input, context, view) => ({{\n    \
+                 output: runtime.parseResult(\n      {schema},\n      \
+                 (\n        await mesh.dispatchPlaced({{\n          \
+                 placement: {placement},\n          \
+                 node: {node_address},\n          \
+                 execution: view.run.execution.id,\n          \
+                 path: runtime.instancePath(view, {node}),\n          \
+                 inputs: input,\n          \
+                 signal: context.signal,\n        \
+                 }})\n      ).output,\n      {subject},\n    ),\n  }}),\n",
+                placement = names::string(&placement),
+                node_address = names::string(&format!("{address}.{id}")),
+                node = names::string(id),
+                subject = names::string(&format!("the result of `{}`", function.value))
+            )
+        }
         NodeKind::Agent { agent } => {
             let binding = names.value(&agent.value.to_string());
             let schema = output_schema.expect("an agent node has an output surface");
@@ -2603,6 +2659,43 @@ fn dispatch_run(
     let Some(definition) = ir.definitions.get(target) else {
         return format!("{indent}run: () => Promise.resolve({{ output: {{}} }}),\n");
     };
+    // A dispatched instance whose target is placed goes over the wire exactly as
+    // a placed node does: the `map` admits what its `max_concurrency:` says and
+    // the placement delivers what its pool can run, which is
+    // `docs/distributed.md` §2's "a `map` declares how many instances the graph
+    // may have in flight; when the node it dispatches is placed, how many of
+    // them are running at once is the number of live sessions claiming that
+    // placement". The rest are undispatched, on the board, with their own
+    // `timeout:` running (§6.4).
+    if let Some(placement) = placement_of(ir, target)
+        && matches!(
+            definition.body,
+            DefinitionBody::Agent(_) | DefinitionBody::Tool(_)
+        )
+    {
+        let schema = names.value(&format!("{target}.output")).to_string();
+        imported.push(schema.clone());
+        return format!(
+            "{indent}run: async (input, context, site) => {{\n{indent}  \
+             const answer = await mesh.dispatchPlaced({{\n{indent}    \
+             placement: {placement},\n{indent}    \
+             node: {target_name},\n{indent}    \
+             execution: site.execution.id,\n{indent}    \
+             path: site.path,\n{indent}    \
+             inputs: input,\n{indent}    \
+             signal: context.signal,\n{indent}  \
+             }});\n{indent}  \
+             return {{\n{indent}    \
+             output: runtime.parseResult({schema}, answer.output, {subject}),\n{indent}    \
+             models: answer.models,\n{indent}    \
+             toolDispatches: answer.toolDispatches,\n{indent}  \
+             }};\n{indent}\
+             }},\n",
+            placement = names::string(&placement),
+            target_name = names::string(target),
+            subject = names::string(&format!("the answer of `{target}`"))
+        );
+    }
     match &definition.body {
         DefinitionBody::Agent(_) => {
             let binding = names.value(target);
@@ -3703,6 +3796,11 @@ async function quiesceFlow(
   // (`docs/durability.md` §5).
   const release = async (outcome: unknown): Promise<void> => {
     runtime.releaseHumanWaits(executionId);
+    // …and the placement waits, for the same reason one level out: a dispatch
+    // nothing is waiting for is work a worker could still take, whose result
+    // would be posted against a node execution that is gone
+    // (`docs/distributed.md` §6.1, `./mesh.ts`).
+    mesh.releasePlacementWaits(executionId);
     // And the deliveries nothing joined, on the two ways out where one still in
     // flight can change what this function has to decide.
     //
@@ -3860,6 +3958,24 @@ fn control_name_raw(target: &ControlTarget) -> String {
         ControlTarget::Node(node) => node.as_str().to_string(),
         ControlTarget::End => "__end__".to_string(),
     }
+}
+
+/// Which placement claims this component, if one does (grammar §14.1).
+///
+/// The first claim wins, exactly as `check::placements` and `codegen::env` read
+/// it: a component two placements name is already a compile error, and reading
+/// it twice here would make the emitted project depend on which of the two
+/// reports the author fixes.
+fn placement_of(ir: &Ir, address: &str) -> Option<String> {
+    let section = ir.deploy.placements.as_ref()?;
+    for placement in section.entries.values() {
+        for member in &placement.members {
+            if member.value.to_string() == address {
+                return Some(placement.name.value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The canonical path of a node's result surface, if it has one.

@@ -74,6 +74,20 @@
 //!    are open design questions the runtime pass carries to the PRD's Open
 //!    Questions and implements against the resolution, never against the
 //!    placeholder §13 records.
+//!
+//! # Where the unwind has got to
+//!
+//! **The hub half has landed and the worker half has not.** `src/mesh.ts`,
+//! `src/deployment.ts` and `src/artifact.ts` are emitted, a placed node is
+//! dispatch-and-await, and the environment manifest is partitioned per
+//! `docs/distributed.md` §9.1 — so items 5 and the *emission* half of this
+//! file's second claim are done, and the two tests that asserted them have been
+//! turned around below rather than deleted. What has **not** landed is the
+//! `worker` verb, its node-runner, and the multi-process acceptance suite; the
+//! documents therefore still say the protocol is not built, item 4's §12 is
+//! still true of the half a reader can deploy, and the doc-pinning tests below
+//! are untouched. The pass that lands the worker turns *those* around and
+//! finishes this file the way `trigger_auth_surface.rs` was finished.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -311,70 +325,255 @@ fn the_deploy_layer_carries_every_key_into_the_artifact() {
     );
 }
 
-/// **None of it reaches the generated project.**
+/// **The mesh reaches the generated project, and reaches the right files.**
 ///
-/// This is the assertion the runtime pass turns around. Every file of the
-/// emitted project is scanned for the material only a mesh contributes — the
-/// placement names, the token's variable, the public base, the five routes
-/// of `docs/distributed.md` §3 and the session header they carry — and a hit
-/// means half a protocol shipped.
+/// This is the assertion the hub pass turned around, and the half of the
+/// turnaround it could do: the material only a mesh contributes — the placement
+/// names, the token's variable, the public base, the four routes of
+/// `docs/distributed.md` §3 the hub mounts and the session header they carry —
+/// is no longer absent, and what replaces "it is absent" is **where each piece
+/// belongs**.
 ///
-/// Half is the dangerous amount. A build that emits nothing is a deployment
-/// where no worker ever joins, which is visible the first time somebody starts
-/// one; a build that emits a route and no scheduler is a mesh that accepts a
-/// join and never dispatches, which looks like a hung graph.
+/// Half is still the dangerous amount, which is why the check is a partition
+/// rather than a presence: the *composition's* mesh facts belong to
+/// `src/deployment.ts`, which is the one module the hub and a worker both read
+/// (§9.1), and the *protocol's* belong to `src/mesh.ts`, which is a constant of
+/// the compiler release. A route that appeared in the emitted graph, or a
+/// placement name compiled into the hub, would be a wire whose shape depended on
+/// the composition — and §10.1's "the routes of §3, their paths and their
+/// methods" is a promise about the release rather than about the deployment.
 #[test]
-fn no_placement_or_hub_material_reaches_the_generated_project() {
+fn the_mesh_reaches_the_generated_project_in_the_modules_that_hold_it() {
     let ir = resolve_clean("emitted");
     let generated = compose_core::emit(&ir);
-    for file in generated.files() {
-        for material in MESH_ONLY {
+    let file = |path: &str| {
+        generated
+            .file(path)
+            .unwrap_or_else(|| panic!("a mesh project emits `{path}`"))
+            .contents
+            .as_str()
+    };
+
+    // The deploy layer's own facts, in the module that carries the partition.
+    let deployment = file("src/deployment.ts");
+    for material in [
+        "mac_signing_pool",
+        "gpu_pool",
+        "MESH_INERTNESS_TOKEN",
+        "hub.inertness.example",
+    ] {
+        assert!(
+            deployment.contains(material),
+            "`src/deployment.ts` does not carry `{material}`, so what the hub and a worker read \
+             one answer out of has stopped describing this target (docs/distributed.md §9.1)"
+        );
+    }
+
+    // …and the protocol's, in the constant that speaks it.
+    let mesh = file("src/mesh.ts");
+    for route in [
+        "/workers/join",
+        "/workers/poll",
+        "/workers/effects",
+        "/workers/result",
+        "/workers/artifact",
+    ] {
+        assert!(
+            mesh.contains(route),
+            "`src/mesh.ts` mounts no `{route}`, and §3's five routes are what a worker speaks to"
+        );
+    }
+    assert!(
+        mesh.contains("x-worker-session"),
+        "`src/mesh.ts` reads no session header, and every route after the join carries one (§3)"
+    );
+
+    // The composition's own modules stay clear of both: a placement decides
+    // which process runs a node, and the node is compiled once.
+    for path in [
+        "src/graph.ts",
+        "src/state.ts",
+        "src/schemas.ts",
+        "src/env.ts",
+    ] {
+        for route in ["/workers/join", "/workers/poll", "/workers/result"] {
             assert!(
-                !file.contents.contains(material),
-                "`{}` carries `{material}`, so part of the worker protocol has shipped ahead of \
-                 the rest: turn this file around the way `trigger_auth_surface.rs` was turned \
-                 around, following the unwind list in its module docs",
-                file.path
+                !file(path).contains(route),
+                "`{path}` carries `{route}`, so the wire has leaked into the composition's own \
+                 lowering: §10.1 promises the routes to a compiler release, not to a deployment"
             );
         }
     }
-}
-
-/// The environment manifest is the half with no sentence to bind.
-///
-/// `crates/compose-core/src/codegen/env.rs` walks the definitions, the trigger
-/// table and the deploy layer's `storage_backends:`/`event_sources:`. It does
-/// **not** walk `hub:`, so `${MESH_INERTNESS_TOKEN}` is absent from
-/// `src/env.ts` — and that is correct exactly while nothing reads it: a launch
-/// check that refused to start a project over a variable no code touches would
-/// be a false requirement, and one that let a real mesh start without its token
-/// would be the opposite failure.
-///
-/// The runtime pass has to move this assertion, not delete it. PRD resolved q41
-/// makes the manifest **per placement**: the hub's own list is what
-/// `readEnvironment()` checks at start, and a worker's list is what it reports
-/// at join. `docs/distributed.md` §9.1 is the partition rule to implement.
-#[test]
-fn the_environment_manifest_does_not_yet_know_about_the_hub() {
-    let ir = resolve_clean("environment");
-    let generated = compose_core::emit(&ir);
-    let environment = &generated
-        .files()
-        .iter()
-        .find(|file| file.path == "src/env.ts")
-        .expect("every project emits its environment manifest")
-        .contents;
-
     assert!(
-        environment.contains("OPENAI_API_KEY"),
-        "the manifest still lists what it always listed, so this test is measuring the walk \
-         rather than an empty file"
+        !file("src/mesh.ts").contains("mac_signing_pool"),
+        "`src/mesh.ts` names a placement of this composition, and it is a constant of the \
+         compiler release: what differs between two deployments is `src/deployment.ts`"
+    );
+
+    // And the seam itself: a placed component's node is a dispatch rather than a
+    // call, which is the whole of what `docs/distributed.md` §7 asks of the hub.
+    let graph = file("src/graph.ts");
+    assert!(
+        graph.contains("mesh.dispatchPlaced({"),
+        "no node of this composition dispatches, and `agent.signer` is placed on \
+         `mac_signing_pool`: the generated node function for a placed component is \
+         dispatch-and-await (docs/distributed.md §7)"
     );
     assert!(
-        !environment.contains("MESH_INERTNESS_TOKEN"),
-        "`src/env.ts` names the hub's join token, so the environment walk has learned about \
-         `hub:` — which is the runtime pass's job, together with the per-placement partition of \
-         `docs/distributed.md` §9.1 (PRD resolved q41)"
+        graph.contains("placement: \"mac_signing_pool\","),
+        "the dispatch names no placement, so the hub would have nothing to queue the work to \
+         (docs/distributed.md §2: work queues to a placement, never to a worker)"
+    );
+    // The seam is per component: the fixture's second placement gets a dispatch
+    // of its own, and the `function:` node over the placed `tool.notarize` gets
+    // one too — grammar §14.1 leaves a `function:` node's tool alone precisely
+    // because its own placement is the whole answer there.
+    assert!(
+        graph.contains("placement: \"gpu_pool\","),
+        "`agent.summarizer` is placed on `gpu_pool` and its node does not dispatch: a placement \
+         decides which process runs a node, one node at a time"
+    );
+    assert_eq!(
+        graph.matches("mesh.dispatchPlaced({").count(),
+        3,
+        "this fixture has three placed nodes — the two agents and the `function:` node over \
+         `tool.notarize` — and each is one dispatch"
+    );
+}
+
+/// The material a mesh contributes reaches the project, and nothing else does.
+///
+/// The counterpart of the test above, kept as a scan because it is the one that
+/// catches a *leak*: a composition with no `placements:` must emit a project in
+/// which nothing about a mesh appears except the constant hub module, which
+/// mounts nothing for it.
+#[test]
+fn a_composition_with_no_placements_carries_no_mesh_of_its_own() {
+    let directory = std::env::temp_dir()
+        .join("agent-compose-placement-inertness")
+        .join(format!("{}-unplaced", std::process::id()));
+    let _ = fs::remove_dir_all(&directory);
+    fs::create_dir_all(&directory).expect("can create the project");
+    fs::write(directory.join("main.yml"), SPEC).expect("can write the spec");
+    let resolution = compose_core::resolve(directory.join("main.yml"));
+    let ir = resolution.ir.expect("the composition alone resolves");
+    assert!(compose_core::check(&ir).is_empty());
+
+    let generated = compose_core::emit(&ir);
+    // The composition's own lowering, which is where a leak would show: the
+    // constants (`src/mesh.ts`) and the identity module describe the wire in
+    // their prose, and describing it is what they are for.
+    for path in [
+        "src/graph.ts",
+        "src/env.ts",
+        "src/state.ts",
+        "src/schemas.ts",
+        "src/triggers.ts",
+    ] {
+        let contents = &generated
+            .file(path)
+            .unwrap_or_else(|| panic!("every project emits `{path}`"))
+            .contents;
+        for material in MESH_ONLY {
+            assert!(
+                !contents.contains(material),
+                "`{path}` carries `{material}` for a composition that places nothing"
+            );
+        }
+        assert!(
+            !contents.contains("dispatchPlaced"),
+            "`{path}` dispatches a node for a composition that places none"
+        );
+    }
+    let deployment = &generated
+        .file("src/deployment.ts")
+        .expect("every project emits its deployment module")
+        .contents;
+    assert!(
+        deployment.contains("export const placements: readonly PlacementManifest[] = [];"),
+        "a composition with no placements declares none: {deployment}"
+    );
+    assert!(
+        deployment.contains("export const joinTokenEnv: string | undefined = undefined;"),
+        "a composition with no `hub:` names no join token: {deployment}"
+    );
+}
+
+/// The environment manifest is partitioned per process (PRD resolved q41).
+///
+/// The assertion this file used to make — that `src/env.ts` did not know about
+/// `hub:` — was correct exactly while nothing read the token. The hub reads it
+/// now, so the assertion **moved** rather than went: `readEnvironment()` checks
+/// the *hub's* list, which is what `docs/distributed.md` §9.1 partitions, and
+/// `src/deployment.ts` carries each placement's beside it so both ends read one
+/// answer under one artifact hash.
+///
+/// Both directions §9.1 closes with are here, over this fixture's own shape.
+/// Every agent it declares is placed, so `${OPENAI_API_KEY}` — the credential
+/// their model's provider carries — is spent on the two workers and **not** on
+/// the hub, which is the least-privilege line PRD 5.10 draws: the hub cannot
+/// leak what it never held. The join token is the hub's alone, by the same rule
+/// read the other way.
+#[test]
+fn the_environment_manifest_is_partitioned_per_process() {
+    let ir = resolve_clean("environment");
+    let generated = compose_core::emit(&ir);
+    let contents = |path: &str| {
+        generated
+            .file(path)
+            .unwrap_or_else(|| panic!("every project emits `{path}`"))
+            .contents
+            .as_str()
+    };
+    let environment = contents("src/env.ts");
+    let deployment = contents("src/deployment.ts");
+
+    assert!(
+        !environment.contains("OPENAI_API_KEY"),
+        "`src/env.ts` demands the provider credential of two placed agents, and the hub runs \
+         neither: a launch check over a value nothing in this process reads is the false \
+         requirement §9.1 is written against — {environment}"
+    );
+    assert_eq!(
+        deployment.matches("\"OPENAI_API_KEY\",").count(),
+        2,
+        "the credential belongs to both placements' manifests, because both run an agent that \
+         spends it (docs/distributed.md §9.1): {deployment}"
+    );
+    assert!(
+        environment.contains("MESH_INERTNESS_TOKEN"),
+        "`src/env.ts` does not name the hub's join token, and the hub verifies every join against \
+         it: a deployment missing it would start clean and refuse every worker (grammar §14.2, \
+         `docs/distributed.md` §3)"
+    );
+    assert!(
+        environment.contains("deploy.hub.join_token"),
+        "the token reaches the manifest without the surface that wrote it: {environment}"
+    );
+    for placement in ["mac_signing_pool", "gpu_pool"] {
+        assert!(
+            deployment.contains(&format!("name: \"{placement}\",")),
+            "`src/deployment.ts` carries no manifest for `{placement}`, so a worker claiming it \
+             has no list to report `env_ok` against (docs/distributed.md §3.1, §9.1)"
+        );
+    }
+    // Named once in this module, as `joinTokenEnv` — the variable the hub reads
+    // its own credential from — and in **no placement's manifest**: §9.1 puts a
+    // deploy-layer variable on the hub's list alone, and a worker reporting the
+    // mesh's own token would be reporting a credential it has no business
+    // holding (§9.3).
+    let placements = deployment
+        .split_once("export const hubEnvironment")
+        .expect("the module declares the hub's list after the placements")
+        .0;
+    assert!(
+        !placements.contains("MESH_INERTNESS_TOKEN"),
+        "a placement's manifest names the hub's join token: {placements}"
+    );
+    assert!(
+        deployment
+            .contains("export const joinTokenEnv: string | undefined = \"MESH_INERTNESS_TOKEN\";"),
+        "the module does not name the variable the hub reads its join token from: {deployment}"
     );
 }
 

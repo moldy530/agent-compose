@@ -16,6 +16,7 @@
 
 import { END, START, StateGraph } from "@langchain/langgraph";
 
+import * as mesh from "./mesh.ts";
 import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
@@ -737,7 +738,22 @@ const flowTriageNodeScan: runtime.NodeDescriptor = {
     "pattern": runtime.toJson(runtime.evaluate("input.pattern", roots)),
     "max_matches": runtime.toJson(runtime.evaluate("25", roots)),
   }),
-  run: async (input, context) => ({ output: await toolRepoGrep(input, context) }),
+  run: async (input, context, view) => ({
+    output: runtime.parseResult(
+      toolRepoGrepOutput,
+      (
+        await mesh.dispatchPlaced({
+          placement: "patchers",
+          node: "flow.triage.scan",
+          execution: view.run.execution.id,
+          path: runtime.instancePath(view, "scan"),
+          inputs: input,
+          signal: context.signal,
+        })
+      ).output,
+      "the result of `tool.repo_grep`",
+    ),
+  }),
   writes: [
     { field: "matches", channel: "matches", reduce: "set" },
   ],
@@ -837,7 +853,14 @@ const flowTriageNodeDispatchMap: runtime.MapDescriptor = {
         "patch_hint": runtime.toJson(runtime.evaluate("finding.patch_hint", roots)),
       }),
       run: async (input, context, site) => {
-        const answer = await runtime.callAgent(agentFixer, input, [], context, { path: site.path });
+        const answer = await mesh.dispatchPlaced({
+          placement: "patchers",
+          node: "agent.fixer",
+          execution: site.execution.id,
+          path: site.path,
+          inputs: input,
+          signal: context.signal,
+        });
         return {
           output: runtime.parseResult(agentFixerOutput, answer.output, "the answer of `agent.fixer`"),
           models: answer.models,
@@ -1641,6 +1664,11 @@ async function quiesceFlow(
   // (`docs/durability.md` §5).
   const release = async (outcome: unknown): Promise<void> => {
     runtime.releaseHumanWaits(executionId);
+    // …and the placement waits, for the same reason one level out: a dispatch
+    // nothing is waiting for is work a worker could still take, whose result
+    // would be posted against a node execution that is gone
+    // (`docs/distributed.md` §6.1, `./mesh.ts`).
+    mesh.releasePlacementWaits(executionId);
     // And the deliveries nothing joined, on the two ways out where one still in
     // flight can change what this function has to decide.
     //

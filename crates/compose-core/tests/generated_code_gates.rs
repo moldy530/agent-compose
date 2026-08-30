@@ -3057,7 +3057,19 @@ fn the_generated_project_checks_its_environment_when_it_is_loaded() {
     for golden in GOLDENS {
         let project = staged(golden, root, "environment");
         let ir = artifact(golden);
-        let references = compose_core::codegen::env::References::of(&ir);
+        // **The hub's own list, not the composition's whole environment.**
+        // `docs/distributed.md` §9.1 partitions the manifest per process, and
+        // `readEnvironment()` checks the process this is: a variable only a
+        // placement's worker needs is one this deployment cannot leak, so
+        // demanding it here would be the false requirement §9.1 is written
+        // against. For a composition with no `placements:` the two are the same
+        // list, which is every golden but one.
+        let partition = compose_core::codegen::env::Partition::of(&ir);
+        let references = compose_core::codegen::env::References::for_process(
+            &ir,
+            &partition,
+            &compose_core::codegen::env::Process::Hub,
+        );
         let names: Vec<&str> = references.names().collect();
 
         let mut sealed = bun();
@@ -3098,6 +3110,32 @@ fn the_generated_project_checks_its_environment_when_it_is_loaded() {
                 "`{}` named `{name}` without saying where it is referenced:\n{complaint}",
                 golden.directory,
             );
+        }
+
+        // …and the other direction, which is the half `docs/distributed.md` §9.1
+        // exists for: a variable that belongs to a **placement** and to no
+        // process this hub is must not be demanded here. `KEYCHAIN_PASSWORD` on
+        // a machine that has no keychain is the failure it names; the hub's
+        // refusing to start over one it never reads is the same failure wearing
+        // the compiler's face.
+        for process in partition.processes() {
+            if matches!(process, compose_core::codegen::env::Process::Hub) {
+                continue;
+            }
+            let held =
+                compose_core::codegen::env::References::for_process(&ir, &partition, process);
+            for variable in held.names() {
+                if names.contains(&variable) {
+                    continue;
+                }
+                assert!(
+                    !complaint.contains(variable),
+                    "`{}` refused to start over `{variable}`, which only the placement `{}` runs \
+                     anything that reads (docs/distributed.md §9.1):\n{complaint}",
+                    golden.directory,
+                    process.name(),
+                );
+            }
         }
 
         let mut supplied = bun();

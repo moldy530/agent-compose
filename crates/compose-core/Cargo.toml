@@ -43,6 +43,16 @@ cel = { version = "=0.14.3", default-features = false, features = ["regex"] }
 # `regex` already carries this crate, so it is a name for something the tree
 # holds either way rather than a new dependency.
 regex-syntax = { version = "0.8", default-features = false, features = ["std"] }
+# SHA-256, for the artifact's content hash (`docs/distributed.md` §3.5, §4.1).
+# A generated project's identity on the worker wire is a hash over its tree, and
+# both ends of that wire have to compute it the same way — the compiler when it
+# emits, the worker when it verifies what it unpacked — so the digest is the
+# compiler's own rather than a shell-out to whatever `sha256sum` a machine has.
+# `sha2` is the RustCrypto implementation the ecosystem standardises on; a
+# hand-rolled one would be a security-relevant primitive nobody reviews, and the
+# verification step §4 puts before materialising an artifact is exactly the place
+# that would matter.
+sha2 = "0.10"
 
 [dev-dependencies]
 # Schema-conformance harness only: the compiler itself does not depend on a

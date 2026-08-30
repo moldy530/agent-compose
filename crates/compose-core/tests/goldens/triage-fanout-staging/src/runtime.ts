@@ -7364,9 +7364,51 @@ export function quiescent(execution: string): boolean {
   const sites = inFlight.get(execution);
   if (sites === undefined) return true;
   for (const site of sites.keys()) {
-    if (pausesUnder(execution, site) === 0) return false;
+    if (parkedUnder(execution, site) === 0) return false;
   }
   return true;
+}
+
+/**
+ * How many things `execution` is **parked** on at or inside `site`: the human
+ * pauses [`pausesUnder`] counts, plus whatever the registered counters add.
+ *
+ * The one registrant is `./mesh.ts`, and what it adds is the placement wait of
+ * `docs/distributed.md` §6.1 — a placed node whose dispatch no worker has taken.
+ * A node awaiting one is a unit of work in flight that cannot advance on its
+ * own, which is exactly what [`quiescent`] is asking about, so an execution
+ * whose only unfinished work is waiting for a Mac to wake up has parked and the
+ * `parked` webhook is owed (§6.6, PRD resolved q34).
+ *
+ * It is a registry rather than a direct call for one reason: `./runtime.ts` is
+ * the module `./mesh.ts` imports, so a call the other way would close a cycle —
+ * and a project whose composition places nothing must not pay for the mesh at
+ * all. [`pausesUnder`] stays untouched, because its **other** reader is
+ * [`runActivity`]'s deadline, and a placement wait is time a node's `timeout:`
+ * does count: §6.5 makes the chain run "from dispatch", so queueing behind a
+ * busy pool is inside the budget where waiting for a human is not (D102).
+ */
+function parkedUnder(execution: string, site: string): number {
+  let parked = pausesUnder(execution, site);
+  for (const counter of parkedCounters) parked += counter(execution, site);
+  return parked;
+}
+
+/** What a registered parked-work counter answers. See [`parkedUnder`]. */
+export type ParkedWork = (execution: string, site: string) => number;
+
+/** The counters [`parkedUnder`] adds to the human board's own. */
+const parkedCounters: ParkedWork[] = [];
+
+/**
+ * Register one more kind of parked work, for [`quiescent`] to count.
+ *
+ * Called at module scope by `./mesh.ts`, so a project that imports the mesh has
+ * placement waits counted and one that does not has exactly the behaviour it had
+ * before placements existed.
+ */
+export function registerParkedWork(counter: ParkedWork): void {
+  parkedCounters.push(counter);
 }
 
 /**
@@ -8303,6 +8345,15 @@ export interface ReportedExecution {
   readonly status: string;
   /** The pauses it is holding, as the surface that can answer them presents them. */
   readonly interrupts?: readonly unknown[];
+  /**
+   * The placement waits it is holding — a placed node whose dispatch no worker
+   * has taken, or one a worker is running (`docs/distributed.md` §6.1).
+   *
+   * Its own key rather than a row of `interrupts`, because the two are answered
+   * by different things: an interrupt is a question with a schema and a resume
+   * URL, and this is a machine that has not shown up yet.
+   */
+  readonly placements?: readonly unknown[];
   readonly outputs?: Record<string, unknown>;
   readonly error?: string;
   readonly trace?: readonly TraceEntry[];
@@ -8352,12 +8403,14 @@ export async function executionReport(
     // what a reader is asking about is the run, and the rest of it is here.
   }
   const waits = execution.interrupts ?? [];
+  const placed = execution.placements ?? [];
   return {
     execution_id: execution.id,
     flow: execution.flow,
     trigger: execution.trigger,
     status: execution.status,
     ...(waits.length === 0 ? {} : { interrupts: waits }),
+    ...(placed.length === 0 ? {} : { placement_waits: placed }),
     ...(delivered.length === 0 ? {} : { deliveries: delivered.map(reportedDelivery) }),
     ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
     ...(execution.error === undefined ? {} : { error: execution.error }),
