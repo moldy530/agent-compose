@@ -4795,7 +4795,10 @@ one route declares one). *PRD 5.6.*
 `node:` accepts `agent.*`, `tool.*`, or `flow.*`. **Rationale**: matches the PRD
 example (`node: agent.worker`, `node: tool.review_queue`) and reflects that map
 instances are isolated per-item invocations, not nodes of the enclosing graph —
-which is also what makes them the natural unit for `runtime: isolated`.
+which is also what makes an `agent.*` or `tool.*` target the natural unit for a
+placement (§14.1): the dispatch is already the thing a hub hands to a worker,
+and several workers claiming one name are the pool it fans out across, with no
+change to the logical definition.
 [D105](#d105-a-map-dispatch-isolates-conversation-history-per-instance) draws the
 same conclusion for conversation history, and
 [D73](#d73-on_item_error-carries-its-retry-policy-inline) for policy: what a
