@@ -4,9 +4,9 @@
 //!
 //! `hub:` and `placements:` are **live static grammar**: every rule about them
 //! is enforced by `validate` today, and every one of them is carried into the
-//! artifact. What does not exist yet is the protocol — the worker verb, the four
-//! routes of `docs/distributed.md` §3, the artifact server, placement waits on
-//! the board, and effect streaming. This file is that middle state written down
+//! artifact. What does not exist yet is the protocol — the worker verb, the five
+//! routes of `docs/distributed.md` §3, the artifact server among them, placement
+//! waits on the board, and effect streaming. This file is that middle state written down
 //! in executable form, and it is the sibling of
 //! `tests/trigger_auth_surface.rs`, which holds the *opposite* state for a
 //! surface whose runtime did land.
@@ -49,11 +49,17 @@
 //!    bind. `References::of` walks the definitions, the trigger table and the
 //!    deploy layer's `storage_backends:`/`event_sources:`, and deliberately does
 //!    **not** walk `hub:`. Per PRD resolved q41 the runtime pass must teach it
-//!    the per-placement partition of `docs/distributed.md` §9.1: a variable a
-//!    placed component references belongs to that placement's manifest, one an
-//!    unplaced component references belongs to the hub's, and `hub.join_token:`
-//!    belongs to the hub's. Until then a hub credential in `src/env.ts` would be
-//!    a launch check for a value nothing reads.
+//!    the per-placement partition of `docs/distributed.md` §9.1, and the shape
+//!    of that partition is the part worth reading before writing it: a
+//!    process's manifest is the variables of every component that can **execute
+//!    in it**, which is not the same as the components `members:` lists. A tool
+//!    an agent attaches runs in that agent's process whether or not it names a
+//!    placement (grammar 14.1 rule 4), and so does everything an attached
+//!    `flow.*` reaches — so those variables belong to the *agent's* placement
+//!    and, when nothing unplaced reaches them, not to the hub's at all.
+//!    `hub.join_token:` and the rest of the deploy layer belong to the hub's.
+//!    Until then a hub credential in `src/env.ts` would be a launch check for a
+//!    value nothing reads.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -173,6 +179,8 @@ const MESH_ONLY: &[&str] = &[
     "/workers/poll",
     "/workers/effects",
     "/workers/result",
+    "/workers/artifact",
+    "X-Worker-Session",
 ];
 
 fn render(diagnostics: &[Diagnostic]) -> String {
@@ -293,8 +301,9 @@ fn the_deploy_layer_carries_every_key_into_the_artifact() {
 ///
 /// This is the assertion the runtime pass turns around. Every file of the
 /// emitted project is scanned for the material only a mesh contributes — the
-/// placement names, the token's variable, the public base, and the four routes
-/// of `docs/distributed.md` §3 — and a hit means half a protocol shipped.
+/// placement names, the token's variable, the public base, the five routes
+/// of `docs/distributed.md` §3 and the session header they carry — and a hit
+/// means half a protocol shipped.
 ///
 /// Half is the dangerous amount. A build that emits nothing is a deployment
 /// where no worker ever joins, which is visible the first time somebody starts
