@@ -138,9 +138,10 @@ halves are normative, and together they are the whole of the concurrency story:
   stops. It does **not** suspend polling while a node runs: a four-minute build
   is four minutes of holds that return empty, and the session stays inside the
   liveness window the whole time. Without this clause the window below would
-  presume a working worker gone, re-park its queue, and leave it with a result
-  to post against a session the hub has forgotten — a path no section of this
-  document describes because no implementation may reach it.
+  presume a working worker gone, abandon the dispatch it is in the middle of
+  (§6.3), and leave it with a result to post against a session the hub has
+  forgotten — an attempt failed, and a build's four minutes thrown away, for a
+  worker that was never in trouble.
 - The hub MUST NOT answer a session's poll with a dispatch while that session
   has a dispatch it has not settled. A busy worker's polls are therefore
   heartbeats and nothing else, however much work is queued for the placement it
@@ -421,8 +422,8 @@ effect key and scoped to their execution (§7.1) — not by session, and not by
 dispatch — so the journal takes them from whichever session hands them over, and
 the hub is still the single writer that inserts them. A worker that discarded
 the batch instead would hand the redispatch of §7.2 an `effect_history` short of
-the frontier, and the node would re-issue an effect the journal was owed: the
-model call §7.3 promises is not paid for twice, paid for twice.
+the frontier, and the node would re-issue an effect the journal was owed — so
+the model call §7.3 promises is not paid for twice would be paid for twice.
 
 A worker SHOULD send a batch as soon as an effect completes rather than
 accumulating until the node ends, because an effect that never reached the hub is
@@ -685,7 +686,8 @@ with nothing to do costs one held request per worker and nothing else.
 §2 expiring**: 90 seconds with no request on that session — no poll, no effect
 batch, no result. That is the only detector this protocol has, and the hub is
 the only side that may fire it: a worker never declares itself gone, it re-joins
-(§5).
+(§5). Declaring it **ends** the session — the hub forgets it, so any later
+request carrying it meets `410` and the worker joins again (§3, §5).
 
 What the declaration costs depends on the one thing a session can be holding.
 §2's pull model queues work to a **placement**, never to a worker, and hands it
@@ -706,12 +708,15 @@ dispatch it has not settled. Two cases, and they are the whole rule.
   on the board if no worker is claiming the placement** (§6.2) — which is the
   sense in which heartbeat loss re-parks.
 
-A revived worker that comes back and posts a result for an abandoned dispatch is
-answered `409` and discards it (§3.4): that is the "already-superseded" case, and
-abandoning the dispatch is what supersedes it. Effect batches it still holds are
-a different matter and are still accepted — they are keyed by effect key and
-scoped to their execution, not to a session or a dispatch (§3.3) — so a batch
-in flight when the lid closed is journaled rather than lost.
+A revived worker meets both halves of §3 in order, and the order is the point.
+Its first request carries a session the hub has forgotten, so it is answered
+`410` and the worker joins again. The result it then posts for the abandoned
+dispatch is answered `409` and discarded (§3.4) — the "already-superseded" case,
+and abandoning the dispatch is what supersedes it. The effect batches it still
+holds are a different matter and **are** journaled: they are keyed by effect key
+and scoped to their execution, not to a session or a dispatch (§3.3), so a batch
+in flight when the lid closed reaches the journal on the re-send and the retry
+replays it instead of re-issuing it (§7.2).
 
 PRD resolved q39 puts this as "heartbeat loss re-parks what was queued to the
 vanished worker", and §2's pull model is what makes that phrase concrete rather
@@ -789,8 +794,8 @@ side that declares it** — §6.3 states that rule and this section is its
 consequence. A disconnect is therefore never observed as such: it is a session
 that stopped making requests while holding a dispatch, which the hub abandons,
 which fails the attempt. A worker that comes back afterwards learns so from the
-`409` its result meets (§3.4), and takes part in the retry only by joining like
-anyone else.
+`409` its re-posted result meets (§3.4, §6.3), and takes part in the retry only
+by joining like anyone else.
 
 ### 7.4 What LangGraph is here
 
@@ -1027,7 +1032,7 @@ the previous version behave **wrongly** rather than be refused:
   join refusal that started meaning it is the same case from the other side;
 * shortening the **liveness window** of §2. Lengthening it is compatible;
   shortening it is not, because the first thing an older worker learns about the
-  new one is that its work was re-parked underneath it.
+  new one is a `409` on the result of a dispatch abandoned underneath it (§6.3).
 
 A bump is a statement that workers of the older release cannot join this hub,
 and §3.1's `409` is what enforces it. Because a worker and a hub are built from
