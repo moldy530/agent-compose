@@ -4324,7 +4324,8 @@ placements:
     members: [agent.embedder]
 ```
 
-The rules, each a compile error (Decision
+**Four rules, each a compile error, and they are numbered because other
+documents cite them by number** (Decision
 [D129](#d129-placement-members-are-agents-and-tools-disjoint-and-colocated-with-what-attaches-them)):
 
 1. **`members:` is required and non-empty**, and names each component **once**.
@@ -4365,8 +4366,11 @@ The rules, each a compile error (Decision
    A placed component's own placement governs it wherever it is reached without
    an attaching agent: a `function:` node (§8.4), an `agent:` node, or a flow
    instantiated by a `flow:` node (§8.5), all of which the hub schedules.
-5. **A component in no placement executes on the hub.** That is the default and
-   is never a diagnostic: `placements:` names the exceptions.
+
+And one thing that is **not** a rule, because it is what happens when no rule
+applies: **a component in no placement executes on the hub.** That is the
+default and is never a diagnostic — `placements:` names the exceptions — which
+is why the numbered list above stops at four.
 
 `--target local` needs no placement at all, and admits them: a `local` target
 with placements is the hub and its workers on one machine, which is how a mesh

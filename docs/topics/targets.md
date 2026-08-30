@@ -214,15 +214,17 @@ tool — rather than load assignment.
 | `hub.join_token` | the bearer credential a worker joins with, as an `${ENV}` reference — required wherever `placements:` is non-empty |
 | `hub.public_url` | the absolute `http`/`https` base every ingress URL derives from; no wildcard, because this is your URL rather than an allowlist pattern |
 
-Five rules, each a compile error:
+Five rules, each a compile error — grammar §14.1's four about a placement, in
+its numbering, and then §14.2's about the token:
 
-- `members:` is required, non-empty, and names each component once.
-- a `flow.*` member is refused, naming the deferral: v1 places the leaves that
-  hold a machine's capability, and a flow is a subgraph the hub schedules. Place
-  the nodes it reaches instead.
-- placements are **disjoint**. One component in two of them is two answers to
-  which worker runs it.
-- an attachment **colocates with its agent**. The whole artifact reaches every
+- **§14.1 rule 1** — `members:` is required, non-empty, and names each component
+  once.
+- **rule 2** — a `flow.*` member is refused, naming the deferral: v1 places the
+  leaves that hold a machine's capability, and a flow is a subgraph the hub
+  schedules. Place the nodes it reaches instead.
+- **rule 3** — placements are **disjoint**. One component in two of them is two
+  answers to which worker runs it.
+- **rule 4** — an attachment **colocates with its agent**. The whole artifact reaches every
   worker, so a placement decides which process runs a node, and an agent's
   `tools:` list is what runs a component inside the agent's own process. A tool
   placed somewhere other than the agent attaching it — including a placed tool on
@@ -232,14 +234,15 @@ Five rules, each a compile error:
   untouched: a placed tool reached from a `function:` node, or anything inside a
   flow instantiated by a `flow:` node, keeps its own placement, and there its own
   placement is the whole answer.
-- `hub.join_token` is required wherever placements are, and takes an `${ENV}`
-  reference, never a literal. **Holding it is being trusted with the mesh**: the
-  whole artifact, the right to claim any placement, and the journal's effect
-  stream.
+- **§14.2** — `hub.join_token` is required wherever placements are, and takes an
+  `${ENV}` reference, never a literal. **Holding it is being trusted with the
+  mesh**: the whole artifact, the right to claim any placement, and the journal's
+  effect stream.
 
-A component in **no** placement executes on the hub. That is the default and
-needs no entry — `placements:` names the exceptions — so a target with no
-`placements:` is an ordinary single-process deployment.
+A component in **no** placement executes on the hub. That is the default, is
+never a diagnostic, and is why the list above stops where it does —
+`placements:` names the exceptions — so a target with no `placements:` is an
+ordinary single-process deployment.
 
 **The rules above are enforced today; the protocol is not built yet.** Nothing a
 placement or a `hub:` block declares reaches the project a build emits — no
