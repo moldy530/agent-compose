@@ -271,18 +271,21 @@ Logical definition and placement are orthogonal (Kubernetes/Terraform lesson):
 
 ```yaml
 # deploy/<target>.yml — selected by --target <name>; see 5.8 per-target invariant
+hub:
+  join_token: ${MESH_JOIN_TOKEN}   # required when placements exist (resolved q38)
 placements:
-  agent.researcher:
-    runtime: isolated      # own instance/container; sandbox, creds, network policy
-  flow.review_loop:
-    runtime: colocated
+  mac:
+    members: [agent.signer]        # claimed at join by whoever has the keys
+  gpu:
+    members: [agent.embedder]
 ```
 
 - `--target local`: one Node.js process.
 - `--target distributed`: **hub-and-spoke** — one hub owns the graph (scheduler, journal, wait board, triggers); workers execute the nodes placed on them over an outbound-dialed dispatch protocol (resolved q37, q43). The earlier sketch here — N deployable LangGraph apps stitched with `RemoteGraph` — is superseded by resolved q43: the journal, wait board, and instance identity live outside LangGraph's state model, so the seam RemoteGraph offers is the wrong one.
 - Already-guaranteed properties make this nearly free: structured I/O on every node ⇒ every edge is serializable ⇒ any edge can become a network boundary without semantic change; the journal (resolved q26) ⇒ one durable execution history whoever executes.
 - Isolation is also a **security** feature (per-agent sandboxing, credentials, blast-radius containment for tool-wielding agents) — a declarative story no current framework has.
-- v0: `placements` is parsed and validated but **no-op**.
+- Placements are **named claims** (resolved q38): a placement is a logical name with `members:`, and a worker asserts it at join — the address-keyed `runtime: isolated|colocated` shape this section once sketched was reserved grammar and is re-shaped by the same resolutions.
+- `placements` executes under the distributed runtime (resolved q37–q44); until that lands it stays parsed and validated only.
 
 ### 5.11 Invocation & triggers — how executions come to exist
 
