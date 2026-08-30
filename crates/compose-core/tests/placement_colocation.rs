@@ -106,6 +106,31 @@ fn fanout(target: &str) -> String {
     )
 }
 
+/// A flow reaching **two** placeable components: a `function:` node naming
+/// `tool.xcodebuild` and an `agent:` node naming `agent.signer`.
+///
+/// Two contradictions rather than one, which is what tells a dedupe written on
+/// the wrong key from one written on the address.
+const TWO_LEAF_FLOW: &str = r#"flow.release:
+  description: Build and sign the requested scheme.
+  inputs:
+    scheme: { type: string }
+  outputs: {}
+  nodes:
+    build:
+      function: tool.xcodebuild
+      input:
+        scheme: "input.scheme"
+    sign:
+      agent: agent.signer
+      input:
+        scheme: "input.scheme"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: sign }
+    - { from: sign, to: end }
+"#;
+
 /// A scratch project of this test's own, cleaned out before use.
 fn project(name: &str, spec: &str, deploy: &str) -> PathBuf {
     let directory = std::env::temp_dir()
@@ -532,6 +557,110 @@ fn a_map_inside_an_attached_flow_may_reach_the_agents_own_placement() {
             agent("reviewer", "flow.fan")
         ),
         &mesh("  mac:\n    members: [agent.reviewer, tool.xcodebuild]\n"),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One contradiction, one diagnostic.
+// ---------------------------------------------------------------------------
+
+/// A tool attached directly **and** reached through an attached flow is one
+/// contradiction, and gets one report.
+///
+/// `agent.builder` attaches `tool.xcodebuild` and `flow.sign`, whose `function:`
+/// node names that same tool. The direct row 4 and the transitive case then hold
+/// the same sentence about the same address, and between them there is one
+/// repair: place the agent, or drop the tool's placement. Told twice, a reader
+/// makes that one choice twice and the second report points at a line whose
+/// repair is the first's.
+#[test]
+fn a_tool_attached_directly_and_reached_through_a_flow_is_refused_once() {
+    refuses(
+        "direct-and-transitive",
+        &format!(
+            "{BACKEND}{SIGNING_FLOW}{}",
+            agent("builder", "tool.xcodebuild, flow.sign")
+        ),
+        &mesh("  mac:\n    members: [tool.xcodebuild]\n"),
+        "`tool.xcodebuild` is a member of placement `mac`, and `agent.builder` that attaches it \
+         has no placement, so it runs on the hub",
+    );
+}
+
+/// …and the report kept is the direct one however the `tools:` list is ordered.
+///
+/// The same composition with the two attachments swapped. Which of two reports
+/// survives may not depend on the order an author happened to write a list in,
+/// and "that attaches it" is the better of the two sentences: it names the line
+/// the author wrote rather than a path to it.
+#[test]
+fn the_direct_report_survives_whichever_attachment_is_written_first() {
+    refuses(
+        "transitive-written-first",
+        &format!(
+            "{BACKEND}{SIGNING_FLOW}{}",
+            agent("builder", "flow.sign, tool.xcodebuild")
+        ),
+        &mesh("  mac:\n    members: [tool.xcodebuild]\n"),
+        "`tool.xcodebuild` is a member of placement `mac`, and `agent.builder` that attaches it \
+         has no placement, so it runs on the hub",
+    );
+}
+
+/// Two attached flows reaching one placed component are one contradiction too.
+///
+/// `flow.sign` and `flow.fan` both reach `tool.xcodebuild` — one by a
+/// `function:` node, one by a `map` dispatch — and the two reports would be the
+/// same sentence with a different flow named in it, for the same one repair.
+#[test]
+fn two_attached_flows_reaching_one_placement_are_refused_once() {
+    refuses(
+        "two-flows-one-tool",
+        &format!(
+            "{BACKEND}{SIGNING_FLOW}{}{}",
+            fanout("tool.xcodebuild"),
+            agent("reviewer", "flow.sign, flow.fan")
+        ),
+        &mesh("  mac:\n    members: [tool.xcodebuild]\n"),
+        "`tool.xcodebuild` is a member of placement `mac`, and `agent.reviewer` that reaches it \
+         through the attached `flow.sign` has no placement, so it runs on the hub",
+    );
+}
+
+/// …and the dedupe is on the **address**, so two genuine contradictions are
+/// still two reports.
+///
+/// `flow.release` reaches both `tool.xcodebuild` and `agent.signer`, and an
+/// unplaced `agent.reviewer` attaching it cannot run either of them. A dedupe
+/// keyed on the attachment instead of on what it reaches would report the first
+/// and swallow the second — an author repairs one placement, revalidates, and
+/// meets the next, which is the failure mode a corpus asserting only "at least
+/// one diagnostic" never sees.
+#[test]
+fn two_placements_reached_through_one_attached_flow_are_both_refused() {
+    let spec = format!(
+        "{BACKEND}{}{TWO_LEAF_FLOW}{}",
+        agent("signer", ""),
+        agent("reviewer", "flow.release")
+    );
+    let diagnostics = diagnose(
+        "two-contradictions",
+        &spec,
+        &mesh("  mac:\n    members: [agent.signer, tool.xcodebuild]\n"),
+    );
+    let messages: Vec<&str> = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "`agent.signer` is a member of placement `mac`, and `agent.reviewer` that reaches it \
+             through the attached `flow.release` has no placement, so it runs on the hub",
+            "`tool.xcodebuild` is a member of placement `mac`, and `agent.reviewer` that reaches \
+             it through the attached `flow.release` has no placement, so it runs on the hub",
+        ],
+        "each placed component the attached flow reaches is its own contradiction"
     );
 }
 

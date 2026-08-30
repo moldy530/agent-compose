@@ -61,6 +61,26 @@
 //! here would report one contradiction twice, and the second report would point
 //! at a line whose repair is the first report's.
 //!
+//! # One contradiction, one diagnostic
+//!
+//! That boundary answers only the inner agent's attachments. Two shapes reach
+//! one contradiction twice by paths it never crosses, and both are answered
+//! here rather than by the traversal:
+//!
+//! * an agent attaches a placed `tool.*` **and** a `flow.*` whose own nodes name
+//!   that same tool. The direct case and the transitive one then land on one
+//!   address, and both are the same repair — place the agent, or drop the tool's
+//!   placement. The **direct** report is the one kept, because it names the
+//!   attachment the author wrote rather than a path to it, and it is kept
+//!   whatever order the `tools:` list happens to be in.
+//! * an agent attaches two flows that both reach one placed component. One
+//!   contradiction again, reported once, labelled at the first site the walk
+//!   found.
+//!
+//! Both are dropped on the address, never on the diagnostic: an agent holding
+//! genuinely separate contradictions — two placed tools it cannot run — still
+//! gets one report for each of them.
+//!
 //! # What is not here
 //!
 //! The tool reached without an agent. A `function:` node names a `tool.*`
@@ -75,7 +95,7 @@
 //! claims each), so it is a check rather than a parser or resolver rule:
 //! neither of the two files decides it alone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::Namespace;
 use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
@@ -111,6 +131,17 @@ pub(crate) fn check(ctx: &mut Ctx<'_>) {
             continue;
         };
         let on = claim.get(address);
+        // The `tool.*` this agent attaches itself, and the addresses an attached
+        // flow has already been reported for. Both keep one contradiction to one
+        // diagnostic; `direct` is built before the loop so the report kept is
+        // the direct one however the `tools:` list is ordered.
+        let direct: BTreeSet<String> = agent
+            .tools
+            .iter()
+            .filter(|attached| attached.value.namespace == Namespace::Tool)
+            .map(|attached| attached.value.to_string())
+            .collect();
+        let mut reported: BTreeSet<String> = BTreeSet::new();
         for attached in &agent.tools {
             match attached.value.namespace {
                 Namespace::Tool => {
@@ -152,6 +183,13 @@ pub(crate) fn check(ctx: &mut Ctx<'_>) {
                             continue;
                         };
                         if on.is_some_and(|held| held.value == runs_on.value) {
+                            continue;
+                        }
+                        // The same contradiction reached a second way — by the
+                        // agent's own `tools:` list, which the direct case
+                        // reports better, or by another attached flow, which
+                        // reports it identically. One repair, one diagnostic.
+                        if direct.contains(reached) || !reported.insert(reached.clone()) {
                             continue;
                         }
                         reports.push(
