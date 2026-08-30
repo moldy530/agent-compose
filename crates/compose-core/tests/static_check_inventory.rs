@@ -241,6 +241,19 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // The half of grammar 14.1's placement rules that needs two files. The
+        // parser owns everything decidable from the deploy file alone — the
+        // member forms, the `flow.*` deferral, disjointness, and the conditional
+        // join token — and the resolver owns whether a member resolves. This is
+        // the rule that is about neither file on its own: which agents attach
+        // which tools is the composition's, and which placement claims each is
+        // the active target's.
+        rule: "an attached tool colocates with the agent that attaches it (14.1, D129)",
+        pass: "check/placements.rs",
+        codes: &["conflicting-placement"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "the effective write map is injective (8.0, D93)",
         pass: "check/channels.rs",
         codes: &["conflicting-writes"],

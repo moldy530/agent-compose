@@ -1,13 +1,16 @@
 # rule: a deploy file may not declare definitions (grammar 1.2, Decision D3)
 # code: misplaced-section
 # message: `agent.fixer` is a definition and may only appear in a spec file
-# at: 12:1
+# at: 15:1
 # help: spec files and deploy files are disjoint: only the deploy layer forks per environment, and `deploy/<target>.yml` is selected with `--target`
 version: "0.1"
 
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
 placements:
-  agent.fixer:
-    runtime: isolated
+  mac:
+    members: [agent.fixer]
 
 agent.fixer:
   model: model.fast

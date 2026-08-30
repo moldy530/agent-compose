@@ -1,0 +1,9 @@
+# rule: hub.join_token is required wherever placements is non-empty (grammar 14.2, Decision D130)
+# at: /hub
+# via: /allOf/0/then/properties/hub/required
+version: "0.1"
+hub:
+  public_url: "https://hub.example"
+placements:
+  mac:
+    members: [agent.signer]

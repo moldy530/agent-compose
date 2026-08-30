@@ -1,0 +1,6 @@
+# rule: hub.public_url is this deployment's own URL rather than a pattern, so it carries no wildcard (grammar 14.2)
+# at: /hub/public_url
+# via: /$defs/hub/properties/public_url/allOf/1/pattern
+version: "0.1"
+hub:
+  public_url: "https://*.hub.example"

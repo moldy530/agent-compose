@@ -1,9 +1,16 @@
 //! The deploy layer: `deploy/<target>.yml` (grammar 14).
 //!
 //! Only this layer forks per environment (PRD 5.8's per-target invariant), and
-//! it is disjoint from spec files (Decision D3). `placements` and
-//! `event_sources` are reserved grammar: parsed and validated in v0, executed
-//! in M3 (grammar 15).
+//! it is disjoint from spec files (Decision D3). `event_sources` is reserved
+//! grammar: parsed and validated in v0, executed in M3 (grammar 15).
+//!
+//! `hub:` and `placements:` are **not** reserved. They are the live static
+//! surface of the distributed claims model (PRD resolved q37–q44): a placement
+//! is a logical name a worker claims at an authenticated join, and the hub is
+//! the process that owns the graph. Every rule about them is enforced now; the
+//! protocol that reads them lands with the `worker` verb, and
+//! `crates/compose-core/tests/placement_surface_inertness.rs` is what says so
+//! in executable form (grammar 14.1, 14.2, `docs/distributed.md`).
 
 use crate::diag::{Span, Spanned};
 
@@ -19,66 +26,55 @@ pub struct PlacementsSection {
     pub span: Span,
 }
 
-/// Where a component runs (grammar 14.1, Decision D47).
+/// One named placement: a claim a worker asserts, and the components it runs
+/// (grammar 14.1, Decision D128).
+///
+/// The name is the whole binding surface. Which machine satisfies it is decided
+/// by whoever joins asserting it — capability affinity, not load assignment —
+/// so nothing here is an address (PRD resolved q38).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placement {
-    /// The component address: `agent.*`, `tool.*`, or `flow.*`.
-    pub address: Spanned<Address>,
-    /// `runtime:` — required.
-    pub runtime: Option<Spanned<Runtime>>,
-    /// `network:` — reserved; defaults to `all`.
-    pub network: Option<Spanned<Network>>,
+    /// The name a worker claims, from the section key.
+    pub name: Spanned<Ident>,
+    /// `members:` — the component addresses this placement runs. Non-empty,
+    /// `agent.*` and `tool.*` only in v1 (Decision D129).
+    pub members: Vec<Spanned<Address>>,
     /// `description:`
     pub description: Option<Spanned<String>>,
-    /// The whole entry's span, address and body together. [`Self::address`]
-    /// carries the address alone, for the diagnostics that are about it.
+    /// The whole entry's span, name and body together. [`Self::name`] carries
+    /// the name alone, for the diagnostics that are about it.
     pub span: Span,
 }
 
-/// A placement's runtime (grammar 14.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Runtime {
-    /// Its own instance or container.
-    Isolated,
-    /// In the calling process.
-    Colocated,
+/// The `hub:` section (grammar 14.2, Decision D130).
+///
+/// Both keys are optional on their own: a target that declares placements needs
+/// the token, and a target that declares none may still want to say where its
+/// ingress is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HubSection {
+    /// `join_token:` — the bearer credential a worker joins with, as an
+    /// `${ENV}` reference and never as a literal (grammar 4.3, PRD resolved
+    /// q32/q38).
+    pub join_token: Option<Spanned<EnvRef>>,
+    /// `public_url:` — the absolute base every ingress URL this deployment
+    /// hands out derives from (PRD resolved q44 invariant 4).
+    pub public_url: Option<Spanned<String>>,
+    /// Whether `join_token:` was **written**, whatever became of it.
+    ///
+    /// [`Self::join_token`] is `None` both for a key nobody wrote and for one
+    /// the env-ref rule refused, and the requiredness rule has to tell those
+    /// apart: an author who wrote a literal has already been told what is wrong
+    /// with it, and adding "this target declares placements and no
+    /// `hub.join_token`" would be a second diagnostic for one mistake — the
+    /// same reason a deploy file whose `version:` was rejected is not also told
+    /// it is missing.
+    pub declares_join_token: bool,
+    /// The section's own span.
+    pub span: Span,
 }
 
-impl Runtime {
-    /// The keyword that names this runtime.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Isolated => "isolated",
-            Self::Colocated => "colocated",
-        }
-    }
-}
-
-/// A placement's sandbox network policy — reserved (grammar 14.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Network {
-    /// No network access.
-    None,
-    /// Outbound only.
-    Egress,
-    /// Unrestricted (the default).
-    All,
-}
-
-impl Network {
-    /// The keyword that names this policy.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Egress => "egress",
-            Self::All => "all",
-        }
-    }
-}
-
-/// The `storage_backends:` section (grammar 14.2).
+/// The `storage_backends:` section (grammar 14.3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StorageBackendsSection {
     /// `defaults:` — per-kind fallback backends.
@@ -107,7 +103,7 @@ pub struct BackendAlias {
     pub config: BackendConfig,
 }
 
-/// A backend configuration (grammar 14.2).
+/// A backend configuration (grammar 14.3).
 ///
 /// An open plugin-config object (Decision D50): `provider` is a closed
 /// vocabulary and the connection fields of grammar 4.3 must be `${ENV}`
@@ -135,7 +131,7 @@ pub struct ConnectionField {
     pub value: Spanned<EnvRef>,
 }
 
-/// The v0 storage providers (grammar 14.2, Decision D48).
+/// The v0 storage providers (grammar 14.3, Decision D48).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendProvider {
     /// `memory` (kv)
@@ -163,7 +159,7 @@ pub enum BackendProvider {
 }
 
 impl BackendProvider {
-    /// Every provider, grouped by kind in the order grammar 14.2 lists them.
+    /// Every provider, grouped by kind in the order grammar 14.3 lists them.
     pub const ALL: &'static [Self] = &[
         Self::Memory,
         Self::Sqlite,
@@ -207,7 +203,7 @@ impl BackendProvider {
     }
 }
 
-/// The `event_sources:` section — reserved grammar (grammar 14.3).
+/// The `event_sources:` section — reserved grammar (grammar 14.4).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventSourcesSection {
     /// The sources, in declaration order.
@@ -216,7 +212,7 @@ pub struct EventSourcesSection {
     pub span: Span,
 }
 
-/// One event source: a logical name bound to infrastructure (grammar 14.3).
+/// One event source: a logical name bound to infrastructure (grammar 14.4).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EventSource {
     /// The logical name an `event` trigger's `source:` refers to.
@@ -232,7 +228,7 @@ pub struct EventSource {
     pub span: Span,
 }
 
-/// The v0 event-source kinds (grammar 14.3).
+/// The v0 event-source kinds (grammar 14.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventSourceKind {
     /// `redis_streams`
@@ -244,7 +240,7 @@ pub enum EventSourceKind {
 }
 
 impl EventSourceKind {
-    /// Every kind, in the order grammar 14.3 lists them.
+    /// Every kind, in the order grammar 14.4 lists them.
     pub const ALL: &'static [Self] = &[Self::RedisStreams, Self::Sqs, Self::Nats];
 
     /// The keyword that names this kind.
@@ -277,7 +273,7 @@ pub const SECRET_FIELDS: &[&str] = &[
 ];
 
 /// A value of an open plugin-config object, under a key outside
-/// [`SECRET_FIELDS`] (grammar 14.2, 14.3, Decision D50).
+/// [`SECRET_FIELDS`] (grammar 14.3, 14.4, Decision D50).
 ///
 /// The shape mirrors [`Literal`](super::common::Literal), because a plugin
 /// object carries arbitrary YAML for the plugin's own published schema to

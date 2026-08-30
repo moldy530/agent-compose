@@ -4,7 +4,7 @@ use crate::diag::{SourceName, Span, Spanned};
 
 use super::common::Ident;
 use super::definition::Definition;
-use super::deploy::{EventSourcesSection, PlacementsSection, StorageBackendsSection};
+use super::deploy::{EventSourcesSection, HubSection, PlacementsSection, StorageBackendsSection};
 use super::policy::PolicyBlock;
 use super::schema::TypeNode;
 use super::trigger::TriggersSection;
@@ -16,7 +16,7 @@ pub enum DocumentKind {
     /// A spec file: definitions plus `version`, `imports`, `defaults`,
     /// `state`, `triggers`.
     Spec,
-    /// A deploy file: `version` plus `placements`, `storage_backends`,
+    /// A deploy file: `version` plus `hub`, `placements`, `storage_backends`,
     /// `event_sources`.
     Deploy,
 }
@@ -125,8 +125,10 @@ pub struct DeployFile {
     pub source: SourceName,
     /// `version:` — required in every deploy file.
     pub version: Option<Spanned<String>>,
-    /// `placements:` — reserved grammar.
+    /// `placements:` — the named claims a worker asserts at join (grammar 14.1).
     pub placements: Option<PlacementsSection>,
+    /// `hub:` — the process that owns the graph (grammar 14.2).
+    pub hub: Option<HubSection>,
     /// `storage_backends:`
     pub storage_backends: Option<StorageBackendsSection>,
     /// `event_sources:` — reserved grammar.
@@ -242,5 +244,10 @@ impl Reduce {
 pub const SPEC_SECTIONS: &[&str] = &["version", "imports", "defaults", "state", "triggers"];
 
 /// The top-level keys a deploy file may carry (grammar 1.5).
-pub const DEPLOY_SECTIONS: &[&str] =
-    &["version", "placements", "storage_backends", "event_sources"];
+pub const DEPLOY_SECTIONS: &[&str] = &[
+    "version",
+    "hub",
+    "placements",
+    "storage_backends",
+    "event_sources",
+];

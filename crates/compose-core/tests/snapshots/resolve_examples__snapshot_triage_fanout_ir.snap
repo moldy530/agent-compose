@@ -2638,30 +2638,36 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"local\")"
   "deploy": {
     "target": "local",
     "source": "deploy/local.yml",
+    "hub": {
+      "join_token": {
+        "value": {
+          "env_ref": "MESH_JOIN_TOKEN"
+        },
+        "span": "deploy/local.yml:26:15..26:33"
+      },
+      "span": "deploy/local.yml:26:3..26:33"
+    },
     "placements": {
       "entries": {
-        "agent.fixer": {
-          "address": {
-            "value": "agent.fixer",
-            "span": "deploy/local.yml:20:3..20:14"
+        "patchers": {
+          "name": {
+            "value": "patchers",
+            "span": "deploy/local.yml:29:3..29:11"
           },
-          "runtime": "colocated",
+          "members": [
+            {
+              "value": "agent.fixer",
+              "span": "deploy/local.yml:30:15..30:26"
+            }
+          ],
           "description": {
-            "value": "Isolated under staging; in-process locally, where there is one process.",
-            "span": "deploy/local.yml:22:18..22:89"
+            "value": "The machine holding a checkout; on a laptop, this one.",
+            "span": "deploy/local.yml:31:18..31:72"
           },
-          "span": "deploy/local.yml:20:3..22:89"
-        },
-        "flow.triage": {
-          "address": {
-            "value": "flow.triage",
-            "span": "deploy/local.yml:23:3..23:14"
-          },
-          "runtime": "colocated",
-          "span": "deploy/local.yml:23:3..24:23"
+          "span": "deploy/local.yml:29:3..31:72"
         }
       },
-      "span": "deploy/local.yml:20:3..24:23"
+      "span": "deploy/local.yml:29:3..31:72"
     }
   }
 }

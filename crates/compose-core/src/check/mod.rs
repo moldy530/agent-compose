@@ -43,6 +43,7 @@
 //! | [`convergence`] | 7.6.1, 7.6.2, 10.2 | forks and co-takeable pairs, balanced convergence, and the concurrent-branch half of the reduced-channel rule |
 //! | [`reachable`] | 7.8 | every node is reachable from its flow's `start` |
 //! | [`components`] | 7.5, 7.7, 13.3 | recursion, and a `respond: sync` trigger's flow reaching a `human` node |
+//! | [`placements`] | 14.1 | an attached tool's placement against the placement of every agent that attaches it |
 //! | [`fanout`] | 8.6 | `map.over` dominance, and `detach:` under a durably checkpointed target |
 //!
 //! Where a rule splits across the two families — `map.over` resolves a path in
@@ -78,6 +79,7 @@ pub(crate) mod graph;
 pub(crate) mod guards;
 pub(crate) mod maps;
 pub(crate) mod model;
+pub(crate) mod placements;
 pub(crate) mod providers;
 pub(crate) mod reach;
 pub(crate) mod reachable;
@@ -109,6 +111,7 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
     triggers::check(&mut ctx);
     stores::check_session_scope(&mut ctx);
     stores::check_map_writes(&mut ctx);
+    placements::check(&mut ctx);
     components::check(&mut ctx);
 
     let ir = ctx.ir;

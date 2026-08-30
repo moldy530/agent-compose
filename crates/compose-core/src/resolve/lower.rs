@@ -744,21 +744,27 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         return Some(ir::Deploy {
             target: source.target.clone(),
             source: None,
+            hub: None,
             placements: None,
             storage_backends: None,
             event_sources: None,
         });
     };
 
+    let hub = file.file.hub.as_ref().map(|section| ir::deploy::Hub {
+        join_token: section.join_token.clone(),
+        public_url: section.public_url.clone(),
+        span: section.span.clone(),
+    });
+
     let placements = optional(file.file.placements.as_ref(), |section| {
         let mut entries = BTreeMap::new();
         for placement in &section.placements {
             entries.insert(
-                placement.address.value.to_string(),
+                placement.name.value.as_str().to_string(),
                 ir::deploy::Placement {
-                    address: placement.address.clone(),
-                    runtime: placement.runtime.as_ref()?.value,
-                    network: placement.network.as_ref().map(|network| network.value),
+                    name: placement.name.clone(),
+                    members: placement.members.clone(),
                     description: placement.description.clone(),
                     span: placement.span.clone(),
                 },
@@ -829,6 +835,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
     Some(ir::Deploy {
         target: source.target.clone(),
         source: Some(file.name.clone()),
+        hub,
         placements,
         storage_backends,
         event_sources,

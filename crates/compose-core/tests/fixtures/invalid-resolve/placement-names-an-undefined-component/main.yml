@@ -1,9 +1,17 @@
-# rule: a `placements:` key resolves in the composition (grammar 14.1)
+# rule: a placement `members:` entry resolves in the composition (grammar 14.1)
 # code: undefined-reference
-# message: `flow.g` is not defined in this composition
-# at: deploy/local.yml:3:3
-# help: did you mean `flow.f`?
+# message: `tool.repo_grap` is not defined in this composition
+# at: deploy/local.yml:8:15
+# help: did you mean `tool.repo_grep`?
 version: "0.1"
+tool.repo_grep:
+  description: Search the repository for a pattern.
+  input:
+    pattern: { type: string }
+  output:
+    matches: { type: string }
+  exec:
+    command: repo-grep
 flow.f:
   outputs: {}
   nodes:

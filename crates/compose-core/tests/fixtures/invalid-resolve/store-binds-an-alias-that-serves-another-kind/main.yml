@@ -1,9 +1,9 @@
-# rule: a store's `backend:` alias serves the store's own kind (grammar 14.2)
+# rule: a store's `backend:` alias serves the store's own kind (grammar 14.3)
 # code: invalid-value
 # message: the `staging` target binds `docs_db` to `redis`, which is not a `vector` storage provider
 # at: main.yml:19:12
 # label: deploy/staging.yml:5:5 `docs_db` is defined here, in `deploy/staging.yml`
-# help: `store.docs` declares `kind: vector`, and a backend serves exactly one kind: the `vector` providers are `sqlite_vec`, `chroma`, `pgvector`, `qdrant` (grammar 14.2)
+# help: `store.docs` declares `kind: vector`, and a backend serves exactly one kind: the `vector` providers are `sqlite_vec`, `chroma`, `pgvector`, `qdrant` (grammar 14.3)
 # target: staging
 # ---
 # The parser owns the other half of this rule, where a per-kind `defaults:`

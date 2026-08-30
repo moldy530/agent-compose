@@ -397,10 +397,13 @@ note: a value longer than one line is cut, with a `…` where the cut is; \
 /// The deploy layer the built-in target admits is compared like any other
 /// component.
 ///
-/// `placements:` is reserved grammar and a no-op until M3 (PRD 5.10), which is
-/// exactly why it is worth diffing: a plan is how a reviewer sees a change to a
-/// section nothing executes yet. `storage_backends:` is the one section of that
-/// layer this version cannot reach, and `docs/plan.md` §11 says why.
+/// `placements:` and `hub:` are live static grammar whose runtime has not landed
+/// (grammar 14.1, 14.2), which is exactly why they are worth diffing: a plan is
+/// how a reviewer sees a change to a section nothing executes yet, and a mesh's
+/// membership is a deployment decision either way. The `hub:` block is the
+/// deploy layer's one singleton, so it reports at the bare address `hub`.
+/// `storage_backends:` is the one section of that layer this version cannot
+/// reach, and `docs/plan.md` §11 says why.
 #[test]
 fn a_changed_deploy_layer_is_reported_as_a_component() {
     let (report, code) = report("redeployed");
@@ -408,13 +411,14 @@ fn a_changed_deploy_layer_is_reported_as_a_component() {
         report,
         "\
 components
-  + placement.agent.reviewer  redeployed/after/deploy/local.yml:5:3
-  ~ placement.agent.writer  redeployed/after/deploy/local.yml:7:3
-      description: \"In-process, where there is one process.\" -> \"Its own process, even locally.\"
-      runtime: \"colocated\" -> \"isolated\"
+  ~ hub  redeployed/after/deploy/local.yml:6:3
+      public_url: (absent) -> \"http://localhost:8080\"
+  + placement.reviewers  redeployed/after/deploy/local.yml:10:3
+  ~ placement.writers  redeployed/after/deploy/local.yml:12:3
+      description: \"In-process, where there is one process.\" -> \"Its own machine, even locally.\"
 
 `redeployed/after/main.yml` differs from `redeployed/before/main.yml` (target `local`): \
-2 component changes
+3 component changes
 "
     );
     assert_eq!(code, 0);

@@ -43,8 +43,8 @@ pub use definition::{
 };
 pub use deploy::{
     BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
-    EventSourceKind, EventSourcesSection, Network, Placement, PlacementsSection, Runtime,
-    SECRET_FIELDS, StorageBackendsSection,
+    EventSourceKind, EventSourcesSection, HubSection, Placement, PlacementsSection, SECRET_FIELDS,
+    StorageBackendsSection,
 };
 pub use document::{
     Channel, DEPLOY_SECTIONS, DeployFile, Document, DocumentKind, ImportPath, ImportsSection,
@@ -83,13 +83,6 @@ mod keyword_tests {
 
         assert_eq!(AgentAccess::Read.as_str(), "read");
         assert_eq!(AgentAccess::ReadWrite.as_str(), "read_write");
-
-        assert_eq!(Runtime::Isolated.as_str(), "isolated");
-        assert_eq!(Runtime::Colocated.as_str(), "colocated");
-
-        assert_eq!(Network::None.as_str(), "none");
-        assert_eq!(Network::Egress.as_str(), "egress");
-        assert_eq!(Network::All.as_str(), "all");
 
         assert_eq!(FlowContext::Isolated.as_str(), "isolated");
         assert_eq!(FlowContext::Inherit.as_str(), "inherit");

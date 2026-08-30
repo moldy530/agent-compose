@@ -486,12 +486,17 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
         );
     }
 
-    // The two reserved sections `local` admits are §4's entirely.
+    // The three sections `local` admits are §4's entirely. `hub:` is a singleton
+    // rather than a map of named entries, so it is one subject at the address
+    // `hub`, and nothing inside it repeats a key.
     for (name, placement) in section(&artifact, &["deploy", "placements"]) {
         found.insert(
             (COMPONENTS, format!("placement.{name}")),
-            Slice::own(without(placement, &["address"])),
+            Slice::own(without(placement, &["name"])),
         );
+    }
+    if let Some(hub) = artifact.pointer("/deploy/hub") {
+        found.insert((COMPONENTS, "hub".to_string()), Slice::own(hub.clone()));
     }
     for (name, source) in section(&artifact, &["deploy", "event_sources"]) {
         found.insert(
@@ -501,7 +506,7 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
     }
     accounted(
         artifact.get("deploy").unwrap_or(&Value::Null),
-        &["placements", "event_sources"],
+        &["hub", "placements", "event_sources"],
         "the deploy layer",
     );
 
@@ -1203,14 +1208,16 @@ const SIBLINGS: &str = r#"    - { from: approve, to: end, when: "approve.output.
 const SIBLINGS_SWAPPED: &str = r#"    - { from: approve, to: escalate, when: "approve.output.decision == 'reject'" }
     - { from: approve, to: end, when: "approve.output.decision == 'approve'" }"#;
 
-/// The last placement of the deploy layer, and the same file with an event
-/// source planted under it so that there is one to edit — `local` declares
-/// none, and `event_sources:` is one of the two reserved sections it admits
+/// The placement of the deploy layer, and the same file with an event source
+/// planted under it so that there is one to edit — `local` declares none, and
+/// `event_sources:` is the reserved section it admits beside the two live ones
 /// (`docs/plan.md` §11).
-const PLACEMENT: &str = r#"  flow.triage:
-    runtime: colocated"#;
-const EVENT_SOURCE: &str = r#"  flow.triage:
-    runtime: colocated
+const PLACEMENT: &str = r#"  patchers:
+    members: [agent.fixer]
+    description: The machine holding a checkout; on a laptop, this one."#;
+const EVENT_SOURCE: &str = r#"  patchers:
+    members: [agent.fixer]
+    description: The machine holding a checkout; on a laptop, this one.
 
 event_sources:
   bug_reports:
@@ -1218,8 +1225,14 @@ event_sources:
     url: ${REDIS_URL}
     stream: bug-reports
     consumer_group: agent-compose"#;
-const EVENT_SOURCE_MOVED: &str = r#"  flow.triage:
-    runtime: colocated
+const EVENT_SOURCE_EMPTY: &str = r#"  patchers:
+    members: [agent.fixer]
+    description: The machine holding a checkout; on a laptop, this one.
+
+event_sources: {}"#;
+const EVENT_SOURCE_MOVED: &str = r#"  patchers:
+    members: [agent.fixer]
+    description: The machine holding a checkout; on a laptop, this one.
 
 event_sources:
   bug_reports:
@@ -1508,11 +1521,7 @@ const CASES: &[Case] = &[
     Case {
         what: "a section declared with no entries where the other side declares none",
         before: &[],
-        after: &[(
-            "deploy/local.yml",
-            "  flow.triage:\n    runtime: colocated",
-            "  flow.triage:\n    runtime: colocated\n\nevent_sources: {}",
-        )],
+        after: &[("deploy/local.yml", PLACEMENT, EVENT_SOURCE_EMPTY)],
         differs: false,
     },
     // --- One field of one component, with nothing else moving. ----------------
@@ -1955,12 +1964,47 @@ const CASES: &[Case] = &[
         differs: true,
     },
     Case {
-        what: "a placement runtime changed",
+        what: "a placement given a second member",
         before: &[],
         after: &[(
             "deploy/local.yml",
-            "  flow.triage:\n    runtime: colocated",
-            "  flow.triage:\n    runtime: isolated",
+            "    members: [agent.fixer]",
+            "    members: [agent.fixer, tool.repo_grep]",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "a placement's description reworded",
+        before: &[],
+        after: &[(
+            "deploy/local.yml",
+            "    description: The machine holding a checkout; on a laptop, this one.",
+            "    description: The machine holding a checkout.",
+        )],
+        differs: true,
+    },
+    // The `hub:` block is the deploy layer's one singleton, so both of its keys
+    // are swept here rather than by a section walk: `join_token:` is the
+    // variable a worker's credential is read from, and `public_url:` is the base
+    // every ingress URL derives from, so repointing either is a deployment
+    // change a reviewer has to see (grammar 14.2).
+    Case {
+        what: "the hub's join token read from another variable",
+        before: &[],
+        after: &[(
+            "deploy/local.yml",
+            "  join_token: ${MESH_JOIN_TOKEN}",
+            "  join_token: ${LAPTOP_JOIN_TOKEN}",
+        )],
+        differs: true,
+    },
+    Case {
+        what: "the hub given a public base",
+        before: &[],
+        after: &[(
+            "deploy/local.yml",
+            "  join_token: ${MESH_JOIN_TOKEN}",
+            "  join_token: ${MESH_JOIN_TOKEN}\n  public_url: \"http://localhost:8080\"",
         )],
         differs: true,
     },

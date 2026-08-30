@@ -2,9 +2,11 @@
 # at: /agent.fixer
 # via: /$defs/deployFileOnly/patternProperties/^(agent|tool|flow|store|provider|model)\.
 version: "0.1"
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
 placements:
-  agent.fixer:
-    runtime: isolated
+  mac:
+    members: [agent.fixer]
 agent.fixer:
   model: model.fast
   prompt: Fix the finding.

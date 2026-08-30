@@ -2787,7 +2787,7 @@ fn the_local_backends_behaved(answer: &Value) {
         "…and the corpse is gone rather than waited out once per op"
     );
 
-    // A backend grammar 14.2 names and this release does not implement.
+    // A backend grammar 14.3 names and this release does not implement.
     let production = answer["productionBackend"]
         .as_str()
         .expect("a `redis` backend is refused rather than answered from the wrong store");

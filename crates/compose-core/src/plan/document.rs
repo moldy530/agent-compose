@@ -137,6 +137,8 @@ pub enum ComponentKind {
     Trigger,
     /// An entry of the active target's `placements:`.
     Placement,
+    /// The active target's `hub:` block.
+    Hub,
     /// An entry of the active target's `event_sources:`.
     EventSource,
 }

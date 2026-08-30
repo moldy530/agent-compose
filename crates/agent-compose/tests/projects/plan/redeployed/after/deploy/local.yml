@@ -1,9 +1,14 @@
-# The same target, with one placement retimed and a second one added.
+# The same target, with one placement's membership widened, a second one added,
+# and the hub given a public base.
 version: "0.1"
 
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+  public_url: "http://localhost:8080"
+
 placements:
-  agent.reviewer:
-    runtime: colocated
-  agent.writer:
-    runtime: isolated
-    description: Its own process, even locally.
+  reviewers:
+    members: [agent.reviewer]
+  writers:
+    members: [agent.writer]
+    description: Its own machine, even locally.

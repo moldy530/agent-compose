@@ -31,7 +31,7 @@
 //!   (grammar 11.3, 13.5). An alias that resolves is checked one step further:
 //!   the provider behind it must serve the kind of the store that named it,
 //!   which is decidable here and nowhere earlier because an alias declares no
-//!   kind of its own (grammar 14.2).
+//!   kind of its own (grammar 14.3).
 //!
 //! # What it leaves alone
 //!

@@ -1,4 +1,4 @@
-# rule: a per-kind backend default takes that kind's providers (grammar 14.2, Decision D48)
+# rule: a per-kind backend default takes that kind's providers (grammar 14.3, Decision D48)
 # code: invalid-value
 # message: `chroma` is not a `kv` storage provider
 # at: 11:17
