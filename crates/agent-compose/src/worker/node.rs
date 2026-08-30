@@ -85,6 +85,11 @@ pub(crate) fn execute(
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut result: Option<Value> = None;
     let mut unreadable: Option<String> = None;
+    // Set where this worker stops reading before the runner stops writing, which
+    // is the one case the child has to be **killed** rather than waited on: a
+    // process writing into a pipe nobody drains blocks for ever, and a `wait`
+    // over it would take this thread with it.
+    let mut abandoned: Option<Stop> = None;
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else {
             break;
@@ -101,7 +106,12 @@ pub(crate) fn execute(
         match said.get("type").and_then(Value::as_str) {
             Some("effect") => {
                 let record = said.get("effect").cloned().unwrap_or(Value::Null);
-                sender.effects(&json!({ "dispatch_id": id, "effects": [record] }))?;
+                if let Err(stop) =
+                    sender.effects(&json!({ "dispatch_id": id, "effects": [record] }))
+                {
+                    abandoned = Some(stop);
+                    break;
+                }
             }
             Some("result") => {
                 let mut body = said;
@@ -119,7 +129,18 @@ pub(crate) fn execute(
             }
         }
     }
+    if result.is_none() {
+        // Either the runner ended without answering — in which case this is a
+        // no-op — or this worker stopped reading it, and then the kill is what
+        // makes the `wait` below return.
+        let _ = child.kill();
+    }
     let status = child.wait();
+    if let Some(stop) = abandoned {
+        // The worker itself is winding down — a redeployment, a refusal — so the
+        // dispatch is not settled here: the hub ended it, or is about to.
+        return Err(stop);
+    }
 
     let settling = match (result, unreadable) {
         (Some(body), None) => body,
