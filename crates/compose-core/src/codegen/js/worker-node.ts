@@ -279,10 +279,6 @@ class DispatchJournal implements Journal {
     throw new WorkerJournalReach("supersede a dispatch");
   }
 
-  reparkDispatch(_id: string): void {
-    throw new WorkerJournalReach("re-park a dispatch");
-  }
-
   effectsUnder(_execution: string, _site: string): readonly JournalRecord[] {
     throw new WorkerJournalReach("read an execution's effect history");
   }
@@ -395,6 +391,13 @@ async function runPlaced(options: {
     ...(answer.toolDispatches === undefined && toolDispatches.length === 0
       ? {}
       : { toolDispatches: answer.toolDispatches ?? toolDispatches }),
+    // And the fourth, which has **only** the collector: a store op answers its
+    // caller rather than the node, so nothing about it is on `answer`. It goes
+    // home because the trace entry belongs to the hub's node execution, and an
+    // entry with `models` and no `stores` would say a placed agent's `stores:`
+    // did nothing where the same agent unplaced reports what it did (PRD 5.8,
+    // `docs/distributed.md` §4.3).
+    ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
   };
 }
 
@@ -542,6 +545,7 @@ async function main(): Promise<void> {
       ...(answer.history === undefined ? {} : { history: answer.history }),
       ...(answer.models === undefined ? {} : { models: answer.models }),
       ...(answer.toolDispatches === undefined ? {} : { tool_dispatches: answer.toolDispatches }),
+      ...(answer.stores === undefined ? {} : { stores: answer.stores }),
     };
   } catch (error) {
     // The node failed, which is an outcome rather than a crash: §3.4 takes "its

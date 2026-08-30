@@ -193,6 +193,181 @@ script — so bun, npm and pnpm all resolve it to the same versions. The lockfil
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
 
+## Answering a `human` node
+
+A flow that reaches a `human` node stops there and its execution reports
+`status: "interrupted"`. The status route is where the question is: an
+interrupted report carries an `interrupts` array, one entry per pause the
+execution is holding, and each entry has everything needed to ask a person and
+take their answer.
+
+```json
+{
+  "execution_id": "exec_0f1e…",
+  "flow": "flow.review",
+  "trigger": "on_request",
+  "status": "interrupted",
+  "interrupts": [
+    {
+      "wait_id": "approve/0",
+      "flow": "flow.review",
+      "node": "approve",
+      "paused_at": "2025-01-01T12:00:00.000Z",
+      "expires_at": "2025-01-02T12:00:00.000Z",
+      "input": { "draft": "…" },
+      "output_schema": { "type": "object", "properties": { "decision": { "enum": ["approve", "reject"] } }, "required": ["decision"], "additionalProperties": false },
+      "resume_url": "/executions/exec_0f1e…/resume?wait=approve%2F0"
+    }
+  ]
+}
+```
+
+`input` is the node's own `input:`, evaluated — what the human is shown.
+`output_schema` is the published JSON Schema of its `output:`, which is exactly
+what an answer is validated against — at this route and at the terminal below —
+so a form can be built from the report rather than from the composition. `expires_at` is present only where the
+node declares a `timeout:`.
+
+POST the answer to `resume_url` as the JSON body:
+
+```sh
+curl -X POST "http://127.0.0.1:8787/executions/exec_0f1e…/resume?wait=approve%2F0" \
+  -H 'content-type: application/json' \
+  -d '{"decision":"approve"}'
+```
+
+A `202` means the answer was taken and the graph has gone back to work; poll the
+status route for the rest. A payload that does not fit the node's `output:` is a
+`400` and **does not consume the wait** — the execution is still interrupted and
+the corrected answer can be sent to the same URL. So is a request carrying
+`?wait=` more than once, and for the same reason: it names two pauses where a
+resume answers one, so it is refused as that — rather than joined into an id
+nothing is holding — and consumes neither. A `409` is about *which* pause
+rather than about the body: the execution has already completed or failed, so
+there is no run left to be waiting; the run is still going and nothing in it is
+waiting; the wait already expired and `on_timeout:` has routed the execution on;
+the execution is holding more than one pause and the request named none; or
+`?wait=` named a pause this execution is not holding — a stale id from an
+earlier poll. The last two carry a `pending` array of the ids that *are*
+waiting, and `?wait=` is how one of them is named. That id is a pause's
+`wait_id`: its instance path, which is stable across runs of one composition —
+`approve/0` at the top level of a flow, `review/0/2/approve/0` for the pause
+inside the third instance a `map` dispatched. `interrupts` is ordered by
+`wait_id`, and so is the list a `409` gives, so two runs of one composition
+publish the same questions in the same order however their instances happened
+to be scheduled.
+
+**A node above a pause does not spend its budget waiting.** A `timeout:` on the
+`flow:` node or `map` that dispatched the flow the pause is in — including one
+resolved from `defaults:` — bounds the work that node does, and the wait is not
+work it is doing: its clock is held still while a pause below it is open and
+resumes with the time it had left. This is what makes the rule "a `human` node
+resolves no `timeout` at any level" mean what it says for a pause that is not at
+the top level of the triggered flow.
+
+**A retry asks again.** A `retry:` on the node that dispatched the flow a pause
+is in re-executes the whole instance from its entry as a fresh attempt (grammar
+8.5), so an attempt that fails while somebody is still thinking takes its
+question with it: an answer arriving after that is a `409` saying the wait is no
+longer held, and the next attempt asks again at the same `wait_id`. Poll the
+status route for the question rather than holding on to an `interrupts` entry
+from an earlier poll.
+
+**A wait survives the process that opened it.** It is a parked promise rather
+than a checkpoint, so a restarted `serve` does not *hold* it — it **replays** the
+execution out of this project's journal and parks again, under the same
+`wait_id`, because the id is the node's instance path and no process generation
+is part of it. So a resume URL handed out by the process that died answers in
+the one that replaced it. What the journal does not hold is a wait nobody
+answered — there is nothing to record about it — which is exactly what makes
+re-parking the right thing to do with one.
+
+**Replaying back to that pause takes as long as it takes**, and the app serves
+its other executions meanwhile rather than holding the port until every replay
+has landed. So an answer can arrive before the wait is back on the board, and
+that request is refused with a refusal of its own: a `409` carrying `recovering:
+true` and saying to send it again, rather than one of the ones above that mean
+the pause is over.
+
+The same is true of a `run`: a pause it could not ask leaves its execution open
+in the journal, and `bun src/index.ts resume <execution-id>` picks it up,
+prompting at the terminal exactly as an interactive `run` does.
+
+## Answering a pause at the terminal
+
+The resume route is one way to answer a pause. The other is `run` itself: a run
+whose **standard input is a terminal** asks each pause it reaches, right there,
+and carries on with the answer. So a flow with a `human` node in it is runnable
+without serving anything.
+
+```text
+$ bun src/index.ts run flow.review --input goal=ship
+
+pause `approve/0` — flow.review node `approve`
+  shown:
+    {
+      "draft": "the drafted answer"
+    }
+  answer: { decision: "approve" | "reject", note?: string }
+  expires: 2025-01-02T12:00:00.000Z
+answer `approve/0` with one line of JSON: {"decision":"approve"}
+taken.
+```
+
+The prompt goes to **stderr**, so stdout is still only the flow's outputs and
+`--format json` still prints exactly the document it always did. `shown` is the
+node's `input:`, evaluated; `answer` is a sketch of its `output:` — the full JSON
+Schema is what the status route publishes, for a program rather than a person —
+and `expires` appears only where the node declares a `timeout:`.
+
+**One JSON value per line.** A value spanning lines has no terminator a prompt
+could recognize without either guessing or hanging on a malformed one, so an
+answer is a line. A line that is not JSON, and one the node's `output:` refuses,
+are both refused and the question is asked again — the wait is not consumed, the
+same rule the resume route's `400` follows. A blank line is not an answer at all
+and just re-prompts.
+
+**One question at a time.** An execution holding several pauses — a `map` over a
+flow that pauses — is asked them one after another, and each question is the
+lowest `wait_id` **open when it is asked**: the order the status route publishes
+them in, so pauses waiting together are asked in the composition's order rather
+than the one the scheduler parked them in. A pause that opens while a question
+is on the screen is asked after it, whatever its id sorts as — the question in
+front of you is never taken back to make room for it. Each prompt names its own
+wait id.
+
+**A budget keeps running while you think.** Nothing about being asked at a
+terminal holds a `timeout:` still: a wait that runs out while its question is on
+the screen routes through `on_timeout:` exactly as it would under `serve`, and
+the prompt is withdrawn saying so before the next question is asked. A line typed
+for a question that has just been withdrawn is read as the next question's
+answer — a stream of typed lines carries no addressing — which is why every
+prompt names the pause it belongs to.
+
+**Standard input ending ends the run.** Close it, or answer fewer questions than
+the run asks, and there is nothing left that could answer the rest: the run stops
+where it stood, with `status: "interrupted"` and exit `3`, exactly as a run with
+no terminal does.
+
+### When there is no terminal
+
+`AGENT_COMPOSE_INTERACTIVE` decides the surface where standard input cannot:
+
+| value | what a `run` does |
+|---|---|
+| `1` | asks at standard input whatever it is — which is how a **script** answers a pause: `printf '%s\n' '{"decision":"approve"}' \| AGENT_COMPOSE_INTERACTIVE=1 bun src/index.ts run flow.review --input goal=ship` |
+| `0` | never asks, even at a terminal — which is how a supervisor keeps a run on the exit-`3` path below |
+| unset | asks when standard input is a terminal |
+
+Any other value is refused before the run starts, naming the variable: a command
+that could not be run (exit `2`), rather than a setting nothing read.
+
+A run that is not asking reports the pause and exits **`3`**, its own code beside
+`1` for a run that produced no answer and `2` for a command that could not be
+run. The trace document is still written, with `status: "interrupted"` and the
+pause on the entry of the node it stopped at, and the answer goes to `serve`'s
+resume route instead.
+
 ## Pinned versions
 
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a

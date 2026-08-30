@@ -463,6 +463,22 @@ fn the_worker_half_reaches_the_generated_project_in_the_files_a_worker_reads() {
         !runner.contains("mac_signing_pool") && !runner.contains("MESH_INERTNESS_TOKEN"),
         "the node runner names this composition, and it is a constant of the compiler release"
     );
+    // All four of a node execution's collectors travel, and `stores` is the one
+    // that has to be **sent** rather than returned: a store op answers its
+    // caller, so its record is only ever in `context.storeRecords` — an array
+    // the worker's process holds and the hub's node execution never sees. A
+    // runner that kept it, or a dispatch that carried no collector to empty it
+    // into, would leave the hub's trace entry reporting a placed agent that
+    // touched no store while the same agent unplaced reports what it did
+    // (PRD 5.8, §4.3).
+    assert!(
+        runner.contains("...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),"),
+        "the node runner drops the store records it collected: {runner}"
+    );
+    assert!(
+        graph.contains("stores: context.storeRecords,"),
+        "a dispatch carries no collector for the store records its answer brings home: {graph}"
+    );
 
     // The manifest, and the one property that makes §9.1's "one answer under one
     // artifact hash" true of two files rather than only of one derivation.

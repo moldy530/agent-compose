@@ -1390,7 +1390,14 @@ function parking(execution: Execution): void {
   // the webhook, and one waiting on a human and a Mac fires one listing both.
   const open = [
     ...humanWaits(execution.id).map((wait) => wait.id),
-    ...placementWaits(execution.id).map((wait) => wait.id),
+    // …and only the ones **no worker has taken**, which is the line
+    // `docs/distributed.md` §6.4 draws: "no worker has taken the node yet" is
+    // the pause, and a node a worker took is running rather than waiting. The
+    // status route publishes both with their status; a `parked` delivery is
+    // about what the execution is waiting for.
+    ...placementWaits(execution.id)
+      .filter((wait) => wait.status === "parked")
+      .map((wait) => wait.id),
   ];
   if (open.length === 0 || open.every((id) => execution.reported.has(id))) return;
   // Marked **before** the journaling below rather than after it, because the

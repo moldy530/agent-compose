@@ -750,6 +750,7 @@ const flowTriageNodeScan: runtime.NodeDescriptor = {
           path: runtime.instancePath(view, "scan"),
           inputs: input,
           signal: context.signal,
+          stores: context.storeRecords,
         })
       ).output,
       "the result of `tool.repo_grep`",
@@ -862,6 +863,7 @@ const flowTriageNodeDispatchMap: runtime.MapDescriptor = {
           path: site.path,
           inputs: input,
           signal: context.signal,
+          stores: context.storeRecords,
         });
         return {
           output: runtime.parseResult(agentFixerOutput, answer.output, "the answer of `agent.fixer`"),

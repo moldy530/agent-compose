@@ -17,6 +17,8 @@ import * as runtime from "./runtime.ts";
 import type { z } from "zod";
 
 import {
+  stateApproval,
+  stateCountersignature,
   stateSignature,
   stateSignatures,
   stateTicket,
@@ -27,6 +29,26 @@ import {
  * (grammar 10.3's name-based wiring).
  */
 export const channels = {
+  /**
+   * What the person on the other branch said.
+   *
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts at `""`.
+   */
+  approval: Annotation<z.infer<typeof stateApproval>, runtime.Written<z.infer<typeof stateApproval>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
+    default: () => "",
+  }),
+  /**
+   * What the second placed branch signed, on its own channel.
+   *
+   * Unreduced: single-writer, and a write supplies the whole value.
+   * Starts at `""`.
+   */
+  countersignature: Annotation<z.infer<typeof stateCountersignature>, runtime.Written<z.infer<typeof stateCountersignature>>>({
+    reducer: (left, right) => runtime.setReduce(left, right),
+    default: () => "",
+  }),
   /**
    * What the worker signed, as it came back over the wire.
    *

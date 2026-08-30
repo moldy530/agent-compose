@@ -219,7 +219,20 @@ const pollers = new Set<() => void>();
  */
 let boardMoved = 0;
 
-/** Wake every held poll, because the board may have something for it now. */
+/**
+ * Wake every held poll, because the board may have something for it now.
+ *
+ * Called at **both** kinds of move, and the second is as load-bearing as the
+ * first. Work arriving is one: a wait that just parked is work a held poll asked
+ * about a moment too early. Work *leaving* is the other: a session is answered
+ * nothing while it holds an unsettled dispatch (§2), so the instant a dispatch
+ * stops being unsettled — settled by a result, superseded by a deadline, dropped
+ * with the execution — the session behind it became eligible for the next item
+ * in the queue. A stir that only ever announced arrivals would drain a queue at
+ * one item per hold: §2 promises "a small latency floor on dispatch — one round
+ * trip after the hold is answered", and a `map` of eight onto a pool of one would
+ * spend seven holds idling instead.
+ */
 function stirPolls(): void {
   boardMoved += 1;
   for (const wake of [...pollers]) wake();
@@ -239,6 +252,19 @@ export interface PlacedAnswer {
   readonly models?: readonly runtime.ModelCall[];
   /** The subflows a model invoked (PRD §9.20). */
   readonly toolDispatches?: readonly runtime.DispatchRecord[];
+  /**
+   * What its store ops did (PRD 5.8), for the trace entry the **hub** writes.
+   *
+   * The fourth collector a node execution fills, and the one that has to travel
+   * because it has no other way home: the three above are returned by the node
+   * function itself, while store records are pushed into
+   * `runtime.RunContext.storeRecords` as they happen — an array a worker's
+   * process holds a copy of and the hub's node execution never sees. Left
+   * behind, a placed agent's `stores:` would be missing from the entry that
+   * reports it and present on the same agent unplaced, which is a placement
+   * changing what a run *reports* (§4.3, PRD 5.6).
+   */
+  readonly stores?: readonly runtime.StoreRecord[];
 }
 
 /**
@@ -320,6 +346,16 @@ interface DispatchOptions {
   /** [`PlacedSite.policy`]. */
   readonly policy?: runtime.InstancePolicy;
   readonly signal?: AbortSignal;
+  /**
+   * The node execution's own store-record collector — `context.storeRecords`.
+   *
+   * Where [`PlacedAnswer.stores`] is emptied into, which is what puts a placed
+   * node's store ops on the same trace entry an unplaced one puts them on
+   * (`runtime.runNode` reads the array, not the answer). Absent exactly where
+   * the context's own is: a detached `map` delivery, whose records are dropped
+   * by design (D94).
+   */
+  readonly stores?: runtime.StoreRecord[];
 }
 
 /** See [`executeLocally`]. */
@@ -446,7 +482,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   // A process that executes placed nodes answers this itself ([`executeLocally`]),
   // and is asked before anything is journaled: a worker holds no board, and the
   // journal of this execution is the hub's alone (§3.3, §8 rule 3).
-  if (executor !== undefined) return await executor(options);
+  if (executor !== undefined) return absorb(options, await executor(options));
   const site = options.path.join("/");
   if (!mounted) throw new PlacementUnreachable(options.node, options.placement);
   const journal = await openJournal();
@@ -473,7 +509,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   // A row a previous generation already finished with. Consumed rather than
   // redone, which is `docs/durability.md` §5's replay discipline reaching the one
   // effect this module owns.
-  if (row.status === "settled") return answerOf(row);
+  if (row.status === "settled") return absorb(options, answerOf(row));
   if (row.status === "superseded") {
     throw new DispatchSuperseded(
       options.node,
@@ -482,9 +518,16 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     );
   }
   // …and a row some dead process had handed to a session: sessions are this
-  // process's only (§5), so one it did not issue is one nobody is holding.
-  const taken = row.status === "dispatched" && sessions.has(row.session ?? "");
-  if (row.status === "dispatched" && !taken) journal.reparkDispatch(row.id);
+  // process's only (§5), so one it did not issue is one whose holder this hub
+  // has ended. **Superseded, never put back on the board** — see
+  // [`supersedeOrphans`], which is where the same rule is applied at start and
+  // where the reasoning is. This is its belt-and-braces: a row that reached here
+  // still `dispatched` is one that start could not read.
+  if (row.status === "dispatched" && !sessions.has(row.session ?? "")) {
+    journal.supersedeDispatch(row.id, ORPHANED);
+    throw new DispatchSuperseded(options.node, options.placement, ORPHANED);
+  }
+  const taken = row.status === "dispatched";
   rows.set(row.id, row);
 
   return await new Promise<PlacedAnswer>((resolve, reject) => {
@@ -495,7 +538,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       settle: (outcome) => {
         finish();
         if (outcome.kind === "error") reject(replayedFailure(outcome));
-        else resolve(outcome.value as PlacedAnswer);
+        else resolve(absorb(options, outcome.value as PlacedAnswer));
       },
     };
     const abort = (): void => {
@@ -510,6 +553,10 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       journal.supersedeDispatch(row.id, `the hub stopped waiting for this dispatch: ${reason}`);
       rows.delete(row.id);
       held.settle({ kind: "error", name: "DispatchSuperseded", message: reason });
+      // A dispatch that has stopped being unsettled frees whichever session was
+      // holding it, and the queue behind it is what that session is answered
+      // next — see [`stirPolls`].
+      stirPolls();
     };
     const finish = (): void => {
       awaiting.delete(row.id);
@@ -542,6 +589,34 @@ function nextOrdinal(execution: string, site: string): number {
   return ordinal;
 }
 
+/**
+ * Put what a placed node did into the collectors of the node execution that
+ * dispatched it, and answer it.
+ *
+ * The one field of a [`PlacedAnswer`] the caller cannot read off the return
+ * value, because `runtime.runNode` does not read store records off an answer:
+ * it reads the array it handed the activity, on both of its ways out. So the
+ * hub's copy of that array is where a worker's records have to land, and this is
+ * the one place a dispatch's answer is produced — the three ways it can be
+ * (executed locally, replayed off a settled row, settled by a result) all come
+ * through here.
+ *
+ * Applied on a **replayed** row too, and deliberately: the entry this generation
+ * writes is a fresh entry, and a resumed execution that dropped the records
+ * would report a node that did nothing to its stores where its predecessor
+ * reported one that did (`docs/durability.md` §5).
+ */
+function absorb(options: DispatchOptions, answer: PlacedAnswer): PlacedAnswer {
+  if (answer.stores !== undefined && options.stores !== undefined) {
+    options.stores.push(...answer.stores);
+  }
+  return answer;
+}
+
+/** Why a dispatch a replaced process was holding is over. See [`supersedeOrphans`]. */
+const ORPHANED =
+  "the hub process holding this dispatch was replaced, so the session it was issued to ended (docs/distributed.md §5)";
+
 /** What a settled row answers a node with. */
 function answerOf(row: DispatchRow): PlacedAnswer {
   const outcome = row.outcome;
@@ -565,8 +640,10 @@ function answerOf(row: DispatchRow): PlacedAnswer {
 export function releasePlacementWaits(execution: string): void {
   ordinals.delete(execution);
   const ended = "the execution this dispatch belonged to ended";
+  let freed = false;
   for (const [id, held] of [...awaiting]) {
     if (held.execution !== execution) continue;
+    freed = true;
     rows.delete(id);
     // Settled as a failure rather than left pending: the promise belongs to a
     // node execution nothing is waiting for any more, and a promise nobody
@@ -582,6 +659,9 @@ export function releasePlacementWaits(execution: string): void {
       });
   }
   announceWaits(execution);
+  // A session that was holding one of these is free now, and the queue behind it
+  // is what it is answered next (see [`stirPolls`]).
+  if (freed) stirPolls();
 }
 
 /**
@@ -609,7 +689,42 @@ export function placementWaits(execution: string): readonly PlacementWait[] {
       status: held.taken ? "dispatched" : "parked",
     });
   }
-  return found.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+  return found.sort(byParkOrder);
+}
+
+/**
+ * Park order, as §6.2 means it and as `journal.unsettledDispatches` sorts by:
+ * when it went on the board, and then the ordinal at its instance path.
+ *
+ * The ordinal is compared **numerically**, which is the whole of why this is a
+ * function rather than `<`. A wait id is `<instance path>/<ordinal>` and both
+ * halves carry integers, so a string compare puts `sign/10` before `sign/2` and
+ * `fan/0/11/0` before `fan/0/2/0` — a report of a draining queue in an order
+ * that is not the order it drains in. `./journal.ts` was given
+ * `ORDER BY parked_at ASC, rowid ASC` for exactly this reason, and the report
+ * that publishes the board has to agree with the board.
+ */
+function byParkOrder(left: PlacementWait, right: PlacementWait): number {
+  if (left.parkedAt !== right.parkedAt) return left.parkedAt < right.parkedAt ? -1 : 1;
+  return natural(left.id, right.id);
+}
+
+/** Compare two `/`-separated paths, reading a run of digits as the number it is. */
+function natural(left: string, right: string): number {
+  const here = left.split("/");
+  const there = right.split("/");
+  for (let index = 0; index < Math.max(here.length, there.length); index += 1) {
+    const one = here[index];
+    const other = there[index];
+    if (one === undefined) return -1;
+    if (other === undefined) return 1;
+    if (one === other) continue;
+    const first = Number(one);
+    const second = Number(other);
+    if (Number.isInteger(first) && Number.isInteger(second)) return first < second ? -1 : 1;
+    return one < other ? -1 : 1;
+  }
+  return 0;
 }
 
 /**
@@ -651,18 +766,27 @@ function announceWaits(execution: string): void {
 }
 
 /**
- * How many placement waits `execution` is holding at or inside `site`.
+ * How many placement waits `execution` is holding at or inside `site` that
+ * **no worker has taken**.
  *
  * Registered with `runtime.registerParkedWork` at module scope, so
- * `runtime.quiescent` counts a node waiting on a worker as parked rather than as
- * work still advancing — which is what makes §6.6's webhook fire for a placement
- * and what stops a `parked` delivery from being taken while a sibling branch is
- * still running.
+ * `runtime.quiescent` counts a node waiting *for* a worker as parked rather than
+ * as work still advancing — which is what makes §6.6's webhook fire for a
+ * placement and what stops a `parked` delivery from being taken while a sibling
+ * branch is still running.
+ *
+ * **A dispatch a worker is holding is not one of them**, and that is §6.4's own
+ * line: "no worker has taken the node yet" is the pause, and "a worker took it"
+ * is a node that is *running* — somewhere else, but running, and an execution
+ * with one in flight has not stopped advancing on its own. Counting a taken
+ * dispatch would make `runtime.quiescent` true for the whole four minutes a
+ * placed build takes, so a `human` pause opening on a parallel branch would fire
+ * a `parked` delivery reporting a run that is mid-node as parked.
  */
 registerParkedWork((execution, site) => {
   let parked = 0;
   for (const held of awaiting.values()) {
-    if (held.execution !== execution) continue;
+    if (held.execution !== execution || held.taken) continue;
     if (held.site === site || held.site.startsWith(`${site}/`)) parked += 1;
   }
   return parked;
@@ -701,11 +825,11 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
   mounted = true;
 
   // Registered **before** `./serve.ts`'s own recovery hook, so the rows a dead
-  // process left `dispatched` are back on the board before the replays that
-  // reach them start (§5: sessions are this process's, so a row naming one it
-  // never issued is a row nobody is holding).
+  // process left `dispatched` are ended before the replays that reach them start
+  // (§5: sessions are this process's, so a row naming one it never issued is a
+  // row whose session has ended).
   app.addHook("onReady", async () => {
-    await reparkOrphans();
+    await supersedeOrphans();
   });
 
   app.post("/workers/join", async (request, reply) => join(request, reply));
@@ -718,18 +842,37 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
 }
 
 /**
- * Put every dispatch a dead process was holding back on the board.
+ * End every dispatch a replaced process was holding, without a result.
  *
- * §5's third rule, applied to the one piece of state a session can be holding: a
- * `dispatched` row names a session, sessions live in memory, and this process
- * has issued none yet — so every such row is one nobody is holding and the next
- * worker claiming its placement should be given it.
+ * A `dispatched` row names a session, sessions live in memory (§5), and this
+ * process has issued none yet — so every such row was issued by the process this
+ * one replaced, and §5 is explicit about what that means: "an unsettled dispatch
+ * on an ended session is superseded exactly as §6.3 supersedes one, so its
+ * node's attempt fails under that node's `retry:`/`on_error:` chain". The
+ * sessions of a replaced process are ended by definition.
+ *
+ * **Putting them back on the board instead would be the one thing this protocol
+ * is written to prevent.** A worker two hundred seconds into a placed node knows
+ * nothing about the restart: its poll meets `410`, it joins again, and a re-
+ * parked row is then handed to whichever session claims that placement —
+ * possibly the very worker still running it, since `holding` is read off rows
+ * *this* process has handed out and it has handed out none. Two executions of
+ * one instance path would then run at once, the second handed an `effect_history`
+ * that does not yet hold what the first is issuing, and the model call §7.3
+ * promises is not paid for twice is paid for twice.
+ *
+ * What it costs is one attempt per in-flight placed node, which is exactly what
+ * §6.3 costs for the same reason (a dispatch nobody can be shown to be holding)
+ * and what §6.4 tells an author to answer with a `retry:`. The effects the
+ * superseded attempt streamed home are in the journal, so the retry replays them
+ * rather than re-issuing them (§7.2), and a late result from the worker that was
+ * running it meets the `409` §3.4 gives a superseded dispatch.
  */
-async function reparkOrphans(): Promise<void> {
+async function supersedeOrphans(): Promise<void> {
   try {
     const journal = await openJournal();
     for (const row of journal.unsettledDispatches()) {
-      if (row.status === "dispatched") journal.reparkDispatch(row.id);
+      if (row.status === "dispatched") journal.supersedeDispatch(row.id, ORPHANED);
     }
   } catch (error) {
     // A journal this process cannot read is not a reason to refuse to serve:
@@ -1231,6 +1374,11 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
             ...(body["tool_dispatches"] === undefined
               ? {}
               : { toolDispatches: body["tool_dispatches"] }),
+            // The fourth collector, which travels because it cannot be read off
+            // the answer on this side — see [`PlacedAnswer.stores`]. Journaled
+            // with the rest of the outcome, so a replayed row reports what the
+            // node's stores did as well as what its models did.
+            ...(body["stores"] === undefined ? {} : { stores: body["stores"] }),
           },
         }
       : {
@@ -1242,6 +1390,11 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   rows.delete(id);
   const held = awaiting.get(id);
   if (held !== undefined) held.settle(outcome);
+  // This session has settled what it was holding, so it may be handed the next
+  // item in the queue — and the poll that will hand it over is one this process
+  // is holding right now. Without the stir it waits out its hold first, which
+  // turns a queue of eight into eight holds of idling (see [`stirPolls`]).
+  stirPolls();
   return reply.code(204).send();
 }
 

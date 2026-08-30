@@ -603,14 +603,6 @@ export interface Journal {
    */
   supersedeDispatch(id: string, reason: string): void;
   /**
-   * Put one dispatch back on the board, forgetting the session that held it.
-   *
-   * What a hub does at start with the rows it finds `dispatched`: sessions are
-   * advisory and in memory only (§5), so a row naming one that this process
-   * never issued is a row nobody is holding.
-   */
-  reparkDispatch(id: string): void;
-  /**
    * Every effect recorded at, or inside, one instance path — the
    * `effect_history` a redispatch carries (§3.2, §7.2).
    *
@@ -1061,13 +1053,6 @@ class SqliteJournal implements Journal {
     this.#database.run(
       "UPDATE dispatches SET status = 'superseded', settled_at = ?, detail = ?, session = NULL WHERE id = ? AND status IN ('parked', 'dispatched')",
       [new Date().toISOString(), reason, id],
-    );
-  }
-
-  reparkDispatch(id: string): void {
-    this.#database.run(
-      "UPDATE dispatches SET status = 'parked', session = NULL, dispatched_at = NULL WHERE id = ? AND status = 'dispatched'",
-      [id],
     );
   }
 

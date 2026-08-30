@@ -27,6 +27,9 @@ import {
   flowDirectInputs,
   flowReleaseInputs,
   flowRetriedInputs,
+  flowSignedOffInputs,
+  flowSignedOffNodeApproveOutput,
+  flowWatchedInputs,
   toolNotarizeInput,
   toolNotarizeOutput,
   toolSignInput,
@@ -42,6 +45,8 @@ import type { GraphState } from "./state.ts";
  */
 const stateShape: runtime.Shape = {
   properties: {
+    "approval": "string",
+    "countersignature": "string",
     "signature": "string",
     "signatures": {
       "items": "string"
@@ -128,6 +133,38 @@ const flowRetriedShape: runtime.Shape = {
 const flowRetriedNodeSignShape: runtime.Shape = {
   "properties": {
     "signature": "string"
+  }
+};
+
+/** `flow.signed_off` — the `input` root inside it (grammar 7.5). */
+const flowSignedOffShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.signed_off` node `sign` — the `sign.output` root its guards read. */
+const flowSignedOffNodeSignShape: runtime.Shape = {
+  "properties": {
+    "signature": "string"
+  }
+};
+
+/**
+ * `flow.signed_off` node `approve` — the `approve.output` root its guards read.
+ */
+const flowSignedOffNodeApproveShape: runtime.Shape = {
+  "properties": {
+    "decision": "string"
+  }
+};
+
+/** `flow.watched` — the `input` root inside it (grammar 7.5). */
+const flowWatchedShape: runtime.Shape = {
+  "properties": {
+    "paths": {
+      "items": "string"
+    }
   }
 };
 
@@ -288,12 +325,12 @@ const flowBatchNodeFanMap: runtime.MapDescriptor = {
     path: "input.paths",
     shape: "any",
   },
-  maxConcurrency: 4,
+  maxConcurrency: 12,
   onItemError: "fail",
   routes: [
     {
       target: "agent.signer",
-      maxConcurrency: 4,
+      maxConcurrency: 12,
       detach: false,
       itemShape: "string",
       input: (roots) => ({
@@ -308,6 +345,7 @@ const flowBatchNodeFanMap: runtime.MapDescriptor = {
           path: site.path,
           inputs: input,
           signal: context.signal,
+          stores: context.storeRecords,
         });
         return {
           output: runtime.parseResult(agentSignerOutput, answer.output, "the answer of `agent.signer`"),
@@ -431,6 +469,7 @@ const flowConversationNodeSign: runtime.NodeDescriptor = {
       history: runtime.historyTurns(view.state["messages"] as unknown[]),
       policy: view.run.policy,
       signal: context.signal,
+      stores: context.storeRecords,
     });
     return {
       output: runtime.parseResult(agentSignerOutput, answer.output, "the answer of `agent.signer`"),
@@ -509,6 +548,7 @@ const flowDirectNodeSign: runtime.NodeDescriptor = {
           path: runtime.instancePath(view, "sign"),
           inputs: input,
           signal: context.signal,
+          stores: context.storeRecords,
         })
       ).output,
       "the result of `tool.sign`",
@@ -578,6 +618,7 @@ const flowReleaseNodeSign: runtime.NodeDescriptor = {
       history: runtime.historyTurns(view.state["messages"] as unknown[]),
       policy: view.run.policy,
       signal: context.signal,
+      stores: context.storeRecords,
     });
     return {
       output: runtime.parseResult(agentSignerOutput, answer.output, "the answer of `agent.signer`"),
@@ -681,6 +722,7 @@ const flowRetriedNodeSign: runtime.NodeDescriptor = {
       history: runtime.historyTurns(view.state["messages"] as unknown[]),
       policy: view.run.policy,
       signal: context.signal,
+      stores: context.storeRecords,
     });
     return {
       output: runtime.parseResult(agentSignerOutput, answer.output, "the answer of `agent.signer`"),
@@ -724,6 +766,218 @@ const flowRetriedBinding: runtime.SubflowBinding = {
       ...options,
       streamMode: "values",
       outputKeys: flowRetriedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.signed_off ---
+
+/** `flow.signed_off` node `sign` — `agent.signer` (grammar 8.1). */
+const flowSignedOffNodeSign: runtime.NodeDescriptor = {
+  flow: "flow.signed_off",
+  node: "sign",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowSignedOffShape, state: stateShape, output: flowSignedOffNodeSignShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.signed_off.sign",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "sign"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentSignerOutput, answer.output, "the answer of `agent.signer`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "signature", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: "approve" },
+  ],
+};
+
+/**
+ * `flow.signed_off` node `approve` — the pause it holds: what the human is shown, and what an answer has to fit (grammar 8.7, PRD 5.11).
+ */
+const flowSignedOffNodeApproveHuman: runtime.HumanDescriptor = {
+  flow: "flow.signed_off",
+  node: "approve",
+  schema: {
+    "additionalProperties": false,
+    "properties": {
+      "decision": {
+        "enum": [
+          "approve",
+          "reject"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "decision"
+    ],
+    "type": "object"
+  },
+  parse: (payload) => runtime.parseResult(flowSignedOffNodeApproveOutput, payload, "the answer to `flow.signed_off` node `approve`"),
+};
+
+/**
+ * `flow.signed_off` node `approve` — a human-in-the-loop pause (grammar 8.7).
+ */
+const flowSignedOffNodeApprove: runtime.NodeDescriptor = {
+  flow: "flow.signed_off",
+  node: "approve",
+  // Grammar 9.3, resolved: `retry` from exempt (Decision D102), `timeout` from exempt (Decision D102), `on_error` from `defaults:`.
+  policy: {
+    onError: "fail",
+  },
+  exempt: true,
+  shapes: { input: flowSignedOffShape, state: stateShape, output: flowSignedOffNodeApproveShape },
+  input: (roots, view) => ({
+    "signature": runtime.toJson(runtime.evaluate("state.signature", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runHuman(flowSignedOffNodeApproveHuman, input, context, view),
+  writes: [
+    { field: "decision", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.signed_off` — its nodes, its `start` edges, and the compiled graph. */
+function flowSignedOff() {
+  return new StateGraph(State)
+    .addNode("sign", (state: GraphState) => runtime.runNode(flowSignedOffNodeSign, state), {
+      ends: ["approve"],
+    })
+    .addNode("approve", (state: GraphState) => runtime.runNode(flowSignedOffNodeApprove, state), {
+      ends: [END],
+    })
+    .addEdge(START, "sign")
+    .compile();
+}
+
+/**
+ * `flow.signed_off`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowSignedOffGraph = flowSignedOff();
+
+/**
+ * `flow.signed_off` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowSignedOffBinding: runtime.SubflowBinding = {
+  address: "flow.signed_off",
+  outputs: ["signature"],
+  recursionLimit: 27,
+  stream: (initial, options) =>
+    flowSignedOffGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowSignedOffGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.watched ---
+
+/**
+ * `flow.watched` node `watch` — the fan-out it dispatches (grammar 8.6). `over` resolves against `input.paths`, and `path` is what an instance's own bindings call the item.
+ */
+const flowWatchedNodeWatchMap: runtime.MapDescriptor = {
+  node: "watch",
+  as: "path",
+  source: {
+    path: "input.paths",
+    shape: "any",
+  },
+  maxConcurrency: 4,
+  onItemError: "fail",
+  routes: [
+    {
+      target: "flow.signed_off",
+      maxConcurrency: 4,
+      detach: false,
+      itemShape: "string",
+      input: (roots) => ({
+        "path": runtime.toJson(runtime.evaluate("path", roots)),
+      }),
+      run: async (input, context, site) =>
+        runtime.runSubflow(flowSignedOffBinding, {
+          inputs: input as Record<string, unknown>,
+          execution: site.execution,
+          path: site.path,
+          signal: context.signal,
+        }),
+      writes: [
+        { field: "signature", channel: "signatures", reduce: "append" },
+      ],
+    },
+  ],
+};
+
+/** `flow.watched` node `watch` — a fan-out (grammar 8.6). */
+const flowWatchedNodeWatch: runtime.NodeDescriptor = {
+  flow: "flow.watched",
+  node: "watch",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowWatchedShape, state: stateShape, output: "any" },
+  input: (_roots, view) => runtime.mapPlan(flowWatchedNodeWatchMap, view),
+  run: async (input, context) =>
+    runtime.runMap(flowWatchedNodeWatchMap, input as runtime.MapPlan, context),
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.watched` — its nodes, its `start` edges, and the compiled graph. */
+function flowWatched() {
+  return new StateGraph(State)
+    .addNode("watch", (state: GraphState) => runtime.runNode(flowWatchedNodeWatch, state), {
+      ends: [END],
+    })
+    .addEdge(START, "watch")
+    .compile();
+}
+
+/**
+ * `flow.watched`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowWatchedGraph = flowWatched();
+
+/**
+ * `flow.watched` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowWatchedBinding: runtime.SubflowBinding = {
+  address: "flow.watched",
+  outputs: ["signatures"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowWatchedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowWatchedGraph.outputChannels,
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
@@ -866,6 +1120,38 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowRetriedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.signed_off": {
+    address: "flow.signed_off",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 27,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowSignedOffInputs, inputs, "the `inputs:` of `flow.signed_off`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowSignedOffGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowSignedOffGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.watched": {
+    address: "flow.watched",
+    inputs: ["paths"],
+    inputKinds: { "paths": "json", },
+    outputs: ["signatures"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowWatchedInputs, inputs, "the `inputs:` of `flow.watched`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowWatchedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowWatchedGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
 };
@@ -1313,6 +1599,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
       };
     },
   "flow.retried.sign":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentSigner,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
+  "flow.signed_off.sign":
     async (input, context, site) => {
       const answer = await runtime.callAgent(
         agentSigner,

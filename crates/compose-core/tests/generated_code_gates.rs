@@ -678,6 +678,8 @@ const REDUCTIONS: &[Reduction] = &[
             { "ticket": "notarized", "signatures": "two" }
         ]"#,
         expected: r#"{
+            "approval": "",
+            "countersignature": "",
             "signature": "signed",
             "ticket": "notarized",
             "signatures": ["one", "two"],

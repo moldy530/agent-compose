@@ -743,6 +743,53 @@ fn a_placed_node_runs_on_a_worker_and_the_rest_of_the_flow_runs_on_the_hub() {
     assert_eq!(unknown.status, 409, "{}", body_of(&unknown));
 }
 
+/// What a placed node's **stores** did reaches the trace entry the hub writes
+/// (PRD 5.8, §4.3).
+///
+/// The fourth collector a node execution fills, and the only one with no way
+/// home of its own: `history`, `models` and `tool_dispatches` are returned by the
+/// node function, while a store op answers its *caller* and pushes its record
+/// into `context.storeRecords` — an array the worker's process holds a copy of
+/// and the hub's node execution never sees. A result that dropped it would give
+/// a placed agent's entry `models` and no `stores` where the same agent unplaced
+/// reports both, and §4.3's "a placement decides which process runs a node" would
+/// have become "a placement decides what a run reports".
+#[test]
+fn a_placed_nodes_store_records_reach_the_trace_entry_the_hub_writes() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/releases", &json!({ "path": "dist/app" }));
+    let dispatch = worker.dispatch(&hub);
+    let record = json!({
+        "store": "store.notes",
+        "op": "memory_get",
+        "effect": "read",
+        "via": "tool",
+        "scope": "global",
+        "key": "dist/app",
+        "answer": { "note": "signed once before" }
+    });
+    let settled = hub.send(worker.request("POST", "/workers/result").json(&json!({
+        "dispatch_id": dispatch["dispatch_id"],
+        "output": { "signature": "signed-by-the-mac" },
+        "stores": [record.clone()],
+    })));
+    assert_eq!(settled.status, 204, "{}", body_of(&settled));
+
+    let report = hub.until(&execution, "completed", |report| {
+        report["status"] == json!("completed")
+    });
+    let entry = &report["trace"][0];
+    assert_eq!(entry["node"], json!("sign"), "{report:#}");
+    assert_eq!(
+        entry["stores"],
+        json!([record]),
+        "the store records the worker sent home are not on the node's entry: {report:#}"
+    );
+}
+
 /// A `function:` node over a placed tool dispatches too, and its answer is held
 /// to the tool's `output:` on the way back in (grammar §14.1, §6.1).
 ///
@@ -983,6 +1030,152 @@ fn a_placement_wait_fires_the_parked_lifecycle_webhook() {
     );
 }
 
+/// A dispatch a worker has **taken** is not a parking, and no webhook says it is
+/// (§6.4, §6.6).
+///
+/// §6.4's table is two rows and this is the line between them: "no worker has
+/// taken the node yet" is the pause — the thing a `parked` delivery announces —
+/// while "a worker took it" is a node that is *running*, somewhere else. An
+/// execution holding one has not stopped advancing on its own, so it is owed no
+/// delivery at all, and a report that said otherwise would tell a subscriber that
+/// a four-minute build was waiting for a machine that was in fact building.
+///
+/// `flow.watched` is the shape that can tell the two apart, and its shape is not
+/// incidental: LangGraph's superstep barrier holds two *branches* of one graph in
+/// step with each other, so a question on one branch cannot open while a node on
+/// the other is still running. A **dispatched instance** runs a graph of its own
+/// and advances while a sibling instance is parked, so a `map` of two is what
+/// reaches a quiescence with one dispatch still out at a worker.
+///
+/// The liveness window is a long one, because what is being observed is a
+/// dispatch a session is **holding**: these workers are a test rather than a
+/// process, so they make no request between the poll that took the dispatch and
+/// the result that settles it, and the suite's short window would supersede
+/// exactly the state this is about (§6.3).
+#[test]
+fn a_dispatch_a_worker_took_is_not_a_parking() {
+    let Some(project) = harness::scratch_project("mesh-watched") else {
+        return;
+    };
+    let held = harness::Scratch::at(project);
+    let Some(hub) = hub_into(
+        held.path(),
+        &[(
+            "AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS".to_string(),
+            "60000".to_string(),
+        )],
+    ) else {
+        return;
+    };
+    let receiver = harness::Receiver::start().expect("a loopback port");
+    let execution = hub.start(
+        "/watched-releases",
+        &json!({
+            "paths": ["dist/one", "dist/two"],
+            "callback_url": format!("{}/hook", receiver.base_url),
+        }),
+    );
+
+    // Both instances park their sign-off, with no worker anywhere: the pause of
+    // §6.4's first row, and whatever the parks announced is the delivery count
+    // this test measures from.
+    let board = hub.until(&execution, "parked both instances", |report| {
+        report["placement_waits"]
+            .as_array()
+            .is_some_and(|waits| waits.len() == 2)
+    });
+    receiver.wait_for_event("parked", 1, PATIENCE);
+    let announced = receiver.of_event("parked").len();
+    let ids: Vec<&str> = board["placement_waits"]
+        .as_array()
+        .expect("two waits")
+        .iter()
+        .map(|wait| wait["wait_id"].as_str().expect("a wait id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["watch/0/0/sign/0/0", "watch/0/1/sign/0/0"],
+        "{board:#}"
+    );
+
+    // Two sessions, because §2 hands one session one dispatch at a time and both
+    // instances have to be out at once for the question below to open while a
+    // node is running.
+    let one = hub.worker();
+    let first = one.dispatch(&hub);
+    let two = hub.worker();
+    let second = two.dispatch(&hub);
+    let leading = first["instance_path"] == json!("watch/0/0/sign/0");
+    let (asking, asker, running, runner) = if leading {
+        (&first, &one, &second, &two)
+    } else {
+        (&second, &two, &first, &one)
+    };
+    assert_eq!(
+        asking["instance_path"],
+        json!("watch/0/0/sign/0"),
+        "{asking:#}"
+    );
+    assert_eq!(
+        running["instance_path"],
+        json!("watch/0/1/sign/0"),
+        "{running:#}"
+    );
+
+    // Settling one instance's dispatch carries that instance on to its question —
+    // while the other instance's dispatch is still out at its worker.
+    asker.settle(
+        &hub,
+        asking["dispatch_id"].as_str().expect("a dispatch id"),
+        &json!({ "signature": "signed-first" }),
+    );
+    let asked = hub.until(&execution, "opened its question", |report| {
+        report["interrupts"]
+            .as_array()
+            .is_some_and(|waits| !waits.is_empty())
+    });
+    assert_eq!(
+        asked["placement_waits"][0]["status"],
+        json!("dispatched"),
+        "the other instance's node is out at a worker: {asked:#}"
+    );
+    // Long enough that a delivery this quiescence had taken would have arrived:
+    // every other one in this suite lands in milliseconds.
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        receiver.of_event("parked").len(),
+        announced,
+        "a `parked` webhook was delivered for an execution whose only other work is a node a \
+         worker is running (§6.4)"
+    );
+
+    // …and when that node's result lands, the execution really has stopped
+    // advancing on its own, and the delivery names what it is waiting for.
+    runner.settle(
+        &hub,
+        running["dispatch_id"].as_str().expect("a dispatch id"),
+        &json!({ "signature": "signed-second" }),
+    );
+    let parked = receiver.wait_for_event("parked", announced + 1, PATIENCE);
+    let body = &parked[announced].body;
+    assert_eq!(body["execution_id"], json!(execution));
+    assert!(
+        body["placement_waits"].is_null(),
+        "the placement waits were gone by then, and the report says so: {body:#}"
+    );
+    let questions: Vec<&str> = body["interrupts"]
+        .as_array()
+        .expect("the delivery lists the questions")
+        .iter()
+        .map(|wait| wait["wait_id"].as_str().expect("a wait id"))
+        .collect();
+    assert_eq!(
+        questions,
+        ["watch/0/0/approve/0", "watch/0/1/approve/0"],
+        "the delivery names the questions a person can answer: {body:#}"
+    );
+}
+
 /// A poll already in flight is answered **when the work parks**, not when its
 /// hold runs out (§2).
 ///
@@ -1047,6 +1240,97 @@ fn a_poll_in_flight_is_answered_when_the_work_parks_rather_than_when_its_hold_en
         "the poll waited {waited:?} of a {hold:?} hold for work that parked after 400ms: a \
          dispatch woke nobody, and §2's latency floor became the hold"
     );
+}
+
+/// A poll already in flight is answered when **this session's own dispatch
+/// settles**, not when its hold runs out (§2).
+///
+/// The other half of the wake, and the one a queue is drained by. A session is
+/// answered `204` for every hold while it holds a dispatch it has not settled
+/// (§2), so the instant the result lands that session became eligible for the
+/// next item — and the poll that will hand it over is one the hub is already
+/// holding. A hub that only ever woke polls when work *arrived* would drain a
+/// queue at one item per hold: §2's "small latency floor on dispatch — one round
+/// trip after the hold is answered" would become a whole hold per item, which
+/// for the default 25s is a `map` of eight spending three minutes idling on a
+/// mesh whose nodes answer instantly.
+#[test]
+fn a_poll_in_flight_is_answered_when_the_session_settles_what_it_was_holding() {
+    let Some(project) = harness::scratch_project("mesh-drain") else {
+        return;
+    };
+    let held = harness::Scratch::at(project);
+    let hold = Duration::from_secs(6);
+    let Some(hub) = hub_into(
+        held.path(),
+        &[
+            (
+                "AGENT_COMPOSE_MESH_POLL_HOLD_MS".to_string(),
+                hold.as_millis().to_string(),
+            ),
+            (
+                "AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS".to_string(),
+                "30000".to_string(),
+            ),
+        ],
+    ) else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/batches", &json!({ "paths": ["dist/one", "dist/two"] }));
+
+    // Both items are admitted and parked; this session takes the first and is
+    // now busy, so its next poll is held for the whole hold.
+    let first = worker.dispatch(&hub);
+    let taken = first["dispatch_id"]
+        .as_str()
+        .expect("a dispatch id")
+        .to_string();
+
+    let base = hub.base_url.clone();
+    let session = worker.session.clone();
+    let polling = std::thread::spawn(move || {
+        let client = Client::new(&base)
+            .expect("the hub's address parses")
+            .with_timeout(Duration::from_secs(30));
+        let started = Instant::now();
+        let answered = client
+            .send(
+                Hub::authorized("GET", "/workers/poll").header("x-worker-session", session.clone()),
+            )
+            .expect("the hub answered");
+        (answered, started.elapsed())
+    });
+
+    // Long enough that the poll is certainly held, short enough that the hold
+    // has most of itself left.
+    std::thread::sleep(Duration::from_millis(400));
+    let settled = worker.settle(&hub, &taken, &json!({ "signature": "one" }));
+    assert_eq!(settled.status, 204, "{}", body_of(&settled));
+
+    let (answered, waited) = polling.join().expect("the polling thread");
+    assert_eq!(answered.status, 200, "{}", body_of(&answered));
+    let next = answered.json();
+    assert_ne!(
+        next["dispatch_id"],
+        json!(taken),
+        "the hold was answered with the dispatch it had already settled: {next:#}"
+    );
+    assert!(
+        waited < hold / 2,
+        "the poll waited {waited:?} of a {hold:?} hold after settling what it held at 400ms: a \
+         session that became free woke nobody, and §2's latency floor became the hold"
+    );
+
+    worker.settle(
+        &hub,
+        next["dispatch_id"].as_str().expect("a dispatch id"),
+        &json!({ "signature": "two" }),
+    );
+    let done = hub.until(&execution, "completed", |report| {
+        report["status"] == json!("completed")
+    });
+    assert_eq!(done["outputs"]["signatures"], json!(["one", "two"]));
 }
 
 /// A poll whose client hung up takes no dispatch, and stops being a heartbeat.
@@ -1368,33 +1652,79 @@ fn a_fan_out_onto_a_one_worker_placement_runs_one_item_at_a_time() {
     );
 }
 
+/// The status report publishes placement waits **in park order** (§6.2).
+///
+/// The order a queue drains in is the order the board resumes in — `parked_at`,
+/// then the ordinal at the instance path — and a report that sorted its waits as
+/// strings would publish a different one: `fan/0/10/0` before `fan/0/2/0`. The
+/// journal's own read was given `ORDER BY parked_at ASC, rowid ASC` for exactly
+/// this reason (`tests/toolchain/dispatch-board.mjs` holds that half), and a
+/// reader watching a queue drain has to see the rows in the order they will be
+/// taken in. Twelve items, because nothing under ten can tell the two orders
+/// apart.
+#[test]
+fn the_status_report_publishes_placement_waits_in_park_order() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let paths: Vec<String> = (0..12).map(|index| format!("dist/{index}")).collect();
+    let execution = hub.start("/batches", &json!({ "paths": paths }));
+
+    let board = hub.until(&execution, "parked all twelve items", |report| {
+        report["placement_waits"]
+            .as_array()
+            .is_some_and(|waits| waits.len() == 12)
+    });
+    let published: Vec<&str> = board["placement_waits"]
+        .as_array()
+        .expect("twelve waits")
+        .iter()
+        .map(|wait| wait["wait_id"].as_str().expect("a wait id"))
+        .collect();
+    let expected: Vec<String> = (0..12).map(|index| format!("fan/0/{index}/0")).collect();
+    assert_eq!(
+        published, expected,
+        "the report published its waits in an order that is not the order they will be taken \
+         in (§6.2): {board:#}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // §5 — a hub replaced behind its own name
 // ---------------------------------------------------------------------------
 
-/// A restarted hub forgets its sessions and **nothing else**: the worker's next
-/// request meets `410`, it joins again, and the dispatch is back on the board
-/// because the journal is where it lived (§5, §8 rule 3).
+/// A restarted hub forgets its sessions, and keeps the board that had **not**
+/// been handed out (§5, §8 rule 3).
+///
+/// The half of §5 that costs nothing: a wait nobody was holding is a row in the
+/// journal, and the journal is not the process. The worker of the dead process
+/// meets `410`, joins again, and is handed the very dispatch its predecessor
+/// parked — same id, same wait identity, because §6.1 makes that identity
+/// deterministic rather than a handle.
 #[test]
-fn a_hub_restarted_under_its_own_name_loses_its_sessions_and_keeps_its_board() {
-    let Some(project) = shared_project("mesh-restart") else {
+fn a_hub_restarted_under_its_own_name_keeps_the_work_nobody_had_taken() {
+    let Some(project) = shared_project("mesh-restart-parked") else {
         return;
     };
     let execution;
-    let taken;
+    let parked;
     {
         let Some(hub) = hub_into(&project, &[]) else {
             return;
         };
-        let worker = hub.worker();
         execution = hub.start("/releases", &json!({ "path": "dist/app" }));
-        let dispatch = worker.dispatch(&hub);
-        taken = dispatch["dispatch_id"]
+        // Parked, and **not** taken: no worker joins in this process at all.
+        let report = hub.until(&execution, "parked", |report| {
+            report["placement_waits"]
+                .as_array()
+                .is_some_and(|waits| !waits.is_empty())
+        });
+        parked = report["placement_waits"][0]["dispatch_id"]
             .as_str()
             .expect("a dispatch id")
             .to_string();
-        // …and the process dies here, with the dispatch unsettled. `Served`'s
-        // drop kills the app and the command that launched it.
+        // …and the process dies here. `Served`'s drop kills the app and the
+        // command that launched it.
     }
 
     let Some(hub) = hub_into(&project, &[]) else {
@@ -1406,22 +1736,19 @@ fn a_hub_restarted_under_its_own_name_loses_its_sessions_and_keeps_its_board() {
     };
     assert_eq!(ghost.poll(&hub).status, 410);
 
-    // A re-join, and the board is exactly as the journal left it: the row the
-    // dead process had handed out is nobody's, so the next worker gets it.
     let worker = hub.worker();
     let again = worker.dispatch(&hub);
     assert_eq!(again["execution_id"], json!(execution), "{again:#}");
     assert_eq!(again["instance_path"], json!("sign/0"), "{again:#}");
     assert_eq!(
         again["dispatch_id"],
-        json!(taken),
-        "a resumed hub re-attached to the dispatch its predecessor parked, under the wait \
-         identity §6.1 fixes, rather than opening a second one for work a worker may already \
-         be doing"
+        json!(parked),
+        "a resumed hub opened a second dispatch for a wait its predecessor had parked and \
+         nobody had taken"
     );
     worker.settle(
         &hub,
-        &taken,
+        &parked,
         &json!({ "signature": "signed-after-the-restart" }),
     );
     let done = hub.until(&execution, "completed", |report| {
@@ -1431,6 +1758,92 @@ fn a_hub_restarted_under_its_own_name_loses_its_sessions_and_keeps_its_board() {
         done["outputs"]["signature"],
         json!("signed-after-the-restart")
     );
+    drop(harness::Scratch::at(project));
+}
+
+/// A dispatch the **replaced** process was holding is superseded, and the
+/// node's `retry:` is what dispatches it again (§5, §6.3, §7.3).
+///
+/// §5's own words for the state this leaves behind: "an unsettled dispatch on an
+/// ended session is superseded exactly as §6.3 supersedes one, so its node's
+/// attempt fails under that node's `retry:`/`on_error:` chain". The sessions of
+/// a process that has been replaced are ended by definition — they lived in its
+/// memory — so every row it left `dispatched` is one of those.
+///
+/// **What the alternative would be is why this is asserted at all.** Putting the
+/// row back on the board would hand one instance path to a second session while
+/// the worker of the dead process is still executing it: that worker knows
+/// nothing about the restart, and the new process's "is this session already
+/// holding something" is read off rows *it* handed out, of which it has none. Two
+/// executions of one node instance would then run at once, the second replaying
+/// an `effect_history` that does not hold what the first is issuing — so the
+/// model call §7.3 promises is not paid for twice would be paid for twice.
+#[test]
+fn a_dispatch_a_replaced_hub_was_holding_is_superseded_and_retried() {
+    let Some(project) = shared_project("mesh-restart-dispatched") else {
+        return;
+    };
+    let execution;
+    let orphan;
+    {
+        let Some(hub) = hub_into(&project, &[]) else {
+            return;
+        };
+        let worker = hub.worker();
+        execution = hub.start("/retried-releases", &json!({ "path": "dist/app" }));
+        let dispatch = worker.dispatch(&hub);
+        orphan = dispatch["dispatch_id"]
+            .as_str()
+            .expect("a dispatch id")
+            .to_string();
+        assert_eq!(dispatch["instance_path"], json!("sign/0"));
+        // …and the process dies here, with that dispatch out at a worker.
+    }
+
+    let Some(hub) = hub_into(&project, &[]) else {
+        return;
+    };
+    // The retry is a **different** dispatch, at the next wait ordinal of the
+    // same instance path: §6.1's identity is the node's path plus an ordinal, so
+    // a second attempt asks for a dispatch of its own rather than re-using the
+    // one the dead process handed out.
+    let worker = hub.worker();
+    let retried = worker.dispatch(&hub);
+    assert_eq!(retried["execution_id"], json!(execution), "{retried:#}");
+    assert_eq!(retried["instance_path"], json!("sign/0"), "{retried:#}");
+    assert_ne!(
+        retried["dispatch_id"],
+        json!(orphan),
+        "the resumed hub handed a second session the dispatch its predecessor had already given \
+         to a worker that may still be running it"
+    );
+    let board = hub.report(&execution);
+    assert_eq!(
+        board["placement_waits"][0]["wait_id"],
+        json!("sign/0/1"),
+        "the attempt after a superseded one parks at the next ordinal (§6.1): {board:#}"
+    );
+
+    // And the worker of the dead process, coming back with the answer it did
+    // produce: `409`, discarded, exactly as §3.4 answers a superseded dispatch.
+    let revived = hub.worker();
+    let late = revived.settle(
+        &hub,
+        &orphan,
+        &json!({ "signature": "from-the-old-process" }),
+    );
+    assert_eq!(late.status, 409, "{}", body_of(&late));
+    assert_eq!(late.json()["dispatch_id"], json!(orphan));
+
+    worker.settle(
+        &hub,
+        retried["dispatch_id"].as_str().expect("a dispatch id"),
+        &json!({ "signature": "signed-on-the-retry" }),
+    );
+    let done = hub.until(&execution, "completed", |report| {
+        report["status"] == json!("completed")
+    });
+    assert_eq!(done["outputs"]["signature"], json!("signed-on-the-retry"));
     drop(harness::Scratch::at(project));
 }
 

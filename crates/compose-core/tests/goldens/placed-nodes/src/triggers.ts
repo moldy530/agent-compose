@@ -252,6 +252,21 @@ export const httpTriggers: readonly HttpTrigger[] = [
       };
     },
   },
+  {
+    name: "on_watched",
+    flow: "flow.watched",
+    path: "/watched-releases",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "paths": runtime.toJson(runtime.evaluate("payload.body.paths", bound)),
+      };
+    },
+    callback: (payload) => text("payload.body.callback_url", roots(payload), "`callback` of the trigger `on_watched`"),
+  },
 ];
 
 export const manualTriggers: readonly ManualTrigger[] = [

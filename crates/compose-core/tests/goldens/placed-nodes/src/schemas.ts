@@ -54,7 +54,7 @@ export type AgentSignerOutput = z.infer<typeof agentSignerOutput>;
 
 /** `flow.batch` — the module's parameters (grammar 7.5). */
 export const flowBatchInputs = z.object({
-  paths: z.array(z.string()).max(4),
+  paths: z.array(z.string()).max(12),
 }).strict();
 export type FlowBatchInputs = z.infer<typeof flowBatchInputs>;
 
@@ -62,7 +62,7 @@ export type FlowBatchInputs = z.infer<typeof flowBatchInputs>;
  * `flow.batch` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
  */
 export const flowBatchOutputs = z.object({
-  signatures: z.array(z.string()).max(8),
+  signatures: z.array(z.string()).max(12),
 }).strict();
 export type FlowBatchOutputs = z.infer<typeof flowBatchOutputs>;
 
@@ -123,6 +123,48 @@ export const flowRetriedOutputs = z.object({
 }).strict();
 export type FlowRetriedOutputs = z.infer<typeof flowRetriedOutputs>;
 
+/** `flow.signed_off` — the module's parameters (grammar 7.5). */
+export const flowSignedOffInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowSignedOffInputs = z.infer<typeof flowSignedOffInputs>;
+
+/**
+ * `flow.signed_off` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowSignedOffOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowSignedOffOutputs = z.infer<typeof flowSignedOffOutputs>;
+
+/** `flow.signed_off` node `approve` — what the human is shown (grammar 8.7). */
+export const flowSignedOffNodeApproveInput = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowSignedOffNodeApproveInput = z.infer<typeof flowSignedOffNodeApproveInput>;
+
+/**
+ * `flow.signed_off` node `approve` — what the human returns, routable like any structured output (grammar 8.7).
+ */
+export const flowSignedOffNodeApproveOutput = z.object({
+  decision: z.enum(["approve", "reject"]),
+}).strict();
+export type FlowSignedOffNodeApproveOutput = z.infer<typeof flowSignedOffNodeApproveOutput>;
+
+/** `flow.watched` — the module's parameters (grammar 7.5). */
+export const flowWatchedInputs = z.object({
+  paths: z.array(z.string()).max(4),
+}).strict();
+export type FlowWatchedInputs = z.infer<typeof flowWatchedInputs>;
+
+/**
+ * `flow.watched` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowWatchedOutputs = z.object({
+  signatures: z.array(z.string()).max(12),
+}).strict();
+export type FlowWatchedOutputs = z.infer<typeof flowWatchedOutputs>;
+
 /** `tool.notarize` — its parameters (grammar 6). */
 export const toolNotarizeInput = z.object({
   path: z.string(),
@@ -147,12 +189,20 @@ export const toolSignOutput = z.object({
 }).strict();
 export type ToolSignOutput = z.infer<typeof toolSignOutput>;
 
+/** State channel `approval` — its declared type (grammar 10.1). */
+export const stateApproval = z.string().describe("What the person on the other branch said.").default("");
+export type StateApproval = z.infer<typeof stateApproval>;
+
+/** State channel `countersignature` — its declared type (grammar 10.1). */
+export const stateCountersignature = z.string().describe("What the second placed branch signed, on its own channel.").default("");
+export type StateCountersignature = z.infer<typeof stateCountersignature>;
+
 /** State channel `signature` — its declared type (grammar 10.1). */
 export const stateSignature = z.string().describe("What the worker signed, as it came back over the wire.").default("");
 export type StateSignature = z.infer<typeof stateSignature>;
 
 /** State channel `signatures` — its declared type (grammar 10.1). */
-export const stateSignatures = z.array(z.string()).max(8).describe("One entry per dispatched item, in source-item order.");
+export const stateSignatures = z.array(z.string()).max(12).describe("One entry per dispatched item, in source-item order.");
 export type StateSignatures = z.infer<typeof stateSignatures>;
 
 /** State channel `ticket` — its declared type (grammar 10.1). */

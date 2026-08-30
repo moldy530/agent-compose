@@ -2006,7 +2006,8 @@ fn activity(
                  inputs: input,\n      \
                  history: runtime.historyTurns(view.state[\"messages\"] as unknown[]),\n      \
                  policy: view.run.policy,\n      \
-                 signal: context.signal,\n    \
+                 signal: context.signal,\n      \
+                 stores: context.storeRecords,\n    \
                  }});\n    \
                  return {{\n      \
                  output: runtime.parseResult({schema}, answer.output, {subject}),\n      \
@@ -2036,7 +2037,8 @@ fn activity(
                  itemIndex: view.run.execution.item_index,\n          \
                  path: runtime.instancePath(view, {node}),\n          \
                  inputs: input,\n          \
-                 signal: context.signal,\n        \
+                 signal: context.signal,\n          \
+                 stores: context.storeRecords,\n        \
                  }})\n      ).output,\n      {subject},\n    ),\n  }}),\n",
                 placement = names::string(&placement),
                 node_address = names::string(&format!("{address}.{id}")),
@@ -2628,7 +2630,8 @@ fn dispatch_run(
              itemIndex: site.execution.item_index,\n{indent}    \
              path: site.path,\n{indent}    \
              inputs: input,\n{indent}    \
-             signal: context.signal,\n{indent}  \
+             signal: context.signal,\n{indent}    \
+             stores: context.storeRecords,\n{indent}  \
              }});\n{indent}  \
              return {{\n{indent}    \
              output: runtime.parseResult({schema}, answer.output, {subject}),\n{indent}    \
