@@ -25,6 +25,10 @@ hardening; this key does not pretend to be them.
 
 The token is an `${ENV}` reference and never a literal, like every other
 credential in the grammar: a literal here is `invalid-env-ref`, not this code.
+Nor is a `hub:` that is not a mapping at all — that is `wrong-type`. One mistake
+draws one diagnostic, and telling the author of a malformed block to declare the
+block they wrote would be a repair that is false about the file in front of
+them.
 
 A `hub:` block on its own is legal, with or without placements. `public_url:` is
 useful alone — it is the base every ingress URL this deployment hands out
