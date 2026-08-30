@@ -385,13 +385,7 @@ joined: §5 fixes the rule — the hub ends those sessions when it rotates, and 
 | a claim names no placement in the active target | `400` | names the claim, and lists the target's placement names |
 | `env_ok` is present and a claimed placement's manifest is unsatisfied | `403` | names the **variables**, never their values, never whether the hub holds them |
 | `env_ok` is present on a join whose `artifact_hash` is not the current one — an absent hash included, since an absent hash is never the current one — or absent on one whose is | `400` | names the rule above: the report is against the manifest in the artifact the worker holds |
-| the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§3.5, §4) |
-
-**The last row is the one line of this contract that is not settled wire.** It is
-§4.1's divergence from PRD resolved q40, staged as an open question in §13, and
-it is written here as the behaviour §4.1 argues for rather than as a rule this
-document fixes. Every row above it is settled, and the difference is not a
-formality: the runtime pass closes §13's row before it implements this one.
+| the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§3.5, §4) — the rule PRD resolved q40's amendment fixes |
 
 The order matters, and it is the order of the rows: a worker that cannot be
 authenticated is told nothing, a worker whose wire this hub does not speak is
@@ -646,56 +640,29 @@ can only refuse on are the two required of every join, cold start included. So a
 provisioning join is still a join the version check runs on, and a worker of the
 wrong release is refused before it downloads anything.
 
-**The hash half of the triple is the one clause of this document that is not
-settled wire, and what follows is written as the proposal it is.** The proposal:
-a hash mismatch is not a refusal — the answer carries the current artifact and
-the worker fetches it — and an **absent** hash is that same case at its limit,
-refused no more than the mismatch is, because a hub that answered a first join
-`400` for naming no artifact would make a fresh machine unable to bootstrap into
-the mesh at all, since fetching (§3.5) is downstream of the join that names what
-to fetch.
+**A hash mismatch is not a refusal** — the answer carries the current artifact
+and the worker fetches it — and an **absent** hash is that same case at its
+limit, refused no more than the mismatch is, because a hub that answered a first
+join `400` for naming no artifact would make a fresh machine unable to bootstrap
+into the mesh at all, since fetching (§3.5) is downstream of the join that names
+what to fetch.
 
-That is narrower than resolved q40, and the narrowing is **a divergence from the
-literal text of a resolved entry rather than a reading of it**. q40 names two
-things pinned in the handshake — artifact hash and compiler version — and says
-"a mismatch is a refused join naming both"; the paragraph above refuses on
-compiler version and runtime, and *repairs* a hash mismatch instead of refusing
-it. **`prd.md` is the single source of truth for design decisions, so this
-document does not get to overrule a resolved entry by stating the opposite in a
-normative voice** — which is why the paragraph above is a proposal and not a
-rule, and why §13 carries it as an open question rather than a footnote.
+This is the rule PRD resolved q40 fixes, by its amendment (2026-08-30): the
+mismatch clause reads on what the worker **runs**, not what it **holds** — a
+compiler-version or runtime mismatch is a refused join naming both sides, and a
+hash mismatch is repaired by the join's answer. The amendment exists because the
+entry's original clauses collided — a refused join on a hash mismatch cannot
+coexist with "redeployment is automatic on the next join" — and this document's
+earlier revisions carried the collision as a gate (§13) rather than deciding a
+PRD question downstream; the amendment is that gate closing.
 
-The engineering is not what is in doubt, and the argument for it is in q40's own
-next clause: *redeployment is automatic on the next join*. The artifact hash is
-the single member of the triple the hub can **fix in the answer it is already
-sending**, so fixing it is what "automatic" means. Refusing it would also strand
-§3.1's provisioning join, which is a join made with no artifact at all: no fresh
-machine could bootstrap into a mesh, because fetching (§3.5) is downstream of the
-join that names what to fetch. The two members the hub cannot fix — the release a
-worker binary was built from, the runtime installed on its machine — are the
-refusals.
-
-What is in doubt is the paperwork, and this document does not get to do it. The
-project's discipline puts an amendment to a resolved entry through the PRD, not
-through a downstream document's reconciliation paragraph — which is the
-difference between this clause and §4.2's Bun exception, where the scoping is
-written into resolved q40 itself. **So the divergence is a gate rather than a
-note** (§13), and the gate has two halves. Before any hub implements either
-reading, q40's mismatch clause goes to the PRD's Open Questions and is resolved
-there — the hash is repaired; the compiler version and the runtime are refused —
-and the hub is written against *that* resolution. And until it lands, neither
-reading is available: shipping the proposal above would decide a PRD question in
-a downstream document, and an implementer reading q40 alone and writing a hub
-that answers `409` to an unfamiliar `artifact_hash` locks every fresh worker out
-of the mesh permanently. §12 is where that exclusion is stated against the
-runtime pass, and §13's row is what the pass has to close first.
-
-Moving the question into the PRD is not this document's act either: an amendment
-to a resolved entry is a change to `prd.md`, and a change to `prd.md` is a
-reviewed decision of its own rather than a paragraph a downstream document writes
-on its behalf. What this document can do is record the divergence precisely
-enough that the amendment is a transcription, and refuse to present it as settled
-in the meantime — which is what §13 does.
+Why the hash is the repairable member: it is the single member of the triple the
+hub can **fix in the answer it is already sending**, so fixing it is what
+"automatic" means. Refusing it would also strand §3.1's provisioning join, which
+is a join made with no artifact at all: no fresh machine could bootstrap into a
+mesh, because fetching (§3.5) is downstream of the join that names what to
+fetch. The two members the hub cannot fix — the release a worker binary was
+built from, the runtime installed on its machine — are the refusals.
 
 A **compiler-version or runtime mismatch is a refused join** (`409`, §3.1), and
 the refusal names both sides:
@@ -1335,14 +1302,14 @@ placeholder §13 records.
 
 ## 13. What this document does not settle
 
-Three questions are **open**, and each one is here because a normative document
+Two questions are **open**, and each one is here because a normative document
 may fix a wire and may not fix a design decision the PRD has not made. `prd.md`
 is the single source of truth for design decisions; this document is downstream
 of it, and §12's "held to" stops at this table.
 
 **So this section is a gate, not a note.** The project's discipline is that a new
 design question lands in the PRD's Open Questions and is resolved there before
-the affected area is implemented. These three are that list *staged*, which is as
+the affected area is implemented. These two are that list *staged*, which is as
 far as this document can take them: entering a question in the PRD's Open
 Questions, and resolving it there, is a change to `prd.md` and a reviewed
 decision of its own — never something a downstream document performs by
@@ -1354,22 +1321,18 @@ decided a PRD question in a downstream document, which is the thing this section
 exists to prevent; `crates/compose-core/tests/placement_surface_inertness.rs`
 carries the same duty in its unwind list.
 
-The three rows are not the same shape, and the difference decides how hard each
-gate bites. The first and third are **gaps** — no resolved entry speaks to them,
-each is filled here conservatively, and the wire admits any answer additively, so
-what the PRD owes is a decision rather than a correction. The second is a
-**contradiction**: a resolved entry says one thing and §4.1 argues for another,
-so until the PRD is amended there is no reading of it a hub may implement at all.
+Both rows are the same shape: **gaps**. No resolved entry speaks to either, each
+is filled here conservatively, and the wire admits any answer additively, so what
+the PRD owes each is a decision rather than a correction. (This table held a
+third row — a contradiction between resolved q40's mismatch clause and §4.1's
+repair — until q40's amendment of 2026-08-30 resolved it; §4.1 now states that
+rule as settled wire.)
 
 | | what is unsettled | what stands in the meantime |
 |---|---|---|
 | **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it — a v1 default this document proposes, which no resolved entry contradicts and none has weighed. The wire admits any other answer additively (an OPTIONAL capacity at join, §10.2), so the runtime may build against one; **raising** it is what the PRD has to answer first |
-| **the artifact-hash half of resolved q40** (§4.1) | q40 reads "pinned by artifact hash and compiler version in the handshake; a mismatch is a refused join naming both", and §4.1 repairs a hash mismatch rather than refusing it, because a cold start has no hash to send and a refusal would make bootstrap impossible. The amendment q40 needs is that clause reading on the compiler version and the runtime | **nothing on the wire**: §4.1 records its behaviour as the proposal the amendment should ratify, not as a rule a hub may implement before it does, and q40's literal reading is the one that locks fresh workers out. This is the row that blocks — no hub implements the join's hash branch either way until the amendment lands |
 | **containment beyond the process boundary** (§11) | resolved q31 fixed v1 containment at root plus timeout and deferred containers, seccomp and "any deploy-target-level restriction (refusing bash on a distributed placement is a placement fact)" **to the distribution work**. The distribution resolutions did not take it up, and q44's out-list does not name it, so nothing has decided whether a placement may carry a sandbox or a capability restriction | no such key exists, in the grammar or on the wire; a worker runs the artifact with its own privileges. Grammar D128 retires the reserved `network:` key on the ground that no *resolved* containment story backs it, which is a statement about today rather than about what a later resolution may add |
 
-Two of the three do not block the runtime: each names a default that stands until
-the PRD answers, and each answer arrives additively rather than as a re-cut. The
-middle row **does** block, and deliberately — a contradiction has no conservative
-default to stand on, so the join's hash branch waits for its amendment while the
-rest of §3.1 is built. What all three block is an implementation deciding any of
-them quietly.
+Neither row blocks the runtime: each names a default that stands until the PRD
+answers, and each answer arrives additively rather than as a re-cut. What both
+block is an implementation deciding either of them quietly.
