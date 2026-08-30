@@ -79,6 +79,12 @@ horizontal scaling is the execution, never the node. Scaling out later means
 sharding executions across hubs over the Postgres journal slot (resolved q27),
 which §8 is written to keep possible.
 
+That clause is about executions sharing with **each other**, and it says nothing
+about the two processes inside one: a `store.*` on a process-local backend is a
+different physical store on a worker from the one on the hub, whichever execution
+opened it. Nothing refuses that pairing today, and §13's third row is where it
+stands.
+
 Peer partition — each machine owning a subgraph and its own journal — is
 **rejected**, and named here so it is not re-proposed as an optimisation. It
 imports distributed replay, split brain, and cross-journal identity, against
@@ -1406,8 +1412,9 @@ spawning the node runner the artifact carries, one process per dispatch.
 
 What is **not** built, and is named rather than missing: per-placement artifact
 slicing (§4.3), multi-hub (§8), worker-to-worker edges and Windows workers
-(§11) — and the two questions of §13, which are held to their conservative
-defaults there.
+(§11) — and the four questions of §13, each held to what stands for it there:
+two knobs nobody has weighed, and two shapes this compiler accepts and runs
+worse than an author would expect.
 
 **A hub of this release serves exactly one artifact: its own tree.** That is the
 fourth named absence, and it is named here because §3.5's table has a row for a
@@ -1474,14 +1481,14 @@ nothing implements past them.
 
 ## 13. What this document does not settle
 
-Two questions are **open**, and each one is here because a normative document
+Four questions are **open**, and each one is here because a normative document
 may fix a wire and may not fix a design decision the PRD has not made. `prd.md`
 is the single source of truth for design decisions; this document is downstream
 of it, and §12's "held to" stops at this table.
 
 **So this section is a gate, not a note.** The project's discipline is that a new
 design question lands in the PRD's Open Questions and is resolved there before
-the affected area is implemented. These two are that list *staged*, which is as
+the affected area is implemented. These four are that list *staged*, which is as
 far as this document can take them: entering a question in the PRD's Open
 Questions, and resolving it there, is a change to `prd.md` and a reviewed
 decision of its own — never something a downstream document performs by
@@ -1492,24 +1499,38 @@ that reads a "what stands in the meantime" cell as wire has decided a PRD
 question in a downstream document, which is the thing this section exists to
 prevent.
 
-The runtime that landed was written to those defaults and no further, and the
-absences are held rather than remembered:
-`crates/compose-core/src/codegen/mesh.rs` greps the emitted hub for a capacity of
-any spelling and for a containment surface of any spelling, and fails if either
-appears. Raising a default is what needs the PRD; keeping one needs a test.
+The rows come in two shapes, and the difference is what a reader owes each.
 
-Both rows are the same shape: **gaps**. No resolved entry speaks to either, each
-is filled here conservatively, and the wire admits any answer additively, so what
-the PRD owes each is a decision rather than a correction. (This table held a
-third row — a contradiction between resolved q40's mismatch clause and §4.1's
-repair — until q40's amendment of 2026-08-30 resolved it; §4.1 now states that
-rule as settled wire.)
+The first two are **gaps**: a knob nobody has weighed, filled here
+conservatively, where the wire admits any answer additively — so what the PRD
+owes each is a decision rather than a correction, and the runtime that landed was
+written to those defaults and no further. Their absences are held rather than
+remembered: `crates/compose-core/src/codegen/mesh.rs` greps the emitted hub for a
+capacity of any spelling and for a containment surface of any spelling, and fails
+if either appears. Raising a default is what needs the PRD; keeping one needs a
+test.
+
+The last two are **sharp edges**: a composition this compiler accepts, and runs
+worse than its author would expect. Each is here because the repair is a rule —
+a compile error over a shape that compiles today, or a wire that carries
+something this document's wire does not — and a rule with no resolved entry
+behind it is exactly what this section holds. What stands for each is stated in
+its cell, and neither is a silent failure by the time a reader meets it: one is
+diagnosed where it happens, the other is what this row exists to say out loud.
+(This table also held a row for a contradiction between resolved q40's mismatch
+clause and §4.1's repair, until q40's amendment of 2026-08-30 resolved it; §4.1
+now states that rule as settled wire.)
 
 | | what is unsettled | what stands in the meantime |
 |---|---|---|
 | **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it — a v1 default this document proposes, which no resolved entry contradicts and none has weighed. The wire admits any other answer additively (an OPTIONAL capacity at join, §10.2), so the runtime may build against one; **raising** it is what the PRD has to answer first |
 | **containment beyond the process boundary** (§11) | resolved q31 fixed v1 containment at root plus timeout and deferred containers, seccomp and "any deploy-target-level restriction (refusing bash on a distributed placement is a placement fact)" **to the distribution work**. The distribution resolutions did not take it up, and q44's out-list does not name it, so nothing has decided whether a placement may carry a sandbox or a capability restriction | no such key exists, in the grammar or on the wire; a worker runs the artifact with its own privileges. Grammar D128 retires the reserved `network:` key on the ground that no *resolved* containment story backs it, which is a statement about today rather than about what a later resolution may add |
+| **a placed component's `store.*` on a process-local backend** (§1, §9.1) | whether a placed component may reach a store whose backend is process-local — and if not, whether the refusal covers every scope or a narrower one. Resolved q37's "executions share nothing by construction — global-scope stores are already external backends", which §1 restates, is a premise about *global scope* rather than a rule about placements, and no resolved entry speaks to the pair. The repair is a **breaking** grammar rule: a composition placing an `agent.*` whose `stores:` name a `memory`, `sqlite` or `local_fs` store compiles clean today | nothing refuses it, and the two processes each open **their own copy** — the worker's under its data directory's materialised artifact, the hub's under the built project — so a write on one side is not a read on the other, and the flow carries on with data that is not there. This holds under `--target local` too, where grammar §14.1 admits a hub and its workers on one machine. What an author who needs one store across a mesh does today is bind a **networked** backend; §9.1's partition already carries that half, since such a backend's variables belong to every placement that reaches a store bound to it |
+| **a `human:` node a placed component reaches** (§3.4, §4.3) | how a pause opened on a worker reaches the hub's wait board. PRD resolved q43 names wait-board unity among the grounds for choosing this protocol over `RemoteGraph`, and §4.3 has a placement decide which *process* runs a node rather than what a node means — but neither fixes a carriage for a pause, and §3.4's result carries a node's output or its failure with no third shape. Both repairs are rules: a third terminal outcome on this wire plus a remote wait on the board, or a static refusal of the composition | the dispatch **fails**, and fails named: `src/worker-node.ts` reports the pause as a `PlacedHumanWait` whose message says a worker holds no wait board and points here, so the node's `retry:`/`on_error:` chain runs over a failure that says what happened rather than over a bare interrupt. The composition still compiles, because refusing it is the other candidate repair and this table is where a rule with no resolution behind it waits |
 
-Neither row blocks the runtime: each names a default that stands until the PRD
-answers, and each answer arrives additively rather than as a re-cut. What both
-block is an implementation deciding either of them quietly.
+No row here blocks the runtime: each names what stands until the PRD answers.
+The first two arrive additively rather than as a re-cut, which is what lets the
+runtime build against their defaults; the last two may not — a compile error over
+a shape that compiles today is a breaking change, and that is a reason for the
+PRD to weigh them rather than a reason to pre-empt one here. What every row
+blocks is the same thing: an implementation deciding one of them quietly.

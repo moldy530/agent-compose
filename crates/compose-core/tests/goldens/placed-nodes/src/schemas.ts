@@ -38,6 +38,20 @@ export const agentBrieferOutput = z.object({
 }).strict();
 export type AgentBrieferOutput = z.infer<typeof agentBrieferOutput>;
 
+/** `agent.escalator` — its declared input (grammar 5.3). */
+export const agentEscalatorInput = z.object({
+  path: z.string(),
+}).strict();
+export type AgentEscalatorInput = z.infer<typeof agentEscalatorInput>;
+
+/**
+ * `agent.escalator` — the structured output the model is constrained to, and what routing reads (PRD 5.2, 5.3).
+ */
+export const agentEscalatorOutput = z.object({
+  approval: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type AgentEscalatorOutput = z.infer<typeof agentEscalatorOutput>;
+
 /** `agent.signer` — its declared input (grammar 5.3). */
 export const agentSignerInput = z.object({
   path: z.string(),
@@ -93,6 +107,48 @@ export const flowDirectOutputs = z.object({
   signature: z.string(),
 }).strict();
 export type FlowDirectOutputs = z.infer<typeof flowDirectOutputs>;
+
+/** `flow.escalated` — the module's parameters (grammar 7.5). */
+export const flowEscalatedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowEscalatedInputs = z.infer<typeof flowEscalatedInputs>;
+
+/**
+ * `flow.escalated` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowEscalatedOutputs = z.object({
+  approval: z.string(),
+}).strict();
+export type FlowEscalatedOutputs = z.infer<typeof flowEscalatedOutputs>;
+
+/** `flow.escalation` — the module's parameters (grammar 7.5). */
+export const flowEscalationInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowEscalationInputs = z.infer<typeof flowEscalationInputs>;
+
+/**
+ * `flow.escalation` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowEscalationOutputs = z.object({
+  approval: z.string(),
+}).strict();
+export type FlowEscalationOutputs = z.infer<typeof flowEscalationOutputs>;
+
+/** `flow.escalation` node `ask` — what the human is shown (grammar 8.7). */
+export const flowEscalationNodeAskInput = z.object({
+  path: z.string(),
+}).strict();
+export type FlowEscalationNodeAskInput = z.infer<typeof flowEscalationNodeAskInput>;
+
+/**
+ * `flow.escalation` node `ask` — what the human returns, routable like any structured output (grammar 8.7).
+ */
+export const flowEscalationNodeAskOutput = z.object({
+  decision: z.enum(["approve", "reject"]),
+}).strict();
+export type FlowEscalationNodeAskOutput = z.infer<typeof flowEscalationNodeAskOutput>;
 
 /** `flow.release` — the module's parameters (grammar 7.5). */
 export const flowReleaseInputs = z.object({

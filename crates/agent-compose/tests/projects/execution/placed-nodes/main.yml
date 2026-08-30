@@ -23,6 +23,13 @@
 #     number of live sessions claiming `mac`, and the rest are undispatched.
 #     Twelve because park order is published as well as resumed, and nothing
 #     under ten waits can tell a numeric ordering from a lexicographic one.
+#   * `flow.escalated` is `docs/distributed.md` §13's fourth row, made runnable:
+#     a placed agent attaching a `flow.*` with a `human:` node in it. Grammar
+#     §14.1 rule 4 runs everything an attached flow reaches in the attaching
+#     agent's placement, so that question is asked on a **worker**, where there
+#     is no wait board to ask it on — and what the runtime does about that is a
+#     named failure rather than a bare interrupt, which is the row's "what
+#     stands in the meantime" and what the acceptance suite asserts.
 #   * `flow.watched` is §6.4's distinction: a `map` over `flow.signed_off`, whose
 #     instances each dispatch a placed node and then ask a person about the
 #     answer. Two of them run at once, so one can reach its question while the
@@ -129,6 +136,15 @@ triggers:
     respond: async
     callback: "payload.body.callback_url"
 
+  on_escalated:
+    type: http
+    flow: flow.escalated
+    path: /escalations
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
   # `session_key:` is here for `docs/distributed.md` §3.2's payload: the
   # execution identity a placed node runs under is the hub's to derive, and this
   # is the trigger that gives one an identity to derive.
@@ -208,6 +224,70 @@ agent.signer:
     signature:
       type: string
       min_length: 1
+
+# Placed, and it attaches a flow with a question for a person in it. Grammar
+# §14.1 rule 4: everything an attached `flow.*` reaches runs where the attaching
+# agent runs, so `flow.escalation`'s `human:` node is asked on the worker — which
+# is the shape `docs/distributed.md` §13's fourth row is about.
+agent.escalator:
+  description: Decide a release by asking a person at the machine that holds it.
+  model: model.smart
+  prompt: |
+    Ask a person about the path you are given, and report what they answered.
+  tools: [flow.escalation]
+  input:
+    path:
+      type: string
+  output:
+    approval:
+      type: string
+      min_length: 1
+
+# Attached rather than triggered, and never reached any other way here: what it
+# is for is being **inside** a placed agent's tool loop.
+flow.escalation:
+  description: Ask a person whether a release may go ahead.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    ask:
+      human:
+        input:
+          path: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        path: "input.path"
+      writes:
+        decision: approval
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.escalated:
+  description: Reach a person's question from a node that runs on a worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    escalate:
+      agent: agent.escalator
+      input:
+        path: "input.path"
+      writes:
+        approval: approval
+  edges:
+    - { from: start, to: escalate }
+    - { from: escalate, to: end }
 
 flow.release:
   description: Sign a release on a worker, and notarize it on the hub.

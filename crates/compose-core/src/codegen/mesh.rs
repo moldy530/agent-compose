@@ -148,10 +148,11 @@ mod tests {
 
     /// The hub's source with its prose taken out.
     ///
-    /// The two §13 rows are about what the hub **does**, and both are explained
-    /// at length in the comments — an absence a reader could take for an
-    /// oversight is worse than one they are told about — so a scan over the
-    /// whole file would be a scan that fails for saying why it passes.
+    /// The two rows above — §13's first two, the ones that name a **knob** —
+    /// are about what the hub does, and both are explained at length in the
+    /// comments, an absence a reader could take for an oversight being worse
+    /// than one they are told about. So a scan over the whole file would be a
+    /// scan that fails for saying why it passes.
     fn code() -> String {
         SOURCE
             .lines()

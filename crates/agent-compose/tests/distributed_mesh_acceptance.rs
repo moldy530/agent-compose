@@ -1022,3 +1022,86 @@ fn a_fan_out_onto_a_one_worker_placement_runs_one_item_at_a_time() {
         "no item of the fan-out was ever seen waiting, so this test observed no queue at all"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8. The pause a worker cannot hold (§13's fourth row)
+// ---------------------------------------------------------------------------
+
+/// A `human:` node a **placed** component reaches fails its dispatch, by name.
+///
+/// The wait board is the hub's: it is what a status report publishes, what the
+/// resume route answers and what a recovery re-parks (§1, PRD resolved q4/q28).
+/// A worker holds none of it — and grammar §14.1 rule 4 puts everything an
+/// attached `flow.*` reaches in the attaching agent's placement, so
+/// `agent.escalator`'s `flow.escalation` asks its question on the worker.
+/// §3.4 gives a result an output or a failure and no third shape for a pause, so
+/// carrying one home is `docs/distributed.md` §13's fourth row and is not built.
+///
+/// What **is** built is the diagnosis, and that is what this asserts: the run
+/// fails, and what reaches the operator is a `PlacedHumanWait` saying a worker
+/// holds no wait board and naming the way out — rather than the bare
+/// `HumanInterrupt` a single-process run raises, whose text points at `serve`'s
+/// resume route and at an interactive `run`, neither of which is true here.
+///
+/// The provider's transcript is asserted beside it, because the pause happens
+/// **inside the tool loop**: the loop's first call is made on the worker and the
+/// pinned output call that would have ended the node never is.
+#[test]
+fn a_human_node_a_placed_agent_reaches_fails_its_dispatch_with_a_named_diagnosis() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    // One call, and only one: the loop asks for the attached flow, the flow
+    // reaches the question, and nothing comes back to the model.
+    mesh.provider.enqueue(Script::new(
+        SONNET,
+        Outcome::tool_calls(vec![ToolCall::new(
+            "escalation",
+            json!({ "path": "release.dmg" }),
+        )]),
+    ));
+    let _worker = mesh.worker("escalation");
+
+    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let report = mesh.until(&execution, "ended", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        report["status"], "failed",
+        "a pause reached on a worker did not fail the run: {report:#}"
+    );
+
+    let said = report["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("PlacedHumanWait"),
+        "the failure is not named for what it is: {report:#}"
+    );
+    assert!(
+        said.contains("wait board"),
+        "the failure does not say why a worker cannot hold the pause: {report:#}"
+    );
+    assert!(
+        said.contains("§13"),
+        "the failure does not point at the row that records this: {report:#}"
+    );
+    // The interrupt a single-process run raises tells its reader to answer
+    // through `serve`'s resume route. This hub **is** a `serve`, and there is no
+    // wait on its board to answer, so that text reaching an operator here would
+    // send them looking for a pause that was never opened.
+    assert!(
+        !said.contains("resume"),
+        "the failure still tells the operator to answer a pause that never opened: {report:#}"
+    );
+    // Nothing was published either: the pause never reached the hub's board,
+    // which is the whole of why this is a failure rather than a parking.
+    assert!(
+        report["interrupts"].is_null(),
+        "a pause reached on a worker was published on the hub's board: {report:#}"
+    );
+
+    let snapshot = mesh.provider.snapshot();
+    assert!(
+        snapshot.is_drained(),
+        "the loop's first call was not made on the worker: {snapshot:#?}"
+    );
+}

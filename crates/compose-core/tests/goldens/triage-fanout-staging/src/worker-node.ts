@@ -117,6 +117,7 @@ import {
 } from "./journal.ts";
 import { type PlacedAnswer, executeLocally } from "./mesh.ts";
 import type * as runtime from "./runtime.ts";
+import { interruptOf } from "./runtime.ts";
 
 /** The dispatch this process was handed, as §3.2 puts it on the wire. */
 interface Dispatch {
@@ -486,6 +487,43 @@ function named(error: unknown): { name: string; message: string } {
   return { name: "Error", message: String(error) };
 }
 
+/**
+ * The one failure this side names for itself: a `human:` node reached **here**
+ * (`docs/distributed.md` §13's fourth row).
+ *
+ * A pause is opened on the hub's wait board — the board a status report
+ * publishes, a resume route answers and a recovery re-parks (§1, PRD resolved
+ * q4/q28). A worker holds none of that, so `runtime.runHuman` finds no board and
+ * raises the interrupt it raises for any run with no way to answer a question,
+ * and this dispatch ends as a failure the node's `retry:`/`on_error:` chain runs
+ * over.
+ *
+ * What is renamed here is **what the operator is told**, not what happens. The
+ * bare interrupt says "this run has no way to answer" and points at `serve` and
+ * at an interactive `run` — true of the process it was written for and
+ * misleading here, where the hub *is* a `serve` and the pause is unanswerable
+ * for a reason that has nothing to do with the invocation: the node is executing
+ * on the far side of a wire whose §3.4 result carries an output or a failure and
+ * has no third shape for a pause. Carrying one home is §13's open question, so
+ * this says so and names the composition's own way out.
+ *
+ * Read off the `cause` chain rather than off the error, because the pause is
+ * reached inside an attached `flow.*` — grammar §14.1 rule 4 runs one in the
+ * attaching agent's placement — and every ladder between there and here wraps
+ * what it lets through ([`runtime.interruptOf`]).
+ */
+function pausedOnAHuman(error: unknown): { name: string; message: string } | undefined {
+  const interrupt = interruptOf(error);
+  if (interrupt === undefined) return undefined;
+  return {
+    name: "PlacedHumanWait",
+    message:
+      `\`${interrupt.flow}\` node \`${interrupt.node}\` is a \`human:\` node, and it was reached on a **worker**: this node is placed, so it and everything it attaches execute in the placement's process (grammar §14.1 rule 4), and a worker holds no wait board — the board every pause is published on, answered through and recovered onto is the hub's (docs/distributed.md §1). ` +
+      `The dispatch therefore fails rather than parking, and the node's \`retry:\`/\`on_error:\` chain runs over this. ` +
+      `Reach the pause from a component the hub runs — an unplaced agent, or the flow's own node — or take the placement off the component that reaches it. Carrying a pause home from a worker is docs/distributed.md §13's open question and is not built.`,
+  };
+}
+
 async function main(): Promise<void> {
   const text = await stdin();
   let dispatch: Dispatch;
@@ -556,8 +594,9 @@ async function main(): Promise<void> {
   } catch (error) {
     // The node failed, which is an outcome rather than a crash: §3.4 takes "its
     // output, or its failure" and the hub runs the node's `retry:`/`on_error:`
-    // chain over it exactly as it would over a local failure (§7.3).
-    line = { type: "result", error: named(error) };
+    // chain over it exactly as it would over a local failure (§7.3). One
+    // failure is renamed on its way out, and only one — see [`pausedOnAHuman`].
+    line = { type: "result", error: pausedOnAHuman(error) ?? named(error) };
   }
   closeSession(dispatch.execution_id);
   // After every effect line this dispatch produced, so a reader that stops at

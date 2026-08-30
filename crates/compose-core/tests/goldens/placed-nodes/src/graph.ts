@@ -21,10 +21,14 @@ import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
   agentBrieferOutput,
+  agentEscalatorOutput,
   agentSignerOutput,
   flowBatchInputs,
   flowConversationInputs,
   flowDirectInputs,
+  flowEscalatedInputs,
+  flowEscalationInputs,
+  flowEscalationNodeAskOutput,
   flowReleaseInputs,
   flowRetriedInputs,
   flowSignedOffInputs,
@@ -98,6 +102,36 @@ const flowDirectShape: runtime.Shape = {
 const flowDirectNodeSignShape: runtime.Shape = {
   "properties": {
     "signature": "string"
+  }
+};
+
+/** `flow.escalated` — the `input` root inside it (grammar 7.5). */
+const flowEscalatedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.escalated` node `escalate` — the `escalate.output` root its guards read.
+ */
+const flowEscalatedNodeEscalateShape: runtime.Shape = {
+  "properties": {
+    "approval": "string"
+  }
+};
+
+/** `flow.escalation` — the `input` root inside it (grammar 7.5). */
+const flowEscalationShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.escalation` node `ask` — the `ask.output` root its guards read. */
+const flowEscalationNodeAskShape: runtime.Shape = {
+  "properties": {
+    "decision": "string"
   }
 };
 
@@ -259,6 +293,60 @@ const agentBriefer: runtime.AgentBinding = {
     },
   },
   tools: [],
+  maxToolIterations: 8,
+};
+
+/**
+ * `agent.escalator` — one LLM call with structured output (PRD 5.2, grammar 5). The schema below is the **published** JSON Schema of grammar 3.8's table, which is the column the conformance corpus proves equal to the parse its answer then faces.
+ */
+const agentEscalator: runtime.AgentBinding = {
+  address: "agent.escalator",
+  prompt: "Ask a person about the path you are given, and report what they answered.\n",
+  model: modelSmart,
+  output: {
+    name: "escalator_output",
+    description: "The structured output `agent.escalator` must produce.",
+    schema: {
+      "additionalProperties": false,
+      "properties": {
+        "approval": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "approval"
+      ],
+      "type": "object"
+    },
+  },
+  tools: [
+    {
+      name: "escalation",
+      address: "flow.escalation",
+      description: "Ask a person whether a release may go ahead.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context, call) =>
+        runtime.callSubflowTool(
+          { name: "escalation", binding: flowEscalationBinding, inputs: flowEscalationInputs },
+          args,
+          context,
+          call,
+        ),
+    },
+  ],
   maxToolIterations: 8,
 };
 
@@ -589,6 +677,159 @@ const flowDirectBinding: runtime.SubflowBinding = {
       ...options,
       streamMode: "values",
       outputKeys: flowDirectGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.escalated ---
+
+/** `flow.escalated` node `escalate` — `agent.escalator` (grammar 8.1). */
+const flowEscalatedNodeEscalate: runtime.NodeDescriptor = {
+  flow: "flow.escalated",
+  node: "escalate",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowEscalatedShape, state: stateShape, output: flowEscalatedNodeEscalateShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.escalated.escalate",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "escalate"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentEscalatorOutput, answer.output, "the answer of `agent.escalator`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "approval", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.escalated` — its nodes, its `start` edges, and the compiled graph. */
+function flowEscalated() {
+  return new StateGraph(State)
+    .addNode("escalate", (state: GraphState) => runtime.runNode(flowEscalatedNodeEscalate, state), {
+      ends: [END],
+    })
+    .addEdge(START, "escalate")
+    .compile();
+}
+
+/**
+ * `flow.escalated`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowEscalatedGraph = flowEscalated();
+
+/**
+ * `flow.escalated` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowEscalatedBinding: runtime.SubflowBinding = {
+  address: "flow.escalated",
+  outputs: ["approval"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowEscalatedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowEscalatedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.escalation ---
+
+/**
+ * `flow.escalation` node `ask` — the pause it holds: what the human is shown, and what an answer has to fit (grammar 8.7, PRD 5.11).
+ */
+const flowEscalationNodeAskHuman: runtime.HumanDescriptor = {
+  flow: "flow.escalation",
+  node: "ask",
+  schema: {
+    "additionalProperties": false,
+    "properties": {
+      "decision": {
+        "enum": [
+          "approve",
+          "reject"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "decision"
+    ],
+    "type": "object"
+  },
+  parse: (payload) => runtime.parseResult(flowEscalationNodeAskOutput, payload, "the answer to `flow.escalation` node `ask`"),
+};
+
+/** `flow.escalation` node `ask` — a human-in-the-loop pause (grammar 8.7). */
+const flowEscalationNodeAsk: runtime.NodeDescriptor = {
+  flow: "flow.escalation",
+  node: "ask",
+  // Grammar 9.3, resolved: `retry` from exempt (Decision D102), `timeout` from exempt (Decision D102), `on_error` from `defaults:`.
+  policy: {
+    onError: "fail",
+  },
+  exempt: true,
+  shapes: { input: flowEscalationShape, state: stateShape, output: flowEscalationNodeAskShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runHuman(flowEscalationNodeAskHuman, input, context, view),
+  writes: [
+    { field: "decision", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.escalation` — its nodes, its `start` edges, and the compiled graph. */
+function flowEscalation() {
+  return new StateGraph(State)
+    .addNode("ask", (state: GraphState) => runtime.runNode(flowEscalationNodeAsk, state), {
+      ends: [END],
+    })
+    .addEdge(START, "ask")
+    .compile();
+}
+
+/**
+ * `flow.escalation`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowEscalationGraph = flowEscalation();
+
+/**
+ * `flow.escalation` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowEscalationBinding: runtime.SubflowBinding = {
+  address: "flow.escalation",
+  outputs: ["approval"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowEscalationGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowEscalationGraph.outputChannels,
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
@@ -1090,6 +1331,38 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         outputKeys: flowDirectGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
+  "flow.escalated": {
+    address: "flow.escalated",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["approval"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowEscalatedInputs, inputs, "the `inputs:` of `flow.escalated`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowEscalatedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowEscalatedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.escalation": {
+    address: "flow.escalation",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["approval"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowEscalationInputs, inputs, "the `inputs:` of `flow.escalation`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowEscalationGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowEscalationGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.release": {
     address: "flow.release",
     inputs: ["path"],
@@ -1582,6 +1855,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
     },
   "flow.direct.sign":
     async (input, context) => ({ output: await toolSign(input, context) }),
+  "flow.escalated.escalate":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentEscalator,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
   "flow.release.sign":
     async (input, context, site) => {
       const answer = await runtime.callAgent(

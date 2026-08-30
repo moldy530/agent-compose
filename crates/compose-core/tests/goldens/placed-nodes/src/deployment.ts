@@ -60,6 +60,7 @@ export const placements: readonly PlacementManifest[] = [
     members: [
       "agent.signer",
       "tool.sign",
+      "agent.escalator",
     ],
     environment: [
       "KEYCHAIN_PASSWORD",
