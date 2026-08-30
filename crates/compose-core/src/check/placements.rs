@@ -26,6 +26,20 @@
 //! not. Left legal, it would be a placement an author wrote, a compiler
 //! accepted, and a deployment silently ignored.
 //!
+//! **"Runs on the hub" is a claim about the composition, not about one call
+//! site**, and it survives the shape that looks like a counterexample: an agent
+//! reachable *only* from inside some other agent's process — named by a flow
+//! that a placed agent attaches, and by nothing else. Manual invocation is
+//! universal. Every flow a composition declares is runnable on its own, whether
+//! or not a `manual` trigger names it (PRD 5.11, Decision D64), and
+//! `codegen::graph`'s registry is every flow rather than every triggered one —
+//! so a flow attached as a tool is also a flow the hub starts directly, and the
+//! `agent:` node inside it is then dispatched by the hub's scheduler like any
+//! other. That is why this pass reads the attaching agent's **own** placement
+//! and nothing else: an unplaced agent named anywhere has an execution on the
+//! hub, so there is no composition in which a wider question would answer
+//! differently.
+//!
 //! # The transitive case: an attached `flow.*`
 //!
 //! A `flow.*` in a `tools:` list cannot itself be placed — placing a flow is
