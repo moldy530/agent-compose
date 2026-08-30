@@ -1014,9 +1014,15 @@ class SqliteJournal implements Journal {
   }
 
   effectsUnder(execution: string, site: string): readonly JournalRecord[] {
+    // `substr` rather than `LIKE`, and that is a correctness choice rather than
+    // a stylistic one: a node id is grammar 2.1's identifier, which admits `_`,
+    // and `_` is `LIKE`'s single-character wildcard — so `LIKE 'my_node/0/%'`
+    // would also take the effects of a `myXnode`, handing a redispatched node a
+    // history of calls another node made.
+    const inside = `${site}/`;
     const rows = this.#database.all(
-      "SELECT * FROM effects WHERE execution = ? AND (site = ? OR site LIKE ?) ORDER BY key ASC",
-      [execution, site, `${site}/%`],
+      "SELECT * FROM effects WHERE execution = ? AND (site = ? OR substr(site, 1, ?) = ?) ORDER BY key ASC",
+      [execution, site, inside.length, inside],
     ) as Row[];
     return rows.map((row) => recordOf(row));
   }

@@ -1000,16 +1000,48 @@ fn a_vanished_session_supersedes_its_dispatch_and_the_retry_carries_the_history(
         .expect("a dispatch id")
         .to_string();
     // The model call this attempt made and paid for, journaled by the hub.
-    let effect = json!([{
-        "key": "sign/0#model/0",
-        "site": "sign/0",
-        "kind": "model",
-        "ordinal": 0,
-        "request": "{\"model\":\"model.smart\"}",
-        "outcome": { "kind": "value", "value": { "text": "half a signature" } },
-    }]);
+    // Two of them: the node's own model call, and the tool call its loop made
+    // **under** it. A site is "inside" a dispatch by the prefix relation grammar
+    // §9.4's paths already carry (§3.2), so both belong to this dispatch's
+    // history and the redispatch has to carry both.
+    let effect = json!([
+        {
+            "key": "sign/0#model/0",
+            "site": "sign/0",
+            "kind": "model",
+            "ordinal": 0,
+            "request": "{\"model\":\"model.smart\"}",
+            "outcome": { "kind": "value", "value": { "text": "half a signature" } },
+        },
+        {
+            "key": "sign/0/tool.sign/0#tool/0",
+            "site": "sign/0/tool.sign/0",
+            "kind": "tool",
+            "ordinal": 0,
+            "request": "{\"path\":\"dist/app\"}",
+            "outcome": { "kind": "value", "value": { "signature": "half" } },
+        },
+    ]);
     let handed = first.effects(&hub, &id, &effect);
     assert_eq!(handed.status, 204, "{}", body_of(&handed));
+
+    // **The hub is the single writer, and it writes into the dispatch's own
+    // execution and under the dispatch's own site.** A record naming a site
+    // outside it is not a record this dispatch could have produced, and taking
+    // it would let one session write an effect another node will replay.
+    let elsewhere = first.effects(
+        &hub,
+        &id,
+        &json!([{
+            "key": "stamp/0#tool/0",
+            "site": "stamp/0",
+            "kind": "tool",
+            "ordinal": 0,
+            "request": "{}",
+            "outcome": { "kind": "value", "value": {} },
+        }]),
+    );
+    assert_eq!(elsewhere.status, 400, "{}", body_of(&elsewhere));
 
     // …and then the laptop closes. Nothing else is sent on this session, so the
     // liveness window runs out and the hub declares it gone.
@@ -1032,10 +1064,15 @@ fn a_vanished_session_supersedes_its_dispatch_and_the_retry_carries_the_history(
         .expect("a redispatch carries the history");
     assert_eq!(
         history.len(),
-        1,
-        "the redispatch did not carry the effect the first attempt journaled: {redispatch:#}"
+        2,
+        "the redispatch did not carry both effects the first attempt journaled — its own and the \
+         one its tool loop made under it (§3.2, §7.2): {redispatch:#}"
     );
-    assert_eq!(history[0]["key"], json!("sign/0#model/0"));
+    let keys: Vec<&str> = history
+        .iter()
+        .map(|record| record["key"].as_str().expect("a key"))
+        .collect();
+    assert_eq!(keys, ["sign/0#model/0", "sign/0/tool.sign/0#tool/0"]);
     assert_eq!(
         history[0]["outcome"]["value"],
         json!({ "text": "half a signature" }),
