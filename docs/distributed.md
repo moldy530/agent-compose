@@ -212,6 +212,27 @@ join returned, in the `X-Worker-Session` header, **in addition to** the bearer
 token: the token says which mesh, the session says which worker. The one
 exception is stated at §3.5 and stated there because it is an exception.
 
+**An unknown session is `410`.** A request on a session-carrying route whose
+`X-Worker-Session` the hub does not recognise — one it never issued, or one it
+forgot when the process behind its name was replaced (§5) — is answered
+`410 Gone`, at `/workers/poll`, `/workers/effects` and `/workers/result` alike.
+That
+is the **only** status meaning "the session is unknown", and on those three
+routes it is the only one a worker answers by joining again (§5). Two statuses a
+reader might take for it are not it, and the difference is behavioural rather
+than cosmetic:
+
+- a refusal at the **join** — `400`, `401`, `403`, `409` (§3.1) — is
+  **terminal**. A second join would be refused identically, so a worker MUST NOT
+  answer one by joining again;
+- a `409` at **`/workers/result`** (§3.4) is about a `dispatch_id`, not about a
+  session. The worker keeps the session it has, discards the result, and goes on
+  polling.
+
+§3.5's `404` is a third thing again and is stated there: a worker that meets it
+re-joins, but over a *hash* it can no longer fetch rather than a session the hub
+has forgotten.
+
 ### 3.1 `POST /workers/join`
 
 ```json
@@ -304,6 +325,26 @@ told that before anything about the deployment, and the placement and manifest
 answers — which describe the target — are given only to a worker that has got
 that far.
 
+**A refused join is terminal.** Every row above names a condition another join
+would meet identically — a credential that does not verify, a wire this hub does
+not speak, a release that does not match, a claim that names no placement, a
+manifest that is not satisfied, a report made against the wrong artifact. So a
+worker refused at join **stops**: it exits non-zero, naming the refusal as it was
+given, and starting it again is an operator's act — or its supervisor's, whose
+backoff is that supervisor's business. The bounded backoff of §2 covers the
+other case and only it: a join that never *completed* — a connection refused, a
+socket closed, a `5xx` — which is a transport failure and says nothing about
+whether this worker belongs here.
+
+Nothing in this document tells a worker to answer a refused join with another
+join, and two gates depend on that. A worker that met `409` with a re-join would
+spin against a hub that has told it, correctly and permanently, that it is the
+wrong release — which is precisely what §10.3 relies on `409` to enforce. A
+worker that met `401` with a re-join would do the same to a hub whose join token
+was rotated out from under it, hammering it with a credential that cannot start
+working. The disposable-session rule of §5 is about `410` and about nothing
+else.
+
 The token check MUST be a constant-time comparison, for the reason grammar §13.3
 gives about inbound trigger credentials: a caller who can time a refusal
 otherwise recovers the token byte by byte.
@@ -336,12 +377,22 @@ Carries the session. Long-polls for up to one hold (§2).
   queue for the placement it claims; that is the mechanism, not a degenerate
   case of it.
 
+- **`410`** when the session is unknown (§3): the worker joins again and resumes
+  polling under the session that join returns. A hub that has just been replaced
+  behind its name answers every worker this way, once each, and that is the whole
+  of what a hub restart costs (§5).
+
+- **`401`** when the token does not verify, with no detail, as everywhere
+  (§3.1) — and terminal in the same sense: the credential is the one the join
+  used, so re-joining cannot improve it.
+
 **Polling is the heartbeat.** There is no separate liveness route, and there MUST
 NOT be one: the property §6 needs is "is this worker still there", and a poll is
 the only request that answers it — for an idle worker and a busy one alike,
 which is why §2 requires the poll to continue while a node runs. A session with
-no request inside the liveness window is presumed gone, and its **queued but
-undispatched** work re-parks (§6).
+no request inside the liveness window is presumed gone; §6.3 fixes what that
+costs, which is nothing at all unless the session was holding a dispatch, and
+that dispatch's node fails an attempt.
 
 ### 3.3 `POST /workers/effects`
 
@@ -359,6 +410,20 @@ journal already holds is accepted and dropped. A batch is therefore safe to
 re-send after a transport failure, and a worker SHOULD re-send rather than
 guess.
 
+| condition | status | body |
+|---|---|---|
+| the batch is journaled | `204` | empty. Every record in it was inserted or was already held |
+| the token does not verify | `401` | no detail, as everywhere (§3.1) |
+| the session is unknown | `410` | names the rule of §3: join again, and send this batch again under the new session |
+
+**A batch answered `410` is re-sent, never dropped.** The records are keyed by
+effect key and scoped to their execution (§7.1) — not by session, and not by
+dispatch — so the journal takes them from whichever session hands them over, and
+the hub is still the single writer that inserts them. A worker that discarded
+the batch instead would hand the redispatch of §7.2 an `effect_history` short of
+the frontier, and the node would re-issue an effect the journal was owed: the
+model call §7.3 promises is not paid for twice, paid for twice.
+
 A worker SHOULD send a batch as soon as an effect completes rather than
 accumulating until the node ends, because an effect that never reached the hub is
 an effect the replay of §7 cannot skip.
@@ -375,7 +440,25 @@ safe on the return path as well as the outbound one.
 A result the hub cannot attribute — an unknown or already-superseded
 `dispatch_id` — is answered `409` and the worker discards it: the execution has
 moved on, and re-driving it from a stale result is exactly the divergence
-`docs/durability.md` §7 refuses.
+`docs/durability.md` §7 refuses. The commonest way a `dispatch_id` becomes
+superseded is §6.3: the hub gave up on the session this dispatch was issued to,
+and the node has been through its `retry:` chain since.
+
+| condition | status | body |
+|---|---|---|
+| the dispatch settles, or was already settled | `204` | empty |
+| the token does not verify | `401` | no detail, as everywhere (§3.1) |
+| the session is unknown | `410` | names the rule of §3: join again, and post this result again under the new session |
+| the `dispatch_id` is unknown or already superseded | `409` | names the dispatch. The result is discarded |
+
+**`410` and `409` are different failures and a worker MUST NOT treat them
+alike.** `410` says *the hub does not know you*, and the result is still owed:
+join, and post it again under the new session — the hub attributes it by
+`dispatch_id`, which the new session does not change. `409` says *the hub knows
+you and does not want this*, and the result is dead. A worker whose re-posted
+result meets `409` has its answer and stops re-posting; a worker that read the
+two as one would either abandon a result the hub was waiting for or re-drive an
+execution that has moved past it.
 
 ### 3.5 `GET /workers/artifact/{hash}`
 
@@ -398,11 +481,18 @@ present its session when it has one; a hub MUST NOT require it.
 | the hash is well-formed and unknown here | `404` | names the hash, and the hash this hub currently serves |
 | the hash is malformed | `400` | names what a hash looks like |
 
+A `401` here is terminal in the sense §3.1 gives it: this route takes the join's
+own credential, so joining again cannot improve it. There is no `410` on this
+route, because there is no session on it to be unknown.
+
 A hub MUST keep serving an artifact while any execution that was dispatched
 under it is unfinished, and MAY drop it afterwards. A worker meeting `404` for
 the hash its join returned re-joins rather than retrying the fetch: the join is
 what re-derives the current hash, and re-deriving it anywhere else would be a
-second answer to what this deployment is running.
+second answer to what this deployment is running. That re-join is over a *hash*,
+not a session — it is the one re-join in this document that no `410` asked
+for — and the join it makes is an ordinary one, refused terminally if it is
+refused at all.
 
 Range requests are OPTIONAL. A hub that serves them MUST honour
 `Accept-Ranges: bytes` semantics; a worker MUST work without them.
@@ -528,11 +618,17 @@ The reason is failover. Any process pointed at the journal recovers every
 execution — that is the failover primitive `docs/durability.md` §6 already
 proves — and these three rules are what stop the *worker protocol* from being
 the thing that makes it impossible. A hub restarted under a stable name loses
-sessions and nothing else: workers' next requests are answered `401`/`409` with
-"re-join", they re-join, and dispatch resumes from the journal.
+sessions and nothing else: workers' next requests are answered `410` — the
+status §3 gives an unknown session at every session-carrying route — they join
+again, and dispatch resumes from the journal.
 
-A worker MUST therefore treat a session as disposable: any response telling it
-the session is unknown is answered by joining again, not by failing.
+A worker MUST therefore treat a session as disposable: **a `410` is answered by
+joining again and retrying the request that met it**, not by failing. The
+converse is equally binding, and is what keeps that rule from becoming a loop: a
+**refused join** is not a session problem and MUST NOT be answered by another
+join (§3.1). The two cases are told apart by the status and by nothing else,
+which is why §3 gives `410` exactly one meaning and gives that meaning to no
+other status.
 
 ---
 
@@ -827,7 +923,13 @@ At a given `PROTOCOL_VERSION`:
 * that a dispatch's `instance_path` is the flattened path grammar §9.4 keys
   effects by, so a worker derives the keys the hub would;
 * the status this document gives each refusal, and the rule that a refusal
-  naming a variable names **names** (§9).
+  naming a variable names **names** (§9);
+* that `410` at a session-carrying route means the session is unknown and a join
+  is what fixes it, and that a refusal at `/workers/join` means the opposite —
+  another join is refused identically (§3, §3.1, §5). These two are the whole of
+  what a worker's error handling has to decide, and both are load-bearing: an
+  implementation that read them the other way round would either fail a mesh a
+  hub restart should have healed, or hammer a hub that has refused it.
 
 An implementation MUST NOT rely on the *text* of any refusal, which is written
 for a person and is improved between releases; nor on the internal shape of a
@@ -862,8 +964,9 @@ the previous version behave **wrongly** rather than be refused:
   death;
 * changing which side writes the journal (§3.3), or where an idempotency key
   comes from (§3.3, §3.4);
-* changing what a status code means at a route — a `409` that stopped meaning
-  "re-join" is the sharpest case, because §5 tells workers to act on it;
+* changing what a status code means at a route — a `410` that stopped meaning
+  "re-join" is the sharpest case, because §5 tells workers to act on it, and a
+  join refusal that started meaning it is the same case from the other side;
 * shortening the **liveness window** of §2. Lengthening it is compatible;
   shortening it is not, because the first thing an older worker learns about the
   new one is that its work was re-parked underneath it.
