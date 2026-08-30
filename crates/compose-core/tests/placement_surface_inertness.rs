@@ -57,8 +57,11 @@
 //!    in it**, which is not the same as the components `members:` lists. A tool
 //!    an agent attaches runs in that agent's process whether or not it names a
 //!    placement (grammar 14.1 rule 4), and so does everything an attached
-//!    `flow.*` reaches — so those variables belong to the *agent's* placement
-//!    and, when nothing unplaced reaches them, not to the hub's at all.
+//!    `flow.*` reaches — so those variables belong to the *agent's* placement,
+//!    and to the hub's as well wherever the component reached has a hub
+//!    dispatch of its own, which every unplaced `agent.*` has and an unplaced
+//!    `tool.*` has exactly when a `function:` node names it. A tool nothing
+//!    unplaced reaches is the case that leaves the hub's list entirely.
 //!    `hub.join_token:` and the rest of the deploy layer belong to the hub's.
 //!    Until then a hub credential in `src/env.ts` would be a launch check for a
 //!    value nothing reads.
