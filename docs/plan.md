@@ -259,6 +259,7 @@ is accounted for.
 | `"model"` | a `model.*` definition |
 | `"trigger"` | an entry of `triggers:` |
 | `"placement"` | an entry of the active target's `placements:` |
+| `"hub"` | the active target's `hub:` block |
 | `"event_source"` | an entry of the active target's `event_sources:` |
 
 **What this section owns.** Every component arriving or leaving, and every field
@@ -274,8 +275,9 @@ Concretely, two components have fields held elsewhere:
 * a **trigger** reports only `flow` and `description` here — which flow it runs,
   and what it is for. Its whole delivery surface is §6's.
 
-Everything else — an agent, a tool, a store, a provider, a model, a placement, an
-event source — reports every field of its resolved definition here.
+Everything else — an agent, a tool, a store, a provider, a model, a placement, the
+`hub:` block, an event source — reports every field of its resolved definition
+here.
 
 One field of every entry is never reported: the key the artifact repeats
 **inside** the value, so that an entry read on its own still names what it is.
@@ -286,10 +288,13 @@ Which field it is depends on what the entry is, and this is all of them:
 | entry | the field that repeats its key |
 |---|---|
 | a definition | `address` |
-| a placement | `address` |
+| a placement | `name` |
 | an event source | `name` |
 | a trigger | `name` |
 | a `state:` channel (§5) | `name` |
+
+The `hub:` block is not in that table and needs no row: it is a singleton rather
+than an entry under a key, so nothing inside it repeats one.
 
 A definition's `namespace` — the tag its body is written under (grammar 2.2) — is
 equal by construction for the same reason: it follows from the address. It is
@@ -473,7 +478,8 @@ Every record names its subject by an address, and the spelling is fixed:
 |---|---|
 | a definition | its typed address, as grammar 2.2 spells it: `agent.reviewer`, `flow.review_loop` |
 | a trigger | `trigger.` and the name it is declared under: `trigger.on_request` |
-| a placement | `placement.` and the component address it is keyed by: `placement.agent.fixer` |
+| a placement | `placement.` and the name it is declared under: `placement.mac` |
+| the `hub:` block | `hub` |
 | an event source | `event_source.` and its logical name: `event_source.bug_reports` |
 | a node | the flow's address, a `.`, and the flow-local node id: `flow.review_loop.draft` |
 | an edge | the flow's address, a `.`, the source, `->`, and the target: `flow.review_loop.draft->review` |
@@ -625,9 +631,9 @@ a reason:
 * **`storage_backends:`** — the deploy layer's backend bindings. `plan` resolves
   the built-in `local` target on both sides (§1), and grammar 14 makes
   `storage_backends:` a compile error under `local` (Decision D87), so no
-  artifact this command can build carries one. The two reserved sections `local`
-  *does* admit — `placements:` and `event_sources:` — are compared, and appear in
-  §4.
+  artifact this command can build carries one. The three sections `local` *does*
+  admit — `hub:`, `placements:` and `event_sources:` — are compared, and appear
+  in §4.
 * **a declared-but-empty section**, as against an absent one. The IR draws that
   distinction — `state:` written with no channels is not `state:` unwritten — and
   a plan reports the channels, the triggers and the placements themselves rather
