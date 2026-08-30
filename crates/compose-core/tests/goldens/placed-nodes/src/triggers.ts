@@ -207,6 +207,7 @@ export const httpTriggers: readonly HttpTrigger[] = [
         "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
       };
     },
+    callback: (payload) => text("payload.body.callback_url", roots(payload), "`callback` of the trigger `on_release`"),
   },
   {
     name: "on_retried_release",

@@ -2241,6 +2241,68 @@ fn a_raw_binding_bound(answer: &Value) {
     );
 }
 
+/// The artifact's content hash means the same thing in both languages
+/// (`docs/distributed.md` §3.5, §4).
+///
+/// The rule has two implementations by construction and neither is optional:
+/// `compose_core::codegen::artifact::hash` writes the constant when the compiler
+/// emits, and `contentHash` in the emitted `src/mesh.ts` is what a worker
+/// re-derives from the entries it unpacked "before unpacking anything" (§4
+/// step 2). A worker whose answer differed by a byte would refuse every artifact
+/// a hub serves it — or, the other way round, materialise one it had not really
+/// verified — so this is the CEL corpus's discipline applied to the second pair
+/// of implementations this project has.
+///
+/// Asked of the **mesh** golden, because that is the project whose answer a
+/// worker will act on; the rule itself is composition-independent, which the
+/// unit tests beside `artifact::hash` cover.
+#[test]
+fn the_artifact_hash_is_the_same_in_both_languages() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let golden = goldens::golden("placed-nodes");
+    let project = staged(golden, root, "artifact-hash");
+
+    let output = runner("artifact-content-hash.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the artifact-hash runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    let emitted = goldens::emitted(golden);
+    let declared = answer["declared"].as_str().expect("the declared hash");
+    assert_eq!(
+        declared,
+        compose_core::codegen::artifact::hash(emitted.files()),
+        "the constant the emitter wrote is not the hash it computes"
+    );
+    assert_eq!(
+        answer["computed"].as_str(),
+        Some(declared),
+        "the emitted project hashes its own tree to something other than the hash it declares: \
+         a worker verifying what it unpacked would refuse the artifact this hub serves"
+    );
+    let mut served: Vec<&str> = answer["files"]
+        .as_array()
+        .expect("the file list")
+        .iter()
+        .map(|path| path.as_str().expect("a path"))
+        .collect();
+    served.sort_unstable();
+    assert_eq!(
+        served,
+        emitted.paths().collect::<Vec<_>>(),
+        "`ARTIFACT_FILES` is not the set this build emitted"
+    );
+}
+
 /// Gate 2f: a command that never reads its input still completes.
 ///
 /// Grammar 8.2 sends a scalar `input:` to the child's standard input, and no

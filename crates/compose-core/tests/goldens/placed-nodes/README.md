@@ -13,9 +13,12 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 
 | path | what it holds |
 |---|---|
+| `src/artifact.ts` | what this tree **is**: a content hash over its own files, the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
-| `src/env.ts` | every `${ENV}` reference the composition makes, and `readEnvironment()`, the presence check over them |
+| `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, and the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1) |
+| `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
 | `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
+| `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:`, the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
 | `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |

@@ -57,6 +57,11 @@ state:
 triggers:
   # `respond: async` throughout: a placed node parks until a worker takes it, so
   # every execution here outlives its request by construction.
+  # The lifecycle webhook is on this one, because a placed node with no worker
+  # is a **parking** in exactly resolved q34's sense: the execution has stopped
+  # advancing on its own, and `docs/distributed.md` §6.6 says a subscriber
+  # "learns 'waiting for the Mac' exactly the way it learns 'waiting for a
+  # human'". A `callback:` is what makes that observable.
   on_release:
     type: http
     flow: flow.release
@@ -65,6 +70,7 @@ triggers:
     input:
       path: "payload.body.path"
     respond: async
+    callback: "payload.body.callback_url"
 
   on_retried_release:
     type: http

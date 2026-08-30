@@ -769,6 +769,60 @@ fn a_placed_node_with_no_worker_parks_and_a_join_is_what_wakes_it() {
     assert_eq!(done["outputs"]["signature"], json!("late-but-signed"));
 }
 
+/// A parking fires the `parked` lifecycle webhook, so a subscribed system
+/// "learns 'waiting for the Mac' exactly the way it learns 'waiting for a
+/// human'" (§6.6, PRD resolved q34).
+///
+/// The webhook is owed to a **quiescence**, and a placed node awaiting a worker
+/// is what makes an execution one: it is a unit of work in flight that cannot
+/// advance on its own, which is the same thing a `human` pause is and the reason
+/// `runtime.quiescent` had to learn about placement waits at all. The body is
+/// the status route's report, so the receiver can see which placement it is
+/// waiting on without asking.
+#[test]
+fn a_placement_wait_fires_the_parked_lifecycle_webhook() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let receiver = harness::Receiver::start().expect("a loopback port");
+    let execution = hub.start(
+        "/releases",
+        &json!({ "path": "dist/app", "callback_url": format!("{}/hook", receiver.base_url) }),
+    );
+
+    let parked = receiver.wait_for_event("parked", 1, PATIENCE);
+    assert_eq!(parked.len(), 1, "one webhook per parking, not one per wait");
+    let body = &parked[0].body;
+    assert_eq!(body["execution_id"], json!(execution));
+    assert_eq!(body["status"], json!("running"));
+    assert_eq!(body["placement_waits"][0]["placement"], json!("mac"));
+    assert_eq!(
+        body["placement_waits"][0]["node"],
+        json!("flow.release.sign")
+    );
+    assert!(
+        body["interrupts"].is_null(),
+        "an execution waiting for a machine publishes no question a human could answer: {body:#}"
+    );
+
+    // And the parking is announced **once**: a re-park under the same wait id is
+    // not a second question, which is what keeps a recovered execution quiet.
+    let worker = hub.worker();
+    let dispatch = worker.dispatch(&hub);
+    worker.settle(
+        &hub,
+        dispatch["dispatch_id"].as_str().expect("a dispatch id"),
+        &json!({ "signature": "signed" }),
+    );
+    let settled = receiver.wait_for_event("settled", 1, PATIENCE);
+    assert_eq!(settled[0].body["status"], json!("completed"));
+    assert_eq!(
+        receiver.of_event("parked").len(),
+        1,
+        "the parking was announced more than once"
+    );
+}
+
 /// An unknown session is `410` at every session-carrying route, and at those
 /// routes only (§3).
 #[test]
