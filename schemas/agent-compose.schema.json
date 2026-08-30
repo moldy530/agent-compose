@@ -2676,9 +2676,10 @@
       "required": ["members"],
       "properties": {
         "members": {
-          "description": "The components this claim runs. Non-empty, and each address must resolve in the composition. v1 places agent.* and tool.* - the leaves that hold a machine's capability - while placing a flow.* is deferred, named (PRD resolved q44).",
+          "description": "The components this claim runs. Non-empty, each address distinct, and each must resolve in the composition. v1 places agent.* and tool.* - the leaves that hold a machine's capability - while placing a flow.* is deferred, named (PRD resolved q44).",
           "type": "array",
           "minItems": 1,
+          "uniqueItems": true,
           "items": {
             "type": "string",
             "pattern": "^(agent|tool)\\.[a-z][a-z0-9_]{0,63}$"

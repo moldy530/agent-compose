@@ -5,14 +5,16 @@
 //! A flow **reaches** the components its own nodes name, its maps' dispatch
 //! targets, the `human` nodes among them, the stores and tools of every agent it
 //! reaches, and everything the flows it reaches reach in turn. One relation
-//! serves four checks and each reads a different part of what [`reached`]
+//! serves five checks and each reads a different part of what [`reached`]
 //! returns: session coherence reads the stores ([`stores_of`], grammar 11.3),
 //! sync-trigger interrupt-freedom reads the `human` nodes (grammar 13.3),
 //! detached-dispatch interrupt-freedom reads them from one dispatch target
-//! ([`reached_by`], grammar 8.6 rule 7), and recursion reads the flows — which
+//! ([`reached_by`], grammar 8.6 rule 7), placement colocation reads the
+//! placeable components — clauses 1 and 2, the `agent.*` and `tool.*` a flow's
+//! own nodes and maps name (grammar 14.1) — and recursion reads the flows, which
 //! it needs as *edges* with their invocation sites rather than as a set, so it
 //! walks [`calls`] instead (grammar 7.5). Stating the traversal once here is
-//! what keeps the four from drifting apart (Decision D86).
+//! what keeps the five from drifting apart (Decision D86).
 //!
 //! # Dispatch sites (grammar 11.4, Decision D83)
 //!
@@ -71,12 +73,13 @@ pub(crate) fn flow_at<'a>(ir: &'a Ir, address: &str) -> Option<&'a Flow> {
 
 /// What one flow **reaches** (grammar 7.7).
 ///
-/// Four checks quantify over this one relation and each reads a different part
+/// Five checks quantify over this one relation and each reads a different part
 /// of it: session coherence reads [`stores`](Self::stores) (grammar 11.3), the
 /// two interrupt-freedom rules read [`humans`](Self::humans) — one over a
 /// `respond: sync` trigger's flow (grammar 13.3) and one over a **detached**
-/// dispatch's target (grammar 8.6 rule 7) — and recursion reads the flows, which
-/// it needs with their invocation sites rather than as a set, so it walks
+/// dispatch's target (grammar 8.6 rule 7) — placement colocation reads
+/// [`placeable`](Self::placeable) (grammar 14.1), and recursion reads the flows,
+/// which it needs with their invocation sites rather than as a set, so it walks
 /// [`calls`] instead (grammar 7.5).
 #[derive(Debug, Default)]
 pub(crate) struct Reached {
@@ -86,6 +89,36 @@ pub(crate) struct Reached {
     /// id, each with the id's span. A map rather than a list so the answer does
     /// not depend on the order the walk happened to take.
     pub(crate) humans: BTreeMap<(String, String), Span>,
+    /// The `agent.*` and `tool.*` addresses a walked flow's own nodes and maps
+    /// name — clauses 1 and 2, which are exactly the components a placement may
+    /// hold (grammar 14.1).
+    ///
+    /// Deliberately **not** an agent's attached `tool.*`: clauses 3 and 4 stop
+    /// at an agent's stores and its `flow.*` tools, and the one check that reads
+    /// this wants that boundary. An attached tool already colocates with its
+    /// agent by a rule of its own, so collecting it here would report one
+    /// contradiction twice and point the second report at the wrong line.
+    ///
+    /// Each address carries the site that names it, earliest first by source and
+    /// offset, because the walk pops its worklist in an order nothing fixes and
+    /// a diagnostic's label may not depend on it.
+    pub(crate) placeable: BTreeMap<String, Span>,
+}
+
+/// Record a placeable component at the site naming it, earliest site winning.
+///
+/// "Earliest" is by source name and byte offset, which is a total order over
+/// spans and is the only thing available: [`Span`] is not `Ord`, and the walk's
+/// own order is not a property of the composition.
+fn record(found: &mut Reached, address: &Spanned<Address>) {
+    let key = address.value.to_string();
+    let position = |span: &Span| (span.source.as_str().to_string(), span.bytes.start);
+    match found.placeable.get(&key) {
+        Some(held) if position(held) <= position(&address.span) => {}
+        _ => {
+            found.placeable.insert(key, address.span.clone());
+        }
+    }
 }
 
 /// Everything a flow reaches (grammar 7.7).
@@ -161,15 +194,22 @@ fn walk(ir: &Ir, address: &str, seen: &mut BTreeSet<String>, found: &mut Reached
                     );
                 }
                 NodeKind::Agent { agent } => {
+                    record(found, agent);
                     agent_reaches(ir, &agent.value.to_string(), &mut pending, found);
                 }
+                // A `function:` node names a `tool.*` directly (grammar 8.4).
+                // It reaches nothing further — a tool is a process or a request
+                // — so clause 1 is the whole of what it contributes.
+                NodeKind::Function { function } => record(found, function),
                 NodeKind::Flow { flow, .. } => pending.push(flow.value.to_string()),
                 NodeKind::Map { map } => {
                     for target in targets(&map.dispatch) {
                         match target.value.namespace {
                             Namespace::Agent => {
+                                record(found, target);
                                 agent_reaches(ir, &target.value.to_string(), &mut pending, found);
                             }
+                            Namespace::Tool => record(found, target),
                             Namespace::Flow => pending.push(target.value.to_string()),
                             _ => {}
                         }

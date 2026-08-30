@@ -1,0 +1,13 @@
+# rule: a placement names each member once (grammar 14.1, Decision D129)
+# code: invalid-value
+# message: the `members` of placement `mac` lists `agent.signer` twice
+# at: 13:29
+# help: a placement's members are the components a worker claiming its name runs, so naming one twice says exactly what naming it once said: delete the repeat (grammar 14.1)
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  mac:
+    members: [agent.signer, agent.signer]

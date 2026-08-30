@@ -1926,11 +1926,12 @@ live run rather than a plausible alternative to it.
 
 ### 7.7 Component reachability
 
-Four static checks ask whether a flow — or one `map` dispatch target — can
+Five static checks ask whether a flow — or one `map` dispatch target — can
 *reach* something: session coherence (§11.3), sync-trigger interrupt-freedom
-(§13.3, §8.7), detached-dispatch interrupt-freedom (§8.6 rule 7, §8.7), and
-recursion (§7.5). They share **one** relation, defined here once so that they
-cannot drift apart (Decision [D86](#d86-component-reachability-is-one-relation-and-it-crosses-every-invocation-edge)).
+(§13.3, §8.7), detached-dispatch interrupt-freedom (§8.6 rule 7, §8.7),
+placement colocation (§14.1 rule 4), and recursion (§7.5). They share **one**
+relation, defined here once so that they cannot drift apart (Decision
+[D86](#d86-component-reachability-is-one-relation-and-it-crosses-every-invocation-edge)).
 
 A flow `F` **reaches** the components and `human` nodes named by the following,
 transitively:
@@ -1957,19 +1958,25 @@ output is not an invocation.
 | session coherence (§11.3) | **declared** triggers (§13) | the trigger's flow reaches a `session`-scoped store and the trigger declares no `session_key:` |
 | interrupt-freedom (§13.3, §8.7) | **declared** `http` triggers with `respond: sync` | the trigger's flow reaches a `human` node |
 | detached-dispatch interrupt-freedom (§8.6 rule 7, §8.7) | dispatches declaring `detach: true` | the dispatch **target** reaches a `human` node |
+| placement colocation (§14.1 rule 4) | the `flow.*` entries of an agent's `tools:` | the attached flow reaches an `agent.*` or `tool.*` placed elsewhere than the agent — clauses 1 and 2 only, since clause 4's attached tools are held by the same rule at their own agent |
 | recursion (§7.5) | flow definitions | a flow reaches itself |
 
-The relation is uniform across the four on purpose. An interrupt inside a
+The relation is uniform across the five on purpose. An interrupt inside a
 flow-as-tool is still an interrupt in the middle of a synchronous request, and
 PRD 5.11's settled position is that a `respond: sync` flow is *statically*
 interrupt-free; a pause inside a flow-as-tool of an agent a detached dispatch
 targets is as unanswerable as one written in the target itself; a session-scoped
-store reached through a map-dispatched flow still needs a session identity; and
-recursion through a tool attachment is still recursion. Clause 4 — traversal into
-`tools:` — is the one every earlier per-check wording left unstated. The fourth
-row is the one whose domain is a **target** rather than a flow: it asks the same
-question of the address a dispatch names, which for an `agent.*` target is
-clauses 3 and 4 alone (an agent holds no `human` node of its own).
+store reached through a map-dispatched flow still needs a session identity; a
+component reached through a flow-as-tool runs in the calling agent's process, so
+its placement is the calling agent's business; and recursion through a tool
+attachment is still recursion. Clause 4 — traversal into `tools:` — is the one
+every earlier per-check wording left unstated. The third row is the one whose
+domain is a **target** rather than a flow: it asks the same question of the
+address a dispatch names, which for an `agent.*` target is clauses 3 and 4 alone
+(an agent holds no `human` node of its own). The fourth is the one that reads a
+*part* of the relation rather than all of it, for a reason stated at §14.1 rule 4:
+an attached tool colocates with its own agent by the same rule, so following
+clause 4 there would answer one question twice.
 
 This relation answers "can this flow *cause* that component to run". It is not
 §7.8's relation, which asks whether a node of one flow is reachable from that
@@ -4302,7 +4309,7 @@ Keys are identifiers (§2.1).
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `members` | list of `agent.*` / `tool.*` addresses | yes | non-empty; every address MUST resolve in the composition |
+| `members` | list of `agent.*` / `tool.*` addresses | yes | non-empty, each named once; every address MUST resolve in the composition |
 | `description` | string | no | documentation only (D54) |
 
 ```yaml
@@ -4317,8 +4324,10 @@ placements:
 The rules, each a compile error (Decision
 [D129](#d129-placement-members-are-agents-and-tools-disjoint-and-colocated-with-what-attaches-them)):
 
-1. **`members:` is required and non-empty.** A placement with no members is a
-   claim nothing is ever dispatched under.
+1. **`members:` is required and non-empty**, and names each component **once**.
+   A placement with no members is a claim nothing is ever dispatched under; a
+   repeated entry says what the first entry said, and is refused the way a
+   repeated `tools:` entry is (§5.4).
 2. **v1 members are `agent.*` and `tool.*`.** A `flow.*` member is refused with
    a message naming the deferral: a flow is a subgraph the hub schedules, and
    placing one is out of v1's scope, named (PRD resolved q44). Place the nodes
@@ -4326,15 +4335,27 @@ The rules, each a compile error (Decision
 3. **Placements are DISJOINT.** One component named by two placements is an
    error naming both: two claims are two answers to which worker runs it, and
    the choice is the author's rather than the hub's.
-4. **An attached tool colocates with the agent that attaches it.** The whole
+4. **An attachment colocates with the agent that attaches it.** The whole
    generated artifact reaches every worker (PRD resolved q40), so a placement
    decides which *process* runs a node rather than which code exists there — and
-   an attached tool is called from inside its agent's own tool loop. So a tool
-   whose placement differs from that of an agent attaching it is an error, and
-   so is a placed tool attached to an agent with **no** placement, which would
-   run on the hub. A tool with the same placement, or with none, is fine. A
-   placed tool's own placement governs it where it is reached without an agent —
-   a `function:` node (§8.4).
+   an agent's `tools:` list is the one construct that runs another component
+   inside the agent's own process instead of handing it back to the hub's
+   scheduler. Two forms, one rule:
+   - an attached **`tool.*`** is called from inside the agent's tool loop, so a
+     tool whose placement differs from that of an agent attaching it is an
+     error, and so is a placed tool attached to an agent with **no** placement,
+     which would run on the hub. A tool with the same placement, or with none,
+     is fine.
+   - an attached **`flow.*`** starts an instance in that same loop (§5.4). The
+     flow carries no placement of its own — placing one is deferred — but every
+     `agent.*` and `tool.*` its instance **reaches** (§7.7 clauses 1 and 2) runs
+     where the agent runs, so each of them is held to the same rule. A placement
+     reachable only that way would be one the compiler accepted and the
+     deployment ignored.
+
+   A placed component's own placement governs it wherever it is reached without
+   an attaching agent: a `function:` node (§8.4), an `agent:` node, or a flow
+   instantiated by a `flow:` node (§8.5), all of which the hub schedules.
 5. **A component in no placement executes on the hub.** That is the default and
    is never a diagnostic: `placements:` names the exceptions.
 
@@ -5597,8 +5618,10 @@ impossible to share anyway. *PRD 5.6.*
 
 §7.7 defines reaching once — own nodes, `map` dispatch targets, an agent's
 `stores:`, an agent's `tools:` (including `flow.*` entries), transitively — and
-session coherence (§11.3), sync interrupt-freedom (§13.3, §8.7), and recursion
-(§7.5) all use it.
+session coherence (§11.3), sync interrupt-freedom (§13.3, §8.7), placement
+colocation (§14.1 rule 4) and recursion (§7.5) all use it. A check may read one
+part of what the relation returns — colocation reads clauses 1 and 2 — but never
+a traversal of its own.
 **Rationale**: the three checks each spelled out their own traversal, and the
 sets differed: §11.3 enumerated nodes, `flow:` nodes, and `stores:`; §13.3 said
 only "reachable from its entry". The gap is not academic — a `respond: sync`
@@ -7312,10 +7335,11 @@ single-process deployment. *PRD 5.10, resolved q37, q38, q40, q44.*
 ### D129. Placement members are agents and tools, disjoint, and colocated with what attaches them
 
 A placement's `members:` is a non-empty list of `agent.*` and `tool.*` addresses
-that MUST resolve. A `flow.*` member is refused with a message naming the
-deferral. One component may be a member of at most one placement. A `tool.*`
-whose placement differs from that of an agent attaching it — including an agent
-with no placement at all — is a compile error.
+that MUST resolve, each named once. A `flow.*` member is refused with a message
+naming the deferral. One component may be a member of at most one placement. A
+`tool.*` whose placement differs from that of an agent attaching it — including
+an agent with no placement at all — is a compile error, and so is a placement
+reached only through a `flow.*` that agent attaches.
 
 **Rationale**, one clause at a time.
 
@@ -7338,6 +7362,14 @@ address is read.
 under — a statically visible dead surface, the same posture §13.3 takes to an
 empty `callback_allow:`.
 
+*Each named once.* A repeated entry is a different failure from a shared one and
+gets a different rule, because disjointness has nothing to say about it: a
+component written twice in one list holds one answer, written twice, and a
+message naming "both `mac` and `mac`" would offer a choice between one thing and
+itself. It is the repeated-entry rule §5.4 already applies to an agent's
+`tools:` and `stores:`, spelled the same way and carrying the same code, so an
+author meets one rule about repeated list entries rather than two.
+
 *Disjoint.* Workers claiming `mac` and workers claiming `gpu` are different
 machines by construction; that is what a claim is for. A component named by both
 gives the hub two answers to "which worker runs this", and whichever it picked
@@ -7358,7 +7390,24 @@ agent with no placement is refused, because that agent runs on the hub and would
 drag the tool there — a placement written, accepted, and silently ignored, which
 is the failure mode worth a compile error. A placed tool reached from a
 `function:` node (§8.4) is untouched: nothing there disagrees with it, and that
-case is what placing a tool is for. *PRD 5.10, resolved q38, q40, q44.*
+case is what placing a tool is for.
+
+*Colocated through an attached flow, too.* The rule is about the agent's
+**process**, not about the `tool.` prefix, and §5.4 puts a second construct in
+that process: a `flow.*` in a `tools:` list starts an instance inside the tool
+loop, exactly where a tool call happens. Reading the flow's own address — "a
+flow cannot be placed, so there is no claim to disagree with" — is true of the
+flow and false of everything it reaches, and stopping there would leave the last
+row of the table open one indirection out: a `mac` tool reached only through an
+attached flow would run on the hub, silently, with the deploy file saying
+otherwise. So the check walks what the instance reaches (§7.7 clauses 1 and 2)
+and holds each placed component to the same four rows. The walk stops where
+clauses 3 and 4 stop, at an agent's own attached `tool.*`, because that pair is
+already governed by the direct rule and following it would report one
+contradiction twice. The other direction stays untouched and matters as much: a
+flow instantiated by a `flow:` node (§8.5) is scheduled by the hub, so every
+placement inside it is honoured and there is nothing to refuse — the repair the
+diagnostic offers third. *PRD 5.10, resolved q38, q40, q44.*
 
 ### D130. The `hub` block, and the conditional join token
 
@@ -7505,8 +7554,9 @@ describe, and `callback_auth:` requiring `callback_allow:`, which is that same
 conditional-required-key shape a second time (§13.3, D126, D127), the deploy
 layer's third instance of it — `hub.join_token:` required as soon as
 `placements:` is non-empty, which is one `if`/`then` over two sections of one
-file (§14.2, D130) — and, beside it, a placement's non-empty `members:` list and
-the `agent.*`/`tool.*` pattern its entries take (§14.1, D129), the map form
+file (§14.2, D130) — and, beside it, a placement's non-empty `members:` list, its
+entries' distinctness, and the `agent.*`/`tool.*` pattern they take (§14.1,
+D129), the map form
 rules and the `on_item_error` shape (§8.6) — including the confinement of
 `input:`/`writes:`/`detach:` to the homogeneous form (rule 7, D85) and the
 absence of any `context:` key, which is a `flow:` node's alone because a

@@ -71,6 +71,14 @@ pub(crate) fn placements(node: &Node, cx: &mut Cx) -> Option<PlacementsSection> 
 }
 
 /// Read one placement's `members:` list.
+///
+/// Duplicates *within* one list are refused here rather than left to
+/// [`disjoint`], and the two rules are different rules. Disjointness is about
+/// two placements holding two answers; a component written twice in one list
+/// holds one answer, written twice, and "a member of both `mac` and `mac`"
+/// would name no choice an author could make. The wording and the code are
+/// grammar 5.4's, which already refuses a repeated entry of an agent's `tools:`
+/// or `stores:` — one repeated-entry rule, spelled one way.
 fn members_of(
     node: &Node,
     subject: &str,
@@ -120,6 +128,26 @@ fn members_of(
         let Some(address) = lexical::address(&text, "a placement member", MEMBERS, cx) else {
             continue;
         };
+        if let Some(first) = members
+            .iter()
+            .find(|other: &&Spanned<crate::ast::common::Address>| other.value == address.value)
+        {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    address.span.clone(),
+                    format!(
+                        "the `members` of {subject} lists `{}` twice",
+                        address.value
+                    ),
+                )
+                .with_label(first.span.clone(), "first listed here")
+                .with_help(
+                    "a placement's members are the components a worker claiming its name runs, so naming one twice says exactly what naming it once said: delete the repeat (grammar 14.1)",
+                ),
+            );
+            continue;
+        }
         members.push(address);
     }
     members
@@ -133,6 +161,12 @@ fn members_of(
 /// made here, rather than a dispatch-time coin toss. The diagnostic names both,
 /// with the first labelled, because the repair is a choice between two lines an
 /// author wrote deliberately.
+///
+/// **Two** placements, always: a component repeated inside one list never
+/// reaches this pass, because [`members_of`] drops the repeat and reports it as
+/// what it is. A rule that names two placements must have two to name, or the
+/// message becomes "a member of both `mac` and `mac`" and the repair it offers
+/// is a choice between one thing and itself.
 fn disjoint(placements: &[Placement], cx: &mut Cx) {
     let mut claimed: BTreeMap<String, (&str, Span)> = BTreeMap::new();
     for placement in placements {
