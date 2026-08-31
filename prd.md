@@ -525,7 +525,9 @@ Formerly open, now settled — rationale lives in the referenced sections:
 
 _New questions raised during grammar/spec work land here and must be resolved (moved to §9) before implementation of the affected area begins._
 
-_None currently open._
+- **q45 — May a placed component reach a `store.*` on a process-local backend?** Staged from the distributed-runtime work (`docs/distributed.md` §13). Resolved q37's "global-scope stores are already external backends" is a premise about global scope, not a rule about placements, so nothing today refuses a composition that places an `agent.*` whose `stores:` name a `memory`, `sqlite`, or `local_fs` store — and at runtime the hub and the worker each open **their own copy**, so a write on one side is not a read on the other. The candidate repair is a **breaking** grammar rule (refuse the shape, at every scope or a narrower one); the runtime meanwhile ships the sharp edge documented, deciding nothing. Whether the refusal lands, and how wide it reaches (including `--target local`, where a hub and its workers share one machine), is this question.
+
+- **q46 — What does a `human:` node reached by a placed component mean?** Staged from the distributed-runtime work (`docs/distributed.md` §13). Resolved q43 names wait-board unity among the grounds for this protocol, but no resolved entry fixes a carriage for a pause opened on a worker: §3.4's result carries a node's output or its failure, with no third shape. The candidate repairs are a rule either way — a third terminal outcome on the wire plus a remote wait on the hub's board, or a static refusal of the composition. The runtime meanwhile fails such a dispatch **named** (`PlacedHumanWait`, pointing at the §13 row) so the node's `retry:`/`on_error:` chain runs over a failure that says what happened; it decides neither repair.
 
 ## 11. References
 
