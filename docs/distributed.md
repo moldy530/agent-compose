@@ -1655,7 +1655,7 @@ or a second implementation of this document.
 | version | what changed, and why it is a bump |
 |---|---|
 | **1** | this document, as the runtime that landed with it speaks it |
-| **2** | §3.4's **paused** result (PRD resolved q46, 2026-08-31). A result may settle a dispatch with the wait a `human:` node opened, and a peer of `1` would read one as a node that answered with no output — a node that "quietly means something else", which is §10.3's first row exactly, and its third: `paused` changes what a result *is* |
+| **2** | §3.4's **paused** result (PRD resolved q46, 2026-08-31). A result may settle a dispatch with the wait a `human:` node opened, and a peer of `1` would read one as a node that answered with no output — a node that "quietly means something else", which is §10.3's first row exactly, and its third: `paused` changes what a result *is*. The same release also **enforces** §3.3's effect-key derivation at `/workers/effects`: a record carrying a `key` its own `site`, `kind` and `ordinal` do not derive is `400` where it was journaled before. That is not what the bump is for and needs none of its own — the derivation is the rule §3.3 and grammar §9.4 already stated, so a conforming `1` peer sends what it always sent, and one that spelled a key its own fields do not derive is now *refused* rather than left to write into another node's slot, which is what §10 says a protocol check is for. It is recorded here because this table is where a second implementation reads what moved |
 
 **The bump to 2 costs nothing in practice, and saying so is the point of
 recording it.** A worker and the hub it talks to are built from one compiler
