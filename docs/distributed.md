@@ -689,6 +689,14 @@ question as expired for the whole time it is answerable behind a slow worker's
 clock — a status route contradicting the resume route, which is the one thing it
 may not do.
 
+So `expires_at` is the one member of a `paused` body **no hub check backs**, and
+deliberately: the checks below refuse a pause over a field the hub would
+otherwise have *used*, and this is the one field it never uses. Its rule — the
+field is present exactly when the node declares `timeout:` — is a producer
+obligation, kept by a worker because the settled row is the only record of what
+that machine's clock said. Refusing a pause over it would cost a node its attempt
+for a disagreement about a record no reader has.
+
 **A restart re-arms it whole**, because a restarted hub re-derives a placed pause
 by *planting it again*: it publishes the `paused_at` its predecessor published
 and gives the question the node's whole `timeout:` in front of it, with a
