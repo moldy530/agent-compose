@@ -1455,6 +1455,7 @@ if (answered === undefined) {
       node: "ask",
       shown: { path: "release.dmg" },
       paused_at: "2026-08-31T09:14:02.113Z",
+      expires_at: "2026-09-01T09:14:02.113Z",
       effect: { key: `${site}#human/0`, site, ordinal: 0, request: '{"node":"ask"}' },
     },
   });
@@ -1563,6 +1564,20 @@ fn a_runner_that_pauses_settles_its_dispatch_paused_and_the_worker_keeps_polling
     assert_eq!(
         paused["paused"]["effect"]["key"], "sign/0/ask/0#human/0",
         "the pause does not name the record its answer is journaled under: {paused:#}"
+    );
+    // Both instants travel, and unchanged: §3.4 makes `expires_at` OPTIONAL —
+    // present exactly when the node declares `timeout:` — and this worker
+    // neither drops it nor re-takes it from its own clock. What a hub does with
+    // it is a reader's business (`docs/durability.md` §9): the budget it arms is
+    // the node's own, and this is the field a status route publishes.
+    assert_eq!(
+        paused["paused"]["paused_at"], "2026-08-31T09:14:02.113Z",
+        "{paused:#}"
+    );
+    assert_eq!(
+        paused["paused"]["expires_at"], "2026-09-01T09:14:02.113Z",
+        "the wait's budget did not reach the hub, so nothing there could publish when the \
+         question stops being answerable: {paused:#}"
     );
 
     // …and the worker kept polling: the second dispatch reached it on the same

@@ -751,7 +751,16 @@ execution wrote.
 generation's clock, and a `human` node's own budget restarts when the wait
 re-parks — a wait the journal *holds* is not re-parked at all, and replays with
 the instants the recording generation measured (§3.4). A backoff's jitter is
-re-rolled. None of it changes what an effect answers, and a recorded effect is
+re-rolled.
+
+One wait re-parks with **what is left** of its budget rather than with a fresh
+one, and it is the one the journal can date: a pause a worker settled its
+dispatch with (`docs/distributed.md` §3.4) is on the dispatch row, so a hub that
+re-derives it knows when it took the question and spends the node's `timeout:`
+from there. A local pause has no such row — nothing is journaled for a wait
+nobody answered — so there is nothing to measure from and the budget starts
+again. The two differ in what a restart costs a person's remaining time, and in
+nothing else: same budget, same route, same record. None of it changes what an effect answers, and a recorded effect is
 answered out of the record whatever the clock says.
 
 What it can change is *whether* a deadline fires, and that is a change in the

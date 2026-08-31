@@ -2139,6 +2139,229 @@ fn a_paused_result_this_hub_cannot_read_fails_the_dispatch_rather_than_the_worke
     );
 }
 
+/// The two other ways a `paused` is unreadable, each answered by the one
+/// failure §3.4 gives this route (§3.4, §8, `docs/durability.md` §4).
+///
+/// The first is the effect **key**. `pauseOf` holds the wait and the record's
+/// `site` to the dispatch's instance path, and the key is the field the record
+/// is actually written under: a body whose site is inside this dispatch and
+/// whose key is `stamp/0#model/0` would land a `human` record in another node's
+/// effect slot, where that node's own replay claims it and raises a
+/// `ReplayDivergence` — an unabsorbable failure of an execution the offending
+/// session was never dispatched into. The key is `<site>#human/<ordinal>` and
+/// nothing else.
+///
+/// The second is the `human:` node itself. An answer is held to that node's
+/// `output:`, read off this hub's own copy of the descriptor (§4.3), so a pause
+/// naming a node the artifact does not declare is a question no surface could
+/// safely take — and it is refused *here*, before the dispatch is settled, so
+/// that both spellings of "this hub cannot read your pause" reach an operator as
+/// one failure class rather than as a bare throw out of a settlement already
+/// answered `204`.
+#[test]
+fn a_paused_result_naming_another_nodes_key_or_no_node_at_all_is_unreadable() {
+    for (case, mutate) in [
+        (
+            "another node's effect key",
+            (|pause: &mut Value| {
+                pause["effect"]["key"] = json!("stamp/0#model/0");
+            }) as fn(&mut Value),
+        ),
+        (
+            "a node this artifact does not declare",
+            |pause: &mut Value| {
+                pause["node"] = json!("consider");
+            },
+        ),
+    ] {
+        let Some(hub) = hub() else {
+            return;
+        };
+        let worker = hub.worker();
+        let execution = hub.start("/escalations", &json!({ "path": "dist/app" }));
+        let dispatch = worker.dispatch(&hub);
+        let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+        let site = dispatch["instance_path"].as_str().expect("a site");
+
+        let mut pause = paused_at(site);
+        mutate(&mut pause);
+        let taken = hub.send(
+            worker
+                .request("POST", "/workers/result")
+                .json(&json!({ "dispatch_id": id, "paused": pause })),
+        );
+        assert_eq!(
+            taken.status,
+            204,
+            "`{case}` was answered outside §3.4's four statuses: {}",
+            body_of(&taken)
+        );
+
+        let ended = hub.until(&execution, "ended", |report| {
+            report["status"] == json!("completed") || report["status"] == json!("failed")
+        });
+        assert_eq!(ended["status"], json!("failed"), "`{case}`: {ended:#}");
+        assert!(
+            ended["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("PausedResultUnreadable"),
+            "`{case}` reached an operator as something other than the one failure this route \
+             gives an unreadable pause: {ended:#}"
+        );
+        assert!(
+            ended["interrupts"]
+                .as_array()
+                .is_none_or(|waits| waits.is_empty()),
+            "`{case}` reached the board: {ended:#}"
+        );
+    }
+}
+
+/// A pause with a `timeout:` expires on the **node's own budget**, and the
+/// expiry redispatches (§3.4, grammar §8.7, PRD resolved q46).
+///
+/// `flow.deadline`'s `ask` is the fixture's other question — the same node as
+/// `flow.escalation`'s with a two-second budget on it — and this is the sentence
+/// §3.4 ends on: "a wait whose budget runs out is the same path with the other
+/// settlement: the expiry is journaled as the pause's record, the node is
+/// redispatched, and the replay raises the node's own `on_timeout:` route".
+///
+/// **The `expires_at` on the wire is a year out**, which is the point of the
+/// number. It is stamped by the *worker's* clock, and a hub that armed its timer
+/// from it would be letting another machine's clock decide what a `timeout:`
+/// means: a worker a year fast gives the person a year, one ten minutes slow
+/// gives them nothing at all, and the same node unplaced always gets exactly its
+/// two seconds. So the instant is published — a reader sees what the execution
+/// recorded (`docs/durability.md` §9) — and the budget armed is the
+/// composition's, spent from the moment this hub took the pause.
+///
+/// What catches the other arming is a **lower bound on the clock**: a wait held
+/// for its own two seconds cannot end sooner, while one armed off a year-out
+/// instant ends within milliseconds — `setTimeout` fires at once for a delay
+/// past its 32-bit range, which is exactly what a wildly skewed peer would hand
+/// a hub. A lower bound is the shape a timing assertion may take here, since
+/// load can only ever make the elapsed time longer.
+#[test]
+fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/escalations", &json!({ "path": "dist/app" }));
+
+    let dispatch = worker.dispatch(&hub);
+    let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+    let site = dispatch["instance_path"]
+        .as_str()
+        .expect("a site")
+        .to_string();
+    let wait = format!("{site}/deadline/0/ask/0");
+    let stamped = "2027-08-31T09:14:02.113Z";
+    let pause = json!({
+        "wait": wait,
+        "flow": "flow.deadline",
+        "node": "ask",
+        "shown": { "path": "dist/app" },
+        "paused_at": "2026-08-31T09:14:02.113Z",
+        "expires_at": stamped,
+        "effect": {
+            "key": format!("{wait}#human/0"),
+            "site": wait,
+            "ordinal": 0,
+            "request": "{\"node\":\"ask\"}",
+        },
+    });
+    let planted = Instant::now();
+    let settled = hub.send(
+        worker
+            .request("POST", "/workers/result")
+            .json(&json!({ "dispatch_id": id, "paused": pause })),
+    );
+    assert_eq!(settled.status, 204, "{}", body_of(&settled));
+
+    // On the board, showing the instant the **pause** recorded rather than one
+    // this hub worked out: `expires_at` travels for a reader.
+    let report = hub.until(&execution, "published the worker's pause", |report| {
+        report["interrupts"]
+            .as_array()
+            .is_some_and(|waits| !waits.is_empty())
+    });
+    assert_eq!(
+        report["interrupts"][0]["wait_id"],
+        json!(wait),
+        "{report:#}"
+    );
+    assert_eq!(
+        report["interrupts"][0]["expires_at"],
+        json!(stamped),
+        "the wait publishes an expiry other than the one the process that asked recorded: \
+         {report:#}"
+    );
+
+    // …and nobody answers it. Two seconds later the budget the *composition*
+    // declares is spent, the expiry is journaled as the pause's own record, and
+    // the node re-enters dispatch carrying it — which is what raises the node's
+    // `on_timeout:` on the worker. A hub that had armed the year on the wire
+    // would still be waiting here, and this poll would run out its patience.
+    let redispatch = worker.dispatch(&hub);
+    assert!(
+        planted.elapsed() >= Duration::from_millis(1500),
+        "the wait ended after {:?}, which is less than the two seconds `flow.deadline`'s `ask` \
+         declares: the budget was armed off the instant on the wire rather than off the node's \
+         own `timeout:`, so another machine's clock decided how long a person had",
+        planted.elapsed()
+    );
+    assert_ne!(
+        redispatch["dispatch_id"], dispatch["dispatch_id"],
+        "the expiry resumed the settled dispatch rather than opening one: {redispatch:#}"
+    );
+    assert_eq!(redispatch["instance_path"], json!(site), "{redispatch:#}");
+    let history = redispatch["effect_history"]
+        .as_array()
+        .expect("a redispatch carries the history");
+    let recorded = history
+        .iter()
+        .find(|record| record["kind"] == json!("human"))
+        .unwrap_or_else(|| panic!("the redispatch carries no `human` record: {redispatch:#}"));
+    assert_eq!(recorded["key"], json!(format!("{wait}#human/0")));
+    assert_eq!(
+        recorded["outcome"]["value"]["settled"],
+        json!("expired"),
+        "the wait ended as something other than an expiry: {recorded:#}"
+    );
+    assert!(
+        recorded["outcome"]["value"].get("output").is_none(),
+        "an expired wait was journaled with an answer nobody gave: {recorded:#}"
+    );
+    assert_eq!(
+        recorded["outcome"]["value"]["expiresAt"],
+        json!(stamped),
+        "the record was dated by the hub rather than by the process that asked \
+         (docs/durability.md §9): {recorded:#}"
+    );
+
+    // The board is clear: an expired wait is not a question a surface may still
+    // show, exactly as an unplaced one's is not.
+    let after = hub.report(&execution);
+    assert!(
+        after["interrupts"]
+            .as_array()
+            .is_none_or(|waits| waits.is_empty()),
+        "an expired pause is still published as an open question: {after:#}"
+    );
+
+    worker.settle(
+        &hub,
+        redispatch["dispatch_id"].as_str().expect("an id"),
+        &json!({ "approval": "nobody answered in time" }),
+    );
+    let ended = hub.until(&execution, "completed", |report| {
+        report["status"] == json!("completed") || report["status"] == json!("failed")
+    });
+    assert_eq!(ended["status"], json!("completed"), "{ended:#}");
+}
+
 // ---------------------------------------------------------------------------
 // §2 — queueing
 // ---------------------------------------------------------------------------

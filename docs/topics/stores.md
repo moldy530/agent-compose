@@ -127,7 +127,8 @@ that declares `placements:` runs a placed component in more than one process by
 design. Binding one from anything a placement's process can execute is
 `process-local-store`, at every `scope:` and under `local` too. The repair is a
 networked backend, whose variables the deployment already routes to every
-placement that reaches the store.
+placement that reaches the store — or, until this release opens one, keeping the
+component that binds the store off `placements:` so only the hub opens it.
 
 `scope: session` requires the execution to have a session identity, and that
 identity comes from the trigger. A declared `http`, `schedule`, or `event`

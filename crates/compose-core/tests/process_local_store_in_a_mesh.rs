@@ -587,6 +587,85 @@ fn the_local_target_refuses_and_names_the_repair_it_admits() {
     );
 }
 
+/// Both repairs are offered, and the message says which one this release runs.
+///
+/// The rule is ratified and correct, and the backend half of its repair is the
+/// deployment the design is heading for — but a build of *this* release opens
+/// only the process-local backends: `src/stores.ts` throws on every other
+/// provider, because production `storage_backends` land behind the store plugin
+/// interface in M3 (PRD §7). An author who followed a message that stopped at
+/// "bind `redis`" would write a deploy file that validates, builds, and throws
+/// at the first `store set`, which is a worse outcome than the one they came in
+/// with. So the message names the repair that runs today as well, and this is
+/// the test that fails when the release grows the backends and the caveat is
+/// left behind: a `redis` store that no longer throws makes the sentence below
+/// wrong, and the fixtures' exact `# help:` lines come with it.
+#[test]
+fn the_repair_names_the_half_a_build_of_this_release_can_run() {
+    let caveat = "refuses at the first store op";
+    let diagnostics = diagnose(
+        "release-caveat",
+        &format!("{BACKEND}{KV_STORE}{}", filer("archivist", "")),
+        Some(&mesh(
+            "  vault:\n    members: [agent.archivist]\n",
+            "sqlite",
+        )),
+        "mesh",
+    );
+    refused("release-caveat", &diagnostics, "store.notes", "vault");
+    let named = diagnostics[0]
+        .help
+        .clone()
+        .expect("the refusal offers a repair");
+    assert!(
+        named.contains("bind `redis` or `postgres` instead"),
+        "the design's repair is not offered under a named target: {named}"
+    );
+    assert!(
+        named.contains(caveat) && named.contains("M3"),
+        "the message offers a networked backend without saying that this release refuses one at \
+         run time, so an author who takes it gets a project that compiles and throws: {named}"
+    );
+    assert!(
+        named.contains(
+            "taking the component out of `placements:` is the repair a build of this \
+                        release runs"
+        ),
+        "the message never names the repair this release can actually run: {named}"
+    );
+
+    // …and under `local`, where the first repair is a target of its own rather
+    // than a key, the same caveat: a `deploy/<target>.yml` naming `s3` is a
+    // build this release refuses at the first blob op just the same.
+    let directory = project(
+        "release-caveat-local",
+        &format!(
+            "{BACKEND}store.notes:\n  kind: kv\n  scope: global\n  description: Filed.\n  \
+             value_schema:\n    last: {{ type: string }}\n{}",
+            filer("archivist", "")
+        ),
+        None,
+    );
+    fs::write(
+        directory.join("deploy/local.yml"),
+        "version: \"0.1\"\n\nhub:\n  join_token: ${MESH_JOIN_TOKEN}\n\n\
+         placements:\n  vault:\n    members: [agent.archivist]\n",
+    )
+    .expect("can write the deploy file");
+    let resolution = resolve_with_target(directory.join("main.yml"), "local");
+    let diagnostics = compose_core::check(&resolution.ir.expect("an artifact"));
+    refused("release-caveat-local", &diagnostics, "store.notes", "vault");
+    let local = diagnostics[0]
+        .help
+        .as_deref()
+        .expect("the refusal offers a repair");
+    assert!(
+        local.contains(caveat),
+        "the `local` message sends an author to a target of its own without saying this release \
+         would refuse the backend it names: {local}"
+    );
+}
+
 /// A composition that places nothing keeps every local store it has.
 ///
 /// The floor: this is what every project without a deploy layer is, and the

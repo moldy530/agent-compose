@@ -286,6 +286,11 @@ pub(crate) fn check_stores(ctx: &mut Ctx<'_>) {
         // The first placement in name order. Several placements reaching one
         // store is one fault with one repair — the backend — so it is reported
         // once, on the route the labels can actually draw.
+        //
+        // **No placement at all is the accept row**, and the common one: a store
+        // every process that reaches it opens on the hub is a store with one
+        // process, whatever its backend. That is the rule's whole floor — a
+        // composition with no `placements:` reaches it for every store it has.
         let Some((process, placement)) =
             partition
                 .processes_of(address)
@@ -298,9 +303,20 @@ pub(crate) fn check_stores(ctx: &mut Ctx<'_>) {
         };
         // The route starts at the `members:` entry that holds the placement and
         // ends at the store, so it has at least two steps: a `store.*` is never
-        // a member of a placement (grammar 14.1 rule 2), so it never holds one
-        // in its own right. `hops` is everything between them.
+        // a member of a placement — the parser refuses one outright (grammar
+        // 14.1 rule 2), so a one-step route cannot be built by any spec that
+        // reaches this pass. Asserted rather than assumed, because the arm below
+        // is a *silent* skip: an edge that gave a store a one-step arrival would
+        // retire this rule on the shapes it fires for with no test failing.
+        // `hops` is everything between the two ends.
         let route = partition.route(address, process);
+        debug_assert!(
+            route.len() >= 2,
+            "`{address}` arrives in placement `{placement}` in {} step(s): a store holding a \
+             process in its own right has no chain to draw, and this rule would say nothing \
+             about a store that forks",
+            route.len()
+        );
         let [root, hops @ .., opened] = route.as_slice() else {
             continue;
         };
@@ -343,13 +359,23 @@ pub(crate) fn check_stores(ctx: &mut Ctx<'_>) {
 
 /// What the author writes instead, which is a different sentence under `local`.
 ///
-/// Under any named target the repair is the one that already works: bind a
-/// networked backend, whose credentials §9.1's partition already carries to
-/// every placement that reaches the store. Under `local` there is no such
-/// edit — the target substitutes local storage for **every** store
-/// unconditionally and refuses a `storage_backends:` block outright (grammar 14,
-/// Decision D87) — so offering one would send an author to a key the next
-/// compile refuses.
+/// Under any named target the design's repair is a networked backend, whose
+/// credentials §9.1's partition already carries to every placement that reaches
+/// the store. Under `local` there is no such edit — the target substitutes local
+/// storage for **every** store unconditionally and refuses a `storage_backends:`
+/// block outright (grammar 14, Decision D87) — so offering one would send an
+/// author to a key the next compile refuses.
+///
+/// **Both sentences end in the same caveat, and it is the honest half.** This
+/// compiler release opens only the process-local backends: `src/stores.ts`
+/// refuses every other provider at the first store op, because production
+/// `storage_backends` land behind the store plugin interface in M3 (PRD §7). So
+/// a diagnostic that offered `redis` and stopped would send an author to a
+/// build that compiles and then throws — a repair the release does not have.
+/// The one it does have is the second: take the component that binds the store
+/// out of `placements:`, which is a composition every release runs. Naming both,
+/// in that order, is what keeps this an error message an author can act on
+/// today without hiding the shape the deployment is heading for (PRD G3).
 fn repair(ctx: &Ctx<'_>, provider: crate::ast::deploy::BackendProvider) -> String {
     // Only the ones that serve this store's kind: a `kv` store cannot be bound
     // to `s3`, so offering it would be a repair the next compile refuses
@@ -363,6 +389,12 @@ fn repair(ctx: &Ctx<'_>, provider: crate::ast::deploy::BackendProvider) -> Strin
         Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
         None => "a networked backend".to_string(),
     };
+    // The caveat both sentences end in: the second repair is the one a build of
+    // this release runs. See this function's own note.
+    let today = "This release opens only the process-local backends — a networked one compiles \
+                 and then refuses at the first store op, since production `storage_backends` land \
+                 behind the store plugin interface in M3 (PRD §7) — so taking the component out \
+                 of `placements:` is the repair a build of this release runs";
     if ctx.ir.target == crate::DEFAULT_TARGET {
         format!(
             "a mesh runs this store's component in more than one process — several workers may \
@@ -371,7 +403,7 @@ fn repair(ctx: &Ctx<'_>, provider: crate::ast::deploy::BackendProvider) -> Strin
              substitutes local storage for every store and admits no `storage_backends:`, so a \
              mesh that shares this store is a target of its own: declare `deploy/<target>.yml` \
              binding it to {list}, or take the component that binds it out of `placements:` so \
-             only the hub ever opens it (grammar 14, 14.1 rule 5, PRD resolved q45)"
+             only the hub ever opens it. {today} (grammar 14, 14.1 rule 5, PRD resolved q45)"
         )
     } else {
         format!(
@@ -380,7 +412,7 @@ fn repair(ctx: &Ctx<'_>, provider: crate::ast::deploy::BackendProvider) -> Strin
              one opens its own copy, so a write on one side is never a read on another: bind {list} \
              instead, whose variables the environment partition already carries to every placement \
              that reaches the store, or take the component that binds it out of `placements:` so \
-             only the hub ever opens it (grammar 14.1 rule 5, PRD resolved q45)"
+             only the hub ever opens it. {today} (grammar 14.1 rule 5, PRD resolved q45)"
         )
     }
 }

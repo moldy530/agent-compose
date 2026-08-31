@@ -1861,6 +1861,20 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
         observed["remote_answered"]["waiting_after_the_answer"],
         json!(0)
     );
+    // …and a second answer is refused with the sentence a local pause's second
+    // answer is refused with. A delivery that re-settled it would journal a
+    // second `human` record over an answer somebody already gave — the record
+    // below says the first one stands.
+    assert_eq!(
+        observed["remote_answered"]["twice"],
+        json!("settled"),
+        "a wait a worker opened took a second answer: {observed}"
+    );
+    assert_eq!(
+        observed["remote_answered"]["record_after_the_second_answer"],
+        observed["remote_answered"]["record"],
+        "the second answer rewrote the record the first one settled: {observed}"
+    );
 
     // An expiry settles into the record whose replay raises the node's own
     // `on_timeout:` — the composition's route, decided by the same line of the
@@ -1873,6 +1887,39 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
     assert!(
         observed["remote_expired"]["record"].get("output").is_none(),
         "an expired wait recorded an answer nobody gave: {observed}"
+    );
+
+    // **The budget is the composition's, and the clock is this hub's.** The
+    // pause driven here carries an `expires_at` an hour in this process's past —
+    // what a worker an hour behind stamps on a question it just asked — and the
+    // node's own `timeout:` is a minute. Armed off the wire the wait would have
+    // expired on the next tick and no person could ever have answered it; armed
+    // off the descriptor it is still open, and takes the answer.
+    assert_eq!(
+        observed["remote_skewed"]["settled_while_the_budget_runs"],
+        json!("pending"),
+        "a worker's clock decided when this hub's wait expired, so a `timeout:` the composition \
+         declares means something different on every machine: {observed}"
+    );
+    assert_eq!(observed["remote_skewed"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["remote_skewed"]["record"]["settled"],
+        json!("resumed")
+    );
+    // …and the instant a reader is shown is still the worker's, because that is
+    // what the pause recorded (`docs/durability.md` §9): displayed, not armed.
+    assert!(
+        observed["remote_skewed"]["published_expires_at"].is_string(),
+        "the wait a worker opened publishes no `expiresAt`, so a surface showing it would have to \
+         re-derive one: {observed}"
+    );
+    // The other end of the same rule: a budget already spent expires at once
+    // rather than never, which is what a hub restarted late into a wait re-arms.
+    assert_eq!(observed["remote_spent"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["remote_spent"]["record"]["settled"],
+        json!("expired"),
+        "a wait whose budget ran out before this process took it stayed open for ever: {observed}"
     );
 
     // The two settlements that are the run's own shape rather than the

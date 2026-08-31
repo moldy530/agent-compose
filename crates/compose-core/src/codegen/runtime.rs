@@ -148,6 +148,34 @@ mod tests {
         );
     }
 
+    /// A placed pause's budget is spent on the **hub's** clock, off the
+    /// composition's own `timeout:` (`docs/distributed.md` §3.4, PRD resolved
+    /// q46).
+    ///
+    /// `expires_at` travels because a reader of the execution has to see the
+    /// wait the way the process that opened it recorded it (`docs/durability.md`
+    /// §9) — and it is stamped by the **worker's** clock, which is not this
+    /// one's. A timer armed off it would give a `timeout: 5m` node no time at
+    /// all on a worker ten minutes behind and a quarter of an hour on one ten
+    /// minutes ahead, while the same node unplaced always gets five minutes. So
+    /// the wire's instant is displayed and the descriptor's budget is armed,
+    /// spent from the instant this hub took the pause. Pinned as a grep because
+    /// the alternative is a test that has to move two machines' clocks apart;
+    /// `tests/toolchain/human-waits.mjs` drives the behaviour.
+    #[test]
+    fn a_remote_pauses_budget_is_the_compositions_and_is_spent_on_this_hubs_clock() {
+        assert!(
+            SOURCE.contains("const left = Math.max(0, descriptor.timeoutMs - spent);"),
+            "a pause a worker opened is not armed off the node's own `timeout:`"
+        );
+        assert!(
+            !SOURCE.contains("Date.parse(remote.expiresAt)"),
+            "a wait's budget is armed off an instant another machine's clock stamped, so clock \
+             skew between a hub and a worker shortens or lengthens a `timeout:` the same node \
+             unplaced would honour exactly"
+        );
+    }
+
     /// The runtime is the same bytes for every composition: a project that
     /// declares nothing and one that declares everything differ in `graph.ts`,
     /// and this is what makes that true.

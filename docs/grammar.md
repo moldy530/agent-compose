@@ -4415,12 +4415,17 @@ documents cite them by number** (Decisions
    are still separate processes. A target that declares no placement is one
    process and is untouched, and so is a store only the hub ever opens.
 
-   *The repair is the one that already works*: bind a **networked** backend
-   (§14.3) — `redis`, `postgres`, `chroma`, `pgvector`, `qdrant`, `s3`, `gcs` —
-   whose variables §9.1's partition already carries to every placement that
-   reaches a store bound to it. Under `local` there is no such edit, since that
-   target admits no `storage_backends:` at all, so a `local` mesh that has to
-   share a store is a target of its own (PRD resolved q45).
+   *The repair the design carries* is a **networked** backend (§14.3) — `redis`,
+   `postgres`, `chroma`, `pgvector`, `qdrant`, `s3`, `gcs` — whose variables
+   §9.1's partition already routes to every placement that reaches a store bound
+   to it. Under `local` there is no such edit, since that target admits no
+   `storage_backends:` at all, so a `local` mesh that has to share a store is a
+   target of its own (PRD resolved q45). *The repair this release runs* is the
+   other one: take the component that binds the store out of `placements:`, so
+   only the hub opens it. Both are named in the diagnostic, in that order,
+   because a compiler release opens only the process-local backends — a
+   networked one compiles and refuses at the first store op, since production
+   `storage_backends` land behind the store plugin interface in M3 (PRD §7).
 
 And one thing that is **not** a rule, because it is what happens when no rule
 applies: **a component in no placement executes on the hub.** That is the

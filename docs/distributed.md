@@ -88,7 +88,10 @@ whichever execution opened it, and a placement is several processes by design
 error wherever a component that can execute in a placement's process binds such a
 store, at every scope and under `--target local` too (PRD resolved q45). A mesh
 that shares one store binds a **networked** backend, whose variables §9.1's
-partition already carries to every placement that reaches it.
+partition already carries to every placement that reaches it — and until this
+compiler release opens one (production `storage_backends` land behind the store
+plugin interface in M3, PRD §7), a mesh whose composition needs a store keeps the
+component that binds it on the hub.
 
 Peer partition — each machine owning a subgraph and its own journal — is
 **rejected**, and named here so it is not re-proposed as an optimisation. It
@@ -561,17 +564,20 @@ stays a valid backend for a personal mesh — there is still exactly one writer
 (PRD resolved q42).
 
 Each record carries its **effect key**, derived by the execution-derived rule
-grammar §9.4 fixes, and insertion is **idempotent by that key**: a record the
-journal already holds is accepted and dropped. A batch is therefore safe to
-re-send after a transport failure, and a worker SHOULD re-send rather than
-guess.
+grammar §9.4 fixes — `<site>#<kind>/<ordinal>`, which the hub re-derives from the
+record's own three fields and refuses a record that disagrees with, since the key
+is what the row is written under and one naming another node's slot would be
+claimed by that node's replay as a divergence. Insertion is **idempotent by that
+key**: a record the journal already holds is accepted and dropped. A batch is
+therefore safe to re-send after a transport failure, and a worker SHOULD re-send
+rather than guess.
 
 | condition | status | body |
 |---|---|---|
 | the batch is journaled | `204` | empty. Every record in it was inserted or was already held |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and send this batch again under the new session |
-| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field or naming a `site` outside the dispatch's | `400` | names what a batch and a record carry |
+| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field, naming a `site` outside the dispatch's, or carrying a `key` its own `site`, `kind` and `ordinal` do not derive | `400` | names what a batch and a record carry |
 | the `dispatch_id` names no dispatch this hub holds | `409` | names the dispatch. The batch is discarded, as at §3.4 |
 
 The last two rows are not about the batch's *contents* the way the first three
@@ -649,7 +655,19 @@ finds it in the next (§6.1's property, for the same reason). `shown` is the
 node's evaluated `input:`, which is what the person is asked. `paused_at` and
 `expires_at` are the wait's instants, which stay the pause's own rather than
 being re-taken from the hub's clock: `docs/durability.md` §9 requires that a
-reader "sees what the execution did, not what this process did". `effect` is the
+reader "sees what the execution did, not what this process did".
+
+**Those two are read, never armed.** They are stamped by the *worker's* clock,
+and two machines' clocks disagree — so a hub that armed the wait's timer at
+`expires_at − now` would give a `timeout: 5m` node no time at all on a worker ten
+minutes behind it and a quarter of an hour on one ten minutes ahead, while the
+same node unplaced always gets five minutes. What the hub arms is the node's own
+`timeout:` out of its copy of the descriptor, spent from the instant it took the
+pause — the settled row's `settled_at`, so a restarted hub re-arms what is left
+rather than starting the budget again. Both readings are then on one clock, and
+the parity q46 requires is exact rather than approximate.
+
+`effect` is the
 journal record the **answer** will be written under, exactly as the worker's own
 recorder claimed it (`docs/durability.md` §4) — the key the redispatched node
 will look up, and the canonical `request` it will compare against.
@@ -658,8 +676,16 @@ will look up, and the canonical `request` it will compare against.
 it, exactly as §3.3 holds a record's `site`. It is §8's single writer stated for
 the route that also plants a wait: no session may journal an effect into a node
 it was never dispatched, and none may put a question on the board under another
-node's identity — which the resume surface would then answer. A `paused` that
-breaks either, or that is short of a member, is **not** answered with a status:
+node's identity — which the resume surface would then answer. The `key` is held
+with them, by the derivation rather than by the prefix: it MUST be
+`<site>#human/<ordinal>` for the `site` and `ordinal` beside it
+(`docs/durability.md` §4), because the key is the field the record is written
+under and one naming another node's slot would be claimed by *that* node's replay
+as a divergence. `flow` and `node` MUST name a `human:` node the hub's own
+artifact declares, since the answer is held to that node's `output:` and a
+question nothing can validate an answer against is one no surface may take. A
+`paused` that breaks any of those, or that is short of a member, is **not**
+answered with a status:
 this route's table is closed (§10.1) and a status outside it is a refusal a
 worker stops for, so the hub settles the dispatch as a *failure* naming what was
 wrong, and the node's own `retry:`/`on_error:` chain runs over it. The placement

@@ -246,7 +246,10 @@ its numbering, and then §14.2's about the token:
   backend — whose variables the environment partition already carries to every
   placement that reaches the store — or to take the component that binds it out
   of `placements:`. Under `local` there is no `storage_backends:` to edit, so the
-  repair there is a target of its own.
+  repair there is a target of its own. **This release opens only the local
+  backends**, so the second repair is the one a build of it runs: a networked
+  backend compiles and refuses at the first store op until the store plugin
+  interface lands in M3.
 - **§14.2** — `hub.join_token` is required wherever placements are, and takes an
   `${ENV}` reference, never a literal. **Holding it is being trusted with the
   mesh**: the whole artifact, the right to claim any placement, and the journal's

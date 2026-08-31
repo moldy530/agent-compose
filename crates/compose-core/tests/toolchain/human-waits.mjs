@@ -845,31 +845,47 @@ function claiming(key, site) {
 
 /** The pause a worker settles its dispatch with, as §3.4 carries one home. */
 function remote(fields = {}) {
+  const node = fields.node ?? "sign";
   return {
-    wait: "escalate/0/sign/0",
+    wait: `escalate/0/${node}/0`,
     flow: "flow.sign_off",
-    node: "sign",
+    node,
     shown: { question: "ship it?" },
     pausedAt: "2026-08-31T09:14:02.113Z",
     effect: {
-      key: "escalate/0/sign/0#human/0",
-      site: "escalate/0/sign/0",
+      key: `escalate/0/${node}/0#human/0`,
+      site: `escalate/0/${node}/0`,
       ordinal: 0,
-      request: '{"node":"sign"}',
+      request: `{"node":"${node}"}`,
     },
     ...fields,
   };
 }
 
+/** When this hub took the pause, which is what its budget is spent from. */
+const now = () => new Date().toISOString();
+
 // The hub reads the contract off its own copy of the descriptor rather than off
-// anything that travelled (§4.3), which is what this registration is.
-runtime.registerHumanNodes({ "flow.sign_off.sign": descriptor() });
+// anything that travelled (§4.3), which is what this registration is. Three
+// nodes, because the budget is read off the descriptor too: `sign` declares no
+// `timeout:` and waits, `decide` declares a short one, and `confirm` declares a
+// long one — which is what makes "the wire's `expires_at` is not the timer"
+// decidable below.
+runtime.registerHumanNodes({
+  "flow.sign_off.sign": descriptor(),
+  "flow.sign_off.decide": descriptor({ node: "decide", timeoutMs: 30, onTimeout: "__end__" }),
+  "flow.sign_off.confirm": descriptor({
+    node: "confirm",
+    timeoutMs: 60_000,
+    onTimeout: "__end__",
+  }),
+});
 
 {
   const execution = "exec_remote_answered";
   runtime.openHumanWaits(execution, true);
   const pause = remote();
-  const held = outcomeOf(runtime.holdRemotePause(execution, pause));
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, now()));
   await settle();
   const published = runtime.humanWaits(execution);
   // A payload the node's `output:` refuses does **not** consume the wait.
@@ -894,19 +910,27 @@ runtime.registerHumanNodes({ "flow.sign_off.sign": descriptor() });
   seen.settled = held.state;
   seen.record = held.value;
   seen.waiting_after_the_answer = runtime.humanWaits(execution).length;
+  // …and a **second** answer is refused, exactly as a local pause's is: a wait
+  // is settled once, and a delivery that re-settled one would journal a second
+  // `human` record over an answer somebody already gave.
+  const twice = runtime.deliverHumanAnswer(execution, pause.wait, { decision: "reject" });
+  await settle();
+  seen.twice = twice.ok === false ? twice.reason : "taken";
+  seen.record_after_the_second_answer = held.value;
   observed.remote_answered = seen;
   runtime.releaseHumanWaits(execution);
 }
 
 {
-  // The budget the **worker** started, not a fresh one: `expiresAt` is the
-  // pause's own instant, so what is left of it is what this board arms.
+  // The budget is the **composition's**, spent from the instant this hub took
+  // the pause: `descriptor.timeoutMs`, not the wire's `expiresAt`.
   const execution = "exec_remote_expired";
   runtime.openHumanWaits(execution, true);
   const held = outcomeOf(
     runtime.holdRemotePause(
       execution,
-      remote({ expiresAt: new Date(Date.now() + 30).toISOString() }),
+      remote({ node: "decide", expiresAt: new Date(Date.now() + 30).toISOString() }),
+      now(),
     ),
   );
   await until(() => held.state !== "pending");
@@ -915,24 +939,70 @@ runtime.registerHumanNodes({ "flow.sign_off.sign": descriptor() });
 }
 
 {
+  // **A worker's clock is not this hub's**, and a wait's budget may not depend
+  // on the difference. `expiresAt` here is an hour in this process's past — what
+  // a worker an hour behind would stamp on a pause it opened a moment ago — and
+  // the node's own budget is a minute, so the wait is still open. Armed off the
+  // wire it would have expired on the next tick, `on_timeout:` would have routed,
+  // and nobody could ever have answered a question the composition gave a minute.
+  const execution = "exec_remote_skewed";
+  runtime.openHumanWaits(execution, true);
+  const pause = remote({
+    node: "confirm",
+    expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
+  });
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, now()));
+  await settle();
+  const seen = { settled_while_the_budget_runs: held.state };
+  // …and the instant a reader is shown is still the pause's own
+  // (`docs/durability.md` §9): displayed, not armed.
+  seen.published_expires_at = runtime.humanWaits(execution)[0]?.expiresAt;
+  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await settle();
+  seen.settled = held.state;
+  seen.record = held.value;
+  observed.remote_skewed = seen;
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // The other end of the same rule: a budget this hub has **already** spent
+  // expires on the next tick rather than never. A restarted hub re-derives a
+  // wait it took ten minutes ago from the settled row's own instant, so what it
+  // re-arms is what is left of a minute — here, nothing.
+  const execution = "exec_remote_spent";
+  runtime.openHumanWaits(execution, true);
+  const held = outcomeOf(
+    runtime.holdRemotePause(
+      execution,
+      remote({ node: "confirm" }),
+      new Date(Date.now() - 600_000).toISOString(),
+    ),
+  );
+  await until(() => held.state !== "pending");
+  observed.remote_spent = { settled: held.state, record: held.value };
+  runtime.releaseHumanWaits(execution);
+}
+
+{
   // The two settlements that are the run's own shape, not the composition's.
   const abandoned = "exec_remote_abandoned";
   runtime.openHumanWaits(abandoned, true);
-  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote()));
+  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote(), now()));
   await settle();
   runtime.releaseHumanWaits(abandoned);
   await settle();
 
   const withdrawn = "exec_remote_withdrawn";
   runtime.openHumanWaits(withdrawn, true);
-  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote()));
+  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote(), now()));
   await settle();
   runtime.closeHumanWaits(withdrawn);
   await settle();
 
   const unanswerable = "exec_remote_unanswerable";
   runtime.openHumanWaits(unanswerable, false);
-  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote()));
+  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote(), now()));
   await settle();
 
   observed.remote_unsettled = {

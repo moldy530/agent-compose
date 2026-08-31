@@ -203,6 +203,13 @@ mod tests {
     /// first would let one session write an effect another node replays, and the
     /// second would put a question on the board under somebody else's identity,
     /// which the resume surface would then answer.
+    ///
+    /// **The effect `key` is a third identity and is held with them**, because it
+    /// is the field the record is actually written under: a `site` inside this
+    /// dispatch carrying a key outside it would land a `human` record in another
+    /// node's slot, where that node's replay claims it and raises a divergence
+    /// the offending session's execution can never absorb. Both readers of the
+    /// wire are checked, since the effects route writes keys the same way.
     #[test]
     fn a_paused_result_may_not_name_a_node_its_dispatch_does_not_hold() {
         let read = function_body("function pauseOf(");
@@ -211,6 +218,17 @@ mod tests {
             "a paused settlement is read without holding its wait and its effect record to the \
              dispatch's own instance path, so one session could plant a wait — and journal an \
              answer — under a node it was never dispatched (docs/distributed.md §8): {read}"
+        );
+        assert!(
+            read.contains("key !== effectKey(site, \"human\", ordinal)"),
+            "a paused settlement is read without holding its effect `key` to the site and ordinal \
+             beside it, so a session could journal its answer under another node's key: {read}"
+        );
+        let batch = function_body("function recordOf(");
+        assert!(
+            batch.contains("key !== effectKey(site,"),
+            "the effects route takes a record whose `key` is not the one its own `site`, `kind` \
+             and `ordinal` derive, which is the same hole one ledger over: {batch}"
         );
         // …and the answer is journaled under the identity the **worker** derived
         // rather than one this side works out again: two derivations of one

@@ -1514,6 +1514,130 @@ fn a_placed_pause_answered_after_its_worker_left_parks_until_another_joins() {
     );
 }
 
+/// The three calls `agent.escalator` makes when it asks the question with a
+/// **budget** on it, and nobody answers.
+///
+/// The same three as [`escalating`] — the loop's request for the attached flow,
+/// the loop's answer once the tool has returned, and the pinned structured
+/// output that ends the node — with the first naming the *other* attached flow.
+/// Which of the two questions a run reaches is this queue's to decide, which is
+/// what lets one agent, one trigger and one placement serve both endings of a
+/// wait.
+fn expiring(approval: &str) -> Vec<Script> {
+    vec![
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "deadline",
+                json!({ "path": "release.dmg" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("nobody was at the machine")),
+        Script::new(SONNET, Outcome::structured(json!({ "approval": approval }))),
+    ]
+}
+
+/// A placed pause **runs out of time**, and the redispatch takes the node's own
+/// `on_timeout:` route on a worker (§3.4, grammar §8.7, PRD resolved q46).
+///
+/// The other ending of a wait, end to end and in real processes: the question is
+/// asked on the worker, the wait is planted on the hub's board with the budget
+/// `flow.deadline`'s `ask` declares, nobody answers it, the hub journals the
+/// expiry as the pause's own record, and the node re-enters dispatch carrying
+/// it. What the replay then does is the whole of the parity claim — it raises
+/// the `HumanExpiry` the *composition's* `on_timeout:` routes, at the same line
+/// of the same function an unplaced pause's expiry is raised at — and the proof
+/// is `lapse`, a node no edge targets: a value it wrote reached the model, so
+/// the route was taken rather than the question answered.
+///
+/// The wait is deliberately **not** read off the board here. Its budget is two
+/// seconds of real time and this test starts two processes, so a report that
+/// caught the question open would be a race a test should not run; the wire
+/// suite asserts the publication, and what is asserted here is what only real
+/// processes can show.
+#[test]
+fn a_placed_pause_that_runs_out_of_time_takes_its_on_timeout_route_on_a_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(expiring("nobody approved it"));
+    let worker = mesh.worker("escalation-expiring");
+
+    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["approval"],
+        "nobody approved it",
+        "the node did not finish after its wait expired; the worker said:\n{}",
+        worker.transcript()
+    );
+
+    // **The expiry is journaled as the pause's own record**, which is what the
+    // redispatch replayed: one `human` effect, settled `expired`, carrying no
+    // answer — a wait nobody answered may not journal one.
+    let human = harness::journal_rows(
+        &mesh.project,
+        "SELECT key, payload FROM effects WHERE kind = 'human'",
+    );
+    let records = human.as_array().expect("the query answers rows");
+    assert_eq!(
+        records.len(),
+        1,
+        "the expiry is not journaled once as a `human` effect: {human:#}"
+    );
+    let payload = records[0]["payload"].as_str().unwrap_or_default();
+    assert!(
+        payload.contains("\"settled\":\"expired\""),
+        "the wait was journaled as something other than an expiry: {human:#}"
+    );
+    assert!(
+        !payload.contains("\"output\""),
+        "an expired wait was journaled with an answer nobody gave: {human:#}"
+    );
+    assert!(
+        payload.contains("\"expiresAt\""),
+        "the record does not say when the budget ran out: {human:#}"
+    );
+
+    // …and the node went back through dispatch to reach its route: two settled
+    // rows at one instance path, the second of which is the one that replayed
+    // the expiry.
+    let board = harness::journal_rows(
+        &mesh.project,
+        "SELECT status, placement, node FROM dispatches ORDER BY rowid",
+    );
+    assert_eq!(
+        board,
+        json!([
+            { "status": "settled", "placement": PLACEMENT, "node": "flow.escalated.escalate" },
+            { "status": "settled", "placement": PLACEMENT, "node": "flow.escalated.escalate" },
+        ]),
+        "the expired pause did not send the node back through dispatch: {board:#}"
+    );
+
+    // **`on_timeout:` routed, and it routed on the worker.** `lapse` is reached
+    // by no edge, so the only way its value exists is the route the replayed
+    // expiry raised — and it comes back to the model as the attached flow's
+    // answer, which is where this test can read it.
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the redispatch re-issued a model call the journal already held: {requests:#?}"
+    );
+    let said = serde_json::to_string(&requests[1]).expect("a request serializes");
+    assert!(
+        said.contains("nobody answered in time"),
+        "the attached flow answered without taking its `on_timeout:` route, so the expiry ended \
+         the node rather than routing it: {said}"
+    );
+    let snapshot = mesh.provider.snapshot();
+    assert!(
+        snapshot.is_drained(),
+        "the escalating agent did not make the three calls it was scripted: {snapshot:#?}"
+    );
+}
+
 /// The **hub** goes away between the question and the answer, and the wait comes
 /// back (§5, `docs/durability.md` §6).
 ///

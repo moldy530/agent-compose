@@ -100,12 +100,17 @@ storage_backends:
 
 ## The fix
 
-**Bind a networked backend.** This is the repair the design already carries: the
-environment partition routes a backend's variables to the hub *and* to every
-placement whose components reach a store bound to it, so a worker that opens the
-store is refused at join if it has no credential for it rather than failing at
-its first op. One line of the deploy file, and the two processes are two readers
-of one store.
+**Take the component out of the mesh** — the repair a build of this release
+runs. A store only the hub ever opens is a store with one process, whatever its
+backend. Dropping `agent.archivist` from `members:` says the filing happens on
+the hub, which is where the store is.
+
+**Or bind a networked backend**, which is where the deployment is heading and
+what the design already carries: the environment partition routes a backend's
+variables to the hub *and* to every placement whose components reach a store
+bound to it, so a worker that opens the store is refused at join if it has no
+credential for it rather than failing at its first op. One line of the deploy
+file, and the two processes are two readers of one store.
 
 ```yaml deploy fixed
 version: "0.1"
@@ -122,16 +127,20 @@ storage_backends:
     kv: { provider: redis, url: "${REDIS_URL}" }
 ```
 
-**Or take the component out of the mesh.** A store only the hub ever opens is a
-store with one process, whatever its backend. Dropping `agent.archivist` from
-`members:` says the filing happens on the hub, which is where the store is.
+**This release opens only the process-local backends**, so that block is a
+deployment rather than a repair today: `validate` and `build` take it, and the
+first store op throws — production `storage_backends` (Redis, Postgres, pgvector,
+S3 and the rest of grammar §14.3's vocabulary) land behind the store plugin
+interface in M3 (PRD §7). That is the order the two repairs are in above, and it
+is the order the diagnostic puts them in too.
 
-**Under `--target local` the first repair is not available**, and the diagnostic
-says so: `local` substitutes local storage for every store unconditionally and
-refuses a `storage_backends:` block outright, so there is no line to edit. A
-`local` mesh that has to share a store is a target of its own — a
-`deploy/<name>.yml` naming a networked backend — and until there is one, the
-component that binds the store belongs outside `placements:`.
+**Under `--target local` the backend repair is not available at all**, and the
+diagnostic says so: `local` substitutes local storage for every store
+unconditionally and refuses a `storage_backends:` block outright, so there is no
+line to edit. A `local` mesh that has to share a store is a target of its own — a
+`deploy/<name>.yml` naming a networked backend — and until there is one (and
+until this release opens it), the component that binds the store belongs outside
+`placements:`.
 
 Grammar: `docs/grammar.md` §14.1 rule 5, §11.3, §14.3, Decision D131. PRD:
 resolved question 45. Protocol: `docs/distributed.md` §1, §9.1. Topic:

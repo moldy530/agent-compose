@@ -7175,6 +7175,20 @@ export function registerHumanNodes(nodes: Readonly<Record<string, HumanDescripto
 }
 
 /**
+ * Whether `<flow address>.<node id>` is a `human:` node of this composition.
+ *
+ * The registry's other reader, and the reason it is a question rather than a
+ * lookup: `./mesh.ts` reads a paused result **before** it settles the dispatch,
+ * and a body naming a node this artifact does not have is one it has to refuse
+ * *there* — as the one "this hub cannot read your pause" failure §3.4 gives the
+ * route — rather than have [`holdRemotePause`] throw a bare error over a
+ * dispatch already answered `204`.
+ */
+export function registersHumanNode(address: string): boolean {
+  return humanNodes.has(address);
+}
+
+/**
  * Whether a pause reached in this process is **settled home** rather than held
  * (`docs/distributed.md` §3.4).
  *
@@ -8110,12 +8124,24 @@ export async function runHuman(
  *    plants the wait a local run would have opened at that site;
  *  * the **instants** are the worker's, which is `docs/durability.md` §9's rule
  *    — "a reader of the resumed document sees what the execution did, not what
- *    this process did" — so a wait re-derived after a hub restart keeps the
- *    budget it had rather than starting a fresh one;
+ *    this process did" — so what a reader is shown about this wait is what the
+ *    process that asked the question recorded;
  *  * the **contract** is the descriptor's, read out of [`humanNodes`]. The
  *    artifact is everywhere (`docs/distributed.md` §4.3), so the schema a UI is
  *    handed and the parser an answer is held to are this node's own — not a
  *    second reading of something that travelled.
+ *
+ * **The budget is the third of those and not the second**, which is the one
+ * place the two rules pull apart. `expires_at` is an instant stamped by the
+ * *worker's* clock, and two machines' clocks disagree — so a timer armed at
+ * `Date.parse(expires_at) - Date.now()` would give a `timeout: 5m` node no time
+ * at all on a worker ten minutes behind this hub, and a quarter of an hour on
+ * one ten minutes ahead. What is armed is therefore `descriptor.timeoutMs` — the
+ * composition's own budget, which is the same number the worker computed its
+ * instant from — spent from `since`, an instant on **this** hub's clock: the
+ * moment this process took the pause. A hub restarted mid-wait passes the
+ * settled dispatch row's `settled_at`, so the budget keeps running across the
+ * restart rather than starting again, and both readings stay on one clock.
  *
  * Answers the record the hub journals: exactly the `JournaledWait` a local pause
  * writes through `slot.keep`, so the redispatch's `effect_history` hands the
@@ -8128,14 +8154,18 @@ export async function runHuman(
 export async function holdRemotePause(
   execution: string,
   remote: RemotePause,
+  since: string,
 ): Promise<JournaledWait> {
   const address = `${remote.flow}.${remote.node}`;
   const descriptor = humanNodes.get(address);
   if (descriptor === undefined) {
-    // Unreachable over an artifact both ends hold — the handshake triple pins
-    // one tree (`docs/distributed.md` §4.1) — and said rather than assumed,
-    // because a pause nothing can validate an answer against is a wait no
-    // surface could safely take.
+    // Unreachable twice over: an artifact both ends hold registers the same
+    // nodes — the handshake triple pins one tree (`docs/distributed.md` §4.1) —
+    // and the hub refuses a pause naming an unregistered node before it settles
+    // the dispatch, which is the one failure §3.4 gives the result route
+    // (`./mesh.ts`'s `pauseOf`, [`registersHumanNode`]). Said rather than
+    // assumed, because a pause nothing can validate an answer against is a wait
+    // no surface could safely take.
     throw new Error(
       `\`${address}\` paused on a worker and this hub registers no such \`human:\` node: it registers ${
         [...humanNodes.keys()].map((name) => `\`${name}\``).join(", ") || "none"
@@ -8208,12 +8238,16 @@ export async function holdRemotePause(
     hold(board, remote.wait, mine);
     announce(execution);
 
-    if (remote.expiresAt !== undefined) {
-      // What is left of the budget **the worker started**, not a fresh one: the
-      // wall clock ran from the moment the question was asked (grammar 8.7), and
-      // a hub that re-derives this wait after a restart re-arms whatever is
-      // left. A budget already spent expires on the next tick rather than never.
-      const left = Math.max(0, Date.parse(remote.expiresAt) - Date.now());
+    if (descriptor.timeoutMs !== undefined) {
+      // The **composition's** budget, spent from the moment this hub took the
+      // pause, on this hub's clock — see the note above on why the wire's
+      // `expires_at` is a fact to display and not a timer to arm. `since` is
+      // this process's own instant either way: the settlement it just took, or
+      // the settled row's `settled_at` when a restarted hub re-derives the wait,
+      // so a budget already spent expires on the next tick rather than never.
+      const took = Date.parse(since);
+      const spent = Number.isNaN(took) ? 0 : Math.max(0, Date.now() - took);
+      const left = Math.max(0, descriptor.timeoutMs - spent);
       timer = setTimeout(() => settle("expired", undefined), left);
       if (typeof (timer as { unref?: () => void }).unref === "function") {
         (timer as { unref: () => void }).unref();

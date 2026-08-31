@@ -3,7 +3,7 @@
 # message: `store.notes` is on the process-local `sqlite` backend (the `kv` default of the `mesh` target), and `agent.archivist` that binds it executes in placement `vault`
 # at: main.yml:24:12
 # label: deploy/mesh.yml:8:15 `agent.archivist` is a member of placement `vault`
-# help: a mesh runs this store's component in more than one process — several workers may claim one placement, and the hub dispatches whatever else reaches the store — and each one opens its own copy, so a write on one side is never a read on another: bind `redis` or `postgres` instead, whose variables the environment partition already carries to every placement that reaches the store, or take the component that binds it out of `placements:` so only the hub ever opens it (grammar 14.1 rule 5, PRD resolved q45)
+# help: a mesh runs this store's component in more than one process — several workers may claim one placement, and the hub dispatches whatever else reaches the store — and each one opens its own copy, so a write on one side is never a read on another: bind `redis` or `postgres` instead, whose variables the environment partition already carries to every placement that reaches the store, or take the component that binds it out of `placements:` so only the hub ever opens it. This release opens only the process-local backends — a networked one compiles and then refuses at the first store op, since production `storage_backends` land behind the store plugin interface in M3 (PRD §7) — so taking the component out of `placements:` is the repair a build of this release runs (grammar 14.1 rule 5, PRD resolved q45)
 # target: mesh
 version: "0.1"
 provider.p:

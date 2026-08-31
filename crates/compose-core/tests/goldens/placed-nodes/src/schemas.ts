@@ -94,6 +94,40 @@ export const flowConversationOutputs = z.object({
 }).strict();
 export type FlowConversationOutputs = z.infer<typeof flowConversationOutputs>;
 
+/** `flow.deadline` — the module's parameters (grammar 7.5). */
+export const flowDeadlineInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowDeadlineInputs = z.infer<typeof flowDeadlineInputs>;
+
+/**
+ * `flow.deadline` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowDeadlineOutputs = z.object({
+  approval: z.string(),
+}).strict();
+export type FlowDeadlineOutputs = z.infer<typeof flowDeadlineOutputs>;
+
+/** `flow.deadline` node `ask` — what the human is shown (grammar 8.7). */
+export const flowDeadlineNodeAskInput = z.object({
+  path: z.string(),
+}).strict();
+export type FlowDeadlineNodeAskInput = z.infer<typeof flowDeadlineNodeAskInput>;
+
+/**
+ * `flow.deadline` node `ask` — what the human returns, routable like any structured output (grammar 8.7).
+ */
+export const flowDeadlineNodeAskOutput = z.object({
+  decision: z.enum(["approve", "reject"]),
+}).strict();
+export type FlowDeadlineNodeAskOutput = z.infer<typeof flowDeadlineNodeAskOutput>;
+
+/** `flow.deadline` node `lapse` — what the subprocess produces (grammar 8.2). */
+export const flowDeadlineNodeLapseOutput = z.object({
+  decision: z.string(),
+}).strict();
+export type FlowDeadlineNodeLapseOutput = z.infer<typeof flowDeadlineNodeLapseOutput>;
+
 /** `flow.direct` — the module's parameters (grammar 7.5). */
 export const flowDirectInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
