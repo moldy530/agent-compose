@@ -3902,40 +3902,99 @@ const SWEPT_SIGNALS = ["SIGINT", "SIGTERM"] as const;
 const commandSweeps: (() => void)[] = [];
 
 /**
- * Register a running command, and — while any is running — arrange for a stop
- * signal to take its process group with it.
+ * Arrange for a stop signal to take a command's process group with it, from
+ * **before** the shell that group belongs to exists.
  *
  * A detached command is a command the **terminal** can no longer reach: its
  * group is not the foreground one any more, so the `SIGINT` a person types
  * reaches this process and nothing below it. Left there, `Ctrl-C` on a `run`
  * would end the graph and leave the build it was in the middle of still writing
  * into `root:` — a regression against a hand-rolled `exec:` tool, whose child
- * *is* in that group and does die. So the group this call detached is swept
- * here instead, and what the terminal used to do the runtime now does.
+ * *is* in that group and does die. So the group a call detached is swept here
+ * instead, and what the terminal used to do the runtime now does.
+ *
+ * **Armed before the fork rather than after it**, which is an ordering and not a
+ * detail. A stop signal has a *disposition* before it has a listener: until the
+ * first `process.on` for it, the platform installs no handler and the kernel's
+ * default ends this process where it stands — nothing runs, this module
+ * included. A shell forked before that call is therefore a shell whose group a
+ * `Ctrl-C` in the window between the two would leave running, with the graph
+ * that started it gone: exactly the escape the sweep exists to close, in the
+ * one instant it is easiest to reach. Once the handler is installed the window
+ * cannot reopen — a listener runs between turns of the loop, and the spawn and
+ * the [`holdCommand`] beside it are one turn — so arming first is the whole of
+ * the fix. `crates/compose-core/src/codegen/runtime.rs` pins the order.
  *
  * Two properties keep this from being a runtime that seizes an embedder's
- * signals. The handlers exist **only while a command does** — installed with the
+ * signals. The handlers exist **only while a command does** — armed for the
  * first, removed with the last, so a process that is not running one has exactly
- * the disposition it had before this module was imported. And the sweep
- * **re-raises**: it kills the groups, stands down, and delivers the same signal
- * again, so whatever would have happened — `serve`'s own handler closing the app
+ * the disposition it had before this module was imported, and a spawn that
+ * throws stands them down again on its way out. And the sweep **re-raises**: it
+ * kills the groups, stands down, and delivers the same signal again, so whatever
+ * would have happened — `serve`'s own handler closing the app
  * (`src/serve.ts`), or the default disposition ending the process — happens,
  * unchanged and with the same exit status (grammar 5.5, Decision D124).
  */
-function holdCommand(child: ChildProcess): void {
-  if (runningCommands.size === 0) {
-    for (const signal of SWEPT_SIGNALS) {
-      const sweep = (): void => {
-        for (const running of runningCommands) killCommandGroup(running);
-        runningCommands.clear();
-        standDown();
-        process.kill(process.pid, signal);
-      };
-      commandSweeps.push(() => process.removeListener(signal, sweep));
-      process.on(signal, sweep);
-    }
+function armCommandSweep(): void {
+  if (commandSweeps.length > 0) return;
+  for (const signal of SWEPT_SIGNALS) {
+    const sweep = (): void => {
+      for (const running of runningCommands) killCommandGroup(running);
+      runningCommands.clear();
+      standDown();
+      process.kill(process.pid, signal);
+    };
+    commandSweeps.push(() => process.removeListener(signal, sweep));
+    process.on(signal, sweep);
   }
+}
+
+/** Register a running command with the sweep [`armCommandSweep`] armed. */
+function holdCommand(child: ChildProcess): void {
+  armCommandSweep();
   runningCommands.add(child);
+}
+
+/**
+ * Fork one `builtin.bash` shell into a process group of its own, with the stop
+ * sweep armed **first**.
+ *
+ * The one place a shell is forked, and it exists to make that ordering a fact
+ * rather than a habit: the arming and the fork are two adjacent statements whose
+ * order is the whole of [`armCommandSweep`]'s window argument, and a call site
+ * that reached `spawn` directly would reopen it. `crates/compose-core/src/
+ * codegen/runtime.rs` reads this body and holds the two lines in this order.
+ *
+ * `detached` is what puts the shell in that group (see [`runBuiltinBash`] for
+ * why the group is the unit), and `signal` is the node's, so a cancelled run
+ * kills the shell the platform's own way with [`killCommandGroup`] sweeping up
+ * behind it.
+ *
+ * A `spawn` that throws where it stands — a bad argument shape, rather than the
+ * `error` event a missing `bash` arrives as — leaves no command running, so the
+ * handlers stand down again on the way out: they exist only while a command
+ * does, which is the property that keeps this from seizing an embedder's
+ * signals.
+ *
+ * The return type is **inferred** rather than written, which is the one place
+ * this file leaves one off: the overload `spawn` resolves for this `stdio` tuple
+ * types `stdout` and `stderr` as streams, and naming a wider type here would put
+ * a null check on every read of the pipes below for a stream this call can never
+ * be without.
+ */
+function forkBoundShell(command: string, root: string, signal: AbortSignal) {
+  armCommandSweep();
+  try {
+    return spawn("bash", ["-c", command], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+      signal,
+    });
+  } catch (error) {
+    if (runningCommands.size === 0) standDown();
+    throw error;
+  }
 }
 
 /** Drop a command that has ended, and the sweep with the last of them. */
@@ -3985,15 +4044,12 @@ async function runBuiltinBash(
       // belonged to has already failed. Under `retry:` that is two generations
       // of the same command in one root with the graph believing one is live.
       // See [`killCommandGroup`] for what the kill is and what still escapes it.
-      const child = spawn("bash", ["-c", command], {
-        cwd: root,
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
-        signal: context.signal,
-      });
+      //
       // …and detaching is also what puts the command out of the terminal's
-      // reach, which [`holdCommand`] is the answer to: while one is running,
-      // a stop signal this process is sent takes its group with it.
+      // reach, which [`forkBoundShell`] is the answer to: it arms the sweep
+      // *before* the fork, so a stop signal this process is sent takes the
+      // group with it from the instant that group exists.
+      const child = forkBoundShell(command, root, context.signal);
       holdCommand(child);
       let stdout = "";
       let stderr = "";

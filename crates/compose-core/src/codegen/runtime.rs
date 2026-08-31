@@ -246,6 +246,53 @@ mod tests {
         );
     }
 
+    /// A `builtin.bash` command's stop sweep is armed **before** the shell is
+    /// forked (grammar 5.5, Decision D124).
+    ///
+    /// A stop signal has a *disposition* before it has a listener: until the
+    /// first `process.on` for it, the platform installs no handler and the
+    /// kernel's default ends this process where it stands. So a shell forked
+    /// before the arming is a shell whose group a `Ctrl-C` in the window between
+    /// the two would leave running, with the graph that started it gone — the
+    /// orphan D124 exists to close, reached at the one moment it is easiest to
+    /// reach. Armed first, the window cannot reopen: a listener runs between
+    /// turns of the event loop, and the spawn and the `holdCommand` beside it
+    /// are one turn.
+    ///
+    /// Pinned as an **order** rather than as a behaviour because the behaviour
+    /// is a race: the acceptance suite's
+    /// `a_run_asked_to_stop_takes_its_command_with_it` sends its signal as soon
+    /// as the command's own marker appears, and on an idle machine the runtime
+    /// wins that race whichever way round these two lines are — it lost it under
+    /// load, which is how the window was found. What is decidable here is the
+    /// ordering that makes the race unreachable.
+    #[test]
+    fn a_commands_stop_sweep_is_armed_before_the_shell_is_forked() {
+        let forked = function_body("function forkBoundShell(");
+        let armed = forked
+            .find("armCommandSweep();")
+            .expect("`forkBoundShell` arms the stop sweep");
+        let spawned = forked
+            .find("return spawn(\"bash\", [\"-c\", command], {")
+            .expect("`forkBoundShell` forks the shell");
+        assert!(
+            armed < spawned,
+            "the sweep is armed after the shell is forked, so a stop signal arriving in between \
+             is met by the kernel's default disposition: the graph ends and the command's process \
+             group is left running inside `root:` (grammar 5.5, Decision D124): {forked}"
+        );
+        // …and the fork has **one** call site, which is what makes the ordering
+        // above a property of the runtime rather than of one function: a second
+        // `spawn` of the shell would carry its own ordering, and the window this
+        // closes is reopened by whichever one forgets.
+        assert_eq!(
+            SOURCE.matches("spawn(\"bash\"").count(),
+            1,
+            "a `builtin.bash` shell is forked somewhere other than `forkBoundShell`, which is the \
+             one call site that arms the stop sweep first"
+        );
+    }
+
     /// The body of one top-level declaration of the runtime.
     ///
     /// The same reader `codegen::mesh` and `codegen::serve` use, for the same

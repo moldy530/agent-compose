@@ -7203,7 +7203,12 @@ reaches an `exec:` tool's child. That would have traded one orphan for another,
 so the runtime closes it directly — while a command is running, `SIGINT` and
 `SIGTERM` sweep the live groups and are then re-raised, leaving the exit
 behaviour, the exit status and `serve`'s own shutdown exactly as they were. The
-handlers exist only for as long as a command does.
+handlers exist only for as long as a command does, and they are installed
+**before the shell is forked**: until a stop signal has a handler it has the
+kernel's default disposition, so one arriving in the instant between a fork and
+the runtime's own registration of it would end the graph and leave that group
+running — the orphan this decision is about, reached at the one moment it is
+easiest to reach.
 
 **What is still out of reach**, and is said rather than implied: a process that
 *left* the group on purpose — `setsid`, a shell that turned job control on
