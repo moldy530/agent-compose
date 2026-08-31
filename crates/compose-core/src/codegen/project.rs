@@ -234,8 +234,14 @@ const TSCONFIG: &str = r#"//
 "#;
 
 /// `README.md`.
+///
+/// Takes the environment partition because one of its sections turns on it: the
+/// paragraph about a pause a **worker** opens is emitted exactly when a
+/// placement's process can reach a `human:` node (`docs/distributed.md` §9.1,
+/// and see [`human_waits`]). Handed in rather than recomputed, so the README and
+/// the manifests describe one deployment.
 #[must_use]
-pub fn readme(ir: &Ir) -> super::GeneratedFile {
+pub fn readme(ir: &Ir, partition: &super::env::Partition) -> super::GeneratedFile {
     let mut contents = super::header(ir, "> ");
     contents.push('\n');
     contents.push_str(&format!(
@@ -245,7 +251,7 @@ pub fn readme(ir: &Ir) -> super::GeneratedFile {
         ir.entrypoint, ir.target
     ));
     contents.push_str(README_BODY);
-    contents.push_str(&human_waits(ir));
+    contents.push_str(&human_waits(ir, partition));
     contents.push_str(&store_data(ir));
     contents.push_str(&route_timeouts(ir));
     contents.push_str(&host_functions(ir));
@@ -460,29 +466,41 @@ one.
 /// all (grammar 8.7, PRD 5.11, §9.21). A composition with no `human` node gets
 /// none of it, exactly as one with no store gets no store section — the resume
 /// route is still mounted, and the paragraph above already says so.
-fn human_waits(ir: &Ir) -> String {
-    let pauses = ir.definitions.values().any(|definition| {
+fn human_waits(ir: &Ir, partition: &super::env::Partition) -> String {
+    let mut pauses = false;
+    let mut placed = false;
+    for (address, definition) in &ir.definitions {
         let crate::ir::definition::DefinitionBody::Flow(flow) = &definition.body else {
-            return false;
+            continue;
         };
-        flow.nodes
+        if !flow
+            .nodes
             .iter()
             .any(|node| matches!(node.kind, crate::ir::flow::NodeKind::Human { .. }))
-    });
+        {
+            continue;
+        }
+        pauses = true;
+        // **Which processes can run this flow's instance**, read off the
+        // environment partition rather than walked again here: `docs/distributed.md`
+        // §9.1's closure is already the answer to that question, attachment
+        // included, and it is the same closure grammar 14.1 rule 5 refuses a
+        // process-local store on. A placement in the list is a worker that can
+        // open this question.
+        placed |= partition
+            .processes_of(address)
+            .any(|process| matches!(process, super::env::Process::Placement(_)));
+    }
     if !pauses {
         return String::new();
     }
     let mut section = String::from(HUMAN_WAITS);
-    // The one paragraph a **mesh** adds, and only a mesh: a project with no
-    // placements has no worker for a pause to be opened on, and telling its
-    // reader what happens when one is would be a paragraph about a shape this
-    // deployment cannot reach.
-    if ir
-        .deploy
-        .placements
-        .as_ref()
-        .is_some_and(|section| !section.entries.is_empty())
-    {
+    // The one paragraph a **mesh** adds, and only one whose mesh can reach a
+    // question: a deployment where no placement's process runs a flow with a
+    // `human:` node in it has no worker for a pause to be opened on, and telling
+    // its reader what happens when one is would be a paragraph about a shape
+    // this deployment cannot produce.
+    if placed {
         section.push_str(PLACED_WAITS);
     }
     section
@@ -665,14 +683,21 @@ pause on the entry of the node it stopped at, and the answer goes to `serve`'s
 resume route instead.
 "##;
 
-/// The paragraph a composition that both pauses **and** places gets.
+/// The paragraph a composition whose **placements can reach a pause** gets.
 ///
-/// A reader of a mesh project meets a real question the section above does not
+/// A reader of such a project meets a real question the section above does not
 /// answer: a placed agent's tool loop can reach a `human` node, so the question
 /// is asked in a process the resume route is not served from. The answer is
 /// "nothing changes", and that is worth writing down precisely because it is the
 /// answer somebody would not assume (`docs/distributed.md` §3.4, PRD resolved
 /// q46).
+///
+/// Emitted on the **closure** rather than on the mere presence of `placements:`,
+/// which is the difference between a paragraph about this deployment and a
+/// paragraph about meshes in general: a project whose placements hold only
+/// components that reach no `human:` node can never produce the shape described
+/// here, and telling its reader otherwise is a page of documentation for a
+/// question that will not be asked.
 const PLACED_WAITS: &str = r##"
 ## A pause a worker opens
 
@@ -1042,10 +1067,17 @@ if (entry !== undefined && pathToFileURL(entry).href === import.meta.url && proc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::test_support::ir_of;
+    use crate::codegen::test_support::{ir_of, ir_of_mesh};
 
     fn manifest() -> String {
         package_json(&ir_of("version: \"0.1\"\n")).contents
+    }
+
+    /// The README one composition emits, over the partition [`readme`] reads its
+    /// placement-dependent sections off — the one [`super::super::emit`] hands
+    /// it, derived here rather than passed in because a test builds one IR.
+    fn readme_of(ir: &Ir) -> crate::codegen::GeneratedFile {
+        readme(ir, &crate::codegen::env::Partition::of(ir))
     }
 
     #[test]
@@ -1131,7 +1163,7 @@ mod tests {
     /// checking something nobody had been told about.
     #[test]
     fn the_readme_launches_with_bun_and_documents_the_node_fallback() {
-        let contents = readme(&ir_of("version: \"0.1\"\n")).contents;
+        let contents = readme_of(&ir_of("version: \"0.1\"\n")).contents;
 
         let bun = contents
             .find("bun src/index.ts")
@@ -1165,6 +1197,116 @@ mod tests {
         assert!(contents.contains("no `packageManager` field"), "{contents}");
     }
 
+    /// The paragraph about a pause a **worker** opens is emitted for a
+    /// deployment whose placements can actually reach a `human:` node, and for
+    /// no other (`docs/distributed.md` §3.4, §9.1, PRD resolved q46).
+    ///
+    /// The gate is the environment partition's closure rather than the presence
+    /// of a `placements:` block, and the pair below differ in exactly one token
+    /// — which agent is the placement's member — so what this asserts is the
+    /// closure and not the section's prose. A deployment whose placement holds
+    /// only an agent that attaches nothing can never produce a pause on a
+    /// worker, and a paragraph about one would be documentation for a shape it
+    /// cannot reach; the composition still pauses on the hub, so the section
+    /// about answering a question is in both.
+    #[test]
+    fn only_a_deployment_whose_placement_can_reach_a_pause_is_told_about_one() {
+        const ASKS: &str = r#"version: "0.1"
+
+state:
+  approval: { type: string, default: "" }
+  filed: { type: string, default: "" }
+
+provider.p:
+  kind: anthropic
+  api_key: ${MODEL_KEY}
+
+model.m:
+  provider: provider.p
+  id: some-model
+
+agent.escalator:
+  model: model.m
+  prompt: Ask a person about it.
+  tools: [flow.approve]
+  input:
+    goal: { type: string }
+  output:
+    approval: { type: string }
+
+agent.filer:
+  model: model.m
+  prompt: File it.
+  input:
+    goal: { type: string }
+  output:
+    filed: { type: string }
+
+flow.approve:
+  description: Ask a person whether it may go ahead.
+  inputs:
+    goal: { type: string }
+  outputs:
+    approval: { type: string }
+  nodes:
+    ask:
+      human:
+        input:
+          goal: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        goal: "input.goal"
+      writes:
+        decision: approval
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.work:
+  inputs:
+    goal: { type: string }
+  outputs:
+    filed: { type: string }
+  nodes:
+    escalate: { agent: agent.escalator }
+    file: { agent: agent.filer }
+  edges:
+    - { from: start, to: escalate }
+    - { from: escalate, to: file }
+    - { from: file, to: end }
+"#;
+        let placing = |member: &str| {
+            readme_of(&ir_of_mesh(
+                ASKS,
+                &format!(
+                    "version: \"0.1\"\n\n\
+                     hub:\n  join_token: ${{MESH_JOIN_TOKEN}}\n\n\
+                     placements:\n  mac:\n    members: [{member}]\n"
+                ),
+            ))
+            .contents
+        };
+
+        let unreachable = placing("agent.filer");
+        assert!(
+            unreachable.contains("## Answering a `human` node"),
+            "a composition that pauses is still told how a pause is answered: {unreachable}"
+        );
+        assert!(
+            !unreachable.contains("## A pause a worker opens"),
+            "a placement that reaches no question is told what happens when its worker asks \
+             one: {unreachable}"
+        );
+
+        let reachable = placing("agent.escalator");
+        assert!(
+            reachable.contains("## A pause a worker opens"),
+            "the placed agent attaches the flow holding the question, so its worker can open \
+             one: {reachable}"
+        );
+    }
+
     /// A composition with a `store.*` is told where its data goes, and one
     /// without gets no section — the same rule the host-function section
     /// follows.
@@ -1176,13 +1318,13 @@ mod tests {
     /// than after the version table nobody reads to the end of.
     #[test]
     fn a_composition_with_a_store_is_told_where_its_data_goes() {
-        let plain = readme(&ir_of("version: \"0.1\"\n")).contents;
+        let plain = readme_of(&ir_of("version: \"0.1\"\n")).contents;
         assert!(
             !plain.contains("## Where a store keeps its data"),
             "a composition with no store keeps nothing"
         );
 
-        let contents = readme(&ir_of(
+        let contents = readme_of(&ir_of(
             r#"version: "0.1"
 
 store.prefs:
@@ -1252,19 +1394,19 @@ model.default:
             )
         };
 
-        let plain = readme(&ir_of("version: \"0.1\"\n")).contents;
+        let plain = readme_of(&ir_of("version: \"0.1\"\n")).contents;
         assert!(
             !plain.contains("## `route_on: [timeout]` needs a `timeout:`"),
             "a composition with no route is not told about one"
         );
-        let narrowed = readme(&ir_of(&models("\n  route_on: [rate_limit]"))).contents;
+        let narrowed = readme_of(&ir_of(&models("\n  route_on: [rate_limit]"))).contents;
         assert!(
             !narrowed.contains("## `route_on: [timeout]` needs a `timeout:`"),
             "…nor is a route that declared the condition away: {narrowed}"
         );
 
         for route_on in ["", "\n  route_on: [overloaded, timeout]"] {
-            let contents = readme(&ir_of(&models(route_on))).contents;
+            let contents = readme_of(&ir_of(&models(route_on))).contents;
             let section = contents
                 .find("## `route_on: [timeout]` needs a `timeout:`")
                 .unwrap_or_else(|| {
@@ -1289,7 +1431,7 @@ model.default:
     /// of the project could not find.
     #[test]
     fn the_readme_documents_every_pin() {
-        let contents = readme(&ir_of("version: \"0.1\"\n")).contents;
+        let contents = readme_of(&ir_of("version: \"0.1\"\n")).contents;
         for (package, version) in PINS.iter().chain(DEV_PINS) {
             assert!(
                 contents.contains(&format!("| `{package}` | `{version}` |")),
@@ -1305,13 +1447,13 @@ model.default:
     /// deadline is.
     #[test]
     fn a_composition_with_a_function_binding_is_told_what_registering_one_costs() {
-        let plain = readme(&ir_of("version: \"0.1\"\n")).contents;
+        let plain = readme_of(&ir_of("version: \"0.1\"\n")).contents;
         assert!(
             !plain.contains("## Host functions"),
             "a composition using no escape hatch is not told about one"
         );
 
-        let contents = readme(&ir_of(
+        let contents = readme_of(&ir_of(
             r#"version: "0.1"
 
 tool.rank:
