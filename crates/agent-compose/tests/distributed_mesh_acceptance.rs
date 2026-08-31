@@ -1504,11 +1504,16 @@ fn a_placed_pause_answered_after_its_worker_left_parks_until_another_joins() {
 
     // The redispatch has nobody to take it, so it is a **pause** rather than a
     // failure (§6.4's first row): on the board, and costing the execution
-    // nothing but its own `timeout:`.
+    // nothing but its own `timeout:`. Not necessarily at once, though: the dead
+    // worker's session is presumed live until the window of §2 expires, so a
+    // hub may first hand the redispatch to the session that is gone — and the
+    // expiry then supersedes it and parks the retry (§6.3). Both readings end
+    // on the board, so the board's **parked** row is what is waited for, never
+    // the first row to appear.
     let parked = mesh.until(&execution, "parked its redispatch", |report| {
         report["placement_waits"]
             .as_array()
-            .is_some_and(|waits| !waits.is_empty())
+            .is_some_and(|waits| waits.iter().any(|wait| wait["status"] == "parked"))
     });
     assert_eq!(
         parked["status"], "running",
