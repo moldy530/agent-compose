@@ -518,11 +518,20 @@ export class DispatchSuperseded extends Error {
  *    making requests (§6.3), which fails this attempt under the node's own
  *    `retry:`/`on_error:` chain exactly as a local failure would.
  *
- * The node's `timeout:` is **not** held still while this waits. §6.5 makes the
- * chain run from dispatch and §2 says so outright — "a `timeout:` on a placed
- * node is a bound on queueing plus execution, not on execution alone" — which is
- * the opposite of a `human` node's rule (D102) and is why `runtime.pausesUnder`
- * is left alone and only `runtime.quiescent` learns about placement waits.
+ * The node's `timeout:` is **not** held still while a *placement* wait waits.
+ * §6.5 makes the chain run from dispatch and §2 says so outright — "a `timeout:`
+ * on a placed node is a bound on queueing plus execution, not on execution
+ * alone" — which is why a parked dispatch adds nothing to `runtime.pausesUnder`
+ * and only `runtime.quiescent` learns about placement waits.
+ *
+ * **A pause is the other rule**, and not an exception to this one. A dispatch
+ * that settles paused puts a `human` wait on this hub's board under this node's
+ * own instance path ([`answered`]), so `runtime.pausesUnder` counts it and
+ * `runActivity` holds the node's deadline still for as long as the question is
+ * open — which is D102 reaching a placed node exactly as it reaches the same
+ * node unplaced, since what the budget bounds is the work the instance does and
+ * never the time a person spends thinking. Queueing is inside the budget;
+ * thinking is outside it, on both sides of the wire.
  */
 export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAnswer> {
   // A process that executes placed nodes answers this itself ([`executeLocally`]),
@@ -580,8 +589,10 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       // predecessor published (`docs/durability.md` §9) — and with the node's
       // whole `timeout:` in front of it, exactly as a resumed generation re-parks
       // a local wait nobody answered (§5, PRD resolved q46's parity bar).
+      // Planting is one function for both generations ([`answered`]), so the
+      // budget and the deadline it publishes are derived once and here as there.
       if (journal.lookup(options.execution, ending.pause.effect.key) === undefined) {
-        await answered(journal, options, replanted(ending.pause));
+        await answered(journal, options, ending.pause);
       }
       continue;
     }
@@ -703,8 +714,10 @@ function awaited(
  *
  * The wait's budget is the node's own `timeout:`, spent from the moment
  * `holdRemotePause` puts it on the board — never the worker-stamped
- * `expires_at`, which is another machine's clock and is carried for a reader
- * rather than for a timer.
+ * `expires_at`, which is another machine's clock. The deadline that hub
+ * publishes is the one it will fire, derived beside the arming, which is why
+ * nothing here dates a pause on its way in: both plantings, the live one and a
+ * restart's, hand the pause on exactly as it came off the wire.
  */
 async function answered(
   journal: Journal,
@@ -727,39 +740,6 @@ async function answered(
       recordedAt: new Date().toISOString(),
     });
   });
-}
-
-/**
- * One pause, dated for the generation about to **plant** it (§3.4).
- *
- * A hub that re-derives an unanswered pause arms the node's whole `timeout:`
- * from the moment it puts the wait back on the board — that is the parity PRD
- * resolved q46 asks for, since a local wait nobody answered is re-parked with a
- * fresh budget too (`docs/durability.md` §5). A deadline a reader is *shown* has
- * to be the deadline that will fire, so this moves `expires_at` with it: after an
- * outage longer than the budget, publishing the predecessor's instant would show
- * a question as expired while the resume surface still takes its answer, which is
- * the one thing a status route may not say.
- *
- * **`paused_at` does not move.** It is when the execution asked, which is a fact
- * about the run rather than about this process (`docs/durability.md` §9) — and
- * the placed pause is the only wait that has it across a restart, because it is
- * the only one with a row. The budget is read off the pair rather than off the
- * descriptor for the reason `answered` carries the worker's effect key rather
- * than deriving one: the two instants are both the worker's own clock, so their
- * difference is the composition's `timeout:` exactly, with no skew in it — and
- * the same number is what `runtime.holdRemotePause` arms out of its own copy of
- * the descriptor. A pause with no budget declares no `expires_at` (§3.4) and is
- * handed on untouched.
- */
-function replanted(pause: runtime.RemotePause): runtime.RemotePause {
-  if (pause.expiresAt === undefined) return pause;
-  const opened = Date.parse(pause.pausedAt);
-  const due = Date.parse(pause.expiresAt);
-  // An unreadable or backwards pair is left exactly as it is: nothing of this
-  // release writes one, and a display instant is not worth inventing.
-  if (Number.isNaN(opened) || Number.isNaN(due) || due < opened) return pause;
-  return { ...pause, expiresAt: new Date(Date.now() + (due - opened)).toISOString() };
 }
 
 /** The next placement-wait ordinal at one instance path (§6.1). */
@@ -879,8 +859,9 @@ function endingIn(value: unknown): Ending {
  * remove; so the ordinal a pause carries is held to [`claimedHumanOrdinal`], the
  * number this hub would give the next `human` claim at that site. A worker of
  * this release always sends exactly that — the pause it settles on is its own
- * first live claim, after replaying whatever `effect_history` carried — and §10.1
- * makes it something a second implementation may rely on rather than infer.
+ * first live claim, after replaying whatever `effect_history` carried — and §3.4
+ * states the rule, which is what makes it something a second implementation may
+ * rely on (§10.1) rather than infer from a refusal it is forbidden to read.
  */
 function pauseOf(
   journal: Journal,

@@ -1927,12 +1927,51 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
         observed["remote_skewed"]["record"]["settled"],
         json!("resumed")
     );
-    // …and the instant a reader is shown is still the worker's, because that is
-    // what the pause recorded (`docs/durability.md` §9): displayed, not armed.
-    assert!(
-        observed["remote_skewed"]["published_expires_at"].is_string(),
-        "the wait a worker opened publishes no `expiresAt`, so a surface showing it would have to \
-         re-derive one: {observed}"
+    // …and the deadline a reader is shown is the deadline that fires. The wire's
+    // instant is an hour in this process's past, so a board that republished it
+    // would show the question as expired for the whole minute the resume surface
+    // still takes its answer — a status route contradicting the resume route.
+    assert_eq!(
+        observed["remote_skewed"]["published_expires_at_is_the_wires"],
+        json!(false),
+        "the wait publishes the instant the worker's clock stamped rather than the one this hub \
+         armed, so a surface shows a deadline that is not the one that will fire: {observed}"
+    );
+    assert_eq!(
+        observed["remote_skewed"]["published_expires_at_is_ahead"],
+        json!(true),
+        "the wait publishes a deadline this process is already past while its own timer runs on: \
+         {observed}"
+    );
+    assert_eq!(
+        observed["remote_skewed"]["record_dates_the_deadline_it_published"],
+        json!(true),
+        "the record holds a deadline other than the one the board published, so a replayed wait \
+         reports a budget the execution was never under: {observed}"
+    );
+    // …and a node with no `timeout:` publishes no deadline, whatever the wire
+    // dated the pause: grammar 8.7 makes that wait unbounded, and an instant
+    // nothing will fire is not one a surface may show.
+    assert_eq!(
+        observed["remote_unbounded"],
+        json!({ "settled": "pending", "published_expires_at": null }),
+        "a pause under a node that declares no `timeout:` published an expiry nothing will ever \
+         fire: {observed}"
+    );
+    // A pause naming a `human:` node this build no longer declares is resolved
+    // q29's disagreement — a journal that does not describe this run — rather
+    // than a bare failure a node's `on_error:` could absorb. Only a restart on a
+    // rebuilt artifact reaches it: the result route refuses such a pause before
+    // the dispatch is settled.
+    assert_eq!(
+        observed["remote_unregistered"],
+        json!({
+            "settled": "ReplayDivergence",
+            "names_the_record": true,
+            "published": 0,
+        }),
+        "a pause naming a node this build does not declare did not fail as a divergence naming \
+         the record its answer would have been written under: {observed}"
     );
     // **The budget is armed whole every time the wait is planted**, which is the
     // half a hub restart decides: a process that re-derives an unanswered pause

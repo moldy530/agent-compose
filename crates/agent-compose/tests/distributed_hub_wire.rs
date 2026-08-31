@@ -2279,21 +2279,24 @@ fn a_paused_result_that_does_not_name_one_node_throughout_is_unreadable() {
 /// settlement: the expiry is journaled as the pause's record, the node is
 /// redispatched, and the replay raises the node's own `on_timeout:` route".
 ///
-/// **The `expires_at` on the wire is a year out**, which is the point of the
-/// number. It is stamped by the *worker's* clock, and a hub that armed its timer
-/// from it would be letting another machine's clock decide what a `timeout:`
-/// means: a worker a year fast gives the person a year, one ten minutes slow
-/// gives them nothing at all, and the same node unplaced always gets exactly its
-/// two seconds. So the instant is published — a reader sees what the execution
-/// recorded (`docs/durability.md` §9) — and the budget armed is the
-/// composition's, spent from the moment this hub took the pause.
+/// **The instants on the wire are years out**, which is the point of the
+/// numbers. They are stamped by the *worker's* clock, and a hub that armed its
+/// timer from `expires_at` would be letting another machine's clock decide what
+/// a `timeout:` means: a worker years fast gives the person years, one ten
+/// minutes slow gives them nothing at all, and the same node unplaced always
+/// gets exactly its two seconds. So the budget armed is the composition's, spent
+/// from the moment this hub took the pause — and the deadline the board
+/// *publishes* is that arming's, because a deadline a reader is shown has to be
+/// the deadline that fires. `paused_at` is the one instant that stays the
+/// worker's: when the execution asked is a fact about the run
+/// (`docs/durability.md` §9).
 ///
 /// What catches the other arming is a **lower bound on the clock**: a wait held
-/// for its own two seconds cannot end sooner, while one armed off a year-out
+/// for its own two seconds cannot end sooner, while one armed off a years-out
 /// instant ends within milliseconds — `setTimeout` fires at once for a delay
-/// past its 32-bit range, which is exactly what a wildly skewed peer would hand
-/// a hub. A lower bound is the shape a timing assertion may take here, since
-/// load can only ever make the elapsed time longer.
+/// past its 32-bit range or a negative one, which is exactly what a wildly
+/// skewed peer would hand a hub. A lower bound is the shape a timing assertion
+/// may take here, since load can only ever make the elapsed time longer.
 #[test]
 fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() {
     let Some(hub) = hub() else {
@@ -2309,13 +2312,16 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
         .expect("a site")
         .to_string();
     let wait = format!("{site}/deadline/0/ask/0");
-    let stamped = "2027-08-31T09:14:02.113Z";
+    // A worker years behind this hub: the pair is its own clock's, and both
+    // instants are ones no clock this test runs on has yet to reach.
+    let asked = "2020-01-01T00:00:00.000Z";
+    let stamped = "2020-01-01T00:00:02.000Z";
     let pause = json!({
         "wait": wait,
         "flow": "flow.deadline",
         "node": "ask",
         "shown": { "path": "dist/app" },
-        "paused_at": "2026-08-31T09:14:02.113Z",
+        "paused_at": asked,
         "expires_at": stamped,
         "effect": {
             "key": format!("{wait}#human/0"),
@@ -2332,8 +2338,9 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
     );
     assert_eq!(settled.status, 204, "{}", body_of(&settled));
 
-    // On the board, showing the instant the **pause** recorded rather than one
-    // this hub worked out: `expires_at` travels for a reader.
+    // On the board, showing when the **execution** asked and when **this hub**
+    // will stop taking an answer — the two instants read off different clocks
+    // for the two different reasons §3.4 gives.
     let report = hub.until(&execution, "published the worker's pause", |report| {
         report["interrupts"]
             .as_array()
@@ -2345,10 +2352,20 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
         "{report:#}"
     );
     assert_eq!(
-        report["interrupts"][0]["expires_at"],
-        json!(stamped),
-        "the wait publishes an expiry other than the one the process that asked recorded: \
-         {report:#}"
+        report["interrupts"][0]["paused_at"],
+        json!(asked),
+        "the wait was dated by the hub rather than by the process that asked \
+         (docs/durability.md §9): {report:#}"
+    );
+    let shown = report["interrupts"][0]["expires_at"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        shown.as_str() > stamped,
+        "the wait publishes the deadline the worker's clock stamped rather than the one this hub \
+         armed, so a status route shows a question as expired for the whole time the resume \
+         surface still takes its answer: {report:#}"
     );
 
     // …and nobody answers it. Two seconds later the budget the *composition*
@@ -2387,10 +2404,30 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
         "an expired wait was journaled with an answer nobody gave: {recorded:#}"
     );
     assert_eq!(
-        recorded["outcome"]["value"]["expiresAt"],
-        json!(stamped),
+        recorded["outcome"]["value"]["pausedAt"],
+        json!(asked),
         "the record was dated by the hub rather than by the process that asked \
          (docs/durability.md §9): {recorded:#}"
+    );
+    assert_eq!(
+        recorded["outcome"]["value"]["expiresAt"],
+        json!(shown),
+        "the record holds a deadline other than the one the board published and the timer fired, \
+         so a replayed wait reports a budget the execution was never under: {recorded:#}"
+    );
+    // …and the wait stopped waiting **at or after** the deadline it published,
+    // which no reading of the wire's instant could manage: an expiry stamped by
+    // this hub's clock, on a budget whose end this hub named, is the pair a
+    // reader is entitled to — a question is never over before the instant a
+    // surface said it would be.
+    let ended = recorded["outcome"]["value"]["settledAt"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        ended >= shown,
+        "the wait expired at {ended}, before the {shown} it published as its deadline: \
+         {recorded:#}"
     );
 
     // The board is clear: an expired wait is not a question a surface may still

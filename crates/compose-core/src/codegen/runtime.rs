@@ -153,13 +153,11 @@ mod tests {
     /// same instant an unplaced pause's is (`docs/distributed.md` §3.4, PRD
     /// resolved q46).
     ///
-    /// `expires_at` travels because a reader of the execution has to see the
-    /// wait the way the process that opened it recorded it (`docs/durability.md`
-    /// §9) — and it is stamped by the **worker's** clock, which is not this
-    /// one's. A timer armed off it would give a `timeout: 5m` node no time at
-    /// all on a worker ten minutes behind and a quarter of an hour on one ten
-    /// minutes ahead, while the same node unplaced always gets five minutes. So
-    /// the wire's instant is displayed and the descriptor's budget is armed.
+    /// The wire's `expires_at` is stamped by the **worker's** clock, which is
+    /// not this one's. A timer armed off it would give a `timeout: 5m` node no
+    /// time at all on a worker ten minutes behind and a quarter of an hour on
+    /// one ten minutes ahead, while the same node unplaced always gets five
+    /// minutes. So the descriptor's budget is what is armed.
     ///
     /// **And it is armed whole, every time the wait is planted**, which is the
     /// half a restart decides: a hub that re-derives an unanswered pause plants
@@ -170,6 +168,14 @@ mod tests {
     /// is a test that has to move two machines' clocks apart;
     /// `tests/toolchain/human-waits.mjs` drives the behaviour, and
     /// `distributed_hub_wire.rs` drives the restart over real processes.
+    ///
+    /// **And what it publishes is what it armed.** The `expiresAt` on the board
+    /// entry and on the record is derived here, off the instant this planting
+    /// spends the budget from — [`runHuman`]'s own line, which is what the
+    /// assertion holds it to. Republishing the wire's instant would show a
+    /// question as expired while the resume surface still takes its answer, on
+    /// the first planting behind a slow worker's clock as surely as on a
+    /// re-derivation after a long outage.
     #[test]
     fn a_remote_pauses_budget_is_the_compositions_and_is_armed_whole_whenever_it_is_planted() {
         let held = function_body("export async function holdRemotePause(");
@@ -187,16 +193,29 @@ mod tests {
              `timeout:`, whole, from the moment the wait is planted: {held}"
         );
         assert!(
-            !held.contains("remote.expiresAt) -") && !held.contains("Date.parse(remote.expiresAt)"),
-            "a wait's budget is armed off an instant another machine's clock stamped, so clock \
-             skew between a hub and a worker shortens or lengthens a `timeout:` the same node \
-             unplaced would honour exactly: {held}"
-        );
-        assert!(
             !held.contains("descriptor.timeoutMs -"),
             "a re-derived pause is armed with what is left of a predecessor's budget rather than \
              with the node's own, so a hub restart costs a person time the same wait unplaced \
              would have given them (PRD resolved q46): {held}"
+        );
+        let dated = ": new Date(began + descriptor.timeoutMs).toISOString();";
+        assert!(
+            local.contains(dated),
+            "the unplaced derivation this one is held to has moved, so the two are no longer the \
+             same line: {local}"
+        );
+        assert!(
+            held.contains(dated),
+            "a pause a worker opened publishes a deadline derived from something other than the \
+             instant its own timer is armed from, so a reader is shown an expiry that is not the \
+             one that will fire: {held}"
+        );
+        assert!(
+            !held.contains("remote.expiresAt"),
+            "the wire's `expires_at` is read where the wait is planted — armed off, or republished \
+             onto the board or the record — so another machine's clock decides how long a \
+             `timeout:` lasts or what a status route says about it (docs/distributed.md §3.4): \
+             {held}"
         );
     }
 

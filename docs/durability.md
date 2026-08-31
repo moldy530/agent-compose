@@ -760,8 +760,10 @@ answered out of the record whatever the clock says.
 could date. A pause a worker settled its dispatch with
 (`docs/distributed.md` §3.4) is on the dispatch row, so a hub that re-derives it
 *knows* when it took the question — and does not spend that on the timer: the
-wait is planted again, and planting is what arms it. A local pause has no such
-row and could not do otherwise. The two therefore cost a person's remaining time
+wait is planted again, planting is what arms it, and the `expiresAt` the planting
+publishes and later journals is that arming's own, since a deadline a reader is
+shown has to be the deadline that fires. `pausedAt` is untouched by any of it
+(§9). A local pause has no such row and could not do otherwise. The two therefore cost a person's remaining time
 exactly the same, which is what PRD resolved q46 requires of them — "timeout,
 retry, on_error semantics … are the single-process ones" — and a restart is
 downtime nobody could have answered through, not budget somebody spent.

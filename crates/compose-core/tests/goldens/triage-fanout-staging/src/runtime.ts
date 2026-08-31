@@ -6997,7 +6997,17 @@ export interface RemotePause {
   /** The node's `input:`, evaluated — what the human is shown (grammar 8.7). */
   readonly shown: Readonly<Record<string, unknown>>;
   readonly pausedAt: string;
-  /** When its budget runs out — present exactly when `timeout:` is declared. */
+  /**
+   * When the budget runs out **on the worker's clock** — present exactly when
+   * `timeout:` is declared, and what that process's own trace entry records
+   * (`docs/trace.md` §3.4).
+   *
+   * A fact about what the worker did, and nothing the hub arms or republishes:
+   * the deadline a hub shows is derived where its timer is armed
+   * ([`holdRemotePause`]), so that a reader is shown the instant the wait will
+   * actually end at. It travels because the pause happened on another machine
+   * and the settled row is the only record of it.
+   */
   readonly expiresAt?: string;
   /**
    * The effect record the answer is journaled under, as the worker's own
@@ -8128,28 +8138,39 @@ export async function runHuman(
  *
  *  * the **identity** is the one the worker derived (grammar 9.4), so the hub
  *    plants the wait a local run would have opened at that site;
- *  * the **instants** are the worker's, which is `docs/durability.md` §9's rule
- *    — "a reader of the resumed document sees what the execution did, not what
- *    this process did" — so what a reader is shown about this wait is what the
- *    process that asked the question recorded;
+ *  * `paused_at` is the worker's, which is `docs/durability.md` §9's rule — "a
+ *    reader of the resumed document sees what the execution did, not what this
+ *    process did" — so when the execution asked is what a reader is shown,
+ *    across a restart included;
  *  * the **contract** is the descriptor's, read out of [`humanNodes`]. The
  *    artifact is everywhere (`docs/distributed.md` §4.3), so the schema a UI is
  *    handed and the parser an answer is held to are this node's own — not a
  *    second reading of something that travelled.
  *
- * **The budget is the third of those and not the second**, which is the one
- * place the two rules pull apart. `expires_at` is an instant stamped by the
- * *worker's* clock, and two machines' clocks disagree — so a timer armed at
- * `Date.parse(expires_at) - Date.now()` would give a `timeout: 5m` node no time
- * at all on a worker ten minutes behind this hub, and a quarter of an hour on
- * one ten minutes ahead. What is armed is therefore `descriptor.timeoutMs` — the
- * composition's own budget, which is the same number the worker computed its
- * instant from — from the moment the wait goes on **this** board, which is the
- * only instant a local pause's budget is ever spent from either. A hub that
- * re-derives an unanswered pause after a restart plants it again and arms it
- * again, exactly as a resumed generation re-parks a local wait: PRD resolved q46
- * says a placed `human:` node means what the same node unplaced means, and "how
- * long do I have" is not a dimension a deploy file may answer differently.
+ * **The budget follows the third of those and not the second**, which is the one
+ * place the two rules pull apart: a deadline is an instant, so the rule above it
+ * would make it the worker's, and it may not be. The wire's `expires_at` is an
+ * instant stamped by the *worker's* clock, and two machines' clocks disagree —
+ * so a timer armed at `Date.parse(expires_at) - Date.now()` would give a
+ * `timeout: 5m` node no time at all on a worker ten minutes behind this hub, and
+ * a quarter of an hour on one ten minutes ahead. What is armed is therefore
+ * `descriptor.timeoutMs` — the composition's own budget, which is the same
+ * number the worker computed its instant from — from the moment the wait goes on
+ * **this** board, which is the only instant a local pause's budget is ever spent
+ * from either. A hub that re-derives an unanswered pause after a restart plants
+ * it again and arms it again, exactly as a resumed generation re-parks a local
+ * wait: PRD resolved q46 says a placed `human:` node means what the same node
+ * unplaced means, and "how long do I have" is not a dimension a deploy file may
+ * answer differently.
+ *
+ * **And the deadline published is the deadline armed**, which is the same rule
+ * read from the reader's side: `expiresAt` is derived here, from the instant
+ * this planting spends the budget from, and the wire's instant is never
+ * republished. Publishing the worker's would show a `timeout: 5m` question as
+ * expired for the whole five minutes it is answerable on a worker ten minutes
+ * behind — a status route saying one thing while the resume route does another —
+ * and after a restart the predecessor's instant says the same of an outage
+ * longer than the budget. One derivation, beside the arming, for both plantings.
  *
  * Answers the record the hub journals — through `keep`, the caller's writer,
  * called **inside** the settlement for the reason [`runHuman`]'s own `slot.keep`
@@ -8172,22 +8193,43 @@ export async function holdRemotePause(
   const address = `${remote.flow}.${remote.node}`;
   const descriptor = humanNodes.get(address);
   if (descriptor === undefined) {
-    // Unreachable twice over: an artifact both ends hold registers the same
-    // nodes — the handshake triple pins one tree (`docs/distributed.md` §4.1) —
-    // and the hub refuses a pause naming an unregistered node before it settles
-    // the dispatch, which is the one failure §3.4 gives the result route
-    // (`./mesh.ts`'s `pauseOf`, [`registersHumanNode`]). Said rather than
-    // assumed, because a pause nothing can validate an answer against is a wait
-    // no surface could safely take.
-    throw new Error(
+    // **A composition that no longer declares the node the pause came from.**
+    // Unreachable while one generation holds the pause: an artifact both ends
+    // hold registers the same nodes — the handshake triple pins one tree
+    // (`docs/distributed.md` §4.1) — and the hub refuses a pause naming an
+    // unregistered node before it settles the dispatch (`./mesh.ts`'s
+    // `pauseOf`). What that reasoning does *not* cover is the path this class is
+    // for: a hub restarted on a rebuilt artifact re-derives an unanswered pause
+    // straight off the settled row, where no route re-reads it, and finds a
+    // `human:` node the composition has since renamed or dropped. That is
+    // resolved q29's disagreement exactly — a journal that does not describe
+    // this run — so it is that class, at the record the answer would have been
+    // written under, rather than a bare error travelling as the node's.
+    throw new ReplayDivergence(
+      {
+        key: remote.effect.key,
+        site: remote.effect.site,
+        kind: "human",
+        ordinal: remote.effect.ordinal,
+      },
       `\`${address}\` paused on a worker and this hub registers no such \`human:\` node: it registers ${
         [...humanNodes.keys()].map((name) => `\`${name}\``).join(", ") || "none"
       } (docs/distributed.md §3.4)`,
     );
   }
+  // **The wait's own instants, on the clock that will fire them.** `pausedAt` is
+  // the pause's — when the execution asked is a fact about the run — and the
+  // deadline is this planting's, derived here from the same `began` the timer
+  // below is armed off. Those are [`runHuman`]'s own two lines, and for its
+  // reason: a reader is shown the instant the wait will actually end at.
+  const began = Date.now();
+  const expiresAt =
+    descriptor.timeoutMs === undefined
+      ? undefined
+      : new Date(began + descriptor.timeoutMs).toISOString();
   const instants: Omit<JournaledInstants, "settledAt"> = {
     pausedAt: remote.pausedAt,
-    ...(remote.expiresAt === undefined ? {} : { expiresAt: remote.expiresAt }),
+    ...(expiresAt === undefined ? {} : { expiresAt }),
   };
   const opened: HumanPause = instants;
   const wait: HumanWait = {
@@ -8198,7 +8240,7 @@ export async function holdRemotePause(
     shown: remote.shown,
     schema: descriptor.schema,
     pausedAt: remote.pausedAt,
-    ...(remote.expiresAt === undefined ? {} : { expiresAt: remote.expiresAt }),
+    ...(expiresAt === undefined ? {} : { expiresAt }),
   };
 
   const board = humanBoards.get(execution);
@@ -8277,9 +8319,9 @@ export async function holdRemotePause(
     if (descriptor.timeoutMs !== undefined) {
       // The **composition's** budget, from the moment the wait goes on this
       // board — the same line, the same number and the same instant as
-      // [`runHuman`]'s own timer, which is what parity means here. See the note
-      // above on why the wire's `expires_at` is a fact to display and not a
-      // timer to arm.
+      // [`runHuman`]'s own timer, and the instant `expiresAt` above publishes.
+      // See the note above on why the wire's `expires_at` is neither armed nor
+      // republished.
       //
       // **A restart re-arms it whole**, because the hub re-derives an unanswered
       // pause by planting it again and this is the planting: a local wait nobody

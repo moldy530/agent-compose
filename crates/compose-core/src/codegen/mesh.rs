@@ -215,7 +215,10 @@ mod tests {
     /// derives faithfully from whatever ordinal travelled beside it, so an
     /// answer journaled at an ordinal the redispatched node's own claim will
     /// never reach is a question a person has already answered and the node asks
-    /// again.
+    /// again. §3.4 states the rule the check enforces — the ordinal is the
+    /// number of `human` records the journal already holds at that site — so a
+    /// second implementation reads it out of the document rather than out of a
+    /// refusal §10.1 forbids it to rely on.
     #[test]
     fn a_paused_result_may_not_name_a_node_its_dispatch_does_not_hold() {
         let read = function_body("function pauseOf(");

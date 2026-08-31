@@ -218,6 +218,16 @@ not admit more work than the mesh can run writes the `max_concurrency:` those
 workers can serve; and a `timeout:` on a placed node is a bound on **queueing
 plus execution**, not on execution alone.
 
+What it is not a bound on is *thinking*. A dispatch that settles paused (§3.4)
+puts a `human` wait on the hub's board under the dispatching node's own instance
+path, and grammar D102's rule — "a budget above a wait does not run while the
+wait is open" — reaches it there exactly as it reaches the same node unplaced. So
+a placed node given `timeout: 10m` fails if ten minutes of queueing and work go
+by, and does not fail because an approver took a day: the clock stops while the
+question is open and starts again when it is answered. A composition that wants
+the approval itself bounded writes the `human:` block's own `timeout:`, which is
+the one line that bounds a wait on either side of the wire.
+
 A worker's `POST`s do not wait behind its poll: effect batches (§3.3) and
 results (§3.4) are issued as they happen, concurrently with the held `GET`. "One
 outstanding `GET`" bounds the polling, not the connection count.
@@ -652,43 +662,49 @@ travels than that. `wait` is the node's deterministic wait identity — its
 instance path plus an ordinal, grammar §9.4 — so the hub plants the wait a local
 run would have opened at that site, and a resume prepared against one generation
 finds it in the next (§6.1's property, for the same reason). `shown` is the
-node's evaluated `input:`, which is what the person is asked. `paused_at` and
-`expires_at` are the wait's instants, which stay the pause's own rather than
-being re-taken from the hub's clock: `docs/durability.md` §9 requires that a
-reader "sees what the execution did, not what this process did".
+node's evaluated `input:`, which is what the person is asked. `paused_at` is when
+the execution asked, and the hub publishes it unchanged, restarts included:
+`docs/durability.md` §9 requires that a reader "sees what the execution did, not
+what this process did", and a placed pause is the only wait that still has that
+instant after a restart, because it is the only one on a row.
 
-**Those two are read, never armed.** They are stamped by the *worker's* clock,
-and two machines' clocks disagree — so a hub that armed the wait's timer at
-`expires_at − now` would give a `timeout: 5m` node no time at all on a worker ten
-minutes behind it and a quarter of an hour on one ten minutes ahead, while the
-same node unplaced always gets five minutes. What the hub arms is the node's own
-`timeout:` out of its copy of the descriptor, from the moment the wait goes on
-its board — which is the only instant a local wait's budget is ever spent from
-either. Both readings are then on one clock, and a `timeout: 5m` node gets five
-minutes whichever machine asked the question, which is the parity q46 requires.
+`expires_at` is what the worker's own trace entry records for the pause
+(`docs/trace.md` §3.4) — `paused_at` plus the node's `timeout:`, on the worker's
+clock — and it is a fact about what the worker did, **never a timer and never a
+deadline the hub republishes**. Two machines' clocks disagree, so a hub that
+armed the wait at `expires_at − now` would give a `timeout: 5m` node no time at
+all on a worker ten minutes behind it and a quarter of an hour on one ten minutes
+ahead, while the same node unplaced always gets five minutes. What the hub arms
+is the node's own `timeout:` out of its copy of the descriptor, from the moment
+the wait goes on its board — the only instant a local wait's budget is ever spent
+from either — and the `expires_at` it publishes on its status route is *that*
+deadline, derived beside the arming and on the clock that will fire it. A
+`timeout: 5m` node gets five minutes whichever machine asked the question, and
+the five minutes a reader is shown are the five minutes the resume surface will
+take an answer through. Publishing the wire's instant instead would show a
+question as expired for the whole time it is answerable behind a slow worker's
+clock — a status route contradicting the resume route, which is the one thing it
+may not do.
 
 **A restart re-arms it whole**, because a restarted hub re-derives a placed pause
 by *planting it again*: it publishes the `paused_at` its predecessor published
-(`docs/durability.md` §9 — a reader sees what the execution did) and gives the
-question the node's whole `timeout:` in front of it. That is what the same node
-unplaced does, for the same reason it does it: an unanswered local pause journals
-nothing (resolved q28), so a resumed generation re-parks it from scratch and its
-budget starts again (`docs/durability.md` §5). Five minutes after a restart, a
-`timeout: 5m` pause has the same time left on either side of the wire, and "how
-long do I have" is not a question a deploy file gets to answer. The hub *knows*
-when it took the pause — the settled row is dated — and does not spend that
-knowledge on the budget; a wait no process was holding is a wait nobody could
-have answered, and charging it to the person would be charging them for the
-downtime.
+and gives the question the node's whole `timeout:` in front of it, with a
+published deadline that says so. That is what the same node unplaced does, for
+the same reason it does it: an unanswered local pause journals nothing (resolved
+q28), so a resumed generation re-parks it from scratch and its budget starts
+again (`docs/durability.md` §5). Five minutes after a restart, a `timeout: 5m`
+pause has the same time left on either side of the wire, and "how long do I have"
+is not a question a deploy file gets to answer. The hub *knows* when it took the
+pause — the settled row is dated — and does not spend that knowledge on the
+budget; a wait no process was holding is a wait nobody could have answered, and
+charging it to the person would be charging them for the downtime.
 
-`expires_at` moves with the arming, and only there. A deadline a reader is shown
-has to be the deadline that fires, so a re-derived wait publishes the budget's
-end as *this* generation measures it — the pair the pause carried gives the
-budget exactly, both instants being one worker clock — rather than an instant an
-outage longer than the budget has already passed, which would show a question as
-expired while the resume surface still takes its answer. `paused_at` does not
-move: when the execution asked is a fact about the run, and the placed pause is
-the only wait that still has it after a restart.
+**The `human:` block's `timeout:` is the only clock the question is under.** The
+*dispatching* node's `timeout:` — a bound on queueing plus execution (§2, §6.5) —
+is held still while the wait is open, because the wait is planted under that
+node's instance path and grammar D102 says a budget above a wait does not run
+while one is open. A placed node's budget therefore bounds what the instance
+*does*, on either side of the wire, and never what a person takes to answer.
 
 `effect` is the
 journal record the **answer** will be written under, exactly as the worker's own
@@ -707,6 +723,20 @@ under and one naming another node's slot would be claimed by *that* node's repla
 as a divergence. `flow` and `node` MUST name a `human:` node the hub's own
 artifact declares, since the answer is held to that node's `output:` and a
 question nothing can validate an answer against is one no surface may take.
+
+**And `ordinal` MUST be the number of `human` records this execution's journal
+already holds at `effect.site`** — counted at the site itself, since an ordinal
+is per site and not per subtree. That is the ordinal the *next* `human` claim at
+that site takes (`docs/durability.md` §4), and the redispatched node's own claim
+is what reads the answer back: a record written at any other ordinal is one no
+claim ever reaches, so the person is asked a second time — the one failure this
+whole ending exists to remove. It is stated here rather than left to the key
+check, which derives faithfully from whatever ordinal travelled beside it and so
+cannot see this. A worker of this release always sends exactly this number,
+because the pause it settles on is its own first live claim after replaying the
+`effect_history` the dispatch carried (§7.2), and the two derivations — the
+worker's claims-in-session and the hub's records-in-journal — count the same
+records.
 
 **And all of them MUST name one node**, which is the same rule along the other
 axis. `wait` and `effect.site` MUST be the **same path**: a pause's identity *is*
@@ -1196,6 +1226,13 @@ is running the whole time.
 "Fail if the machine is not up in ten minutes" is already spellable: the node's
 `timeout:`/`on_error:` chain applies from dispatch (grammar §9). No key is added
 for placements.
+
+The one interval that chain does not count is a pause the dispatch settled on
+(§3.4): the wait is planted under the dispatching node's instance path, so
+grammar D102 holds the node's budget still while the question is open, exactly as
+it does for an unplaced node with a wait inside it (§2). "Fail if nobody approves
+in ten minutes" is therefore the `human:` block's own `timeout:`, not the placed
+node's — the same line it is without a mesh.
 
 ### 6.6 The lifecycle webhook
 

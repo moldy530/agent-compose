@@ -988,14 +988,62 @@ runtime.registerHumanNodes({
   const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
   await settle();
   const seen = { settled_while_the_budget_runs: held.state };
-  // …and the instant a reader is shown is still the pause's own
-  // (`docs/durability.md` §9): displayed, not armed.
-  seen.published_expires_at = runtime.humanWaits(execution)[0]?.expiresAt;
+  // …and the deadline a reader is shown is the one this hub will fire, derived
+  // beside the arming rather than taken off the wire. The wire's instant is an
+  // hour past, so publishing it would show the question as expired for the whole
+  // minute the resume surface still takes its answer.
+  const shown = runtime.humanWaits(execution)[0]?.expiresAt;
+  seen.published_expires_at_is_the_wires = shown === pause.expiresAt;
+  seen.published_expires_at_is_ahead =
+    typeof shown === "string" && shown > new Date().toISOString();
   runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
   await settle();
   seen.settled = held.state;
   seen.record = held.value;
+  // The record holds the deadline the board published, which is the one the
+  // timer was armed for: a replayed wait shows what this execution was under.
+  seen.record_dates_the_deadline_it_published = held.value?.expiresAt === shown;
   observed.remote_skewed = seen;
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // …and a node the artifact gives no `timeout:` publishes no deadline at all,
+  // however the wire dated the pause. Grammar 8.7 makes that wait unbounded, so
+  // there is no timer — and an instant nothing will ever fire is not one a
+  // status route may show. `sign` declares none; the pause carries an hour.
+  const execution = "exec_remote_unbounded";
+  runtime.openHumanWaits(execution, true);
+  const dated = remote({ expiresAt: new Date(Date.now() + 3_600_000).toISOString() });
+  const held = outcomeOf(runtime.holdRemotePause(execution, dated, () => {}));
+  await settle();
+  observed.remote_unbounded = {
+    settled: held.state,
+    published_expires_at: runtime.humanWaits(execution)[0]?.expiresAt ?? null,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // **A composition that has stopped declaring the node the pause names.**
+  // Unreachable while one generation holds the pause — `./mesh.ts`'s `pauseOf`
+  // refuses it before the dispatch is settled — but a hub restarted on a rebuilt
+  // artifact re-derives an unanswered pause straight off the settled row, where
+  // no route reads the body again. That is resolved q29's disagreement exactly,
+  // so it is that class, named at the record the answer would have been written
+  // under, and travels past every policy rather than being absorbed as a node
+  // failure.
+  const execution = "exec_remote_unregistered";
+  runtime.openHumanWaits(execution, true);
+  const gone = outcomeOf(
+    runtime.holdRemotePause(execution, remote({ node: "withdrawn" }), () => {}),
+  );
+  await settle();
+  observed.remote_unregistered = {
+    settled: gone.state,
+    names_the_record: (gone.value ?? "").includes("escalate/0/withdrawn/0#human/0"),
+    published: runtime.humanWaits(execution).length,
+  };
   runtime.releaseHumanWaits(execution);
 }
 
