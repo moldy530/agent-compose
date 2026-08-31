@@ -118,15 +118,28 @@ pub(crate) fn refuses(diagnostics: &[Diagnostic]) -> bool {
 }
 
 /// `build`'s JSON report:
-/// `{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ]}`.
+/// `{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ], "scaffolded": [ … ]}`.
 ///
-/// One shape for every outcome, the way [`json`] is: a clean build writes three
+/// One shape for every outcome, the way [`json`] is: a clean build writes four
 /// empty arrays rather than nothing, and a `--check` that found drift writes the
-/// same three keys with the last populated. A consumer parses one document and
+/// same four keys with `drift` populated. A consumer parses one document and
 /// branches on its contents instead of on which command produced it.
+///
+/// **`scaffolded` is here because it is a write outside `--out`.** Every other
+/// key describes the output directory, which a caller can re-derive by running
+/// the build again; a scaffold is a file put into the *source* tree once and
+/// never written again, so a report that left it out would have a job discard an
+/// unreviewed file and then never hear about it a second time. It is
+/// [`scaffold_phrase`]'s claim as data — one object per implementation, `path`
+/// project-relative and `tool` the address that asked for it — because "said out
+/// loud rather than left for a later `git status`" is not a promise one output
+/// format gets to keep and the other does not. Empty under `--check`, which
+/// never scaffolds, and on a build that found every implementation already
+/// there.
 pub(crate) fn build_json(
     diagnostics: &[Diagnostic],
     drift: &[crate::build::Drift],
+    scaffolded: &[(String, String)],
 ) -> Result<String, serde_json::Error> {
     let mut report = serde_json::Map::new();
     report.insert("diagnostics".to_string(), errors_of(diagnostics)?);
@@ -146,6 +159,20 @@ pub(crate) fn build_json(
                         "state".to_string(),
                         serde_json::Value::String(entry.state.as_str().to_string()),
                     );
+                    serde_json::Value::Object(object)
+                })
+                .collect(),
+        ),
+    );
+    report.insert(
+        "scaffolded".to_string(),
+        serde_json::Value::Array(
+            scaffolded
+                .iter()
+                .map(|(path, tool)| {
+                    let mut object = serde_json::Map::new();
+                    object.insert("path".to_string(), serde_json::Value::String(path.clone()));
+                    object.insert("tool".to_string(), serde_json::Value::String(tool.clone()));
                     serde_json::Value::Object(object)
                 })
                 .collect(),

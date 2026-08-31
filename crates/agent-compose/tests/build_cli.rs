@@ -944,6 +944,10 @@ fn the_machine_format_is_one_document_on_stdout() {
         serde_json::from_str(stdout(&output)).expect("stdout is one JSON document");
     assert_eq!(report["diagnostics"], serde_json::json!([]));
     assert_eq!(report["drift"], serde_json::json!([]));
+    // Every key is present whatever the outcome, so a consumer parses one
+    // document: this composition binds no module, and the answer is an empty
+    // array rather than a missing key.
+    assert_eq!(report["scaffolded"], serde_json::json!([]));
 
     fs::write(out.join("src/state.ts"), "// mine now\n").expect("writable");
     let drifted = build(&[
@@ -1110,6 +1114,49 @@ tool.sign:
         manifest.contains("\"authored\": [\n    \"src/tools/sign.ts\"\n  ],"),
         "…and says which half of the tree it is: {manifest}"
     );
+
+    // …and the machine report carries the same claim, because a job reading
+    // JSON is exactly the reader who cannot see a verdict line: a build that
+    // wrote a file into the source tree and reported four empty arrays would
+    // have a CI run commit an unreviewed stub or throw it away, and a scaffold
+    // discarded is never offered again.
+    let second_project = scratch("module-binding-json");
+    let second_entrypoint = second_project.join("main.yml");
+    fs::write(
+        &second_entrypoint,
+        fs::read_to_string(&entrypoint).expect("the entrypoint is readable"),
+    )
+    .expect("the entrypoint is writable");
+    let scaffolding = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .env("NO_COLOR", "1")
+        .arg("build")
+        .arg(&second_entrypoint)
+        .args(["--format", "json"])
+        .output()
+        .expect("the command runs");
+    assert_eq!(code(&scaffolding), 0, "{}", stderr(&scaffolding));
+    let report: serde_json::Value =
+        serde_json::from_str(stdout(&scaffolding)).expect("stdout is one JSON document");
+    assert_eq!(
+        report["scaffolded"],
+        serde_json::json!([{ "path": "src/tools/sign.ts", "tool": "tool.sign" }]),
+        "the machine report names the file this build wrote into the project: {report}"
+    );
+    // …and the build after it reports none, for the reason the human verdict
+    // says nothing: the file is the author's now.
+    let quiet = Command::cargo_bin("agent-compose")
+        .expect("the binary under test is built")
+        .env("NO_COLOR", "1")
+        .arg("build")
+        .arg(&second_entrypoint)
+        .args(["--format", "json"])
+        .output()
+        .expect("the command runs");
+    assert_eq!(code(&quiet), 0, "{}", stderr(&quiet));
+    let report: serde_json::Value =
+        serde_json::from_str(stdout(&quiet)).expect("stdout is one JSON document");
+    assert_eq!(report["scaffolded"], serde_json::json!([]), "{report}");
 
     // 3. `validate` is clean now, and so is `--check`: the scaffold is not on
     //    the emitted file list, so nothing compares it against a template.

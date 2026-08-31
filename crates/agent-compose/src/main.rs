@@ -1058,7 +1058,7 @@ fn build_project(
         target_only,
     };
     let written = match format {
-        Format::Json => match report::build_json(&diagnostics, &drift) {
+        Format::Json => match report::build_json(&diagnostics, &drift, &scaffolded) {
             Ok(text) => write(&mut io::stdout().lock(), &text),
             Err(error) => return fail(&format!("cannot write the report as JSON: {error}")),
         },

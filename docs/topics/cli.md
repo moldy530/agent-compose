@@ -111,11 +111,14 @@ of the tree's content hash, so an edited implementation is a build to re-run and
 a new artifact. How many a build carried is on its verdict line, beside the count
 of what it emitted.
 
-`build --format json` writes `validate`'s two keys and a third:
-`{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ]}`, where `drift` names
-the files that do not match. All three are always present, so a clean build is
-three empty arrays and a `--check` that found something is the same document
-with the last one populated.
+`build --format json` writes `validate`'s two keys and two more:
+`{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ], "scaffolded": [ … ]}`,
+where `drift` names the files that do not match and `scaffolded` names the
+implementations this build wrote into your tree — `{"path": …, "tool": …}` each,
+the same write the verdict line reports, because it is the one write a build
+makes outside `--out` and it is made only once. All four are always present, so
+a clean build is four empty arrays and a `--check` that found something is the
+same document with `drift` populated.
 
 ## `run`
 
