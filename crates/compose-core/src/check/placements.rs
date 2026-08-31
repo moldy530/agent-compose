@@ -305,19 +305,41 @@ pub(crate) fn check_stores(ctx: &mut Ctx<'_>) {
         // ends at the store, so it has at least two steps: a `store.*` is never
         // a member of a placement — the parser refuses one outright (grammar
         // 14.1 rule 2), so a one-step route cannot be built by any spec that
-        // reaches this pass. Asserted rather than assumed, because the arm below
-        // is a *silent* skip: an edge that gave a store a one-step arrival would
-        // retire this rule on the shapes it fires for with no test failing.
-        // `hops` is everything between the two ends.
+        // reaches this pass. `hops` is everything between the two ends.
+        //
+        // **What decides the refusal is the partition, not the chain.** The
+        // store opens in a placement's process — `processes_of` has already said
+        // so — and that is grammar 14.1 rule 5's whole condition; the route only
+        // supplies the labels that draw *how*. So a route too short to name a
+        // binder costs the diagnostic its chain and never its verdict: the arm
+        // below reports the store with the sentence that needs no chain, rather
+        // than skipping and retiring the rule on whatever shape produced it.
+        // The `debug_assert` is the louder half of the same guard — a build
+        // under test panics on the shape rather than degrading quietly — and
+        // between the two there is no build in which an unforeseen arrival
+        // accepts a store that forks.
         let route = partition.route(address, process);
         debug_assert!(
             route.len() >= 2,
             "`{address}` arrives in placement `{placement}` in {} step(s): a store holding a \
-             process in its own right has no chain to draw, and this rule would say nothing \
-             about a store that forks",
+             process in its own right has no chain to draw, and the refusal below has no binder \
+             to name",
             route.len()
         );
         let [root, hops @ .., opened] = route.as_slice() else {
+            reports.push(
+                Diagnostic::error(
+                    DiagnosticCode::ProcessLocalStore,
+                    definition.span.clone(),
+                    format!(
+                        "`{address}` is on the process-local `{}` backend ({}), and it executes \
+                         in placement `{placement}`",
+                        backend.provider.as_str(),
+                        backend.from,
+                    ),
+                )
+                .with_help(repair(ctx, backend.provider)),
+            );
             continue;
         };
         let binder = hops.last().unwrap_or(root);
