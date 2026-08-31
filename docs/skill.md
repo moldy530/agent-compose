@@ -142,9 +142,12 @@ normative text.
   hand goes in a file of its own: a `tool.*` may bind `module: ./src/tools/<name>.ts`,
   and `agent-compose build main.yml` scaffolds that file once — typed signature,
   contract, a body that throws — and never writes it again. `build` overwrites
-  and `--check`s only the files it emits, so your implementation lives in the
-  same tree with nothing to merge. `agent-compose docs tools` has the rules,
-  including the `env:` and exactly-pinned `dependencies:` a module declares.
+  only the files it emits, so your implementation lives in the same tree with
+  nothing to merge, and it carries the ones the composition references into the
+  build so they travel with the artifact. Running one is running a tool: the
+  node's policy chain, the journal and the trace treat it exactly as they treat
+  an `exec:`. `agent-compose docs tools` has the rules, including the `env:` and
+  exactly-pinned `dependencies:` a module declares.
 - **Never put a credential in a spec.** Where a secret may come from is a rule
   the compiler enforces rather than a convention you can keep by being careful;
   `agent-compose docs models` is where it is written.

@@ -102,6 +102,13 @@ project beside the entrypoint, when it is not there. `validate` and
 repair; `build` writes the stub and never writes or reads that file again. See
 `agent-compose docs tools`.
 
+A build also **carries** each such file into the output directory, at the same
+relative path — because the composition references it, and the output directory
+is what an artifact is. Those copies are part of what `--check` compares and part
+of the tree's content hash, so an edited implementation is a build to re-run and
+a new artifact. How many a build carried is on its verdict line, beside the count
+of what it emitted.
+
 `build --format json` writes `validate`'s two keys and a third:
 `{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ]}`, where `drift` names
 the files that do not match. All three are always present, so a clean build is

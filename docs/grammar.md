@@ -1310,6 +1310,43 @@ type checker, because codegen emits a typed interface from those schemas and the
 authored file has to satisfy it. Change a schema and the authored file stops
 compiling, naming the field that moved.
 
+**The generated half is one file.** `src/modules.ts` carries one exported
+function type per module-bound tool — written from that tool's `input:` and
+`output:` — and one typed `const` beside it holding the authored default export.
+It is the **only** generated module that imports authored code; authored code
+may import anything the project generates. A scaffold imports its own contract
+type from there, so the signature an author fills in is never typed by hand.
+
+**Running one is running a tool.** A module tool executes **in the graph's own
+process** at both of a tool's surfaces — a `function:` node's activity and a tool
+an agent's model called — and everything around the call is what the other three
+bindings get: arguments parsed against the declared `input:` before the
+implementation sees them and the result against `output:` after; the node's
+`retry:`/`timeout:`/`on_error:` chain of §9.3 over the whole of it, including a
+deadline the implementation never looks at; one journaled effect, so a resumed
+execution consumes the recorded answer rather than calling again
+([`docs/durability.md`](durability.md) §3.2); the same tool-call record in the
+trace; and a model's arguments the schema refuses handed back to the model as a
+refusal rather than failing the node (D119). Only the binding differs. The
+implementation is handed `(input, context)`, where `context` is the invocation
+context §9.4's delivery surface names, exactly as a `function:` binding's is.
+
+**Declared `env:` is materialised before the call.** An `exec:` block's `env:`
+is added to the child's environment because that is where its implementation
+reads it; a module runs in this process, so each entry is set in `process.env`
+before the implementation is entered. `SIGNING_KEY: "${SIGNING_KEY}"` — the
+ordinary spelling — writes back the value already there; a binding that maps one
+name to another variable's value is how the two can differ.
+
+**The file travels with the artifact.** It is edited in the project, beside the
+entrypoint, and `build` copies each referenced one into the output directory at
+the same relative path — so it is in `src/artifact.ts`'s file list and inside the
+tree's content hash, and a worker that fetched the artifact runs it having never
+seen the checkout (PRD resolved q49,
+[`docs/distributed.md`](distributed.md) §4). Editing an implementation is a new
+artifact hash. `build --check` compares those copies like every other file of the
+tree; a file under `src/` the composition does not reference ships nowhere.
+
 **The path.** `/`-separated segments, each `.`, `..` or a name matching
 `[A-Za-z0-9_][A-Za-z0-9_.-]*`, the last ending in `.ts`; no leading `/`, no
 backslashes, no whitespace, no URLs — grammar §1.4's path form with a different

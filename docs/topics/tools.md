@@ -173,13 +173,40 @@ module:
 
 What an `exec:` or an `http:` reaches is nobody's contract. A module is held to
 the tool's declared `input:`/`output:` by the **type checker**: codegen emits a
-typed interface from those schemas, and the authored file has to satisfy it — so
-a schema change is a type error naming the field that moved, in the file that has
-to change.
+typed interface into `src/modules.ts` from those schemas, and the authored file
+has to satisfy it — so a schema change is a type error naming the field that
+moved, in the file that has to change. Your file imports that type; `bun run
+typecheck` is the gate.
 
-**Where the file goes, and who owns it.** `build` overwrites and `--check`s
-exactly the files it emits, and touches nothing else in the output directory, so
-your implementation lives in the same tree without a marker comment or a manual
+```ts
+// src/tools/sign.ts
+import type { ToolSignModule } from "../modules.ts";
+
+const toolSign: ToolSignModule = async (input) => ({
+  signature: await sign(input.payload, process.env.SIGNING_KEY),
+});
+
+export default toolSign;
+```
+
+**It is a tool, and nothing about running it is special.** The call happens in
+the graph's own process, and everything around it is what every other binding
+gets: the arguments are parsed against the declared `input:` before your code
+sees them, the result against `output:` after; the node's
+`retry:`/`timeout:`/`on_error:` chain governs it, so a module that throws is
+retried and one that never answers is bounded; the call is journaled, so a
+resumed execution does not run it a second time; it appears in the trace as the
+tool call it is; and when a **model** called it with arguments the schema
+refuses, the refusal goes back to the model rather than ending the node. Only
+the binding differs.
+
+Generated code reaches your file in exactly one place — `src/modules.ts`, which
+imports it and holds it to that type. Your file may import anything the project
+generates.
+
+**Where the file goes, and who owns it.** `build` overwrites exactly the files
+it emits and touches nothing else in the output directory, so your
+implementation lives in the same tree without a marker comment or a manual
 section anywhere. The path is project-relative, ends in `.ts`, stays inside the
 project root, and may not be a name `build` writes (`src/graph.ts`,
 `package.json`, …). `src/tools/<name>.ts` is the conventional place.
@@ -189,6 +216,16 @@ missing and names the repair; `agent-compose build <spec>` **scaffolds** it —
 typed signature, the contract as a doc comment, a body that throws — writes it
 **once**, and never writes that file again. Fill it in, commit it, rebuild: your
 bytes are left exactly alone.
+
+**It travels with the artifact.** You edit the file in the project, beside
+`main.yml`; a build copies each one the composition references into the output
+directory at the same relative path, because that directory is what a worker
+fetches and runs (`agent-compose docs targets`). So the file is in
+`src/artifact.ts`'s list and inside its content hash: editing an implementation
+is a new artifact, and every worker is handed it through the join handshake.
+`build --check` compares those copies too — a copy that no longer matches what
+you wrote is a build to re-run. A file under `src/` the composition does not
+reference ships nowhere.
 
 **Say what it reads and what it imports.** The compiler cannot walk a
 `process.env` read inside your TypeScript, and it ships no lockfile beside the
