@@ -133,6 +133,53 @@ mod tests {
         }
     }
 
+    /// …and the positive half of the same row: a session carries exactly the
+    /// fields §5 gives it.
+    ///
+    /// A denylist holds the spellings a capacity has arrived under before; this
+    /// holds the one nobody has spelled yet. A `Session` that grew a `slots`, a
+    /// `budget`, an `inFlight` or a second `dispatchable` would be a dispatch
+    /// capacity whatever it was called, and §13's first row forbids this
+    /// implementation from deciding that number — so the shape of the record the
+    /// hub keeps per worker is pinned rather than scanned.
+    #[test]
+    fn a_session_carries_exactly_the_fields_the_document_gives_it() {
+        assert_eq!(
+            fields_of("interface Session {"),
+            ["id", "claims", "dispatchable", "seen"],
+            "`src/mesh.ts`'s `Session` is not the record `docs/distributed.md` §5 describes: a \
+             field added to it is how a dispatch capacity would arrive without being called one, \
+             and §13's first row is the PRD question that forbids"
+        );
+    }
+
+    /// The field names one top-level interface of the hub declares, in order.
+    fn fields_of(header: &str) -> Vec<String> {
+        function_body(header)
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                // Prose, and the blank lines between it: a field is a line that
+                // declares one.
+                if trimmed.starts_with("//")
+                    || trimmed.starts_with('*')
+                    || trimmed.starts_with("/*")
+                {
+                    return None;
+                }
+                let declaration = trimmed.strip_suffix(';')?;
+                let (name, _) = declaration.split_once(':')?;
+                Some(
+                    name.trim()
+                        .trim_start_matches("readonly ")
+                        .trim()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
     /// …and §13's second, the same way: v1 ships no sandbox and no
     /// per-placement restriction, so nothing here names one.
     #[test]

@@ -37,6 +37,13 @@
 //! is what `worker::artifact::install` checks for and skips on, exactly as
 //! `agent-compose run` does. The alternative would be one `bun install` from the
 //! network per test.
+//!
+//! So step 4 is **skipped in this file**, and is checked where it can be run
+//! without a network: `worker::artifact`'s own
+//! `a_materialised_tree_has_its_dependency_set_installed` materialises a tree
+//! outside any install and runs the command in it, and
+//! `tests/distributed_worker_protocol.rs` provisions its workers into scratch
+//! directories where the same step runs for real.
 
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
@@ -335,6 +342,19 @@ impl Worker {
     fn kill(&mut self) {
         end(&mut self.child);
         self.reaped = true;
+    }
+
+    /// Whether this worker is still running.
+    ///
+    /// The assertion a restart needs: §3.1 makes a refused join terminal, so a
+    /// worker that read a `410` — or the `409` its late result meets — as a
+    /// refusal would be **gone**, and a mesh that healed on paper would have no
+    /// worker left in it.
+    fn running(&mut self) -> bool {
+        self.child
+            .try_wait()
+            .expect("the worker can be waited on")
+            .is_none()
     }
 
     /// Wait for this worker to exit on its own, and answer how it did.
@@ -832,6 +852,105 @@ fn a_hub_restarted_under_its_own_name_is_met_with_a_re_join() {
         outputs["signature"],
         "signed-by-the-process-that-replaced-it",
         "the worker did not come back to the hub that replaced the one it joined; it said:\n{}",
+        worker.transcript()
+    );
+}
+
+/// …and one replaced **while a worker is holding a dispatch** (§5, §3.4, §6.3).
+///
+/// The test above replaces an idle hub, where the worker's next request is a
+/// poll on a session that is holding nothing. This one replaces the process with
+/// a dispatch out at a live worker, which is the state §5 writes a rule for — "an
+/// unsettled dispatch on an ended session is superseded exactly as §6.3
+/// supersedes one" — and it is the whole of the worker's side of a restart that
+/// the idle case never reaches:
+///
+/// * the **poll thread** meets `410` and re-joins;
+/// * the **node thread**, still running `bun src/worker-node.ts` from before the
+///   restart, meets `410` on its own effect and result `POST`s and has to take
+///   the session that re-join produced rather than joining a second time itself;
+/// * its result names a dispatch the replacement process superseded at start, so
+///   it meets `409` — which §3.4 makes "discard the result and keep the session"
+///   and §3.1 would make terminal if a worker read it as a refusal;
+/// * and the attempt the retry opened is accepted **while that first runner is
+///   still alive**, which is §2's queued dispatch on a session the hub has every
+///   right to hand one to.
+///
+/// A regression in any of those strands every worker in a mesh at the first
+/// redeployment, and leaves a suite of idle restarts green. So what is asserted
+/// is that the same worker process — never restarted, never reconfigured — is
+/// still running at the end and is the one that answered the retry.
+#[test]
+fn a_hub_restarted_over_a_dispatch_a_worker_is_running_is_met_with_a_re_join() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    /// What both attempts answer with — see the third script.
+    const SIGNED: &str = "signed-across-a-restart-mid-node";
+    mesh.provider.enqueue_all([
+        // The first attempt: one loop call that answers at once and is
+        // journaled, and then a pinned-output call that does not come back
+        // until the process behind the hub has been replaced.
+        Script::new(SONNET, Outcome::text("thinking about it")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": SIGNED })).after(Duration::from_secs(3)),
+        ),
+        // Whatever the second attempt still has to ask for. A redispatch carries
+        // the history the journal held when the worker **took** it (§7.2), so
+        // whether the pinned-output call is replayed or re-issued turns on
+        // whether the re-join beat a three-second model call — a race between
+        // two processes, and both of its answers are this one.
+        Script::new(SONNET, Outcome::structured(json!({ "signature": SIGNED }))),
+    ]);
+    let mut worker = mesh.worker("restart-mid-node");
+
+    let execution = mesh.start_execution("/retried-releases", &json!({ "path": "release.dmg" }));
+    // The restart happens once the worker is **inside** the node: the first
+    // effect is committed on the hub, and the wait says a session is holding
+    // the dispatch.
+    until(
+        "the first attempt's model call reached the hub's journal",
+        || worker.transcript(),
+        || harness::journal_holds(&mesh.project, &["sign/0#model/0"]),
+    );
+    let holding = mesh.until(&execution, "was taken by the worker", |report| {
+        report["placement_waits"][0]["status"] == "dispatched"
+    });
+    let superseded = holding["placement_waits"][0]["dispatch_id"]
+        .as_str()
+        .expect("a dispatched wait names the dispatch holding it")
+        .to_string();
+
+    // The process behind the name is replaced, with that dispatch out at a
+    // worker that is still executing it.
+    mesh.restart();
+
+    // §5: the dispatch the replaced process was holding is superseded, and the
+    // node's `retry:` opens another — a different dispatch, at the next ordinal.
+    let retried = mesh.until(&execution, "opened a second attempt", |report| {
+        report["placement_waits"][0]["dispatch_id"]
+            .as_str()
+            .is_some_and(|held| held != superseded)
+    });
+    assert_eq!(
+        retried["placement_waits"][0]["wait_id"], "sign/0/1",
+        "the attempt after a superseded one is a wait of its own (§6.1): {retried:#}"
+    );
+
+    // …and the worker that was mid-node when the process changed under it is the
+    // one that answers it.
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"],
+        SIGNED,
+        "the retry did not reach the worker that survived the restart; it said:\n{}",
+        worker.transcript()
+    );
+    assert!(
+        worker.running(),
+        "the worker stopped somewhere across the restart — a `410` or the `409` its late result \
+         met was read as a refusal (§3.1, §3.4); it said:\n{}",
         worker.transcript()
     );
 }
