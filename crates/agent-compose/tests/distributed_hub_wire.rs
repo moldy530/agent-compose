@@ -786,6 +786,57 @@ fn a_placed_node_runs_on_a_worker_and_the_rest_of_the_flow_runs_on_the_hub() {
     assert_eq!(unknown.status, 409, "{}", body_of(&unknown));
 }
 
+/// A result naming no dispatch at all is answered inside §3.4's table (`409`),
+/// not beside it (`400`).
+///
+/// §3.4's refusal table is four rows — `204`, `401`, `410`, `409` — and §10.1
+/// lets an implementation rely on "the status this document gives each refusal".
+/// A body with no `dispatch_id` is a result this hub cannot attribute, which is
+/// the `409` row; answering `400` would put a status on this route that the
+/// document does not give it, and the cost lands on the other end of the wire:
+/// this repository's own worker takes any other `4xx` here for a refusal it
+/// stops for (`src/worker/node.rs`), so one malformed body would end a healthy
+/// worker instead of discarding one result.
+///
+/// §3.3 is the deliberate contrast and is asserted beside it: **that** table has
+/// a `400` row for a batch that is not a batch, so a missing `dispatch_id`
+/// there stays a `400`.
+#[test]
+fn a_result_that_names_no_dispatch_is_refused_under_the_status_that_route_gives() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+
+    let unattributable = hub.send(
+        worker
+            .request("POST", "/workers/result")
+            .json(&json!({ "output": { "signature": "signed" } })),
+    );
+    assert_eq!(
+        unattributable.status,
+        409,
+        "a result this hub cannot attribute was refused with a status §3.4's table does not \
+         give the route: {}",
+        body_of(&unattributable)
+    );
+    assert_eq!(
+        unattributable.json()["dispatch_id"],
+        Value::Null,
+        "the refusal names a dispatch the body never named: {}",
+        body_of(&unattributable)
+    );
+
+    // The batch route's own table, which does give a `400` to a body that is
+    // not a batch (§3.3's fourth row).
+    let malformed = hub.send(
+        worker
+            .request("POST", "/workers/effects")
+            .json(&json!({ "effects": [] })),
+    );
+    assert_eq!(malformed.status, 400, "{}", body_of(&malformed));
+}
+
 /// What a placed node's **stores** did reaches the trace entry the hub writes
 /// (PRD 5.8, §4.3).
 ///

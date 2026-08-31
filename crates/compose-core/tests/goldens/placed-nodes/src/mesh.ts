@@ -1382,7 +1382,18 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   const body = (request.body ?? {}) as Record<string, unknown>;
   const id = typeof body["dispatch_id"] === "string" ? body["dispatch_id"] : undefined;
   if (id === undefined) {
-    return reply.code(400).send({ error: "a result names the `dispatch_id` it settles" });
+    // **`409`, and not the `400` §3.3 gives a malformed batch.** §3.4's table is
+    // four rows and none of them is a `400`, and §10.1 lets an implementation
+    // rely on "the status this document gives each refusal" — so a body naming
+    // no dispatch is answered under the row it belongs to: a result this hub
+    // cannot attribute is discarded. The difference is not cosmetic on the other
+    // end of the wire, where a `4xx` outside the table is a refusal a worker
+    // stops for (`src/worker/node.rs`), and a healthy worker is not worth losing
+    // over one unattributable result.
+    return reply.code(409).send({
+      dispatch_id: null,
+      error: "a result names the `dispatch_id` it settles, and this one names none",
+    });
   }
   const journal = await openJournal();
   const row = journal.dispatchOf(id);
