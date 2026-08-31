@@ -1025,9 +1025,10 @@
     },
 
     "modulePath": {
-      "description": "A project-relative path to a TypeScript file inside the project: `/`-separated segments, each `.`, `..`, or a name matching [A-Za-z0-9_][A-Za-z0-9_.-]*, the last ending in `.ts`. No leading `/`, no backslashes, no whitespace, no URLs. `validate` additionally refuses a path whose prefix climbs out of the project root and one naming a file `build` emits, neither of which a per-file schema can decide (grammar 6.1, Decision D132).",
+      "description": "A project-relative path to a TypeScript implementation inside the project: `/`-separated segments, each `.`, `..`, or a name matching [A-Za-z0-9_][A-Za-z0-9_.-]*, the last ending in `.ts` and never in `.d.ts` - a declaration file states types and holds no code, and the generated seam imports a bound implementation for its value, which the type checker refuses of a declaration. No leading `/`, no backslashes, no whitespace, no URLs. `validate` additionally refuses a path whose prefix climbs out of the project root and one naming a file `build` emits, neither of which a per-file schema can decide (grammar 6.1, Decision D132).",
       "type": "string",
-      "pattern": "^((\\.|\\.\\.|[A-Za-z0-9_][A-Za-z0-9_.-]*)/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\\.ts$"
+      "pattern": "^((\\.|\\.\\.|[A-Za-z0-9_][A-Za-z0-9_.-]*)/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\\.ts$",
+      "not": { "pattern": "\\.[dD]\\.ts$" }
     },
 
     "moduleImpl": {

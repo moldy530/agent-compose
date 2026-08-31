@@ -489,7 +489,7 @@ const GRAMMAR: &[Check] = &[
     // agreement *between* tools, and what needs the filesystem is whether the
     // file is there.
     Check {
-        rule: "a `module:` path is project-relative TypeScript inside the project, at a name `build` does not emit (6.1, D132)",
+        rule: "a `module:` path is a project-relative TypeScript implementation — never a `.d.ts` — inside the project, at a name `build` does not emit (6.1, D132)",
         pass: "parse/binding.rs",
         codes: &["invalid-module-path", "missing-key", "unexpected-env-ref"],
         evidence: Evidence::Fixture,

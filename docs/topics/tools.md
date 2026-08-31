@@ -213,13 +213,14 @@ generates.
 **Where the file goes, and who owns it.** `build` overwrites exactly the files
 it emits and touches nothing else in the output directory, so your
 implementation lives in the same tree without a marker comment or a manual
-section anywhere. The path is project-relative, ends in `.ts`, stays inside the
-project root, is at most 100 bytes long — the artifact is served as a tar and
-that is what a header holds — and may neither be a name `build` writes
-(`src/graph.ts`, `package.json`, …) nor sit inside one. Two bindings may not
-name one file, two spellings of one file, or a path inside another's:
-`src/tools/<name>.ts` is the conventional place, and one file answers to one
-tool.
+section anywhere. The path is project-relative, ends in `.ts` and not in `.d.ts`
+— a declaration file states types and holds no code, and the seam imports your
+module for its value — stays inside the project root, is at most 100 bytes long
+— the artifact is served as a tar and that is what a header holds — and may
+neither be a name `build` writes (`src/graph.ts`, `package.json`, …) nor sit
+inside one. Two bindings may not name one file, two spellings of one file, or a
+path inside another's: `src/tools/<name>.ts` is the conventional place, and one
+file answers to one tool.
 
 **You never type the signature.** `validate` refuses a binding whose file is
 missing and names the repair; `agent-compose build <spec>` **scaffolds** it —

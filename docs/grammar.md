@@ -1295,7 +1295,7 @@ module:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `path` | string | **yes** | project-relative, `/`-separated, ending in `.ts`; the scalar form is this key alone |
+| `path` | string | **yes** | project-relative, `/`-separated, ending in `.ts` and not `.d.ts`; the scalar form is this key alone |
 | `env` | map env-var-name (`[A-Za-z_][A-Za-z0-9_]*`) → string (interpolable) | no | the environment the module's code may read (§4.3 class 2) |
 | `dependencies` | map npm-package-name → **exact** version | no | folded into the generated `package.json` |
 
@@ -1356,20 +1356,25 @@ artifact hash. `build --check` compares those copies like every other file of th
 tree; a file under `src/` the composition does not reference ships nowhere.
 
 **The path.** `/`-separated segments, each `.`, `..` or a name matching
-`[A-Za-z0-9_][A-Za-z0-9_.-]*`, the last ending in `.ts`; no leading `/`, no
-backslashes, no whitespace, no URLs — grammar §1.4's path form with a different
-extension, and for the same reason. Every prefix stays **inside the project
-root**, and a path that climbs out and returns is refused exactly as an
-`imports:` entry is. Normalized, it is at most **100 bytes**: the artifact is
-served to a worker as a tar and a ustar header holds a name in that many
-([`docs/distributed.md`](distributed.md) §3.5), so a longer path is a
-composition that validates and whose artifact no worker could ever fetch. It
-also may not name a path `agent-compose build` writes (`src/graph.ts`,
-`package.json`, …), **nor sit inside one**: the emitted file list is the
-boundary between generated and authored code (PRD resolved q47), so a binding on
-one of those names would be authored code the next build destroys, and
-`./src/graph.ts/impl.ts` would need `src/graph.ts` to be a file and a directory
-in one tree. The code for all of them is `invalid-module-path`.
+`[A-Za-z0-9_][A-Za-z0-9_.-]*`, the last ending in `.ts` — and **never in
+`.d.ts`**, which ends in `.ts` and names no implementation: a declaration file
+states a module's types and holds none of its code, while `src/modules.ts`
+imports a bound implementation for its *value*, which the type checker refuses
+of a declaration outright. Accepting one would scaffold executable code into a
+file that may hold none and emit a project that could never type-check, so it is
+refused at the path. No leading `/`, no backslashes, no whitespace, no URLs —
+grammar §1.4's path form with a different extension, and for the same reason.
+Every prefix stays **inside the project root**, and a path that climbs out and
+returns is refused exactly as an `imports:` entry is. Normalized, it is at most
+**100 bytes**: the artifact is served to a worker as a tar and a ustar header
+holds a name in that many ([`docs/distributed.md`](distributed.md) §3.5), so a
+longer path is a composition that validates and whose artifact no worker could
+ever fetch. It also may not name a path `agent-compose build` writes
+(`src/graph.ts`, `package.json`, …), **nor sit inside one**: the emitted file
+list is the boundary between generated and authored code (PRD resolved q47), so
+a binding on one of those names would be authored code the next build destroys,
+and `./src/graph.ts/impl.ts` would need `src/graph.ts` to be a file and a
+directory in one tree. The code for all of them is `invalid-module-path`.
 
 **Case is not what tells two paths apart, and neither is nesting.** A path here
 is a file name, and macOS and Windows hold `src/Graph.ts` and `src/graph.ts` in
@@ -7789,12 +7794,14 @@ and writes, removes and reports nothing else under the output directory. A
 `tool.*` may bind a fourth implementation, `module: <project-relative .ts>`,
 naming hand-authored TypeScript in that same tree; `build` scaffolds an absent
 one **once** and never writes it again. The path is refused when it is not
-project-relative and `.ts`, when any prefix climbs out of the project root, when
-it is longer than the 100 bytes a tar header holds, and when it names a file the
-emitter writes **or sits inside one**; the code is `invalid-module-path`, as is
-two bindings whose paths cannot share a checkout — the same file, two spellings
-of it, or one inside the other. A binding whose file is missing is refused by
-`validate` and by `build --check`, naming `build` as the repair.
+project-relative and `.ts`, when it is a `.d.ts` — which ends in `.ts` and
+declares an implementation rather than being one — when any prefix climbs out of
+the project root, when it is longer than the 100 bytes a tar header holds, and
+when it names a file the emitter writes **or sits inside one**; the code is
+`invalid-module-path`, as is two bindings whose paths cannot share a checkout —
+the same file, two spellings of it, or one inside the other. A binding whose file
+is missing is refused by `validate` and by `build --check`, naming `build` as the
+repair.
 
 **Rationale.**
 

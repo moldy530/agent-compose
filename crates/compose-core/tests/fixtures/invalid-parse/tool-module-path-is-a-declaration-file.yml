@@ -1,0 +1,12 @@
+# rule: a `module:` path names an implementation, and a `.d.ts` is not one (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `./src/tools/sign.d.ts` is a TypeScript declaration file, which holds no implementation
+# at: 12:11
+# help: a `.d.ts` states types and never code, and `src/modules.ts` imports a bound implementation for its value — which `tsc` refuses of a declaration file — so the project this emits could not type-check whatever the file held: name the implementation itself, `src/tools/<name>.ts` being the conventional place (grammar 6.1, PRD resolved q48)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.d.ts

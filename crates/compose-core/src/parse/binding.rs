@@ -422,9 +422,30 @@ pub(crate) fn function_binding(node: &Node, subject: &str, cx: &mut Cx) -> Optio
 ///
 /// One, and it is `.ts`: the generated project is TypeScript run from source
 /// with no build step (see `codegen`), so a `.js` beside it would be a second
-/// authoring language nothing type-checks, and a `.d.ts` names no
-/// implementation at all.
+/// authoring language nothing type-checks.
+///
+/// It is not the whole extension rule, because it cannot be: a `.d.ts` ends in
+/// `.ts` and passes this test while naming no implementation at all, which is
+/// [`MODULE_DECLARATION_ENDING`]'s to refuse.
 const MODULE_EXTENSION: &str = ".ts";
+
+/// The ending that makes a `.ts` file a **declaration** file rather than an
+/// implementation.
+///
+/// [`MODULE_EXTENSION`] alone cannot tell the two apart, because a declaration
+/// file's name ends in `.ts` too — and `./src/tools/sign.d.ts` is a binding
+/// whose project could never type-check whatever it held: `src/modules.ts`
+/// imports a bound implementation for its **value**, and `tsc` refuses a value
+/// import of a declaration file outright (TS2846). A build would scaffold
+/// executable code into a file that may hold none, `--check` would be clean
+/// forever, and the type gate PRD resolved q48 makes the merge tool would be
+/// unreachable for that composition — so the refusal is here, at the path, with
+/// a span on what was written.
+///
+/// Matched **case-insensitively** for the reason the emitted-name comparison
+/// below is: the string is a file name first, and macOS and Windows do not tell
+/// `sign.D.ts` and `sign.d.ts` apart.
+const MODULE_DECLARATION_ENDING: &str = ".d.ts";
 
 const MODULE_PATH_RULE: &str = "a `module:` path is `/`-separated, each segment `.`, `..`, or a name matching `[A-Za-z0-9_][A-Za-z0-9_.-]*`, and the last segment ends in `.ts`: no leading `/`, no backslashes, no whitespace, no URLs (grammar 6.1)";
 
@@ -508,6 +529,26 @@ fn module_path(written: &Spanned<String>, subject: &str, cx: &mut Cx) -> Option<
                 format!("`{text}` is not a project-relative path to a TypeScript file"),
             )
             .with_help(MODULE_PATH_RULE),
+        );
+        return None;
+    }
+    if text
+        .rsplit('/')
+        .next()
+        .unwrap_or(text)
+        .to_ascii_lowercase()
+        .ends_with(MODULE_DECLARATION_ENDING)
+    {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!("`{text}` is a TypeScript declaration file, which holds no implementation"),
+            )
+            .with_help(format!(
+                "a `.d.ts` states types and never code, and `src/modules.ts` imports a bound implementation for its value — which `tsc` refuses of a declaration file — so the project this emits could not type-check whatever the file held: name the implementation itself, `{}/<name>.ts` being the conventional place (grammar 6.1, PRD resolved q48)",
+                crate::codegen::AUTHORED_ZONE
+            )),
         );
         return None;
     }

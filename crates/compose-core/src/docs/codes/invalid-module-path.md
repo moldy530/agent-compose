@@ -5,12 +5,19 @@
 A `module:` binding names hand-authored TypeScript **inside the project**, and
 that file travels: it ships in the artifact every worker fetches, hash-addressed
 like everything else the build produced (`docs/distributed.md` §4). So its path
-has one portable spelling, and five rules hold it there.
+has one portable spelling, and six rules hold it there.
 
 It is **project-relative**: `/`-separated segments, each `.`, `..` or a name
 matching `[A-Za-z0-9_][A-Za-z0-9_.-]*`, the last ending in `.ts`. No leading
 `/`, no backslashes, no whitespace, no URLs. An absolute path names a file on
 the machine that ran `build` and nowhere else.
+
+It names an **implementation**, so it is never a `.d.ts`. A declaration file
+ends in `.ts` and holds no code — it states the types of a module written
+somewhere else — while `src/modules.ts` imports a bound implementation for its
+*value*, which the type checker refuses of a declaration outright. A binding on
+one would have `build` scaffold executable code into a file that may hold none,
+and emit a project that could never type-check whatever was there.
 
 Every prefix stays **inside the project root** — the entrypoint's own directory.
 A path that climbs out and returns is refused even where it lands back inside,
