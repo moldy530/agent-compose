@@ -369,6 +369,13 @@ flow.escalated:
   nodes:
     escalate:
       agent: agent.escalator
+      # The retry §6.4 says a placement worth sleeping on wants. An answer can
+      # land while the asking worker's dead session is still inside its liveness
+      # window, in which case the hub hands the redispatch to the session that
+      # is gone and the expiry supersedes it — an **attempt**, not the run
+      # (§6.3), but only where a retry makes the next attempt reachable. The
+      # answer's other timing parks the redispatch directly and spends nothing.
+      retry: { max: 2, backoff: 1ms }
       input:
         path: "input.path"
       writes:
