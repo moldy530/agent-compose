@@ -1,0 +1,15 @@
+# rule: placements are disjoint (grammar 14.1, Decision D129)
+# code: conflicting-placement
+# message: `agent.signer` is a member of both `mac` and `gpu`
+# at: 15:15
+# help: placements are disjoint: a component runs on the workers claiming one placement, and two claims would leave the hub to choose — name it in one of the two (grammar 14.1, PRD resolved q38)
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  mac:
+    members: [agent.signer]
+  gpu:
+    members: [agent.signer]

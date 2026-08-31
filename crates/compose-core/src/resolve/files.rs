@@ -445,6 +445,7 @@ fn deploy(
                     source: file.source,
                     version: file.version,
                     placements: None,
+                    hub: None,
                     storage_backends: None,
                     event_sources: None,
                     span: file.span,
@@ -585,9 +586,10 @@ fn is_portable_target(target: &str) -> bool {
 /// The span of whichever deploy section decided a file's kind, for the
 /// diagnostics that have to point at the evidence.
 fn deploy_section_span(file: &DeployFile) -> Option<Span> {
-    file.placements
+    file.hub
         .as_ref()
         .map(|section| section.span.clone())
+        .or_else(|| file.placements.as_ref().map(|section| section.span.clone()))
         .or_else(|| {
             file.storage_backends
                 .as_ref()

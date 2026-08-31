@@ -2,7 +2,10 @@
 # admits everything of except `storage_backends:` (grammar 14, Decision D87).
 version: "0.1"
 
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
 placements:
-  agent.writer:
-    runtime: colocated
+  writers:
+    members: [agent.writer]
     description: In-process, where there is one process.

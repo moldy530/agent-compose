@@ -1,0 +1,13 @@
+# rule: a target that declares placements and writes no `hub:` at all is pointed at itself (grammar 14.2, Decision D130)
+# code: missing-join-token
+# message: this target declares placements and no `hub.join_token`
+# at: 7:1
+# help: a placement is claimed by a worker at an authenticated join, and the join token is the whole of that authentication — holding it is being trusted with the mesh: declare `hub: { join_token: ${SOME_VAR} }`, or remove the placements if this target runs in one process (grammar 14.2, PRD resolved q38)
+# count: 1
+version: "0.1"
+
+placements:
+  mac:
+    members: [agent.signer]
+  gpu:
+    members: [agent.embedder]

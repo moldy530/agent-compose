@@ -112,8 +112,9 @@ fn no_target_named_resolves_local() {
     // `local` substitutes local storage unconditionally and may not carry a
     // backend section at all, so the artifact carries none either.
     assert!(ir.deploy.storage_backends.is_none());
-    // `placements:` is reserved grammar, and reserved is not inert: `local`
-    // carries the section it was declared with, span and all (D87).
+    // `hub:` and `placements:` are live static grammar `local` admits like any
+    // other target: the artifact carries the sections it was declared with,
+    // spans and all (D87, grammar 14.1, 14.2).
     let placements = ir
         .deploy
         .placements
@@ -121,6 +122,19 @@ fn no_target_named_resolves_local() {
         .expect("`deploy/local.yml` declares `placements:`");
     assert!(!placements.is_empty());
     assert_eq!(placements.span.source.as_str(), "deploy/local.yml");
+    let hub = ir
+        .deploy
+        .hub
+        .as_ref()
+        .expect("`deploy/local.yml` declares `hub:`");
+    assert_eq!(
+        hub.join_token
+            .as_ref()
+            .expect("the hub declares a join token")
+            .value
+            .name,
+        "MESH_JOIN_TOKEN"
+    );
 }
 
 /// Under a named target the same composition carries that target's layer, and
@@ -543,7 +557,7 @@ fn a_declared_section_carries_its_span_even_when_it_declares_nothing() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Grammar 14.2's capability rule is checked on both halves of a backend
+/// Grammar 14.3's capability rule is checked on both halves of a backend
 /// config — the per-kind `defaults:` in the parser, the alias here — and a rule
 /// written a little too tight is exactly what a negative corpus cannot catch.
 /// So: every store kind bound to an alias whose provider serves it, two stores

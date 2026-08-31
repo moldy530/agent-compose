@@ -1,0 +1,9 @@
+# rule: placements with no `hub:` block at all is refused by the conditional's `required` (grammar 14.2, Decision D130)
+# at: <root>
+# via: /allOf/0/then/required
+version: "0.1"
+placements:
+  mac:
+    members: [agent.signer]
+  gpu:
+    members: [agent.embedder]

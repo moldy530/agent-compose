@@ -1,0 +1,30 @@
+# rule: a placed tool attached to an unplaced agent would run on the hub (grammar 14.1, Decision D129)
+# code: conflicting-placement
+# message: `tool.xcodebuild` is a member of placement `mac`, and `agent.builder` that attaches it has no placement, so it runs on the hub
+# at: main.yml:26:11
+# label: deploy/mesh.yml:7:3 `mac` is declared here
+# help: an attached tool is called from inside the agent's own tool loop, so it executes on whichever worker took the agent's dispatch: put the two in one placement, drop the tool's, or reach the tool from a `function:` node, where its placement is the whole answer (grammar 14.1, PRD resolved q40)
+# target: mesh
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+tool.xcodebuild:
+  description: Build and sign the macOS app.
+  input:
+    scheme: { type: string }
+  output:
+    log: { type: string }
+  exec:
+    command: xcodebuild
+agent.builder:
+  model: model.m
+  prompt: Build the requested scheme.
+  tools: [tool.xcodebuild]
+  input:
+    scheme: { type: string }
+  output:
+    verdict: { type: string }

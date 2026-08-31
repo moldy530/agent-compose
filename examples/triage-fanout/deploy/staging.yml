@@ -3,15 +3,28 @@
 # (PRD 5.8 per-target invariant).
 version: "0.1"
 
-# RESERVED (PRD 5.10): parsed and validated in v0, executed in M3. Map instances
-# are the natural unit for `runtime: isolated` — one worker per sandbox, with no
-# change to the logical definition.
+# The process that owns the graph: scheduler, journal, wait board and triggers
+# (grammar 14.2, PRD resolved q37). `join_token` is the bearer credential every
+# worker presents at join, as an `${ENV}` reference and never a literal, and
+# holding it is being trusted with the mesh (PRD resolved q38). `public_url` is
+# the base every ingress URL this deployment hands out derives from.
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+  public_url: "https://triage.internal.example"
+
+# Logical names a worker claims at join — capability affinity, not load
+# assignment, which is why nothing here is an address (grammar 14.1). Components
+# named in no placement execute on the hub, which is every other component of
+# this project.
 placements:
-  agent.fixer:
-    runtime: isolated
-    network: egress
-  flow.triage:
-    runtime: colocated
+  patchers:
+    members:
+      - agent.fixer
+      - tool.repo_grep
+    description: >-
+      The machines holding a checkout: agent.fixer reads files under the repo
+      root, and tool.repo_grep — reached from a `function:` node, so its own
+      placement governs it — greps the same tree.
 
 storage_backends:
   defaults:

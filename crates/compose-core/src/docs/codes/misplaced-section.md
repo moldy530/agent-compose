@@ -4,7 +4,7 @@
 
 There are exactly two document kinds and they are **disjoint**. A spec file
 carries `version`, `imports` (entrypoint only), `defaults`, `state`, `triggers`
-and definition keys. A deploy file carries `version`, `placements`,
+and definition keys. A deploy file carries `version`, `hub`, `placements`,
 `storage_backends` and `event_sources`.
 
 That split is the mechanical enforcement of the per-target invariant: **only the

@@ -216,4 +216,4 @@ schema refuses is returned to the model as an error tool result and reaches no
 backend — a refused call leaves no store record. A **backend** that could not
 answer fails the agent node instead.
 
-Normative source: `docs/grammar.md` §8.8, §11, §11.1–11.5, §14.2
+Normative source: `docs/grammar.md` §8.8, §11, §11.1–11.5, §14.3

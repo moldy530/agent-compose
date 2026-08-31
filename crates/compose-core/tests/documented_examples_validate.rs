@@ -39,6 +39,15 @@
 //!   block and the pair is resolved under `--target <target>`. The marker
 //!   carries the name because the target is what the file is *for*, and a
 //!   deploy file checked under the wrong name is not checked at all.
+//!
+//!   An **explanation** may carry deploy blocks too, and there they do double
+//!   duty, because a deploy-layer rule has no single-file demonstration at all:
+//!   the explanation's `yaml triggers` block is the composition, its **first**
+//!   `yaml deploy <t>` block is the deploy layer that triggers the code, and
+//!   every **further** one is a written-out repair held to a clean verdict —
+//!   the deploy-layer counterpart of the `yaml spec` correction a spec-level
+//!   explanation carries. Each block needs its own target name, since each
+//!   becomes `deploy/<target>.yml` in one scratch project.
 //! * ```` ```yaml ```` — a fragment. Skipped, and deliberately so: a block
 //!   showing `retry: { max: 2 }` on its own is not a document and has no
 //!   verdict to have.
@@ -170,6 +179,27 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "unknown-server-tool",
     "unknown-server-tool-field",
     "unsupported-server-tools",
+];
+
+/// The explanations whose failure lives in the **deploy layer**, and the codes
+/// they teach.
+///
+/// A deploy-layer rule cannot be demonstrated by one `main.yml`: the sections it
+/// is about are illegal in a spec file, so the example needs a second document
+/// the harness above writes for it. Rather than exempt these codes from carrying
+/// a runnable example — which is what
+/// [`EXPLANATIONS_WITHOUT_A_RUNNABLE_EXAMPLE`] would have meant, and would have
+/// left three checks with nothing running them — the explanation carries its
+/// deploy file in the document, and both halves are run: the first block must
+/// report the code, and every further block must clear it.
+///
+/// A **set equality**, like every list in this file: an explanation that lost
+/// its deploy blocks would still read as a worked example and would be checked
+/// by nothing.
+const EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE: &[&str] = &[
+    "conflicting-placement",
+    "missing-join-token",
+    "unsupported-placement",
 ];
 
 /// The topics that teach a deploy file, and must keep one that resolves.
@@ -305,6 +335,32 @@ fn report(name: &str, source: &str) -> Vec<Diagnostic> {
     let directory = scratch(name);
     fs::write(directory.join("main.yml"), source).expect("can write the spec");
     report_in(&directory, compose_core::DEFAULT_TARGET)
+}
+
+/// Write one composition and every deploy file a document declares, then
+/// resolve it under `target`.
+///
+/// Every deploy block goes into the project, not just the one being checked, so
+/// that the files a reader would copy sit beside each other exactly as they do
+/// in the document. Only the named target is resolved: the others are files the
+/// composition simply has.
+fn report_with_deploy(
+    name: &str,
+    spec: &str,
+    deploys: &[(String, String)],
+    target: &str,
+) -> Vec<Diagnostic> {
+    let directory = scratch(name);
+    fs::write(directory.join("main.yml"), spec).expect("can write the spec");
+    fs::create_dir_all(directory.join("deploy")).expect("can create `deploy/`");
+    for (declared, body) in deploys {
+        fs::write(
+            directory.join("deploy").join(format!("{declared}.yml")),
+            body,
+        )
+        .expect("can write the deploy file");
+    }
+    report_in(&directory, target)
 }
 
 /// Resolve and check one complete spec, and require it to say nothing.
@@ -589,8 +645,17 @@ fn every_deploy_example_resolves_against_its_topic() {
 #[test]
 fn every_explanation_example_reports_its_code() {
     for (code, document) in explanations() {
+        let deploys = deploy_blocks(&document);
         for (index, source) in blocks(&document, "triggers").into_iter().enumerate() {
-            let diagnostics = report(&format!("explain-{code}-{index}"), &source);
+            let name = format!("explain-{code}-{index}");
+            // A deploy-layer failure is the pair, not the spec: the composition
+            // on its own is well-formed, and the first deploy block is what
+            // makes it an error.
+            let diagnostics = if deploys.is_empty() {
+                report(&name, &source)
+            } else {
+                report_with_deploy(&name, &source, &deploys, &deploys[0].0)
+            };
             let reported: Vec<&str> = diagnostics
                 .iter()
                 .map(|diagnostic| diagnostic.code.as_str())
@@ -602,6 +667,72 @@ fn every_explanation_example_reports_its_code() {
             );
         }
     }
+}
+
+/// An explanation whose failure is in the deploy layer carries the deploy files
+/// its example needs, and every repair it writes out resolves clean.
+///
+/// The deploy-layer twin of
+/// [`every_corrected_explanation_example_validates_clean`], and it exists for
+/// the same reason: an explanation is required to *report* its code, and a fix
+/// stated only in prose is the one part nothing runs. Here the fix **is** a
+/// deploy file, so it is run as one — against the same composition, under its
+/// own target name.
+#[test]
+fn every_deploy_layer_explanation_carries_a_failing_pair_and_a_repair() {
+    let mut carrying = Vec::new();
+    for (code, document) in explanations() {
+        let deploys = deploy_blocks(&document);
+        if deploys.is_empty() {
+            continue;
+        }
+        carrying.push(code.clone());
+
+        let specs = blocks(&document, "triggers");
+        assert_eq!(
+            specs.len(),
+            1,
+            "`{code}.md` has exactly one composition for its deploy files to be targets of"
+        );
+        assert!(
+            deploys.len() >= 2,
+            "`{code}.md` writes a deploy file that triggers the code and none that repairs it;              the second `yaml deploy <target>` block is the fix, applied"
+        );
+        let mut names: Vec<&str> = deploys.iter().map(|(target, _)| target.as_str()).collect();
+        names.sort_unstable();
+        let distinct = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            distinct,
+            "`{code}.md` names one target twice; each block becomes `deploy/<target>.yml`, so              the second would overwrite the first"
+        );
+
+        for (target, _) in &deploys[1..] {
+            let diagnostics = report_with_deploy(
+                &format!("explain-repair-{code}-{target}"),
+                &specs[0],
+                &deploys,
+                target,
+            );
+            assert!(
+                diagnostics.is_empty(),
+                "`{code}.md`'s repaired `deploy/{target}.yml` does not validate against its own \
+                 spec:\n{}",
+                render(&diagnostics)
+            );
+        }
+    }
+    carrying.sort();
+    let expected: Vec<String> = EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE
+        .iter()
+        .map(|code| (*code).to_string())
+        .collect();
+    assert_eq!(
+        carrying, expected,
+        "an explanation gained or lost its deploy example; `yaml deploy <target>` is the marker, \
+         and EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE is the list"
+    );
 }
 
 /// Every repair an explanation writes out validates clean.
@@ -685,6 +816,9 @@ fn every_listed_explanation_names_a_real_code() {
         assert!(!reason.is_empty(), "`{code}`'s exemption states a reason");
     }
     for code in EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE {
+        assert!(known.contains(code), "`{code}` is not a diagnostic code");
+    }
+    for code in EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE {
         assert!(known.contains(code), "`{code}` is not a diagnostic code");
     }
 }

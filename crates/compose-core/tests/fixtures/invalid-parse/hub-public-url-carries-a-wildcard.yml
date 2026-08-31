@@ -1,0 +1,8 @@
+# rule: `hub.public_url:` is this deployment's own URL, not a pattern (grammar 14.2)
+# code: invalid-value
+# message: "https://*.hub.example" is not a `hub.public_url`: it contains `*`, and a public base is this deployment's own URL rather than a pattern
+# at: 8:15
+version: "0.1"
+
+hub:
+  public_url: "https://*.hub.example"

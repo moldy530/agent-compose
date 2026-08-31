@@ -739,12 +739,17 @@ fn a_deploy_file_with_every_section() {
         r#"
 version: "0.1"
 
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+  public_url: "https://hub.example"
+
 placements:
-  agent.fixer:
-    runtime: isolated
-    network: none
-    description: Sandboxed, no egress.
-  flow.triage: { runtime: colocated }
+  mac:
+    members:
+      - agent.fixer
+      - tool.repo_grep
+    description: The machine with the signing keys.
+  gpu: { members: [agent.embedder] }
 
 storage_backends:
   defaults:

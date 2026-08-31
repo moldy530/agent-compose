@@ -35,18 +35,18 @@
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/trigger" }
     },
+    "hub": {
+      "description": "DEPLOY FILE ONLY. The process that owns the graph: scheduler, journal, wait board and triggers. Workers dial out to it and never the other way round. Grammar 14.2 / PRD resolved q37, q38, q44.",
+      "$ref": "#/$defs/hub"
+    },
     "placements": {
-      "description": "DEPLOY FILE ONLY. Placement annotations per component address. Parsed and validated in v0, executed in M3. Grammar 14.1 / PRD 5.10.",
+      "description": "DEPLOY FILE ONLY. Logical names a worker claims at an authenticated join, each naming the components that claim runs. Live static grammar: every rule is checked, and the worker protocol lands with the runtime. Grammar 14.1 / PRD resolved q38.",
       "type": "object",
-      "propertyNames": {
-        "description": "An agent., tool., or flow. address defined in the composition.",
-        "type": "string",
-        "pattern": "^(agent|tool|flow)\\.[a-z][a-z0-9_]{0,63}$"
-      },
+      "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/placement" }
     },
     "storage_backends": {
-      "description": "DEPLOY FILE ONLY. Physical backing for stores: per-kind defaults plus named aliases that `store.<s>.backend` refers to. Resolution: explicit alias -> per-kind defaults -> target built-in. Grammar 14.2 / PRD 5.8.",
+      "description": "DEPLOY FILE ONLY. Physical backing for stores: per-kind defaults plus named aliases that `store.<s>.backend` refers to. Resolution: explicit alias -> per-kind defaults -> target built-in. Grammar 14.3 / PRD 5.8.",
       "type": "object",
       "properties": {
         "defaults": {
@@ -69,7 +69,7 @@
       "additionalProperties": false
     },
     "event_sources": {
-      "description": "DEPLOY FILE ONLY. Binds the logical `source:` names used by event triggers to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.3 / PRD 5.11.",
+      "description": "DEPLOY FILE ONLY. Binds the logical `source:` names used by event triggers to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.4 / PRD 5.11.",
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/identifier" },
       "additionalProperties": { "$ref": "#/$defs/eventSource" }
@@ -86,15 +86,30 @@
   "additionalProperties": false,
   "dependentRequired": {
     "imports": ["version"],
+    "hub": ["version"],
     "placements": ["version"],
     "storage_backends": ["version"],
     "event_sources": ["version"]
   },
+  "allOf": [
+    {
+      "if": {
+        "required": ["placements"],
+        "properties": { "placements": { "minProperties": 1 } }
+      },
+      "then": {
+        "description": "A placement is claimed by a worker at an authenticated join, and the join token is the whole of that authentication - so a target that declares placements and no hub.join_token describes a mesh nobody can join. Declare the token, or remove the placements (grammar 14.2, Decision D130 / PRD resolved q38).",
+        "required": ["hub"],
+        "properties": { "hub": { "required": ["join_token"] } }
+      }
+    }
+  ],
   "dependentSchemas": {
     "imports": { "$ref": "#/$defs/notADeployFile" },
     "state": { "$ref": "#/$defs/notADeployFile" },
     "triggers": { "$ref": "#/$defs/notADeployFile" },
     "defaults": { "$ref": "#/$defs/notADeployFile" },
+    "hub": { "$ref": "#/$defs/deployFileOnly" },
     "placements": { "$ref": "#/$defs/deployFileOnly" },
     "storage_backends": { "$ref": "#/$defs/deployFileOnly" },
     "event_sources": { "$ref": "#/$defs/deployFileOnly" }
@@ -105,6 +120,7 @@
       "description": "A spec file must not carry deploy-layer sections: only the deploy layer forks per target (PRD 5.8).",
       "not": {
         "anyOf": [
+          { "required": ["hub"] },
           { "required": ["placements"] },
           { "required": ["storage_backends"] },
           { "required": ["event_sources"] }
@@ -112,7 +128,7 @@
       }
     },
     "deployFileOnly": {
-      "description": "A deploy file carries only version + placements/storage_backends/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
+      "description": "A deploy file carries only version + hub/placements/storage_backends/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
       "not": {
         "anyOf": [
           { "required": ["imports"] },
@@ -2655,16 +2671,39 @@
     },
 
     "placement": {
-      "description": "Where a component runs. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.1 / PRD 5.10.",
+      "description": "One named claim a worker asserts at join, and the components that claim runs. Nothing here is an address: which machine satisfies a claim is decided by whoever joins asserting it, so a placement is capability affinity rather than load assignment. Two rules this schema cannot express: placements are disjoint, and an attached tool colocates with the agent that attaches it (grammar 14.1, Decisions D128, D129 / PRD resolved q38, q40).",
       "type": "object",
-      "required": ["runtime"],
+      "required": ["members"],
       "properties": {
-        "runtime": {
-          "description": "isolated: its own instance/container, with sandbox, credentials, and network policy. colocated: in the calling process.",
-          "enum": ["isolated", "colocated"]
+        "members": {
+          "description": "The components this claim runs. Non-empty, each address distinct, and each must resolve in the composition. v1 places agent.* and tool.* - the leaves that hold a machine's capability - while placing a flow.* is deferred, named (PRD resolved q44).",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(agent|tool)\\.[a-z][a-z0-9_]{0,63}$"
+          }
         },
-        "network": { "description": "Sandbox network policy (reserved, default all).", "enum": ["none", "egress", "all"] },
         "description": { "description": "Documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "hub": {
+      "description": "The process that owns the graph. Both keys are optional on their own; join_token becomes required as soon as placements: is non-empty, which the root schema states because it is a rule about two sections (grammar 14.2, Decision D130).",
+      "type": "object",
+      "properties": {
+        "join_token": {
+          "description": "The bearer credential a worker presents at join, as an ${ENV} reference and never a literal. Holding it is being trusted with the mesh: the whole artifact, the right to claim any placement, and the journal's effect stream (PRD resolved q38).",
+          "$ref": "#/$defs/envRef"
+        },
+        "public_url": {
+          "description": "The ingress base every URL this deployment hands out derives from: an absolute http or https URL naming a host, its scheme spelled lowercase. Unlike a callback_allow entry this is the deployment's own URL rather than a pattern, so it carries no wildcard (PRD resolved q44 invariant 4).",
+          "allOf": [
+            { "$ref": "#/$defs/noEnvRefString" },
+            { "pattern": "^https?://[^\\s/?#*]+([/?#][^\\s*]*)?$" }
+          ]
+        }
       },
       "additionalProperties": false
     },
@@ -2737,7 +2776,7 @@
       }
     },
     "eventSource": {
-      "description": "Binding of a logical event source name to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.3 / PRD 5.11.",
+      "description": "Binding of a logical event source name to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.4 / PRD 5.11.",
       "type": "object",
       "required": ["kind"],
       "properties": {

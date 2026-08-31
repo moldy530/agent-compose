@@ -270,7 +270,7 @@ impl FileRole {
 }
 
 /// Sections that only a deploy file may carry (grammar 1.5).
-const DEPLOY_ONLY: &[&str] = &["placements", "storage_backends", "event_sources"];
+const DEPLOY_ONLY: &[&str] = &["hub", "placements", "storage_backends", "event_sources"];
 /// Sections that only a spec file may carry (grammar 1.5).
 const SPEC_ONLY: &[&str] = &["imports", "defaults", "state", "triggers"];
 
@@ -393,6 +393,7 @@ fn deploy_file(
         source,
         version: None,
         placements: None,
+        hub: None,
         storage_backends: None,
         event_sources: None,
         span: root.span.clone(),
@@ -402,6 +403,7 @@ fn deploy_file(
         let key = entry.key.value.as_str();
         match key {
             "version" => file.version = version(&entry.value, cx),
+            "hub" => file.hub = deploy::hub(&entry.value, cx),
             "placements" => file.placements = deploy::placements(&entry.value, cx),
             "storage_backends" => {
                 file.storage_backends = deploy::storage_backends(&entry.value, cx);
@@ -413,6 +415,19 @@ fn deploy_file(
             _ => unknown_top_level_key(entry, DocumentKind::Deploy, cx),
         }
     }
+
+    // A rule about two sections of one file, so it is stated once both have
+    // been read (grammar 14.2, Decision D130). The key's *presence* is passed
+    // separately from what parsing made of it: a `hub:` that is not a mapping
+    // is refused already, and telling its author to declare the block they
+    // wrote would be a second diagnostic for one mistake.
+    deploy::require_join_token(
+        file.placements.as_ref(),
+        file.hub.as_ref(),
+        mapping.contains_key("hub"),
+        &root.span,
+        cx,
+    );
 
     // Stated only where its premise can still be true: a file the caller is
     // holding as an import is refused for being imported at all, and one it is
@@ -553,7 +568,8 @@ mod tests {
     use super::{DiagnosticCode, FileRole, parse_as};
 
     const IMPORTS_NO_VERSION: &str = "imports:\n  - other.yml\n";
-    const DEPLOY_NO_VERSION: &str = "placements:\n  flow.f: { runtime: colocated }\n";
+    const DEPLOY_NO_VERSION: &str =
+        "placements:\n  mac: { members: [agent.a] }\nhub:\n  join_token: ${TOKEN}\n";
     const ENTRYPOINT_RULE: &str =
         "a file that declares `imports:` is the entrypoint and must declare `version:`";
     const DEPLOY_RULE: &str = "a deploy file must declare `version:`";

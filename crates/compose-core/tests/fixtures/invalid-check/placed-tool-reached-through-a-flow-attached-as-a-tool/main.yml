@@ -1,0 +1,44 @@
+# rule: a flow attached as a tool runs in the agent's process, so what it reaches colocates too (grammar 14.1, Decision D129)
+# code: conflicting-placement
+# message: `tool.xcodebuild` is a member of placement `mac`, and `agent.reviewer` that reaches it through the attached `flow.sign` has no placement, so it runs on the hub
+# at: main.yml:40:11
+# label: main.yml:31:17 `flow.sign` reaches `tool.xcodebuild` here
+# label: deploy/mesh.yml:7:3 `mac` is declared here
+# help: a flow attached as a tool runs its instance inside the agent's own tool loop (grammar 5.4), so every node of it executes on whichever worker took the agent's dispatch: put the agent in that placement, drop the placement from what the flow reaches, or reach the flow from a `flow:` node instead, where the hub schedules its nodes and each placement is honoured (grammar 14.1, PRD resolved q40)
+# target: mesh
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+tool.xcodebuild:
+  description: Build and sign the macOS app.
+  input:
+    scheme: { type: string }
+  output:
+    log: { type: string }
+  exec:
+    command: xcodebuild
+flow.sign:
+  description: Build and sign the requested scheme.
+  inputs:
+    scheme: { type: string }
+  outputs: {}
+  nodes:
+    build:
+      function: tool.xcodebuild
+      input:
+        scheme: "input.scheme"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+agent.reviewer:
+  model: model.m
+  prompt: Review the release.
+  tools: [flow.sign]
+  input:
+    scheme: { type: string }
+  output:
+    verdict: { type: string }

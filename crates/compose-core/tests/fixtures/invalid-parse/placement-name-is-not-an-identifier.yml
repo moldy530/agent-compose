@@ -1,0 +1,12 @@
+# rule: a placement is a named entry, and the name is an identifier (grammar 14.1, 2.1)
+# code: invalid-identifier
+# message: a placement name `agent.fixer` is not a valid identifier
+# at: 11:3
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  agent.fixer:
+    members: [agent.fixer]

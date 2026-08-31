@@ -111,10 +111,12 @@
 //! lands it ([`graph`]). Nothing answers a plausible value.
 //!
 //! The same posture covers the two places the deploy layer reaches past this
-//! release: a store bound to a production backend (grammar 14.2's `redis`,
+//! release: a store bound to a production backend (grammar 14.3's `redis`,
 //! `pgvector`, `s3`, …) says so at the op rather than answering out of the wrong
-//! store, and `placements` is reserved grammar carried into the IR and executed
-//! by nothing (grammar 15). Both land in M3.
+//! store, and `hub:`/`placements:` are live static grammar this pass emits
+//! nothing for — the worker protocol `docs/distributed.md` fixes lands with the
+//! `worker` verb, and `tests/placement_surface_inertness.rs` is what says so.
+//! Both land in M3.
 
 pub mod cel;
 pub mod cli;

@@ -17,16 +17,25 @@ code is `undefined-reference` instead — different question, different message.
 ```yaml triggers
 version: "0.1"
 
-placements:
-  store.docs:
-    runtime: isolated
+agent.reviewer:
+  model: tool.web_search
+  prompt: Review the draft and say whether it ships.
+  output:
+    verdict: { type: string }
 ```
 
 ## The fix
 
-Name something the position accepts. Above, `placements:` keys are `agent.*`,
-`tool.*` or `flow.*` — a store is not a placeable component — and the section
-belongs in a deploy file besides.
+Name something the position accepts. Above, an agent's `model:` takes a
+`model.*`, and `tool.web_search` is a tool: the agent needs the model binding it
+calls, and the tool belongs in its `tools:` list if it wants it at all.
+
+A deploy file's `placements:` reads the same way one level along: a placement's
+`members:` are `agent.*` and `tool.*` addresses, so `store.docs` there is this
+code — a store is not a placeable component (§14.1). A `flow.*` member is
+refused too, but with a message naming the deferral rather than this one, since
+placing a flow is a feature this release does not have rather than a spelling
+mistake (`unsupported-placement`).
 
 Two positions take a **flow-local node id** rather than an address, and a typed
 address there is this error too: `on_error: { fallback: … }` and a `human`

@@ -1,0 +1,9 @@
+# rule: `hub:` carries `join_token:` and `public_url:` and nothing else (grammar 14.2)
+# code: unknown-key
+# message: unknown key `heartbeat` in `hub`
+# at: 9:3
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+  heartbeat: 30s

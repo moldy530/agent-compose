@@ -1,4 +1,4 @@
-# rule: event source kinds are a closed set (grammar 14.3, Decision D46)
+# rule: event source kinds are a closed set (grammar 14.4, Decision D46)
 # code: unknown-variant
 # message: `kafka` is not a valid event source `kind`
 # at: 10:11

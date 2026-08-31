@@ -3,6 +3,9 @@
 # message: a deploy file must declare `version:`
 # at: 6:1
 # help: write `version: "0.1"` — quoted, since an unquoted `0.1` is a YAML float
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
 placements:
-  agent.fixer:
-    runtime: isolated
+  mac:
+    members: [agent.fixer]

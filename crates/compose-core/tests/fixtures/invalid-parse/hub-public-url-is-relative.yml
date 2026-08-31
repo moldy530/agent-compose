@@ -1,0 +1,9 @@
+# rule: `hub.public_url:` is an absolute http/https URL (grammar 14.2)
+# code: invalid-value
+# message: "hub.example/ingress" is not a `hub.public_url`: it names no scheme, and an ingress base is absolute
+# at: 9:15
+# help: the base is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://hub.example`; `http` stays legal, which is what makes localhost development work (grammar 14.2, PRD resolved q44)
+version: "0.1"
+
+hub:
+  public_url: "hub.example/ingress"

@@ -2638,34 +2638,51 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
   "deploy": {
     "target": "staging",
     "source": "deploy/staging.yml",
+    "hub": {
+      "join_token": {
+        "value": {
+          "env_ref": "MESH_JOIN_TOKEN"
+        },
+        "span": "deploy/staging.yml:12:15..12:33"
+      },
+      "public_url": {
+        "value": "https://triage.internal.example",
+        "span": "deploy/staging.yml:13:15..13:48"
+      },
+      "span": "deploy/staging.yml:12:3..13:48"
+    },
     "placements": {
       "entries": {
-        "agent.fixer": {
-          "address": {
-            "value": "agent.fixer",
-            "span": "deploy/staging.yml:10:3..10:14"
+        "patchers": {
+          "name": {
+            "value": "patchers",
+            "span": "deploy/staging.yml:20:3..20:11"
           },
-          "runtime": "isolated",
-          "network": "egress",
-          "span": "deploy/staging.yml:10:3..12:20"
-        },
-        "flow.triage": {
-          "address": {
-            "value": "flow.triage",
-            "span": "deploy/staging.yml:13:3..13:14"
+          "members": [
+            {
+              "value": "agent.fixer",
+              "span": "deploy/staging.yml:22:9..22:20"
+            },
+            {
+              "value": "tool.repo_grep",
+              "span": "deploy/staging.yml:23:9..23:23"
+            }
+          ],
+          "description": {
+            "value": "The machines holding a checkout: agent.fixer reads files under the repo root, and tool.repo_grep — reached from a `function:` node, so its own placement governs it — greps the same tree.",
+            "span": "deploy/staging.yml:25:7..29:1"
           },
-          "runtime": "colocated",
-          "span": "deploy/staging.yml:13:3..14:23"
+          "span": "deploy/staging.yml:20:3..29:1"
         }
       },
-      "span": "deploy/staging.yml:10:3..14:23"
+      "span": "deploy/staging.yml:20:3..29:1"
     },
     "storage_backends": {
       "defaults": {
         "kv": {
           "name": {
             "value": "kv",
-            "span": "deploy/staging.yml:18:5..18:7"
+            "span": "deploy/staging.yml:31:5..31:7"
           },
           "kind": "kv",
           "provider": "redis",
@@ -2674,17 +2691,17 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "env_ref": "REDIS_URL"
               },
-              "span": "deploy/staging.yml:20:7..20:24"
+              "span": "deploy/staging.yml:33:7..33:24"
             }
           },
-          "span": "deploy/staging.yml:18:5..20:24"
+          "span": "deploy/staging.yml:31:5..33:24"
         }
       },
       "aliases": {
         "docs_db": {
           "name": {
             "value": "docs_db",
-            "span": "deploy/staging.yml:24:5..24:12"
+            "span": "deploy/staging.yml:37:5..37:12"
           },
           "provider": "chroma",
           "connection": {
@@ -2692,7 +2709,7 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "env_ref": "CHROMA_URL"
               },
-              "span": "deploy/staging.yml:26:7..26:25"
+              "span": "deploy/staging.yml:39:7..39:25"
             }
           },
           "extra": {
@@ -2700,20 +2717,20 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "text": "project-docs"
               },
-              "span": "deploy/staging.yml:27:7..27:26"
+              "span": "deploy/staging.yml:40:7..40:26"
             }
           },
-          "span": "deploy/staging.yml:24:5..27:26"
+          "span": "deploy/staging.yml:37:5..40:26"
         }
       },
-      "span": "deploy/staging.yml:17:3..27:26"
+      "span": "deploy/staging.yml:30:3..40:26"
     },
     "event_sources": {
       "entries": {
         "bug_reports": {
           "name": {
             "value": "bug_reports",
-            "span": "deploy/staging.yml:32:3..32:14"
+            "span": "deploy/staging.yml:45:3..45:14"
           },
           "kind": "redis_streams",
           "connection": {
@@ -2721,7 +2738,7 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "env_ref": "REDIS_URL"
               },
-              "span": "deploy/staging.yml:34:5..34:22"
+              "span": "deploy/staging.yml:47:5..47:22"
             }
           },
           "extra": {
@@ -2729,19 +2746,19 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "text": "agent-compose"
               },
-              "span": "deploy/staging.yml:36:5..36:34"
+              "span": "deploy/staging.yml:49:5..49:34"
             },
             "stream": {
               "value": {
                 "text": "bug-reports"
               },
-              "span": "deploy/staging.yml:35:5..35:24"
+              "span": "deploy/staging.yml:48:5..48:24"
             }
           },
-          "span": "deploy/staging.yml:32:3..36:34"
+          "span": "deploy/staging.yml:45:3..49:34"
         }
       },
-      "span": "deploy/staging.yml:32:3..36:34"
+      "span": "deploy/staging.yml:45:3..49:34"
     }
   }
 }

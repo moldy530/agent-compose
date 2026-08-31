@@ -196,7 +196,7 @@ pub struct ScheduleTrigger {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EventTrigger {
     /// `source:` — a logical name the active target's `event_sources:` binds
-    /// to infrastructure (grammar 14.3).
+    /// to infrastructure (grammar 14.4).
     pub source: Spanned<Ident>,
     /// `input:` — CEL over the event payload.
     #[serde(skip_serializing_if = "Option::is_none")]

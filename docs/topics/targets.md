@@ -7,17 +7,22 @@ composition one artifact with several deployments rather than several
 compositions.
 
 A deploy file is never imported. It is a document kind of its own, and the two
-kinds are disjoint — a spec file declaring `placements:`, `storage_backends:` or
-`event_sources:` is an error, and so is a deploy file declaring definitions,
-`imports:`, `state:`, `triggers:` or `defaults:`.
+kinds are disjoint — a spec file declaring `hub:`, `placements:`,
+`storage_backends:` or `event_sources:` is an error, and so is a deploy file
+declaring definitions, `imports:`, `state:`, `triggers:` or `defaults:`.
 
 ```yaml deploy staging
 # deploy/staging.yml
 version: "0.1"
 
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+  public_url: "https://hub.example"
+
 placements:
-  agent.researcher: { runtime: isolated, network: egress }
-  flow.ingest: { runtime: colocated }
+  mac:
+    members: [agent.researcher]
+    description: the machine with the signing keys
 
 storage_backends:
   defaults:
@@ -79,8 +84,8 @@ flow.ingest:
 
 That file validates under `--target local` with no deploy file at all, and under
 `--target staging` against the aliases above. The two are checked together: the
-addresses `placements:` names — `agent.researcher`, `flow.ingest` — have to
-resolve in the composition the deploy file is a target of.
+addresses `placements:` names — `agent.researcher` — have to resolve in the
+composition the deploy file is a target of.
 
 ## `local` is reserved and built in
 
@@ -90,8 +95,10 @@ unconditionally. Four consequences:
 
 - `deploy/local.yml` is **optional**, and `--target local` with no file is the
   zero-config path, not an error.
-- When present it may declare `placements:` and `event_sources:` — both reserved
-  grammar, parsed and carried into the IR under every target.
+- When present it may declare `hub:`, `placements:` and `event_sources:`. The
+  first two are live grammar checked under every target — a `local` mesh is the
+  hub and its workers on one machine, which is how you develop one — and
+  `event_sources:` is reserved grammar carried into the IR.
 - It **must not** declare `storage_backends:`. That section is *active* grammar
   which `local` overrides unconditionally, so the block could only be an inert
   key whose author expected a substitution. A store that wants a real backend
@@ -192,12 +199,56 @@ env-ref values only.
 Capability checks apply at the alias definition: a `vector` store bound to a
 non-vector-capable provider is a compile error.
 
-## `placements` — reserved
+## `hub` and `placements` — the distributed surface
 
-Keys are component addresses (`agent.*`, `tool.*`, `flow.*`) that must resolve
-in the composition. `runtime:` is `isolated` or `colocated` and is required;
-`network:` is `none`/`egress`/`all` and defaults to `all`. `--target local`
-implies everything colocated in one process.
+A **placement** is a logical name a worker claims at an authenticated join, and
+the components that claim runs. Nothing here is an address: which machine
+satisfies `mac` is decided by whoever joins asserting it, so a placement is
+capability affinity — the machine with the signing keys, the GPU, the licensed
+tool — rather than load assignment.
+
+| Key | Shape |
+|---|---|
+| `placements.<name>.members` | non-empty list of distinct `agent.*` / `tool.*` addresses that must resolve |
+| `placements.<name>.description` | documentation |
+| `hub.join_token` | the bearer credential a worker joins with, as an `${ENV}` reference — required wherever `placements:` is non-empty |
+| `hub.public_url` | the absolute `http`/`https` base every ingress URL derives from; no wildcard, because this is your URL rather than an allowlist pattern |
+
+Five rules, each a compile error — grammar §14.1's four about a placement, in
+its numbering, and then §14.2's about the token:
+
+- **§14.1 rule 1** — `members:` is required, non-empty, and names each component
+  once.
+- **rule 2** — a `flow.*` member is refused, naming the deferral: v1 places the
+  leaves that hold a machine's capability, and a flow is a subgraph the hub
+  schedules. Place the nodes it reaches instead.
+- **rule 3** — placements are **disjoint**. One component in two of them is two
+  answers to which worker runs it.
+- **rule 4** — an attachment **colocates with its agent**. The whole artifact reaches every
+  worker, so a placement decides which process runs a node, and an agent's
+  `tools:` list is what runs a component inside the agent's own process. A tool
+  placed somewhere other than the agent attaching it — including a placed tool on
+  an *unplaced* agent, which would run on the hub — is refused; so is a placement
+  reached only through a `flow.*` that agent attaches, because a flow-as-tool
+  call starts its instance in the same tool loop. What the hub schedules is
+  untouched: a placed tool reached from a `function:` node, or anything inside a
+  flow instantiated by a `flow:` node, keeps its own placement, and there its own
+  placement is the whole answer.
+- **§14.2** — `hub.join_token` is required wherever placements are, and takes an
+  `${ENV}` reference, never a literal. **Holding it is being trusted with the
+  mesh**: the whole artifact, the right to claim any placement, and the journal's
+  effect stream.
+
+A component in **no** placement executes on the hub. That is the default, is
+never a diagnostic, and is why the list above stops where it does —
+`placements:` names the exceptions — so a target with no `placements:` is an
+ordinary single-process deployment.
+
+**The rules above are enforced today; the protocol is not built yet.** Nothing a
+placement or a `hub:` block declares reaches the project a build emits — no
+worker joins, nothing parks, and there is no `worker` verb in this release. The
+wire contract the runtime will be held to is normative in
+`docs/distributed.md`.
 
 ## `event_sources` — reserved
 
@@ -213,11 +264,9 @@ on its runtime effect is a documented no-op.
 
 | Construct | Status in v0 |
 |---|---|
-| `placements` | parsed + validated, no-op |
 | `event_sources` | parsed + validated, no-op |
 | `triggers.<t>.type: schedule` | parsed + validated, no-op |
 | `triggers.<t>.type: event` | parsed + validated, no-op |
-| `network:` on a placement | parsed, no-op |
 
 `human` nodes were on this list and have left it: the runtime landed, so a
 compiled project really pauses and resumes — and their durability has left it
@@ -225,14 +274,24 @@ too: a wait that a restart interrupted comes back with its id intact, because
 the wait id is the node's instance path and the journal is what a resumed
 execution reads its answers out of.
 
+**`placements` left it by being re-cut, which is the one departure that is not a
+runtime landing.** The old shape keyed placements by component address and gave
+each a `runtime: isolated|colocated` and a reserved `network:`. The distributed
+design settled a different model — a named claim a worker asserts at an
+authenticated join — and reserved grammar exists to be re-shapeable before its
+first execution: nothing had run, so nothing broke. What replaced it is **live
+static grammar** with a runtime still to come, which is a third posture and not a
+reserved one: every rule above is enforced, and `docs/distributed.md` is what the
+runtime will be held to.
+
 An `http` trigger's `auth:`, `callback_auth:` and `callback_allow:` have left it
 as well, and they were the rows worth reading twice while they were here: a
-no-op `placements` is visible in what a deployment is not, while a no-op `auth:`
-would serve every caller and look exactly like a guarded route. The generated
-app verifies callers, signs deliveries and refuses a callback URL outside the
-list — see `agent-compose docs triggers`. What that adds to a *target's* story
-is the credential list: those blocks' `${ENV}` references are in the manifest a
-built project checks at process start, so a deployment receiving only the
-secrets its own surfaces name receives these too.
+no-op `schedule` is visible the first morning it does not fire, while a no-op
+`auth:` would serve every caller and look exactly like a guarded route. The
+generated app verifies callers, signs deliveries and refuses a callback URL
+outside the list — see `agent-compose docs triggers`. What that adds to a
+*target's* story is the credential list: those blocks' `${ENV}` references are in
+the manifest a built project checks at process start, so a deployment receiving
+only the secrets its own surfaces name receives these too.
 
-Normative source: `docs/durability.md`, `docs/grammar.md` §14, §14.1, §14.2, §14.3, §15
+Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/grammar.md` §14, §14.1–14.4, §15

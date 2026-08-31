@@ -12,111 +12,114 @@ Deploy(
             PlacementsSection {
                 placements: [
                     Placement {
-                        address: agent.fixer @ 10:3..10:14,
-                        runtime: Some(
-                            Isolated @ 11:14..11:22,
+                        name: "patchers" @ 20:3..20:11,
+                        members: [
+                            agent.fixer @ 22:9..22:20,
+                            tool.repo_grep @ 23:9..23:23,
+                        ],
+                        description: Some(
+                            "The machines holding a checkout: agent.fixer reads files under the repo root, and tool.repo_grep — reached from a `function:` node, so its own placement governs it — greps the same tree." @ 25:7..29:1,
                         ),
-                        network: Some(
-                            Egress @ 12:14..12:20,
-                        ),
-                        description: None,
-                        span: 10:3..12:20,
-                    },
-                    Placement {
-                        address: flow.triage @ 13:3..13:14,
-                        runtime: Some(
-                            Colocated @ 14:14..14:23,
-                        ),
-                        network: None,
-                        description: None,
-                        span: 13:3..14:23,
+                        span: 20:3..29:1,
                     },
                 ],
-                span: 10:3..14:23,
+                span: 20:3..29:1,
+            },
+        ),
+        hub: Some(
+            HubSection {
+                join_token: Some(
+                    env("${MESH_JOIN_TOKEN}") @ 12:15..12:33,
+                ),
+                public_url: Some(
+                    "https://triage.internal.example" @ 13:15..13:48,
+                ),
+                declares_join_token: true,
+                span: 12:3..13:48,
             },
         ),
         storage_backends: Some(
             StorageBackendsSection {
                 defaults: [
                     BackendDefault {
-                        kind: Kv @ 18:5..18:7,
+                        kind: Kv @ 31:5..31:7,
                         config: BackendConfig {
                             provider: Some(
-                                Redis @ 19:17..19:22,
+                                Redis @ 32:17..32:22,
                             ),
                             connection: [
                                 ConnectionField {
-                                    name: "url" @ 20:7..20:10,
-                                    value: env("${REDIS_URL}") @ 20:12..20:24,
+                                    name: "url" @ 33:7..33:10,
+                                    value: env("${REDIS_URL}") @ 33:12..33:24,
                                 },
                             ],
                             extra: [],
-                            span: 19:7..20:24,
+                            span: 32:7..33:24,
                         },
                     },
                 ],
                 aliases: [
                     BackendAlias {
-                        name: "docs_db" @ 24:5..24:12,
+                        name: "docs_db" @ 37:5..37:12,
                         config: BackendConfig {
                             provider: Some(
-                                Chroma @ 25:17..25:23,
+                                Chroma @ 38:17..38:23,
                             ),
                             connection: [
                                 ConnectionField {
-                                    name: "url" @ 26:7..26:10,
-                                    value: env("${CHROMA_URL}") @ 26:12..26:25,
+                                    name: "url" @ 39:7..39:10,
+                                    value: env("${CHROMA_URL}") @ 39:12..39:25,
                                 },
                             ],
                             extra: [
                                 PluginEntry {
-                                    key: "index" @ 27:7..27:12,
+                                    key: "index" @ 40:7..40:12,
                                     value: Text(
                                         "project-docs",
-                                    ) @ 27:14..27:26,
+                                    ) @ 40:14..40:26,
                                 },
                             ],
-                            span: 25:7..27:26,
+                            span: 38:7..40:26,
                         },
                     },
                 ],
-                span: 17:3..27:26,
+                span: 30:3..40:26,
             },
         ),
         event_sources: Some(
             EventSourcesSection {
                 sources: [
                     EventSource {
-                        name: "bug_reports" @ 32:3..32:14,
+                        name: "bug_reports" @ 45:3..45:14,
                         kind: Some(
-                            RedisStreams @ 33:11..33:24,
+                            RedisStreams @ 46:11..46:24,
                         ),
                         connection: [
                             ConnectionField {
-                                name: "url" @ 34:5..34:8,
-                                value: env("${REDIS_URL}") @ 34:10..34:22,
+                                name: "url" @ 47:5..47:8,
+                                value: env("${REDIS_URL}") @ 47:10..47:22,
                             },
                         ],
                         extra: [
                             PluginEntry {
-                                key: "stream" @ 35:5..35:11,
+                                key: "stream" @ 48:5..48:11,
                                 value: Text(
                                     "bug-reports",
-                                ) @ 35:13..35:24,
+                                ) @ 48:13..48:24,
                             },
                             PluginEntry {
-                                key: "consumer_group" @ 36:5..36:19,
+                                key: "consumer_group" @ 49:5..49:19,
                                 value: Text(
                                     "agent-compose",
-                                ) @ 36:21..36:34,
+                                ) @ 49:21..49:34,
                             },
                         ],
-                        span: 32:3..36:34,
+                        span: 45:3..49:34,
                     },
                 ],
-                span: 32:3..36:34,
+                span: 45:3..49:34,
             },
         ),
-        span: 4:1..36:34,
+        span: 4:1..49:34,
     },
 )

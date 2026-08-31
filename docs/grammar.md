@@ -78,13 +78,13 @@ other, never both (Decision [D3](#d3-spec-files-and-deploy-files-are-disjoint-do
 | Kind | Selected by | May contain |
 |---|---|---|
 | **Spec file** | reachable from the entrypoint's `imports:`, or being the entrypoint | `version`, `imports` (entrypoint only), `defaults`, `state`, `triggers`, typed-address definition keys |
-| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `placements`, `storage_backends`, `event_sources` |
+| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `event_sources` |
 
-A spec file that declares `placements`, `storage_backends`, or `event_sources`
-is a compile error, and a deploy file that declares definitions, `imports`,
-`state`, `triggers`, or `defaults` is a compile error. This is the mechanical
-enforcement of the PRD 5.8 per-target invariant: only the deploy layer forks per
-environment.
+A spec file that declares `hub`, `placements`, `storage_backends`, or
+`event_sources` is a compile error, and a deploy file that declares definitions,
+`imports`, `state`, `triggers`, or `defaults` is a compile error. This is the
+mechanical enforcement of the PRD 5.8 per-target invariant: only the deploy layer
+forks per environment.
 
 The **entrypoint** is the spec file named on the command line (conventionally
 `main.yml`). It is the only file that MAY declare `imports:`.
@@ -153,6 +153,7 @@ imports:
 | `state` | allowed | allowed | illegal | ≤ 1 per composition |
 | `triggers` | allowed | allowed | illegal | ≤ 1 per composition |
 | `agent.*` `tool.*` `flow.*` `store.*` `provider.*` `model.*` | allowed | allowed | illegal | 1 per address |
+| `hub` | illegal | illegal | allowed | ≤ 1 per target |
 | `placements` | illegal | illegal | allowed | ≤ 1 per target |
 | `storage_backends` | illegal | illegal | allowed | ≤ 1 per target |
 | `event_sources` | illegal | illegal | allowed | ≤ 1 per target |
@@ -277,7 +278,7 @@ error of the form "expected an `agent.*` reference, found `tool.web_search`"
 | `human.on_timeout` | flow-local node id, `end` | same positions as `on_error.fallback` |
 | edge `from` / `to` | flow-local node id, `start`, `end` | |
 | `triggers.<t>.flow` | `flow.*` | |
-| `placements` keys | `agent.*`, `tool.*`, `flow.*` | deploy layer |
+| `placements.<name>.members[]` | `agent.*`, `tool.*` | deploy layer; a placement's **name** is an identifier (§2.1) and not a reference, and a `flow.*` member is refused (§14.1 rule 2) |
 
 ### 2.4 Flow-local node ids and pseudo-nodes
 
@@ -750,6 +751,7 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `token`, `secret` | an `http` trigger's `auth:` and `callback_auth:` blocks (§13.3) |
+| `join_token` | the deploy layer's `hub:` block (§14.2) |
 
 The table classifies these field *names* wherever they occur; it never makes one
 legal where its section's own key rules do not admit it. A `provider.*` takes
@@ -768,7 +770,7 @@ surface is left to an implementer's judgement.
 | Class | Surfaces | Rule |
 |---|---|---|
 | **1. Env-ref value only** | the secret and connection fields tabulated above | the whole string is one `${NAME}` reference; a literal is a compile error |
-| **2. Interpolable** | `http` node and `http:` tool-binding `url` and `headers` values; the whole `exec:` surface — `command`, every entry of `args`, `cwd`, and `env` values, on both the tool binding (§6.1) and the inline node (§8.2); provider `headers` values and the non-secret provider keys of §12.1 (`region`, `location`, `project`, `organization`, `profile`, `api_version`); non-secret `storage_backends` and `event_sources` config values (§14.2, §14.3) | embedded `${NAME}` tokens are substituted at process start |
+| **2. Interpolable** | `http` node and `http:` tool-binding `url` and `headers` values; the whole `exec:` surface — `command`, every entry of `args`, `cwd`, and `env` values, on both the tool binding (§6.1) and the inline node (§8.2); provider `headers` values and the non-secret provider keys of §12.1 (`region`, `location`, `project`, `organization`, `profile`, `api_version`); non-secret `storage_backends` and `event_sources` config values (§14.3, §14.4) | embedded `${NAME}` tokens are substituted at process start |
 | **3. No refs** | **everything else** | an unescaped `${NAME}` token is a **compile error** naming the field |
 
 Class 3 therefore covers, among others: prompts; every `description:`; every
@@ -779,7 +781,9 @@ channel names, typed addresses, a store's `backend:` alias, a tool's
 `function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
 a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); the `header:` and
 `prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:` entry
-(§13.3); a `blob put`'s `content_type:` (§11.4); and every enum-valued key.
+(§13.3); `hub.public_url:` (§14.2), which is shape-checked here and is part of
+what a deployment *is*; a `blob put`'s `content_type:` (§11.4); and every
+enum-valued key.
 
 Nothing is interpolated in class 3, so an unescaped token there is an error
 rather than text that silently survives into the output — the author who wrote
@@ -1058,7 +1062,10 @@ tools run with the privileges of the process running the graph, which is what a
 hand-rolled `exec:` tool has always done: a model holding `builtin.bash` holds
 arbitrary code execution on that host. Container and syscall isolation, and any
 refusal keyed on a deploy target, are the distribution work's and are stated here
-rather than implied (PRD resolved q31).
+rather than implied (PRD resolved q31). That work has not answered it: resolved
+q37–q44 settled the topology, the binding surface and the wire without taking
+containment up, so it stays open and is filed as such in
+[`docs/distributed.md`](distributed.md) §13.
 
 Traces gain no surface: a built-in call is a `ToolCallRecord` like any other, and
 `docs/trace.md` §11 keeps its answer out of the format exactly as it keeps an
@@ -1925,11 +1932,12 @@ live run rather than a plausible alternative to it.
 
 ### 7.7 Component reachability
 
-Four static checks ask whether a flow — or one `map` dispatch target — can
+Five static checks ask whether a flow — or one `map` dispatch target — can
 *reach* something: session coherence (§11.3), sync-trigger interrupt-freedom
-(§13.3, §8.7), detached-dispatch interrupt-freedom (§8.6 rule 7, §8.7), and
-recursion (§7.5). They share **one** relation, defined here once so that they
-cannot drift apart (Decision [D86](#d86-component-reachability-is-one-relation-and-it-crosses-every-invocation-edge)).
+(§13.3, §8.7), detached-dispatch interrupt-freedom (§8.6 rule 7, §8.7),
+placement colocation (§14.1 rule 4), and recursion (§7.5). They share **one**
+relation, defined here once so that they cannot drift apart (Decision
+[D86](#d86-component-reachability-is-one-relation-and-it-crosses-every-invocation-edge)).
 
 A flow `F` **reaches** the components and `human` nodes named by the following,
 transitively:
@@ -1956,19 +1964,25 @@ output is not an invocation.
 | session coherence (§11.3) | **declared** triggers (§13) | the trigger's flow reaches a `session`-scoped store and the trigger declares no `session_key:` |
 | interrupt-freedom (§13.3, §8.7) | **declared** `http` triggers with `respond: sync` | the trigger's flow reaches a `human` node |
 | detached-dispatch interrupt-freedom (§8.6 rule 7, §8.7) | dispatches declaring `detach: true` | the dispatch **target** reaches a `human` node |
+| placement colocation (§14.1 rule 4) | the `flow.*` entries of an agent's `tools:` | the attached flow reaches an `agent.*` or `tool.*` placed elsewhere than the agent — clauses 1 and 2 only, since clause 4's attached tools are held by the same rule at their own agent |
 | recursion (§7.5) | flow definitions | a flow reaches itself |
 
-The relation is uniform across the four on purpose. An interrupt inside a
+The relation is uniform across the five on purpose. An interrupt inside a
 flow-as-tool is still an interrupt in the middle of a synchronous request, and
 PRD 5.11's settled position is that a `respond: sync` flow is *statically*
 interrupt-free; a pause inside a flow-as-tool of an agent a detached dispatch
 targets is as unanswerable as one written in the target itself; a session-scoped
-store reached through a map-dispatched flow still needs a session identity; and
-recursion through a tool attachment is still recursion. Clause 4 — traversal into
-`tools:` — is the one every earlier per-check wording left unstated. The fourth
-row is the one whose domain is a **target** rather than a flow: it asks the same
-question of the address a dispatch names, which for an `agent.*` target is
-clauses 3 and 4 alone (an agent holds no `human` node of its own).
+store reached through a map-dispatched flow still needs a session identity; a
+component reached through a flow-as-tool runs in the calling agent's process, so
+its placement is the calling agent's business; and recursion through a tool
+attachment is still recursion. Clause 4 — traversal into `tools:` — is the one
+every earlier per-check wording left unstated. The third row is the one whose
+domain is a **target** rather than a flow: it asks the same question of the
+address a dispatch names, which for an `agent.*` target is clauses 3 and 4 alone
+(an agent holds no `human` node of its own). The fourth is the one that reads a
+*part* of the relation rather than all of it, for a reason stated at §14.1 rule 4:
+an attached tool colocates with its own agent by the same rule, so following
+clause 4 there would answer one question twice.
 
 This relation answers "can this flow *cause* that component to run". It is not
 §7.8's relation, which asks whether a node of one flow is reachable from that
@@ -3264,7 +3278,7 @@ layers answer different questions: `backend:` (§11.3) says *where the vectors
 live* and forks per target, while `embed.provider` says *what turns text into a
 vector* and does not — PRD 5.9 settles providers as logical-layer, not
 per-target. A backend-derived default would invert that, and there is nothing
-for it to derive from: §14.2's storage vocabulary declares no embedding
+for it to derive from: §14.3's storage vocabulary declares no embedding
 capability, and under `--target local` no alias and no per-kind default is
 consulted at all (§14). Naming the connection is what keeps one store's
 embeddings identical under `local` and under `staging`, with only the vectors'
@@ -3278,7 +3292,7 @@ position, so it accepts `provider.*` and nothing else (§2.3).
 ### 11.3 Backends and scope
 
 - `backend:` names an **abstract alias** defined per target in
-  `deploy/<target>.yml` → `storage_backends.aliases` (§14.2). Resolution order:
+  `deploy/<target>.yml` → `storage_backends.aliases` (§14.3). Resolution order:
   explicit alias → per-kind `defaults:` → target built-in. `--target local`
   substitutes local storage for every store unconditionally (PRD 5.8), so under
   `local` no alias and no per-kind default is consulted at all (§14).
@@ -4195,7 +4209,7 @@ ingest:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `source` | identifier | yes | logical name; bound to infrastructure by `event_sources:` (§14.3) |
+| `source` | identifier | yes | logical name; bound to infrastructure by `event_sources:` (§14.4) |
 | `input` | map field→CEL over `payload` | no | `payload.id`, `payload.body`, `payload.attributes`, `payload.source` |
 | `dedupe_key` | CEL over `payload` → string | no (default `payload.id`) | inbound at-least-once dedupe (PRD 5.11) |
 
@@ -4232,10 +4246,13 @@ guarantee. Four consequences follow, and they are what make `deploy/local.yml`
 well-defined rather than a file the grammar half-recognizes (Decision
 [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)):
 
-- `deploy/local.yml` is OPTIONAL. When present it MAY declare `placements:` and
-  `event_sources:` — both are reserved grammar (§15), parsed, type-checked, and
-  carried into the IR under every target including `local`, so neither is inert
-  there.
+- `deploy/local.yml` is OPTIONAL. When present it MAY declare `hub:`,
+  `placements:` and `event_sources:`. The first two are **live** static grammar
+  (§14.1, §14.2) and are checked under every target including `local`, which is
+  what a mesh looks like on one machine: this process is the hub, and an
+  `agent-compose worker` beside it is the spoke. `event_sources:` is reserved
+  grammar (§15), parsed, type-checked, and carried into the IR under every
+  target, so it is not inert there either.
 - It MUST NOT declare `storage_backends:`. That section is *active* grammar which
   `local` overrides unconditionally: no alias and no per-kind default is ever
   consulted, so the block could only be an inert key whose author expected a
@@ -4260,9 +4277,16 @@ well-defined rather than a file the grammar half-recognizes (Decision
 # deploy/staging.yml
 version: "0.1"
 
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+  public_url: "https://hub.example"
+
 placements:
-  agent.researcher: { runtime: isolated, network: egress }
-  flow.review_loop: { runtime: colocated }
+  mac:
+    members: [agent.signer, tool.xcodebuild]
+    description: the machine with the signing keys
+  gpu:
+    members: [agent.embedder]
 
 storage_backends:
   defaults:
@@ -4278,21 +4302,143 @@ event_sources:
     consumer_group: agent-compose
 ```
 
-### 14.1 `placements` (RESERVED — parsed and validated, no-op in v0)
+### 14.1 `placements`
 
-Keys are component addresses (`agent.*`, `tool.*`, `flow.*`) that MUST resolve in
-the composition.
+A **placement** is a logical name a worker claims at an authenticated join, and
+the components that claim runs. Nothing here is an address: which physical
+machine satisfies a claim is decided by whoever shows up, so a placement is
+*capability affinity* — the machine with the signing keys, the GPU, the one
+licensed tool — rather than load assignment (PRD resolved q38, Decision
+[D128](#d128-a-placement-is-a-named-claim-and-its-members-are-components)).
+
+Keys are identifiers (§2.1).
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `runtime` | `isolated` \| `colocated` | yes | own instance/container vs in-process |
-| `network` | `none` \| `egress` \| `all` | no (default `all`) | sandbox network policy (reserved) |
+| `members` | list of `agent.*` / `tool.*` addresses | yes | non-empty, each named once; every address MUST resolve in the composition |
 | `description` | string | no | documentation only (D54) |
 
-`--target local` implies everything colocated in one process. `--target
-distributed` (post-v0) stitches boundaries with remote subgraphs (PRD 5.10).
+```yaml
+placements:
+  mac:
+    members: [agent.signer, tool.xcodebuild]
+    description: the machine with the signing keys
+  gpu:
+    members: [agent.embedder]
+```
 
-### 14.2 `storage_backends`
+**Four rules, each a compile error, and they are numbered because other
+documents cite them by number** (Decision
+[D129](#d129-placement-members-are-agents-and-tools-disjoint-and-colocated-with-what-attaches-them)):
+
+1. **`members:` is required and non-empty**, and names each component **once**.
+   A placement with no members is a claim nothing is ever dispatched under; a
+   repeated entry says what the first entry said, and is refused the way a
+   repeated `tools:` entry is (§5.4).
+2. **v1 members are `agent.*` and `tool.*`.** A `flow.*` member is refused with
+   a message naming the deferral: a flow is a subgraph the hub schedules, and
+   placing one would ship the scheduler to the worker — the peer-partition shape
+   PRD resolved q37 rejects — so it is outside the v1 scope resolved q44 fixes.
+   Place the nodes it reaches instead.
+3. **Placements are DISJOINT.** One component named by two placements is an
+   error naming both: two claims are two answers to which worker runs it, and
+   the choice is the author's rather than the hub's.
+4. **An attachment colocates with the agent that attaches it.** The whole
+   generated artifact reaches every worker (PRD resolved q40), so a placement
+   decides which *process* runs a node rather than which code exists there — and
+   an agent's `tools:` list is the one construct that runs another component
+   inside the agent's own process instead of handing it back to the hub's
+   scheduler. Two forms, one rule:
+   - an attached **`tool.*`** is called from inside the agent's tool loop, so a
+     tool whose placement differs from that of an agent attaching it is an
+     error, and so is a placed tool attached to an agent with **no** placement,
+     which would run on the hub. A tool with the same placement, or with none,
+     is fine. An agent's **own** placement is the whole of what decides this,
+     including for an agent that appears only inside a flow some other agent
+     attaches: manual invocation is universal — every flow a composition
+     declares is runnable on its own, named by a `manual` trigger or not
+     ([D64](#d64-implicit-manual-invocation-is-a-cli-property-not-a-declared-trigger))
+     — so that flow is one the hub can start directly, and the `agent:` node
+     inside it is dispatched by the hub's scheduler when it does.
+   - an attached **`flow.*`** starts an instance in that same loop (§5.4). The
+     flow carries no placement of its own — placing one is deferred — but every
+     `agent.*` and `tool.*` its instance **reaches** (§7.7 clauses 1 and 2) runs
+     where the agent runs, so each of them is held to the same rule. A placement
+     reachable only that way would be one the compiler accepted and the
+     deployment ignored.
+
+   A placed component's own placement governs it wherever it is reached without
+   an attaching agent: a `function:` node (§8.4), an `agent:` node, or a flow
+   instantiated by a `flow:` node (§8.5), all of which the hub schedules.
+
+And one thing that is **not** a rule, because it is what happens when no rule
+applies: **a component in no placement executes on the hub.** That is the
+default and is never a diagnostic — `placements:` names the exceptions — which
+is why the numbered list above stops at four.
+
+`--target local` needs no placement at all, and admits them: a `local` target
+with placements is the hub and its workers on one machine, which is how a mesh
+is developed.
+
+**This section replaced a reserved one.** Until the claims model was resolved,
+`placements:` was keyed by component address and carried `runtime:
+isolated|colocated` plus a reserved `network:`. Reserved grammar is parsed,
+checked, and carried into the IR, and *may be re-shaped before its first
+execution* — that is what reserved means (§15). Decision
+[D128](#d128-a-placement-is-a-named-claim-and-its-members-are-components) records
+why the old shape could not survive the resolution.
+
+### 14.2 `hub`
+
+The **hub** is the process that owns the graph: scheduler, journal, wait board
+and triggers (PRD resolved q37). Workers dial out to it and never the other way
+round, which is what makes a laptop behind NAT a first-class placement. This
+block is what a deploy file says about it.
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `join_token` | `${ENV}` reference | conditionally — see below | the bearer credential a worker presents at join |
+| `public_url` | absolute `http`/`https` URL | no | the ingress base every URL this deployment hands out derives from |
+
+```yaml
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+  public_url: "https://hub.example"
+```
+
+The rules (Decision
+[D130](#d130-the-hub-block-and-the-conditional-join-token)):
+
+1. **`join_token:` takes an `${ENV}` value-form reference and nothing else.** A
+   literal is a compile error, like every other credential in the grammar
+   (§4.3, PRD resolved q32). One kind only: bearer.
+2. **`join_token:` is REQUIRED when `placements:` is non-empty**, and its
+   absence is a compile error naming both repairs — declare the token, or remove
+   the placements. A `hub:` block with neither key, or one present without any
+   placements, is legal: `public_url:` is useful alone.
+3. **`public_url:` is an absolute URL naming a host**, its scheme `http` or
+   `https` written lowercase, with **no wildcard**: this is the deployment's own
+   base rather than an allowlist pattern, so a `*` in it is a character in a
+   hostname that resolves nowhere. Shape errors follow §13.3's conventions,
+   which is the other URL surface an author meets.
+4. **Unknown keys are errors**, as everywhere outside a plugin-config object
+   (D50).
+
+**What the token means is the v1 trust model, and it is worth stating plainly:
+holding the join token is being trusted with the mesh** — the whole artifact,
+the right to claim any placement, and the journal's effect stream (PRD resolved
+q38). The per-placement environment manifest checked at join is self-reported
+presence, not proof: proving a secret would mean sending it, which resolved q41
+exists to forbid. Per-placement credentials are an additive later hardening,
+not something this one key pretends to be.
+
+**The protocol these two sections describe is normative in
+[`docs/distributed.md`](distributed.md)**, which fixes the wire contract the
+runtime is written against. The keys are live static grammar today: every rule
+above is enforced by `validate`, and the `worker` verb that reads them lands
+with the runtime.
+
+### 14.3 `storage_backends`
 
 | Key | Shape | Notes |
 |---|---|---|
@@ -4312,7 +4458,7 @@ strings and credentials are env-ref values only (§4.3).
 Capability checks apply at the alias definition: a `vector` store bound to a
 non-vector-capable provider is a compile error (PRD 5.8).
 
-### 14.3 `event_sources` (RESERVED — parsed and validated, no-op in v0)
+### 14.4 `event_sources` (RESERVED — parsed and validated, no-op in v0)
 
 Maps the logical `source:` names used by `event` triggers to infrastructure.
 
@@ -4331,19 +4477,34 @@ its runtime effect is a documented no-op (PRD 5.10, 5.11).
 
 | Construct | Status in v0 | Lands in |
 |---|---|---|
-| `placements` | parsed + validated, no-op | M3 |
 | `event_sources` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: schedule` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: event` | parsed + validated, no-op | M3 |
-| `network:` on a placement | parsed, no-op | M3 |
 
-**Two constructs have left this list, and both left it by their runtime
-landing.**
+**Three constructs have left this list, and each left it a different way.**
 
 `human` nodes were here until M2: a compiled project really pauses, publishes
 the question, and resumes (§8.7), and its waits now survive a restart as well —
 a resumed execution re-parks under the same wait id and reads its answers out of
 the journal (`docs/durability.md`).
+
+**`placements:` left it by being re-cut**, which is the one departure that is
+not a runtime landing, and it is what the reserved posture is *for*. The old
+shape keyed placements by component address and gave each a `runtime:
+isolated|colocated` and a reserved `network:`. Resolving how a machine becomes a
+placement (PRD resolved q38) settled a different model — a named claim a worker
+asserts at an authenticated join — and the address-keyed shape could not express
+it. Reserved grammar is fully specified and carried into the IR precisely so
+that it *may be re-shaped before its first execution*: nothing had run, so
+nothing was broken, and the alternative would have been shipping a second
+placement grammar beside a dead first one. §14.1 and §14.2 are the result;
+Decision [D128](#d128-a-placement-is-a-named-claim-and-its-members-are-components)
+records the re-cut, and the keys are **live static grammar** — every rule about
+them is enforced by `validate` today, while the `worker` verb that reads them
+lands with the runtime. `crates/compose-core/tests/placement_surface_inertness.rs`
+is what holds that middle state honest: it asserts that no placement or hub
+material reaches a generated project yet, pins the sentences that say so, and
+enumerates what the runtime pass must unwind.
 
 **The three authentication keys were here until the http-native events pass**,
 and they are the ones that read differently from every other row, which is why
@@ -4651,7 +4812,10 @@ one route declares one). *PRD 5.6.*
 `node:` accepts `agent.*`, `tool.*`, or `flow.*`. **Rationale**: matches the PRD
 example (`node: agent.worker`, `node: tool.review_queue`) and reflects that map
 instances are isolated per-item invocations, not nodes of the enclosing graph —
-which is also what makes them the natural unit for `runtime: isolated`.
+which is also what makes an `agent.*` or `tool.*` target the natural unit for a
+placement (§14.1): the dispatch is already the thing a hub hands to a worker,
+and several workers claiming one name are the pool it fans out across, with no
+change to the logical definition.
 [D105](#d105-a-map-dispatch-isolates-conversation-history-per-instance) draws the
 same conclusion for conversation history, and
 [D73](#d73-on_item_error-carries-its-retry-policy-inline) for policy: what a
@@ -4856,11 +5020,19 @@ these to be parsed and validated now and executed in M3; the payload shapes and
 dedupe rule are specified so the IR carries everything M3 needs without a grammar
 change. *PRD 5.11.*
 
-### D47. Placement entries take `runtime` plus a reserved `network:`
+### D47. Placement entries take `runtime` plus a reserved `network:` — RETIRED
 
-**Rationale**: PRD 5.10 describes isolation as covering sandbox, credentials, and
-network policy; `network:` is the smallest reserved surface that records the
-intent without pre-building the M3 feature. *PRD 5.10.*
+Superseded by [D128](#d128-a-placement-is-a-named-claim-and-its-members-are-components),
+[D129](#d129-placement-members-are-agents-and-tools-disjoint-and-colocated-with-what-attaches-them)
+and [D130](#d130-the-hub-block-and-the-conditional-join-token). The entry stays
+at its number because a decision number is a stable citation; what it decided no
+longer exists. It read: a placement is keyed by component address and takes a
+required `runtime: isolated|colocated` plus a reserved `network:
+none|egress|all`, on the reading that PRD 5.10's isolation covered sandbox,
+credentials and network policy. PRD resolved q38 settled how a machine becomes a
+placement, and the answer is a **claim a worker asserts**, not a runtime mode a
+component declares. §14.1 is the shape that followed; §15 records why re-shaping
+reserved grammar is what reserved is for. *PRD 5.10, resolved q38.*
 
 ### D48. Backend resolution order and provider vocabularies are fixed in the grammar
 
@@ -5466,8 +5638,10 @@ impossible to share anyway. *PRD 5.6.*
 
 §7.7 defines reaching once — own nodes, `map` dispatch targets, an agent's
 `stores:`, an agent's `tools:` (including `flow.*` entries), transitively — and
-session coherence (§11.3), sync interrupt-freedom (§13.3, §8.7), and recursion
-(§7.5) all use it.
+session coherence (§11.3), sync interrupt-freedom (§13.3, §8.7), placement
+colocation (§14.1 rule 4) and recursion (§7.5) all use it. A check may read one
+part of what the relation returns — colocation reads clauses 1 and 2 — but never
+a traversal of its own.
 **Rationale**: the three checks each spelled out their own traversal, and the
 sets differed: §11.3 enumerated nodes, `flow:` nodes, and `stores:`; §13.3 said
 only "reachable from its entry". The gap is not academic — a `respond: sync`
@@ -5485,7 +5659,7 @@ newly rejected one is a spec that would have violated a guarantee at runtime.
 
 ### D87. `local` is a reserved target, and `deploy/local.yml` carries no `storage_backends`
 
-`local` is built in: no deploy file is required, `placements:` and
+`local` is built in: no deploy file is required, `hub:`, `placements:` and
 `event_sources:` are read from `deploy/local.yml` when it exists,
 `storage_backends:` there is a compile error, neither a store's `backend:` alias
 nor an `event` trigger's `source:` needs a definition under it, and
@@ -5498,13 +5672,15 @@ silently ignored (the inert key [D61](#d61-else-takes-the-literal-true) and
 [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)
 refuse), or rejected. The PRD's sentence is senior, so honoring is out and the
 document's own posture picks rejection over silence. The rest of the file stays
-legal because `placements:` and `event_sources:` are not storage and are carried
-into the IR under `local` exactly as under any other target, so nothing there is
-inert. The asymmetry with `event_sources:` is the
-active/reserved split of §15: `storage_backends:` configures something `local`
-overrides *today*, while `event_sources:` is reserved grammar no v0 target
-executes, so it is carried into the IR under every target rather than being dead
-under one. Satisfying both binding checks vacuously under `local` is what keeps
+legal because `hub:`, `placements:` and `event_sources:` are not storage and are
+carried into the IR under `local` exactly as under any other target, so nothing
+there is inert. The asymmetry is the split §15 draws three ways:
+`storage_backends:` configures something `local` overrides *today*; `hub:` and
+`placements:` are live grammar whose every static rule `local` is held to, and a
+`local` mesh — this process as the hub, a worker beside it — is a real
+deployment rather than a contradiction; `event_sources:` is reserved grammar no
+v0 target executes, so it too is carried into the IR under every target rather
+than being dead under one. Satisfying both binding checks vacuously under `local` is what keeps
 the zero-infra guarantee real — a project whose staging target names chroma and
 Redis Streams still validates and runs with nothing installed, which is the
 whole point of the guarantee. Requiring a named target's file to exist is the
@@ -6309,7 +6485,7 @@ applied here to one of its own constructs.
 
 The other repair — giving `blob` ops metadata — is the one that does not fit.
 It would add parameters to three rows, a filter predicate the blob providers of
-§14.2 (`local_fs`, `s3`, `gcs`) would each have to implement, and a synthesized
+§14.3 (`local_fs`, `s3`, `gcs`) would each have to implement, and a synthesized
 tool surface, all to answer a question PRD 5.8 never asks: its own example
 declares `metadata_schema` on a vector store, where metadata exists to narrow a
 similarity search, and its compile-check sentence pairs the two schemas with
@@ -6417,7 +6593,7 @@ A `vector` store's `embed:` block MUST name a `provider.*`; the storage backend
 never computes vectors. The referenced provider must publish embedding
 capability, checked at the store definition by §12.2's mechanism (§11.2, §2.3).
 **Rationale**: §11.2 said an omitted `provider:` was "default resolved from the
-target's backend", and no section defines that resolution. §14.2's storage
+target's backend", and no section defines that resolution. §14.3's storage
 vocabulary (`sqlite_vec`, `chroma`, `pgvector`, `qdrant`) publishes no embedding
 capability and its capability checks are about *vector storage*;
 [D36](#d36-embedmodel-is-a-bare-provider-native-id-not-a-model-ref) said only
@@ -6463,7 +6639,7 @@ computable for embeddings: an isolated deployment receives the env vars its
 resolved providers reference, which requires the embedding connection to be a
 named ref rather than a target-derived guess. A backend that genuinely embeds
 server-side stays additive — that is a storage-plugin capability and would
-arrive as one, published in §14.2's vocabulary and PRD-gated like any other new
+arrive as one, published in §14.3's vocabulary and PRD-gated like any other new
 design surface. *PRD 5.8, 5.9, G3.*
 
 ### D117. `payload.body` is an empty object on a bodyless request
@@ -7134,6 +7310,189 @@ prefix, since `X-Content-Type` and `Content-Type-Signature` are the receiver's
 own names and a rule that swallowed them would refuse a configuration that
 collides with nothing. *PRD resolved q33, q34, q35, §13.3.*
 
+### D128. A placement is a named claim, and its members are components
+
+`placements:` is keyed by an **identifier** (§2.1) naming a claim, and each entry
+lists the components that claim runs. The previous shape — keyed by component
+address, carrying `runtime: isolated|colocated` and a reserved `network:` — is
+retired ([D47](#d47-placement-entries-take-runtime-plus-a-reserved-network--retired)).
+
+**Rationale**. PRD resolved q37 and q38 settle the topology and the binding
+surface together, and the pair leaves the old shape with nothing to say. The hub
+owns the graph and workers dial out to it, so a placement can never be an
+address: a Mac behind NAT joins the way a CI runner joins, and what it offers is
+a *claim* — `agent-compose worker --join <hub> --claims mac,gpu`. That makes the
+name the binding surface, and a name is exactly what an address-keyed mapping
+has nowhere to put. The direction is the one Kubernetes labels take and for the
+same reason: which machine satisfies a claim is decided by whoever shows up, so
+several workers claiming one name form a pool, and the spec never learns their
+addresses.
+
+`runtime:` went the same way. `isolated` versus `colocated` was a *mode* a
+component declared about itself, and under hub-and-spoke the mode is implied by
+whether the component is claimed at all: a placed component runs on a worker
+process, an unplaced one runs on the hub, and there is no third answer for a
+keyword to select. `network:` recorded a sandbox intent no resolved containment
+story backs. PRD resolved q31 fixes v1 containment at a mandatory root plus a
+timeout — a builtin runs with the runtime's own privileges — and defers the rest,
+"containers/seccomp and any deploy-target-level restriction (refusing bash on a
+distributed placement is a placement fact)", to the distribution work; the
+distribution resolutions q37–q44 settled the topology, the binding surface and
+the wire without taking that question up. So the key would have read like a
+security control that nothing enforced and no resolution had specified. What
+happens to the question itself is filed as open in
+[`docs/distributed.md`](distributed.md) §13, and its answer, when it comes, is an
+addition to the claims model rather than a reason to have kept a reserved key
+ahead of it.
+
+**Why re-shaping was available at all.** Reserved grammar is fully specified,
+parsed, type-checked and carried into the IR *and executes as a no-op* (§15).
+The purpose of that posture is exactly this: the shape may be re-cut before its
+first execution, because nothing has run and nothing can have depended on what
+it did. The alternative — keeping the address-keyed grammar beside the claims
+model — would have shipped two placement languages, one of them dead, to spare a
+migration no deployment had yet made. What the posture does **not** license is
+re-shaping a construct whose absence of runtime is invisible from outside, which
+is the asymmetry §15 draws around the authentication keys.
+
+A component in **no** placement executes on the hub. That is stated in §14.1 as
+the default rather than enforced as a rule, because there is nothing to enforce:
+`placements:` names the exceptions, and a project that names none is a
+single-process deployment. *PRD 5.10, resolved q31, q37, q38, q40, q44.*
+
+### D129. Placement members are agents and tools, disjoint, and colocated with what attaches them
+
+A placement's `members:` is a non-empty list of `agent.*` and `tool.*` addresses
+that MUST resolve, each named once. A `flow.*` member is refused with a message
+naming the deferral. One component may be a member of at most one placement. A
+`tool.*` whose placement differs from that of an agent attaching it — including
+an agent with no placement at all — is a compile error, and so is a placement
+reached only through a `flow.*` that agent attaches.
+
+**Rationale**, one clause at a time.
+
+*Agents and tools only.* An agent is one model call and a tool is one
+implementation: each is a unit of work a hub can hand to a worker, and each is
+where a machine's capability actually lives — the signing keys, the GPU, the
+licensed binary. A flow is a subgraph, and what schedules a subgraph is the hub's
+scheduler, journal and wait board. Placing one would mean shipping the scheduler
+to the worker — a second scheduler and, behind it, a second journal, which is
+the peer-partition shape PRD resolved q37 rejects — or quietly placing every node
+the flow reaches, which is a different feature wearing one address. PRD resolved
+q44 fixes what v1 distributed ships and flow placement is not among it, so the
+refusal is a **deferral** and its message says so: the composition is
+well-formed, and what the author asked for is a feature this release does not
+have. Telling that author "expected an `agent.*`
+or `tool.*` reference" would read as a spelling correction for a decision the PRD
+took deliberately, which is why the `flow.` prefix is intercepted before the
+address is read.
+
+*Non-empty.* A placement with no members is a claim nothing is ever dispatched
+under — a statically visible dead surface, the same posture §13.3 takes to an
+empty `callback_allow:`.
+
+*Each named once.* A repeated entry is a different failure from a shared one and
+gets a different rule, because disjointness has nothing to say about it: a
+component written twice in one list holds one answer, written twice, and a
+message naming "both `mac` and `mac`" would offer a choice between one thing and
+itself. It is the repeated-entry rule §5.4 already applies to an agent's
+`tools:` and `stores:`, spelled the same way and carrying the same code, so an
+author meets one rule about repeated list entries rather than two.
+
+*Disjoint.* Workers claiming `mac` and workers claiming `gpu` are different
+machines by construction; that is what a claim is for. A component named by both
+gives the hub two answers to "which worker runs this", and whichever it picked
+would be invisible in the spec. The choice belongs to the author, in the file
+where both lines are, so the diagnostic names both placements and labels the
+first.
+
+*Colocated with what attaches it.* This is the clause that is not obvious, and
+it follows from PRD resolved q40: the hub ships the **whole** artifact to every
+worker, with per-placement slicing deferred. So a placement decides which
+*process* runs a node, never which code exists where — and an attached tool is
+called from inside its agent's own tool loop, in the process running the agent.
+The tool's own placement therefore gets no say, and a composition that declares
+one is holding two answers again. The asymmetry is deliberate: a tool with **no**
+placement attached to a placed agent is fine, because the artifact really is
+everywhere and the tool has claimed nothing; a **placed** tool attached to an
+agent with no placement is refused, because that agent runs on the hub and would
+drag the tool there — a placement written, accepted, and silently ignored, which
+is the failure mode worth a compile error. A placed tool reached from a
+`function:` node (§8.4) is untouched: nothing there disagrees with it, and that
+case is what placing a tool is for.
+
+*Colocated through an attached flow, too.* The rule is about the agent's
+**process**, not about the `tool.` prefix, and §5.4 puts a second construct in
+that process: a `flow.*` in a `tools:` list starts an instance inside the tool
+loop, exactly where a tool call happens. Reading the flow's own address — "a
+flow cannot be placed, so there is no claim to disagree with" — is true of the
+flow and false of everything it reaches, and stopping there would leave the last
+row of the table open one indirection out: a `mac` tool reached only through an
+attached flow would run on the hub, silently, with the deploy file saying
+otherwise. So the check walks what the instance reaches (§7.7 clauses 1 and 2)
+and holds each placed component to the same four rows. The walk stops where
+clauses 3 and 4 stop, at an agent's own attached `tool.*`, because that pair is
+already governed by the direct rule and following it would report one
+contradiction twice. The other direction stays untouched and matters as much: a
+flow instantiated by a `flow:` node (§8.5) is scheduled by the hub, so every
+placement inside it is honoured and there is nothing to refuse — the repair the
+diagnostic offers third. *PRD 5.10, resolved q38, q40, q44.*
+
+### D130. The `hub` block, and the conditional join token
+
+`hub:` takes `join_token:` — an `${ENV}` value-form reference, never a literal —
+and `public_url:` — an absolute `http`/`https` URL naming a host, with no
+wildcard. `join_token:` is REQUIRED when `placements:` is non-empty and optional
+otherwise; a `hub:` block with neither key is legal, and so is one declared where
+no placement is.
+
+**Rationale**. *A block rather than two top-level keys*, because both describe
+one thing — the process that owns the graph (PRD resolved q37) — and a deploy
+file's top level is a short list of sections whose members should each be a
+subject rather than a field.
+
+*An env reference only.* The join token is a credential, and §4.3's rule is that
+the spec never contains one. Nothing about this key is special enough to be the
+exception, and the one kind is bearer (PRD resolved q38), so there is no scheme
+to select.
+
+*Conditionally required.* Declaring a placement is declaring that some node runs
+somewhere else, and the only way a worker becomes that somewhere else is an
+authenticated join: a mesh described without a token is a mesh nobody can join,
+which `validate` can see and a deployment would discover at the first dispatch.
+The failure gets a code of its own — `missing-join-token` — rather than
+`missing-key`, for the reason
+[D126](#d126-callback_auth-makes-callback_allow-mandatory) and
+[D120](#d120-a-keyless-anthropic-or-openai-provider-names-its-endpoint) have
+theirs: what is absent is decided by a *sibling*, and the repair is a choice of
+two, so the message names both — declare the token, or remove the placements.
+The rule reads `join_token:` as **written** rather than as parsed, so an author
+who wrote a literal is told what is wrong with the literal and is not also told
+the key is missing.
+
+*Legal on its own.* `public_url:` is useful with no placements at all: PRD
+resolved q44's fourth invariant makes ingress name-addressed, so every URL a
+deployment hands out derives from a configurable base, and a single-process
+`serve` behind a load balancer needs that base as much as a mesh does.
+
+*No wildcard in `public_url:`.* §13.3's `callback_allow:` entries are **patterns**
+matched against a URL somebody else supplied, and `*` there is the match. This is
+the opposite direction: the base is ours, written out, and concatenated into URLs
+this deployment publishes. A `*` in it is a character in a hostname that resolves
+nowhere. The rest of the shape rules are `callback_allow:`'s, deliberately, down
+to the wording — an author meeting both surfaces should meet one set of URL
+rules ([D127](#d127-a-callback-allowlist-entry-is-a-wildcard-url-and-the-delivery-wire-is-fixed)).
+
+**The trust model this key carries is v1's whole answer, and §14.2 states it
+rather than implying it**: holding the join token is being trusted with the mesh
+— the whole artifact, the right to claim any placement, and the journal's effect
+stream. The per-placement environment manifest checked at join is self-reported
+presence, not proof, because proving a secret would mean sending it and PRD
+resolved q41 exists to forbid that. Per-placement credentials are an additive
+later hardening. Saying so in the grammar is the same discipline §13.3 applies to
+a constant-time comparison: a security property a reader could assume wrongly is
+worse than one they have to look up. *PRD 5.10, resolved q37, q38, q41, q44.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -7221,7 +7580,12 @@ pairings, the scheme counts on both auth blocks — exactly one on `auth:`, at
 least one on `callback_auth:` — and the two conditionals the callback keys carry:
 `callback_auth:` or `callback_allow:` requiring a `callback:` for either to
 describe, and `callback_auth:` requiring `callback_allow:`, which is that same
-conditional-required-key shape a second time (§13.3, D126, D127), the map form
+conditional-required-key shape a second time (§13.3, D126, D127), the deploy
+layer's third instance of it — `hub.join_token:` required as soon as
+`placements:` is non-empty, which is one `if`/`then` over two sections of one
+file (§14.2, D130) — and, beside it, a placement's non-empty `members:` list, its
+entries' distinctness, and the `agent.*`/`tool.*` pattern they take (§14.1,
+D129), the map form
 rules and the `on_item_error` shape (§8.6) — including the confinement of
 `input:`/`writes:`/`detach:` to the homogeneous form (rule 7, D85) and the
 absence of any `context:` key, which is a `flow:` node's alone because a
@@ -7283,7 +7647,7 @@ A file that passes the schema and fails `validate` is normal and expected; a fil
 that fails the schema always fails `validate`. Keeping that direction is why the
 schema stops short of guessing: `queue_url` on an event source is a plain
 interpolable string, because §4.3's secret-field list is closed and does not name
-it (§14.3), and a trigger `path:` is only required to start with `/` and carry no
+it (§14.4), and a trigger `path:` is only required to start with `/` and carry no
 whitespace, because the router's own parameter syntax (`/reviews/:id`) is opaque
 to the grammar (§13.3).
 
@@ -7387,7 +7751,8 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 
 # ---- deploy file ------------------------------------------------------------
 version: "0.1"
-placements:       { <address>: { runtime: isolated|colocated, network? } }
+hub:              { join_token?: ${VAR}, public_url?: "https://<host>" }
+placements:       { <name>: { members: [agent.*|tool.*, ...], description? } }
 storage_backends: { defaults: { kv|vector|blob: {...} }, aliases: { <alias>: {...} } }
 event_sources:    { <name>: { kind: ..., ... } }
 ```

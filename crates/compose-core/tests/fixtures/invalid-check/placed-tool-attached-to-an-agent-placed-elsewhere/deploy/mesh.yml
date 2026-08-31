@@ -1,0 +1,10 @@
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  mac:
+    members: [tool.xcodebuild]
+  gpu:
+    members: [agent.builder]

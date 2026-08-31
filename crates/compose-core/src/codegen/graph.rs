@@ -100,7 +100,7 @@
 //! # What is emitted for a construct this release does not execute
 //!
 //! A store bound to a **production** backend is the only one. Grammar
-//! 14.2's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
+//! 14.3's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
 //! the rest land in M3 — so [`backend_of`] resolves the alias at compile time
 //! and the emitted binding carries the provider it resolved to; `src/stores.ts`
 //! is where a store bound to one says so, naming the backend, where the

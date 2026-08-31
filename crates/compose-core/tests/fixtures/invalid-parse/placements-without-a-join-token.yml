@@ -1,0 +1,13 @@
+# rule: `hub.join_token:` is required wherever placements are (grammar 14.2, Decision D130)
+# code: missing-join-token
+# message: this target declares placements and no `hub.join_token`
+# at: 9:3
+# help: a placement is claimed by a worker at an authenticated join, and the join token is the whole of that authentication — holding it is being trusted with the mesh: declare `hub: { join_token: ${SOME_VAR} }`, or remove the placements if this target runs in one process (grammar 14.2, PRD resolved q38)
+version: "0.1"
+
+hub:
+  public_url: "https://hub.example"
+
+placements:
+  mac:
+    members: [agent.signer]
