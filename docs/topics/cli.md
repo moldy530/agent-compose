@@ -86,9 +86,21 @@ of ECMAScript, so a composition can be valid and have no TypeScript project.
 
 `--out` defaults to `<project>/build/<target>`. `--check` writes nothing and
 reports whether the directory already matches the spec — that is the CI step,
-and it exits `1` on drift. `build` replaces and removes only files carrying its
-own generated-file header, so a directory holding somebody else's TypeScript is
-refused rather than overwritten.
+and it exits `1` on drift.
+
+**The emitted file list is the boundary.** `build` replaces exactly the files it
+emits and `--check` compares exactly them; nothing else under the output
+directory is written, removed, or reported. A directory holding none of the
+compiler's own files is refused rather than overwritten — the generated-file
+header is how it tells its work from yours — and a file the emitter does not
+produce is nobody's business but yours, wherever it sits.
+
+The one exception is a write rather than a removal: a `tool.*` bound to
+`module: ./src/tools/<name>.ts` gets that file **scaffolded once**, in the
+project beside the entrypoint, when it is not there. `validate` and
+`build --check` refuse a binding whose file is missing and name `build` as the
+repair; `build` writes the stub and never writes or reads that file again. See
+`agent-compose docs tools`.
 
 `build --format json` writes `validate`'s two keys and a third:
 `{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ]}`, where `drift` names
