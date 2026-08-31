@@ -101,7 +101,7 @@
 //!
 //! A store bound to a **production** backend is the only one. Grammar
 //! 14.3's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
-//! the rest land in M3 — so [`backend_of`] resolves the alias at compile time
+//! the rest land in M3 — so `ir::deploy::backend_of` resolves the alias at compile time
 //! and the emitted binding carries the provider it resolved to; `src/stores.ts`
 //! is where a store bound to one says so, naming the backend, where the
 //! resolution came from, and the milestone. Under `--target local` no alias and
@@ -119,7 +119,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated};
-use crate::ast::definition::{Builtin, ProviderKind, StoreKind};
+use crate::ast::definition::{Builtin, ProviderKind};
 use crate::ast::flow::FlowContext;
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
@@ -237,9 +237,11 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
         }
     }
     body.push_str(&registry_source(ir, names, &registry, &mut imported));
+    body.push_str(&placed_source(ir, names));
 
     contents.push_str("\nimport { END, START, StateGraph } from \"@langchain/langgraph\";\n");
-    contents.push_str("\nimport * as runtime from \"./runtime.ts\";\n");
+    contents.push_str("\nimport * as mesh from \"./mesh.ts\";\n");
+    contents.push_str("import * as runtime from \"./runtime.ts\";\n");
     contents.push_str("import * as stores from \"./stores.ts\";\n");
     imported.sort();
     imported.dedup();
@@ -617,7 +619,7 @@ fn stores(ir: &Ir, names: &Names) -> String {
         let local = address
             .split_once('.')
             .map_or(address.as_str(), |(_, rest)| rest);
-        let backend = backend_of(ir, store);
+        let backend = crate::ir::deploy::backend_of(ir, store);
         text.push('\n');
         text.push_str(&names::doc(
             "",
@@ -626,7 +628,7 @@ fn stores(ir: &Ir, names: &Names) -> String {
                  (grammar 11.1, 11.3).",
                 store.kind.as_str(),
                 store.scope.as_str(),
-                backend.provider,
+                backend.provider.as_str(),
                 backend.from
             )],
         ));
@@ -677,74 +679,13 @@ fn stores(ir: &Ir, names: &Names) -> String {
         text.push_str("  backend: {\n");
         text.push_str(&format!(
             "    provider: {},\n",
-            names::string(backend.provider)
+            names::string(backend.provider.as_str())
         ));
         text.push_str(&format!("    from: {},\n", names::string(&backend.from)));
         text.push_str("  },\n");
         text.push_str("};\n");
     }
     text
-}
-
-/// Which backend a store resolved to under the active target, and why.
-struct Backend {
-    provider: &'static str,
-    from: String,
-}
-
-/// Grammar 11.3's resolution order, run at compile time.
-///
-/// `--target local` substitutes local storage for **every** store
-/// unconditionally, so under it no alias and no per-kind default is consulted at
-/// all (PRD 5.8, Decision D87) — which is what makes a project with production
-/// infrastructure in `deploy/staging.yml` still buildable and runnable with none.
-/// Under any other target the order is the grammar's: explicit alias, then the
-/// per-kind `defaults:`, then the target built-in, which is the same local
-/// storage because it is the only backend this compiler release implements.
-fn backend_of(ir: &Ir, store: &crate::ir::definition::Store) -> Backend {
-    let built_in = match store.kind {
-        StoreKind::Kv => "sqlite",
-        StoreKind::Vector => "sqlite_vec",
-        StoreKind::Blob => "local_fs",
-    };
-    if ir.target == crate::DEFAULT_TARGET {
-        return Backend {
-            provider: built_in,
-            from: "the `local` target substitutes local storage for every store unconditionally"
-                .to_string(),
-        };
-    }
-    let backends = ir.deploy.storage_backends.as_ref();
-    if let Some(alias) = &store.backend
-        && let Some(config) =
-            backends.and_then(|backends| backends.aliases.get(alias.value.as_str()))
-    {
-        return Backend {
-            provider: config.provider.as_str(),
-            from: format!(
-                "the alias `{}`, defined by the `{}` target",
-                alias.value, ir.target
-            ),
-        };
-    }
-    if let Some(config) = backends.and_then(|backends| backends.defaults.get(store.kind.as_str())) {
-        return Backend {
-            provider: config.provider.as_str(),
-            from: format!(
-                "the `{}` default of the `{}` target",
-                store.kind.as_str(),
-                ir.target
-            ),
-        };
-    }
-    Backend {
-        provider: built_in,
-        from: format!(
-            "the built-in for `kind: {}`, which the `{}` target does not override",
-            store.kind.as_str(),
-            ir.target
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,6 +1985,67 @@ fn activity(
         });
 
     match &node.kind {
+        // **A placed component is dispatched, not called** (grammar §14.1,
+        // `docs/distributed.md` §7). The node keeps everything else it has — its
+        // input phase, its `retry:`/`timeout:` chain, its writes and its edges —
+        // and only the activity changes: the hub journals a dispatch, parks it
+        // until a worker claiming the placement takes it, and feeds the answer
+        // back into the graph as if the node had run here.
+        NodeKind::Agent { agent } if placement_of(ir, &agent.value.to_string()).is_some() => {
+            let placement = placement_of(ir, &agent.value.to_string())
+                .expect("the guard above found a placement");
+            let schema = output_schema.expect("an agent node has an output surface");
+            format!(
+                "  run: async (input, context, view) => {{\n    \
+                 const answer = await mesh.dispatchPlaced({{\n      \
+                 placement: {placement},\n      \
+                 node: {node_address},\n      \
+                 execution: view.run.execution.id,\n      \
+                 itemIndex: view.run.execution.item_index,\n      \
+                 path: runtime.instancePath(view, {node}),\n      \
+                 inputs: input,\n      \
+                 history: runtime.historyTurns(view.state[\"messages\"] as unknown[]),\n      \
+                 policy: view.run.policy,\n      \
+                 signal: context.signal,\n      \
+                 stores: context.storeRecords,\n    \
+                 }});\n    \
+                 return {{\n      \
+                 output: runtime.parseResult({schema}, answer.output, {subject}),\n      \
+                 history: answer.history,\n      \
+                 models: answer.models,\n      \
+                 toolDispatches: answer.toolDispatches,\n    \
+                 }};\n  }},\n",
+                placement = names::string(&placement),
+                node_address = names::string(&format!("{address}.{id}")),
+                node = names::string(id),
+                subject = names::string(&format!("the answer of `{}`", agent.value))
+            )
+        }
+        NodeKind::Function { function }
+            if placement_of(ir, &function.value.to_string()).is_some() =>
+        {
+            let placement = placement_of(ir, &function.value.to_string())
+                .expect("the guard above found a placement");
+            let schema = output_schema.expect("a function node has an output surface");
+            format!(
+                "  run: async (input, context, view) => ({{\n    \
+                 output: runtime.parseResult(\n      {schema},\n      \
+                 (\n        await mesh.dispatchPlaced({{\n          \
+                 placement: {placement},\n          \
+                 node: {node_address},\n          \
+                 execution: view.run.execution.id,\n          \
+                 itemIndex: view.run.execution.item_index,\n          \
+                 path: runtime.instancePath(view, {node}),\n          \
+                 inputs: input,\n          \
+                 signal: context.signal,\n          \
+                 stores: context.storeRecords,\n        \
+                 }})\n      ).output,\n      {subject},\n    ),\n  }}),\n",
+                placement = names::string(&placement),
+                node_address = names::string(&format!("{address}.{id}")),
+                node = names::string(id),
+                subject = names::string(&format!("the result of `{}`", function.value))
+            )
+        }
         NodeKind::Agent { agent } => {
             let binding = names.value(&agent.value.to_string());
             let schema = output_schema.expect("an agent node has an output surface");
@@ -2603,6 +2605,45 @@ fn dispatch_run(
     let Some(definition) = ir.definitions.get(target) else {
         return format!("{indent}run: () => Promise.resolve({{ output: {{}} }}),\n");
     };
+    // A dispatched instance whose target is placed goes over the wire exactly as
+    // a placed node does: the `map` admits what its `max_concurrency:` says and
+    // the placement delivers what its pool can run, which is
+    // `docs/distributed.md` §2's "a `map` declares how many instances the graph
+    // may have in flight; when the node it dispatches is placed, how many of
+    // them are running at once is the number of live sessions claiming that
+    // placement". The rest are undispatched, on the board, with their own
+    // `timeout:` running (§6.4).
+    if let Some(placement) = placement_of(ir, target)
+        && matches!(
+            definition.body,
+            DefinitionBody::Agent(_) | DefinitionBody::Tool(_)
+        )
+    {
+        let schema = names.value(&format!("{target}.output")).to_string();
+        imported.push(schema.clone());
+        return format!(
+            "{indent}run: async (input, context, site) => {{\n{indent}  \
+             const answer = await mesh.dispatchPlaced({{\n{indent}    \
+             placement: {placement},\n{indent}    \
+             node: {target_name},\n{indent}    \
+             execution: site.execution.id,\n{indent}    \
+             itemIndex: site.execution.item_index,\n{indent}    \
+             path: site.path,\n{indent}    \
+             inputs: input,\n{indent}    \
+             signal: context.signal,\n{indent}    \
+             stores: context.storeRecords,\n{indent}  \
+             }});\n{indent}  \
+             return {{\n{indent}    \
+             output: runtime.parseResult({schema}, answer.output, {subject}),\n{indent}    \
+             models: answer.models,\n{indent}    \
+             toolDispatches: answer.toolDispatches,\n{indent}  \
+             }};\n{indent}\
+             }},\n",
+            placement = names::string(&placement),
+            target_name = names::string(target),
+            subject = names::string(&format!("the answer of `{target}`"))
+        );
+    }
     match &definition.body {
         DefinitionBody::Agent(_) => {
             let binding = names.value(target);
@@ -3703,6 +3744,11 @@ async function quiesceFlow(
   // (`docs/durability.md` §5).
   const release = async (outcome: unknown): Promise<void> => {
     runtime.releaseHumanWaits(executionId);
+    // …and the placement waits, for the same reason one level out: a dispatch
+    // nothing is waiting for is work a worker could still take, whose result
+    // would be posted against a node execution that is gone
+    // (`docs/distributed.md` §6.1, `./mesh.ts`).
+    mesh.releasePlacementWaits(executionId);
     // And the deliveries nothing joined, on the two ways out where one still in
     // flight can change what this function has to decide.
     //
@@ -3860,6 +3906,199 @@ fn control_name_raw(target: &ControlTarget) -> String {
         ControlTarget::Node(node) => node.as_str().to_string(),
         ControlTarget::End => "__end__".to_string(),
     }
+}
+
+/// `placedNodes`: what each placed call site **does**, for the process that
+/// executes it (`docs/distributed.md` §3.2, §7.4).
+///
+/// The other half of the seam whose hub side is `mesh.dispatchPlaced`. Every
+/// site that dispatches gets an entry here under the address the dispatch names,
+/// and the entry is the activity the node would have run had nothing been placed
+/// — so the two are lowered from one description and cannot drift into two
+/// behaviours for one node.
+///
+/// # Why it is keyed by the dispatch's address rather than by the placement
+///
+/// Because §2 queues work to a placement and hands over a *node*: the dispatch
+/// carries `node`, and a placement holds as many of these as its members are
+/// reached by. The three keys are the three ways a graph reaches a placed
+/// component (grammar §14.1): `<flow>.<node>` for an `agent:` node and for a
+/// `function:` node, and the component's own address for a `map` dispatch
+/// target, which is the address `dispatch_run` puts on the wire.
+///
+/// # What a worker is given, and why it is given rather than derived
+///
+/// The activity is handed the dispatch's inputs **and the four facts §3.2 carries
+/// beside them**: the execution's session key and item index, the conversation
+/// history an `agent:` node takes, and grammar §9.3's level-1 policy. Each is a
+/// fact the hub holds about this node execution that the node would have read for
+/// itself had it run there, and the worker has no way to compute any of them — it
+/// holds no `messages` channel, no `$run`, and no lifecycle row.
+///
+/// That is what makes a placement a decision about *which process* rather than
+/// about what a node means (§4.3, §2, PRD 5.6's "zero change to the logical
+/// definition"). Placing an `agent:` node without them would silently drop the
+/// turns grammar §10.4 fills the shared channel with, and would instantiate a
+/// `flow.*` in the agent's `tools:` under a different retry/timeout ladder from
+/// the one the same agent unplaced instantiates it under (D79).
+///
+/// A `map`-dispatched target sends neither `history` nor `policy`, and that is
+/// not a gap: grammar §8.6 rule 10 runs a dispatched instance on a fresh
+/// conversation with level 1 absent (D105), which is what the local lowering
+/// does too.
+fn placed_source(ir: &Ir, names: &Names) -> String {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut push = |key: String, body: String, seen: &mut BTreeSet<String>| {
+        if seen.insert(key.clone()) {
+            entries.push((key, body));
+        }
+    };
+    for (address, definition) in &ir.definitions {
+        let DefinitionBody::Flow(flow) = &definition.body else {
+            continue;
+        };
+        for node in &flow.nodes {
+            let id = node.id.value.as_str();
+            match &node.kind {
+                NodeKind::Agent { agent }
+                    if placement_of(ir, &agent.value.to_string()).is_some() =>
+                {
+                    push(
+                        format!("{address}.{id}"),
+                        placed_agent(names, &agent.value.to_string()),
+                        &mut seen,
+                    );
+                }
+                NodeKind::Function { function }
+                    if placement_of(ir, &function.value.to_string()).is_some() =>
+                {
+                    push(
+                        format!("{address}.{id}"),
+                        placed_tool(names, &function.value.to_string()),
+                        &mut seen,
+                    );
+                }
+                NodeKind::Map { map } => {
+                    for target in map_targets(map) {
+                        if placement_of(ir, &target).is_none() {
+                            continue;
+                        }
+                        let Some(definition) = ir.definitions.get(&target) else {
+                            continue;
+                        };
+                        let body = match &definition.body {
+                            DefinitionBody::Agent(_) => placed_agent(names, &target),
+                            DefinitionBody::Tool(_) => placed_tool(names, &target),
+                            _ => continue,
+                        };
+                        push(target.clone(), body, &mut seen);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut text = String::from(PLACED_DOC);
+    if entries.is_empty() {
+        text.push_str("export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {};\n");
+        return text;
+    }
+    text.push_str("export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {\n");
+    // Sorted, so the emitted record is ordered by what it holds rather than by
+    // the order the flows happened to be walked in ([`super`]'s ordering rule).
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    for (key, body) in entries {
+        text.push_str(&format!("  {}:\n{body}", names::string(&key)));
+    }
+    text.push_str("};\n");
+    text
+}
+
+/// Every address one `map` node dispatches to, in declaration order.
+fn map_targets(map: &Map) -> Vec<String> {
+    match &map.dispatch {
+        MapDispatch::Homogeneous { node, .. } => vec![node.value.to_string()],
+        MapDispatch::Routed {
+            routes, default, ..
+        } => routes
+            .iter()
+            .chain(default.as_deref())
+            .map(|route| route.node.value.to_string())
+            .collect(),
+    }
+}
+
+/// One placed `agent.*`, run where it was placed.
+///
+/// The history and the level-1 policy are the **dispatch's** — §3.2's `history`
+/// and `policy`, which the hub derived from the node's own call site and put on
+/// the wire (see [`placed_source`]). Absent is empty and absent is "none set",
+/// which is exactly what a `map`-dispatched agent sends: grammar §8.6 rule 10
+/// runs a dispatched instance on a fresh conversation with level 1 absent
+/// (D105), so the same lowering serves both without a branch.
+///
+/// Everything else is the local lowering's own call, down to the answer being
+/// left unparsed: the hub holds it to the node's declared surface when it feeds
+/// it back into the graph.
+fn placed_agent(names: &Names, address: &str) -> String {
+    format!(
+        "    async (input, context, site) => {{\n      \
+         const answer = await runtime.callAgent(\n        {binding},\n        input,\n        \
+         site.history ?? [],\n        context,\n        \
+         {{ path: site.path, policy: site.policy }},\n      );\n      \
+         return {{\n        \
+         output: answer.output,\n        \
+         history: answer.history,\n        \
+         models: answer.models,\n        \
+         toolDispatches: answer.toolDispatches,\n      \
+         }};\n    \
+         }},\n",
+        binding = names.value(address)
+    )
+}
+
+/// One placed `tool.*`, run where it was placed.
+fn placed_tool(names: &Names, address: &str) -> String {
+    format!(
+        "    async (input, context) => ({{ output: await {}(input, context) }}),\n",
+        names.value(address)
+    )
+}
+
+const PLACED_DOC: &str = "\n\
+/**\n \
+* What each placed call site does, for the process that **executes** it\n \
+* (`docs/distributed.md` §3.2, §7.4).\n \
+*\n \
+* The other side of `mesh.dispatchPlaced`. A hub journals a dispatch and waits;\n \
+* the worker that takes it runs `./worker-node.ts`, which looks the dispatch's\n \
+* `node` up here and runs exactly the activity this node would have run had\n \
+* nothing been placed. One lowering, two processes — which is what keeps a\n \
+* placed node from meaning something different from an unplaced one.\n \
+*\n \
+* Keyed by the address a dispatch names: `<flow>.<node>` for an `agent:` or\n \
+* `function:` node, and the component's own address for a `map` dispatch target\n \
+* (grammar §14.1's three ways a graph reaches a placed component).\n \
+*/\n";
+
+/// Which placement claims this component, if one does (grammar §14.1).
+///
+/// The first claim wins, exactly as `check::placements` and `codegen::env` read
+/// it: a component two placements name is already a compile error, and reading
+/// it twice here would make the emitted project depend on which of the two
+/// reports the author fixes.
+fn placement_of(ir: &Ir, address: &str) -> Option<String> {
+    let section = ir.deploy.placements.as_ref()?;
+    for placement in section.entries.values() {
+        for member in &placement.members {
+            if member.value.to_string() == address {
+                return Some(placement.name.value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The canonical path of a node's result surface, if it has one.

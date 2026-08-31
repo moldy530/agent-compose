@@ -1208,16 +1208,20 @@ const SIBLINGS: &str = r#"    - { from: approve, to: end, when: "approve.output.
 const SIBLINGS_SWAPPED: &str = r#"    - { from: approve, to: escalate, when: "approve.output.decision == 'reject'" }
     - { from: approve, to: end, when: "approve.output.decision == 'approve'" }"#;
 
-/// The placement of the deploy layer, and the same file with an event source
-/// planted under it so that there is one to edit — `local` declares none, and
-/// `event_sources:` is the reserved section it admits beside the two live ones
-/// (`docs/plan.md` §11).
-const PLACEMENT: &str = r#"  patchers:
-    members: [agent.fixer]
-    description: The machine holding a checkout; on a laptop, this one."#;
-const EVENT_SOURCE: &str = r#"  patchers:
-    members: [agent.fixer]
-    description: The machine holding a checkout; on a laptop, this one.
+/// The `hub:` block of the `local` deploy layer, and the same file with an event
+/// source planted under it so that there is one to edit — `local` declares none,
+/// and `event_sources:` is the reserved section it admits beside the two live
+/// ones (`docs/plan.md` §11).
+///
+/// The anchor is the hub rather than a placement, because `local` places
+/// nothing: a placed component is dispatched to whichever worker claims its
+/// placement (`docs/distributed.md` §3), so a target whose runs are
+/// single-process leaves `placements:` to `deploy/staging.yml` — which is where
+/// this corpus's placement coverage comes from.
+const HUB: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}"#;
+const EVENT_SOURCE: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
 
 event_sources:
   bug_reports:
@@ -1225,14 +1229,12 @@ event_sources:
     url: ${REDIS_URL}
     stream: bug-reports
     consumer_group: agent-compose"#;
-const EVENT_SOURCE_EMPTY: &str = r#"  patchers:
-    members: [agent.fixer]
-    description: The machine holding a checkout; on a laptop, this one.
+const EVENT_SOURCE_EMPTY: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
 
 event_sources: {}"#;
-const EVENT_SOURCE_MOVED: &str = r#"  patchers:
-    members: [agent.fixer]
-    description: The machine holding a checkout; on a laptop, this one.
+const EVENT_SOURCE_MOVED: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
 
 event_sources:
   bug_reports:
@@ -1240,6 +1242,37 @@ event_sources:
     url: ${REDIS_URL}
     stream: triage-reports
     consumer_group: agent-compose"#;
+
+/// A placement planted under the same anchor, and the two edits a plan has to
+/// report about one (grammar §14.1, `docs/plan.md` §4).
+///
+/// Planted rather than read out of the example, for [`EVENT_SOURCE`]'s reason:
+/// the target this corpus resolves under is `local`, whose runs are
+/// single-process and which therefore places nothing. The section still has to
+/// be covered — a `plan` that stopped reporting a placement would let a
+/// deployment move a component to another machine with nothing in the review —
+/// so the pairs bring their own.
+const PLACEMENT: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  patchers:
+    members: [agent.fixer]
+    description: The machine holding a checkout."#;
+const PLACEMENT_WIDENED: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  patchers:
+    members: [agent.fixer, tool.repo_grep]
+    description: The machine holding a checkout."#;
+const PLACEMENT_REWORDED: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  patchers:
+    members: [agent.fixer]
+    description: The machine with a checkout on it."#;
 
 /// Two edges of **different** nodes, and the same two swapped. Neither node's
 /// own outgoing order moves, so neither node's routing decision reads
@@ -1521,7 +1554,7 @@ const CASES: &[Case] = &[
     Case {
         what: "a section declared with no entries where the other side declares none",
         before: &[],
-        after: &[("deploy/local.yml", PLACEMENT, EVENT_SOURCE_EMPTY)],
+        after: &[("deploy/local.yml", HUB, EVENT_SOURCE_EMPTY)],
         differs: false,
     },
     // --- One field of one component, with nothing else moving. ----------------
@@ -1569,8 +1602,8 @@ const CASES: &[Case] = &[
     },
     Case {
         what: "an event source's stream repointed",
-        before: &[("deploy/local.yml", PLACEMENT, EVENT_SOURCE)],
-        after: &[("deploy/local.yml", PLACEMENT, EVENT_SOURCE_MOVED)],
+        before: &[("deploy/local.yml", HUB, EVENT_SOURCE)],
+        after: &[("deploy/local.yml", HUB, EVENT_SOURCE_MOVED)],
         differs: true,
     },
     // --- Every remaining key of one component, swept a component at a time. ---
@@ -1965,22 +1998,14 @@ const CASES: &[Case] = &[
     },
     Case {
         what: "a placement given a second member",
-        before: &[],
-        after: &[(
-            "deploy/local.yml",
-            "    members: [agent.fixer]",
-            "    members: [agent.fixer, tool.repo_grep]",
-        )],
+        before: &[("deploy/local.yml", HUB, PLACEMENT)],
+        after: &[("deploy/local.yml", HUB, PLACEMENT_WIDENED)],
         differs: true,
     },
     Case {
         what: "a placement's description reworded",
-        before: &[],
-        after: &[(
-            "deploy/local.yml",
-            "    description: The machine holding a checkout; on a laptop, this one.",
-            "    description: The machine holding a checkout.",
-        )],
+        before: &[("deploy/local.yml", HUB, PLACEMENT)],
+        after: &[("deploy/local.yml", HUB, PLACEMENT_REWORDED)],
         differs: true,
     },
     // The `hub:` block is the deploy layer's one singleton, so both of its keys

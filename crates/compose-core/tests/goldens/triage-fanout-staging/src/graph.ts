@@ -16,6 +16,7 @@
 
 import { END, START, StateGraph } from "@langchain/langgraph";
 
+import * as mesh from "./mesh.ts";
 import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
@@ -737,7 +738,24 @@ const flowTriageNodeScan: runtime.NodeDescriptor = {
     "pattern": runtime.toJson(runtime.evaluate("input.pattern", roots)),
     "max_matches": runtime.toJson(runtime.evaluate("25", roots)),
   }),
-  run: async (input, context) => ({ output: await toolRepoGrep(input, context) }),
+  run: async (input, context, view) => ({
+    output: runtime.parseResult(
+      toolRepoGrepOutput,
+      (
+        await mesh.dispatchPlaced({
+          placement: "patchers",
+          node: "flow.triage.scan",
+          execution: view.run.execution.id,
+          itemIndex: view.run.execution.item_index,
+          path: runtime.instancePath(view, "scan"),
+          inputs: input,
+          signal: context.signal,
+          stores: context.storeRecords,
+        })
+      ).output,
+      "the result of `tool.repo_grep`",
+    ),
+  }),
   writes: [
     { field: "matches", channel: "matches", reduce: "set" },
   ],
@@ -837,7 +855,16 @@ const flowTriageNodeDispatchMap: runtime.MapDescriptor = {
         "patch_hint": runtime.toJson(runtime.evaluate("finding.patch_hint", roots)),
       }),
       run: async (input, context, site) => {
-        const answer = await runtime.callAgent(agentFixer, input, [], context, { path: site.path });
+        const answer = await mesh.dispatchPlaced({
+          placement: "patchers",
+          node: "agent.fixer",
+          execution: site.execution.id,
+          itemIndex: site.execution.item_index,
+          path: site.path,
+          inputs: input,
+          signal: context.signal,
+          stores: context.storeRecords,
+        });
         return {
           output: runtime.parseResult(agentFixerOutput, answer.output, "the answer of `agent.fixer`"),
           models: answer.models,
@@ -1641,6 +1668,11 @@ async function quiesceFlow(
   // (`docs/durability.md` §5).
   const release = async (outcome: unknown): Promise<void> => {
     runtime.releaseHumanWaits(executionId);
+    // …and the placement waits, for the same reason one level out: a dispatch
+    // nothing is waiting for is work a worker could still take, whose result
+    // would be posted against a node execution that is gone
+    // (`docs/distributed.md` §6.1, `./mesh.ts`).
+    mesh.releasePlacementWaits(executionId);
     // And the deliveries nothing joined, on the two ways out where one still in
     // flight can change what this function has to decide.
     //
@@ -1752,3 +1784,38 @@ async function quiesceFlow(
 export function createBuilder() {
   return new StateGraph(State);
 }
+
+/**
+ * What each placed call site does, for the process that **executes** it
+ * (`docs/distributed.md` §3.2, §7.4).
+ *
+ * The other side of `mesh.dispatchPlaced`. A hub journals a dispatch and waits;
+ * the worker that takes it runs `./worker-node.ts`, which looks the dispatch's
+ * `node` up here and runs exactly the activity this node would have run had
+ * nothing been placed. One lowering, two processes — which is what keeps a
+ * placed node from meaning something different from an unplaced one.
+ *
+ * Keyed by the address a dispatch names: `<flow>.<node>` for an `agent:` or
+ * `function:` node, and the component's own address for a `map` dispatch target
+ * (grammar §14.1's three ways a graph reaches a placed component).
+ */
+export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
+  "agent.fixer":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentFixer,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
+  "flow.triage.scan":
+    async (input, context) => ({ output: await toolRepoGrep(input, context) }),
+};

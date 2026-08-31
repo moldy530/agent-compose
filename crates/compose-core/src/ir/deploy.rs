@@ -152,3 +152,96 @@ pub struct EventSource {
     /// The whole entry's span.
     pub span: Span,
 }
+
+// ---------------------------------------------------------------------------
+// Which backend a store binds (grammar 11.3, 14.3, Decision D87)
+// ---------------------------------------------------------------------------
+
+/// Which backend a store resolved to under the active target, and why.
+///
+/// The `from` clause is written for a person: a diagnostic and the runtime's own
+/// refusal both quote it, so an author reading either is told which line of
+/// which file decided the binding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedBackend {
+    /// The storage plugin (grammar 14.3).
+    pub provider: BackendProvider,
+    /// Where the binding came from, as a clause a sentence can end with.
+    pub from: String,
+    /// The `storage_backends:` entry that decided it, as a spec address —
+    /// `deploy.storage_backends.aliases.<alias>` or
+    /// `deploy.storage_backends.defaults.<kind>`. Absent where the target
+    /// built-in decided it, because no entry wrote that one.
+    pub site: Option<String>,
+}
+
+/// Grammar 11.3's resolution order, run at compile time.
+///
+/// `--target local` substitutes local storage for **every** store
+/// unconditionally, so under it no alias and no per-kind default is consulted at
+/// all (PRD 5.8, Decision D87) — which is what makes a project with production
+/// infrastructure in `deploy/staging.yml` still buildable and runnable with none.
+/// Under any other target the order is the grammar's: explicit alias, then the
+/// per-kind `defaults:`, then the target built-in, which is the same local
+/// storage because it is the only backend this compiler release implements.
+///
+/// Stated once, here, rather than at each of the three passes that ask. Codegen
+/// asks in order to emit the binding and the refusal that goes with it,
+/// `check::placements` asks whether a placed component reaches a store only its
+/// own process can see (grammar 14.1), and `codegen::env` asks which processes a
+/// backend's credentials belong to (`docs/distributed.md` §9.1). Three answers
+/// to one question would be three ways for a deployment to be told something the
+/// store does not do.
+#[must_use]
+pub fn backend_of(ir: &crate::ir::Ir, store: &crate::ir::definition::Store) -> ResolvedBackend {
+    let built_in = match store.kind {
+        StoreKind::Kv => BackendProvider::Sqlite,
+        StoreKind::Vector => BackendProvider::SqliteVec,
+        StoreKind::Blob => BackendProvider::LocalFs,
+    };
+    if ir.target == crate::DEFAULT_TARGET {
+        return ResolvedBackend {
+            provider: built_in,
+            from: "the `local` target substitutes local storage for every store unconditionally"
+                .to_string(),
+            site: None,
+        };
+    }
+    let backends = ir.deploy.storage_backends.as_ref();
+    if let Some(alias) = &store.backend
+        && let Some(config) =
+            backends.and_then(|backends| backends.aliases.get(alias.value.as_str()))
+    {
+        return ResolvedBackend {
+            provider: config.provider,
+            from: format!(
+                "the alias `{}`, defined by the `{}` target",
+                alias.value, ir.target
+            ),
+            site: Some(format!("deploy.storage_backends.aliases.{}", alias.value)),
+        };
+    }
+    if let Some(config) = backends.and_then(|backends| backends.defaults.get(store.kind.as_str())) {
+        return ResolvedBackend {
+            provider: config.provider,
+            from: format!(
+                "the `{}` default of the `{}` target",
+                store.kind.as_str(),
+                ir.target
+            ),
+            site: Some(format!(
+                "deploy.storage_backends.defaults.{}",
+                store.kind.as_str()
+            )),
+        };
+    }
+    ResolvedBackend {
+        provider: built_in,
+        from: format!(
+            "the built-in for `kind: {}`, which the `{}` target does not override",
+            store.kind.as_str(),
+            ir.target
+        ),
+        site: None,
+    }
+}

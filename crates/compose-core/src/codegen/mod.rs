@@ -46,8 +46,12 @@
 //! tsconfig.json         strict, NodeNext, no build step
 //! README.md             what this directory is, how to run it, how to eject
 //! .gitignore            the two paths a generated project acquires
+//! manifest.json         what a worker reads out of the tree (distributed §9.1)
+//! src/artifact.ts       this tree's content hash and file list (distributed §4)
 //! src/cel.ts            the CEL evaluator the routers embed (PRD 5.5)
-//! src/env.ts            every `${ENV}` reference, and the process-start check
+//! src/deployment.ts     the placements, and the env partition (distributed §9.1)
+//! src/env.ts            the hub's `${ENV}` references, and the launch check
+//! src/mesh.ts           the hub half of the worker protocol (distributed §3)
 //! src/runtime.ts        what a node does when it runs (grammar 8, 9)
 //! src/stores.ts         the local store backends (PRD 5.8, grammar 11)
 //! src/schemas.ts        every schema in the composition, as Zod (grammar 3.8)
@@ -57,13 +61,17 @@
 //! src/serve.ts          the generated app over them (PRD 5.11)
 //! src/cli.ts            the project's own `run`/`serve` command line
 //! src/index.ts          the project's public surface, and its entry point
+//! src/worker-node.ts    one placed node, run on a worker (distributed §3.2)
 //! ```
 //!
-//! Five of those are **constants**: `src/cel.ts`, `src/runtime.ts`,
-//! `src/stores.ts`, `src/serve.ts` and `src/cli.ts` are byte-identical in every
-//! project a compiler release builds, which is what keeps a golden diff about
-//! the composition rather than about the machinery beside it. The rest are the
-//! composition, lowered.
+//! Seven of those are **constants**: `src/cel.ts`, `src/mesh.ts`,
+//! `src/runtime.ts`, `src/stores.ts`, `src/serve.ts`, `src/cli.ts` and
+//! `src/worker-node.ts` are byte-identical in every project a compiler release
+//! builds, which is what keeps a golden diff about the composition rather than
+//! about the machinery beside it. The rest are the composition, lowered.
+//!
+//! `src/artifact.ts` is emitted **last and over the rest**, because what it
+//! carries is a hash of them (`docs/distributed.md` §4, and see [`artifact`]).
 //!
 //! `src/` is **compiler-owned**: `build` removes files under it that it did not
 //! emit, and `build --check` reports them as drift. Nothing outside `src/` is
@@ -110,19 +118,27 @@
 //! with an activity that throws naming the construct and the milestone that
 //! lands it ([`graph`]). Nothing answers a plausible value.
 //!
-//! The same posture covers the two places the deploy layer reaches past this
-//! release: a store bound to a production backend (grammar 14.3's `redis`,
+//! The same posture covers the one place the deploy layer still reaches past
+//! this release: a store bound to a production backend (grammar 14.3's `redis`,
 //! `pgvector`, `s3`, …) says so at the op rather than answering out of the wrong
-//! store, and `hub:`/`placements:` are live static grammar this pass emits
-//! nothing for — the worker protocol `docs/distributed.md` fixes lands with the
-//! `worker` verb, and `tests/placement_surface_inertness.rs` is what says so.
-//! Both land in M3.
+//! store.
+//!
+//! `hub:`/`placements:` are **not** on that list any more. This pass emits the
+//! hub `docs/distributed.md` fixes: [`mesh`] is the five `/workers/*` routes and
+//! the dispatch board behind them, [`deployment`] the placements and the
+//! environment partition of §9.1, [`artifact`] the tree's content hash and file
+//! list, and [`graph`] lowers a placed component's node to a dispatch and its
+//! activity into the registry `src/worker-node.ts` runs on the other side.
+//! `tests/placement_surface_landing.rs` is what says so in executable form.
 
+pub mod artifact;
 pub mod cel;
 pub mod cli;
+pub mod deployment;
 pub mod env;
 pub mod graph;
 pub mod journal;
+pub mod mesh;
 pub mod names;
 pub mod pattern;
 pub mod policy;
@@ -133,6 +149,7 @@ pub mod serve;
 pub mod state;
 pub mod stores;
 pub mod trigger;
+pub mod worker;
 
 use crate::diag::{Diagnostic, DiagnosticCode};
 use crate::ir::Ir;
@@ -216,16 +233,23 @@ impl GeneratedProject {
 pub fn emit(ir: &Ir) -> GeneratedProject {
     let mut names = names::Names::of(ir);
     graph::declare(&mut names, ir);
-    let environment = env::References::of(ir);
+    // The environment `readEnvironment()` checks is the **hub's own list**, which
+    // is the whole composition's exactly when nothing is placed
+    // (`docs/distributed.md` §9.1): a variable a placement takes off it is one
+    // this process cannot leak, because it never held it.
+    let partition = env::Partition::of(ir);
+    let environment = env::References::for_process(ir, &partition, &env::Process::Hub);
 
-    GeneratedProject::new(vec![
+    let mut files = vec![
         project::package_json(ir),
         project::tsconfig_json(ir),
         project::readme(ir),
         project::gitignore(ir),
         cel::module(ir),
+        deployment::module(ir, &partition),
         env::module(ir, &environment),
         journal::module(ir),
+        mesh::module(ir),
         runtime::module(ir),
         stores::module(ir),
         schema::module(ir, &names),
@@ -234,8 +258,16 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
         trigger::module(ir),
         serve::module(ir),
         cli::module(ir),
+        worker::module(ir),
+        worker::manifest(ir, &partition),
         project::index(ir),
-    ])
+    ];
+    // **Last, and over everything above.** The artifact's identity is a hash of
+    // the tree, so the file that carries it is the one file the hash cannot
+    // cover and the one file that has to be written after the rest exists (see
+    // [`artifact`]).
+    files.push(artifact::module(ir, &files));
+    GeneratedProject::new(files)
 }
 
 /// What this target cannot express, over a composition the validator accepted.
@@ -951,19 +983,24 @@ flow.f:
             [
                 ".gitignore",
                 "README.md",
+                "manifest.json",
                 "package.json",
+                "src/artifact.ts",
                 "src/cel.ts",
                 "src/cli.ts",
+                "src/deployment.ts",
                 "src/env.ts",
                 "src/graph.ts",
                 "src/index.ts",
                 "src/journal.ts",
+                "src/mesh.ts",
                 "src/runtime.ts",
                 "src/schemas.ts",
                 "src/serve.ts",
                 "src/state.ts",
                 "src/stores.ts",
                 "src/triggers.ts",
+                "src/worker-node.ts",
                 "tsconfig.json",
             ]
         );
@@ -1006,6 +1043,32 @@ pub(crate) mod test_support {
     /// Panics when the composition does not resolve, naming what was reported:
     /// a test whose input is invalid is a broken test, not a finding.
     pub fn ir_of(source: &str) -> Ir {
+        placed(source, None)
+    }
+
+    /// The same, with a deploy layer, resolved under the target `mesh`.
+    ///
+    /// What the environment partition's tests need and [`ir_of`] cannot give:
+    /// `placements:` is a deploy-layer section, so a composition without one
+    /// resolves to an artifact with nothing to partition (grammar §14.1).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the composition does not resolve **or does not validate**.
+    /// The deploy layer's own rules — disjointness, the colocation of an
+    /// attached tool — are what a partition is computed over, so a fixture the
+    /// validator would refuse is a fixture whose answer means nothing.
+    pub fn ir_of_mesh(source: &str, deploy: &str) -> Ir {
+        let ir = placed(source, Some(deploy));
+        let diagnostics = crate::check(&ir);
+        assert!(
+            diagnostics.is_empty(),
+            "the test composition does not validate: {diagnostics:#?}"
+        );
+        ir
+    }
+
+    fn placed(source: &str, deploy: Option<&str>) -> Ir {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let directory = std::env::temp_dir().join(format!(
             "agent-compose-codegen-{}-{}",
@@ -1015,7 +1078,14 @@ pub(crate) mod test_support {
         std::fs::create_dir_all(&directory).expect("a scratch directory");
         let entrypoint = directory.join("main.yml");
         std::fs::write(&entrypoint, source).expect("the entrypoint is writable");
-        let resolution = crate::resolve(&entrypoint);
+        let resolution = if let Some(deploy) = deploy {
+            std::fs::create_dir_all(directory.join("deploy")).expect("a deploy directory");
+            std::fs::write(directory.join("deploy/mesh.yml"), deploy)
+                .expect("the deploy file is writable");
+            crate::resolve_with_target(&entrypoint, "mesh")
+        } else {
+            crate::resolve(&entrypoint)
+        };
         let _ = std::fs::remove_dir_all(&directory);
         assert!(
             resolution.diagnostics.is_empty(),

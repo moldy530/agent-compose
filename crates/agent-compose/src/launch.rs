@@ -111,8 +111,23 @@ fn answers(program: &str) -> bool {
 /// has secrets. The emitted project performs the same check at process start,
 /// which is what covers a project run by hand; this one covers the case the
 /// milestone names, and covers it before a graph is built.
+///
+/// **The list is the hub's**, which is what this process is going to be
+/// (`docs/distributed.md` §9.1, PRD resolved q41). A variable only a placement's
+/// worker spends is one this process never reads — the whole point of the
+/// partition is that "the hub cannot leak what it never held" — so demanding it
+/// here would refuse to start a deployment over a value that belongs on another
+/// machine. It is exactly `env::References::of` for every composition that
+/// places nothing, which is every composition until a deploy file says
+/// otherwise, and it is the same list `readEnvironment()` checks inside the
+/// emitted project: two checks of one manifest rather than two manifests.
 pub(crate) fn environment(ir: &Ir) -> Result<(), Refusal> {
-    let references = compose_core::codegen::env::References::of(ir);
+    let partition = compose_core::codegen::env::Partition::of(ir);
+    let references = compose_core::codegen::env::References::for_process(
+        ir,
+        &partition,
+        &compose_core::codegen::env::Process::Hub,
+    );
     let mut missing: Vec<String> = Vec::new();
     for name in references.names() {
         if std::env::var_os(name).is_none() {

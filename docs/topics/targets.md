@@ -244,11 +244,20 @@ never a diagnostic, and is why the list above stops where it does —
 `placements:` names the exceptions — so a target with no `placements:` is an
 ordinary single-process deployment.
 
-**The rules above are enforced today; the protocol is not built yet.** Nothing a
-placement or a `hub:` block declares reaches the project a build emits — no
-worker joins, nothing parks, and there is no `worker` verb in this release. The
-wire contract the runtime will be held to is normative in
-`docs/distributed.md`.
+**The rules above are enforced, and the protocol behind them is built.** A build
+of a target that declares `placements:` emits the hub — the five `/workers/*`
+routes, the dispatch board, the artifact server — and the `worker` verb is the
+process that joins it:
+
+```
+agent-compose worker --hub <url> --claim <name> --token-env <VAR>
+```
+
+A placed node is dispatched rather than called: it parks on the board until a
+worker claiming its placement takes it, the worker runs it out of the artifact
+the hub served, and its effects are journaled by the hub. The wire is normative
+in `docs/distributed.md`, and `agent-compose docs cli` is where the verb's flags
+are.
 
 ## `event_sources` — reserved
 
@@ -274,15 +283,15 @@ too: a wait that a restart interrupted comes back with its id intact, because
 the wait id is the node's instance path and the journal is what a resumed
 execution reads its answers out of.
 
-**`placements` left it by being re-cut, which is the one departure that is not a
-runtime landing.** The old shape keyed placements by component address and gave
-each a `runtime: isolated|colocated` and a reserved `network:`. The distributed
-design settled a different model — a named claim a worker asserts at an
-authenticated join — and reserved grammar exists to be re-shapeable before its
-first execution: nothing had run, so nothing broke. What replaced it is **live
-static grammar** with a runtime still to come, which is a third posture and not a
-reserved one: every rule above is enforced, and `docs/distributed.md` is what the
-runtime will be held to.
+**`placements` left it by being re-cut, and its runtime landed afterwards.** The
+old shape keyed placements by component address and gave each a `runtime:
+isolated|colocated` and a reserved `network:`. The distributed design settled a
+different model — a named claim a worker asserts at an authenticated join — and
+reserved grammar exists to be re-shapeable before its first execution: nothing
+had run, so nothing broke. What replaced it went through a third posture on its
+way here, live static grammar with a runtime still to come, and is now neither:
+every rule above is enforced, a build emits the hub, the `worker` verb joins it,
+and `docs/distributed.md` is what both halves are held to.
 
 An `http` trigger's `auth:`, `callback_auth:` and `callback_allow:` have left it
 as well, and they were the rows worth reading twice while they were here: a

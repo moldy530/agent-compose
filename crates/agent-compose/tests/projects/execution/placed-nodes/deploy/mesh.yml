@@ -1,0 +1,26 @@
+# The deploy layer this fixture is served under: one hub, one placement
+# (grammar §14.1, §14.2, `docs/distributed.md` §1.1).
+#
+# `join_token:` is the bearer credential every worker presents, as an `${ENV}`
+# reference and never a literal — holding it is being trusted with the mesh
+# (§9.3), so it is a name the deployment supplies rather than a value this file
+# carries.
+#
+# The placement holds the agent **and** the tool it attaches. Grammar §14.1
+# rule 4's second row: an attached tool runs inside its agent's own tool loop, so
+# naming both is the same answer written twice, and naming only the agent would
+# have been the same answer written once. What the pair buys is the manifest —
+# `${KEYCHAIN_PASSWORD}` reaches `mac`'s list and nothing else's, which is
+# §9.1's first worked example.
+version: "0.1"
+
+hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+placements:
+  mac:
+    members:
+      - agent.signer
+      - tool.sign
+      - agent.escalator
+    description: The machine holding the signing keys.

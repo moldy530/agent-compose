@@ -15,17 +15,22 @@
 #   * the file is OPTIONAL — deleting it leaves a single-process deployment, and
 #     nothing in the composition changes.
 #
-# `hub:` and `placements:` are admitted here like anywhere else, and they are
-# what a mesh looks like on one laptop: this process is the hub, and a
-# `agent-compose worker --join … --claims patchers` beside it is the spoke. The
-# same two keys deploy to real machines in deploy/staging.yml, one placement
-# holding more members (grammar 14.1, 14.2).
+# `hub:` is admitted here like anywhere else, and this is what it means on a
+# laptop: the process serving this target owns the graph — scheduler, journal,
+# wait board, triggers — and a worker joins it with this credential
+# (grammar 14.2, PRD resolved q37).
+#
+# **`placements:` is deliberately not here, and that absence is the point.** A
+# placed component is dispatched to whichever worker claims its placement
+# (`docs/distributed.md` §3, §7), so a target that places one is a target whose
+# runs need a worker beside them: `agent-compose run main.yml flow.triage` under
+# such a target reaches the placed node and stops there, naming the placement,
+# exactly as a `human` node stops a run with no answer surface. `local` is the
+# target this example is *run* under — the acceptance suite runs it, and so does
+# a reader following README — so it stays a single-process deployment where every
+# node executes here. deploy/staging.yml is where the mesh is illustrated, with
+# two members and the `public_url:` a real ingress needs.
 version: "0.1"
 
 hub:
   join_token: ${MESH_JOIN_TOKEN}
-
-placements:
-  patchers:
-    members: [agent.fixer]
-    description: The machine holding a checkout; on a laptop, this one.

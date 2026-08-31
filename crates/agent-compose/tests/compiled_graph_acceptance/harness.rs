@@ -136,6 +136,14 @@ pub const FIXTURES: &[&str] = &[
     "http-trigger",
     "keyless-gateway",
     "model-failover",
+    // The one fixture whose subject is a *target* rather than a composition:
+    // `deploy/mesh.yml` places two of its components, and every test that drives
+    // it is in `tests/distributed_hub_wire.rs`, served under that target
+    // (`docs/distributed.md` §3). Under `local` — which is what
+    // `the_acceptance_fixtures_validate_clean` resolves it as, and which it has
+    // no deploy file for — it places nothing and is an ordinary single-process
+    // project, which is exactly the claim grammar §14 makes about the layer.
+    "placed-nodes",
     "provider-kinds",
     "server-tools",
     "stores",
@@ -326,6 +334,15 @@ impl Scratch {
         ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("a scratch directory");
+        Self(path)
+    }
+
+    /// Take ownership of a directory somebody else made.
+    ///
+    /// What a test needs when one directory outlives **two** processes — a hub
+    /// restarted against its own journal is the case — so the removal happens
+    /// when the test ends rather than when the first of them does.
+    pub fn at(path: PathBuf) -> Self {
         Self(path)
     }
 
@@ -1389,6 +1406,28 @@ impl Served {
         }
     }
 
+    /// End the app **and the command that launched it**, now, and reap both.
+    ///
+    /// [`Drop`] does this when a test ends; this is for the one test that has to
+    /// do it in the middle: a hub replaced behind its own name has to release
+    /// the port before its replacement can bind it
+    /// (`docs/distributed.md` §5). Idempotent, so the drop that follows is a
+    /// no-op.
+    pub fn stop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        #[cfg(unix)]
+        if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+            // SAFETY: this process's own child, unreaped until the `wait`
+            // below, so its group is still its own.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+    }
+
     /// Wait for the command to exit and answer with its status.
     pub fn wait(&mut self) -> std::process::ExitStatus {
         let status = self.child.wait().expect("the command is waited on");
@@ -1459,6 +1498,43 @@ pub fn serve_entrypoint_into(
     entrypoint: &Path,
     environment: &[(String, String)],
 ) -> Option<Served> {
+    serve_target_into(out, entrypoint, DEFAULT_TARGET, environment)
+}
+
+/// The built-in target, which `serve` takes when none is named (grammar §14).
+const DEFAULT_TARGET: &str = "local";
+
+/// The same again, resolved for a **named target**.
+///
+/// Which is what the worker protocol needs from this harness and nothing else
+/// does: `hub:` and `placements:` are deploy-layer sections, so a mesh is a
+/// *target* of a composition rather than a composition — the same fixture served
+/// under `local` places nothing and mounts no `/workers/*` route at all
+/// (`docs/distributed.md` §1.1, §3).
+pub fn serve_target_into(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    environment: &[(String, String)],
+) -> Option<Served> {
+    serve_target_on(out, entrypoint, target, 0, environment)
+}
+
+/// The same again, on a **port the caller names**.
+///
+/// Which is what replacing a hub behind its own name needs, and nothing else
+/// does: `docs/distributed.md` §5's third rule is that a worker addresses a hub
+/// **name** and "replacing the process behind that URL is invisible to it", so a
+/// restart that moved the port would be testing a reconfiguration rather than a
+/// restart. `0` is what every other caller passes, and takes a port the
+/// operating system picks.
+pub fn serve_target_on(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    port: u16,
+    environment: &[(String, String)],
+) -> Option<Served> {
     // The toolchain check `scratch_project` makes on the caller's behalf, made
     // here too: this entry point is handed a directory rather than asking for
     // one, and a run with no Bun has nothing to serve.
@@ -1467,7 +1543,8 @@ pub fn serve_entrypoint_into(
     command
         .arg("serve")
         .arg(entrypoint)
-        .args(["--port", "0"])
+        .args(["--port", &port.to_string()])
+        .args(["--target", target])
         .arg("--out")
         .arg(out)
         .stdout(Stdio::piped())
@@ -1554,6 +1631,30 @@ pub fn serve_refused_with(
         .arg(&out);
     seal(&mut command, environment);
     Some(command.output().expect("the command runs"))
+}
+
+/// The same again, for a **named target** and a directory the caller owns.
+///
+/// The mesh's two launch checks are what this is for — a `hub.join_token:` that
+/// resolved to nothing, and a poll hold that is not shorter than the liveness
+/// window — and both are properties of a target that declares `placements:`
+/// (`docs/distributed.md` §2, §3).
+pub fn serve_refused_target(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    environment: &[(String, String)],
+) -> Output {
+    let mut command = agent_compose();
+    command
+        .arg("serve")
+        .arg(entrypoint)
+        .args(["--port", "0"])
+        .args(["--target", target])
+        .arg("--out")
+        .arg(out);
+    seal(&mut command, environment);
+    command.output().expect("the command runs")
 }
 
 /// Run one SQL script against a built project's journal, through the driver the

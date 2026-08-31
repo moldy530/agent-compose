@@ -1,0 +1,512 @@
+# Acceptance fixture: nodes that execute somewhere else.
+#
+# `docs/distributed.md` fixes a hub/worker protocol, and this composition is what
+# a hub of it looks like: a deploy layer with a `hub:` and one placement, and
+# three constructs that reach a placed component in the three ways a graph can —
+# an `agent:` node, a `function:` node over a placed tool, and a `map` whose
+# dispatch target is placed.
+#
+# What each one is here for:
+#
+#   * `flow.release` is the steady state. `sign` dispatches `agent.signer` to
+#     whichever worker claims `mac`; `stamp` is a `function:` node over an
+#     **unplaced** tool, so it runs on the hub in the same execution — which is
+#     what makes "a placement decides which process runs a node" observable
+#     rather than asserted, since one run does both.
+#   * `flow.retried` is the mid-node disconnect (§6.3, §7.3): the same dispatch
+#     under a `retry:`, so a superseded attempt is followed by another that parks
+#     again and can be answered. Without a `retry:` the supersede would be the
+#     end of the run and there would be nothing to observe about the re-park.
+#   * `flow.batch` is §2's queueing clause: a `map` admitting twelve items onto a
+#     placement whose pool is whatever showed up. The map declares how many
+#     instances the *graph* may have in flight; how many are **running** is the
+#     number of live sessions claiming `mac`, and the rest are undispatched.
+#     Twelve because park order is published as well as resumed, and nothing
+#     under ten waits can tell a numeric ordering from a lexicographic one.
+#   * `flow.escalated` is `docs/distributed.md` §13's fourth row, made runnable:
+#     a placed agent attaching a `flow.*` with a `human:` node in it. Grammar
+#     §14.1 rule 4 runs everything an attached flow reaches in the attaching
+#     agent's placement, so that question is asked on a **worker**, where there
+#     is no wait board to ask it on — and what the runtime does about that is a
+#     named failure rather than a bare interrupt, which is the row's "what
+#     stands in the meantime" and what the acceptance suite asserts.
+#   * `flow.watched` is §6.4's distinction: a `map` over `flow.signed_off`, whose
+#     instances each dispatch a placed node and then ask a person about the
+#     answer. Two of them run at once, so one can reach its question while the
+#     other's node is still out at a worker — the one shape in which "parked" and
+#     "running somewhere else" answer differently.
+#
+# `agent.signer` attaches `tool.sign` and both are members of `mac`, which is
+# grammar §14.1 rule 4's second row: the same answer written twice. `tool.sign`'s
+# `${KEYCHAIN_PASSWORD}` is `docs/distributed.md` §9.1's own worked example — it
+# belongs to `mac`'s manifest and not to the hub's, because the hub never runs
+# the tool.
+#
+# Nothing here scripts a model call for the placed agent, and that is the point:
+# a placed node's answer arrives over `/workers/result`, so the hub calls no
+# provider for it at all. `tool.notarize` is the hub's own work, and it is an
+# `exec:` for the same reason — one run, two processes, no network.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+  on_error: fail
+
+state:
+  signature:
+    description: What the worker signed, as it came back over the wire.
+    type: string
+    default: ""
+  ticket:
+    description: What the hub's own node produced, in the same execution.
+    type: string
+    default: ""
+  countersignature:
+    description: What the second placed branch signed, on its own channel.
+    type: string
+    default: ""
+  approval:
+    description: What the person on the other branch said.
+    type: string
+    default: ""
+  signatures:
+    description: One entry per dispatched item, in source-item order.
+    type: array
+    max_items: 12
+    items: { type: string }
+    reduce: append
+
+triggers:
+  # `respond: async` throughout: a placed node parks until a worker takes it, so
+  # every execution here outlives its request by construction.
+  # The lifecycle webhook is on this one, because a placed node with no worker
+  # is a **parking** in exactly resolved q34's sense: the execution has stopped
+  # advancing on its own, and `docs/distributed.md` §6.6 says a subscriber
+  # "learns 'waiting for the Mac' exactly the way it learns 'waiting for a
+  # human'". A `callback:` is what makes that observable.
+  on_release:
+    type: http
+    flow: flow.release
+    path: /releases
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+    callback: "payload.body.callback_url"
+
+  on_retried_release:
+    type: http
+    flow: flow.retried
+    path: /retried-releases
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_direct_sign:
+    type: http
+    flow: flow.direct
+    path: /direct-signings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_batch:
+    type: http
+    flow: flow.batch
+    path: /batches
+    method: POST
+    input:
+      paths: "payload.body.paths"
+    respond: async
+
+  # The other lifecycle-webhook trigger, and the one that can tell the two
+  # states of a placed node apart: `docs/distributed.md` §6.4 makes "no worker
+  # has taken the node yet" the pause and a node a worker *took* something that
+  # is running, so a `parked` delivery is owed for the first and not for the
+  # second. `callback:` is what makes the difference observable.
+  on_watched:
+    type: http
+    flow: flow.watched
+    path: /watched-releases
+    method: POST
+    input:
+      paths: "payload.body.paths"
+    respond: async
+    callback: "payload.body.callback_url"
+
+  on_escalated:
+    type: http
+    flow: flow.escalated
+    path: /escalations
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # `session_key:` is here for `docs/distributed.md` §3.2's payload: the
+  # execution identity a placed node runs under is the hub's to derive, and this
+  # is the trigger that gives one an identity to derive.
+  on_conversation:
+    type: http
+    flow: flow.conversation
+    path: /conversations
+    method: POST
+    input:
+      path: "payload.body.path"
+    session_key: "payload.body.session"
+    respond: async
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+# The placed tool: its secret is the one §9.1 works through, and it never reaches
+# the hub's manifest because the hub never runs it.
+tool.sign:
+  description: Sign one path with the machine's keychain.
+  input:
+    path: { type: string }
+  output:
+    signature: { type: string }
+  exec:
+    command: "${OPS_BIN}/echo"
+    args: ['{"signature":"signed"}']
+    env:
+      KEYCHAIN_PASSWORD: ${KEYCHAIN_PASSWORD}
+
+# The hub's own: unplaced, and reached from a `function:` node, where a tool's
+# own placement would be the whole answer if it had one (grammar §14.1).
+tool.notarize:
+  description: Submit a signed path for notarization.
+  input:
+    path: { type: string }
+  output:
+    ticket: { type: string }
+  exec:
+    command: "${OPS_BIN}/echo"
+    args: ["notarized"]
+
+# Unplaced, so it runs on the hub — and it runs **before** the placed node in
+# `flow.conversation`, which is what gives that node's dispatch a conversation to
+# carry. `docs/distributed.md` §3.2's `history` is the field it travels in.
+agent.briefer:
+  description: Say in one line what is being released.
+  model: model.smart
+  prompt: |
+    Describe the release you are given in one line.
+  input:
+    path:
+      type: string
+  output:
+    brief:
+      type: string
+      min_length: 1
+
+agent.signer:
+  description: Sign a release on the machine that holds the keys.
+  model: model.smart
+  prompt: |
+    Sign the path you are given and report what the signature is.
+  tools: [tool.sign]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# Placed, and it attaches a flow with a question for a person in it. Grammar
+# §14.1 rule 4: everything an attached `flow.*` reaches runs where the attaching
+# agent runs, so `flow.escalation`'s `human:` node is asked on the worker — which
+# is the shape `docs/distributed.md` §13's fourth row is about.
+agent.escalator:
+  description: Decide a release by asking a person at the machine that holds it.
+  model: model.smart
+  prompt: |
+    Ask a person about the path you are given, and report what they answered.
+  tools: [flow.escalation]
+  input:
+    path:
+      type: string
+  output:
+    approval:
+      type: string
+      min_length: 1
+
+# Attached rather than triggered, and never reached any other way here: what it
+# is for is being **inside** a placed agent's tool loop.
+flow.escalation:
+  description: Ask a person whether a release may go ahead.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    ask:
+      human:
+        input:
+          path: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        path: "input.path"
+      writes:
+        decision: approval
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+
+flow.escalated:
+  description: Reach a person's question from a node that runs on a worker.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    escalate:
+      agent: agent.escalator
+      input:
+        path: "input.path"
+      writes:
+        approval: approval
+  edges:
+    - { from: start, to: escalate }
+    - { from: escalate, to: end }
+
+flow.release:
+  description: Sign a release on a worker, and notarize it on the hub.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+    ticket:
+      type: string
+  nodes:
+    sign:
+      agent: agent.signer
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+
+    stamp:
+      function: tool.notarize
+      input:
+        path: "input.path"
+      writes:
+        ticket: ticket
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: stamp }
+    - { from: stamp, to: end }
+
+# The third way a graph reaches a placed component, and the one grammar §14.1
+# leaves alone: a `function:` node names a `tool.*` **directly**, so the tool's
+# own placement is the whole of the answer — there is no attaching agent to
+# disagree with. It is a different lowering from an `agent:` node's, because a
+# tool's result is held to its `output:` on the way back in.
+flow.direct:
+  description: Sign a release with no agent in the way.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    sign:
+      function: tool.sign
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+
+flow.retried:
+  description: The same sign-off, under a retry the hub can spend on it.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    sign:
+      agent: agent.signer
+      # Two attempts, and no backoff worth waiting for: what is being exercised
+      # is that a superseded dispatch fails **an attempt** rather than the run
+      # (§6.3), so the second attempt has to be reachable inside a test.
+      retry: { max: 2, backoff: 1ms }
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+
+# The payload of `docs/distributed.md` §3.2, made observable. An unplaced agent
+# runs on the hub and fills the shared `messages` channel (grammar §10.4); the
+# placed agent after it is dispatched, and what it is given has to be what the
+# same node unplaced would have been given — the turns, and the execution
+# identity the trigger's `session_key:` named. Placing a node decides which
+# *process* runs it (§4.3) and nothing else, so a flow whose second node reads
+# its first node's conversation reads it on either side of the wire.
+flow.conversation:
+  description: An unplaced agent, then a placed one that reads its turns.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    brief:
+      agent: agent.briefer
+      input:
+        path: "input.path"
+
+    sign:
+      agent: agent.signer
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: brief }
+    - { from: brief, to: sign }
+    - { from: sign, to: end }
+
+# Two placed nodes on branches of their own, and a question for a person behind
+# one of them. What it is for is the distinction `docs/distributed.md` §6.4
+# draws: a placed node **a worker has taken** is work in flight, so an execution
+# holding one has not stopped advancing on its own and is owed no `parked`
+# webhook — while the same node before a worker takes it is exactly the pause
+# that is. A flow with one placed node cannot tell the two apart, because the
+# only quiescence it ever reaches is the one at the park; this one reaches a
+# quiescence *while a dispatch is being executed*, which is where the two
+# readings differ.
+# One item of it: a sign-off on a worker, and then a question for a person about
+# what came back. Dispatched as an **instance** rather than run as a branch,
+# which is the whole reason the pair below is shaped this way — LangGraph's
+# superstep barrier holds two branches of one graph in step with each other, so a
+# question on one branch cannot open while a node on the other is still running;
+# a dispatched instance runs a graph of its own and advances while a sibling
+# instance is parked.
+flow.signed_off:
+  description: Sign one path on a worker, then ask a person about the result.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    sign:
+      agent: agent.signer
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+
+    # No `timeout:`, which grammar §8.7 makes jointly optional with
+    # `on_timeout:`: the wait stays open for as long as the test needs it, and
+    # nothing here ever answers it.
+    approve:
+      human:
+        input:
+          signature: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        signature: "state.signature"
+      writes:
+        decision: approval
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: approve }
+    - { from: approve, to: end }
+
+flow.watched:
+  description: Two of those at once, so one can be asking while the other signs.
+  inputs:
+    paths:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    signatures:
+      type: array
+      max_items: 12
+      items: { type: string }
+  nodes:
+    watch:
+      map:
+        over: input.paths
+        as: path
+        node: flow.signed_off
+        max_concurrency: 4
+        input:
+          path: "path"
+        writes:
+          signature: signatures
+  edges:
+    - { from: start, to: watch }
+    - { from: watch, to: end }
+
+flow.batch:
+  description: Fan out over several paths, each signed on a worker.
+  inputs:
+    paths:
+      type: array
+      # Twelve rather than a handful, and the number is the point: park order is
+      # published as well as resumed, and a report that sorted its waits as
+      # strings would put `fan/0/10` before `fan/0/2` — which nothing below ten
+      # items can show (§6.2, and `tests/toolchain/dispatch-board.mjs` for the
+      # board's own half of it).
+      max_items: 12
+      items: { type: string }
+  outputs:
+    signatures:
+      type: array
+      max_items: 12
+      items: { type: string }
+  nodes:
+    fan:
+      map:
+        over: input.paths
+        as: path
+        node: agent.signer
+        max_concurrency: 12
+        input:
+          path: "path"
+        writes:
+          signature: signatures
+  edges:
+    - { from: start, to: fan }
+    - { from: fan, to: end }

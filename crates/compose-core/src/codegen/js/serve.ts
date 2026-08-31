@@ -150,6 +150,7 @@ import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
+import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
 import {
   deliverHumanAnswer,
   deliveriesOf,
@@ -347,6 +348,12 @@ export function createApp(): FastifyInstance {
   const blank = blankCredentials();
   if (blank.length > 0) throw new BlankCredentialError(blank);
   decodeBodies(app);
+
+  // The worker protocol's five routes, on a target that declares `placements:`
+  // and on no other (`docs/distributed.md` §2, §3). Mounted **before** the
+  // recovery hook below, so the dispatch rows a dead process left are back on
+  // the board before the replays that reach them start (§5, `./mesh.ts`).
+  mountWorkerRoutes(app);
 
   for (const trigger of httpTriggers) {
     app.route({
@@ -1341,9 +1348,16 @@ function watchPauses(execution: Execution): () => void {
   // whether either of them was the last thing this execution was going to do.
   const unpause = watchHumanPauses(execution.id, consider);
   const unquiet = watchQuiescence(execution.id, consider);
+  // …and a **third**, because `docs/distributed.md` §6.6 puts a placement wait
+  // on the same board: "a subscribed system learns 'waiting for the Mac'
+  // exactly the way it learns 'waiting for a human'". A quiescence whose only
+  // open wait is a placed node with nobody to run it is a parking, and this is
+  // the event that says so.
+  const unplaced = watchPlacementWaits(execution.id, consider);
   return () => {
     unpause();
     unquiet();
+    unplaced();
   };
 }
 
@@ -1370,7 +1384,21 @@ function parking(execution: Execution): void {
   // growing prefix of it — N reports of one event to a receiver building its
   // view from the push.
   if (!quiescent(execution.id)) return;
-  const open = humanWaits(execution.id).map((wait) => wait.id);
+  // Both kinds of wait, in one set. A parking is a *quiescence with something
+  // open*, and `docs/distributed.md` §6.6 makes a placed node with no worker one
+  // of the things that can be open — so an execution waiting only on a Mac fires
+  // the webhook, and one waiting on a human and a Mac fires one listing both.
+  const open = [
+    ...humanWaits(execution.id).map((wait) => wait.id),
+    // …and only the ones **no worker has taken**, which is the line
+    // `docs/distributed.md` §6.4 draws: "no worker has taken the node yet" is
+    // the pause, and a node a worker took is running rather than waiting. The
+    // status route publishes both with their status; a `parked` delivery is
+    // about what the execution is waiting for.
+    ...placementWaits(execution.id)
+      .filter((wait) => wait.status === "parked")
+      .map((wait) => wait.id),
+  ];
   if (open.length === 0 || open.every((id) => execution.reported.has(id))) return;
   // Marked **before** the journaling below rather than after it, because the
   // guard above is synchronous and the journaling is not: a second quiescence
@@ -2150,12 +2178,28 @@ const UNITS: Readonly<Record<string, number>> = {
  */
 function report(execution: Execution): Promise<Record<string, unknown>> {
   const waits = execution.status === "running" ? humanWaits(execution.id) : [];
+  // The placement waits of `docs/distributed.md` §6.1, on the same report and
+  // under a key of their own. Not folded into `interrupts:`, because that key
+  // means "a question a human can answer" (grammar §8.7) and a placed node is
+  // waiting for a machine: an execution holding one is `running`, not
+  // `interrupted`, and a UI told otherwise would publish a question with no
+  // schema and a `resume_url` nothing would take.
+  const placed = execution.status === "running" ? placementWaits(execution.id) : [];
   return executionReport({
     id: execution.id,
     flow: execution.flow,
     trigger: execution.trigger,
     status: statusOf(execution),
     interrupts: waits.map((wait) => question(execution, wait)),
+    placements: placed.map((wait) => ({
+      wait_id: wait.id,
+      dispatch_id: wait.dispatch,
+      placement: wait.placement,
+      node: wait.node,
+      instance_path: wait.site,
+      parked_at: wait.parkedAt,
+      status: wait.status,
+    })),
     ...(execution.outputs === undefined ? {} : { outputs: execution.outputs }),
     ...(execution.error === undefined ? {} : { error: execution.error }),
     ...(execution.trace === undefined ? {} : { trace: execution.trace }),

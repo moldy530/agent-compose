@@ -16,6 +16,7 @@
 
 import { END, START, StateGraph } from "@langchain/langgraph";
 
+import * as mesh from "./mesh.ts";
 import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
@@ -723,6 +724,11 @@ async function quiesceFlow(
   // (`docs/durability.md` §5).
   const release = async (outcome: unknown): Promise<void> => {
     runtime.releaseHumanWaits(executionId);
+    // …and the placement waits, for the same reason one level out: a dispatch
+    // nothing is waiting for is work a worker could still take, whose result
+    // would be posted against a node execution that is gone
+    // (`docs/distributed.md` §6.1, `./mesh.ts`).
+    mesh.releasePlacementWaits(executionId);
     // And the deliveries nothing joined, on the two ways out where one still in
     // flight can change what this function has to decide.
     //
@@ -834,3 +840,19 @@ async function quiesceFlow(
 export function createBuilder() {
   return new StateGraph(State);
 }
+
+/**
+ * What each placed call site does, for the process that **executes** it
+ * (`docs/distributed.md` §3.2, §7.4).
+ *
+ * The other side of `mesh.dispatchPlaced`. A hub journals a dispatch and waits;
+ * the worker that takes it runs `./worker-node.ts`, which looks the dispatch's
+ * `node` up here and runs exactly the activity this node would have run had
+ * nothing been placed. One lowering, two processes — which is what keeps a
+ * placed node from meaning something different from an unplaced one.
+ *
+ * Keyed by the address a dispatch names: `<flow>.<node>` for an `agent:` or
+ * `function:` node, and the component's own address for a `map` dispatch target
+ * (grammar §14.1's three ways a graph reaches a placed component).
+ */
+export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {};

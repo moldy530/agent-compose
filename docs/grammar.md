@@ -4434,9 +4434,14 @@ not something this one key pretends to be.
 
 **The protocol these two sections describe is normative in
 [`docs/distributed.md`](distributed.md)**, which fixes the wire contract the
-runtime is written against. The keys are live static grammar today: every rule
-above is enforced by `validate`, and the `worker` verb that reads them lands
-with the runtime.
+runtime is written against. The keys are live grammar in both halves: every rule
+above is enforced by `validate`, and the runtime enforces them too — a built
+project serves the five `/workers/*` routes on a target that declares
+`placements:`, and the `worker` verb is what joins one:
+
+```
+agent-compose worker --hub <url> --claim <name> --token-env <VAR>
+```
 
 ### 14.3 `storage_backends`
 
@@ -4499,12 +4504,13 @@ that it *may be re-shaped before its first execution*: nothing had run, so
 nothing was broken, and the alternative would have been shipping a second
 placement grammar beside a dead first one. §14.1 and §14.2 are the result;
 Decision [D128](#d128-a-placement-is-a-named-claim-and-its-members-are-components)
-records the re-cut, and the keys are **live static grammar** — every rule about
-them is enforced by `validate` today, while the `worker` verb that reads them
-lands with the runtime. `crates/compose-core/tests/placement_surface_inertness.rs`
-is what holds that middle state honest: it asserts that no placement or hub
-material reaches a generated project yet, pins the sentences that say so, and
-enumerates what the runtime pass must unwind.
+records the re-cut, and the keys are **live grammar with a runtime behind them**
+— every rule about them is enforced by `validate`, a build emits the hub half of
+`docs/distributed.md` into the project, and the `worker` verb is the other half. `crates/compose-core/tests/placement_surface_landing.rs` is what holds that
+posture honest: it asserts that the placement material reaches the generated
+project in the modules that carry it, that nothing of the wire leaks into the
+composition's own lowering, and that no shipped document still says the protocol
+is waiting.
 
 **The three authentication keys were here until the http-native events pass**,
 and they are the ones that read differently from every other row, which is why

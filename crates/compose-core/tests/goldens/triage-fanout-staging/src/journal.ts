@@ -330,6 +330,119 @@ export interface DeliveryRecord extends DeliveryIntent {
   readonly detail?: string;
 }
 
+/**
+ * Where one dispatch of a placed node stands (`docs/distributed.md` §3.4, §6).
+ *
+ *  * `parked` — the node is waiting for a worker that claims its placement.
+ *    This is the **placement wait** §6.1 puts on the board beside a `human`
+ *    pause: journaled, restart-surviving, status-visible.
+ *  * `dispatched` — a session is holding it and has not settled it. The one
+ *    piece of work a session may hold (§2).
+ *  * `settled` — a result ended it (§3.4), and the outcome is on the row.
+ *  * `superseded` — the hub ended it **without** a result: the session holding
+ *    it fell outside the liveness window, or the artifact it was issued under
+ *    was replaced (§5, §6.3). A late result for it meets `409`.
+ *
+ * The two endings are two words for the reason §3.4 gives them two: a re-posted
+ * result must be able to tell an ending its own result made — the hub holds it,
+ * and answers `204` — apart from one the hub made without a result, where the
+ * execution has moved past this dispatch and the answer is `409`.
+ */
+export type DispatchStatus = "parked" | "dispatched" | "settled" | "superseded";
+
+/**
+ * One dispatch of a placed node, as the journal holds it
+ * (`docs/distributed.md` §8 rule 3: no dispatch state anywhere else).
+ *
+ * The row is the placement wait **and** the dispatch: a wait that finds a worker
+ * does not become a second row, it changes status. That is what makes a hub
+ * restart cheap — every open row is re-derived by the replay that re-reaches the
+ * node, under the identity §6.1 fixes — and what makes `docs/durability.md`'s
+ * replay discipline extend to a placed node at all: a settled row is an answer a
+ * resumed hub consumes instead of dispatching the work a second time.
+ */
+export interface DispatchRow {
+  readonly execution: string;
+  /**
+   * The placement wait's identity: the node's instance path plus an ordinal
+   * (`docs/distributed.md` §6.1, grammar §9.4).
+   *
+   * Deterministic, and that is the whole of why it is the primary key beside the
+   * execution: a resumed execution re-reaches the node and has to find the row
+   * its predecessor left rather than open a second dispatch for work a worker
+   * may already be doing. The ordinal counts dispatches at that instance path
+   * within the execution, so a `retry:` after a supersede asks for the next one.
+   */
+  readonly wait: string;
+  /**
+   * `dsp_…` — what a poll answers with and what a result is attributed by
+   * (§3.2, §3.4).
+   *
+   * Opaque to a worker (§10.1) and **not** journal-globally unique by
+   * constraint: §8 rule 2 keeps every identity in this schema execution-scoped,
+   * so this is a random handle with an ordinary index over it rather than a
+   * uniqueness a second hub sharing a Postgres journal would have to arbitrate.
+   */
+  readonly id: string;
+  /** The placement the work is queued to — never a worker (§2, §6.3). */
+  readonly placement: string;
+  /** The node, as `<flow address>.<node id>` (§3.2's `node`). */
+  readonly node: string;
+  /** Its instance path, flattened (§3.2's `instance_path`, grammar §9.4). */
+  readonly site: string;
+  /** What the node's input phase built (§3.2's `inputs`). */
+  readonly inputs: unknown;
+  /**
+   * The innermost enclosing `map`'s source-item index (§3.2's `item_index`),
+   * where one encloses this node.
+   *
+   * This and the two below are the facts the hub holds about a node execution
+   * that the node would have read for itself had it run on the hub, and they are
+   * on the row for `inputs`' reason: the row **is** the dispatch (§8 rule 3), so
+   * everything the poll answer carries is read out of it at hand-over and never
+   * out of a process's memory. A hub restarted mid-dispatch hands the same
+   * payload over as the one it replaced.
+   */
+  readonly itemIndex?: number;
+  /**
+   * The conversation turns an `agent:` node is given (§3.2's `history`,
+   * grammar §10.4), where the node takes any.
+   */
+  readonly history?: unknown;
+  /** Grammar §9.3's level 1 for this instance (§3.2's `policy`), where one is set. */
+  readonly policy?: unknown;
+  readonly status: DispatchStatus;
+  /** The session holding it, while one is. */
+  readonly session?: string;
+  /** What the worker answered, once one did. */
+  readonly outcome?: JournalOutcome;
+  /** When it went on the board, as an ISO 8601 instant — the park order. */
+  readonly parkedAt: string;
+  /**
+   * How this row breaks a `parkedAt` tie: where it went in, relative to every
+   * other row of this table.
+   *
+   * `parkedAt` is milliseconds and a fan-out parks its instances from one
+   * synchronous burst, so ties are the ordinary case rather than the odd one —
+   * and the board's own reads settle them with `ORDER BY parked_at ASC, rowid
+   * ASC` ([`INSERTION_ORDER`]). This is that same rowid, carried on the row so
+   * that a **synchronous** reader — the status report, which is built from a
+   * cache of these rows and cannot await a query — orders a draining queue by
+   * the rule the queue actually drains by, rather than by a second rule of its
+   * own that agrees with it most of the time.
+   *
+   * Present on a row read back **out of** the journal, which is every row any
+   * caller is handed; absent only on one a caller built to hand to [`park`].
+   */
+  readonly order?: number;
+  /** When a session took it. */
+  readonly dispatchedAt?: string;
+  /** When it stopped being unsettled, however it stopped. */
+  readonly settledAt?: string;
+  /** Why the hub superseded it (§6.3), for a reader of the journal. */
+  readonly detail?: string;
+}
+
 /** How an execution ended, or that it has not. */
 export type ExecutionStatus = "open" | "completed" | "failed";
 
@@ -471,6 +584,75 @@ export interface Journal {
    * and the execution it reports on may have ended in the process that died.
    */
   undelivered(): readonly DeliveryRecord[];
+  /**
+   * Put one placed node's dispatch on the board, or answer the row already
+   * there (`docs/distributed.md` §6.1).
+   *
+   * Idempotent on `(execution, wait)`, which is what makes a resumed hub
+   * re-attach: the replay reaches the node again, asks for the same wait
+   * identity, and is handed whatever its predecessor left — a settled answer to
+   * consume, or a wait still on the board to go on holding.
+   */
+  park(row: DispatchRow): DispatchRow;
+  /** The dispatch at one wait identity, if the journal holds one. */
+  dispatchAt(execution: string, wait: string): DispatchRow | undefined;
+  /** The dispatch a `dispatch_id` names, wherever it is (§3.4). */
+  dispatchOf(id: string): DispatchRow | undefined;
+  /** Every dispatch of one execution, in park order. */
+  dispatchesOf(execution: string): readonly DispatchRow[];
+  /**
+   * Every dispatch that is still `parked` or `dispatched`, in **park order**
+   * (§6.2: "dispatch resumes in park order").
+   */
+  unsettledDispatches(): readonly DispatchRow[];
+  /**
+   * Hand one parked dispatch to a session, answering the row it became — or
+   * `undefined` where it was no longer parked, which is the race two polls
+   * arriving together are.
+   */
+  claimDispatch(id: string, session: string): DispatchRow | undefined;
+  /**
+   * Put a dispatch back on the board that a session was handed and **cannot have
+   * received** — the exact inverse of [`claimDispatch`], answering whether this
+   * call did it.
+   *
+   * `docs/distributed.md` §7 makes dispatch at-least-once: "a hub that cannot
+   * tell whether a dispatch arrived re-issues it". Where the hub can tell it did
+   * *not* arrive — the connection the answer was owed to ended before the answer
+   * was written — re-issuing is putting the row back rather than waiting out the
+   * node's deadline, and the row keeps its `parked_at` and its insertion order,
+   * so it keeps its place in the park order §6.2 drains in.
+   *
+   * `session` is in the predicate for the reason `claimDispatch`'s `status` is:
+   * only the session a row was handed to may hand it back, and a row that has
+   * moved on since — settled by a result, superseded by a deadline — is left
+   * exactly as it is.
+   */
+  releaseDispatch(id: string, session: string): boolean;
+  /**
+   * Settle one dispatch with what the worker answered (§3.4).
+   *
+   * Answers whether **this** call settled it. A row already settled answers
+   * `false` and keeps the outcome it has, which is what makes a re-posted result
+   * `204` rather than a second settlement; a row the hub superseded answers
+   * `false` too and keeps that, which is the `409`.
+   */
+  settleDispatch(id: string, outcome: JournalOutcome): boolean;
+  /**
+   * End one unsettled dispatch **without** a result (§6.3), leaving a settled or
+   * already-superseded row exactly as it is.
+   */
+  supersedeDispatch(id: string, reason: string): void;
+  /**
+   * Every effect recorded at, or inside, one instance path — the
+   * `effect_history` a redispatch carries (§3.2, §7.2).
+   *
+   * "Inside" is the prefix relation grammar §9.4's paths already carry: a tool
+   * an agent's loop called records under the agent's site with frames appended,
+   * and a redispatched node has to replay all of it, not only its own outermost
+   * effect.
+   */
+  effectsUnder(execution: string, site: string): readonly JournalRecord[];
 }
 
 // ---------------------------------------------------------------------------
@@ -541,10 +723,55 @@ CREATE TABLE IF NOT EXISTS deliveries (
   detail       TEXT,
   PRIMARY KEY (execution, ordinal)
 );
+CREATE TABLE IF NOT EXISTS dispatches (
+  execution     TEXT NOT NULL,
+  wait          TEXT NOT NULL,
+  id            TEXT NOT NULL,
+  placement     TEXT NOT NULL,
+  node          TEXT NOT NULL,
+  site          TEXT NOT NULL,
+  inputs        TEXT NOT NULL,
+  item_index    INTEGER,
+  history       TEXT,
+  policy        TEXT,
+  status        TEXT NOT NULL,
+  session       TEXT,
+  outcome       TEXT,
+  payload       TEXT,
+  parked_at     TEXT NOT NULL,
+  dispatched_at TEXT,
+  settled_at    TEXT,
+  detail        TEXT,
+  PRIMARY KEY (execution, wait)
+);
 CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
 CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
 CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_at);
+-- Ordinary indexes rather than unique ones, and \`docs/distributed.md\` §8 rule 2
+-- is why: every identity in this schema is execution-scoped, so a shard of
+-- executions can move to another hub without arbitrating a journal-global
+-- constraint. A \`dispatch_id\` is a random handle the issuing hub owns (§10.1).
+CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
+CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
 `;
+
+/**
+ * How park order breaks a tie (`docs/distributed.md` §6.2).
+ *
+ * `parked_at` is an ISO instant with millisecond resolution, and a fan-out parks
+ * its instances from one synchronous burst — sixteen `dispatchPlaced` calls
+ * inside one tick all carry the same instant. §6.2 says dispatch resumes "in
+ * park order", so the tiebreak has to be the order they went on the board, and
+ * the only column that is is the implicit `rowid`: rows here are inserted and
+ * never deleted, so it is exactly monotonic insertion order.
+ *
+ * The tiebreak it replaced was `wait ASC`, which is a **string** — `<instance
+ * path>/<ordinal>` — so instance 10 sorted before instance 2 and a one-worker
+ * pool ran a `map`'s items 0, 1, 10, 11, …, 2, 3. §6.4's undispatched-is-a-pause
+ * row leans on park order for fairness: the item that has waited longest, and
+ * whose `timeout:` has been running longest, is the one taken next.
+ */
+const INSERTION_ORDER = "rowid ASC";
 
 /** The journal as a SQLite file — the only backend `--target local` binds. */
 class SqliteJournal implements Journal {
@@ -598,24 +825,7 @@ class SqliteJournal implements Journal {
       execution,
       key,
     ]) as Row | null;
-    if (found === null) return undefined;
-    const row = found;
-    const payload = String(row["payload"]);
-    const outcome: JournalOutcome =
-      row["outcome"] === "error"
-        ? errorOutcome(payload)
-        : { kind: "value", value: JSON.parse(payload) as unknown };
-    return {
-      execution: String(row["execution"]),
-      key: String(row["key"]),
-      site: String(row["site"]),
-      kind: String(row["kind"]) as EffectKind,
-      ordinal: Number(row["ordinal"]),
-      request: String(row["request"]),
-      outcome,
-      refused: Number(row["refused"] ?? 0) !== 0,
-      recordedAt: String(row["recorded_at"]),
-    };
+    return found === null ? undefined : recordOf(found);
   }
 
   append(record: JournalRecord): void {
@@ -783,6 +993,199 @@ class SqliteJournal implements Journal {
     ) as Row[];
     return rows.map((row) => deliveryOf(row));
   }
+
+  park(row: DispatchRow): DispatchRow {
+    // The read and the write are one synchronous step, so the row this answers
+    // is the row that is there — see [`#openDelivery`] for why that is enough.
+    const held = this.dispatchAt(row.execution, row.wait);
+    if (held !== undefined) return held;
+    this.#database.run(
+      `INSERT INTO dispatches
+         (execution, wait, id, placement, node, site, inputs,
+          item_index, history, policy, status, parked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (execution, wait) DO NOTHING`,
+      [
+        row.execution,
+        row.wait,
+        row.id,
+        row.placement,
+        row.node,
+        row.site,
+        canonical(row.inputs),
+        row.itemIndex ?? null,
+        // SQL `NULL` rather than the four characters `null` for an absent one:
+        // the read below has to tell a dispatch that carries no history apart
+        // from one whose history is the JSON value `null`, which is §3.2's
+        // difference between omitting a key and sending it.
+        row.history === undefined ? null : canonical(row.history),
+        row.policy === undefined ? null : canonical(row.policy),
+        "parked",
+        row.parkedAt,
+      ],
+    );
+    return this.dispatchAt(row.execution, row.wait) ?? row;
+  }
+
+  dispatchAt(execution: string, wait: string): DispatchRow | undefined {
+    const found = this.#database.get(
+      `SELECT rowid AS insertion_order, * FROM dispatches WHERE execution = ? AND wait = ?`,
+      [execution, wait],
+    ) as Row | null;
+    return found === null ? undefined : dispatchOf(found);
+  }
+
+  dispatchOf(id: string): DispatchRow | undefined {
+    const found = this.#database.get("SELECT rowid AS insertion_order, * FROM dispatches WHERE id = ?", [
+      id,
+    ]) as Row | null;
+    return found === null ? undefined : dispatchOf(found);
+  }
+
+  dispatchesOf(execution: string): readonly DispatchRow[] {
+    const rows = this.#database.all(
+      `SELECT rowid AS insertion_order, * FROM dispatches WHERE execution = ? ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
+      [execution],
+    ) as Row[];
+    return rows.map((row) => dispatchOf(row));
+  }
+
+  unsettledDispatches(): readonly DispatchRow[] {
+    const rows = this.#database.all(
+      `SELECT rowid AS insertion_order, * FROM dispatches WHERE status IN ('parked', 'dispatched') ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
+    ) as Row[];
+    return rows.map((row) => dispatchOf(row));
+  }
+
+  claimDispatch(id: string, session: string): DispatchRow | undefined {
+    // `status = 'parked'` in the predicate rather than read first, for the
+    // reason `refuseRecorded` carries it: two polls arriving together are the
+    // race, and the loser must take nothing rather than take it twice.
+    this.#database.run(
+      "UPDATE dispatches SET status = 'dispatched', session = ?, dispatched_at = ? WHERE id = ? AND status = 'parked'",
+      [session, new Date().toISOString(), id],
+    );
+    const held = this.dispatchOf(id);
+    return held?.status === "dispatched" && held.session === session ? held : undefined;
+  }
+
+  releaseDispatch(id: string, session: string): boolean {
+    this.#database.run(
+      "UPDATE dispatches SET status = 'parked', session = NULL, dispatched_at = NULL WHERE id = ? AND status = 'dispatched' AND session = ?",
+      [id, session],
+    );
+    return this.dispatchOf(id)?.status === "parked";
+  }
+
+  settleDispatch(id: string, outcome: JournalOutcome): boolean {
+    const payload =
+      outcome.kind === "value"
+        ? canonical(outcome.value)
+        : canonical({ name: outcome.name, message: outcome.message });
+    // **Read first, and the read is what answers.** The `WHERE` clause is still
+    // the guard — a row already ended keeps the outcome it has — but a status
+    // read *after* the write cannot tell a row this call settled from one an
+    // earlier result settled, and the contract above is that it can. The read
+    // and the write are one synchronous step in this driver, which is the
+    // property [`park`] already relies on.
+    const before = this.dispatchOf(id);
+    this.#database.run(
+      "UPDATE dispatches SET status = 'settled', outcome = ?, payload = ?, settled_at = ? WHERE id = ? AND status IN ('parked', 'dispatched')",
+      [outcome.kind, payload, new Date().toISOString(), id],
+    );
+    if (before === undefined || (before.status !== "parked" && before.status !== "dispatched")) {
+      return false;
+    }
+    const held = this.dispatchOf(id);
+    return held?.status === "settled" && held.settledAt !== undefined;
+  }
+
+  supersedeDispatch(id: string, reason: string): void {
+    this.#database.run(
+      "UPDATE dispatches SET status = 'superseded', settled_at = ?, detail = ?, session = NULL WHERE id = ? AND status IN ('parked', 'dispatched')",
+      [new Date().toISOString(), reason, id],
+    );
+  }
+
+  effectsUnder(execution: string, site: string): readonly JournalRecord[] {
+    // `substr` rather than `LIKE`, and that is a correctness choice rather than
+    // a stylistic one: a node id is grammar 2.1's identifier, which admits `_`,
+    // and `_` is `LIKE`'s single-character wildcard — so `LIKE 'my_node/0/%'`
+    // would also take the effects of a `myXnode`, handing a redispatched node a
+    // history of calls another node made.
+    const inside = `${site}/`;
+    const rows = this.#database.all(
+      "SELECT * FROM effects WHERE execution = ? AND (site = ? OR substr(site, 1, ?) = ?) ORDER BY key ASC",
+      [execution, site, inside.length, inside],
+    ) as Row[];
+    return rows.map((row) => recordOf(row));
+  }
+}
+
+/** One `dispatches` row, as this module reads it. */
+function dispatchOf(row: Row): DispatchRow {
+  const session = row["session"];
+  const outcome = row["outcome"];
+  const payload = row["payload"];
+  const dispatchedAt = row["dispatched_at"];
+  const settledAt = row["settled_at"];
+  const detail = row["detail"];
+  const itemIndex = row["item_index"];
+  const history = row["history"];
+  const policy = row["policy"];
+  const order = row["insertion_order"];
+  return {
+    execution: String(row["execution"]),
+    wait: String(row["wait"]),
+    id: String(row["id"]),
+    placement: String(row["placement"]),
+    node: String(row["node"]),
+    site: String(row["site"]),
+    inputs: JSON.parse(String(row["inputs"])) as unknown,
+    ...(itemIndex === null || itemIndex === undefined ? {} : { itemIndex: Number(itemIndex) }),
+    ...(history === null || history === undefined
+      ? {}
+      : { history: JSON.parse(String(history)) as unknown }),
+    ...(policy === null || policy === undefined
+      ? {}
+      : { policy: JSON.parse(String(policy)) as unknown }),
+    status: String(row["status"]) as DispatchStatus,
+    ...(session === null || session === undefined ? {} : { session: String(session) }),
+    ...(outcome === null || outcome === undefined || payload === null || payload === undefined
+      ? {}
+      : {
+          outcome:
+            outcome === "error"
+              ? errorOutcome(String(payload))
+              : ({ kind: "value", value: JSON.parse(String(payload)) as unknown } as const),
+        }),
+    parkedAt: String(row["parked_at"]),
+    ...(order === null || order === undefined ? {} : { order: Number(order) }),
+    ...(dispatchedAt === null || dispatchedAt === undefined
+      ? {}
+      : { dispatchedAt: String(dispatchedAt) }),
+    ...(settledAt === null || settledAt === undefined ? {} : { settledAt: String(settledAt) }),
+    ...(detail === null || detail === undefined ? {} : { detail: String(detail) }),
+  };
+}
+
+/** One `effects` row, as this module reads it. */
+function recordOf(row: Row): JournalRecord {
+  const payload = String(row["payload"]);
+  return {
+    execution: String(row["execution"]),
+    key: String(row["key"]),
+    site: String(row["site"]),
+    kind: String(row["kind"]) as EffectKind,
+    ordinal: Number(row["ordinal"]),
+    request: String(row["request"]),
+    outcome:
+      row["outcome"] === "error"
+        ? errorOutcome(payload)
+        : { kind: "value", value: JSON.parse(payload) as unknown },
+    refused: Number(row["refused"] ?? 0) !== 0,
+    recordedAt: String(row["recorded_at"]),
+  };
 }
 
 /** One `deliveries` row, as this module reads it. */

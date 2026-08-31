@@ -37,6 +37,15 @@ pub struct Golden {
 /// field map, and a union in the property position rather than as an array's
 /// `items:`. Each of those is a spelling this compiler could get wrong in a way
 /// only `tsc` or a real parse would notice.
+///
+/// `placed-nodes` is the fourth composition and the mesh one. `triage-fanout`'s
+/// `staging` target already places a component, so a mesh reaches the corpus
+/// either way; what this adds is the **three shapes a placed component is
+/// reached by**, in one project — an `agent:` node, a `function:` node over a
+/// placed tool, and a `map` whose dispatch target is placed
+/// (`docs/distributed.md` §7, grammar §14.1). Each lowers to a different call
+/// site, and a golden is where a change to any of them is reviewed as a diff
+/// rather than discovered by a worker.
 pub const GOLDENS: &[Golden] = &[
     Golden {
         directory: "every-schema-form",
@@ -57,6 +66,11 @@ pub const GOLDENS: &[Golden] = &[
         directory: "triage-fanout-staging",
         project: "examples/triage-fanout",
         target: "staging",
+    },
+    Golden {
+        directory: "placed-nodes",
+        project: "crates/agent-compose/tests/projects/execution/placed-nodes",
+        target: "mesh",
     },
 ];
 

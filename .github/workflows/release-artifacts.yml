@@ -173,6 +173,35 @@ jobs:
             exit 1
           fi
 
+      # The two musl legs need a C cross toolchain since the `worker` verb
+      # landed: the binary's TLS stack (`ureq` → `rustls` → `ring`) compiles C,
+      # so "every dependency is pure Rust" stopped being true there. Zig is that
+      # toolchain — one compiler that targets both musl triples the same way —
+      # driven by `cargo zigbuild` in the build step below. Pinned the way the
+      # actions above are pinned: the zig tarball by version *and* sha256
+      # against ziglang.org's published checksum, and `cargo-zigbuild` by exact
+      # version out of the same registry the build already trusts for every
+      # dependency. Bumping either is a commit that says so.
+      - name: Install zig and cargo-zigbuild, the musl legs' C toolchain
+        if: contains(matrix.target.triple, 'musl')
+        env:
+          ZIG_VERSION: 0.14.1
+          ZIG_SHA256: 24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
+          ZIGBUILD_VERSION: 0.23.3
+        run: |
+          tarball="zig-x86_64-linux-$ZIG_VERSION.tar.xz"
+          for attempt in 1 2 3; do
+            if curl -fsSL -o "$RUNNER_TEMP/$tarball" "https://ziglang.org/download/$ZIG_VERSION/$tarball"; then
+              break
+            fi
+            echo "zig download failed (attempt $attempt)"
+            sleep $((attempt * 5))
+          done
+          echo "$ZIG_SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+          cargo install --locked "cargo-zigbuild@$ZIGBUILD_VERSION"
+
       # `qemu-aarch64-static` runs a *static* aarch64 binary directly — no
       # container, no `binfmt` registration, no privileged step — which is
       # exactly what makes the smoke test below affordable on the one leg an
@@ -192,21 +221,23 @@ jobs:
           echo "::error::could not install qemu-user-static"
           exit 1
 
+      # The musl legs build through `cargo zigbuild`, which hands `ring`'s C the
+      # cross compiler and does the final link with zig for the same triple —
+      # including the aarch64 leg this runner has no native toolchain for. The
+      # darwin legs stay `cargo build`: Apple's own clang compiles `ring` there,
+      # and adding a second toolchain to a leg that has one would be a way to
+      # ship bytes two compilers disagree about.
       - name: Build
         env:
           # The commit `--version` carries. The build script would ask the
           # checkout for it; handing it over means the answer is the sha this
           # run is *for*, whatever the checkout's depth or detachment.
           GIT_SHA: ${{ github.sha }}
-          # The one target with no linker on its runner. `rust-lld` ships inside
-          # the toolchain and links a pure-Rust static binary for another
-          # architecture without a cross C toolchain, a container, or a
-          # third-party build action — and every dependency of this crate is
-          # pure Rust, which is what makes that hold. Cargo reads only the
-          # variable that matches the target being built, so this is inert on
-          # the other three legs.
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
-        run: cargo build --release --locked -p agent-compose --target "$TRIPLE"
+        run: |
+          case "$TRIPLE" in
+            *musl*) cargo zigbuild --release --locked -p agent-compose --target "$TRIPLE" ;;
+            *)      cargo build    --release --locked -p agent-compose --target "$TRIPLE" ;;
+          esac
 
       - name: The binary is for the architecture this leg claims
         run: |

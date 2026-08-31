@@ -664,6 +664,28 @@ const REDUCTIONS: &[Reduction] = &[
             "messages": []
         }"#,
     },
+    Reduction {
+        // The mesh golden's state model, which is the graph's and nothing to do
+        // with where its nodes run: `signature` and `ticket` are plain
+        // `last_wins` defaults written by two nodes in two *processes*, and
+        // `signatures` is the `append` channel a fan-out onto a placement fills.
+        // What this pins is that a placed node's answer reaches a channel the
+        // same way a local one's does — the seam is the activity, and grammar
+        // 10.3's write map never learns about it.
+        golden: "placed-nodes",
+        writes: r#"[
+            { "signature": "signed", "signatures": "one" },
+            { "ticket": "notarized", "signatures": "two" }
+        ]"#,
+        expected: r#"{
+            "approval": "",
+            "countersignature": "",
+            "signature": "signed",
+            "ticket": "notarized",
+            "signatures": ["one", "two"],
+            "messages": []
+        }"#,
+    },
 ];
 
 /// One case of the schema-lowering corpus.
@@ -2221,6 +2243,244 @@ fn a_raw_binding_bound(answer: &Value) {
     );
 }
 
+/// The artifact's content hash means the same thing in both languages
+/// (`docs/distributed.md` §3.5, §4).
+///
+/// The rule has two implementations by construction and neither is optional:
+/// `compose_core::codegen::artifact::hash` writes the constant when the compiler
+/// emits, and `contentHash` in the emitted `src/mesh.ts` is what a worker
+/// re-derives from the entries it unpacked "before unpacking anything" (§4
+/// step 2). A worker whose answer differed by a byte would refuse every artifact
+/// a hub serves it — or, the other way round, materialise one it had not really
+/// verified — so this is the CEL corpus's discipline applied to the second pair
+/// of implementations this project has.
+///
+/// Asked of the **mesh** golden, because that is the project whose answer a
+/// worker will act on; the rule itself is composition-independent, which the
+/// unit tests beside `artifact::hash` cover.
+#[test]
+fn the_artifact_hash_is_the_same_in_both_languages() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let golden = goldens::golden("placed-nodes");
+    let project = staged(golden, root, "artifact-hash");
+
+    let output = runner("artifact-content-hash.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the artifact-hash runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    let emitted = goldens::emitted(golden);
+    let declared = answer["declared"].as_str().expect("the declared hash");
+    assert_eq!(
+        declared,
+        compose_core::codegen::artifact::hash(emitted.files()),
+        "the constant the emitter wrote is not the hash it computes"
+    );
+    assert_eq!(
+        answer["computed"].as_str(),
+        Some(declared),
+        "the emitted project hashes its own tree to something other than the hash it declares: \
+         a worker verifying what it unpacked would refuse the artifact this hub serves"
+    );
+    let mut served: Vec<&str> = answer["files"]
+        .as_array()
+        .expect("the file list")
+        .iter()
+        .map(|path| path.as_str().expect("a path"))
+        .collect();
+    served.sort_unstable();
+    assert_eq!(
+        served,
+        emitted.paths().collect::<Vec<_>>(),
+        "`ARTIFACT_FILES` is not the set this build emitted"
+    );
+}
+
+/// The dispatch board's park order, its two settle verbs, and the payload it
+/// carries (`docs/distributed.md` §3.2, §3.4, §6.2).
+///
+/// Three properties a served hub cannot show, driven against `src/journal.ts`
+/// directly — a compiler constant, byte-identical in every project, so this is
+/// what every project runs:
+///
+///   * **park order is insertion order under a tie.** §6.2's "dispatch resumes
+///     in park order" is what a joining worker's scan follows and what §6.4's
+///     undispatched-is-a-pause row leans on for fairness. `parked_at` has
+///     millisecond resolution and a fan-out parks every instance from one
+///     synchronous burst, so they share it; the tiebreak that decides them has
+///     to be the order they went on the board. Twelve waits, because the
+///     tiebreak this replaced was a **string** compare over `<instance
+///     path>/<ordinal>` — `sign/10` sorts before `sign/2` — so a corpus of four
+///     would agree with either rule, and no fixture a served hub runs fans out
+///     wide enough to tell them apart.
+///
+///   * **`settleDispatch` answers whether *this* call settled it.** Its contract
+///     says so and the difference is invisible over the wire, because
+///     `/workers/result` reads the row's status before it calls: a re-posted
+///     result is `204` either way. A future caller that trusted the answer to
+///     tell a first settle from a re-post would take a second result's outcome
+///     as newly journaled — and the row must keep the outcome it has, which is
+///     asserted beside it.
+///
+///   * **`releaseDispatch` is a claim undone, and nothing else.** §7 makes
+///     dispatch at-least-once — "a hub that cannot tell whether a dispatch
+///     arrived re-issues it" — and the poll's own guard re-issues by putting the
+///     row back where a worker hung up before the answer was written. Three
+///     things have to hold of that and none is reachable over HTTP: the row
+///     returns to **its own place** in the park order rather than to the end of
+///     the queue, only the session holding it may hand it back, and a row that
+///     has moved on since — settled by a result, superseded by a deadline — is
+///     left exactly as it is.
+///
+///   * **§3.2's four OPTIONAL payload fields are on the row**, and a row parked
+///     without them carries none. That is what lets the poll answer omit the
+///     keys rather than send `null`, and it is why a hub restarted mid-dispatch
+///     hands over what its predecessor would (§8 rule 3: no dispatch state
+///     anywhere but the journal).
+#[test]
+fn the_dispatch_board_resumes_in_park_order_and_settles_once() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("placed-nodes"), root, "dispatch-board");
+
+    let output = runner("dispatch-board.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the dispatch board did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    let order = &observed["parkOrder"];
+    assert_eq!(
+        order["order"], order["wanted"],
+        "the board does not resume in park order: a one-worker pool would run a `map`'s items \
+         0, 1, 10, 11, …, 2, 3, and the item that has waited longest — whose `timeout:` has been \
+         running longest — is not the one taken next (docs/distributed.md §6.2)"
+    );
+    assert_eq!(
+        order["ofExecution"], order["wanted"],
+        "`dispatchesOf` promises park order too, and a status report reads it"
+    );
+    let insertion: Vec<i64> = order["insertion"]
+        .as_array()
+        .expect("the runner reports the insertion order it read back")
+        .iter()
+        .map(|held| {
+            held.as_i64().unwrap_or_else(|| {
+                panic!("a row read out of the journal carries no `order`: {order:#}")
+            })
+        })
+        .collect();
+    assert!(
+        insertion.windows(2).all(|pair| pair[0] < pair[1]),
+        "the tiebreak the board sorts by is not carried on the rows it answers with, so a \
+         synchronous reader of them — the status report — has to invent one of its own and can \
+         publish an order the queue does not drain in (docs/distributed.md §6.2): {order:#}"
+    );
+
+    let release = &observed["release"];
+    assert_eq!(release["claimed"], json!("dispatched"), "{release:#}");
+    assert_eq!(release["claimedBy"], json!("wrk_one"), "{release:#}");
+    assert_eq!(
+        release["releasedByAnother"],
+        json!(false),
+        "a session that is not holding the row handed it back, so any worker could take work off \
+         another's session (docs/distributed.md §7): {release:#}"
+    );
+    assert_eq!(release["released"], json!(true), "{release:#}");
+    assert_eq!(release["status"], json!("parked"), "{release:#}");
+    assert_eq!(
+        release["session"],
+        json!("absent"),
+        "a row put back on the board still names the session that could not receive it: {release:#}"
+    );
+    assert_eq!(release["dispatchedAt"], json!("absent"), "{release:#}");
+    assert_eq!(
+        release["orderAfterRelease"], release["wantedAfterRelease"],
+        "a released row did not go back to its own place in the park order: the item that has \
+         waited longest is no longer the one taken next, and its `timeout:` has been running the \
+         whole time (docs/distributed.md §6.2, §6.5): {release:#}"
+    );
+    assert_eq!(
+        release["releasedSettled"],
+        json!(false),
+        "a row a worker's result already settled was put back on the board: {release:#}"
+    );
+    assert_eq!(release["settledStatus"], json!("settled"), "{release:#}");
+    assert_eq!(
+        release["releasedSuperseded"],
+        json!(false),
+        "a row the hub superseded was put back on the board, so work the execution has gone past \
+         would be dispatched again (docs/distributed.md §6.3): {release:#}"
+    );
+    assert_eq!(
+        release["supersededStatusAfter"],
+        json!("superseded"),
+        "{release:#}"
+    );
+
+    let settlement = &observed["settlement"];
+    assert_eq!(
+        settlement["first"],
+        json!(true),
+        "the call that settled the dispatch did not say so"
+    );
+    assert_eq!(
+        settlement["again"],
+        json!(false),
+        "a row an earlier result already settled answers `true`, so a caller cannot tell a first \
+         settle from a re-post (docs/distributed.md §3.4)"
+    );
+    assert_eq!(
+        settlement["outcome"]["value"]["signature"],
+        json!("s"),
+        "the second settle overwrote the outcome the first one journaled"
+    );
+    assert_eq!(
+        settlement["afterSupersede"],
+        json!(false),
+        "a superseded row answers `true`, which is the `409` case reading as the `204` one"
+    );
+    assert_eq!(settlement["supersededStatus"], json!("superseded"));
+    assert_eq!(
+        settlement["unknown"],
+        json!(false),
+        "a `dispatch_id` this journal never held answers `true`"
+    );
+
+    let payload = &observed["payload"];
+    assert_eq!(payload["itemIndex"], json!(3));
+    assert_eq!(
+        payload["history"],
+        json!([{ "role": "assistant", "text": "a release of release.dmg" }]),
+        "the conversation a placed `agent:` node is dispatched with did not survive the journal"
+    );
+    assert_eq!(payload["policy"], json!({ "timeoutMs": 30_000 }));
+    for field in ["itemIndex", "history", "policy"] {
+        assert_eq!(
+            payload["absent"][field],
+            json!("absent"),
+            "a row parked without §3.2's `{field}` reads back carrying one, so the poll answer \
+             would send a value where the document omits a key"
+        );
+    }
+}
+
 /// Gate 2f: a command that never reads its input still completes.
 ///
 /// Grammar 8.2 sends a scalar `input:` to the child's standard input, and no
@@ -3057,7 +3317,19 @@ fn the_generated_project_checks_its_environment_when_it_is_loaded() {
     for golden in GOLDENS {
         let project = staged(golden, root, "environment");
         let ir = artifact(golden);
-        let references = compose_core::codegen::env::References::of(&ir);
+        // **The hub's own list, not the composition's whole environment.**
+        // `docs/distributed.md` §9.1 partitions the manifest per process, and
+        // `readEnvironment()` checks the process this is: a variable only a
+        // placement's worker needs is one this deployment cannot leak, so
+        // demanding it here would be the false requirement §9.1 is written
+        // against. For a composition with no `placements:` the two are the same
+        // list, which is every golden but one.
+        let partition = compose_core::codegen::env::Partition::of(&ir);
+        let references = compose_core::codegen::env::References::for_process(
+            &ir,
+            &partition,
+            &compose_core::codegen::env::Process::Hub,
+        );
         let names: Vec<&str> = references.names().collect();
 
         let mut sealed = bun();
@@ -3098,6 +3370,32 @@ fn the_generated_project_checks_its_environment_when_it_is_loaded() {
                 "`{}` named `{name}` without saying where it is referenced:\n{complaint}",
                 golden.directory,
             );
+        }
+
+        // …and the other direction, which is the half `docs/distributed.md` §9.1
+        // exists for: a variable that belongs to a **placement** and to no
+        // process this hub is must not be demanded here. `KEYCHAIN_PASSWORD` on
+        // a machine that has no keychain is the failure it names; the hub's
+        // refusing to start over one it never reads is the same failure wearing
+        // the compiler's face.
+        for process in partition.processes() {
+            if matches!(process, compose_core::codegen::env::Process::Hub) {
+                continue;
+            }
+            let held =
+                compose_core::codegen::env::References::for_process(&ir, &partition, process);
+            for variable in held.names() {
+                if names.contains(&variable) {
+                    continue;
+                }
+                assert!(
+                    !complaint.contains(variable),
+                    "`{}` refused to start over `{variable}`, which only the placement `{}` runs \
+                     anything that reads (docs/distributed.md §9.1):\n{complaint}",
+                    golden.directory,
+                    process.name(),
+                );
+            }
         }
 
         let mut supplied = bun();

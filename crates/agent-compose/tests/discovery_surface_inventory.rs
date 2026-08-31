@@ -64,7 +64,12 @@
 //!
 //! A verb that exists is not yet a command that runs, so the same direction
 //! also checks **arity**: an invocation names at least as many arguments as
-//! clap makes required, counted from that subcommand's own usage line.
+//! clap makes required, read off that subcommand's own usage line and in the
+//! two kinds that line has — bare positionals, and the flags whose value is
+//! required, which is what `worker` takes and nothing else does. Kept apart
+//! rather than totalled, because a flag's value fills that flag's slot and no
+//! other: `agent-compose serve --port 8080` is a usage error, and a count that
+//! summed words would read the `8080` as the path it is missing.
 //! `agent-compose build` is every bit as much a usage error as
 //! `agent-compose migrate` would be, and it is the likelier mistake, because
 //! the verb is real and the sentence around it reads fine.
@@ -200,16 +205,40 @@ fn listed_verbs() -> Vec<String> {
         .collect()
 }
 
-/// How many positional arguments clap **requires** of one verb.
+/// The argument slots clap **requires** of one verb, in the two kinds it has.
 ///
-/// Read out of that subcommand's own usage line — `Usage: agent-compose build
-/// [OPTIONS] <PATH>` — where clap writes a required positional in angle
-/// brackets and an optional one in square. Reading it rather than listing it
-/// here is the same discipline as [`verbs`]: a second inventory is a second
-/// thing to keep in step, and adding a required argument to a shipped verb is
-/// exactly the change that would make the documents wrong without touching
-/// them.
-fn required_arguments(verb: &str) -> usize {
+/// Kept apart rather than summed, because they are filled from different places
+/// in a written invocation and a total cannot tell one from the other: a
+/// document writing `agent-compose serve --port 8080` fills an *option's* slot
+/// and leaves the positional empty, which is the usage error this whole bind
+/// exists to catch, and a single count would read the `8080` as the path.
+struct Required {
+    /// How many bare positionals — `<PATH>`, and `run`'s `<PATH> <FLOW>`.
+    positionals: usize,
+    /// The flags whose value is required — `worker`'s `--hub` and `--token-env`.
+    options: Vec<String>,
+}
+
+impl Required {
+    /// Whether this verb can be written with the program name and no more.
+    fn nothing(&self) -> bool {
+        self.positionals == 0 && self.options.is_empty()
+    }
+}
+
+/// What one verb requires, read out of that subcommand's own usage line.
+///
+/// `Usage: agent-compose build [OPTIONS] <PATH>` and `Usage: agent-compose
+/// worker [OPTIONS] --hub <URL> --token-env <VAR>`: clap writes a required
+/// positional in angle brackets, an optional one in square, and a required
+/// option as the flag followed by its value in the same angle brackets — which
+/// is why the two kinds are told apart *here*, by whether a flag precedes the
+/// placeholder, rather than left to a reader of the count. Reading the line
+/// rather than listing the answer here is the same discipline as [`verbs`]: a
+/// second inventory is a second thing to keep in step, and adding a required
+/// argument to a shipped verb is exactly the change that would make the
+/// documents wrong without touching them.
+fn required_arguments(verb: &str) -> Required {
     let output: Output = Command::cargo_bin("agent-compose")
         .expect("the binary under test is built")
         .args([verb, "--help"])
@@ -220,29 +249,74 @@ fn required_arguments(verb: &str) -> usize {
         .lines()
         .find(|line| line.starts_with("Usage:"))
         .unwrap_or_else(|| panic!("`agent-compose {verb} --help` prints a usage line"));
-    usage
-        .split_whitespace()
-        .filter(|word| word.starts_with('<') && word.ends_with('>'))
-        .count()
+    let words: Vec<&str> = usage.split_whitespace().collect();
+    let mut required = Required {
+        positionals: 0,
+        options: Vec::new(),
+    };
+    let mut at = 0;
+    while at < words.len() {
+        let word = words[at];
+        let placeholder = |held: &str| held.starts_with('<') && held.ends_with('>');
+        if word.starts_with("--") && words.get(at + 1).is_some_and(|next| placeholder(next)) {
+            required.options.push(word.to_string());
+            at += 2;
+            continue;
+        }
+        if placeholder(word) {
+            required.positionals += 1;
+        }
+        at += 1;
+    }
+    required
 }
 
-/// How many positional arguments one written invocation supplies.
+/// The argument slots one written invocation fills, in the same two kinds.
 ///
-/// The leading run of words after the verb that are not flags, an optional
-/// group, or a trailing comment — because that is where a positional goes in
-/// every form these documents write, and stopping at the first flag keeps
-/// `agent-compose build --check` from counting `--check` as the path it is
-/// missing. A placeholder counts: `<path>` is a document saying *a path goes
-/// here*, which is the thing being checked.
-fn supplied_arguments(words: &[String]) -> usize {
-    words
-        .iter()
-        .skip(1)
-        .take_while(|word| {
-            let word = word.as_str();
-            !word.starts_with('-') && !word.starts_with('[') && word != "#"
-        })
-        .count()
+/// **Positionals** are the leading run of words after the verb that are not a
+/// flag, an optional group, or a trailing comment — because that is where a
+/// positional goes in every form these documents write, and stopping at the
+/// first flag is what keeps `agent-compose serve --port 8080` from reading the
+/// `8080` as the path it is missing. A placeholder counts: `<path>` is a
+/// document saying *a path goes here*, which is the thing being checked.
+///
+/// **Flags** are every long flag the invocation names, wherever it stands, with
+/// the optional group's brackets and a repetition's ellipsis trimmed off it and
+/// an `--flag=value` spelling cut at the `=`. Only the name is kept, because
+/// what a required option owes is that the document names it at all — its value
+/// is the placeholder beside it, and a flag written without one is a different
+/// usage error this bind does not claim to catch.
+struct Supplied {
+    positionals: usize,
+    flags: BTreeSet<String>,
+}
+
+fn supplied_arguments(words: &[String]) -> Supplied {
+    let mut supplied = Supplied {
+        positionals: 0,
+        flags: BTreeSet::new(),
+    };
+    let mut leading = true;
+    for word in words.iter().skip(1) {
+        let word = word.as_str();
+        if word == "#" {
+            break;
+        }
+        let bare = word.trim_start_matches('[').trim_end_matches(['.', ']']);
+        if bare.starts_with("--") {
+            supplied
+                .flags
+                .insert(bare.split('=').next().unwrap_or(bare).to_string());
+        }
+        if word.starts_with('-') || word.starts_with('[') {
+            leading = false;
+            continue;
+        }
+        if leading {
+            supplied.positionals += 1;
+        }
+    }
+    supplied
 }
 
 /// A small count as the documents spell it.
@@ -798,7 +872,9 @@ fn a_verb_is_not_documented_by_a_longer_one_that_starts_with_it() {
 /// [`every_grammar_section_is_claimed_by_a_topic`] applies to the grammar.
 #[test]
 fn the_help_lists_the_verbs_that_act_before_the_verbs_that_teach() {
-    const ACT: &[&str] = &["validate", "plan", "build", "resume", "run", "serve"];
+    const ACT: &[&str] = &[
+        "validate", "plan", "build", "resume", "run", "serve", "worker",
+    ];
     const TEACH: &[&str] = &["docs", "explain", "init", "schema", "skill"];
 
     let mut claimed: Vec<String> = ACT
@@ -879,12 +955,17 @@ fn the_documents_name_only_verbs_the_binary_has() {
 /// short of being one. The skill is installed into somebody else's agent, so
 /// there is no correcting it afterwards.
 ///
-/// Both numbers come from clap: the required count from the verb's usage line,
-/// the supplied count from what the document wrote. Table cells are out of
+/// Both sides come from clap: what a verb requires from its own usage line,
+/// what a document supplies from what the document wrote. Table cells are out of
 /// scope and the module header says why.
+///
+/// The two **kinds** of required argument are checked separately, and that is
+/// what keeps the bind honest across the verbs: `serve` requires a positional
+/// and `worker` requires two options, so a check that only counted words would
+/// let `agent-compose serve --port 8080` pass on the strength of the `8080`.
 #[test]
 fn every_command_the_documents_tell_a_reader_to_run_carries_its_arguments() {
-    let arity: BTreeMap<String, usize> = verbs()
+    let arity: BTreeMap<String, Required> = verbs()
         .into_iter()
         .map(|verb| {
             let required = required_arguments(&verb);
@@ -903,18 +984,35 @@ fn every_command_the_documents_tell_a_reader_to_run_carries_its_arguments() {
             let Some(required) = arity.get(verb) else {
                 continue;
             };
-            if *required == 0 {
+            if required.nothing() {
                 continue;
             }
             demanding += 1;
             let supplied = supplied_arguments(&words);
+            let unmet: Vec<&str> = required
+                .options
+                .iter()
+                .filter(|flag| !supplied.flags.contains(*flag))
+                .map(String::as_str)
+                .collect();
             assert!(
-                supplied >= *required,
-                "{document} writes `agent-compose {}`, which exits 2: `{verb}` takes {required} \
-                 argument(s) and this names {supplied}. Name them — a placeholder counts — or, if \
-                 the sentence is about the verb rather than a command to run, write the verb \
+                unmet.is_empty(),
+                "{document} writes `agent-compose {}`, which exits 2: `{verb}` requires {} and \
+                 this names none of {unmet:?}. Name them — a placeholder counts as the value — or, \
+                 if the sentence is about the verb rather than a command to run, write the verb \
                  alone without the program name",
-                words.join(" ")
+                words.join(" "),
+                required.options.join(", ")
+            );
+            assert!(
+                supplied.positionals >= required.positionals,
+                "{document} writes `agent-compose {}`, which exits 2: `{verb}` takes {} \
+                 argument(s) and this names {}. Name them — a placeholder counts — or, if the \
+                 sentence is about the verb rather than a command to run, write the verb alone \
+                 without the program name",
+                words.join(" "),
+                required.positionals,
+                supplied.positionals
             );
         }
     }
@@ -925,6 +1023,58 @@ fn every_command_the_documents_tell_a_reader_to_run_carries_its_arguments() {
         demanding >= 15,
         "the scan still finds the commands that take arguments, found {demanding}"
     );
+}
+
+/// …and the reader that guard is built on tells the two kinds of slot apart.
+///
+/// A guard over documents is only as sharp as its parse, and this one has a
+/// failure mode that would not show up as a red test: widen the reading of
+/// "supplied" and every document keeps passing while the usage errors it exists
+/// to catch walk through. So the reading itself is asserted, on the shape that
+/// separates the two — a flag's **value** is not a positional, and a required
+/// **option** is met by its flag being named rather than by any word being
+/// counted. `agent-compose serve --port 8080` is the case: it exits 2 with `the
+/// following required arguments were not provided: <PATH>`, and a count that
+/// summed words would read the `8080` as that path.
+#[test]
+fn the_argument_reader_does_not_take_a_flags_value_for_a_positional() {
+    let read = |written: &str| {
+        supplied_arguments(
+            &written
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    // The value after a flag fills that flag's slot and no other.
+    assert_eq!(read("serve --port 8080").positionals, 0);
+    assert_eq!(read("build --out dist").positionals, 0);
+    assert_eq!(read("run --input k=v").positionals, 0);
+    // A positional the document did write is counted, flags beside it or not.
+    assert_eq!(read("serve main.yml --port 8080").positionals, 1);
+    assert_eq!(read("run main.yml flow.triage --input k=v").positionals, 2);
+    assert_eq!(
+        read("build <path> [--target <name>] [--check]").positionals,
+        1
+    );
+
+    // A required option is met by its flag, wherever the flag stands and
+    // however the document brackets it.
+    let worker = read("worker --hub <url> --claim <name>... --token-env <VAR>");
+    assert_eq!(worker.positionals, 0);
+    for flag in ["--hub", "--claim", "--token-env"] {
+        assert!(worker.flags.contains(flag), "{flag} was not read as a flag");
+    }
+    assert!(read("build <path> [--check]").flags.contains("--check"));
+    assert!(read("skill --agent=claude").flags.contains("--agent"));
+
+    // And the two verbs this pair is really about, against clap's own answer.
+    let serve = required_arguments("serve");
+    assert_eq!((serve.positionals, serve.options.len()), (1, 0));
+    let worker = required_arguments("worker");
+    assert_eq!(worker.positionals, 0);
+    assert_eq!(worker.options, vec!["--hub", "--token-env"]);
 }
 
 /// (c) …and every topic the documents point at is one the curriculum has.

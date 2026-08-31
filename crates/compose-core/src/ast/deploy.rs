@@ -4,13 +4,14 @@
 //! it is disjoint from spec files (Decision D3). `event_sources` is reserved
 //! grammar: parsed and validated in v0, executed in M3 (grammar 15).
 //!
-//! `hub:` and `placements:` are **not** reserved. They are the live static
-//! surface of the distributed claims model (PRD resolved q37–q44): a placement
-//! is a logical name a worker claims at an authenticated join, and the hub is
-//! the process that owns the graph. Every rule about them is enforced now; the
-//! protocol that reads them lands with the `worker` verb, and
-//! `crates/compose-core/tests/placement_surface_inertness.rs` is what says so
-//! in executable form (grammar 14.1, 14.2, `docs/distributed.md`).
+//! `hub:` and `placements:` are **not** reserved, and no longer awaiting a
+//! runtime either. They are the live surface of the distributed claims model
+//! (PRD resolved q37–q44): a placement is a logical name a worker claims at an
+//! authenticated join, and the hub is the process that owns the graph. Every
+//! rule about them is enforced by `validate`, a build emits the hub these keys
+//! describe, and `agent-compose worker` is the spoke that joins it;
+//! `crates/compose-core/tests/placement_surface_landing.rs` is what says so in
+//! executable form (grammar 14.1, 14.2, `docs/distributed.md`).
 
 use crate::diag::{Span, Spanned};
 

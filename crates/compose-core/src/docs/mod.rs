@@ -65,6 +65,14 @@ pub const ENVIRONMENT: &[(&str, &str)] = &[
         "the schedule a served app retries a callback delivery on (`docs/durability.md` §3.7)",
     ),
     (
+        "AGENT_COMPOSE_MESH_POLL_HOLD_MS",
+        "how long a hub holds a worker's poll before answering it empty (`docs/distributed.md` §2)",
+    ),
+    (
+        "AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS",
+        "how long a worker session may go without a request before the hub gives up on it (`docs/distributed.md` §2)",
+    ),
+    (
         "NO_COLOR",
         "any non-empty value turns styling off on every report (no-color.org)",
     ),

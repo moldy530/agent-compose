@@ -1,0 +1,606 @@
+//
+// The node runner: one placed node, executed on a worker
+// (`docs/distributed.md` §3.2, §7).
+//
+// This is the other end of `./mesh.ts`'s `dispatchPlaced`. The hub journals a
+// dispatch and parks it; a worker takes it and runs **this** module, once per
+// dispatch, in a process of its own:
+//
+// ```text
+// bun src/worker-node.ts        < the dispatch, as one JSON object on stdin
+//                               > NDJSON on stdout: an effect line per effect,
+//                                 then exactly one result line
+// ```
+//
+// # Why a process per dispatch
+//
+// Because a dispatch is the unit the protocol already fails at. §6.3 supersedes
+// the dispatch a vanished session was holding and §7.3 makes a mid-node
+// disconnect an attempt failure, so a node that wedges, leaks or exits has cost
+// the mesh exactly one attempt — and the `agent-compose worker` process that
+// spawned it is a protocol client that goes on polling either way (§2). A
+// long-lived runtime holding several nodes would have to reproduce that
+// isolation itself, and would make "the worker stopped answering" a fact about a
+// module rather than about a process.
+//
+// # The stdin contract
+//
+// One JSON object, exactly the poll answer of §3.2:
+//
+// ```json
+// {
+//   "dispatch_id": "dsp_…",
+//   "execution_id": "exec_…",
+//   "node": "flow.release.sign",
+//   "instance_path": "sign/0",
+//   "inputs": { "…": "…" },
+//   "effect_history": [ { "key": "…", "…": "…" } ]
+// }
+// ```
+//
+// `node` is the address `./graph.ts` registered the activity under — a flow
+// node's `<flow>.<node>` for an `agent:` or `function:` node, and the component
+// address itself for a `map` dispatch target, which are exactly the three ways a
+// graph reaches a placed component (grammar §14.1). `instance_path` is the
+// flattened path grammar §9.4 keys effects by, so the keys this process derives
+// are the keys the hub would have derived (§10.1).
+//
+// # The stdout contract
+//
+// One JSON object per line, and two kinds:
+//
+// ```json
+// {"type":"effect","effect":{"key":"sign/0#model/0","…":"…"}}
+// {"type":"result","output":{"…":"…"},"history":[],"models":[]}
+// ```
+//
+// An **effect** line is written the instant the journal would have taken the
+// record, which is §3.3's "a worker SHOULD send a batch as soon as an effect
+// completes rather than accumulating until the node ends": an effect that never
+// reached the hub is an effect the replay of §7 cannot skip. The `agent-compose
+// worker` process batches the lines and `POST`s them; nothing here speaks HTTP.
+//
+// A **result** line is the last line, and there is exactly one: the node's
+// output, or the failure that ended it. A runner that dies without writing one
+// is an attempt that failed, and the worker reports it as such — which is why
+// this module catches the activity's error and reports it rather than throwing
+// out of the process: a failure the node *made* is worth naming.
+//
+// # Replay to the frontier (§7.2)
+//
+// `effect_history` is the journaled record of everything this node instance
+// already did, read off the hub's journal at hand-over. It is loaded into a
+// journal of this dispatch's own — [`DispatchJournal`] — and the session is
+// opened **resuming**, so `./journal.ts`'s ordinary replay discipline does the
+// rest: the recorder claims the same keys in the same order, consumes a recorded
+// answer instead of issuing the effect, and goes live at the first key the
+// history does not hold. `docs/durability.md` §5 is that discipline; this module
+// adds nothing to it but the journal it reads out of.
+//
+// That is also what makes a **retry** of a placed node cheap: a superseded
+// attempt's effects are the retry's history, so "a model call already paid for is
+// not paid for twice" (§7.3) is the same mechanism as a resumed execution's.
+//
+// # What this module is not
+//
+// * **Not a scheduler.** It runs one node and exits. Which node, and when, is
+//   the hub's (§1).
+// * **Not a journal.** Workers SEND, the hub INSERTS (§3.3, PRD resolved q42):
+//   [`DispatchJournal`] writes nothing anywhere, it emits.
+// * **Not a graph.** LangGraph is the per-process engine on both sides (§7.4)
+//   and this side runs the node function the graph would have run — no
+//   `StateGraph` is streamed here.
+
+import process from "node:process";
+
+import { placedNodes } from "./graph.ts";
+import {
+  type DeliveryAttempt,
+  type DeliveryIntent,
+  type DeliveryRecord,
+  type DeliveryStatus,
+  type DispatchRow,
+  type ExecutionRow,
+  type ExecutionStatus,
+  type Journal,
+  type JournalOutcome,
+  type JournalRecord,
+  closeSession,
+  openSession,
+  recorderFor,
+} from "./journal.ts";
+import { type PlacedAnswer, executeLocally } from "./mesh.ts";
+import type * as runtime from "./runtime.ts";
+import { interruptOf } from "./runtime.ts";
+
+/** The dispatch this process was handed, as §3.2 puts it on the wire. */
+interface Dispatch {
+  readonly dispatch_id: string;
+  readonly execution_id: string;
+  readonly node: string;
+  readonly instance_path: string;
+  readonly inputs: unknown;
+  /**
+   * §3.2's four OPTIONAL fields: what the hub holds about this node execution
+   * that the node would have read for itself had it run there.
+   *
+   * **None of them is derived here.** §3.2 says so outright — "they are the
+   * hub's to derive, and the worker MUST NOT invent them" — and each default a
+   * worker could reach for is a placed node quietly meaning something else: an
+   * empty `session_key` sends a `scope: session` store's diagnostic after a
+   * `--session` the run already passed, and an empty `history` answers from the
+   * input object alone with nothing said.
+   */
+  readonly session_key?: string;
+  readonly item_index?: number;
+  readonly history?: readonly unknown[];
+  readonly policy?: unknown;
+  readonly effect_history?: readonly Record<string, unknown>[];
+}
+
+// ---------------------------------------------------------------------------
+// The journal a dispatch reads and writes (§3.3, §7.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * One dispatch's journal: the handed-over history to read, and a stream to
+ * write.
+ *
+ * It satisfies `./journal.ts`'s [`Journal`] because that is the seam a replay
+ * already goes through — `openSession` takes one, the recorder reads `lookup`
+ * and writes `append`, and nothing about the discipline in `docs/durability.md`
+ * §5 has to know it is talking to a pipe instead of to SQLite.
+ *
+ * **Everything else throws**, and deliberately. A worker holds no lifecycle
+ * rows, no delivery ledger and no dispatch board: those belong to the hub, which
+ * is the single writer (§3.3, §8 rule 3). A method reached here would be a node
+ * activity that had grown a dependency on state this process has no business
+ * having, and a silent no-op would let it look as though it worked.
+ */
+class DispatchJournal implements Journal {
+  /** What the hub handed over, by effect key. */
+  readonly #history = new Map<string, JournalRecord>();
+  /** Where a record goes when it is appended, or when it is marked refused. */
+  readonly #emit: (record: JournalRecord) => void;
+
+  constructor(history: readonly JournalRecord[], emit: (record: JournalRecord) => void) {
+    for (const record of history) this.#history.set(record.key, record);
+    this.#emit = emit;
+  }
+
+  lookup(execution: string, key: string): JournalRecord | undefined {
+    const held = this.#history.get(key);
+    return held === undefined || held.execution !== execution ? undefined : held;
+  }
+
+  append(record: JournalRecord): void {
+    // Held as well as emitted: an effect this dispatch performed is one a later
+    // read in the same process must find, and the hub's copy is a round trip
+    // away.
+    this.#history.set(record.key, record);
+    this.#emit(record);
+  }
+
+  /**
+   * Mark, and **send again with the mark on it**.
+   *
+   * The record has already gone home by the time a contract refuses its answer
+   * (`./journal.ts`'s `refuseRecorded`), so the mark travels as a second copy of
+   * the record: §3.3 makes insertion idempotent by effect key, so the row is not
+   * written twice, and the hub carries the mark across onto the row it already
+   * holds. Without it the redispatch of §7.2 would read an unmarked record and
+   * call this run's own refusal a replay divergence.
+   */
+  refuse(_execution: string, key: string): void {
+    const held = this.#history.get(key);
+    if (held === undefined) return;
+    const marked: JournalRecord = { ...held, refused: true };
+    this.#history.set(key, marked);
+    this.#emit(marked);
+  }
+
+  begin(_row: ExecutionRow): void {
+    throw new WorkerJournalReach("open an execution");
+  }
+
+  end(_id: string, _status: Exclude<ExecutionStatus, "open">, _error?: string): void {
+    throw new WorkerJournalReach("close an execution");
+  }
+
+  execution(_id: string): ExecutionRow | undefined {
+    throw new WorkerJournalReach("read an execution's lifecycle row");
+  }
+
+  openExecutions(): readonly ExecutionRow[] {
+    throw new WorkerJournalReach("list the open executions");
+  }
+
+  intendDelivery(_intent: DeliveryIntent): DeliveryRecord {
+    throw new WorkerJournalReach("intend a lifecycle delivery");
+  }
+
+  refuseDelivery(_intent: DeliveryIntent, _reason: string): DeliveryRecord {
+    throw new WorkerJournalReach("refuse a lifecycle delivery");
+  }
+
+  refuseRecorded(_execution: string, _ordinal: number, _reason: string): void {
+    throw new WorkerJournalReach("refuse a recorded delivery");
+  }
+
+  exhaustRecorded(_execution: string, _ordinal: number, _reason: string): void {
+    throw new WorkerJournalReach("exhaust a recorded delivery");
+  }
+
+  recordAttempt(
+    _execution: string,
+    _ordinal: number,
+    _attempt: DeliveryAttempt,
+    _status: DeliveryStatus,
+  ): void {
+    throw new WorkerJournalReach("record a delivery attempt");
+  }
+
+  deliveries(_execution: string): readonly DeliveryRecord[] {
+    throw new WorkerJournalReach("list an execution's deliveries");
+  }
+
+  undelivered(): readonly DeliveryRecord[] {
+    throw new WorkerJournalReach("list the undelivered callbacks");
+  }
+
+  park(_row: DispatchRow): DispatchRow {
+    throw new WorkerJournalReach("park a dispatch");
+  }
+
+  dispatchAt(_execution: string, _wait: string): DispatchRow | undefined {
+    throw new WorkerJournalReach("read the dispatch board");
+  }
+
+  dispatchOf(_id: string): DispatchRow | undefined {
+    throw new WorkerJournalReach("read the dispatch board");
+  }
+
+  dispatchesOf(_execution: string): readonly DispatchRow[] {
+    throw new WorkerJournalReach("read the dispatch board");
+  }
+
+  unsettledDispatches(): readonly DispatchRow[] {
+    throw new WorkerJournalReach("read the dispatch board");
+  }
+
+  claimDispatch(_id: string, _session: string): DispatchRow | undefined {
+    throw new WorkerJournalReach("claim a dispatch");
+  }
+
+  releaseDispatch(_id: string, _session: string): boolean {
+    throw new WorkerJournalReach("put a dispatch back on the board");
+  }
+
+  settleDispatch(_id: string, _outcome: JournalOutcome): boolean {
+    throw new WorkerJournalReach("settle a dispatch");
+  }
+
+  supersedeDispatch(_id: string, _reason: string): void {
+    throw new WorkerJournalReach("supersede a dispatch");
+  }
+
+  effectsUnder(_execution: string, _site: string): readonly JournalRecord[] {
+    throw new WorkerJournalReach("read an execution's effect history");
+  }
+}
+
+/** A worker reached for a journal operation that is the hub's (§3.3, §8). */
+class WorkerJournalReach extends Error {
+  constructor(what: string) {
+    super(
+      `a placed node tried to ${what} on the worker running it: the hub is the single writer of this execution's journal, and a worker only sends the effects it issued (docs/distributed.md §3.3, §8, PRD resolved q42)`,
+    );
+    this.name = "WorkerJournalReach";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One node, run
+// ---------------------------------------------------------------------------
+
+/**
+ * §3.2's `session_key` for the one execution this process runs a node of.
+ *
+ * Set once from the dispatch, before anything runs. A module-scope value rather
+ * than a parameter because it is a property of the *execution*, and this process
+ * has exactly one: a placed component that reaches another placed component of
+ * its own placement ([`runPlaced`]) is still inside it.
+ */
+let sessionKey = "";
+
+/**
+ * Run one placed node here, under a context and an effect site of its own.
+ *
+ * Installed as `./mesh.ts`'s local executor, which is what makes **nesting**
+ * work: a placed agent whose attached `flow.*` reaches another placed component
+ * (grammar §14.1 rule 4 colocates them, so it is this worker's placement) meets
+ * `dispatchPlaced` again inside its own tool loop, and this answers it by
+ * running the node rather than by looking for a mesh this process is not part
+ * of. The alternative — a `PlacementUnreachable` from a worker that is holding
+ * the very placement — would make an attached flow with a placed node in it
+ * unrunnable anywhere.
+ */
+async function runPlaced(options: {
+  readonly node: string;
+  readonly execution: string;
+  readonly path: readonly string[];
+  readonly inputs: unknown;
+  readonly itemIndex?: number;
+  readonly history?: readonly runtime.Turn[];
+  readonly policy?: runtime.InstancePolicy;
+  readonly signal?: AbortSignal;
+}): Promise<PlacedAnswer> {
+  const run = placedNodes[options.node];
+  if (run === undefined) {
+    throw new Error(
+      `\`${options.node}\` is not a placed node of this artifact: it registers ${
+        Object.keys(placedNodes)
+          .map((name) => `\`${name}\``)
+          .join(", ") || "none"
+      } (docs/distributed.md §3.2)`,
+    );
+  }
+  const site = options.path.join("/");
+  const storeRecords: runtime.StoreRecord[] = [];
+  const modelCalls: runtime.ModelCall[] = [];
+  const toolDispatches: runtime.DispatchRecord[] = [];
+  const execution: runtime.ExecutionIdentity = {
+    id: options.execution,
+    // §3.2's `session_key`, as the hub read it off the execution's lifecycle
+    // row — not a default, because grammar §4.1's session key is what a
+    // `scope: session` store partitions by, and a placed component that
+    // addressed the empty partition would fail its first `memory_get` with a
+    // diagnostic telling the operator to pass a `--session` they already did.
+    //
+    // Held for the **process** rather than passed per call: this runner runs one
+    // dispatch of one execution, and a placed component that reaches another
+    // placed component of its own placement (see this function's own doc)
+    // reaches it inside that same execution.
+    session_key: sessionKey,
+    ...(options.itemIndex === undefined ? {} : { item_index: options.itemIndex }),
+  };
+  const context: runtime.RunContext = {
+    execution,
+    // The hub owns this node's clock: §6.5 runs the `timeout:` chain from
+    // dispatch, so the deadline is enforced where the dispatch was made and a
+    // second one here would be a second answer to the same question. What
+    // stops a running node is the hub superseding its dispatch (§6.3).
+    signal: options.signal ?? new AbortController().signal,
+    node: options.node,
+    storeRecords,
+    modelCalls,
+    toolDispatches,
+    ...(() => {
+      const effects = recorderFor(options.execution, site);
+      return effects === undefined ? {} : { effects };
+    })(),
+  };
+  const answer = await run(options.inputs, context, {
+    path: options.path,
+    execution,
+    ...(options.history === undefined ? {} : { history: options.history }),
+    ...(options.policy === undefined ? {} : { policy: options.policy }),
+  });
+  return {
+    output: answer.output,
+    ...(answer.history === undefined ? {} : { history: answer.history }),
+    // The node execution's own channels rather than the answer's, for
+    // `runtime.RunContext.modelCalls`' reason: an activity that threw returns no
+    // answer, and a call the ladder lost still happened (PRD 5.9).
+    models: answer.models ?? modelCalls,
+    ...(answer.toolDispatches === undefined && toolDispatches.length === 0
+      ? {}
+      : { toolDispatches: answer.toolDispatches ?? toolDispatches }),
+    // And the fourth, which has **only** the collector: a store op answers its
+    // caller rather than the node, so nothing about it is on `answer`. It goes
+    // home because the trace entry belongs to the hub's node execution, and an
+    // entry with `models` and no `stores` would say a placed agent's `stores:`
+    // did nothing where the same agent unplaced reports what it did (PRD 5.8,
+    // `docs/distributed.md` §4.3).
+    ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The process
+// ---------------------------------------------------------------------------
+
+/** Write one NDJSON line, and wait for it to be taken. */
+function say(line: Record<string, unknown>): Promise<void> {
+  return new Promise((resolve) => {
+    // The callback rather than the return value: `write` answers `false` for a
+    // full pipe and takes the bytes anyway, and a result line the process exits
+    // before flushing is a dispatch the worker would report as a crash.
+    process.stdout.write(`${JSON.stringify(line)}\n`, () => resolve());
+  });
+}
+
+/** Everything standard input holds, as one string. */
+async function stdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/** One record off the wire, as the journal holds it. */
+function recordOf(entry: Record<string, unknown>, execution: string): JournalRecord | undefined {
+  const key = entry["key"];
+  const site = entry["site"];
+  const kind = entry["kind"];
+  const ordinal = entry["ordinal"];
+  const request = entry["request"];
+  const outcome = entry["outcome"];
+  if (typeof key !== "string" || typeof site !== "string" || typeof request !== "string") {
+    return undefined;
+  }
+  if (typeof kind !== "string" || typeof ordinal !== "number") return undefined;
+  if (outcome === null || typeof outcome !== "object") return undefined;
+  const held = outcome as Record<string, unknown>;
+  const settled =
+    held["kind"] === "value"
+      ? ({ kind: "value", value: held["value"] } as const)
+      : ({
+          kind: "error",
+          name: typeof held["name"] === "string" ? held["name"] : "Error",
+          message: typeof held["message"] === "string" ? held["message"] : "",
+        } as const);
+  const at = entry["recorded_at"];
+  return {
+    execution,
+    key,
+    site,
+    kind: kind as JournalRecord["kind"],
+    ordinal,
+    request,
+    outcome: settled,
+    refused: entry["refused"] === true,
+    recordedAt: typeof at === "string" ? at : new Date().toISOString(),
+  };
+}
+
+/** One record on the wire, as `/workers/effects` takes it (§3.3). */
+function wireRecord(record: JournalRecord): Record<string, unknown> {
+  return {
+    key: record.key,
+    site: record.site,
+    kind: record.kind,
+    ordinal: record.ordinal,
+    request: record.request,
+    outcome: record.outcome,
+    refused: record.refused,
+    recorded_at: record.recordedAt,
+  };
+}
+
+/** What a failure is called and what it says. */
+function named(error: unknown): { name: string; message: string } {
+  if (error instanceof Error) {
+    return { name: error.name, message: error.message };
+  }
+  return { name: "Error", message: String(error) };
+}
+
+/**
+ * The one failure this side names for itself: a `human:` node reached **here**
+ * (`docs/distributed.md` §13's fourth row).
+ *
+ * A pause is opened on the hub's wait board — the board a status report
+ * publishes, a resume route answers and a recovery re-parks (§1, PRD resolved
+ * q4/q28). A worker holds none of that, so `runtime.runHuman` finds no board and
+ * raises the interrupt it raises for any run with no way to answer a question,
+ * and this dispatch ends as a failure the node's `retry:`/`on_error:` chain runs
+ * over.
+ *
+ * What is renamed here is **what the operator is told**, not what happens. The
+ * bare interrupt says "this run has no way to answer" and points at `serve` and
+ * at an interactive `run` — true of the process it was written for and
+ * misleading here, where the hub *is* a `serve` and the pause is unanswerable
+ * for a reason that has nothing to do with the invocation: the node is executing
+ * on the far side of a wire whose §3.4 result carries an output or a failure and
+ * has no third shape for a pause. Carrying one home is §13's open question, so
+ * this says so and names the composition's own way out.
+ *
+ * Read off the `cause` chain rather than off the error, because the pause is
+ * reached inside an attached `flow.*` — grammar §14.1 rule 4 runs one in the
+ * attaching agent's placement — and every ladder between there and here wraps
+ * what it lets through ([`runtime.interruptOf`]).
+ */
+function pausedOnAHuman(error: unknown): { name: string; message: string } | undefined {
+  const interrupt = interruptOf(error);
+  if (interrupt === undefined) return undefined;
+  return {
+    name: "PlacedHumanWait",
+    message:
+      `\`${interrupt.flow}\` node \`${interrupt.node}\` is a \`human:\` node, and it was reached on a **worker**: this node is placed, so it and everything it attaches execute in the placement's process (grammar §14.1 rule 4), and a worker holds no wait board — the board every pause is published on, answered through and recovered onto is the hub's (docs/distributed.md §1). ` +
+      `The dispatch therefore fails rather than parking, and the node's \`retry:\`/\`on_error:\` chain runs over this. ` +
+      `Reach the pause from a component the hub runs — an unplaced agent, or the flow's own node — or take the placement off the component that reaches it. Carrying a pause home from a worker is docs/distributed.md §13's open question and is not built.`,
+  };
+}
+
+async function main(): Promise<void> {
+  const text = await stdin();
+  let dispatch: Dispatch;
+  try {
+    dispatch = JSON.parse(text) as Dispatch;
+  } catch (error) {
+    await say({
+      type: "result",
+      error: {
+        name: "DispatchUnreadable",
+        message: `the dispatch on standard input is not one JSON object: ${named(error).message}`,
+      },
+    });
+    return;
+  }
+
+  // Before anything runs, because [`runPlaced`] reads it (§3.2).
+  sessionKey = dispatch.session_key ?? "";
+
+  const history: JournalRecord[] = [];
+  for (const entry of dispatch.effect_history ?? []) {
+    const record = recordOf(entry, dispatch.execution_id);
+    if (record !== undefined) history.push(record);
+  }
+
+  // The writes are **chained** rather than raced: an activity does not await
+  // this side, so two effects landing in one tick would otherwise interleave
+  // their lines, and §3.3 takes a batch "in the order it produced them".
+  let writing: Promise<void> = Promise.resolve();
+  const journal = new DispatchJournal(history, (record) => {
+    writing = writing.then(() => say({ type: "effect", effect: wireRecord(record) }));
+  });
+
+  // **Resuming**, always: the history is a record this generation consumes
+  // before it issues anything of its own, which is replay-to-frontier (§7.2).
+  // A dispatch with an empty history is the degenerate case of it and costs a
+  // lookup per effect.
+  openSession(dispatch.execution_id, journal, true);
+  executeLocally(runPlaced);
+
+  let line: Record<string, unknown>;
+  try {
+    const answer = await runPlaced({
+      node: dispatch.node,
+      execution: dispatch.execution_id,
+      path: dispatch.instance_path === "" ? [] : dispatch.instance_path.split("/"),
+      inputs: dispatch.inputs,
+      // Taken as given: §3.2 makes each of these the hub's to derive, and the
+      // types are the wire's rather than this module's to re-check — a payload
+      // that carried something else came from a hub of another release, which
+      // §4.1's handshake refuses at join and not here.
+      ...(typeof dispatch.item_index === "number" ? { itemIndex: dispatch.item_index } : {}),
+      ...(dispatch.history === undefined
+        ? {}
+        : { history: dispatch.history as readonly runtime.Turn[] }),
+      ...(dispatch.policy === undefined
+        ? {}
+        : { policy: dispatch.policy as runtime.InstancePolicy }),
+    });
+    line = {
+      type: "result",
+      output: answer.output,
+      ...(answer.history === undefined ? {} : { history: answer.history }),
+      ...(answer.models === undefined ? {} : { models: answer.models }),
+      ...(answer.toolDispatches === undefined ? {} : { tool_dispatches: answer.toolDispatches }),
+      ...(answer.stores === undefined ? {} : { stores: answer.stores }),
+    };
+  } catch (error) {
+    // The node failed, which is an outcome rather than a crash: §3.4 takes "its
+    // output, or its failure" and the hub runs the node's `retry:`/`on_error:`
+    // chain over it exactly as it would over a local failure (§7.3). One
+    // failure is renamed on its way out, and only one — see [`pausedOnAHuman`].
+    line = { type: "result", error: pausedOnAHuman(error) ?? named(error) };
+  }
+  closeSession(dispatch.execution_id);
+  // After every effect line this dispatch produced, so a reader that stops at
+  // the result has already seen them all.
+  await writing;
+  await say(line);
+}
+
+await main();

@@ -59,6 +59,12 @@ export const environmentReferences: readonly EnvironmentReference[] = [
     ],
   },
   {
+    name: "MESH_JOIN_TOKEN",
+    sites: [
+      "deploy.hub.join_token",
+    ],
+  },
+  {
     name: "OPS_BIN",
     sites: [
       "flow.triage.node.announce_failed.exec.command",
@@ -92,15 +98,7 @@ export const environmentReferences: readonly EnvironmentReference[] = [
   {
     name: "REPO_ROOT",
     sites: [
-      "agent.fixer.tools.builtin.read_file.root",
       "flow.triage.node.verify.exec.cwd",
-      "tool.repo_grep.exec.cwd",
-    ],
-  },
-  {
-    name: "RG_CONFIG_PATH",
-    sites: [
-      "tool.repo_grep.exec.env.RIPGREP_CONFIG_PATH",
     ],
   },
   {

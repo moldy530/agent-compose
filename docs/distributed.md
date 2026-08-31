@@ -2,9 +2,10 @@
 
 **Protocol version:** 1 — carried on every join, and §10 fixes what it pins and
 when it bumps
-**Status:** Normative for the hub/worker protocol a compiled project speaks. The
-static surface it describes — `hub:` and `placements:` — is enforced today; the
-runtime is being built against this document.
+**Status:** Normative for the hub/worker protocol a compiled project speaks. Both
+halves are built — the static surface it describes (`hub:` and `placements:`) is
+enforced by `validate`, a build emits the hub, and `agent-compose worker` is the
+spoke. §12 says what that means, file by file.
 **Companion artifacts:** [`docs/durability.md`](durability.md) (the journal this
 writes into, and the replay it extends over the wire),
 [`docs/grammar.md`](grammar.md) §14.1, §14.2 (the deploy-layer surface), §9.4
@@ -77,6 +78,12 @@ construction — global-scope stores are already external backends — so the un
 horizontal scaling is the execution, never the node. Scaling out later means
 sharding executions across hubs over the Postgres journal slot (resolved q27),
 which §8 is written to keep possible.
+
+That clause is about executions sharing with **each other**, and it says nothing
+about the two processes inside one: a `store.*` on a process-local backend is a
+different physical store on a worker from the one on the hub, whichever execution
+opened it. Nothing refuses that pairing today, and §13's third row is where it
+stands.
 
 Peer partition — each machine owning a subgraph and its own journal — is
 **rejected**, and named here so it is not re-proposed as an optimisation. It
@@ -257,6 +264,12 @@ carries the session the join returned.
 sides: the hub reads it to verify, the worker reads it to offer, and neither
 holds it in the artifact. There is one scheme and one kind.
 
+**The worker process is told that variable's name by its invocation**, not by
+the artifact — the artifact is what the hub serves *after* a join, so a worker
+that had to read the name out of one could not have joined to get it. Nothing on
+the wire turns on this: the name is a deployment's fact on both sides, and what
+travels is the token.
+
 **The session.** Every route after the join carries the `worker_session` the
 join returned, in the `X-Worker-Session` header, **in addition to** the bearer
 token: the token says which mesh, the session says which worker. The one
@@ -349,8 +362,21 @@ artifact the hub is serving, which gives one rule with two cases:
 - a join whose `artifact_hash` is the artifact the hub currently serves MUST
   carry `env_ok`, and it is checked;
 - any other join — a cold start, which omits `artifact_hash` too, or one holding
-  a stale hash — MUST omit it. A worker does not guess a manifest it has not
-  read.
+  a stale hash — SHOULD omit it, because a worker does not guess a manifest it
+  has not read; and a hub that is sent one anyway **MUST ignore it** rather than
+  refuse the join.
+
+**The second half of that rule is an obligation on the hub, and it is what keeps
+the first half satisfiable.** A worker cannot know whether the hash it holds is
+still current until it has asked — a redeployment is exactly the case where it is
+not — so a worker holding an artifact sends the hash and the report together,
+every time. Were the pair refused when the hash turned out to be stale, that
+worker would be refused for sending what the first clause requires and refused
+again for omitting it, and its only way out would be answering a refused join
+with another join, which §5 and §10.1 forbid. Ignoring the report costs nothing:
+it is a report about a manifest this hub is not serving, the answer carries the
+current artifact, and the worker fetches, materialises and joins again — the
+provisioning cycle it was going to enter anyway.
 
 A hub compares an **absent** `artifact_hash` the way it compares a stale one: it
 is not the hash being served, so it takes that same branch. Nothing here needs a
@@ -384,8 +410,8 @@ joined: §5 fixes the rule — the hub ends those sessions when it rotates, and 
 | the compiler version or runtime does not match | `409` | names both sides of whichever half differs (§4.1) |
 | a claim names no placement in the active target | `400` | names the claim, and lists the target's placement names |
 | `env_ok` is present and a claimed placement's manifest is unsatisfied | `403` | names the **variables**, never their values, never whether the hub holds them |
-| `env_ok` is present on a join whose `artifact_hash` is not the current one — an absent hash included, since an absent hash is never the current one — or absent on one whose is | `400` | names the rule above: the report is against the manifest in the artifact the worker holds |
-| the worker's artifact hash is stale | — | not a refusal: the join succeeds and the answer carries the current artifact for the worker to fetch (§3.5, §4) — the rule PRD resolved q40's amendment fixes |
+| `env_ok` is **absent** on a join whose `artifact_hash` is the current one | `400` | names the rule above: there is a manifest this worker could have read, and dispatching to it would skip the check §9.2 exists for |
+| the worker's artifact hash is stale, or absent — and an `env_ok` sent beside either | — | not a refusal: the join succeeds, the report is ignored, and the answer carries the current artifact for the worker to fetch (§3.5, §4) — the rule PRD resolved q40's amendment fixes |
 
 The order matters, and it is the order of the rows: a worker that cannot be
 authenticated is told nothing, a worker whose wire this hub does not speak is
@@ -393,13 +419,19 @@ told that before anything about the deployment, and the placement and manifest
 answers — which describe the target — are given only to a worker that has got
 that far.
 
-**A refused join is terminal.** Every row above names a condition another join
-would meet identically — a credential that does not verify, a wire this hub does
-not speak, a release that does not match, a claim that names no placement, a
-manifest that is not satisfied, a report made against the wrong artifact. So a
-worker refused at join **stops**: it exits non-zero, naming the refusal as it was
-given, and starting it again is an operator's act — or its supervisor's, whose
-backoff is that supervisor's business. The bounded backoff of §2 covers the
+**A refused join is terminal, without exception.** Every row above names a
+condition another join would meet identically — a credential that does not
+verify, a wire this hub does not speak, a release that does not match, a claim
+that names no placement, a manifest that is not satisfied, a report a worker
+could have made and did not. So a worker refused at join **stops**: it exits
+non-zero, naming the refusal as it was given, and starting it again is an
+operator's act — or its supervisor's, whose backoff is that supervisor's
+business.
+
+That the list has no exception in it is a property of the table rather than a
+hope, and the ignore-rule above is what buys it: the one condition a *second*
+join could have cleared — a report sent with a hash that turned out to be
+stale — is not a refusal at all. The bounded backoff of §2 covers the
 other case and only it: a join that never *completed* — a connection refused, a
 socket closed, a `5xx` — which is a transport failure and says nothing about
 whether this worker belongs here.
@@ -430,6 +462,10 @@ Carries the session. Long-polls for up to one hold (§2).
     "node": "flow.release.sign",
     "instance_path": "flow.release#0.sign",
     "inputs": { "…": "…" },
+    "session_key": "…",
+    "item_index": 0,
+    "history": [ { "role": "assistant", "text": "…" } ],
+    "policy": { "timeoutMs": 30000 },
     "effect_history": [ { "…": "…" } ]
   }
   ```
@@ -438,6 +474,33 @@ Carries the session. Long-polls for up to one hold (§2).
   key, so the worker computes the same keys the hub would. `effect_history` is
   the journaled record of effects this node instance already issued, and is what
   a redispatched node replays to the frontier before going live (§7).
+
+  **The four fields between them are what makes a placed node the same node.**
+  Each is OPTIONAL — a dispatch that has none of them omits all four — and each
+  is a fact the *hub* holds about this node execution that the node would have
+  read for itself had it run there. §4.3 fixes what they are for: "a placement
+  decides which *process* runs a node rather than which code exists where", and
+  §2 restates it as PRD 5.6's promise that "the *logical definition* does not
+  change". A payload short of one of them is a node that quietly means something
+  else on a worker, which is the one thing this whole document is written against.
+
+  | | what it carries | absent when |
+  |---|---|---|
+  | `session_key` | grammar §4.1's `execution.session_key`, so a `scope: session` store on the worker addresses the partition the run named | the execution has none |
+  | `item_index` | the source-item index of the innermost enclosing `map` (grammar §4.1) | no `map` encloses this node |
+  | `history` | the turns of the shared `messages` channel an `agent:` node would have been given (grammar §10.4) | the node takes none — every dispatch that is not an `agent:` node, and a `map`-dispatched agent, which grammar §8.6 rule 10 already runs on a fresh conversation (D105) |
+  | `policy` | grammar §9.3's level 1 for this instance — the `policy:` of the `flow:` node that instantiated the enclosing flow, which crosses into a subflow an attached `flow.*` starts (D79) | nothing set one |
+
+  They are **the hub's to derive, and the worker MUST NOT invent them**: a worker
+  that defaulted `session_key` to the empty string would fail a `scope: session`
+  store with a diagnostic telling the operator to pass a `--session` they already
+  passed, and one that defaulted `history` to empty would answer from the input
+  object alone with no diagnostic at all.
+
+  Adding them to a `1` that had already shipped without them would be §10.2's
+  first compatible change — an OPTIONAL field a peer of the previous version
+  ignores — which is why the shape is written this way rather than as a second
+  version of the route.
 
 - **`204`** when the hold expired with no work **for this session** — which
   includes every hold while the session has a dispatch it has not settled (§2).
@@ -466,8 +529,26 @@ that dispatch's node fails an attempt.
 
 ### 3.3 `POST /workers/effects`
 
-Carries the session. A batch of effect records the worker produced while
-executing a dispatch, in the order it produced them.
+Carries the session and the `dispatch_id`. A batch of effect records the worker
+produced while executing that dispatch, in the order it produced them:
+
+```json
+{
+  "dispatch_id": "dsp_…",
+  "effects": [ { "key": "…", "…": "…" } ]
+}
+```
+
+Both fields are REQUIRED, and `dispatch_id` is REQUIRED for a reason that reads
+at first like a contradiction of the rule three paragraphs down: the records are
+keyed by effect key and scoped to their **execution**, "not by session, and not
+by dispatch", so the dispatch is not what *identifies* them — it is what tells
+the hub whose execution they are, and inside which instance path. **The hub
+reads both off the dispatch row it already holds**, never off the batch, and a
+record whose `site` falls outside that dispatch's `instance_path` is refused.
+That is §8's single writer stated as a route: no session can write an effect
+into an execution it was never dispatched, and no worker names an execution at
+all.
 
 **The hub is the single writer, and this route is what preserves that: workers
 SEND, the hub INSERTS.** No worker ever touches the journal, which is why SQLite
@@ -485,6 +566,15 @@ guess.
 | the batch is journaled | `204` | empty. Every record in it was inserted or was already held |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and send this batch again under the new session |
+| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field or naming a `site` outside the dispatch's | `400` | names what a batch and a record carry |
+| the `dispatch_id` names no dispatch this hub holds | `409` | names the dispatch. The batch is discarded, as at §3.4 |
+
+The last two rows are not about the batch's *contents* the way the first three
+are about its fate, and they are written out because a `204` over a batch nothing
+was written for would be the sharpest failure this route has: a worker told its
+effects are journaled when they are not hands the redispatch of §7.2 an
+`effect_history` short of the frontier, and the node re-issues an effect the
+journal was owed.
 
 **A batch answered `410` is re-sent, never dropped.** The records are keyed by
 effect key and scoped to their execution (§7.1) — not by session, and not by
@@ -523,12 +613,19 @@ re-driving it from a stale result is exactly the divergence
 is §6.3: the hub gave up on the session this dispatch was issued to, and the node
 has been through its `retry:` chain since.
 
+A body that names **no** `dispatch_id` is the same row and takes the same `409`,
+with a `null` where the dispatch would be named. This route's table is four
+statuses and §10.1 lets an implementation rely on them, so a result that cannot
+be attributed at all is not answered outside it — unlike §3.3, where a batch that
+is not a batch has a `400` row of its own, because that route also refuses
+*contents* and this one has none to refuse.
+
 | condition | status | body |
 |---|---|---|
 | this result settles the dispatch, or a result already settled it | `204` | empty |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and post this result again under the new session |
-| the `dispatch_id` is unknown, or the hub superseded the dispatch (§6.3) | `409` | names the dispatch. The result is discarded |
+| the `dispatch_id` is unknown, missing, or the hub superseded the dispatch (§6.3) | `409` | names the dispatch, or `null` where the body named none. The result is discarded |
 
 **`410` and `409` are different failures and a worker MUST NOT treat them
 alike.** `410` says *the hub does not know you*, and the result is still owed:
@@ -564,8 +661,19 @@ A `401` here is terminal in the sense §3.1 gives it: this route takes the join'
 own credential, so joining again cannot improve it. There is no `410` on this
 route, because there is no session on it to be unknown.
 
-A hub MUST keep serving an artifact while any execution that was dispatched
-under it is unfinished, and MAY drop it afterwards. A worker meeting `404` for
+A hub MUST keep serving an artifact **it holds** while any execution that was
+dispatched under it is unfinished, and MAY drop it afterwards. The qualifier is
+load-bearing and is what the second table row is written against: a hub that
+holds two artifacts may not drop the older one out from under an execution
+still running on it, because a worker mid-transfer would then have a `404` and
+nothing to fetch. It does **not** oblige a hub to hold two. A hub that serves
+exactly one — which is what a v1 build is, and §12 names that limit — meets this
+rule for the artifact it has and answers `404` for the one it replaced, which is
+not a stranded worker: the `404` sends it back to a join, the join is answered
+with the current artifact, and the fetch it then makes is one this hub can serve.
+That is §5's redeployment rule arriving by the other door.
+
+A worker meeting `404` for
 the hash its join returned re-joins rather than retrying the fetch: the join is
 what re-derives the current hash, and re-deriving it anywhere else would be a
 second answer to what this deployment is running. That re-join is over a *hash*,
@@ -989,6 +1097,12 @@ protocol equally.
    monotonic counter shared across executions, no "last row wins" read that spans
    them, no dispatch state held anywhere but the journal.
 
+What that third rule buys the journal is a ledger of its own, and it is the
+journal's document that defines it: `docs/durability.md` §3.8 is where a dispatch
+row's fields, its four-value `status`, and its relationship to the effect
+frontier are normative. A reader who wants to know what a hub restart re-derives
+from reads that section; this one says what the wire does with it.
+
 The assumption these forbid is the one that would make resolved q37's
 execution-sharded scale-out a *migration* instead of "run more hubs". Keeping it
 out is cheap now and expensive later, which is why it is an invariant rather than
@@ -1059,7 +1173,18 @@ Which gives, concretely:
   moves them off the hub's. An unplaced `tool.*` a `function:` node names is the
   same case for the same reason;
 - a variable referenced from the deploy layer itself — a storage backend, an
-  event source, `hub.join_token:` — belongs to the hub's;
+  event source, `hub.join_token:` — belongs to the hub's. A **storage backend**
+  is the one entry of that layer a placement can also reach, and it reads like a
+  conflict with the executes-in rule above until the two are read the way the
+  unplaced-agent clause is read: the credential that opens a store is spent in
+  whichever process opens it, so a backend's variables belong to the hub's
+  manifest **and** to the manifest of every placement whose components reach a
+  store bound to it — an agent's `stores:`, and the `store:` nodes of a `flow.*`
+  it attaches. That **adds** placements; it never moves a deploy-layer variable
+  off the hub's list. Without the addition a worker joins clean — §3.1's `403`
+  cannot fire over a name the manifest does not carry — and fails at its first
+  store op on a machine with no credential, which is the failure §9.2's check
+  exists to catch;
 - a variable reachable in two processes belongs to both. Two placed agents
   attaching one unplaced tool is the ordinary case, and the tool's secrets go to
   both placements.
@@ -1274,65 +1399,178 @@ cite as settled.
 
 ## 12. What is built today
 
-**The static surface is live. The protocol is not built yet.**
+**Both halves are built.** The static surface is live, and so is the protocol it
+describes.
 
-What `validate` enforces now: everything grammar §14.1 and §14.2 state — a
+What `validate` enforces: everything grammar §14.1 and §14.2 state — a
 placement's name and members, the `flow.*` deferral, disjointness, repeated
 members, the colocation rule for an attached tool and for what an attached flow
-reaches, the conditional join token, and the `public_url:` shape. A deploy file
-that breaks one of those is a compile error today.
+reaches, the conditional join token, and the `public_url:` shape. A deploy file that breaks one of those is a
+compile error.
 
-What does not exist yet: the worker verb, the five routes of §3, the artifact
-server of §3.5, placement waits on the board, and effect streaming. **Nothing a
-placement or a `hub:` block declares reaches the project a build emits.**
+What a **build** emits for a target that declares `placements:`: the hub. The
+five routes of §3 on the served app, the artifact server of §3.5 over a content
+hash the tree carries, the dispatch board with placement waits on it (§6), the
+liveness sweep of §6.3, idempotent effect ingestion (§3.3), and the environment
+partition of §9.1 — emitted into the artifact, so the hub checking a join's
+`env_ok` and a worker computing one read one answer under one hash. A placed
+component's node is dispatch-and-await rather than a call (§7).
 
-That middle state is deliberate and it is bound rather than remembered:
-`crates/compose-core/tests/placement_surface_inertness.rs` asserts that no
-placement or hub material reaches a generated project, pins the sentences in this
-document and in the grammar that say so, and enumerates what the runtime pass has
-to unwind — including teaching the environment manifest about §9.1's partition,
-which is the half of the surface with no sentence of its own.
+What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
+--token-env <VAR> [--data-dir <path>]`, a complete protocol client — the
+provisioning cycle of §4, one held poll at a time with a node running beside it
+(§2), effect batches as they happen, results, §2's backoff for transport
+failures, and the status discipline of §3 and §5. It executes each dispatch by
+spawning the node runner the artifact carries, one process per dispatch. Its
+store is the artifact in hand and the one it replaced, keyed by hash as §4 step 3
+says: a hub rolled back to the older of the two is answered off the disk, and no
+third tree accumulates.
 
-This document is what that runtime will be held to — **except the rows of §13**,
+What is **not** built, and is named rather than missing: per-placement artifact
+slicing (§4.3), multi-hub (§8), worker-to-worker edges and Windows workers
+(§11) — and the four questions of §13, each held to what stands for it there:
+two knobs nobody has weighed, and two shapes this compiler accepts and runs
+worse than an author would expect.
+
+**A hub of this release serves exactly one artifact: its own tree.** That is the
+fourth named absence, and it is named here because §3.5's table has a row for a
+*previous* artifact a hub still holds and this hub holds none — an older hash is
+`404`, naming the one being served. Nothing is stranded by it: §3.5's `404`
+sends a worker back to a join, and the join answers with the artifact this hub
+does have. What it costs is one round trip on a rollback where a hub holding two
+would have cost none. Holding a second is additive — a hash is already the whole
+of what the route is addressed by — so it needs no wire change when a release
+wants it.
+
+Three suites are what make that claim checkable rather than asserted:
+`crates/agent-compose/tests/distributed_hub_wire.rs` speaks §3 to a served hub
+clause by clause; `crates/agent-compose/tests/distributed_worker_protocol.rs`
+holds the worker to every status this document gives it, against a hub that is a
+fixture; and `crates/agent-compose/tests/distributed_mesh_acceptance.rs` runs a
+real hub and real workers and asks whether a distributed execution works — the
+steady state, a cold start, parking and wake, a mid-node disconnect and the
+replay that follows it, two hub restarts (one idle, one over a dispatch a worker
+is in the middle of running), a hub opening a journal written before the
+dispatch board existed, the refusals a worker stops on, and a fan-out queued onto
+a pool of one.
+`crates/compose-core/tests/placement_surface_landing.rs` holds the surface to
+where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in
+`src/mesh.ts`, and neither in the composition's own lowering.
+
+**Six clauses of this document were amended while that runtime landed**, and
+they are listed here rather than left to a diff: a document the implementation
+edited is a document the implementation is measured against, so which sentences
+moved has to be as readable as the sentences are.
+
+- **§3.1's stale-hash row**, and the "without exception" clause that rests on it.
+  A worker holding an artifact cannot know whether the hub still serves it, so it
+  sends the hash and the report together; refusing that pair made the two halves
+  of the `env_ok` rule unsatisfiable together for exactly the worker a
+  redeployment produces, and its only way out would have been answering a refused
+  join with another join. The row now says such a report is **ignored** rather
+  than refused.
+- **§3.2's four OPTIONAL payload fields** — `session_key`, `item_index`,
+  `history`, `policy`. Each is a fact about the node execution the hub holds and
+  a worker cannot derive, and a payload short of one is a placed node that
+  quietly means something else (§4.3).
+- **§3.3's request shape**, which this document had left unwritten: a batch is
+  `{ dispatch_id, effects }`, and the two refusals that follow from naming it.
+  The dispatch is what tells the hub whose execution the records are and inside
+  which instance path — §8's single writer, stated as a route.
+- **§3.4's `409` row**, which now covers a result body that names no
+  `dispatch_id` at all. That route's table gives four statuses and §10.1 lets an
+  implementation rely on them, so answering a fifth outside it would be a status
+  a second implementation could meet and act on wrongly — a `4xx` this document
+  does not give the route is a refusal no re-send improves, and the *only*
+  reading left for it. What such a status costs is a **dispatch** rather than a
+  worker, and that is the one place a refusal is not read the way §3.1 reads a
+  refused join: §3.1's terminality rests on "a second join would be refused
+  identically", which is a statement about this worker's right to be in this mesh
+  at all, and a body one hub would not take says nothing of the kind. A worker
+  that ended on one would leave the placement with none, and its replacement
+  would reach the same record and end the same way. So the attempt fails under
+  the node's own `retry:`/`on_error:` chain and the process goes on polling —
+  which is also why the two routes a worker POSTs to are mounted with a body
+  limit of their own rather than the framework's, since a `413` from underneath
+  a handler is precisely such a status and one an effect record can reach without
+  anything having gone wrong.
+- **§3.5's "an artifact it holds"**, which scopes a MUST that a hub of this
+  release could not otherwise meet: it serves exactly one artifact, and the
+  paragraph above says what that costs.
+- **§9.1's storage-backend clause**: a backend's variables belong to the hub's
+  manifest *and* to every placement that reaches a store bound to it, because the
+  credential that opens a store is spent in whichever process opens it.
+
+None of the six changes what a peer may rely on at this version (§10.1), and
+none is a change §10.3 would bump for: the first is a relaxation, the second and
+third name shapes rather than replace them, the fourth moves a body nothing was
+promised a status for into a row it already had, and no implementation of
+protocol 1 older than this release exists to be made wrong by any of them.
+
+This document is what both halves are held to — **except the rows of §13**,
 which are the clauses it does not settle. Those are not wire this document fixes,
-and the runtime pass is held to the PRD's answer to each rather than to the
-placeholder §13 records.
+and the code they govern is held to the PRD's answer to each rather than to the
+placeholder §13 records; until there is one, the defaults §13 records stand and
+nothing implements past them.
 
 ---
 
 ## 13. What this document does not settle
 
-Two questions are **open**, and each one is here because a normative document
+Four questions are **open**, and each one is here because a normative document
 may fix a wire and may not fix a design decision the PRD has not made. `prd.md`
 is the single source of truth for design decisions; this document is downstream
 of it, and §12's "held to" stops at this table.
 
 **So this section is a gate, not a note.** The project's discipline is that a new
 design question lands in the PRD's Open Questions and is resolved there before
-the affected area is implemented. These two are that list *staged*, which is as
+the affected area is implemented. These four are that list *staged*, which is as
 far as this document can take them: entering a question in the PRD's Open
 Questions, and resolving it there, is a change to `prd.md` and a reviewed
 decision of its own — never something a downstream document performs by
-describing it. **Before the runtime pass writes the code a row governs, that
-row's question must be in the PRD's Open Questions and resolved there, and the
-code written against the resolution rather than against the cell below.** An
-implementation that reads a "what stands in the meantime" cell as wire has
-decided a PRD question in a downstream document, which is the thing this section
-exists to prevent; `crates/compose-core/tests/placement_surface_inertness.rs`
-carries the same duty in its unwind list.
+describing it. **Before any code goes past a row's default, that row's question
+must be in the PRD's Open Questions and resolved there, and the code written
+against the resolution rather than against the cell below.** An implementation
+that reads a "what stands in the meantime" cell as wire has decided a PRD
+question in a downstream document, which is the thing this section exists to
+prevent.
 
-Both rows are the same shape: **gaps**. No resolved entry speaks to either, each
-is filled here conservatively, and the wire admits any answer additively, so what
-the PRD owes each is a decision rather than a correction. (This table held a
-third row — a contradiction between resolved q40's mismatch clause and §4.1's
-repair — until q40's amendment of 2026-08-30 resolved it; §4.1 now states that
-rule as settled wire.)
+The rows come in two shapes, and the difference is what a reader owes each.
+
+The first two are **gaps**: a knob nobody has weighed, filled here
+conservatively, where the wire admits any answer additively — so what the PRD
+owes each is a decision rather than a correction, and the runtime that landed was
+written to those defaults and no further. Their absences are held rather than
+remembered, and `crates/compose-core/src/codegen/mesh.rs` says exactly how far
+that holding reaches: it **pins** the emitted session to the four fields §5 gives
+it, so a capacity arriving under a spelling nobody has used yet is still a failing
+test, and it **greps** the hub's code for the spellings the two rows have arrived
+under before — `capacity`, `maxDispatches`, `max_dispatches` for the first;
+`sandbox`, `seccomp`, `restrictions` for the second. A grep is a floor rather
+than a proof, which is why the first row has the pin as well. Raising a default
+is what needs the PRD; keeping one needs a test.
+
+The last two are **sharp edges**: a composition this compiler accepts, and runs
+worse than its author would expect. Each is here because the repair is a rule —
+a compile error over a shape that compiles today, or a wire that carries
+something this document's wire does not — and a rule with no resolved entry
+behind it is exactly what this section holds. What stands for each is stated in
+its cell, and neither is a silent failure by the time a reader meets it: one is
+diagnosed where it happens, the other is what this row exists to say out loud.
+(This table also held a row for a contradiction between resolved q40's mismatch
+clause and §4.1's repair, until q40's amendment of 2026-08-30 resolved it; §4.1
+now states that rule as settled wire.)
 
 | | what is unsettled | what stands in the meantime |
 |---|---|---|
 | **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it — a v1 default this document proposes, which no resolved entry contradicts and none has weighed. The wire admits any other answer additively (an OPTIONAL capacity at join, §10.2), so the runtime may build against one; **raising** it is what the PRD has to answer first |
 | **containment beyond the process boundary** (§11) | resolved q31 fixed v1 containment at root plus timeout and deferred containers, seccomp and "any deploy-target-level restriction (refusing bash on a distributed placement is a placement fact)" **to the distribution work**. The distribution resolutions did not take it up, and q44's out-list does not name it, so nothing has decided whether a placement may carry a sandbox or a capability restriction | no such key exists, in the grammar or on the wire; a worker runs the artifact with its own privileges. Grammar D128 retires the reserved `network:` key on the ground that no *resolved* containment story backs it, which is a statement about today rather than about what a later resolution may add |
+| **a placed component's `store.*` on a process-local backend** (§1, §9.1; PRD open q45) | whether a placed component may reach a store whose backend is process-local — and if not, whether the refusal covers every scope or a narrower one. Resolved q37's "executions share nothing by construction — global-scope stores are already external backends", which §1 restates, is a premise about *global scope* rather than a rule about placements, and no resolved entry speaks to the pair. The repair is a **breaking** grammar rule: a composition placing an `agent.*` whose `stores:` name a `memory`, `sqlite` or `local_fs` store compiles clean today | nothing refuses it, and the two processes each open **their own copy** — the worker's under its data directory's materialised artifact, the hub's under the built project — so a write on one side is not a read on the other, and the flow carries on with data that is not there. This holds under `--target local` too, where grammar §14.1 admits a hub and its workers on one machine. What an author who needs one store across a mesh does today is bind a **networked** backend; §9.1's partition already carries that half, since such a backend's variables belong to every placement that reaches a store bound to it |
+| **a `human:` node a placed component reaches** (§3.4, §4.3; PRD open q46) | how a pause opened on a worker reaches the hub's wait board. PRD resolved q43 names wait-board unity among the grounds for choosing this protocol over `RemoteGraph`, and §4.3 has a placement decide which *process* runs a node rather than what a node means — but neither fixes a carriage for a pause, and §3.4's result carries a node's output or its failure with no third shape. Both repairs are rules: a third terminal outcome on this wire plus a remote wait on the board, or a static refusal of the composition | the dispatch **fails**, and fails named: `src/worker-node.ts` reports the pause as a `PlacedHumanWait` whose message says a worker holds no wait board and points here, so the node's `retry:`/`on_error:` chain runs over a failure that says what happened rather than over a bare interrupt. The composition still compiles, because refusing it is the other candidate repair and this table is where a rule with no resolution behind it waits |
 
-Neither row blocks the runtime: each names a default that stands until the PRD
-answers, and each answer arrives additively rather than as a re-cut. What both
-block is an implementation deciding either of them quietly.
+No row here blocks the runtime: each names what stands until the PRD answers.
+The first two arrive additively rather than as a re-cut, which is what lets the
+runtime build against their defaults; the last two may not — a compile error over
+a shape that compiles today is a breaking change, and that is a reason for the
+PRD to weigh them rather than a reason to pre-empt one here. What every row
+blocks is the same thing: an implementation deciding one of them quietly.

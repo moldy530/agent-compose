@@ -1,6 +1,6 @@
 # cli
 
-One static binary. Six verbs act on a composition; five teach you about
+One static binary. Seven verbs act on a composition; five teach you about
 compositions in general and take no spec at all.
 
 ```
@@ -13,6 +13,8 @@ agent-compose resume <path> <execution> [--target <name>] [--out <dir>]
                                         [--format human|json]
 agent-compose serve <path> [--host <host>] [--port <port>]
                            [--target <name>] [--out <dir>] [--format human|json]
+agent-compose worker --hub <url> --claim <name>... --token-env <VAR>
+                     [--data-dir <dir>]
 
 agent-compose docs [<topic>]
 agent-compose explain <code>
@@ -165,6 +167,33 @@ It does not wait for those replays, so an answer can arrive while one is still o
 its way back to its pause: that request is refused with `recovering: true` and
 told to send it again, rather than told there is nothing waiting for it.
 
+## `worker`
+
+The other half of a distributed deployment (`docs/distributed.md`). It takes no
+spec: a worker holds no checkout and no YAML, it joins a hub over the URL you
+give it and is served the compiled project.
+
+```
+agent-compose worker --hub https://hub.example --claim mac --token-env MESH_TOKEN
+```
+
+`--claim` is a placement name from the deploy file's `placements:`, repeated for
+each name this machine offers. `--token-env` is the **variable** the join token
+is read from — the same one that target's `hub.join_token:` names; the worker is
+told the name by its invocation because the artifact that would have named it is
+what the hub serves *after* the join. `--data-dir` is where materialised
+artifacts are kept, keyed by content hash, so a redeployment and a rollback are
+both a directory that is already there.
+
+It runs until it is stopped, or until a join is **refused** — a credential that
+does not verify, a release that does not match this hub's, a claim naming no
+placement, a manifest this machine does not satisfy — which exits `2` echoing
+what the hub said. Those are conditions another attempt would meet identically,
+so restarting it is an operator's act.
+
+Bun is required: a worker executes the artifact under it, which is a scoped
+exception to the Node fallback a generated project otherwise runs under.
+
 ## `docs`
 
 Bare, a topic index. With a topic, that topic's document — the curriculum an
@@ -241,6 +270,8 @@ requires no deploy file at all. See `agent-compose docs targets`.
 | `AGENT_COMPOSE_INTERACTIVE` | `run`, `resume` | `1` answers `human` pauses at the terminal even when stdin is not one; `0` forces the exit-`3` path. Any other value is a usage error refused before the run starts |
 | `AGENT_COMPOSE_DATA_DIR` | the emitted project | moves the project's data directory — local stores, the execution journal, and the trace files under `.agent-compose/traces/` |
 | `AGENT_COMPOSE_CALLBACK_RETRY` | `serve` | overrides the callback delivery retry schedule with a comma-separated list of durations (`0s,1s,2s`), for a test or a diagnostic run; unset, the schedule is `docs/durability.md` §3.7's five attempts across fifteen minutes. A value that is not such a list — an unspellable duration, or an empty list, which a variable *set to nothing* is — is a usage error refused before the app listens |
+| `AGENT_COMPOSE_MESH_POLL_HOLD_MS` | `serve`, on a target with `placements:` | how long the hub holds a worker's poll before answering it empty, in whole milliseconds; unset, it is `docs/distributed.md` §2's 25 seconds. It has to stay shorter than the liveness window, and a pair that does not is refused before the app listens. Lengthening it needs nothing of the workers (§10.2): `agent-compose worker` waits a hold out and then waits longer, which is how it learns one it was not built expecting |
+| `AGENT_COMPOSE_MESH_LIVENESS_WINDOW_MS` | `serve`, on a target with `placements:` | how long a worker session may go without a request before the hub declares it gone and supersedes the dispatch it was holding, in whole milliseconds; unset, it is §2's 90 seconds |
 | `NO_COLOR` | every verb that reports | any non-empty value turns styling off, whatever the stream is |
 
 Provider credentials reach a run the same way: an `${ENV}` reference in the spec

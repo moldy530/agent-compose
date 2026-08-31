@@ -1,6 +1,6 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! The verbs fall into two groups. Six act on a composition; the rest teach
+//! The verbs fall into two groups. Seven act on a composition; the rest teach
 //! the reader about compositions in general and are described at the bottom of
 //! this header. The first is the product's core loop (PRD §7 M0):
 //!
@@ -62,6 +62,20 @@
 //! two preconditions of *starting* something are checked: every `${ENV}`
 //! reference has a value (PRD §9.15) and the pinned dependency set is installed
 //! where the project can resolve it.
+//!
+//! The seventh takes no spec at all, and is the other half of a distributed
+//! deployment (`docs/distributed.md`, PRD 5.10):
+//!
+//! ```text
+//! agent-compose worker --hub <url> --claim <name>... --token-env <VAR>
+//!                      [--data-dir <dir>]
+//! ```
+//!
+//! A worker holds no checkout and no YAML: it joins the hub at `--hub`, is
+//! served the compiled project, and executes the nodes placed on the names it
+//! claims. It is grouped with the verbs that act on a composition because it
+//! runs one — the composition simply arrives over the wire rather than off
+//! disk — and everything about the protocol lives in [`worker`].
 //!
 //! `resume` is the durable half (PRD resolved q26–q29, `docs/durability.md`).
 //! Every invocation journals its effects as it makes them, and a `run` that
@@ -196,6 +210,7 @@ mod discover;
 mod launch;
 mod plan;
 mod report;
+mod worker;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -329,6 +344,21 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// Execute the nodes a hub has placed on the names this process claims
+    Worker {
+        /// The hub's base URL, as the deployment publishes it
+        #[arg(long, value_name = "URL")]
+        hub: String,
+        /// One placement name this worker claims, repeatable
+        #[arg(long = "claim", value_name = "NAME")]
+        claims: Vec<String>,
+        /// The variable the join token is read from — the one `hub.join_token:` names
+        #[arg(long, value_name = "VAR")]
+        token_env: String,
+        /// Where this worker keeps the artifacts it materialises [default: ~/.agent-compose/worker]
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+    },
     // The five that teach, after the five that act on a composition. Clap lists
     // subcommands in declaration order, and `--help` is the first thing a
     // coding agent reads: the order it prints is the grouping this header, the
@@ -458,6 +488,17 @@ fn main() -> ExitCode {
             ];
             launch(&path, "resume", &target, &out, format, &arguments)
         }
+        Command::Worker {
+            hub,
+            claims,
+            token_env,
+            data_dir,
+        } => worker::run(&worker::Options {
+            hub,
+            claims,
+            token_env,
+            data_dir,
+        }),
         Command::Serve {
             path,
             host,
