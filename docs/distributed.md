@@ -697,6 +697,26 @@ obligation, kept by a worker because the settled row is the only record of what
 that machine's clock said. Refusing a pause over it would cost a node its attempt
 for a disagreement about a record no reader has.
 
+**The published pair is two clocks, and is not an interval.** The two rules
+above are each required and they do not compose: `paused_at` is the worker's
+reading and the deadline beside it is this hub's, so `expires_at − paused_at` is
+the node's `timeout:` plus however far the two machines' clocks are apart, plus
+the moment the result spent in flight — *less* than the budget on a worker whose
+clock runs ahead of the hub's, and negative once that lead exceeds the budget.
+So a reader that computes what is left of a question by subtracting the one from
+the other is measuring the offset between two machines. What it is entitled to
+is `expires_at` against its own now: the hub publishes the deadline it will fire
+and fires it on the clock it published it from. That is the one line of PRD
+resolved q46's parity bar a placed pause does not hold exactly — the same node
+unplaced dates both members off one reading, so its pair is always exactly
+`timeout:` apart — and it is written down here rather than removed, because
+removing it means breaking one of the two rules it is made of: re-dating
+`paused_at` on the hub loses what `docs/durability.md` §9 requires a reader of a
+resumed run to see, and publishing the worker's deadline makes the status route
+contradict the resume route (above). The journal keeps the pair the board
+published, so the answered pause's own trace entry (`docs/trace.md` §3.4) shows
+the same two clocks, for the same reason.
+
 **A restart re-arms it whole**, because a restarted hub re-derives a placed pause
 by *planting it again*: it publishes the `paused_at` its predecessor published
 and gives the question the node's whole `timeout:` in front of it, with a

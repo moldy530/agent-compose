@@ -2444,6 +2444,18 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
          armed, so a status route shows a question as expired for the whole time the resume \
          surface still takes its answer: {report:#}"
     );
+    // …so the two members of the published entry are **two clocks' readings**,
+    // which §3.4 records as the one line of q46's parity a placed pause does not
+    // hold: subtracting the one from the other measures how far this worker's
+    // clock is from the hub's — years, here — rather than the two seconds `ask`
+    // declares. What a reader is owed is the deadline against its own now, and
+    // that is the member it is handed. A hub that had published the pair as an
+    // interval would be back to showing a deadline it will not fire.
+    assert!(
+        shown.as_str() > "2020-01-02T00:00:00.000Z",
+        "the deadline published lies within a day of the instant the *worker* dated the question, \
+         so the published pair reads as one clock's interval: {report:#}"
+    );
 
     // …and nobody answers it. Two seconds later the budget the *composition*
     // declares is spent, the expiry is journaled as the pause's own record, and

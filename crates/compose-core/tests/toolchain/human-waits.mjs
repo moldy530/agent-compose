@@ -1008,6 +1008,56 @@ runtime.registerHumanNodes({
 }
 
 {
+  // **The pair a reader is shown is two clocks' readings**, which is the one line
+  // of the parity bar a placed pause does not hold and `docs/distributed.md` §3.4
+  // records rather than removes. This worker's clock runs an hour *ahead* of this
+  // process's: it dates the question an hour from here and stamps the deadline
+  // its own minute of budget gives it. Each member of what the board then
+  // publishes is right by its own rule — `pausedAt` is when the execution asked
+  // (`docs/durability.md` §9) and the deadline is the one this hub will fire —
+  // and their difference is neither, being the skew rather than the `timeout:`.
+  // Here it is inverted: a deadline a minute from now is before a question asked
+  // an hour from now.
+  const execution = "exec_remote_two_clocks";
+  runtime.openHumanWaits(execution, true);
+  const asked = new Date(Date.now() + 3_600_000).toISOString();
+  const pause = remote({
+    node: "confirm",
+    pausedAt: asked,
+    expiresAt: new Date(Date.parse(asked) + 60_000).toISOString(),
+  });
+  const planted = Date.now();
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  await settle();
+  const shown = runtime.humanWaits(execution)[0];
+  const seen = {
+    // Open, because the budget armed is the descriptor's and is spent from here.
+    settled_while_the_budget_runs: held.state,
+    published_paused_at_is_the_wires: shown?.pausedAt === pause.pausedAt,
+    published_expires_at_is_the_wires: shown?.expiresAt === pause.expiresAt,
+    // What the composition's minute is worth from the instant this hub planted
+    // the wait, which is the reading the divergence does **not** touch.
+    budget_from_the_planting_ms:
+      typeof shown?.expiresAt === "string" ? Date.parse(shown.expiresAt) - planted : null,
+    // …and what subtracting one published member from the other would say, which
+    // is the skew and not the budget.
+    published_gap_ms:
+      typeof shown?.expiresAt === "string"
+        ? Date.parse(shown.expiresAt) - Date.parse(shown.pausedAt)
+        : null,
+  };
+  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await settle();
+  seen.settled = held.state;
+  // The journal keeps the pair the board published, so the answered pause's own
+  // trace entry shows the same two clocks (`docs/trace.md` §3.4).
+  seen.record_carries_the_published_pair =
+    held.value?.pausedAt === shown?.pausedAt && held.value?.expiresAt === shown?.expiresAt;
+  observed.remote_two_clocks = seen;
+  runtime.releaseHumanWaits(execution);
+}
+
+{
   // …and a node the artifact gives no `timeout:` publishes no deadline at all,
   // however the wire dated the pause. Grammar 8.7 makes that wait unbounded, so
   // there is no timer — and an instant nothing will ever fire is not one a

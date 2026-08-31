@@ -717,6 +717,14 @@ placement at that moment the execution shows a `placement_waits` entry until a
 worker joins. What the node does *not* do is start over — the effects it had
 already journaled, a model call above all, are replayed rather than re-issued,
 and it goes live at the point it stopped.
+
+One reading on such an entry is not this machine's: `paused_at` is the **worker's**
+clock, since when the execution asked is a fact about the run, while `expires_at`
+is this one's, because the deadline shown to a person has to be the deadline this
+process will fire — and the question gets the node's whole `timeout:` from the
+moment the wait lands here. Two machines' clocks disagree, so the gap between the
+two instants is not the `timeout:` and can even be negative. Read `expires_at`
+against the clock you are holding rather than against `paused_at`.
 "##;
 
 /// The section a composition declaring a `store.*` gets.

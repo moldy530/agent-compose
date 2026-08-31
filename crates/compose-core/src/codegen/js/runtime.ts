@@ -8222,6 +8222,17 @@ export async function runHuman(
  * and after a restart the predecessor's instant says the same of an outage
  * longer than the budget. One derivation, beside the arming, for both plantings.
  *
+ * **What those two rules leave is a pair read off two clocks**, and
+ * `docs/distributed.md` §3.4 records it as the one line of q46's parity a placed
+ * pause does not hold: `expiresAt − pausedAt` here is the budget plus however far
+ * the machines disagree, so it is not the node's `timeout:` — it is short of it
+ * on a worker running ahead of this hub, and negative once that lead passes the
+ * budget — where the same node unplaced dates both members off one reading. What
+ * a reader is owed is the deadline against its own now, which is what deriving it
+ * here gives it; the divergence is written down rather than removed, because
+ * removing it means breaking one of the two rules above and both are
+ * load-bearing.
+ *
  * Answers the record the hub journals — through `keep`, the caller's writer,
  * called **inside** the settlement for the reason [`runHuman`]'s own `slot.keep`
  * is: a run that went on from a wait its own record does not hold would ask the
@@ -8271,7 +8282,10 @@ export async function holdRemotePause(
   // the pause's — when the execution asked is a fact about the run — and the
   // deadline is this planting's, derived here from the same `began` the timer
   // below is armed off. Those are [`runHuman`]'s own two lines, and for its
-  // reason: a reader is shown the instant the wait will actually end at.
+  // reason: a reader is shown the instant the wait will actually end at. The
+  // pair is therefore two clocks' readings and their difference is not the
+  // budget (`docs/distributed.md` §3.4) — the deadline is the member a reader
+  // compares against its own now.
   const began = Date.now();
   const expiresAt =
     descriptor.timeoutMs === undefined

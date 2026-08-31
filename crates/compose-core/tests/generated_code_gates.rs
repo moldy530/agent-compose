@@ -1949,6 +1949,67 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
         "the record holds a deadline other than the one the board published, so a replayed wait \
          reports a budget the execution was never under: {observed}"
     );
+    // **And the pair those two rules leave is two clocks' readings**, which
+    // `docs/distributed.md` §3.4 records as the one line of PRD resolved q46's
+    // parity a placed pause does not hold: `pausedAt` is the worker's and the
+    // deadline is this hub's, so their difference is the skew rather than the
+    // node's `timeout:`. The worker driven here runs an hour ahead, which is the
+    // reading that makes the divergence decidable rather than a rounding: the
+    // question is dated an hour from now and the deadline this hub publishes is a
+    // minute from now, so the published pair is *inverted*. The assertions below
+    // pin both halves — the divergence itself, so a reader of the wait is never
+    // silently told it is an interval, and the guarantee it does not touch: the
+    // budget measured from the planting is the whole minute the composition
+    // declares.
+    assert_eq!(
+        observed["remote_two_clocks"]["settled_while_the_budget_runs"],
+        json!("pending"),
+        "a wait a worker dated in this hub's future was settled before anyone could answer it: \
+         {observed}"
+    );
+    assert_eq!(
+        observed["remote_two_clocks"]["published_paused_at_is_the_wires"],
+        json!(true),
+        "the wait was re-dated by the process that planted it rather than by the one that asked \
+         (docs/durability.md §9): {observed}"
+    );
+    assert_eq!(
+        observed["remote_two_clocks"]["published_expires_at_is_the_wires"],
+        json!(false),
+        "the wait publishes the worker's deadline rather than the one this hub armed: {observed}"
+    );
+    let budget = observed["remote_two_clocks"]["budget_from_the_planting_ms"]
+        .as_i64()
+        .unwrap_or(-1);
+    assert!(
+        (60_000..=65_000).contains(&budget),
+        "the deadline published is {budget}ms after the planting, where the node declares a \
+         minute: a worker's clock moved the budget rather than only the pair's reading: \
+         {observed}"
+    );
+    let gap = observed["remote_two_clocks"]["published_gap_ms"]
+        .as_i64()
+        .unwrap_or(0);
+    assert!(
+        gap < -3_000_000,
+        "`expires_at − paused_at` came back {gap}ms, where an hour-ahead worker's pause makes it \
+         about minus an hour: the two members are no longer the two clocks §3.4 documents, so \
+         either the divergence was closed — and the document, the emitted README and \
+         `docs/trace.md` §3.4 now describe a shape the runtime does not have — or one of the two \
+         rules that produce it was broken: {observed}"
+    );
+    assert_eq!(
+        observed["remote_two_clocks"]["settled"],
+        json!("resolved"),
+        "a wait whose published pair is inverted could not be answered: {observed}"
+    );
+    assert_eq!(
+        observed["remote_two_clocks"]["record_carries_the_published_pair"],
+        json!(true),
+        "the journaled record holds a pair the board never published, so the answered pause's \
+         trace entry reports instants the execution was never under (docs/trace.md §3.4): \
+         {observed}"
+    );
     // …and a node with no `timeout:` publishes no deadline, whatever the wire
     // dated the pause: grammar 8.7 makes that wait unbounded, and an instant
     // nothing will fire is not one a surface may show.
