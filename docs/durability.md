@@ -415,10 +415,19 @@ under the effect key the worker's own recorder claimed — and the node re-enter
 dispatch, so the redispatch's `effect_history` carries this record and the replay
 above is what consumes it. Every rule of this section reaches it unchanged,
 because it is the same record: its three instants are the wait's own rather than
-the reading generation's — when the execution asked, when the generation holding
-the question would have stopped waiting, and when it stopped — an unsettled wait
-records nothing and is re-derived, and a settlement the journal cannot record
-fails the node.
+the reading generation's — when the hub began holding the question, when it
+would have stopped waiting, and when it stopped — an unsettled wait records
+nothing and is re-derived, and a settlement the journal cannot record fails the
+node.
+
+All three are the **hub's** clock, and the paragraph above is why: a record that
+took `pausedAt` off the wire — the worker's reading of its own clock — and
+`settledAt` off this one would file, on a worker running ahead of the hub, an
+entry whose answer arrives before its question. So the wait is dated where it is
+planted, exactly as a local one is dated where it is parked, and the pair a
+reader is shown is the node's `timeout:` apart on either side of the wire (PRD
+resolved q46's parity bar). What the worker's clock said is not lost: it is on
+the settled dispatch row (§3.8), which is the record of what that machine did.
 
 This is the record that makes §1 concrete. `docs/trace.md` §11 says outright
 that what a human answered "is not here"; it is here.
@@ -634,7 +643,13 @@ execution, and the four are not interchangeable:
   a resumed generation consumes that too, by re-deriving the wait onto its own
   board unless §3.4's answer record is already in the journal, in which case the
   wait is over and the next dispatch at that instance path is what replays past
-  it.
+  it. **The two instants on such an outcome are the worker's**, and this row is
+  the only place they are kept: `paused_at` is when that machine reached the
+  `human:` node and `expires_at` is what its own trace entry showed, both read
+  off its clock. Neither is a deadline this hub ever armed and neither is the
+  wait's — §3.4's record and the status route both date the wait where the hub
+  planted it — so this row answers "when did that machine ask", and the human
+  wait record answers "what was the question under".
 * **`superseded`** — the hub ended it *without* a result, which is the only way a
   dispatch ends that a worker did not end. A resumed generation replays the
   failure, so the node's `retry:`/`on_error:` chain does now what it did then.
@@ -759,14 +774,16 @@ answered out of the record whatever the clock says.
 **Both kinds of wait re-park with a fresh budget**, including the one the journal
 could date. A pause a worker settled its dispatch with
 (`docs/distributed.md` §3.4) is on the dispatch row, so a hub that re-derives it
-*knows* when it took the question — and does not spend that on the timer: the
-wait is planted again, planting is what arms it, and the `expiresAt` the planting
-publishes and later journals is that arming's own, since a deadline a reader is
-shown has to be the deadline that fires. `pausedAt` is untouched by any of it
-(§9). A local pause has no such row and could not do otherwise. The two therefore cost a person's remaining time
-exactly the same, which is what PRD resolved q46 requires of them — "timeout,
-retry, on_error semantics … are the single-process ones" — and a restart is
-downtime nobody could have answered through, not budget somebody spent.
+*knows* when the worker took the question — and does not spend that on the
+timer, or on the date it publishes: the wait is planted again, planting is what
+arms it, and **both** instants the planting publishes and later journals are that
+arming's own, since a deadline a reader is shown has to be the deadline that
+fires and a wait's `pausedAt` is when the generation holding it began holding it.
+A local pause has no such row and could not do otherwise. The two therefore cost
+a person's remaining time exactly the same and are dated the same way, which is
+what PRD resolved q46 requires of them — "timeout, retry, on_error semantics …
+are the single-process ones" — and a restart is downtime nobody could have
+answered through, not budget somebody spent.
 
 What a resumed generation's clock can change is *whether* a deadline fires, and
 that is a change in the **shape** of the run rather than in the identity of any

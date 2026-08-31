@@ -1818,9 +1818,24 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
                 "required": ["decision"],
                 "additionalProperties": false,
             },
-            "pausedAt": "2026-08-31T09:14:02.113Z",
         }]),
         "a worker's pause is not published the way a local one is: {observed}"
+    );
+    // …and dated where it was planted rather than where it was asked. Both
+    // instants of a published wait are the holding generation's, which is what
+    // makes the pair an interval on either side of the wire (§3.4, PRD resolved
+    // q46's parity bar); the wire's instant is on the settled dispatch row,
+    // which is the record of what that machine's clock said.
+    assert_eq!(
+        observed["remote_answered"]["published_paused_at_is_an_instant"],
+        json!(true),
+        "a worker's pause is published with no date on it: {observed}"
+    );
+    assert_eq!(
+        observed["remote_answered"]["published_paused_at_is_the_wires"],
+        json!(false),
+        "the wait publishes the instant the worker's clock stamped rather than the one this hub \
+         planted it at, so a reader is shown a pair read off two machines: {observed}"
     );
     // Counted by `pausesUnder`, which is the reading `runActivity` holds a
     // dispatching node's deadline still by (D102): the time a person spends
@@ -1848,10 +1863,10 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
         json!({ "decision": "approve" })
     );
     assert_eq!(
-        observed["remote_answered"]["record"]["pausedAt"],
-        json!("2026-08-31T09:14:02.113Z"),
-        "the record was dated by the process that recovered the wait rather than by the one that \
-         opened it (docs/durability.md §9): {observed}"
+        observed["remote_answered"]["record_carries_the_published_pause"],
+        json!(true),
+        "the record holds an instant the board never published, so the answered pause's trace \
+         entry reports a wait the execution was never under (docs/trace.md §3.4): {observed}"
     );
     assert!(
         observed["remote_answered"]["record"]["settledAt"].is_string(),
@@ -1949,62 +1964,68 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
         "the record holds a deadline other than the one the board published, so a replayed wait \
          reports a budget the execution was never under: {observed}"
     );
-    // **And the pair those two rules leave is two clocks' readings**, which
-    // `docs/distributed.md` §3.4 records as the one line of PRD resolved q46's
-    // parity a placed pause does not hold: `pausedAt` is the worker's and the
-    // deadline is this hub's, so their difference is the skew rather than the
-    // node's `timeout:`. The worker driven here runs an hour ahead, which is the
-    // reading that makes the divergence decidable rather than a rounding: the
-    // question is dated an hour from now and the deadline this hub publishes is a
-    // minute from now, so the published pair is *inverted*. The assertions below
-    // pin both halves — the divergence itself, so a reader of the wait is never
-    // silently told it is an interval, and the guarantee it does not touch: the
-    // budget measured from the planting is the whole minute the composition
-    // declares.
+    // **And the pair those rules leave is one clock's**, which is PRD resolved
+    // q46's parity bar for status visibility: the same node unplaced dates both
+    // members off one reading, so `expires_at − paused_at` is the node's
+    // `timeout:` — and a placed pause has to publish the same. The worker driven
+    // here runs an hour ahead, which is what makes the reading decidable rather
+    // than a rounding: a board that had kept the wire's `pausedAt` beside its own
+    // deadline would publish a question dated an hour from now expiring a minute
+    // from now, an *inverted* pair. The assertions below pin the three halves of
+    // it — neither published member came off the wire, the dating is this
+    // planting's, and the gap is the whole minute the composition declares.
     assert_eq!(
-        observed["remote_two_clocks"]["settled_while_the_budget_runs"],
+        observed["remote_planting"]["settled_while_the_budget_runs"],
         json!("pending"),
         "a wait a worker dated in this hub's future was settled before anyone could answer it: \
          {observed}"
     );
     assert_eq!(
-        observed["remote_two_clocks"]["published_paused_at_is_the_wires"],
-        json!(true),
-        "the wait was re-dated by the process that planted it rather than by the one that asked \
-         (docs/durability.md §9): {observed}"
+        observed["remote_planting"]["published_paused_at_is_the_wires"],
+        json!(false),
+        "the wait publishes the instant the worker's clock stamped rather than the one this hub \
+         planted it at, so a reader is shown a pair read off two machines (docs/distributed.md \
+         §3.4): {observed}"
     );
     assert_eq!(
-        observed["remote_two_clocks"]["published_expires_at_is_the_wires"],
+        observed["remote_planting"]["published_expires_at_is_the_wires"],
         json!(false),
         "the wait publishes the worker's deadline rather than the one this hub armed: {observed}"
     );
-    let budget = observed["remote_two_clocks"]["budget_from_the_planting_ms"]
+    let budget = observed["remote_planting"]["budget_from_the_planting_ms"]
         .as_i64()
         .unwrap_or(-1);
     assert!(
         (60_000..=65_000).contains(&budget),
         "the deadline published is {budget}ms after the planting, where the node declares a \
-         minute: a worker's clock moved the budget rather than only the pair's reading: \
+         minute: a worker's clock moved the budget: {observed}"
+    );
+    let dated = observed["remote_planting"]["dated_from_the_planting_ms"]
+        .as_i64()
+        .unwrap_or(i64::MAX);
+    assert!(
+        (0..=5_000).contains(&dated),
+        "the wait is dated {dated}ms from the planting, where a wait a process opens is dated the \
+         instant it opens it: a worker's clock decided when this hub's question was asked: \
          {observed}"
     );
-    let gap = observed["remote_two_clocks"]["published_gap_ms"]
+    let gap = observed["remote_planting"]["published_gap_ms"]
         .as_i64()
         .unwrap_or(0);
-    assert!(
-        gap < -3_000_000,
-        "`expires_at − paused_at` came back {gap}ms, where an hour-ahead worker's pause makes it \
-         about minus an hour: the two members are no longer the two clocks §3.4 documents, so \
-         either the divergence was closed — and the document, the emitted README and \
-         `docs/trace.md` §3.4 now describe a shape the runtime does not have — or one of the two \
-         rules that produce it was broken: {observed}"
+    assert_eq!(
+        gap, 60_000,
+        "`expires_at − paused_at` came back {gap}ms, where the node declares a minute: the two \
+         published members are no longer one clock's reading and its budget, so a reader \
+         computing what is left of a question measures the offset between two machines instead \
+         (docs/distributed.md §3.4, PRD resolved q46): {observed}"
     );
     assert_eq!(
-        observed["remote_two_clocks"]["settled"],
+        observed["remote_planting"]["settled"],
         json!("resolved"),
-        "a wait whose published pair is inverted could not be answered: {observed}"
+        "a wait planted from a wildly skewed pause could not be answered: {observed}"
     );
     assert_eq!(
-        observed["remote_two_clocks"]["record_carries_the_published_pair"],
+        observed["remote_planting"]["record_carries_the_published_pair"],
         json!(true),
         "the journaled record holds a pair the board never published, so the answered pause's \
          trace entry reports instants the execution was never under (docs/trace.md §3.4): \

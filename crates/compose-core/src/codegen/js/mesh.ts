@@ -585,12 +585,12 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       // decided by the journal and by nothing else: an answered pause has its
       // effect record, and the wait is over — the redispatch below is what
       // replays past it. A pause with no record is one nobody answered, so this
-      // process plants it again, under the identity and the `paused_at` its
-      // predecessor published (`docs/durability.md` §9) — and with the node's
-      // whole `timeout:` in front of it, exactly as a resumed generation re-parks
-      // a local wait nobody answered (§5, PRD resolved q46's parity bar).
-      // Planting is one function for both generations ([`answered`]), so the
-      // budget and the deadline it publishes are derived once and here as there.
+      // process plants it again, under the identity its predecessor published —
+      // dated by this planting and with the node's whole `timeout:` in front of
+      // it, exactly as a resumed generation re-parks a local wait nobody
+      // answered (§5, PRD resolved q46's parity bar). Planting is one function
+      // for both generations ([`answered`]), so the pair a reader is shown is
+      // derived once and here as there.
       if (journal.lookup(options.execution, ending.pause.effect.key) === undefined) {
         await answered(journal, options, ending.pause);
       }
@@ -714,10 +714,11 @@ function awaited(
  *
  * The wait's budget is the node's own `timeout:`, spent from the moment
  * `holdRemotePause` puts it on the board — never the worker-stamped
- * `expires_at`, which is another machine's clock. The deadline that hub
- * publishes is the one it will fire, derived beside the arming, which is why
- * nothing here dates a pause on its way in: both plantings, the live one and a
- * restart's, hand the pause on exactly as it came off the wire.
+ * `expires_at`, which is another machine's clock. That planting is where the
+ * wait is dated too, off the reading the deadline is armed from, which is why
+ * nothing here touches the instants a pause carried: both plantings, the live
+ * one and a restart's, hand the pause on exactly as it came off the wire, and
+ * the pair a reader is shown is the one the planting derived (§3.4).
  */
 async function answered(
   journal: Journal,

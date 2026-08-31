@@ -219,6 +219,46 @@ mod tests {
         );
     }
 
+    /// A planted pause is dated by the planting, off the same reading its
+    /// deadline is armed from (`docs/distributed.md` §3.4, PRD resolved q46).
+    ///
+    /// The other half of the rule above, and the one PRD resolved q46 names
+    /// "status visibility": a wait a process opens is dated when that process
+    /// opens it, so the pair a status route publishes is the node's `timeout:`
+    /// apart. A hub that kept the wire's `paused_at` beside a deadline of its own
+    /// would publish two machines' readings — an interval of nothing, negative
+    /// once a worker's lead passes the budget — and would journal, on a worker
+    /// running ahead of it, the entry `docs/durability.md` §3.4 refuses by name:
+    /// one whose answer arrives before its question.
+    ///
+    /// Pinned as a grep for the reason above it, and against [`runHuman`]'s own
+    /// line so that the two datings cannot drift apart;
+    /// `tests/toolchain/human-waits.mjs`'s `remote_planting` block and
+    /// `distributed_hub_wire.rs` drive the behaviour itself.
+    #[test]
+    fn a_remote_pause_is_dated_by_the_planting_that_arms_it() {
+        let held = function_body("export async function holdRemotePause(");
+        let local = function_body("export async function runHuman(");
+        let dated = "const pausedAt = new Date(began).toISOString();";
+        assert!(
+            local.contains(dated),
+            "the unplaced dating this one is held to has moved, so the two are no longer the same \
+             line: {local}"
+        );
+        assert!(
+            held.contains(dated),
+            "a pause a worker opened is dated by something other than the instant this hub plants \
+             it at, so the pair a status route publishes is not the node's `timeout:` apart the \
+             way the same node unplaced publishes it: {held}"
+        );
+        assert!(
+            !held.contains("remote.pausedAt"),
+            "the wire's `paused_at` is republished onto the board or the record, so a reader is \
+             shown a pair read off two machines' clocks and a fast worker's pause journals an \
+             answer that arrives before its question (docs/distributed.md §3.4): {held}"
+        );
+    }
+
     /// The answer to a pause a worker opened is journaled **inside** the
     /// settlement, where a local pause's is (`docs/durability.md` §3.4).
     ///

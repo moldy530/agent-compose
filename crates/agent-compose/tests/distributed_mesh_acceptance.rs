@@ -1754,9 +1754,9 @@ fn a_placed_pauses_route_is_lost_when_the_node_spends_its_budget_waiting_for_a_w
 ///
 /// The pause is journaled — it is what settled the dispatch — so the process
 /// that replaces this one re-derives the wait rather than remembering it, under
-/// the identity and the `paused_at` its predecessor published. That is the same
-/// discipline every other open wait is recovered by, reaching the one kind of
-/// wait that was opened in another process entirely.
+/// the identity its predecessor published and dated by its own planting. That is
+/// the same discipline every other open wait is recovered by, reaching the one
+/// kind of wait that was opened in another process entirely.
 ///
 /// The wait this flow opens declares no `timeout:`, so nothing here is about a
 /// budget; `distributed_hub_wire.rs` is where the re-derived budget and the
@@ -1791,10 +1791,14 @@ fn a_placed_pause_is_re_derived_by_a_hub_restarted_before_the_answer() {
             .is_some_and(|waits| !waits.is_empty())
     });
     assert_eq!(after["interrupts"][0]["wait_id"], json!(id), "{after:#}");
-    assert_eq!(
-        after["interrupts"][0]["paused_at"], before["paused_at"],
-        "the re-derived wait was dated by the process that recovered it rather than by the one \
-         that opened it (docs/durability.md §9): {after:#}"
+    // …and **re-dated by the planting**, exactly as a re-parked local wait is
+    // (`docs/durability.md` §3.4, §5): the generation holding a question is the
+    // one that dates it, so the pair a reader is shown is this process's and
+    // never a mixture of two.
+    assert!(
+        after["interrupts"][0]["paused_at"].as_str() > before["paused_at"].as_str(),
+        "the re-derived wait kept the instant its predecessor published rather than the one this \
+         planting dated it at, so a restart leaves a pair no single clock read: {after:#}"
     );
 
     let fresh = mesh.worker("escalation-after-restart");

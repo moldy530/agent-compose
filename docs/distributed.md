@@ -665,70 +665,62 @@ travels than that. `wait` is the node's deterministic wait identity — its
 instance path plus an ordinal, grammar §9.4 — so the hub plants the wait a local
 run would have opened at that site, and a resume prepared against one generation
 finds it in the next (§6.1's property, for the same reason). `shown` is the
-node's evaluated `input:`, which is what the person is asked. `paused_at` is when
-the execution asked, and the hub publishes it unchanged, restarts included:
-`docs/durability.md` §9 requires that a reader "sees what the execution did, not
-what this process did", and a placed pause is the only wait that still has that
-instant after a restart, because it is the only one on a row.
+node's evaluated `input:`, which is what the person is asked.
 
-`expires_at` is what the worker's own trace entry records for the pause
-(`docs/trace.md` §3.4) — `paused_at` plus the node's `timeout:`, on the worker's
-clock — and it is a fact about what the worker did, **never a timer and never a
-deadline the hub republishes**. Two machines' clocks disagree, so a hub that
-armed the wait at `expires_at − now` would give a `timeout: 5m` node no time at
-all on a worker ten minutes behind it and a quarter of an hour on one ten minutes
-ahead, while the same node unplaced always gets five minutes. What the hub arms
-is the node's own `timeout:` out of its copy of the descriptor, from the moment
-the wait goes on its board — the only instant a local wait's budget is ever spent
-from either — and the `expires_at` it publishes on its status route is *that*
-deadline, derived beside the arming and on the clock that will fire it. A
-`timeout: 5m` node gets five minutes whichever machine asked the question, and
-the five minutes a reader is shown are the five minutes the resume surface will
-take an answer through. Publishing the wire's instant instead would show a
-question as expired for the whole time it is answerable behind a slow worker's
-clock — a status route contradicting the resume route, which is the one thing it
-may not do.
+**The two instants are the worker's record of its own clock, and neither is the
+wait's.** `paused_at` is when that machine reached the node; `expires_at` is what
+its own trace entry recorded for the pause (`docs/trace.md` §3.4) — `paused_at`
+plus the node's `timeout:`, on the same clock. They travel because the pause
+happened on another machine and the settled dispatch row is the only record of
+what that machine did (`docs/durability.md` §3.8), and they are **never armed and
+never republished**. Two machines' clocks disagree, so a hub that armed the wait
+at `expires_at − now` would give a `timeout: 5m` node no time at all on a worker
+ten minutes behind it and a quarter of an hour on one ten minutes ahead, while
+the same node unplaced always gets five minutes; and a hub that published
+`paused_at` beside a deadline of its own would publish a pair read off two clocks,
+whose difference is the machines' offset rather than the node's `timeout:` —
+negative once a worker's lead exceeds the budget — where the same node unplaced
+dates both members off one reading.
 
-So `expires_at` is the one member of a `paused` body **no hub check backs**, and
-deliberately: the checks below refuse a pause over a field the hub would
-otherwise have *used*, and this is the one field it never uses. Its rule — the
-field is present exactly when the node declares `timeout:` — is a producer
-obligation, kept by a worker because the settled row is the only record of what
-that machine's clock said. Refusing a pause over it would cost a node its attempt
-for a disagreement about a record no reader has.
+**So the hub dates the wait where it plants it**, off one `Date.now()` reading,
+and arms the node's own `timeout:` out of its copy of the descriptor from that
+same instant — the only instant a local wait's budget is ever spent from either.
+Both members of the pair it publishes are that reading's: `expires_at` is the
+deadline it will fire, on the clock it published it from, and `paused_at` is when
+the generation holding the question began holding it. A `timeout: 5m` node is
+therefore shown as asked now and expiring in five minutes whichever machine
+reached it, the five minutes a reader is shown are the five minutes the resume
+surface will take an answer through, and `expires_at − paused_at` is the node's
+`timeout:` on either side of the wire. That is PRD resolved q46's parity bar for
+status visibility, held rather than documented around; publishing the wire's
+instants instead would break it twice over — a question shown as expired for the
+whole time it is answerable behind a slow worker's clock, which is a status route
+contradicting the resume route, and a journaled record whose answer arrives
+before its question, which is the entry `docs/durability.md` §3.4 refuses by
+name. The journal keeps the pair the board published, so the answered pause's own
+trace entry (`docs/trace.md` §3.4) is the entry an unplaced pause writes.
 
-**The published pair is two clocks, and is not an interval.** The two rules
-above are each required and they do not compose: `paused_at` is the worker's
-reading and the deadline beside it is this hub's, so `expires_at − paused_at` is
-the node's `timeout:` plus however far the two machines' clocks are apart, plus
-the moment the result spent in flight — *less* than the budget on a worker whose
-clock runs ahead of the hub's, and negative once that lead exceeds the budget.
-So a reader that computes what is left of a question by subtracting the one from
-the other is measuring the offset between two machines. What it is entitled to
-is `expires_at` against its own now: the hub publishes the deadline it will fire
-and fires it on the clock it published it from. That is the one line of PRD
-resolved q46's parity bar a placed pause does not hold exactly — the same node
-unplaced dates both members off one reading, so its pair is always exactly
-`timeout:` apart — and it is written down here rather than removed, because
-removing it means breaking one of the two rules it is made of: re-dating
-`paused_at` on the hub loses what `docs/durability.md` §9 requires a reader of a
-resumed run to see, and publishing the worker's deadline makes the status route
-contradict the resume route (above). The journal keeps the pair the board
-published, so the answered pause's own trace entry (`docs/trace.md` §3.4) shows
-the same two clocks, for the same reason.
+So the two instants are the members of a `paused` body **no hub check backs**,
+and deliberately: the checks below refuse a pause over a field the hub would
+otherwise have *used*, and these are the fields it never uses. `paused_at`'s rule
+— REQUIRED — and `expires_at`'s — present exactly when the node declares
+`timeout:` — are producer obligations, kept by a worker because the settled row
+is where they are read back. Refusing a pause over either would cost a node its
+attempt for a disagreement about a row nothing routes off.
 
 **A restart re-arms it whole**, because a restarted hub re-derives a placed pause
-by *planting it again*: it publishes the `paused_at` its predecessor published
-and gives the question the node's whole `timeout:` in front of it, with a
-published deadline that says so. That is what the same node unplaced does, for
-the same reason it does it: an unanswered local pause journals nothing (resolved
-q28), so a resumed generation re-parks it from scratch and its budget starts
-again (`docs/durability.md` §5). Five minutes after a restart, a `timeout: 5m`
-pause has the same time left on either side of the wire, and "how long do I have"
-is not a question a deploy file gets to answer. The hub *knows* when it took the
-pause — the settled row is dated — and does not spend that knowledge on the
-budget; a wait no process was holding is a wait nobody could have answered, and
-charging it to the person would be charging them for the downtime.
+by *planting it again*: it dates the wait its own now and gives the question the
+node's whole `timeout:` in front of it, with a published deadline that says so.
+That is what the same node unplaced does, for the same reason it does it: an
+unanswered local pause journals nothing (resolved q28), so a resumed generation
+re-parks it from scratch, re-dated, and its budget starts again
+(`docs/durability.md` §5). Five minutes after a restart, a `timeout: 5m` pause
+has the same time left and reads the same on either side of the wire, and "how
+long do I have" is not a question a deploy file gets to answer. The hub *knows*
+when the worker took the pause — the settled row is dated — and does not spend
+that knowledge on the budget or on the date it shows; a wait no process was
+holding is a wait nobody could have answered, and charging it to the person would
+be charging them for the downtime.
 
 **The `human:` block's `timeout:` is the only clock the question is under.** The
 *dispatching* node's `timeout:` — a bound on queueing plus execution (§2, §6.5) —
@@ -842,7 +834,7 @@ machine, on this side of a wait exactly as on the other.
 **A hub restart between the pause and the answer costs nothing**, because the
 pause is journaled: the settled row carries it, and the replay that re-reaches
 the node re-derives the wait onto the new process's board — under the identity
-and the `paused_at` its predecessor published, and with the node's whole
+its predecessor published, dated by this planting, and with the node's whole
 `timeout:` in front of it and a deadline that says so, exactly as a resumed
 generation re-parks a local wait nobody answered (above) — unless the answer's
 record is already in the journal, in which case the wait is over and the

@@ -1894,6 +1894,25 @@ fn a_paused_result_settles_its_dispatch_and_plants_the_wait_on_the_hubs_board() 
         json!(wait),
         "{report:#}"
     );
+    // …and **dated where it was planted**, not where it was asked: `ask`
+    // declares no `timeout:`, so the entry publishes one instant, and that
+    // instant is this hub's reading rather than the worker's. The wire's is on
+    // the settled row, which is the record of what that machine's clock said
+    // (§3.4, `docs/durability.md` §3.8).
+    let published = report["interrupts"][0]["paused_at"]
+        .as_str()
+        .expect("a published pause is dated")
+        .to_string();
+    assert_ne!(
+        json!(published.as_str()),
+        pause["paused_at"],
+        "the wait publishes the instant the worker's clock stamped rather than the one this hub \
+         planted it at, so a reader is shown a pair read off two machines: {report:#}"
+    );
+    assert!(
+        report["interrupts"][0].get("expires_at").is_none(),
+        "the hub published a deadline for a node that declares no `timeout:`: {report:#}"
+    );
     assert_eq!(
         report["interrupts"][0]["output_schema"]["properties"]["decision"]["enum"],
         json!(["approve", "reject"]),
@@ -1980,9 +1999,11 @@ fn a_paused_result_settles_its_dispatch_and_plants_the_wait_on_the_hubs_board() 
         "the journaled answer is not the one the person gave: {recorded:#}"
     );
     assert_eq!(
-        recorded["outcome"]["value"]["pausedAt"], pause["paused_at"],
-        "the record is dated by the hub rather than by the process that asked \
-         (docs/durability.md §9): {recorded:#}"
+        recorded["outcome"]["value"]["pausedAt"],
+        json!(published),
+        "the journaled record holds an instant the board never published, so the answered \
+         pause's trace entry reports a wait the execution was never under \
+         (docs/trace.md §3.4): {recorded:#}"
     );
     assert_eq!(
         recorded["request"], pause["effect"]["request"],
@@ -2362,11 +2383,11 @@ fn a_result_carrying_an_ending_beside_its_pause_is_unreadable() {
 /// a `timeout:` means: a worker years fast gives the person years, one ten
 /// minutes slow gives them nothing at all, and the same node unplaced always
 /// gets exactly its two seconds. So the budget armed is the composition's, spent
-/// from the moment this hub took the pause — and the deadline the board
-/// *publishes* is that arming's, because a deadline a reader is shown has to be
-/// the deadline that fires. `paused_at` is the one instant that stays the
-/// worker's: when the execution asked is a fact about the run
-/// (`docs/durability.md` §9).
+/// from the moment this hub took the pause — and **both** instants the board
+/// publishes are that arming's, because a deadline a reader is shown has to be
+/// the deadline that fires and a pair assembled out of two machines' clocks is
+/// an interval of nothing. What the worker's clock said stays on the settled row
+/// (`docs/durability.md` §3.8).
 ///
 /// What catches the other arming is a **lower bound on the clock**: a wait held
 /// for its own two seconds cannot end sooner, while one armed off a years-out
@@ -2415,9 +2436,9 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
     );
     assert_eq!(settled.status, 204, "{}", body_of(&settled));
 
-    // On the board, showing when the **execution** asked and when **this hub**
-    // will stop taking an answer — the two instants read off different clocks
-    // for the two different reasons §3.4 gives.
+    // On the board, dated and deadlined by **this hub** — the pair PRD resolved
+    // q46's parity bar asks for, both members off the reading the timer was
+    // armed from.
     let report = hub.until(&execution, "published the worker's pause", |report| {
         report["interrupts"]
             .as_array()
@@ -2428,11 +2449,14 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
         json!(wait),
         "{report:#}"
     );
-    assert_eq!(
-        report["interrupts"][0]["paused_at"],
-        json!(asked),
-        "the wait was dated by the hub rather than by the process that asked \
-         (docs/durability.md §9): {report:#}"
+    let began = report["interrupts"][0]["paused_at"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        began.as_str() > stamped,
+        "the wait publishes the instant the worker's clock stamped rather than the one this hub \
+         planted it at, so a reader is shown a pair read off two machines: {report:#}"
     );
     let shown = report["interrupts"][0]["expires_at"]
         .as_str()
@@ -2444,17 +2468,18 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
          armed, so a status route shows a question as expired for the whole time the resume \
          surface still takes its answer: {report:#}"
     );
-    // …so the two members of the published entry are **two clocks' readings**,
-    // which §3.4 records as the one line of q46's parity a placed pause does not
-    // hold: subtracting the one from the other measures how far this worker's
-    // clock is from the hub's — years, here — rather than the two seconds `ask`
-    // declares. What a reader is owed is the deadline against its own now, and
-    // that is the member it is handed. A hub that had published the pair as an
-    // interval would be back to showing a deadline it will not fire.
+    // …and the published pair is an **interval** rather than two machines'
+    // readings: the deadline is after the instant the wait was dated, both are
+    // this hub's, and a reader subtracting the one from the other gets the two
+    // seconds `ask` declares. A pair that had kept the worker's `paused_at`
+    // beside this hub's deadline would read minus six years here. The arithmetic
+    // itself is pinned where a clock is cheap to parse — `human-waits.mjs`'s
+    // `remote_planting` block and `generated_code_gates.rs` — and what this
+    // asserts is the ordering no skew may invert.
     assert!(
-        shown.as_str() > "2020-01-02T00:00:00.000Z",
-        "the deadline published lies within a day of the instant the *worker* dated the question, \
-         so the published pair reads as one clock's interval: {report:#}"
+        began < shown,
+        "the wait published a deadline at {shown} before the {began} it says the question was \
+         asked at, so the pair is read off two machines' clocks: {report:#}"
     );
 
     // …and nobody answers it. Two seconds later the budget the *composition*
@@ -2494,9 +2519,9 @@ fn a_placed_pauses_budget_is_the_nodes_own_and_its_expiry_sends_the_node_back() 
     );
     assert_eq!(
         recorded["outcome"]["value"]["pausedAt"],
-        json!(asked),
-        "the record was dated by the hub rather than by the process that asked \
-         (docs/durability.md §9): {recorded:#}"
+        json!(began),
+        "the record holds an instant the board never published, so a replayed wait reports a \
+         question the execution was never under (docs/trace.md §3.4): {recorded:#}"
     );
     assert_eq!(
         recorded["outcome"]["value"]["expiresAt"],
@@ -2637,15 +2662,18 @@ fn a_pause_a_restarted_hub_re_derives_is_armed_with_the_whole_budget() {
         json!(wait),
         "the re-derived wait is not the one the pause named: {report:#}"
     );
-    // The instants say the same two things the arming does: the execution asked
-    // when it asked, and the deadline a reader is shown is the one this
-    // generation will fire — never the predecessor's, which an outage longer
-    // than the budget has already passed.
-    assert_eq!(
-        report["interrupts"][0]["paused_at"],
-        json!("2020-01-01T00:00:00.000Z"),
-        "the re-derived wait was dated by the process that recovered it rather than by the one \
-         that opened it (docs/durability.md §9): {report:#}"
+    // The instants say the same thing the arming does, and they say it together:
+    // this planting dated the wait and this planting armed it, so neither member
+    // is the predecessor's — which an outage longer than the budget has already
+    // passed — and their difference is still the node's two seconds. That is
+    // what a re-parked local wait publishes, which is the parity bar
+    // (PRD resolved q46).
+    assert!(
+        report["interrupts"][0]["paused_at"]
+            .as_str()
+            .is_some_and(|began| began > "2020-01-01T00:00:02.000Z"),
+        "the re-derived wait publishes the instant its predecessor did, so a reader subtracting \
+         the pair measures the outage rather than the budget: {report:#}"
     );
     assert!(
         report["interrupts"][0]["expires_at"]
@@ -2653,6 +2681,12 @@ fn a_pause_a_restarted_hub_re_derives_is_armed_with_the_whole_budget() {
             .is_some_and(|shown| shown > "2020-01-01T00:00:02.000Z"),
         "the re-derived wait publishes the expiry its predecessor computed, so a status route \
          shows a question as expired while the resume surface still takes its answer: {report:#}"
+    );
+    assert!(
+        report["interrupts"][0]["paused_at"].as_str()
+            < report["interrupts"][0]["expires_at"].as_str(),
+        "the re-derived wait publishes a deadline before the instant it says the question was \
+         asked at: {report:#}"
     );
 
     // …and nobody answers it, so the budget the *composition* declares runs out

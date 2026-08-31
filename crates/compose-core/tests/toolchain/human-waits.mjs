@@ -912,6 +912,7 @@ runtime.registerHumanNodes({
   const published = runtime.humanWaits(execution);
   // A payload the node's `output:` refuses does **not** consume the wait.
   const refused = runtime.deliverHumanAnswer(execution, pause.wait, { decision: "maybe" });
+  const plantedAt = published[0]?.pausedAt;
   const seen = {
     published: published.map((wait) => ({
       id: wait.id,
@@ -919,8 +920,12 @@ runtime.registerHumanNodes({
       node: wait.node,
       shown: wait.shown,
       schema: wait.schema,
-      pausedAt: wait.pausedAt,
     })),
+    // …dated where it was planted rather than where it was asked: the wire's
+    // instant is another machine's clock, and the pair a reader is shown has to
+    // be one clock's (`docs/distributed.md` §3.4).
+    published_paused_at_is_an_instant: typeof plantedAt === "string",
+    published_paused_at_is_the_wires: plantedAt === pause.pausedAt,
     // The reading `runActivity` holds a dispatching node's deadline still by.
     held_under: runtime.pausesUnder(execution, "escalate/0"),
     held_elsewhere: runtime.pausesUnder(execution, "stamp/0"),
@@ -931,6 +936,9 @@ runtime.registerHumanNodes({
   await settle();
   seen.settled = held.state;
   seen.record = held.value;
+  // The journal keeps the instant the board published, so the answered pause's
+  // trace entry is the entry an unplaced pause writes.
+  seen.record_carries_the_published_pause = held.value?.pausedAt === plantedAt;
   seen.waiting_after_the_answer = runtime.humanWaits(execution).length;
   // What the writer was handed, and when: the record itself, and before the
   // promise the answer is acknowledged off resolved.
@@ -1008,17 +1016,17 @@ runtime.registerHumanNodes({
 }
 
 {
-  // **The pair a reader is shown is two clocks' readings**, which is the one line
-  // of the parity bar a placed pause does not hold and `docs/distributed.md` §3.4
-  // records rather than removes. This worker's clock runs an hour *ahead* of this
-  // process's: it dates the question an hour from here and stamps the deadline
-  // its own minute of budget gives it. Each member of what the board then
-  // publishes is right by its own rule — `pausedAt` is when the execution asked
-  // (`docs/durability.md` §9) and the deadline is the one this hub will fire —
-  // and their difference is neither, being the skew rather than the `timeout:`.
-  // Here it is inverted: a deadline a minute from now is before a question asked
-  // an hour from now.
-  const execution = "exec_remote_two_clocks";
+  // **The pair a reader is shown is one clock's**, which is PRD resolved q46's
+  // parity bar for status visibility: the same node unplaced dates both members
+  // off one `Date.now()` reading, so a placed one must too. This worker's clock
+  // runs an hour *ahead* of this process's — it dates the question an hour from
+  // here and stamps the deadline its own minute of budget gives it — and neither
+  // instant reaches the board. What the planting publishes is its own now and
+  // its own now plus the descriptor's minute, so `expiresAt − pausedAt` is
+  // exactly the `timeout:` the composition declares. A board that had kept the
+  // wire's `pausedAt` would publish an *inverted* pair here: a deadline a minute
+  // from now beside a question asked an hour from now.
+  const execution = "exec_remote_planting";
   runtime.openHumanWaits(execution, true);
   const asked = new Date(Date.now() + 3_600_000).toISOString();
   const pause = remote({
@@ -1036,11 +1044,15 @@ runtime.registerHumanNodes({
     published_paused_at_is_the_wires: shown?.pausedAt === pause.pausedAt,
     published_expires_at_is_the_wires: shown?.expiresAt === pause.expiresAt,
     // What the composition's minute is worth from the instant this hub planted
-    // the wait, which is the reading the divergence does **not** touch.
+    // the wait.
     budget_from_the_planting_ms:
       typeof shown?.expiresAt === "string" ? Date.parse(shown.expiresAt) - planted : null,
-    // …and what subtracting one published member from the other would say, which
-    // is the skew and not the budget.
+    // …and how far the *dating* is from that same instant, which is what says
+    // the question was dated here rather than an hour from here.
+    dated_from_the_planting_ms:
+      typeof shown?.pausedAt === "string" ? Date.parse(shown.pausedAt) - planted : null,
+    // …and what subtracting one published member from the other says, which is
+    // the node's `timeout:` and nothing else.
     published_gap_ms:
       typeof shown?.expiresAt === "string"
         ? Date.parse(shown.expiresAt) - Date.parse(shown.pausedAt)
@@ -1050,10 +1062,10 @@ runtime.registerHumanNodes({
   await settle();
   seen.settled = held.state;
   // The journal keeps the pair the board published, so the answered pause's own
-  // trace entry shows the same two clocks (`docs/trace.md` §3.4).
+  // trace entry is the entry an unplaced pause writes (`docs/trace.md` §3.4).
   seen.record_carries_the_published_pair =
     held.value?.pausedAt === shown?.pausedAt && held.value?.expiresAt === shown?.expiresAt;
-  observed.remote_two_clocks = seen;
+  observed.remote_planting = seen;
   runtime.releaseHumanWaits(execution);
 }
 

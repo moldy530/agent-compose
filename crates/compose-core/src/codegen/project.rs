@@ -718,13 +718,12 @@ worker joins. What the node does *not* do is start over — the effects it had
 already journaled, a model call above all, are replayed rather than re-issued,
 and it goes live at the point it stopped.
 
-One reading on such an entry is not this machine's: `paused_at` is the **worker's**
-clock, since when the execution asked is a fact about the run, while `expires_at`
-is this one's, because the deadline shown to a person has to be the deadline this
-process will fire — and the question gets the node's whole `timeout:` from the
-moment the wait lands here. Two machines' clocks disagree, so the gap between the
-two instants is not the `timeout:` and can even be negative. Read `expires_at`
-against the clock you are holding rather than against `paused_at`.
+Both instants on such an entry are **this** machine's, exactly as they are on a
+pause opened here: the question is dated when the wait lands on this board and
+`expires_at` is that instant plus the node's whole `timeout:`, so the gap between
+the two is the budget you wrote, whichever machine reached the node. The worker's
+own clock does not reach the status route — a deadline shown to a person has to be
+the deadline this process will fire, and two machines' clocks disagree.
 "##;
 
 /// The section a composition declaring a `store.*` gets.

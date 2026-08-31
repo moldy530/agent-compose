@@ -7052,6 +7052,15 @@ export interface RemotePause {
   readonly node: string;
   /** The node's `input:`, evaluated — what the human is shown (grammar 8.7). */
   readonly shown: Readonly<Record<string, unknown>>;
+  /**
+   * When the node reached the pause **on the worker's clock**.
+   *
+   * The first of the two instants that describe what the *worker* did, and like
+   * the second it is journaled on the settled dispatch row and never
+   * republished: the wait the hub plants is dated where it is planted, off the
+   * same reading its deadline is armed from ([`holdRemotePause`]), because a
+   * pair assembled out of two machines' clocks is an interval of nothing.
+   */
   readonly pausedAt: string;
   /**
    * When the budget runs out **on the worker's clock** — present exactly when
@@ -8189,23 +8198,32 @@ export async function runHuman(
  * lifecycle webhook fires for it because [`quiescent`] counts it, and
  * [`releaseHumanWaits`] drops it when the run ends.
  *
- * **Three things are the pause's own rather than this process's**, and each is a
+ * **Two things are the pause's own rather than this process's**, and each is a
  * durability rule rather than a convenience:
  *
  *  * the **identity** is the one the worker derived (grammar 9.4), so the hub
  *    plants the wait a local run would have opened at that site;
- *  * `paused_at` is the worker's, which is `docs/durability.md` §9's rule — "a
- *    reader of the resumed document sees what the execution did, not what this
- *    process did" — so when the execution asked is what a reader is shown,
- *    across a restart included;
  *  * the **contract** is the descriptor's, read out of [`humanNodes`]. The
  *    artifact is everywhere (`docs/distributed.md` §4.3), so the schema a UI is
  *    handed and the parser an answer is held to are this node's own — not a
  *    second reading of something that travelled.
  *
- * **The budget follows the third of those and not the second**, which is the one
- * place the two rules pull apart: a deadline is an instant, so the rule above it
- * would make it the worker's, and it may not be. The wire's `expires_at` is an
+ * **The instants are neither of those, and both are this planting's.** They are
+ * the two lines [`runHuman`] opens a local wait with, off one `Date.now()`
+ * reading, and that is what PRD resolved q46's parity bar asks of them: a wait's
+ * `pausedAt` is when the generation holding the question began holding it and
+ * its `expiresAt` is when that generation will stop, so the pair a reader is
+ * shown is exactly the node's `timeout:` apart on either side of the wire. The
+ * wire's own two instants (`docs/distributed.md` §3.4) are the *worker's*
+ * readings, journaled on the settled dispatch row as what that machine's clock
+ * said and never republished here — because two machines' clocks disagree, and a
+ * pair assembled out of both is an interval of nothing. Dating this wait off the
+ * wire's `paused_at` and this hub's deadline is the entry `docs/durability.md`
+ * §3.4 refuses by name: on a worker running ahead of this hub it files an answer
+ * that arrives before its question.
+ *
+ * **The budget follows the contract and not the wire**, which is the rule the
+ * paragraph above is the reader's side of. The wire's `expires_at` is an
  * instant stamped by the *worker's* clock, and two machines' clocks disagree —
  * so a timer armed at `Date.parse(expires_at) - Date.now()` would give a
  * `timeout: 5m` node no time at all on a worker ten minutes behind this hub, and
@@ -8228,16 +8246,15 @@ export async function runHuman(
  * and after a restart the predecessor's instant says the same of an outage
  * longer than the budget. One derivation, beside the arming, for both plantings.
  *
- * **What those two rules leave is a pair read off two clocks**, and
- * `docs/distributed.md` §3.4 records it as the one line of q46's parity a placed
- * pause does not hold: `expiresAt − pausedAt` here is the budget plus however far
- * the machines disagree, so it is not the node's `timeout:` — it is short of it
- * on a worker running ahead of this hub, and negative once that lead passes the
- * budget — where the same node unplaced dates both members off one reading. What
- * a reader is owed is the deadline against its own now, which is what deriving it
- * here gives it; the divergence is written down rather than removed, because
- * removing it means breaking one of the two rules above and both are
- * load-bearing.
+ * **A restart re-dates the pause, exactly as a re-parked local wait is
+ * re-dated.** A hub that re-derives an unanswered pause off the settled row
+ * plants it here again, so both of its instants are the new generation's and
+ * their difference is the whole `timeout:` — which is what the same node
+ * unplaced does, because an unanswered wait journals nothing (resolved q28) and
+ * a resumed generation opens it from scratch (`docs/durability.md` §5). What the
+ * worker's clock said survives on the settled dispatch row, which is where a
+ * reader asking when *that machine* reached the node finds it; it is not the
+ * date of a wait no process was holding.
  *
  * Answers the record the hub journals — through `keep`, the caller's writer,
  * called **inside** the settlement for the reason [`runHuman`]'s own `slot.keep`
@@ -8284,21 +8301,22 @@ export async function holdRemotePause(
       } (docs/distributed.md §3.4)`,
     );
   }
-  // **The wait's own instants, on the clock that will fire them.** `pausedAt` is
-  // the pause's — when the execution asked is a fact about the run — and the
-  // deadline is this planting's, derived here from the same `began` the timer
-  // below is armed off. Those are [`runHuman`]'s own two lines, and for its
-  // reason: a reader is shown the instant the wait will actually end at. The
-  // pair is therefore two clocks' readings and their difference is not the
-  // budget (`docs/distributed.md` §3.4) — the deadline is the member a reader
-  // compares against its own now.
+  // **The wait's own instants, both off the clock that will fire them.** These
+  // are [`runHuman`]'s own two lines, character for character, and that is the
+  // point: one `Date.now()` reading dates the wait this hub is opening and the
+  // deadline it is arming, so the pair a status route publishes is the node's
+  // `timeout:` apart whichever machine the question came from. The wire's own
+  // `paused_at` and `expires_at` are the worker's readings of its own clock —
+  // journaled on the settled dispatch row, never republished here
+  // (`docs/distributed.md` §3.4).
   const began = Date.now();
+  const pausedAt = new Date(began).toISOString();
   const expiresAt =
     descriptor.timeoutMs === undefined
       ? undefined
       : new Date(began + descriptor.timeoutMs).toISOString();
   const instants: Omit<JournaledInstants, "settledAt"> = {
-    pausedAt: remote.pausedAt,
+    pausedAt,
     ...(expiresAt === undefined ? {} : { expiresAt }),
   };
   const opened: HumanPause = instants;
@@ -8309,7 +8327,7 @@ export async function holdRemotePause(
     node: remote.node,
     shown: remote.shown,
     schema: descriptor.schema,
-    pausedAt: remote.pausedAt,
+    pausedAt,
     ...(expiresAt === undefined ? {} : { expiresAt }),
   };
 
