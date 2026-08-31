@@ -230,13 +230,12 @@ fn hold(data_dir: &Path, hash: &str) -> Result<(), String> {
 
 /// `bun install`, in a materialised tree (§4 step 4).
 ///
-/// Skipped where the pinned dependency set **already resolves** from the tree.
-/// Module resolution walks up, so an artifact materialised beneath a directory
-/// that holds the install needs no second copy of it — which is the same reading
-/// `agent-compose run` takes of the same question (`launch::dependencies`), and
-/// the arrangement a monorepo and this suite's own toolchain both are. A worker
-/// that installed anyway would be re-downloading a dependency set it can already
-/// import, on every artifact it is ever served.
+/// Skipped where the pinned dependency set **already resolves at the version
+/// this artifact pins** ([`resolves`]). Module resolution walks up, so an
+/// artifact materialised beneath a directory that holds that install needs no
+/// second copy of it — the arrangement a monorepo and this suite's own toolchain
+/// both are. A worker that installed anyway would be re-downloading a dependency
+/// set it can already import, on every artifact it is ever served.
 pub(crate) fn install(bun: &Path, tree: &Path) -> Result<(), String> {
     if resolves(tree) {
         return Ok(());
@@ -258,13 +257,67 @@ pub(crate) fn install(bun: &Path, tree: &Path) -> Result<(), String> {
     ))
 }
 
-/// Whether the pinned dependency set already resolves from this tree.
+/// The one package every emitted project imports, and the one §4 step 4 is
+/// really about.
+const SUBSTRATE: &str = "@langchain/langgraph";
+
+/// Whether the pinned dependency set already resolves from this tree — **at the
+/// version this artifact pins**.
 ///
-/// The one package every emitted project imports, looked for the way the
-/// runtime looks for it: up the directory chain from where the import is made.
+/// Looked for the way the runtime looks for it: up the directory chain from
+/// where the import is made, taking the nearest `node_modules` and no other,
+/// because that is the copy an import from inside the tree reaches.
+///
+/// The version is the half a bare "is the directory there" would drop, and it is
+/// the half that matters here. `agent-compose run` asks the same question of a
+/// project **built on the machine that runs it** (`launch::dependencies`), and
+/// answers a missing install by refusing; a served artifact is neither built
+/// here nor refused — it arrived over the wire and was materialised under a data
+/// directory the operator chose, which may sit inside an unrelated JavaScript
+/// project whose own install is a LangGraph this compiler release never pinned.
+/// §4.1: "what pins the required major is the compiler release — the same
+/// release that pins the LangGraph version", and the handshake triple refuses a
+/// mismatched pair at join for exactly that reason. A skew reached *after* a
+/// clean join would be the same fault arriving later and quieter — as a runtime
+/// error inside a dispatched node, if it says anything at all — so what an
+/// ancestor holds has to be the version the artifact asks for, and where it is
+/// not, step 4 runs.
 fn resolves(tree: &Path) -> bool {
-    tree.ancestors()
-        .any(|directory| directory.join("node_modules/@langchain/langgraph").is_dir())
+    let Some(wanted) = pinned(tree) else {
+        return false;
+    };
+    for directory in tree.ancestors() {
+        let installed = directory.join("node_modules").join(SUBSTRATE);
+        if !installed.is_dir() {
+            continue;
+        }
+        return installed_version(&installed).is_some_and(|found| found == wanted);
+    }
+    false
+}
+
+/// What this artifact's own `package.json` pins [`SUBSTRATE`] at.
+///
+/// Read out of the tree rather than taken from this binary's own constant: the
+/// artifact is what states what it needs, and a worker that trusted its own copy
+/// of the pin would be checking the install against a number the tree never
+/// mentioned. `None` — an unreadable manifest, or one naming no such dependency
+/// — sends the caller to the install, which is the answer that cannot be wrong.
+fn pinned(tree: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(tree.join("package.json")).ok()?;
+    let document: Value = serde_json::from_str(&text).ok()?;
+    document
+        .get("dependencies")?
+        .get(SUBSTRATE)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The `version` an installed package's own `package.json` declares.
+fn installed_version(package: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(package.join("package.json")).ok()?;
+    let document: Value = serde_json::from_str(&text).ok()?;
+    document.get("version")?.as_str().map(str::to_string)
 }
 
 /// What one materialised artifact says a worker needs — `manifest.json`.
@@ -681,6 +734,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// The version this compiler release pins the execution substrate at, which
+    /// is the version an emitted `package.json` names.
+    fn pin() -> &'static str {
+        compose_core::codegen::project::PINS
+            .iter()
+            .find(|(package, _)| *package == SUBSTRATE)
+            .map(|(_, version)| *version)
+            .expect("every emitted project pins the execution substrate")
+    }
+
+    /// Give `tree` a `package.json` pinning `wants`, and stage an install of
+    /// `holds` where an import from inside the tree would find one.
+    fn stage(tree: &Path, wants: &str, holds: &str) {
+        std::fs::write(
+            tree.join("package.json"),
+            format!("{{ \"dependencies\": {{ \"{SUBSTRATE}\": \"{wants}\" }} }}\n"),
+        )
+        .expect("the artifact's manifest is written");
+        let installed = tree.join("node_modules").join(SUBSTRATE);
+        std::fs::create_dir_all(&installed).expect("the package is staged");
+        std::fs::write(
+            installed.join("package.json"),
+            format!("{{ \"name\": \"{SUBSTRATE}\", \"version\": \"{holds}\" }}\n"),
+        )
+        .expect("the staged package's manifest is written");
+    }
+
+    /// An install above a materialised tree stands in for §4 step 4 only where
+    /// it is the version **this artifact** pins (§4.1).
+    ///
+    /// What this is written against is a worker started inside an unrelated
+    /// JavaScript project — or with a stray `node_modules` anywhere above its
+    /// data directory. A skip that asked only whether the directory exists would
+    /// leave the artifact's own pins uninstalled and run a dispatched node
+    /// against whatever that other install holds: "what pins the required major
+    /// is the compiler release — the same release that pins the LangGraph
+    /// version", and the handshake triple refuses a mixed pair at join precisely
+    /// so that skew cannot happen. Reached this way it would arrive *after* a
+    /// clean join, as a runtime error inside a node if it said anything at all.
+    #[test]
+    fn an_install_above_the_tree_stands_in_only_at_the_version_the_artifact_pins() {
+        let scratch = scratch("resolution");
+        let (hash, tarball) = artifact("resolvable");
+        let tree = materialise(&scratch, &hash, &tarball).expect("it materialises");
+
+        stage(&tree, pin(), "0.0.1-not-the-pin");
+        assert!(
+            !resolves(&tree),
+            "an install of another LangGraph stood in for the one this artifact pins"
+        );
+
+        // The same directory, holding what the artifact asks for: this is the
+        // copy the import reaches, so step 4 would be a download of what is
+        // already there.
+        stage(&tree, pin(), pin());
+        assert!(
+            resolves(&tree),
+            "the install this artifact's own pin names was not taken up"
+        );
+
+        // An install with no manifest to read a version out of says nothing
+        // about which LangGraph it is, and nothing is not the right one.
+        std::fs::remove_file(
+            tree.join("node_modules")
+                .join(SUBSTRATE)
+                .join("package.json"),
+        )
+        .expect("the staged manifest is removed");
+        assert!(!resolves(&tree));
+
+        // …and an artifact whose own manifest names no such dependency is one
+        // nothing above it can answer for either.
+        stage(&tree, pin(), pin());
+        std::fs::write(tree.join("package.json"), "{ \"private\": true }\n")
+            .expect("the manifest is rewritten");
+        assert!(!resolves(&tree));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// §4 step 4 runs, in a materialised tree, and is skipped where the pinned
     /// set already resolves.
     ///
@@ -706,8 +838,8 @@ mod tests {
         let tree = materialise(&scratch, &hash, &tarball).expect("it materialises");
         assert!(
             !resolves(&tree),
-            "this scratch tree resolves the pinned set from an ancestor, so the install below \
-             would be skipped and this test would check nothing: {}",
+            "this scratch tree already resolves what it pins, so the install below would be \
+             skipped and this test would check nothing: {}",
             tree.display()
         );
         install(&bun, &tree).expect("the install runs in the materialised tree");
@@ -721,8 +853,7 @@ mod tests {
         // re-downloading a dependency set it can already import". The program
         // handed over is one that does not exist, so an install that ran at all
         // would fail here.
-        std::fs::create_dir_all(tree.join("node_modules/@langchain/langgraph"))
-            .expect("the pinned package is staged");
+        stage(&tree, pin(), pin());
         assert!(resolves(&tree));
         install(Path::new("/no/such/bun"), &tree).expect("a resolvable tree runs no install");
 

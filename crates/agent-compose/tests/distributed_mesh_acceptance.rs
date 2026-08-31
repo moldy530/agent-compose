@@ -34,9 +34,16 @@
 //! A worker materialises the artifact and then installs its dependencies (§4
 //! step 4). Module resolution walks up, so a data directory beneath the suite's
 //! installed toolchain resolves the pinned set without a second install — which
-//! is what `worker::artifact::install` checks for and skips on, exactly as
-//! `agent-compose run` does. The alternative would be one `bun install` from the
-//! network per test.
+//! is what `worker::artifact::install` checks for and skips on. The alternative
+//! would be one `bun install` from the network per test.
+//!
+//! The check is on the **version** and not on the directory: the toolchain
+//! fixture pins what the emitter pins
+//! (`the_toolchain_fixture_pins_what_the_emitter_pins`), so what is installed
+//! above these data directories is the LangGraph the artifact's own
+//! `package.json` names, which is the only install §4.1 lets stand in for step
+//! 4. A toolchain that drifted off the emitter's pins would run the step here
+//! rather than execute a node under a LangGraph this release never pinned.
 //!
 //! So step 4 is **skipped in this file**, and is checked where it can be run
 //! without a network: `worker::artifact`'s own
