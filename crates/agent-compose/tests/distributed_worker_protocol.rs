@@ -437,7 +437,16 @@ impl Worker {
         ));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).expect("a data directory");
+        Self::over(hub, data_dir, extra)
+    }
 
+    /// A worker over a data directory that is **already there** — one that comes
+    /// back holding whatever its predecessor materialised.
+    fn resuming(hub: &FixtureHub, data_dir: &std::path::Path) -> Self {
+        Self::over(hub, data_dir.to_path_buf(), &[])
+    }
+
+    fn over(hub: &FixtureHub, data_dir: PathBuf, extra: &[(String, String)]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agent-compose"));
         command
             .arg("worker")
@@ -503,6 +512,22 @@ impl Worker {
         }
         let said = self.transcript();
         panic!("the worker never exited; it said:\n{said}");
+    }
+
+    /// Kill this worker and its group, and leave its data directory alone.
+    ///
+    /// What a machine restarted between deployments looks like: the process is
+    /// gone and what it materialised is not.
+    fn stop(&mut self) {
+        #[cfg(unix)]
+        if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+            // SAFETY: a child of this process, spawned into its own group and
+            // not yet reaped.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
     }
 }
 
@@ -603,14 +628,22 @@ fn a_cold_start_joins_twice_and_only_the_second_join_carries_a_report() {
         Some(format!("Bearer {TOKEN}").as_str())
     );
     // …and the tree is on disk, hashed before it was written (§4 step 2).
+    let tree = worker.data_dir.join("artifacts").join(&hash);
     assert!(
-        worker
-            .data_dir
-            .join("artifacts")
-            .join(&hash)
-            .join("runner.ts")
-            .is_file(),
+        tree.join("runner.ts").is_file(),
         "the worker did not materialise what it fetched; it said:\n{}",
+        worker.transcript()
+    );
+    // §4 step 4 ran in it, rather than being skipped. These data directories sit
+    // under the system temporary directory and resolve no pinned set from an
+    // ancestor, so `install` takes the branch that runs the command — which is
+    // the step `tests/distributed_mesh_acceptance.rs` deliberately elides by
+    // rooting its workers under the installed toolchain. The artifact this
+    // fixture serves declares no dependencies, so the install is offline and
+    // costs milliseconds; what it checks is that the step happens at all.
+    assert!(
+        tree.join("node_modules").is_dir(),
+        "the worker materialised the artifact and installed nothing into it; it said:\n{}",
         worker.transcript()
     );
 }
@@ -862,6 +895,111 @@ fn a_worker_holding_a_stale_artifact_joins_once_and_is_answered_with_the_current
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&held);
+}
+
+/// A hub rolled **back** to an artifact this worker still holds is not
+/// downloaded again (§4 step 3, §3.5).
+///
+/// The reason a worker's trees are keyed by hash: "so the previous artifact
+/// survives a rollback". Surviving is only worth the disk if the worker can
+/// answer out of it — a store that kept yesterday's tree and re-downloaded it
+/// anyway would have the cost of the property and not the property.
+///
+/// Three deployments over **one data directory**, which is what one machine
+/// across two redeployments is: yesterday's artifact, today's, and yesterday's
+/// again. What is asserted is the third: two joins, **no fetch**, and both trees
+/// still on the disk — the one in hand and the one it replaced, which is the
+/// pair §4 step 3 names.
+#[test]
+fn a_rollback_to_an_artifact_this_worker_still_holds_is_not_downloaded_again() {
+    let (before, yesterday) = artifact();
+    let (after, today) = redeployed_artifact();
+    assert_ne!(before, after, "the two artifacts hash differently");
+
+    // 1. A cold start onto yesterday's artifact.
+    let first_hub = FixtureHub::start();
+    first_hub.script("/workers/join", accepted(&before, "wrk_provisioning"));
+    first_hub.script("/workers/artifact", Reply::bytes(200, yesterday));
+    first_hub.always("/workers/join", accepted(&before, "wrk_ready"));
+    first_hub.always("/workers/poll", Reply::empty(204));
+    let mut worker = Worker::start(&first_hub, "rollback");
+    first_hub.until("materialised yesterday's artifact and polled", |asked| {
+        asked.iter().any(|request| request.path == "/workers/poll")
+    });
+    worker.stop();
+    let data_dir = worker.data_dir.clone();
+
+    // 2. The redeployment: a hub serving today's, over the same data directory.
+    let second_hub = FixtureHub::start();
+    second_hub.always("/workers/join", accepted(&after, "wrk_after"));
+    second_hub.always("/workers/artifact", Reply::bytes(200, today));
+    second_hub.always("/workers/poll", Reply::empty(204));
+    let mut second = Worker::resuming(&second_hub, &data_dir);
+    second_hub.until("fetched today's artifact and polled", |asked| {
+        asked.iter().any(|request| request.path == "/workers/poll")
+    });
+    assert_eq!(
+        second_hub.asked_at("/workers/artifact").len(),
+        1,
+        "a worker that held neither of this hub's artifacts did not fetch exactly once"
+    );
+    second.stop();
+
+    // 3. The rollback. This hub's artifact route answers a body no worker should
+    //    ever ask it for, so a fetch here is a failing test rather than a
+    //    silently slower worker.
+    let third_hub = FixtureHub::start();
+    third_hub.always("/workers/join", accepted(&before, "wrk_rolled_back"));
+    third_hub.always(
+        "/workers/artifact",
+        Reply::json(
+            500,
+            &json!({ "error": "this artifact was already on the worker's disk" }),
+        ),
+    );
+    third_hub.always("/workers/poll", Reply::empty(204));
+    let mut third = Worker::resuming(&third_hub, &data_dir);
+    third_hub.until(
+        "joined under the rolled-back artifact and polled",
+        |asked| asked.iter().any(|request| request.path == "/workers/poll"),
+    );
+
+    assert!(
+        third_hub.asked_at("/workers/artifact").is_empty(),
+        "the worker re-downloaded an artifact it had materialised two deployments ago, which is \
+         what keying its trees by hash was for (§4 step 3); it said:\n{}",
+        third.transcript()
+    );
+    let joins = third_hub.asked_at("/workers/join");
+    assert_eq!(
+        joins.len(),
+        2,
+        "a worker takes up a tree it holds through the ordinary cycle: one join to be told the \
+         hash, one to report against it: {joins:#?}"
+    );
+    assert_eq!(
+        joins[0].body["artifact_hash"],
+        json!(after),
+        "the first join does not carry the artifact this worker was executing out of: {:#}",
+        joins[0].body
+    );
+    assert_eq!(
+        joins[1].body["artifact_hash"],
+        json!(before),
+        "the second join does not report against the artifact this hub rolled back to: {:#}",
+        joins[1].body
+    );
+    // Both trees are still here: the one in hand, and the one a roll-forward
+    // would ask for next.
+    assert!(data_dir.join("artifacts").join(&before).is_dir());
+    assert!(data_dir.join("artifacts").join(&after).is_dir());
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("held"))
+            .expect("the worker records which artifact it holds")
+            .trim(),
+        before
+    );
+    third.stop();
 }
 
 // ---------------------------------------------------------------------------

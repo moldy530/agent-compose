@@ -16,9 +16,15 @@
 //! ```text
 //! join ──▶ the hub names an artifact
 //!            ├── the one this worker holds ──▶ dispatchable, no download
+//!            ├── one it materialised earlier ──▶ taken up, no download
 //!            └── another (or this worker holds none)
 //!                  └─▶ fetch ─▶ verify ─▶ materialise ─▶ bun install ─▶ join again
 //! ```
+//!
+//! The middle row is the rollback §4 step 3 keys a worker's trees by hash for:
+//! the store holds the artifact in hand and the one it replaced, so a hub rotated
+//! back to yesterday's costs a pointer write rather than a transfer
+//! ([`artifact::adopt`]).
 //!
 //! The cycle is entered from three places and from nowhere else: at start, when
 //! a join names a hash this worker does not hold, and when a fetch meets §3.5's
@@ -202,6 +208,12 @@ pub(crate) fn run(options: &Options) -> ExitCode {
 }
 
 /// Fetch, verify, materialise and install one artifact (§4 steps 2–4).
+///
+/// **Unless this worker already has it.** §4 step 3 keys the trees by hash "so
+/// the previous artifact survives a rollback", and surviving means being taken
+/// up again: a hub rotated back to an artifact this worker materialised under an
+/// earlier deployment is answered out of [`artifact::adopt`], with no fetch and
+/// no unpack. The steps below are for a hash this machine has never held.
 fn provision(
     hub: &Hub,
     bun: &Path,
@@ -209,6 +221,11 @@ fn provision(
     hash: &str,
     backoff: &mut Backoff,
 ) -> Result<(), String> {
+    if let Some(tree) = artifact::adopt(data_dir, hash) {
+        artifact::install(bun, &tree)?;
+        backoff.reset();
+        return Ok(());
+    }
     let tarball = loop {
         match hub.artifact(hash, None) {
             Answer::Said(said) if said.status == 200 => break said.body,

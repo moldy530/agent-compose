@@ -39,13 +39,38 @@
 //! # The data directory
 //!
 //! ```text
-//! <data-dir>/held                  the hash this worker materialised last
+//! <data-dir>/held                  the hash this worker is executing out of
 //! <data-dir>/artifacts/<hash>/     one tree per hash, so a rollback survives
+//! <data-dir>/artifacts/<hash>/.materialised   written last: this tree is whole
 //! ```
 //!
 //! Keyed by hash because §4 step 3 says so — "so the previous artifact survives a
 //! rollback" — and `held` because a worker that has just started has to know
 //! which of them it is holding without asking anything.
+//!
+//! **Surviving a rollback is a property of two functions and not of the layout
+//! alone.** A tree kept under a name nothing ever looks up again is a directory
+//! this worker pays for and never reads, so:
+//!
+//! * [`adopt`] is what §4 step 1 compares against on the way *back*: a hash this
+//!   worker has materialised before is one it holds, whether or not it is the one
+//!   it was executing out of, so a hub rotated back to yesterday's artifact costs
+//!   a pointer write rather than a download.
+//! * [`materialise`] and [`adopt`] both **prune**: what survives is the tree in
+//!   hand and the one it replaced, which is exactly the pair §4 step 3's sentence
+//!   names. Without it a worker on a mesh that redeploys daily keeps one complete
+//!   project tree per deployment for ever.
+//!
+//! The marker file is what makes an adoption safe. Files are written in path
+//! order and the marker after all of them, so a worker killed mid-materialise
+//! leaves a tree that [`adopt`] refuses — the alternative, adopting whatever
+//! directory carries the right name, would execute half an artifact under a hash
+//! that promises the whole of it. It records a verification that has already
+//! happened: the bytes were hashed before any of them were written, and the
+//! marker says which hash they answered to. Its name is one no build emits
+//! (`ARTIFACT_FILES` is the emitter's own list), and a tarball that carried one
+//! anyway would have it overwritten rather than believed — it is written last,
+//! after every entry the archive held.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -59,10 +84,13 @@ fn trees(data_dir: &Path) -> PathBuf {
     data_dir.join("artifacts")
 }
 
-/// The file naming the hash this worker materialised last.
+/// The file naming the hash this worker is executing out of.
 fn held_path(data_dir: &Path) -> PathBuf {
     data_dir.join("held")
 }
+
+/// The file a whole tree carries, written after every other one.
+const MARKER: &str = ".materialised";
 
 /// The artifact this worker is holding, if any — its hash and its tree.
 ///
@@ -71,15 +99,50 @@ fn held_path(data_dir: &Path) -> PathBuf {
 /// start, the first minute of a new machine's life".
 #[must_use]
 pub(crate) fn held(data_dir: &Path) -> Option<(String, PathBuf)> {
-    let hash = std::fs::read_to_string(held_path(data_dir)).ok()?;
-    let hash = hash.trim().to_string();
-    if !well_formed(&hash) {
-        return None;
-    }
-    let tree = trees(data_dir).join(&hash);
+    let hash = pointer(data_dir)?;
     // The pointer and the tree have to agree: a directory removed under a
     // worker is a worker that holds nothing, not one that holds a name.
-    tree.join("manifest.json").is_file().then_some((hash, tree))
+    let tree = whole(data_dir, &hash)?;
+    Some((hash, tree))
+}
+
+/// The hash `held` names, where it names a well-formed one.
+fn pointer(data_dir: &Path) -> Option<String> {
+    let hash = std::fs::read_to_string(held_path(data_dir)).ok()?;
+    let hash = hash.trim().to_string();
+    well_formed(&hash).then_some(hash)
+}
+
+/// The tree for `hash` under this data directory, where a whole one is there.
+///
+/// Whole means the marker is present and names this hash — see the module
+/// header for why that and not the presence of a file the artifact happens to
+/// carry.
+fn whole(data_dir: &Path, hash: &str) -> Option<PathBuf> {
+    if !well_formed(hash) {
+        return None;
+    }
+    let tree = trees(data_dir).join(hash);
+    let stamped = std::fs::read_to_string(tree.join(MARKER)).ok()?;
+    (stamped.trim() == hash).then_some(tree)
+}
+
+/// Take up an artifact this worker has materialised before, without a download.
+///
+/// The other half of §4 step 1: the join names a hash, and what this worker
+/// holds is not only the one it was last executing out of. A hub rolled back to
+/// an artifact still on this disk is answered from disk — which is the property
+/// §4 step 3 keys the trees by hash *for*, and without this the retention would
+/// be storage nobody ever reads.
+///
+/// `None` where no whole tree of that hash is here, which sends the caller to
+/// the fetch. A pointer this could not write is `None` too: re-downloading an
+/// artifact is slow and correct, and the write is attempted again — and reported
+/// properly — by [`materialise`].
+pub(crate) fn adopt(data_dir: &Path, hash: &str) -> Option<PathBuf> {
+    let tree = whole(data_dir, hash)?;
+    hold(data_dir, hash).ok()?;
+    Some(tree)
 }
 
 /// Whether a string is an artifact hash as §3.5 writes one.
@@ -127,11 +190,42 @@ pub(crate) fn materialise(data_dir: &Path, hash: &str, tarball: &[u8]) -> Result
         std::fs::write(&target, bytes)
             .map_err(|error| format!("cannot write `{}`: {error}", target.display()))?;
     }
-    // The pointer last, so a worker killed mid-write comes back holding the
-    // artifact it had rather than a name with half a tree behind it.
-    std::fs::write(held_path(data_dir), format!("{hash}\n"))
-        .map_err(|error| format!("cannot record which artifact this worker holds: {error}"))?;
+    // The marker after every file of the tree, so what [`adopt`] later takes up
+    // is a tree that was finished rather than one that was started.
+    std::fs::write(tree.join(MARKER), format!("{hash}\n"))
+        .map_err(|error| format!("cannot mark `{}` materialised: {error}", tree.display()))?;
+    // …and the pointer last of all, so a worker killed mid-write comes back
+    // holding the artifact it had rather than a name with half a tree behind it.
+    hold(data_dir, hash)?;
     Ok(tree)
+}
+
+/// Point `held` at `hash`, and drop every tree but this one and the one it
+/// replaces (§4 step 3).
+///
+/// Two, and not one: "so the previous artifact survives a rollback" is a promise
+/// about the artifact this one replaced, and a store that kept every tree it
+/// ever wrote would honour it by never reclaiming anything — one complete
+/// generated project per deployment, for the life of the machine.
+///
+/// The prune runs **before** the pointer moves, so a worker killed between them
+/// comes back holding a tree that is still there: what it would have dropped is
+/// what it is no longer pointing at.
+fn hold(data_dir: &Path, hash: &str) -> Result<(), String> {
+    let replaced = pointer(data_dir);
+    let keeping = [Some(hash), replaced.as_deref()];
+    if let Ok(entries) = std::fs::read_dir(trees(data_dir)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let named = name.to_string_lossy();
+            if keeping.iter().any(|kept| *kept == Some(named.as_ref())) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    std::fs::write(held_path(data_dir), format!("{hash}\n"))
+        .map_err(|error| format!("cannot record which artifact this worker holds: {error}"))
 }
 
 /// `bun install`, in a materialised tree (§4 step 4).
@@ -467,6 +561,181 @@ mod tests {
         // The report is what this machine has, never what the manifest names:
         // `KEYCHAIN_PASSWORD` is not set here, so nothing is reported.
         assert!(read.env_ok(&["mac".to_string()]).is_empty());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A data directory of this test's own.
+    fn scratch(purpose: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "agent-compose-worker-{purpose}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("a scratch directory");
+        path
+    }
+
+    /// One artifact whose content is `marking`, as a tarball and its hash.
+    fn artifact(marking: &str) -> (String, Vec<u8>) {
+        let package = format!("{{ \"name\": \"{marking}\", \"private\": true }}\n");
+        let manifest = b"{ \"node_runner\": \"src/worker-node.ts\", \"placements\": [] }\n";
+        let mut blocks = entry("manifest.json", manifest, b'0');
+        blocks.extend(entry("package.json", package.as_bytes(), b'0'));
+        blocks.extend(entry("src/graph.ts", marking.as_bytes(), b'0'));
+        blocks.extend(vec![0u8; 1024]);
+        let tarball = gzipped(blocks);
+        let read = entries(&tarball).expect("the archive reads");
+        let hash = compose_core::codegen::artifact::hash_of(
+            read.iter().map(|(path, bytes)| (path.as_str(), &bytes[..])),
+        );
+        (hash, tarball)
+    }
+
+    /// A hub rolled back to an artifact this worker still has costs no download
+    /// (§4 step 3, §3.5's rollback row).
+    ///
+    /// The reason the trees are keyed by hash at all: "so the previous artifact
+    /// survives a rollback". Surviving means being **taken up** — a store that
+    /// kept the tree and could not answer out of it would be paying for a
+    /// property it does not have, and the fetch would run again over bytes
+    /// already on the disk.
+    #[test]
+    fn a_rollback_to_a_tree_this_worker_still_holds_is_taken_up_without_a_download() {
+        let scratch = scratch("rollback");
+        let (before, yesterday) = artifact("yesterday");
+        let (after, today) = artifact("today");
+        let previous = materialise(&scratch, &before, &yesterday).expect("yesterday materialises");
+        materialise(&scratch, &after, &today).expect("today materialises");
+        assert_eq!(held(&scratch).map(|(hash, _)| hash), Some(after.clone()));
+
+        // The rollback: the hub names the artifact this worker replaced, and it
+        // is answered off the disk.
+        assert_eq!(
+            adopt(&scratch, &before),
+            Some(previous.clone()),
+            "the tree this worker kept for a rollback was not taken up"
+        );
+        assert_eq!(
+            held(&scratch),
+            Some((before.clone(), previous)),
+            "the adoption did not become the artifact this worker executes out of"
+        );
+        // …and the one it rolled back *from* is still there, because that is now
+        // the artifact a roll-forward would ask for.
+        assert!(trees(&scratch).join(&after).is_dir());
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The store is the artifact in hand and the one it replaced, and never a
+    /// third (§4 step 3).
+    ///
+    /// A worker on a mesh that redeploys daily would otherwise keep one complete
+    /// generated project per deployment for the life of the machine: nothing in
+    /// this module ever removed a tree it was not about to rewrite.
+    #[test]
+    fn the_store_keeps_the_artifact_in_hand_and_the_one_it_replaced() {
+        let scratch = scratch("retention");
+        let mut written = Vec::new();
+        for marking in ["first", "second", "third"] {
+            let (hash, tarball) = artifact(marking);
+            materialise(&scratch, &hash, &tarball).expect("it materialises");
+            written.push(hash);
+        }
+        let kept: std::collections::BTreeSet<String> = std::fs::read_dir(trees(&scratch))
+            .expect("the store is there")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            kept,
+            [written[1].clone(), written[2].clone()]
+                .into_iter()
+                .collect(),
+            "the store kept something other than the artifact in hand and the one it replaced"
+        );
+        assert_eq!(
+            adopt(&scratch, &written[0]),
+            None,
+            "a tree this worker dropped was taken up as though it were still there"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A tree that was started and not finished is not one to execute out of.
+    ///
+    /// What the marker is for: the files are written in path order, so a worker
+    /// killed part way through leaves a directory named by a hash whose content
+    /// is not that hash's. Adopting it would run half an artifact.
+    #[test]
+    fn a_tree_left_half_written_is_neither_held_nor_taken_up() {
+        let scratch = scratch("half-written");
+        let (hash, tarball) = artifact("interrupted");
+        let tree = materialise(&scratch, &hash, &tarball).expect("it materialises");
+        std::fs::remove_file(tree.join(MARKER)).expect("the marker is removed");
+        assert_eq!(adopt(&scratch, &hash), None);
+        assert_eq!(
+            held(&scratch),
+            None,
+            "a worker holding a pointer at a tree that was never finished said it holds it"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// §4 step 4 runs, in a materialised tree, and is skipped where the pinned
+    /// set already resolves.
+    ///
+    /// The step every other suite elides: `tests/distributed_mesh_acceptance.rs`
+    /// roots its workers' data directories under the installed toolchain, so
+    /// `resolves` is true there and no install is ever entered. Here it is
+    /// false, so this is the one place the command in [`install`] is really run
+    /// — over an artifact whose dependency set is empty, which is what makes it
+    /// a check on the *step* rather than on a network.
+    #[test]
+    fn a_materialised_tree_has_its_dependency_set_installed() {
+        let Ok(bun) = crate::worker::bun() else {
+            assert!(
+                std::env::var_os("CI").is_none_or(|value| value.is_empty()),
+                "CI runs with Bun installed (`docs/distributed.md` §4.2), so §4 step 4 is \
+                 unchecked here rather than skipped"
+            );
+            eprintln!("skipping: no `bun` on this machine, so §4 step 4 cannot be run");
+            return;
+        };
+        let scratch = scratch("install");
+        let (hash, tarball) = artifact("installable");
+        let tree = materialise(&scratch, &hash, &tarball).expect("it materialises");
+        assert!(
+            !resolves(&tree),
+            "this scratch tree resolves the pinned set from an ancestor, so the install below \
+             would be skipped and this test would check nothing: {}",
+            tree.display()
+        );
+        install(&bun, &tree).expect("the install runs in the materialised tree");
+        assert!(
+            tree.join("node_modules").is_dir(),
+            "`bun install` answered success and left no install behind: {}",
+            tree.display()
+        );
+        // …and a tree that already resolves the pinned set skips the step rather
+        // than repeating it: "a worker that installed anyway would be
+        // re-downloading a dependency set it can already import". The program
+        // handed over is one that does not exist, so an install that ran at all
+        // would fail here.
+        std::fs::create_dir_all(tree.join("node_modules/@langchain/langgraph"))
+            .expect("the pinned package is staged");
+        assert!(resolves(&tree));
+        install(Path::new("/no/such/bun"), &tree).expect("a resolvable tree runs no install");
+
+        // An install that cannot run is the provisioning cycle's failure, and it
+        // says which tree and what the command said.
+        let broken = trees(&scratch).join("broken");
+        std::fs::create_dir_all(&broken).expect("a second tree");
+        std::fs::write(broken.join("package.json"), "{ not a manifest\n").expect("it is written");
+        let refused = install(&bun, &broken).expect_err("a tree that cannot install");
+        assert!(
+            refused.contains(&broken.display().to_string()),
+            "the failure does not name the tree it happened in: {refused}"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
