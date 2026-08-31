@@ -33,6 +33,11 @@ use serde_json::{Value, json};
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
 
+/// The wire version this build's hub speaks (§10), read off the compiler rather
+/// than written out: a bump this file did not follow would refuse every join
+/// here for a reason that has nothing to do with what each test is asking.
+const PROTOCOL: u32 = compose_core::codegen::mesh::PROTOCOL_VERSION;
+
 /// The credential every worker in this file presents.
 const TOKEN: &str = "a-join-token-nobody-else-has";
 
@@ -99,7 +104,7 @@ impl Hub {
     /// A join that is well formed in every field but the ones `body` overrides.
     fn joining(&self, overrides: &[(&str, Value)]) -> Response {
         let mut body = json!({
-            "protocol": 1,
+            "protocol": PROTOCOL,
             "compiler": compiler_version(),
             "runtime": "bun 1.2.3",
             "claims": ["mac"],
@@ -319,7 +324,7 @@ fn every_join_refusal_is_the_status_and_the_shape_the_document_gives_it() {
     let refused = hub.send(
         Request::post("/workers/join")
             .header("authorization", "Bearer not-the-token")
-            .json(&json!({ "protocol": 1, "compiler": compiler_version(), "runtime": "bun 1.2", "claims": ["mac"] })),
+            .json(&json!({ "protocol": PROTOCOL, "compiler": compiler_version(), "runtime": "bun 1.2", "claims": ["mac"] })),
     );
     assert_eq!(refused.status, 401, "{}", body_of(&refused));
     assert!(
@@ -329,14 +334,14 @@ fn every_join_refusal_is_the_status_and_the_shape_the_document_gives_it() {
     );
 
     // …and a request with no credential at all is the same refusal.
-    let anonymous = hub.send(Request::post("/workers/join").json(&json!({ "protocol": 1 })));
+    let anonymous = hub.send(Request::post("/workers/join").json(&json!({ "protocol": PROTOCOL })));
     assert_eq!(anonymous.status, 401);
 
     // The wire, before anything about the deployment (§10).
     let ahead = hub.joining(&[("protocol", json!(99))]);
     assert_eq!(ahead.status, 409, "{}", body_of(&ahead));
     let said = ahead.json();
-    assert_eq!(said["protocol"], json!(1), "{}", body_of(&ahead));
+    assert_eq!(said["protocol"], json!(PROTOCOL), "{}", body_of(&ahead));
     assert_eq!(said["worker_protocol"], json!(99), "{}", body_of(&ahead));
 
     // …and a version this hub cannot **compare** is the same refusal, without
@@ -395,7 +400,7 @@ fn every_join_refusal_is_the_status_and_the_shape_the_document_gives_it() {
     // takes is answered `204`, the placement's work parks behind a worker both
     // ends believe is healthy, and nothing anywhere says why.
     let unnamed = hub.join(&json!({
-        "protocol": 1,
+        "protocol": PROTOCOL,
         "compiler": compiler_version(),
         "runtime": "bun 1.2.3",
     }));
@@ -529,7 +534,7 @@ fn a_provisioning_join_is_answered_and_never_dispatched_to() {
         .as_str()
         .expect("the answer names the artifact")
         .to_string();
-    assert_eq!(answer["protocol"], json!(1));
+    assert_eq!(answer["protocol"], json!(PROTOCOL));
     assert_eq!(answer["compiler"], json!(compiler_version()));
     assert_eq!(answer["poll_url"], json!("/workers/poll"));
     assert_eq!(
@@ -1786,6 +1791,352 @@ fn a_vanished_session_supersedes_its_dispatch_and_the_retry_carries_the_history(
         report["status"] == json!("completed")
     });
     assert_eq!(done["outputs"]["signature"], json!("signed-on-the-retry"));
+}
+
+// ---------------------------------------------------------------------------
+// §3.4 — the third ending: a result that settles a dispatch paused
+// ---------------------------------------------------------------------------
+
+/// The wait `flow.escalation`'s `ask` node opens on a worker, as §3.4 puts it on
+/// the wire.
+///
+/// Written out here rather than produced by a real worker, because that is what
+/// this suite is: `tests/distributed_mesh_acceptance.rs` runs the composition and
+/// watches a worker derive these; this speaks the document to the hub and asks
+/// whether it does what §3.4 says. The identities are the ones a real worker
+/// derives — grammar §9.4's instance path for the wait, and `<site>#human/<n>`
+/// for the record its answer is journaled under.
+fn paused_at(site: &str) -> Value {
+    json!({
+        "wait": format!("{site}/escalation/0/ask/0"),
+        "flow": "flow.escalation",
+        "node": "ask",
+        "shown": { "path": "dist/app" },
+        "paused_at": "2026-08-31T09:14:02.113Z",
+        "effect": {
+            "key": format!("{site}/escalation/0/ask/0#human/0"),
+            "site": format!("{site}/escalation/0/ask/0"),
+            "ordinal": 0,
+            "request": "{\"node\":\"ask\"}",
+        },
+    })
+}
+
+/// A paused result settles its dispatch, plants the wait on the hub's board, and
+/// the resume sends the node back through dispatch with the answered pause in
+/// its history (§3.4, §7.2, PRD resolved q46).
+///
+/// The whole of q46's mechanism on the wire, in the order a mesh meets it. What
+/// each half fails on is different: the `204` says the wire takes the third
+/// ending, the board says the hub kept the identity the worker derived, the
+/// second `204` says a paused result is settled and therefore idempotent, and
+/// the redispatch's `effect_history` says the answer is journaled where the
+/// replay will look for it.
+#[test]
+fn a_paused_result_settles_its_dispatch_and_plants_the_wait_on_the_hubs_board() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/escalations", &json!({ "path": "dist/app" }));
+
+    let dispatch = worker.dispatch(&hub);
+    let id = dispatch["dispatch_id"]
+        .as_str()
+        .expect("a dispatch id")
+        .to_string();
+    let site = dispatch["instance_path"]
+        .as_str()
+        .expect("a dispatch names its instance path")
+        .to_string();
+    // The model call this attempt made **before** the question, journaled by the
+    // hub: what the redispatch has to replay rather than re-issue (§7.3).
+    let handed = worker.effects(
+        &hub,
+        &id,
+        &json!([{
+            "key": format!("{site}#model/0"),
+            "site": site,
+            "kind": "model",
+            "ordinal": 0,
+            "request": "{\"model\":\"model.smart\"}",
+            "outcome": { "kind": "value", "value": { "text": "asking a person" } },
+        }]),
+    );
+    assert_eq!(handed.status, 204, "{}", body_of(&handed));
+
+    let pause = paused_at(&site);
+    let settled = hub.send(
+        worker
+            .request("POST", "/workers/result")
+            .json(&json!({ "dispatch_id": id, "paused": pause })),
+    );
+    assert_eq!(
+        settled.status,
+        204,
+        "a paused result did not settle its dispatch: {}",
+        body_of(&settled)
+    );
+
+    // **On the board, under the identity the worker derived** — published as a
+    // pause rather than as a placement wait, because it is one: an execution
+    // waiting for a person is `interrupted`, and the dispatch it was waiting for
+    // is over.
+    let wait = pause["wait"].as_str().expect("the pause names its wait");
+    let report = hub.until(&execution, "published the worker's pause", |report| {
+        report["interrupts"]
+            .as_array()
+            .is_some_and(|waits| !waits.is_empty())
+    });
+    assert_eq!(report["status"], json!("interrupted"), "{report:#}");
+    assert_eq!(
+        report["interrupts"][0]["wait_id"],
+        json!(wait),
+        "{report:#}"
+    );
+    assert_eq!(
+        report["interrupts"][0]["output_schema"]["properties"]["decision"]["enum"],
+        json!(["approve", "reject"]),
+        "the hub published a contract other than the `human:` node's own `output:`: {report:#}"
+    );
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(|waits| waits.is_empty()),
+        "a settled dispatch is still on the board as a placement wait: {report:#}"
+    );
+
+    // **Idempotent by `dispatch_id`, exactly as any settlement is.** Paused is a
+    // way of being settled, so a re-post is the `204` row and never the `409`
+    // one — and it plants no second wait, which is what the report after it says.
+    let again = hub.send(
+        worker
+            .request("POST", "/workers/result")
+            .json(&json!({ "dispatch_id": id, "paused": pause })),
+    );
+    assert_eq!(
+        again.status,
+        204,
+        "a re-posted paused result was not taken as the settlement the hub already holds: {}",
+        body_of(&again)
+    );
+    let once = hub.report(&execution);
+    assert_eq!(
+        once["interrupts"].as_array().map(Vec::len),
+        Some(1),
+        "a re-posted paused result planted a second wait: {once:#}"
+    );
+
+    // …and the session is **free**: it settled what it was holding, so the hub
+    // may hand it other work. Nothing is queued here, so what that looks like is
+    // an empty hold rather than a `204` over a session the hub thinks is busy.
+    let free = worker.poll(&hub);
+    assert_eq!(free.status, 204, "{}", body_of(&free));
+
+    // The ordinary resume surface answers it.
+    let answered = hub.send(
+        Request::post(format!(
+            "/executions/{execution}/resume?wait={}",
+            wait.replace('/', "%2F")
+        ))
+        .json(&json!({ "decision": "approve" })),
+    );
+    assert_eq!(answered.status, 202, "{}", body_of(&answered));
+
+    // …and the node re-enters dispatch: a new row at the same instance path,
+    // carrying the answered pause **and** the pre-pause model call, so the
+    // replay goes live past the question without re-issuing what was paid for.
+    let redispatch = worker.dispatch(&hub);
+    assert_ne!(
+        redispatch["dispatch_id"], dispatch["dispatch_id"],
+        "the answer resumed the settled dispatch rather than opening one: {redispatch:#}"
+    );
+    assert_eq!(redispatch["instance_path"], json!(site), "{redispatch:#}");
+    let history = redispatch["effect_history"]
+        .as_array()
+        .expect("a redispatch carries the history");
+    let keys: Vec<&str> = history
+        .iter()
+        .map(|record| record["key"].as_str().expect("a key"))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            format!("{site}#model/0"),
+            format!("{site}/escalation/0/ask/0#human/0"),
+        ],
+        "the redispatch does not carry the pre-pause call and the answered pause: {redispatch:#}"
+    );
+    let recorded = &history[1];
+    assert_eq!(recorded["kind"], json!("human"), "{recorded:#}");
+    assert_eq!(
+        recorded["outcome"]["value"]["settled"],
+        json!("resumed"),
+        "the pause is journaled as something other than an answered wait: {recorded:#}"
+    );
+    assert_eq!(
+        recorded["outcome"]["value"]["output"],
+        json!({ "decision": "approve" }),
+        "the journaled answer is not the one the person gave: {recorded:#}"
+    );
+    assert_eq!(
+        recorded["outcome"]["value"]["pausedAt"], pause["paused_at"],
+        "the record is dated by the hub rather than by the process that asked \
+         (docs/durability.md §9): {recorded:#}"
+    );
+    assert_eq!(
+        recorded["request"], pause["effect"]["request"],
+        "the hub derived the record's identity a second time instead of carrying the worker's, \
+         which is a `ReplayDivergence` waiting to happen: {recorded:#}"
+    );
+
+    // The redispatch finishes the node, and the flow ends on the hub.
+    let done = worker.settle(
+        &hub,
+        redispatch["dispatch_id"].as_str().expect("an id"),
+        &json!({ "approval": "the person approved" }),
+    );
+    assert_eq!(done.status, 204, "{}", body_of(&done));
+    let ended = hub.until(&execution, "completed", |report| {
+        report["status"] == json!("completed") || report["status"] == json!("failed")
+    });
+    assert_eq!(ended["status"], json!("completed"), "{ended:#}");
+    assert_eq!(
+        ended["outputs"]["approval"],
+        json!("the person approved"),
+        "the answer the redispatch produced is not what the graph wrote: {ended:#}"
+    );
+}
+
+/// A paused result the hub **cannot attribute** takes §3.4's own `409`
+/// (§3.4, §6.3).
+///
+/// Paused is a way of being settled, so it changes nothing about attribution: a
+/// dispatch the hub superseded has moved past every result, and a worker coming
+/// back with a question is told the same thing a worker coming back with an
+/// answer is told. Answering a paused result differently would make a pause a
+/// way *around* §6.3.
+#[test]
+fn a_paused_result_for_a_superseded_dispatch_is_refused_like_any_other() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let first = hub.worker();
+    // The retried flow, so the supersede is followed by an attempt this test can
+    // wait for: the redispatch arriving is what proves the first row is gone.
+    let execution = hub.start("/retried-releases", &json!({ "path": "dist/app" }));
+    let dispatch = first.dispatch(&hub);
+    let id = dispatch["dispatch_id"]
+        .as_str()
+        .expect("a dispatch id")
+        .to_string();
+    let site = dispatch["instance_path"]
+        .as_str()
+        .expect("a site")
+        .to_string();
+
+    // …and then the laptop closes: nothing else is sent on this session, the
+    // liveness window runs out, and the hub supersedes what it was holding.
+    let second = Worker {
+        session: hub.worker().session,
+    };
+    let redispatch = second.dispatch(&hub);
+    assert_ne!(redispatch["dispatch_id"], dispatch["dispatch_id"]);
+
+    // The revived worker's question is refused exactly as its answer would be.
+    let revived = hub.worker();
+    let late = hub.send(
+        revived
+            .request("POST", "/workers/result")
+            .json(&json!({ "dispatch_id": id, "paused": paused_at(&site) })),
+    );
+    assert_eq!(
+        late.status,
+        409,
+        "a paused result on a superseded dispatch was taken: {}",
+        body_of(&late)
+    );
+    assert_eq!(late.json()["dispatch_id"], json!(id), "{}", body_of(&late));
+
+    // Nothing reached the board, which is the half that would be silent: a wait
+    // planted here would be a question about a node attempt the execution has
+    // already given up on.
+    let report = hub.report(&execution);
+    assert!(
+        report["interrupts"]
+            .as_array()
+            .is_none_or(|waits| waits.is_empty()),
+        "a superseded dispatch's pause reached the hub's board: {report:#}"
+    );
+    second.settle(
+        &hub,
+        redispatch["dispatch_id"].as_str().expect("an id"),
+        &json!({ "signature": "signed-on-the-retry" }),
+    );
+}
+
+/// A `paused` this hub cannot read costs the **dispatch**, not a status outside
+/// §3.4's table (§3.4, §10.1).
+///
+/// The same rule the route already keeps for a body naming no `dispatch_id`,
+/// reaching the third ending: "the status this document gives each refusal" is
+/// something a peer may rely on, and this repository's own worker reads any
+/// other `4xx` here as a refusal it **stops** for (`src/worker/node.rs`). So an
+/// unreadable pause is taken, settles the dispatch as a failure the node's own
+/// chain runs over, and leaves the placement its worker.
+///
+/// The one below is refused for the reason §8 refuses an effect record outside
+/// its dispatch's instance path: the hub is the single writer, so no session may
+/// put a question on the board under a node it was never dispatched.
+#[test]
+fn a_paused_result_this_hub_cannot_read_fails_the_dispatch_rather_than_the_worker() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/escalations", &json!({ "path": "dist/app" }));
+    let dispatch = worker.dispatch(&hub);
+    let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+
+    // A wait outside this dispatch's own instance path: well formed, and not
+    // this session's to plant.
+    let mut trespassing = paused_at("stamp/0");
+    trespassing["wait"] = json!("stamp/0/escalation/0/ask/0");
+    let taken = hub.send(
+        worker
+            .request("POST", "/workers/result")
+            .json(&json!({ "dispatch_id": id, "paused": trespassing })),
+    );
+    assert_eq!(
+        taken.status,
+        204,
+        "an unreadable pause was answered outside §3.4's four statuses, which this repository's \
+         own worker reads as a refusal it stops for: {}",
+        body_of(&taken)
+    );
+
+    // What it cost is the node, under its own `on_error:` — and the failure says
+    // what was wrong with the body rather than leaving an operator a bare stack.
+    let ended = hub.until(&execution, "ended", |report| {
+        report["status"] == json!("completed") || report["status"] == json!("failed")
+    });
+    assert_eq!(ended["status"], json!("failed"), "{ended:#}");
+    let said = ended["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("PausedResultUnreadable"),
+        "the failure is not named for what it is: {ended:#}"
+    );
+    assert!(
+        said.contains("escalate/0"),
+        "the failure does not name the instance path a pause of this dispatch would lie in: \
+         {ended:#}"
+    );
+    assert!(
+        ended["interrupts"]
+            .as_array()
+            .is_none_or(|waits| waits.is_empty()),
+        "a pause naming another node's site reached the board: {ended:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------

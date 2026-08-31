@@ -23,13 +23,16 @@
 #     number of live sessions claiming `mac`, and the rest are undispatched.
 #     Twelve because park order is published as well as resumed, and nothing
 #     under ten waits can tell a numeric ordering from a lexicographic one.
-#   * `flow.escalated` is `docs/distributed.md` §13's fourth row, made runnable:
-#     a placed agent attaching a `flow.*` with a `human:` node in it. Grammar
-#     §14.1 rule 4 runs everything an attached flow reaches in the attaching
-#     agent's placement, so that question is asked on a **worker**, where there
-#     is no wait board to ask it on — and what the runtime does about that is a
-#     named failure rather than a bare interrupt, which is the row's "what
-#     stands in the meantime" and what the acceptance suite asserts.
+#   * `flow.escalated` is `docs/distributed.md` §3.4's third ending (PRD resolved
+#     q46): a placed agent attaching a `flow.*` with a `human:` node in it.
+#     Grammar §14.1 rule 4 runs everything an attached flow reaches in the
+#     attaching agent's placement, so that question is **asked on a worker** —
+#     and the wait comes home. The dispatch settles paused, the hub plants the
+#     wait on its own board, the ordinary resume surface answers it, and the node
+#     re-enters dispatch with the answered pause in its effect history. Under a
+#     tool loop rather than at the flow's top level, because that is the shape
+#     with something to lose: the loop's first model call happens before the
+#     question, and the redispatch has to replay it rather than pay for it twice.
 #   * `flow.watched` is §6.4's distinction: a `map` over `flow.signed_off`, whose
 #     instances each dispatch a placed node and then ask a person about the
 #     answer. Two of them run at once, so one can reach its question while the
@@ -136,6 +139,11 @@ triggers:
     respond: async
     callback: "payload.body.callback_url"
 
+  # The third lifecycle-webhook trigger, and the one that watches a pause a
+  # **worker** opened: `docs/distributed.md` §3.4 makes a placed `human:` node's
+  # wait land on the hub's own board, so the `parked` delivery it fires has to be
+  # the one a local pause fires — same event, same report, same `interrupts:`.
+  # A `callback:` is what makes that comparable rather than asserted.
   on_escalated:
     type: http
     flow: flow.escalated
@@ -144,6 +152,7 @@ triggers:
     input:
       path: "payload.body.path"
     respond: async
+    callback: "payload.body.callback_url"
 
   # `session_key:` is here for `docs/distributed.md` §3.2's payload: the
   # execution identity a placed node runs under is the hub's to derive, and this
@@ -228,7 +237,7 @@ agent.signer:
 # Placed, and it attaches a flow with a question for a person in it. Grammar
 # §14.1 rule 4: everything an attached `flow.*` reaches runs where the attaching
 # agent runs, so `flow.escalation`'s `human:` node is asked on the worker — which
-# is the shape `docs/distributed.md` §13's fourth row is about.
+# is the shape `docs/distributed.md` §3.4's paused result carries home.
 agent.escalator:
   description: Decide a release by asking a person at the machine that holds it.
   model: model.smart

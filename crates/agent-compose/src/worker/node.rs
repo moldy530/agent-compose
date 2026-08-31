@@ -29,11 +29,23 @@
 //! the journal was owed". So [`Sender`] renews the session and sends the same
 //! batch again.
 //!
+//! # A pause is a result like any other
+//!
+//! §3.4 gives a dispatch three endings and the third is a **paused** result: a
+//! `human:` node reached on a worker settles its dispatch with the wait it
+//! opened, and the hub plants that wait on its board (PRD resolved q46). This
+//! module needs no rule for it, and that is the point of the division above —
+//! the runner decides what a result *is* and this posts whatever it wrote, so a
+//! paused line is one more shape of the last line and takes §3.4's own statuses.
+//! What the worker does next is what it does after any settlement: go back to
+//! polling, free to be dispatched other work while a person thinks.
+//!
 //! # A child that dies is an attempt that failed
 //!
 //! A runner that exits without a result line has not answered, and §3.4 takes
-//! "its output, or its failure": the failure this posts names the exit status,
-//! which is what a `retry:` on the hub then spends an attempt on (§7.3).
+//! "its output, its failure, or the pause it stopped at": the failure this posts
+//! names the exit status, which is what a `retry:` on the hub then spends an
+//! attempt on (§7.3).
 //!
 //! # A body this hub will not take costs the dispatch, not the worker
 //!

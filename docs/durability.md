@@ -407,6 +407,17 @@ wait id — the id is the node's instance path (`docs/grammar.md` §9.4), so it 
 deterministic and identical across process generations — and a resume request
 that arrives after the restart finds it.
 
+**A wait a placed node opened is this record too**, written by the hub rather
+than by the process that asked. `docs/distributed.md` §3.4 makes a pause the
+third way a dispatch ends: the worker settles its dispatch with the wait it
+opened, the hub plants that wait on its own board and journals the answer *here*,
+under the effect key the worker's own recorder claimed — and the node re-enters
+dispatch, so the redispatch's `effect_history` carries this record and the replay
+above is what consumes it. Every rule of this section reaches it unchanged,
+because it is the same record: all three instants are the pause's own, an
+unsettled wait records nothing and is re-derived, and a settlement the journal
+cannot record fails the node.
+
 This is the record that makes §1 concrete. `docs/trace.md` §11 says outright
 that what a human answered "is not here"; it is here.
 
@@ -605,7 +616,7 @@ holding what a worker is handed and how the wait ended:
 | `inputs`, `itemIndex`, `history`, `policy` | the dispatch payload: what the node's input phase built, plus the three facts about the node execution the hub holds that a worker cannot derive. On the row rather than in memory, so a hub restarted mid-dispatch hands over what its predecessor would have |
 | `status` | `parked`, `dispatched`, `settled` or `superseded` — the vocabulary below |
 | `session`, `parkedAt`, `dispatchedAt`, `settledAt`, `detail` | which worker session is holding it while one is, and the three instants of the wait, for the reason §3.4 keeps all three of a human wait's |
-| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take |
+| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take — or, on a dispatch a **pause** ended, the wait itself (`docs/distributed.md` §3.4) |
 
 **What `status` means** is the same kind of statement §3.6 makes about an
 execution, and the four are not interchangeable:
@@ -615,7 +626,13 @@ execution, and the four are not interchangeable:
 * **`dispatched`** — a session was handed it and has not settled it.
 * **`settled`** — a worker's result ended it, and the outcome on the row is that
   result. A resumed generation consumes it rather than dispatching again, which
-  is §5's replay discipline reaching this ledger.
+  is §5's replay discipline reaching this ledger. **A pause is one of the three
+  ways a result ends a dispatch** (`docs/distributed.md` §3.4), so the outcome
+  here may be the wait a `human:` node opened rather than the node's answer — and
+  a resumed generation consumes that too, by re-deriving the wait onto its own
+  board unless §3.4's answer record is already in the journal, in which case the
+  wait is over and the next dispatch at that instance path is what replays past
+  it.
 * **`superseded`** — the hub ended it *without* a result, which is the only way a
   dispatch ends that a worker did not end. A resumed generation replays the
   failure, so the node's `retry:`/`on_error:` chain does now what it did then.

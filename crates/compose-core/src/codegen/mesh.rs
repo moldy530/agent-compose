@@ -31,7 +31,12 @@ const SOURCE: &str = include_str!("js/mesh.ts");
 /// Bumped only for a change that would make a peer of the previous version
 /// behave **wrongly** rather than be refused (§10.3). The emitted hub declares
 /// the same number and the test below is what keeps them one.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// `2` since PRD resolved q46: a result may settle a dispatch **paused** (§3.4),
+/// which a peer of version `1` would read as a node that answered with no
+/// output. The handshake triple already refuses mixed releases, so the bump
+/// costs nothing in practice — §10 says so where it records it.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The routes the hub mounts on a target that declares `placements:` (§3).
 ///
@@ -184,6 +189,39 @@ mod tests {
             released.contains("stirPolls()"),
             "a row put back on the board wakes no held poll, so the placement's next worker \
              waits out a whole hold for work that is ready: {released}"
+        );
+    }
+
+    /// A paused result is held to the **dispatch's own instance path**, both of
+    /// the identities it carries (§3.4, §8).
+    ///
+    /// §8's single writer, stated for the route that also plants a wait. The
+    /// effects route already refuses a record whose `site` falls outside its
+    /// dispatch, and a paused result carries two such identities: the effect
+    /// record its answer will be journaled under, and the wait id the hub puts on
+    /// its board. Neither may name a node this session was not dispatched — the
+    /// first would let one session write an effect another node replays, and the
+    /// second would put a question on the board under somebody else's identity,
+    /// which the resume surface would then answer.
+    #[test]
+    fn a_paused_result_may_not_name_a_node_its_dispatch_does_not_hold() {
+        let read = function_body("function pauseOf(");
+        assert!(
+            read.contains("under(wait, row.site)") && read.contains("under(site, row.site)"),
+            "a paused settlement is read without holding its wait and its effect record to the \
+             dispatch's own instance path, so one session could plant a wait — and journal an \
+             answer — under a node it was never dispatched (docs/distributed.md §8): {read}"
+        );
+        // …and the answer is journaled under the identity the **worker** derived
+        // rather than one this side works out again: two derivations of one
+        // effect key agree on the day they are written, and part as a
+        // `ReplayDivergence` on the redispatch.
+        let journaled = function_body("async function answered(");
+        assert!(
+            journaled.contains("key: pause.effect.key")
+                && journaled.contains("request: pause.effect.request"),
+            "the hub re-derives the pause's effect identity instead of carrying the worker's, \
+             which the redispatch's replay would refuse: {journaled}"
         );
     }
 

@@ -6972,6 +6972,78 @@ export class WaitBoardInvariant extends Error {
   }
 }
 
+/**
+ * One pause a **placed** node opened, as the wire carries it home
+ * (`docs/distributed.md` §3.4, PRD resolved q46).
+ *
+ * A worker holds no wait board — the board is the hub's, which is what keeps
+ * wait-board unity (PRD resolved q43) — so a `human` node reached on a worker
+ * does not park there. It **settles its dispatch, paused**, and this is what
+ * that settlement carries: the pause's deterministic identity, what the person
+ * is shown, when it began, and the effect record its answer will be journaled
+ * under.
+ *
+ * Everything here is derived by the process that *asked*, and nothing is
+ * re-derived on the hub. That is the same discipline the env partition follows
+ * (`docs/distributed.md` §9.1): two derivations of one answer agree on the day
+ * they are written, and a wait identity or an effect key derived twice is a
+ * `ReplayDivergence` on the redispatch the day they part.
+ */
+export interface RemotePause {
+  /** Grammar 9.4's instance path, flattened — the identity [`HumanWait.id`] is. */
+  readonly wait: string;
+  readonly flow: string;
+  readonly node: string;
+  /** The node's `input:`, evaluated — what the human is shown (grammar 8.7). */
+  readonly shown: Readonly<Record<string, unknown>>;
+  readonly pausedAt: string;
+  /** When its budget runs out — present exactly when `timeout:` is declared. */
+  readonly expiresAt?: string;
+  /**
+   * The effect record the answer is journaled under, as the worker's own
+   * recorder claimed it (`docs/durability.md` §4).
+   *
+   * The hub appends the record; the redispatch hands it back in
+   * `effect_history`; and the replay of `docs/distributed.md` §7.2 consumes it
+   * at exactly the claim that opened this pause, which is what makes the node go
+   * live *past* the question rather than ask it again.
+   */
+  readonly effect: {
+    readonly key: string;
+    readonly site: string;
+    readonly ordinal: number;
+    /** The canonical identity [`EffectSlot.request`] computed. */
+    readonly request: string;
+  };
+}
+
+/**
+ * A pause this process cannot hold because it is a **worker**: the dispatch
+ * settles paused and the hub plants the wait (`docs/distributed.md` §3.4).
+ *
+ * A subclass of [`HumanInterrupt`] rather than a class beside it, and that is
+ * load-bearing rather than tidy: every ladder and policy between a `human` node
+ * and the process boundary already lets an interrupt through untouched —
+ * [`runActivity`]'s `retry:`, [`attemptItem`]'s `on_item_error:`, [`runNode`]'s
+ * `on_error:`, and the tool loop that re-throws one out of a flow-as-tool call.
+ * A pause absorbed by an `on_error: skip` on its way to the wire would be a
+ * placed node routing past a question the composition declared it needed, which
+ * is the one reading [`HumanInterrupt`] exists to refuse — so this is that error,
+ * carrying a payload, rather than a second thing those ladders would each have
+ * to learn about.
+ */
+export class RemoteHumanPause extends HumanInterrupt {
+  /** What settles the dispatch, and what the hub plants on its board. */
+  readonly remote: RemotePause;
+
+  constructor(remote: RemotePause, opened: HumanPause) {
+    super(remote.flow, remote.node, remote.wait, opened);
+    this.name = "RemoteHumanPause";
+    this.message = `${remote.flow} node \`${remote.node}\` is waiting for a human, and it was reached on a worker: the dispatch settles *paused* and the wait is planted on the hub's board under \`${remote.wait}\`, where the ordinary resume surface answers it (docs/distributed.md §3.4, PRD resolved q46)`;
+    this.remote = remote;
+  }
+}
+
 /** Why a resume was refused, or that it was taken. */
 export type ResumeOutcome =
   | { readonly ok: true; readonly wait: HumanWait }
@@ -7080,6 +7152,54 @@ const humanBoards = new Map<string, WaitBoard>();
  * `finally` that ends its prompt loop.
  */
 const humanWatchers = new Map<string, Set<() => void>>();
+
+/**
+ * Every `human` node this composition declares, by `<flow address>.<node id>`.
+ *
+ * Filled at module scope by `./graph.ts`, which is where the descriptors are
+ * emitted, and read by exactly one caller: the **hub**, planting a pause a
+ * worker opened ([`holdRemotePause`]). A local pause never consults it — it has
+ * its descriptor in hand — so a project with no placements pays a map nothing
+ * reads.
+ *
+ * What it buys is the parity PRD resolved q46 requires: "a placed `human:` node
+ * must mean what the same node unplaced means". The schema a status route
+ * publishes and the parser a resume payload is held to are the node's own, not a
+ * second reading of a JSON Schema that travelled — which is possible at all only
+ * because the whole artifact is everywhere (`docs/distributed.md` §4.3), so the
+ * hub holds the very descriptor the worker paused on.
+ */
+const humanNodes = new Map<string, HumanDescriptor>();
+
+/**
+ * Register this composition's `human` nodes, by `<flow address>.<node id>`.
+ *
+ * Called once at module scope by `./graph.ts`, and by nothing else.
+ */
+export function registerHumanNodes(nodes: Readonly<Record<string, HumanDescriptor>>): void {
+  for (const [address, descriptor] of Object.entries(nodes)) humanNodes.set(address, descriptor);
+}
+
+/**
+ * Whether a pause reached in this process is **settled home** rather than held
+ * (`docs/distributed.md` §3.4).
+ *
+ * Turned on by `./worker-node.ts` and by nothing else: a worker runs one
+ * dispatch of somebody else's execution, and the board a pause belongs on is the
+ * hub's. Every other process — `serve`, an interactive `run`, an ejected
+ * caller — leaves it off and holds its pauses itself.
+ *
+ * It is a process-wide switch rather than a field of the run because the pause
+ * happens arbitrarily deep inside a placed node's tool loop, exactly where the
+ * board is reached from, and because the process that has it on runs one
+ * dispatch and exits.
+ */
+let pausesSettleHome = false;
+
+/** See [`pausesSettleHome`]. Called by `./worker-node.ts` before anything runs. */
+export function dispatchPausesHome(): void {
+  pausesSettleHome = true;
+}
 
 /**
  * Open the pause registry for one execution, saying whether it can be resumed.
@@ -7811,6 +7931,38 @@ export async function runHuman(
     );
   }
 
+  // **A worker settles the dispatch paused instead of parking** (PRD resolved
+  // q46, `docs/distributed.md` §3.4). Answered here, ahead of the board, for the
+  // reason the board is the hub's: this process holds no wait board, no resume
+  // route and no status surface, and the pause's whole life happens on the other
+  // side of the wire. **Nothing is journaled**, exactly as below: the hub writes
+  // the record when the wait is *answered*, and an unanswered wait is what a
+  // resumed generation re-derives (resolved q28).
+  //
+  // The slot is required rather than optional because it is what the answer will
+  // be journaled under; a process running a node with no journal session open is
+  // not one a dispatch ever reaches, and it falls through to the interrupt below
+  // rather than pausing into a wire that could not carry it home.
+  if (pausesSettleHome && slot !== undefined) {
+    throw new RemoteHumanPause(
+      {
+        wait: id,
+        flow: descriptor.flow,
+        node: descriptor.node,
+        shown: (shown ?? {}) as Record<string, unknown>,
+        pausedAt,
+        ...(expiresAt === undefined ? {} : { expiresAt }),
+        effect: {
+          key: slot.key,
+          site: slot.site,
+          ordinal: slot.ordinal,
+          request: slot.request,
+        },
+      },
+      opened,
+    );
+  }
+
   const board = humanBoards.get(context.execution.id);
   if (board === undefined || !board.resumable) {
     // The pause happened — it is on the trace entry either way — and there is
@@ -7944,6 +8096,138 @@ export async function runHuman(
   });
 }
 
+/**
+ * Hold a pause a **worker** opened, on this hub's board, until somebody answers
+ * it or its budget runs out (`docs/distributed.md` §3.4, PRD resolved q46).
+ *
+ * The other half of [`RemoteHumanPause`], and the whole of what makes a placed
+ * `human:` node mean what an unplaced one means. Everything a local pause is
+ * held by, this pause is held by, because it is the **same board**: the status
+ * route publishes it out of [`humanWaits`], `POST /executions/:id/resume`
+ * answers it through [`deliverHumanAnswer`], [`pausesUnder`] holds the
+ * dispatching node's deadline still while it waits (D102), the `parked`
+ * lifecycle webhook fires for it because [`quiescent`] counts it, and
+ * [`releaseHumanWaits`] drops it when the run ends.
+ *
+ * **Three things are the pause's own rather than this process's**, and each is a
+ * durability rule rather than a convenience:
+ *
+ *  * the **identity** is the one the worker derived (grammar 9.4), so the hub
+ *    plants the wait a local run would have opened at that site;
+ *  * the **instants** are the worker's, which is `docs/durability.md` §9's rule
+ *    — "a reader of the resumed document sees what the execution did, not what
+ *    this process did" — so a wait re-derived after a hub restart keeps the
+ *    budget it had rather than starting a fresh one;
+ *  * the **contract** is the descriptor's, read out of [`humanNodes`]. The
+ *    artifact is everywhere (`docs/distributed.md` §4.3), so the schema a UI is
+ *    handed and the parser an answer is held to are this node's own — not a
+ *    second reading of something that travelled.
+ *
+ * Answers the record the hub journals: exactly the `JournaledWait` a local pause
+ * writes through `slot.keep`, so the redispatch's `effect_history` hands the
+ * worker a record its own replay consumes at the very claim that paused
+ * ([`runHuman`]'s replay branch). The two settlements a *composition* declared
+ * resolve; the two that are the run's own shape reject, exactly as they do for a
+ * local pause — an abandoned wait unwinds the task, and a withdrawn answer
+ * surface is a [`HumanInterrupt`].
+ */
+export async function holdRemotePause(
+  execution: string,
+  remote: RemotePause,
+): Promise<JournaledWait> {
+  const address = `${remote.flow}.${remote.node}`;
+  const descriptor = humanNodes.get(address);
+  if (descriptor === undefined) {
+    // Unreachable over an artifact both ends hold — the handshake triple pins
+    // one tree (`docs/distributed.md` §4.1) — and said rather than assumed,
+    // because a pause nothing can validate an answer against is a wait no
+    // surface could safely take.
+    throw new Error(
+      `\`${address}\` paused on a worker and this hub registers no such \`human:\` node: it registers ${
+        [...humanNodes.keys()].map((name) => `\`${name}\``).join(", ") || "none"
+      } (docs/distributed.md §3.4)`,
+    );
+  }
+  const instants: Omit<JournaledInstants, "settledAt"> = {
+    pausedAt: remote.pausedAt,
+    ...(remote.expiresAt === undefined ? {} : { expiresAt: remote.expiresAt }),
+  };
+  const opened: HumanPause = instants;
+  const wait: HumanWait = {
+    id: remote.wait,
+    execution,
+    flow: remote.flow,
+    node: remote.node,
+    shown: remote.shown,
+    schema: descriptor.schema,
+    pausedAt: remote.pausedAt,
+    ...(remote.expiresAt === undefined ? {} : { expiresAt: remote.expiresAt }),
+  };
+
+  const board = humanBoards.get(execution);
+  if (board === undefined || !board.resumable) {
+    // The same answer a local pause gets on a run with no answer surface, and
+    // the same nothing is journaled. Unreachable through `serve`, which is the
+    // only invocation that mounts a mesh at all (`./mesh.ts`'s `mounted`).
+    throw new HumanInterrupt(remote.flow, remote.node, remote.wait, opened);
+  }
+
+  return await new Promise<JournaledWait>((resolve, reject) => {
+    let timer: unknown;
+    const settle = (outcome: Settlement, value: unknown): boolean => {
+      // **This** pause, by identity rather than by id — [`runHuman`]'s rule and
+      // its reason: a redispatch re-executes the node at the same site, so the
+      // board can hold a successor under this very id once this one is settled.
+      if (mine.settled !== undefined) return false;
+      mine.settled = outcome;
+      if (timer !== undefined) clearTimeout(timer as Parameters<typeof clearTimeout>[0]);
+      // Told before the promise settles, so a deadline the dispatching node has
+      // been holding still is running again by the time the redispatch is made.
+      announce(execution);
+      if (outcome === "resumed") {
+        resolve({
+          ...instants,
+          settled: "resumed",
+          output: value,
+          settledAt: stopped(outcome).settledAt,
+        });
+      } else if (outcome === "expired") {
+        // Journaled as an expiry and **routed by the node**, not here: the
+        // redispatch replays this record, and `runHuman` raises the
+        // [`HumanExpiry`] carrying the composition's own `on_timeout:` route
+        // (grammar 8.7). That is the parity — the expiry of a placed pause is
+        // decided by the same line of the same function as an unplaced one's.
+        resolve({ ...instants, settled: "expired", settledAt: stopped(outcome).settledAt });
+      } else if (outcome === "interrupted") {
+        reject(new HumanInterrupt(remote.flow, remote.node, remote.wait, opened));
+      } else {
+        reject(new HumanAbandoned(remote.flow, remote.node, remote.wait));
+      }
+      return true;
+    };
+
+    const mine: Held = {
+      wait,
+      parse: (payload) => descriptor.parse(payload),
+      settle: (outcome, value) => settle(outcome, value),
+    };
+    hold(board, remote.wait, mine);
+    announce(execution);
+
+    if (remote.expiresAt !== undefined) {
+      // What is left of the budget **the worker started**, not a fresh one: the
+      // wall clock ran from the moment the question was asked (grammar 8.7), and
+      // a hub that re-derives this wait after a restart re-arms whatever is
+      // left. A budget already spent expires on the next tick rather than never.
+      const left = Math.max(0, Date.parse(remote.expiresAt) - Date.now());
+      timer = setTimeout(() => settle("expired", undefined), left);
+      if (typeof (timer as { unref?: () => void }).unref === "function") {
+        (timer as { unref: () => void }).unref();
+      }
+    }
+  });
+}
+
 /** How a pause that reached the trace stopped waiting, as the entry spells it. */
 function stopped(outcome: "resumed" | "expired"): {
   readonly settledAt: string;
@@ -7978,7 +8262,13 @@ interface JournaledInstants {
   readonly settledAt: string;
 }
 
-type JournaledWait = JournaledInstants &
+/**
+ * Exported for the one writer of this record that is not [`runHuman`]: the hub,
+ * journaling the answer to a pause a worker opened ([`holdRemotePause`],
+ * `docs/distributed.md` §3.4). The shape is stated once, here, because the
+ * reader of both is the same replay branch of `runHuman`.
+ */
+export type JournaledWait = JournaledInstants &
   ({ readonly settled: "resumed"; readonly output: unknown } | { readonly settled: "expired" });
 
 /** LangGraph's terminal pseudo-node, as a `goto` target spells it. */
@@ -8027,6 +8317,23 @@ function abandonedOf(error: unknown): HumanAbandoned | undefined {
 export function interruptOf(error: unknown): HumanInterrupt | undefined {
   for (let held: unknown = error; held !== undefined && held !== null; ) {
     if (held instanceof HumanInterrupt) return held;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/**
+ * The [`RemoteHumanPause`] on this error's `cause` chain, if it came out of one.
+ *
+ * Read by `./worker-node.ts`, which turns it into the *paused* result of
+ * `docs/distributed.md` §3.4. The chain is walked for [`interruptOf`]'s reason
+ * and one more: the pause is usually reached inside an attached `flow.*`, which
+ * grammar §14.1 rule 4 runs in the attaching agent's placement, so a subflow
+ * boundary and a tool loop are both between it and here.
+ */
+export function remotePauseOf(error: unknown): RemoteHumanPause | undefined {
+  for (let held: unknown = error; held !== undefined && held !== null; ) {
+    if (held instanceof RemoteHumanPause) return held;
     held = (held as { cause?: unknown }).cause;
   }
   return undefined;

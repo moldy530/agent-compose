@@ -1,7 +1,7 @@
 # agent-compose — Distributed Execution
 
-**Protocol version:** 1 — carried on every join, and §10 fixes what it pins and
-when it bumps
+**Protocol version:** 2 — carried on every join, and §10 fixes what it pins and
+when it bumps; §10.4 lists the bumps
 **Status:** Normative for the hub/worker protocol a compiled project speaks. Both
 halves are built — the static surface it describes (`hub:` and `placements:`) is
 enforced by `validate`, a build emits the hub, and `agent-compose worker` is the
@@ -9,7 +9,7 @@ spoke. §12 says what that means, file by file.
 **Companion artifacts:** [`docs/durability.md`](durability.md) (the journal this
 writes into, and the replay it extends over the wire),
 [`docs/grammar.md`](grammar.md) §14.1, §14.2 (the deploy-layer surface), §9.4
-(idempotency keys), [`prd.md`](../prd.md) §5.10, §5.12, resolved questions 37–45
+(idempotency keys), [`prd.md`](../prd.md) §5.10, §5.12, resolved questions 37–46
 
 A graph does not have to run in one process. This document defines how it runs
 in several: what a hub is, what a worker is, the wire they speak, what happens
@@ -305,7 +305,7 @@ has forgotten.
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "compiler": "0.4.1",
   "runtime": "bun 1.1.34",
   "claims": ["mac", "gpu"],
@@ -323,7 +323,7 @@ Answer:
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "compiler": "0.4.1",
   "worker_session": "wrk_9f1c8a3e…",
   "artifact": { "hash": "sha256:…", "url": "/workers/artifact/sha256:…" },
@@ -595,12 +595,122 @@ an effect the replay of §7 cannot skip.
 
 ### 3.4 `POST /workers/result`
 
-Carries the session and the `dispatch_id`. The node's outcome: its output, or
-its failure.
+Carries the session and the `dispatch_id`. The node's outcome: its output, its
+failure, or **the pause it stopped at**.
 
 **Idempotent by `dispatch_id`.** A second result for a dispatch an earlier one
 already **settled** is accepted and dropped, which is what makes at-least-once
 dispatch (§7) safe on the return path as well as the outbound one.
+
+#### The third ending: a result may settle a dispatch *paused*
+
+A `human:` node is reachable on a worker — grammar §14.1 rule 4 runs everything
+an attached `flow.*` reaches in the attaching agent's placement, and "the signing
+machine pauses for approval" is a shape a mesh is *for*, since the machine
+holding the capability is exactly where an approval-gated node belongs. The wait
+board is not: it is the hub's, which is what keeps wait-board unity (PRD resolved
+q43) and what a status report publishes, a resume route answers and a recovery
+re-derives.
+
+So a pause is neither held on the worker nor failed. **The result settles the
+dispatch, carrying the pause**, and the hub plants the wait on its own board
+(PRD resolved q46):
+
+```json
+{
+  "dispatch_id": "dsp_…",
+  "paused": {
+    "wait": "escalate/0/escalation/0/ask/0",
+    "flow": "flow.escalation",
+    "node": "ask",
+    "shown": { "…": "…" },
+    "paused_at": "2026-08-31T09:14:02.113Z",
+    "expires_at": "2026-09-01T09:14:02.113Z",
+    "effect": {
+      "key": "escalate/0/escalation/0/ask/0#human/0",
+      "site": "escalate/0/escalation/0/ask/0",
+      "ordinal": 0,
+      "request": "{\"node\":\"ask\",\"shown\":{…},\"wait\":\"escalate/0/escalation/0/ask/0\"}"
+    }
+  }
+}
+```
+
+`paused` is present exactly when the dispatch ended at a pause, and a result
+carries at most one of `output`, `error` and `paused`. Every member of it is
+REQUIRED except `expires_at`, which is present exactly when the node declares
+`timeout:` (grammar §8.7).
+
+Every field is a fact **the worker derived and the hub cannot**, and nothing more
+travels than that. `wait` is the node's deterministic wait identity — its
+instance path plus an ordinal, grammar §9.4 — so the hub plants the wait a local
+run would have opened at that site, and a resume prepared against one generation
+finds it in the next (§6.1's property, for the same reason). `shown` is the
+node's evaluated `input:`, which is what the person is asked. `paused_at` and
+`expires_at` are the wait's instants, which stay the pause's own rather than
+being re-taken from the hub's clock: `docs/durability.md` §9 requires that a
+reader "sees what the execution did, not what this process did". `effect` is the
+journal record the **answer** will be written under, exactly as the worker's own
+recorder claimed it (`docs/durability.md` §4) — the key the redispatched node
+will look up, and the canonical `request` it will compare against.
+
+**Both identities are held to the dispatch's own `instance_path`**, at or inside
+it, exactly as §3.3 holds a record's `site`. It is §8's single writer stated for
+the route that also plants a wait: no session may journal an effect into a node
+it was never dispatched, and none may put a question on the board under another
+node's identity — which the resume surface would then answer. A `paused` that
+breaks either, or that is short of a member, is **not** answered with a status:
+this route's table is closed (§10.1) and a status outside it is a refusal a
+worker stops for, so the hub settles the dispatch as a *failure* naming what was
+wrong, and the node's own `retry:`/`on_error:` chain runs over it. The placement
+keeps its worker; the attempt is what an unreadable pause costs.
+
+What does **not** travel is the contract: the answer's schema and the parser that
+holds an answer to it are the hub's own, read out of the artifact it is already
+serving. That is §4.3 being load-bearing again — the whole artifact is
+everywhere, so the hub holds the very descriptor the worker paused on — and it is
+what makes the parity PRD resolved q46 requires a lookup rather than a second
+contract on the wire.
+
+**A paused result is SETTLED**, which is why it needs none of the machinery
+below rewritten: the dispatch ended with a result, so idempotency by
+`dispatch_id` is unchanged, a re-posted paused result is `204`, and a paused
+result for a dispatch the hub superseded is `409`. The **session is free** the
+moment it posts one, and may be dispatched other work while a person thinks — a
+worker gone between the pause and the answer therefore costs the execution
+nothing.
+
+What the hub does with it is the ordinary discipline and no new mechanism: it
+plants the wait on the existing board under the identity above (a third kind of
+wait beside a `human` pause and a placement wait — the *same* kind as the first,
+in fact, reached over the wire), fires the lifecycle webhook a local pause fires,
+and publishes the same status a local pause publishes. The existing resume
+surface answers it. The answer is journaled as the pause's own effect record, at
+`effect.key`, and the node then **re-enters dispatch**: a fresh row at the next
+ordinal of that instance path, queued to its placement and parked if nothing
+claims it (resolved q39's machinery), whose `effect_history` carries the answered
+pause — so the replay of §7.2 consumes it at the very claim that paused and the
+node goes live *past* the question. A model call made before the pause is
+replayed, not re-issued, which is §7.3's promise reaching the one case that used
+to be outside it.
+
+A wait whose budget runs out is the same path with the other settlement: the
+expiry is journaled as the pause's record, the node is redispatched, and the
+replay raises the node's own `on_timeout:` route (grammar §8.7) — decided by the
+same line of the same function an unplaced pause's expiry is decided by.
+
+**A hub restart between the pause and the answer costs nothing**, because the
+pause is journaled: the settled row carries it, and the replay that re-reaches
+the node re-derives the wait onto the new process's board — under the identity
+and the instants its predecessor published — unless the answer's record is
+already in the journal, in which case the wait is over and the redispatch is what
+replays past it.
+
+This is a change an older peer would misread — a `1` peer sees a result with no
+`output` and reads it as a node that answered nothing — so `PROTOCOL_VERSION` is
+**2** (§10).
+
+#### The two verbs
 
 **A dispatch ends in one of two states, and this document gives them two verbs**
 — they are not synonyms and the table below turns on the difference. A dispatch
@@ -1383,6 +1493,23 @@ refuses the mixed pair first, and `PROTOCOL_VERSION` is what remains for the
 case the triple stops covering — a worker binary somebody upgrades separately,
 or a second implementation of this document.
 
+### 10.4 The bumps
+
+| version | what changed, and why it is a bump |
+|---|---|
+| **1** | this document, as the runtime that landed with it speaks it |
+| **2** | §3.4's **paused** result (PRD resolved q46, 2026-08-31). A result may settle a dispatch with the wait a `human:` node opened, and a peer of `1` would read one as a node that answered with no output — a node that "quietly means something else", which is §10.3's first row exactly, and its third: `paused` changes what a result *is* |
+
+**The bump to 2 costs nothing in practice, and saying so is the point of
+recording it.** A worker and the hub it talks to are built from one compiler
+release, so the handshake triple (§4.1) already refuses a mixed pair at the join
+— by compiler version, before `protocol` could ever be the deciding field. What
+the bump buys is the case the triple does not cover: a worker binary somebody
+upgraded separately, or a second implementation of this document, either of which
+would otherwise settle a placed pause into silence. It is a version number doing
+what §10 says it is for — refusing a peer rather than letting one be wrong — and
+not an upgrade any operator of this release has to plan for.
+
 ---
 
 ## 11. Out of v1 scope
@@ -1431,10 +1558,13 @@ compile error.
 What a **build** emits for a target that declares `placements:`: the hub. The
 five routes of §3 on the served app, the artifact server of §3.5 over a content
 hash the tree carries, the dispatch board with placement waits on it (§6), the
-liveness sweep of §6.3, idempotent effect ingestion (§3.3), and the environment
-partition of §9.1 — emitted into the artifact, so the hub checking a join's
-`env_ok` and a worker computing one read one answer under one hash. A placed
-component's node is dispatch-and-await rather than a call (§7).
+liveness sweep of §6.3, idempotent effect ingestion (§3.3), the *paused* ending
+of §3.4 — a `human:` node a worker reaches lands on the hub's own wait board, is
+answered through the ordinary resume surface, and sends the node back through
+dispatch with the answered pause in its history — and the environment partition of
+§9.1, emitted into the artifact, so the hub checking a join's `env_ok` and a
+worker computing one read one answer under one hash. A placed component's node is
+dispatch-and-await rather than a call (§7).
 
 What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
 --token-env <VAR> [--data-dir <path>]`, a complete protocol client — the
@@ -1448,9 +1578,8 @@ third tree accumulates.
 
 What is **not** built, and is named rather than missing: per-placement artifact
 slicing (§4.3), multi-hub (§8), worker-to-worker edges and Windows workers
-(§11) — and the three questions of §13, each held to what stands for it there:
-two knobs nobody has weighed, and one shape this compiler accepts and runs worse
-than an author would expect.
+(§11) — and the two questions of §13, each held to what stands for it there:
+two knobs nobody has weighed.
 
 **A hub of this release serves exactly one artifact: its own tree.** That is the
 fourth named absence, and it is named here because §3.5's table has a row for a
@@ -1469,10 +1598,13 @@ holds the worker to every status this document gives it, against a hub that is a
 fixture; and `crates/agent-compose/tests/distributed_mesh_acceptance.rs` runs a
 real hub and real workers and asks whether a distributed execution works — the
 steady state, a cold start, parking and wake, a mid-node disconnect and the
-replay that follows it, two hub restarts (one idle, one over a dispatch a worker
-is in the middle of running), a hub opening a journal written before the
-dispatch board existed, the refusals a worker stops on, and a fan-out queued onto
-a pool of one.
+replay that follows it, three hub restarts (one idle, one over a dispatch a
+worker is in the middle of running, and one between a placed pause and its
+answer), a hub opening a journal written before the dispatch board existed, a
+placed `human:` node whose question comes home and whose answer sends the node
+back to a worker — including the variant where the worker that asked is gone by
+the time the person decides — the refusals a worker stops on, and a fan-out
+queued onto a pool of one.
 `crates/compose-core/tests/placement_surface_landing.rs` holds the surface to
 where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in
 `src/mesh.ts`, and neither in the composition's own lowering.
@@ -1537,14 +1669,14 @@ nothing implements past them.
 
 ## 13. What this document does not settle
 
-Three questions are **open**, and each one is here because a normative document
+Two questions are **open**, and each one is here because a normative document
 may fix a wire and may not fix a design decision the PRD has not made. `prd.md`
 is the single source of truth for design decisions; this document is downstream
 of it, and §12's "held to" stops at this table.
 
 **So this section is a gate, not a note.** The project's discipline is that a new
 design question lands in the PRD's Open Questions and is resolved there before
-the affected area is implemented. These three are that list *staged*, which is as
+the affected area is implemented. These two are that list *staged*, which is as
 far as this document can take them: entering a question in the PRD's Open
 Questions, and resolving it there, is a change to `prd.md` and a reviewed
 decision of its own — never something a downstream document performs by
@@ -1555,47 +1687,42 @@ that reads a "what stands in the meantime" cell as wire has decided a PRD
 question in a downstream document, which is the thing this section exists to
 prevent.
 
-The rows come in two shapes, and the difference is what a reader owes each.
+Both remaining rows are the same shape: a **gap** — a knob nobody has weighed,
+filled here conservatively, where the wire admits any answer additively. So what
+the PRD owes each is a decision rather than a correction, and the runtime that
+landed was written to those defaults and no further. Their absences are held
+rather than remembered, and `crates/compose-core/src/codegen/mesh.rs` says
+exactly how far that holding reaches: it **pins** the emitted session to the four
+fields §5 gives it, so a capacity arriving under a spelling nobody has used yet is
+still a failing test, and it **greps** the hub's code for the spellings the two
+rows have arrived under before — `capacity`, `maxDispatches`, `max_dispatches`
+for the first; `sandbox`, `seccomp`, `restrictions` for the second. A grep is a
+floor rather than a proof, which is why the first row has the pin as well. Raising
+a default is what needs the PRD; keeping one needs a test.
 
-The first two are **gaps**: a knob nobody has weighed, filled here
-conservatively, where the wire admits any answer additively — so what the PRD
-owes each is a decision rather than a correction, and the runtime that landed was
-written to those defaults and no further. Their absences are held rather than
-remembered, and `crates/compose-core/src/codegen/mesh.rs` says exactly how far
-that holding reaches: it **pins** the emitted session to the four fields §5 gives
-it, so a capacity arriving under a spelling nobody has used yet is still a failing
-test, and it **greps** the hub's code for the spellings the two rows have arrived
-under before — `capacity`, `maxDispatches`, `max_dispatches` for the first;
-`sandbox`, `seccomp`, `restrictions` for the second. A grep is a floor rather
-than a proof, which is why the first row has the pin as well. Raising a default
-is what needs the PRD; keeping one needs a test.
-
-The last is a **sharp edge**: a composition this compiler accepts, and runs worse
-than its author would expect. It is here because the repair is a rule — a wire
-that carries something this document's wire does not — and a rule with no
-resolved entry behind it is exactly what this section holds. What stands for it
-is stated in its cell, and it is not a silent failure by the time a reader meets
-it: it is diagnosed where it happens.
-
-**Two rows have left this table by being answered, which is what the table is
+**Three rows have left this table by being answered, which is what the table is
 for.** It held a row for a contradiction between resolved q40's mismatch clause
 and §4.1's repair, until q40's amendment of 2026-08-30 resolved it; §4.1 now
-states that rule as settled wire. And it held a row for **a placed component's
-`store.*` on a process-local backend**, the other sharp edge, until PRD resolved
+states that rule as settled wire. It held a row for **a placed component's
+`store.*` on a process-local backend** — a *sharp edge*, a composition this
+compiler accepted and ran worse than its author would expect — until PRD resolved
 q45 (2026-08-31) answered it with a refusal: grammar §14.1 rule 5 is now a
 compile error over that shape, at every scope and under `--target local` too, and
-§1 and §9.1 state it as a rule rather than as a hazard.
+§1 and §9.1 state it as a rule rather than as a hazard. And it held the other
+sharp edge, **a `human:` node a placed component reaches**, until PRD resolved
+q46 (2026-08-31) answered it with a third ending on the wire: §3.4's *paused*
+result carries the wait home, the hub plants it on the one board, and the answer
+sends the node back through dispatch. That row's own note said the repair would
+be a breaking change and a reason for the PRD to weigh it rather than to pre-empt
+one here — which is what happened: the resolution took the decision, and
+`PROTOCOL_VERSION` moved to 2 (§10.4).
 
 | | what is unsettled | what stands in the meantime |
 |---|---|---|
 | **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it — a v1 default this document proposes, which no resolved entry contradicts and none has weighed. The wire admits any other answer additively (an OPTIONAL capacity at join, §10.2), so the runtime may build against one; **raising** it is what the PRD has to answer first |
 | **containment beyond the process boundary** (§11) | resolved q31 fixed v1 containment at root plus timeout and deferred containers, seccomp and "any deploy-target-level restriction (refusing bash on a distributed placement is a placement fact)" **to the distribution work**. The distribution resolutions did not take it up, and q44's out-list does not name it, so nothing has decided whether a placement may carry a sandbox or a capability restriction | no such key exists, in the grammar or on the wire; a worker runs the artifact with its own privileges. Grammar D128 retires the reserved `network:` key on the ground that no *resolved* containment story backs it, which is a statement about today rather than about what a later resolution may add |
-| **a `human:` node a placed component reaches** (§3.4, §4.3; PRD open q46) | how a pause opened on a worker reaches the hub's wait board. PRD resolved q43 names wait-board unity among the grounds for choosing this protocol over `RemoteGraph`, and §4.3 has a placement decide which *process* runs a node rather than what a node means — but neither fixes a carriage for a pause, and §3.4's result carries a node's output or its failure with no third shape. Both repairs are rules: a third terminal outcome on this wire plus a remote wait on the board, or a static refusal of the composition | the dispatch **fails**, and fails named: `src/worker-node.ts` reports the pause as a `PlacedHumanWait` whose message says a worker holds no wait board and points here, so the node's `retry:`/`on_error:` chain runs over a failure that says what happened rather than over a bare interrupt. The composition still compiles, because refusing it is the other candidate repair and this table is where a rule with no resolution behind it waits |
 
-No row here blocks the runtime: each names what stands until the PRD answers.
-The first two arrive additively rather than as a re-cut, which is what lets the
-runtime build against their defaults; the last may not — a wire an older peer
-would misread, or a compile error over a shape that compiles today, is a breaking
-change, and that is a reason for the PRD to weigh it rather than a reason to
-pre-empt one here. What every row blocks is the same thing: an implementation
-deciding one of them quietly.
+Neither row blocks the runtime: each names what stands until the PRD answers, and
+both arrive additively rather than as a re-cut, which is what lets the runtime
+build against their defaults. What they block is the same thing the three
+answered rows blocked: an implementation deciding one of them quietly.

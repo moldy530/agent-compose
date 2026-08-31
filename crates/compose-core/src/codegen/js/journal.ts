@@ -1608,6 +1608,18 @@ export interface EffectSlot {
   readonly site: string;
   readonly kind: EffectKind;
   readonly ordinal: number;
+  /**
+   * This effect's **identity**, canonicalised — the string a record carries as
+   * its `request` and a replay compares verbatim.
+   *
+   * Carried on the slot for the one caller that has to journal a record it
+   * cannot write itself: a `human` pause opened on a worker is settled by the
+   * hub, which appends the answered record on the far side of the wire
+   * (`docs/distributed.md` §3.4). The identity travels with the pause rather
+   * than being derived a second time there, because a second derivation is a
+   * `ReplayDivergence` the day the two spellings part.
+   */
+  readonly request: string;
   readonly held: JournalOutcome | undefined;
   /**
    * Record what the live effect answered, and answer with the value the
@@ -1748,6 +1760,7 @@ export class EffectRecorder {
       site,
       kind,
       ordinal,
+      request: identity,
       held,
       keep: (value) => {
         // Recorded **and returned** as the journal now holds it, so this

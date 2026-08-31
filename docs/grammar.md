@@ -2707,6 +2707,18 @@ agent's `tools:`:
   pause with nothing to deliver an answer to (§8.6 rule 7, Decision
   [D118](#d118-a-detached-dispatch-reaches-no-human-node)).
 
+A **placed** component may reach one, and it is not a third entry on that list:
+"the signing machine pauses for approval" is a shape a mesh is for, since the
+machine holding the capability is where an approval-gated node belongs. Nothing
+about the node changes — §14.1 rule 4 runs everything an attached `flow.*`
+reaches in the attaching agent's placement, so the question is *asked* on a
+worker, and the wait it opens comes home: the dispatch settles **paused**, the
+hub plants the wait on its own board under the identity §9.4 gives it, and the
+two surfaces above answer it exactly as they answer any other pause (PRD resolved
+q46, `docs/distributed.md` §3.4). The answer sends the node back through
+dispatch, so the timeout, the `on_error:` chain, the status shape and the
+lifecycle webhook are the single-process ones reached over the wire.
+
 ### 8.8 `store`
 
 Deterministic, graph-invoked store operation — the second consumption surface of

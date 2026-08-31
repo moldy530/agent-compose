@@ -1786,6 +1786,136 @@ fn the_wait_board_behaved(observed: &Value) {
         observed["unanswerable"],
         json!({ "settled": "HumanInterrupt", "published": [] })
     );
+
+    a_pause_a_worker_opened_is_a_pause(observed);
+}
+
+/// A pause a **worker** opened is this board's own entry, and behaves as a local
+/// one does (`docs/distributed.md` §3.4, PRD resolved q46).
+///
+/// The parity bar the resolution sets is "a placed `human:` node must mean what
+/// the same node unplaced means", and the sections above are the local half of
+/// exactly these readings — so a divergence shows as two assertions in one file
+/// disagreeing rather than as a served hub behaving oddly.
+///
+/// Split out for [`the_wait_board_behaved`]'s own reason: gate 13 re-runs this
+/// runner under the Node fallback, and one function is what keeps the two
+/// columns from drifting into different verdicts.
+fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
+    // Published as a pause is published, under the identity the worker derived
+    // — and with the **contract this hub holds**, read out of the descriptor
+    // registry rather than off anything the wire carried (§4.3).
+    assert_eq!(
+        observed["remote_answered"]["published"],
+        json!([{
+            "id": "escalate/0/sign/0",
+            "flow": "flow.sign_off",
+            "node": "sign",
+            "shown": { "question": "ship it?" },
+            "schema": {
+                "type": "object",
+                "properties": { "decision": { "enum": ["approve", "reject"] } },
+                "required": ["decision"],
+                "additionalProperties": false,
+            },
+            "pausedAt": "2026-08-31T09:14:02.113Z",
+        }]),
+        "a worker's pause is not published the way a local one is: {observed}"
+    );
+    // Counted by `pausesUnder`, which is the reading `runActivity` holds a
+    // dispatching node's deadline still by (D102): the time a person spends
+    // thinking is not time the placed node's `timeout:` counts, exactly as it is
+    // not time an unplaced one's counts.
+    assert_eq!(observed["remote_answered"]["held_under"], json!(1));
+    assert_eq!(observed["remote_answered"]["held_elsewhere"], json!(0));
+    // A payload the node's `output:` refuses is a `mismatch` and consumes
+    // nothing, which is the resume-payload validation §3.4 promises is the
+    // single-process one.
+    assert_eq!(observed["remote_answered"]["refused"], json!("mismatch"));
+    assert_eq!(
+        observed["remote_answered"]["waiting_after_a_mismatch"],
+        json!(1)
+    );
+    // …and the answer settles it into exactly the record `runHuman` writes for a
+    // pause the hub held itself, which is what the redispatch replays.
+    assert_eq!(observed["remote_answered"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["remote_answered"]["record"]["settled"],
+        json!("resumed")
+    );
+    assert_eq!(
+        observed["remote_answered"]["record"]["output"],
+        json!({ "decision": "approve" })
+    );
+    assert_eq!(
+        observed["remote_answered"]["record"]["pausedAt"],
+        json!("2026-08-31T09:14:02.113Z"),
+        "the record was dated by the process that recovered the wait rather than by the one that \
+         opened it (docs/durability.md §9): {observed}"
+    );
+    assert!(
+        observed["remote_answered"]["record"]["settledAt"].is_string(),
+        "the record does not say when the wait stopped waiting: {observed}"
+    );
+    assert_eq!(
+        observed["remote_answered"]["waiting_after_the_answer"],
+        json!(0)
+    );
+
+    // An expiry settles into the record whose replay raises the node's own
+    // `on_timeout:` — the composition's route, decided by the same line of the
+    // same function an unplaced pause's expiry is decided by.
+    assert_eq!(observed["remote_expired"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["remote_expired"]["record"]["settled"],
+        json!("expired")
+    );
+    assert!(
+        observed["remote_expired"]["record"].get("output").is_none(),
+        "an expired wait recorded an answer nobody gave: {observed}"
+    );
+
+    // The two settlements that are the run's own shape rather than the
+    // composition's reach a remote pause exactly as they reach a local one.
+    assert_eq!(
+        observed["remote_unsettled"],
+        json!({
+            "abandoned": "HumanAbandoned",
+            "withdrawn": "HumanInterrupt",
+            "unanswerable": "HumanInterrupt",
+        }),
+        "a worker's pause survives a run that stopped waiting for it: {observed}"
+    );
+
+    // …and the other end of the wire: the identity a worker sends home is the
+    // one the **same** `runHuman` opens locally at the same view, which is the
+    // whole of what "the same wait identity derivation" means.
+    assert_eq!(
+        observed["travelling"]["opened"],
+        json!(["escalate/0/sign/0"])
+    );
+    assert_eq!(
+        observed["travelling"]["carried"],
+        json!({
+            "name": "RemoteHumanPause",
+            "wait": "escalate/0/sign/0",
+            "flow": "flow.sign_off",
+            "node": "sign",
+            "shown": { "question": "ship it?" },
+            "effect": {
+                "key": "escalate/0/sign/0#human/0",
+                "site": "escalate/0/sign/0",
+                "ordinal": 0,
+                "request": "{\"node\":\"sign\"}",
+            },
+            "travels_as_an_interrupt": true,
+        }),
+        "a pause reached where pauses settle home did not carry what §3.4 puts on the wire: \
+         {observed}"
+    );
+    // Nothing was parked where the pause travelled: a worker holds no board, and
+    // a wait left on one there is a question no surface could ever reach.
+    assert_eq!(observed["travelling"]["published"], json!([]));
 }
 
 /// Gate 20: the terminal a `run` answers a pause at, driven directly.

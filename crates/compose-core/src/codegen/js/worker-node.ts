@@ -60,11 +60,30 @@
 // reached the hub is an effect the replay of §7 cannot skip. The `agent-compose
 // worker` process batches the lines and `POST`s them; nothing here speaks HTTP.
 //
-// A **result** line is the last line, and there is exactly one: the node's
-// output, or the failure that ended it. A runner that dies without writing one
-// is an attempt that failed, and the worker reports it as such — which is why
-// this module catches the activity's error and reports it rather than throwing
-// out of the process: a failure the node *made* is worth naming.
+// A **result** line is the last line, and there is exactly one. It carries the
+// node's output, the failure that ended it, or — §3.4's third ending, PRD
+// resolved q46 — the **pause** it stopped at:
+//
+// ```json
+// {"type":"result","paused":{"wait":"escalate/0/…/ask/0","flow":"…","node":"ask","…":"…"}}
+// ```
+//
+// A runner that dies without writing a result line is an attempt that failed,
+// and the worker reports it as such — which is why this module catches the
+// activity's error and reports it rather than throwing out of the process: a
+// failure the node *made* is worth naming.
+//
+// # A pause is settled, not held (§3.4)
+//
+// The wait board is the hub's — it is what a status report publishes, what the
+// resume route answers and what a recovery re-derives — and this process holds
+// none of it. So a `human:` node reached here does not park and does not fail:
+// [`dispatchPausesHome`] makes `runtime.runHuman` raise the pause, and the line
+// above settles the dispatch with it. The hub plants the wait under the identity
+// this process derived, journals the answer as the pause's own effect record,
+// and sends the node back through dispatch with that record in its
+// `effect_history` — so the replay below consumes it at the very claim that
+// paused and the node goes live past the question.
 //
 // # Replay to the frontier (§7.2)
 //
@@ -111,7 +130,7 @@ import {
 } from "./journal.ts";
 import { type PlacedAnswer, executeLocally } from "./mesh.ts";
 import type * as runtime from "./runtime.ts";
-import { interruptOf } from "./runtime.ts";
+import { dispatchPausesHome, remotePauseOf } from "./runtime.ts";
 
 /** The dispatch this process was handed, as §3.2 puts it on the wire. */
 interface Dispatch {
@@ -486,39 +505,42 @@ function named(error: unknown): { name: string; message: string } {
 }
 
 /**
- * The one failure this side names for itself: a `human:` node reached **here**
- * (`docs/distributed.md` §13's fourth row).
+ * The pause line of §3.4, where this dispatch ended at a `human:` node.
  *
- * A pause is opened on the hub's wait board — the board a status report
- * publishes, a resume route answers and a recovery re-parks (§1, PRD resolved
- * q4/q28). A worker holds none of that, so `runtime.runHuman` finds no board and
- * raises the interrupt it raises for any run with no way to answer a question,
- * and this dispatch ends as a failure the node's `retry:`/`on_error:` chain runs
- * over.
+ * A wait belongs on the hub's board — the board a status report publishes, a
+ * resume route answers and a recovery re-derives (§1, PRD resolved q4/q28) — and
+ * a worker holds none of it. So a pause reached here is not held and not failed:
+ * it is the dispatch's **third ending**, and this is the line that carries it
+ * home (PRD resolved q46).
  *
- * What is renamed here is **what the operator is told**, not what happens. The
- * bare interrupt says "this run has no way to answer" and points at `serve` and
- * at an interactive `run` — true of the process it was written for and
- * misleading here, where the hub *is* a `serve` and the pause is unanswerable
- * for a reason that has nothing to do with the invocation: the node is executing
- * on the far side of a wire whose §3.4 result carries an output or a failure and
- * has no third shape for a pause. Carrying one home is §13's open question, so
- * this says so and names the composition's own way out.
+ * What travels is what the hub cannot derive: the pause's deterministic identity
+ * (grammar §9.4), what the person is shown, when the wait began and when its
+ * budget runs out, and the effect record its answer will be journaled under. The
+ * *contract* does not travel — the hub holds the same descriptor, because the
+ * whole artifact is everywhere (§4.3) — so what the hub plants is the wait this
+ * node would have opened had it run there, held to this node's own `output:`.
  *
  * Read off the `cause` chain rather than off the error, because the pause is
  * reached inside an attached `flow.*` — grammar §14.1 rule 4 runs one in the
  * attaching agent's placement — and every ladder between there and here wraps
- * what it lets through ([`runtime.interruptOf`]).
+ * what it lets through ([`runtime.remotePauseOf`]).
  */
-function pausedOnAHuman(error: unknown): { name: string; message: string } | undefined {
-  const interrupt = interruptOf(error);
-  if (interrupt === undefined) return undefined;
+function pausedOnAHuman(error: unknown): Record<string, unknown> | undefined {
+  const pause = remotePauseOf(error)?.remote;
+  if (pause === undefined) return undefined;
   return {
-    name: "PlacedHumanWait",
-    message:
-      `\`${interrupt.flow}\` node \`${interrupt.node}\` is a \`human:\` node, and it was reached on a **worker**: this node is placed, so it and everything it attaches execute in the placement's process (grammar §14.1 rule 4), and a worker holds no wait board — the board every pause is published on, answered through and recovered onto is the hub's (docs/distributed.md §1). ` +
-      `The dispatch therefore fails rather than parking, and the node's \`retry:\`/\`on_error:\` chain runs over this. ` +
-      `Reach the pause from a component the hub runs — an unplaced agent, or the flow's own node — or take the placement off the component that reaches it. Carrying a pause home from a worker is docs/distributed.md §13's open question and is not built.`,
+    wait: pause.wait,
+    flow: pause.flow,
+    node: pause.node,
+    shown: pause.shown,
+    paused_at: pause.pausedAt,
+    ...(pause.expiresAt === undefined ? {} : { expires_at: pause.expiresAt }),
+    effect: {
+      key: pause.effect.key,
+      site: pause.effect.site,
+      ordinal: pause.effect.ordinal,
+      request: pause.effect.request,
+    },
   };
 }
 
@@ -561,6 +583,12 @@ async function main(): Promise<void> {
   // lookup per effect.
   openSession(dispatch.execution_id, journal, true);
   executeLocally(runPlaced);
+  // …and a pause reached under any of it settles this dispatch rather than
+  // looking for a board (§3.4, PRD resolved q46). Said once, for the process,
+  // because a `human:` node is reached arbitrarily deep inside a placed agent's
+  // tool loop — through an attached `flow.*`, which grammar §14.1 rule 4 runs in
+  // the attaching agent's placement.
+  dispatchPausesHome();
 
   let line: Record<string, unknown>;
   try {
@@ -591,10 +619,16 @@ async function main(): Promise<void> {
     };
   } catch (error) {
     // The node failed, which is an outcome rather than a crash: §3.4 takes "its
-    // output, or its failure" and the hub runs the node's `retry:`/`on_error:`
-    // chain over it exactly as it would over a local failure (§7.3). One
-    // failure is renamed on its way out, and only one — see [`pausedOnAHuman`].
-    line = { type: "result", error: pausedOnAHuman(error) ?? named(error) };
+    // output, its failure, or the pause it stopped at" and the hub runs the
+    // node's `retry:`/`on_error:` chain over a failure exactly as it would over
+    // a local one (§7.3). One throw is **not** a failure and is answered first —
+    // a pause, which settles this dispatch and sends the wait home
+    // ([`pausedOnAHuman`]).
+    const paused = pausedOnAHuman(error);
+    line =
+      paused === undefined
+        ? { type: "result", error: named(error) }
+        : { type: "result", paused };
   }
   closeSession(dispatch.execution_id);
   // After every effect line this dispatch produced, so a reader that stops at

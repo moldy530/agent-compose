@@ -472,7 +472,20 @@ fn human_waits(ir: &Ir) -> String {
     if !pauses {
         return String::new();
     }
-    String::from(HUMAN_WAITS)
+    let mut section = String::from(HUMAN_WAITS);
+    // The one paragraph a **mesh** adds, and only a mesh: a project with no
+    // placements has no worker for a pause to be opened on, and telling its
+    // reader what happens when one is would be a paragraph about a shape this
+    // deployment cannot reach.
+    if ir
+        .deploy
+        .placements
+        .as_ref()
+        .is_some_and(|section| !section.entries.is_empty())
+    {
+        section.push_str(PLACED_WAITS);
+    }
+    section
 }
 
 const HUMAN_WAITS: &str = r##"
@@ -650,6 +663,35 @@ A run that is not asking reports the pause and exits **`3`**, its own code besid
 run. The trace document is still written, with `status: "interrupted"` and the
 pause on the entry of the node it stopped at, and the answer goes to `serve`'s
 resume route instead.
+"##;
+
+/// The paragraph a composition that both pauses **and** places gets.
+///
+/// A reader of a mesh project meets a real question the section above does not
+/// answer: a placed agent's tool loop can reach a `human` node, so the question
+/// is asked in a process the resume route is not served from. The answer is
+/// "nothing changes", and that is worth writing down precisely because it is the
+/// answer somebody would not assume (`docs/distributed.md` §3.4, PRD resolved
+/// q46).
+const PLACED_WAITS: &str = r##"
+## A pause a worker opens
+
+A placed component can reach a `human` node — an agent placed on a machine, with
+a `flow.*` in its `tools:` that asks somebody a question — and everything above
+is still true of it. The wait board is the hub's, so the question comes home: the
+worker settles its dispatch *paused*, the hub puts the wait on the same board a
+local pause goes on, and the status route publishes it with the same `wait_id`,
+the same `output_schema` and the same `resume_url`. Answer it at that URL.
+
+Two things are worth knowing about what happens next, because they are visible in
+the status route while they happen. The worker is **free** the moment it asks —
+the dispatch is over, and that machine may be given other work, or be switched
+off, while a person thinks. And the answer sends the node **back through
+dispatch**: it is queued to its placement again, and if nothing is claiming that
+placement at that moment the execution shows a `placement_waits` entry until a
+worker joins. What the node does *not* do is start over — the effects it had
+already journaled, a model call above all, are replayed rather than re-issued,
+and it goes live at the point it stopped.
 "##;
 
 /// The section a composition declaring a `store.*` gets.

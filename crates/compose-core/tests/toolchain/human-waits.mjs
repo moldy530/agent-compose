@@ -812,4 +812,184 @@ const observed = {};
   runtime.releaseHumanWaits(execution);
 }
 
+// ---------------------------------------------------------------------------
+// A pause a **worker** opened (`docs/distributed.md` §3.4, PRD resolved q46)
+// ---------------------------------------------------------------------------
+//
+// The parity bar q46 sets is "a placed `human:` node must mean what the same node
+// unplaced means", and this is where that is decidable: the sections above drove
+// a local pause through this board, and these drive a remote one through the
+// *same* board and read the same observations back. What a served hub can show
+// is the status shape and the resume; what only this can show is that the wait
+// is the board's own entry — counted by `pausesUnder`, so the dispatching node's
+// budget is held still (D102); refused by a mismatched payload without consuming
+// the turn; abandoned when the run ends; and settled into exactly the record a
+// local pause writes through `slot.keep`, which is what the redispatch replays.
+
+/** A recorder that holds nothing, so a claim lands at the frontier. */
+function claiming(key, site) {
+  return {
+    child: () => claiming(key, site),
+    claim: () => ({
+      key,
+      site,
+      kind: "human",
+      ordinal: 0,
+      request: '{"node":"sign"}',
+      held: undefined,
+      keep: (value) => value,
+      fail: () => {},
+    }),
+  };
+}
+
+/** The pause a worker settles its dispatch with, as §3.4 carries one home. */
+function remote(fields = {}) {
+  return {
+    wait: "escalate/0/sign/0",
+    flow: "flow.sign_off",
+    node: "sign",
+    shown: { question: "ship it?" },
+    pausedAt: "2026-08-31T09:14:02.113Z",
+    effect: {
+      key: "escalate/0/sign/0#human/0",
+      site: "escalate/0/sign/0",
+      ordinal: 0,
+      request: '{"node":"sign"}',
+    },
+    ...fields,
+  };
+}
+
+// The hub reads the contract off its own copy of the descriptor rather than off
+// anything that travelled (§4.3), which is what this registration is.
+runtime.registerHumanNodes({ "flow.sign_off.sign": descriptor() });
+
+{
+  const execution = "exec_remote_answered";
+  runtime.openHumanWaits(execution, true);
+  const pause = remote();
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause));
+  await settle();
+  const published = runtime.humanWaits(execution);
+  // A payload the node's `output:` refuses does **not** consume the wait.
+  const refused = runtime.deliverHumanAnswer(execution, pause.wait, { decision: "maybe" });
+  const seen = {
+    published: published.map((wait) => ({
+      id: wait.id,
+      flow: wait.flow,
+      node: wait.node,
+      shown: wait.shown,
+      schema: wait.schema,
+      pausedAt: wait.pausedAt,
+    })),
+    // The reading `runActivity` holds a dispatching node's deadline still by.
+    held_under: runtime.pausesUnder(execution, "escalate/0"),
+    held_elsewhere: runtime.pausesUnder(execution, "stamp/0"),
+    refused: refused.ok === false ? refused.reason : "taken",
+    waiting_after_a_mismatch: runtime.humanWaits(execution).length,
+  };
+  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await settle();
+  seen.settled = held.state;
+  seen.record = held.value;
+  seen.waiting_after_the_answer = runtime.humanWaits(execution).length;
+  observed.remote_answered = seen;
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // The budget the **worker** started, not a fresh one: `expiresAt` is the
+  // pause's own instant, so what is left of it is what this board arms.
+  const execution = "exec_remote_expired";
+  runtime.openHumanWaits(execution, true);
+  const held = outcomeOf(
+    runtime.holdRemotePause(
+      execution,
+      remote({ expiresAt: new Date(Date.now() + 30).toISOString() }),
+    ),
+  );
+  await until(() => held.state !== "pending");
+  observed.remote_expired = { settled: held.state, record: held.value };
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // The two settlements that are the run's own shape, not the composition's.
+  const abandoned = "exec_remote_abandoned";
+  runtime.openHumanWaits(abandoned, true);
+  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote()));
+  await settle();
+  runtime.releaseHumanWaits(abandoned);
+  await settle();
+
+  const withdrawn = "exec_remote_withdrawn";
+  runtime.openHumanWaits(withdrawn, true);
+  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote()));
+  await settle();
+  runtime.closeHumanWaits(withdrawn);
+  await settle();
+
+  const unanswerable = "exec_remote_unanswerable";
+  runtime.openHumanWaits(unanswerable, false);
+  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote()));
+  await settle();
+
+  observed.remote_unsettled = {
+    abandoned: dropped.state,
+    withdrawn: closed.state,
+    unanswerable: raised.state,
+  };
+  runtime.releaseHumanWaits(withdrawn);
+  runtime.releaseHumanWaits(unanswerable);
+}
+
+// …and the other end of the same wire, **last**, because the switch it turns on
+// is the process's and is never turned off: a worker runs one dispatch and exits
+// (`./worker-node.ts`). What it proves is the half no served hub can: the wait
+// identity a worker sends home is derived by the *same* `runHuman` at the *same*
+// view a local pause is derived by, so a placed node's question is addressed by
+// the id an unplaced one would have opened.
+{
+  const execution = "exec_travelling";
+  runtime.openHumanWaits(execution, true);
+  park(execution, ["escalate", "0"]);
+  await settle();
+  const opened = runtime.humanWaits(execution).map((wait) => wait.id);
+  runtime.releaseHumanWaits(execution);
+  await settle();
+
+  runtime.dispatchPausesHome();
+  const away = "exec_travelled";
+  const recorder = claiming("escalate/0/sign/0#human/0", "escalate/0/sign/0");
+  let carried = { name: "no throw" };
+  try {
+    // No board at all, which is what a worker is: nothing here opens one.
+    await runtime.runHuman(
+      descriptor(),
+      { question: "ship it?" },
+      { execution: { id: away, session_key: "" }, node: "sign", effects: recorder },
+      viewAt(["escalate", "0"], away),
+    );
+  } catch (error) {
+    carried = {
+      name: error?.name,
+      wait: error?.remote?.wait,
+      flow: error?.remote?.flow,
+      node: error?.remote?.node,
+      shown: error?.remote?.shown,
+      effect: error?.remote?.effect,
+      // Every ladder between a `human` node and this wire lets an interrupt
+      // through untouched, and a pause is one — which is why `on_error: skip`
+      // cannot absorb it on its way to the result line.
+      travels_as_an_interrupt: runtime.interruptOf(error) !== undefined,
+    };
+  }
+  observed.travelling = {
+    opened,
+    carried,
+    published: runtime.humanWaits(away).map((wait) => wait.id),
+  };
+}
+
 process.stdout.write(JSON.stringify(observed));
