@@ -62,7 +62,21 @@ fn accepts(name: &str, body: &str) {
     // a diagnostic. The emitted bytes are the goldens' subject and not this
     // file's; that the emitter *answers at all* is this one's, because the
     // corpus of legal-but-unusual compositions is here rather than there.
-    let project = compose_core::emit(&ir);
+    //
+    // A case binding a `module:` implementation is emitted the way `build`
+    // emits one: the stub is scaffolded into the project first and then read
+    // back, because the artifact carries the authored file (PRD resolved q49)
+    // and `emit` is a pure function that is handed those bytes. Scaffolding
+    // rather than inventing content is what keeps this the command's own order.
+    for scaffold in compose_core::codegen::authored::scaffolds(&ir) {
+        let path = dir.join(scaffold.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        fs::create_dir_all(path.parent().expect("a project-relative path has a parent"))
+            .expect("can write the scaffold");
+        fs::write(&path, &scaffold.contents).expect("can write the scaffold");
+    }
+    let authored = compose_core::Authored::read(&ir, &dir)
+        .unwrap_or_else(|error| panic!("{name} references a module that cannot be read: {error}"));
+    let project = compose_core::emit(&ir, &authored);
     assert!(
         !project.files().is_empty(),
         "{name} validates, so `build` owes it a project, and it emitted no files"

@@ -296,6 +296,20 @@ export const httpTriggers: readonly HttpTrigger[] = [
     },
   },
   {
+    name: "on_stamped",
+    flow: "flow.stamped",
+    path: "/stampings",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
     name: "on_watched",
     flow: "flow.watched",
     path: "/watched-releases",

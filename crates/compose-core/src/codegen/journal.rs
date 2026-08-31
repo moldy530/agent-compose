@@ -140,6 +140,7 @@ mod tests {
             ("runBuiltin", runtime, "src/runtime.ts"),
             ("runHttp", runtime, "src/runtime.ts"),
             ("callFunction", runtime, "src/runtime.ts"),
+            ("callModule", runtime, "src/runtime.ts"),
             ("runHuman", runtime, "src/runtime.ts"),
             ("runStoreOp", stores, "src/stores.ts"),
         ] {
@@ -154,15 +155,15 @@ mod tests {
             );
         }
 
-        // …and no eighth. The count is over both emitted modules, because the
+        // …and no ninth. The count is over both emitted modules, because the
         // document's table is.
         let reached = runtime.matches("journaled(").count()
             + runtime.matches(".claim(").count()
             + stores.matches("journaled(").count()
             + stores.matches(".claim(").count();
         assert_eq!(
-            reached, 7,
-            "`docs/durability.md` §3 says there are exactly seven effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
+            reached, 8,
+            "`docs/durability.md` §3 says there are exactly eight effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
         );
     }
 
@@ -914,15 +915,25 @@ mod tests {
     ///
     /// The four spellings are read rather than the one, because whether a
     /// function is exported says nothing about what it does: the delivery seams
-    /// are module-internal and are as much a rule as the seven exported ones.
+    /// are module-internal and are as much a rule as the exported ones. What
+    /// follows the name is either `(` or `<` — a **generic** seam is still that
+    /// seam, and `callModule` is one, so a reader that insisted on the
+    /// parenthesis would report an effect site as missing rather than as
+    /// unjournaled.
     fn function_body(source: &str, name: &str) -> String {
-        let headers = [
-            format!("export async function {name}("),
-            format!("async function {name}("),
-            format!("export function {name}("),
-            format!("function {name}("),
+        let keywords = [
+            "export async function ",
+            "async function ",
+            "export function ",
+            "function ",
         ];
-        let opens = |line: &str| headers.iter().any(|header| line.starts_with(header));
+        let opens = |line: &str| {
+            keywords.iter().any(|keyword| {
+                line.strip_prefix(keyword)
+                    .and_then(|rest| rest.strip_prefix(name))
+                    .is_some_and(|rest| rest.starts_with('(') || rest.starts_with('<'))
+            })
+        };
         let mut lines = source.lines().skip_while(|line| !opens(line));
         let opened = lines
             .next()

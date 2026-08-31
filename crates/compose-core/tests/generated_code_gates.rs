@@ -2607,10 +2607,21 @@ fn the_artifact_hash_is_the_same_in_both_languages() {
         serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
 
     let emitted = goldens::emitted(golden);
+    // The **whole tree**, generated and carried alike: PRD resolved q49 widened
+    // the artifact to "what `build` wrote plus the authored files the spec
+    // references", and this golden binds one. A hash taken over half of it would
+    // agree with nothing — not with the constant the emitter wrote, and not with
+    // what a worker computes from the entries it unpacked.
+    let tree: Vec<compose_core::GeneratedFile> = emitted.artifact().cloned().collect();
+    assert!(
+        !emitted.carried().is_empty(),
+        "`{}` carries no authored file, so this says nothing about the widened list",
+        golden.directory
+    );
     let declared = answer["declared"].as_str().expect("the declared hash");
     assert_eq!(
         declared,
-        compose_core::codegen::artifact::hash(emitted.files()),
+        compose_core::codegen::artifact::hash(&tree),
         "the constant the emitter wrote is not the hash it computes"
     );
     assert_eq!(

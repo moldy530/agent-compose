@@ -20,6 +20,9 @@ import * as mesh from "./mesh.ts";
 import * as runtime from "./runtime.ts";
 import * as stores from "./stores.ts";
 import {
+  toolStampModule,
+} from "./modules.ts";
+import {
   agentBrieferOutput,
   agentEscalatorOutput,
   agentSignerOutput,
@@ -38,11 +41,14 @@ import {
   flowRetriedInputs,
   flowSignedOffInputs,
   flowSignedOffNodeApproveOutput,
+  flowStampedInputs,
   flowWatchedInputs,
   toolNotarizeInput,
   toolNotarizeOutput,
   toolSignInput,
   toolSignOutput,
+  toolStampInput,
+  toolStampOutput,
 } from "./schemas.ts";
 import { State } from "./state.ts";
 import type { GraphState } from "./state.ts";
@@ -251,6 +257,20 @@ const flowSignedOffNodeApproveShape: runtime.Shape = {
   }
 };
 
+/** `flow.stamped` — the `input` root inside it (grammar 7.5). */
+const flowStampedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.stamped` node `stamp` — the `stamp.output` root its guards read. */
+const flowStampedNodeStampShape: runtime.Shape = {
+  "properties": {
+    "stamped": "string"
+  }
+};
+
 /** `flow.watched` — the `input` root inside it (grammar 7.5). */
 const flowWatchedShape: runtime.Shape = {
   "properties": {
@@ -323,6 +343,24 @@ async function toolSign(args: unknown, context: runtime.RunContext): Promise<unk
       decoding: { envelope: [], decoded: [], raw: "signature", empty: false },
     }, input, context),
     "the result of `tool.sign`",
+  );
+}
+
+/**
+ * `tool.stamp` — an authored module (grammar 6.1). Its arguments are parsed with its own declared `input:` before the implementation sees them, which is the checked signature grammar 8.4 asks for. This is the parse a `function:` node's binding faces, and it is a `ResultMismatch` that fails the node: the arguments are the composition's, checked field-by-field at compile time, so a value constraint they miss at runtime is the graph's own failure and there is nobody to hand it to. A **model's** arguments are refused one level out, at the entry in the agent's `tools:`, where `runtime.parseToolArguments` raises the `ToolCallRefused` the loop hands back (Decision D119). The tool's **result** is parsed with `runtime.parseResult` on both surfaces: a tool answering off-contract is not a call anybody can rephrase.
+ */
+async function toolStamp(args: unknown, context: runtime.RunContext): Promise<unknown> {
+  const input = runtime.parseResult(toolStampInput, args, "the arguments `tool.stamp` was called with");
+  return runtime.parseResult(
+    toolStampOutput,
+    await runtime.callModule({
+      address: "tool.stamp",
+      path: "src/tools/stamp.ts",
+      env: [
+        { name: "STAMP_MARKER", value: [{ env: "STAMP_MARKER", site: "tool.stamp.module.env.STAMP_MARKER" }] },
+      ],
+    }, toolStampModule, input, context),
+    "the result of `tool.stamp`",
   );
 }
 
@@ -1490,6 +1528,77 @@ const flowSignedOffBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.stamped ---
+
+/** `flow.stamped` node `stamp` — `tool.stamp` (grammar 8.4). */
+const flowStampedNodeStamp: runtime.NodeDescriptor = {
+  flow: "flow.stamped",
+  node: "stamp",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowStampedShape, state: stateShape, output: flowStampedNodeStampShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => ({
+    output: runtime.parseResult(
+      toolStampOutput,
+      (
+        await mesh.dispatchPlaced({
+          placement: "mac",
+          node: "flow.stamped.stamp",
+          execution: view.run.execution.id,
+          itemIndex: view.run.execution.item_index,
+          path: runtime.instancePath(view, "stamp"),
+          inputs: input,
+          signal: context.signal,
+          stores: context.storeRecords,
+        })
+      ).output,
+      "the result of `tool.stamp`",
+    ),
+  }),
+  writes: [
+    { field: "stamped", channel: "signature", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.stamped` — its nodes, its `start` edges, and the compiled graph. */
+function flowStamped() {
+  return new StateGraph(State)
+    .addNode("stamp", (state: GraphState) => runtime.runNode(flowStampedNodeStamp, state), {
+      ends: [END],
+    })
+    .addEdge(START, "stamp")
+    .compile();
+}
+
+/**
+ * `flow.stamped`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowStampedGraph = flowStamped();
+
+/**
+ * `flow.stamped` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowStampedBinding: runtime.SubflowBinding = {
+  address: "flow.stamped",
+  outputs: ["signature"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowStampedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowStampedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.watched ---
 
 /**
@@ -1811,6 +1920,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowSignedOffGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.stamped": {
+    address: "flow.stamped",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["signature"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowStampedInputs, inputs, "the `inputs:` of `flow.stamped`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowStampedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowStampedGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.watched": {
@@ -2353,6 +2478,8 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
         toolDispatches: answer.toolDispatches,
       };
     },
+  "flow.stamped.stamp":
+    async (input, context) => ({ output: await toolStamp(input, context) }),
 };
 
 /**

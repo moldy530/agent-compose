@@ -4450,6 +4450,197 @@ fn a_refused_call_does_not_stop_the_calls_beside_it_in_one_answer() {
     );
 }
 
+/// A `module:` tool runs at a `function:` node, in this process, and its answer
+/// is held to the tool's declared `output:` (grammar 6.1, PRD resolved q48).
+///
+/// The first half of parity: the only thing that differs from an `exec:` tool at
+/// the same node is where the code lives. The result reaches state by name, the
+/// trace entry is a node execution like any other, and the declared `env:` is
+/// what the authored file read — which the marker in the answer is the evidence
+/// for, because `src/tools/stamp.ts` spells a different word when the variable
+/// is not there.
+#[test]
+fn a_module_tool_runs_at_a_function_node_and_reads_the_environment_it_declared() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke(
+        "module-tools",
+        "flow.direct",
+        &[("payload", "a release")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["stamped"],
+        json!(format!("a release {}", harness::STAMP_MARKER_VALUE)),
+        "the authored module ran, and read the variable its binding declared"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        0,
+        "a module tool at a `function:` node calls no model"
+    );
+
+    let entries = run.entries("stamp");
+    let [entry] = entries.as_slice() else {
+        panic!("`stamp` ran once: {entries:?}");
+    };
+    assert_eq!(entry["outcome"], "completed", "{entry}");
+}
+
+/// The same tool through an agent's **tool loop**, beside its `exec:` twin —
+/// and the two trace records differ in nothing but the component behind them.
+///
+/// The second half of parity, and the one only a comparison can state.
+/// `tool.stamp` and `tool.shout` take the same argument, answer the same shape
+/// and carry the same description, so a record shape that depended on the
+/// binding would show up here as a difference between two calls of one loop. The
+/// refusal is in the same run: `payload` declares `min_length: 1`, and an empty
+/// one goes back to the model as a `refused` record rather than ending the node
+/// (Decision D119).
+#[test]
+fn a_module_tool_in_a_loop_records_what_an_exec_tool_records_and_bounces_the_same_refusal() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // One answer, three calls: the module tool refused, the module tool
+        // correctly, and its `exec:` twin.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new("stamp", json!({ "payload": "" })),
+                ToolCall::new("stamp", json!({ "payload": "a release" })),
+                ToolCall::new("shout", json!({ "payload": "a release" })),
+            ]),
+        ),
+        Script::new(SONNET, Outcome::text("Both tools answered.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "stamped": "both tools answered" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "module-tools",
+        "flow.assisted",
+        &[("payload", "a release")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["stamped"], "both tools answered");
+
+    let recorded = provider.requests();
+    for call in &recorded {
+        assert!(call.is_valid(), "{:?}", call.failures());
+    }
+    // The module's refusal reaches the model exactly as any other tool's does:
+    // one `tool_result` block, flagged, in the loop's next turn.
+    let answering = recorded[1].body()["messages"][2].clone();
+    let blocks = answering["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the turn carries a block per call: {answering}"));
+    assert_eq!(blocks.len(), 3, "{answering}");
+    assert_eq!(blocks[0]["is_error"], json!(true), "{answering}");
+    assert!(
+        blocks[0]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("the arguments `stamp` was called with")),
+        "the refusal names the tool the way the wire offered it: {answering}"
+    );
+    assert!(
+        blocks[1]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains(harness::STAMP_MARKER_VALUE)),
+        "…and the call that was admitted really ran the authored module: {answering}"
+    );
+
+    let entries = run.entries("assist");
+    let [entry] = entries.as_slice() else {
+        panic!("`assist` ran once: {entries:?}");
+    };
+    let calls = entry["models"][0]["toolCalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer's calls are recorded: {entry}"));
+    let [refused, module, exec] = calls.as_slice() else {
+        panic!("all three calls of the answer are recorded: {entry}");
+    };
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert_eq!(refused["target"], "tool.stamp", "{refused}");
+    assert_eq!(module["outcome"], "completed", "{module}");
+    assert_eq!(exec["outcome"], "completed", "{exec}");
+    // The comparison the test exists for: same keys, same values but the two
+    // that name the component. A record that grew a field for one binding —
+    // or lost one — fails here rather than in a reviewer's eye.
+    let keys = |record: &Value| {
+        let mut held: Vec<String> = record
+            .as_object()
+            .unwrap_or_else(|| panic!("a record is an object: {record}"))
+            .keys()
+            .cloned()
+            .collect();
+        held.sort();
+        held
+    };
+    assert_eq!(
+        keys(module),
+        keys(exec),
+        "a module tool's trace record is an `exec:` tool's, field for field:\n\
+         {module}\n{exec}"
+    );
+    assert_eq!(module["name"], "stamp", "{module}");
+    assert_eq!(module["target"], "tool.stamp", "{module}");
+    assert_eq!(exec["target"], "tool.shout", "{exec}");
+    assert!(
+        module["result"].is_null() && exec["result"].is_null(),
+        "`docs/trace.md` §11 keeps a tool's answer out of the trace, on both \
+         bindings:\n{module}\n{exec}"
+    );
+}
+
+/// The policy chain of grammar §9.3 governs a module binding, at all three of
+/// its members.
+///
+/// `retry:` is the first: `tool.flaky` throws on its first call and answers its
+/// second, and the counter it keeps is module-level state in the graph's own
+/// process — the plainest possible evidence that the retry really made a second
+/// call rather than replaying the first.
+///
+/// `timeout:` and `on_error:` are the other two, over a module that never
+/// answers and never looks at `context.signal`. Grammar §9.2 bounds one node
+/// execution with no exemption for a kind, so the node fails on time and its
+/// fallback runs — which is `activities`' `flow.stubborn` with a `module:`
+/// binding in place of a `function:` one.
+#[test]
+fn a_module_tool_is_retried_bounded_and_routed_around_like_every_other_binding() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(retried) = harness::invoke("module-tools", "flow.retried", &[], &provider) else {
+        return;
+    };
+    retried.succeeded();
+    assert_eq!(
+        retried.outputs()["attempts"],
+        json!(2),
+        "the first call threw and the node's `retry:` made a second"
+    );
+
+    let bounded = harness::invoke("module-tools", "flow.impatient", &[], &provider)
+        .expect("the toolchain was there a moment ago");
+    bounded.succeeded();
+    assert_eq!(
+        bounded.outputs()["outcome"],
+        "gave up",
+        "the node's own `timeout:` stopped a module that ignores the deadline, \
+         and `on_error:` scheduled the fallback"
+    );
+    assert_eq!(
+        bounded.visited(),
+        ["wait", "give_up"],
+        "the fallback is the only way into that node"
+    );
+}
+
 /// A call to a tool the agent does not offer is corrected on the **Chat
 /// Completions** wire too — where the invented name may not be replayed.
 ///

@@ -600,9 +600,11 @@ fn launch(
     // the one thing `--format json` promises never to do.
     warned(entrypoint, target, &diagnostics);
 
-    let project = compose_core::emit(&ir);
-    let scaffolds = compose_core::codegen::authored::scaffolds(&ir);
-    match build::write(&project, &scaffolds, out, root(entrypoint)) {
+    let project = match emitted(entrypoint, &ir) {
+        Ok((project, _)) => project,
+        Err(reason) => return fail(&reason),
+    };
+    match build::write(&project, out) {
         Ok(_) => {}
         Err(build::Refusal::Io(error)) => {
             return fail(&format!("cannot write `{}`: {error}", out.display()));
@@ -692,6 +694,32 @@ fn authored(
     report.extend(compose_core::check_modules(ir, root(entrypoint)));
     report.sort();
     report.into_vec()
+}
+
+/// Scaffold what is missing, read what is there, and emit.
+///
+/// The three steps a `build` — and the `run`/`serve` that build before they
+/// launch — take between a clean report and a directory, in the one order they
+/// can be taken in. The scaffold is a write into the **project** (PRD resolved
+/// q48); the read is what PRD resolved q49's widened artifact needs, because
+/// `compose_core::emit` is a pure function and the tree it describes now holds
+/// files it did not write; and a file that was absent a moment ago is there by
+/// the time it is read, which is why the scaffold cannot come second.
+///
+/// Answers the project and what was scaffolded, or the sentence a failed write
+/// or read is reported with — there is no span to point at for either, so both
+/// are the command's own precondition failing (exit `2`).
+fn emitted(
+    entrypoint: &Path,
+    ir: &Ir,
+) -> Result<(compose_core::GeneratedProject, Vec<(String, String)>), String> {
+    let root = root(entrypoint);
+    let scaffolds = compose_core::codegen::authored::scaffolds(ir);
+    let scaffolded = build::scaffold(&scaffolds, root)
+        .map_err(|error| format!("cannot write `{}`: {error}", root.display()))?;
+    let authored = compose_core::codegen::authored::Authored::read(ir, root)
+        .map_err(|error| format!("{error}"))?;
+    Ok((compose_core::emit(ir, &authored), scaffolded))
 }
 
 fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
@@ -952,8 +980,24 @@ fn build_project(
     // this is asked of the errors rather than of the report.
     let target_only = validated && refused;
 
+    // Emitting is what scaffolds, so `--check` takes the other road: it reads
+    // the authored files and writes nothing at all, which it can do because the
+    // pass above already refused a binding whose file is missing.
+    let mut scaffolded: Vec<(String, String)> = Vec::new();
     let project = match (&ir, refused) {
-        (Some(ir), false) => Some(compose_core::emit(ir)),
+        (Some(ir), false) if checking => {
+            match compose_core::codegen::authored::Authored::read(ir, root(entrypoint)) {
+                Ok(authored) => Some(compose_core::emit(ir, &authored)),
+                Err(error) => return fail(&format!("{error}")),
+            }
+        }
+        (Some(ir), false) => match emitted(entrypoint, ir) {
+            Ok((project, written)) => {
+                scaffolded = written;
+                Some(project)
+            }
+            Err(reason) => return fail(&reason),
+        },
         _ => None,
     };
 
@@ -980,19 +1024,13 @@ fn build_project(
         _ => Vec::new(),
     };
     let wrote = match (&project, checking) {
-        (Some(project), false) => {
-            let scaffolds = ir
-                .as_ref()
-                .map(compose_core::codegen::authored::scaffolds)
-                .unwrap_or_default();
-            match build::write(project, &scaffolds, out, root(entrypoint)) {
-                Ok(written) => Some(written),
-                Err(build::Refusal::Io(error)) => {
-                    return fail(&format!("cannot write `{}`: {error}", out.display()));
-                }
-                Err(build::Refusal::NotOurs(paths)) => return fail(&occupied(out, &paths)),
+        (Some(project), false) => match build::write(project, out) {
+            Ok(written) => Some(written),
+            Err(build::Refusal::Io(error)) => {
+                return fail(&format!("cannot write `{}`: {error}", out.display()));
             }
-        }
+            Err(build::Refusal::NotOurs(paths)) => return fail(&occupied(out, &paths)),
+        },
         _ => None,
     };
 
@@ -1006,6 +1044,7 @@ fn build_project(
         drift: &drift,
         not_ours: &not_ours,
         wrote: wrote.as_ref(),
+        scaffolded: &scaffolded,
         target_only,
     };
     let written = match format {
@@ -1042,7 +1081,7 @@ fn build_project(
 /// file list it emits and nothing else, so the only way a build can collide with
 /// authored code is a name it has to write that somebody else's file is at —
 /// and a message saying only "refused" leaves the reader to guess which of the
-/// twenty-one it was. So it names the directory, the paths, and what the
+/// emitted names it was. So it names the directory, the paths, and what the
 /// compiler was going to do to them.
 fn occupied(out: &Path, paths: &[String]) -> String {
     let (noun, pronoun) = if paths.len() == 1 {

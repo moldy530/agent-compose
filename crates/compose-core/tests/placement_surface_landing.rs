@@ -297,7 +297,7 @@ fn the_deploy_layer_carries_every_key_into_the_artifact() {
 #[test]
 fn the_mesh_reaches_the_generated_project_in_the_modules_that_hold_it() {
     let ir = resolve_clean("emitted");
-    let generated = compose_core::emit(&ir);
+    let generated = compose_core::emit(&ir, &compose_core::Authored::none());
     let file = |path: &str| {
         generated
             .file(path)
@@ -404,7 +404,7 @@ fn the_mesh_reaches_the_generated_project_in_the_modules_that_hold_it() {
 #[test]
 fn the_worker_half_reaches_the_generated_project_in_the_files_a_worker_reads() {
     let ir = resolve_clean("worker");
-    let generated = compose_core::emit(&ir);
+    let generated = compose_core::emit(&ir, &compose_core::Authored::none());
     let file = |path: &str| {
         generated
             .file(path)
@@ -540,7 +540,7 @@ fn a_composition_with_no_placements_carries_no_mesh_of_its_own() {
     let ir = resolution.ir.expect("the composition alone resolves");
     assert!(compose_core::check(&ir).is_empty());
 
-    let generated = compose_core::emit(&ir);
+    let generated = compose_core::emit(&ir, &compose_core::Authored::none());
     // The composition's own lowering, which is where a leak would show: the
     // constants (`src/mesh.ts`) and the identity module describe the wire in
     // their prose, and describing it is what they are for.
@@ -618,7 +618,7 @@ fn a_composition_with_no_placements_carries_no_mesh_of_its_own() {
 #[test]
 fn the_environment_manifest_is_partitioned_per_process() {
     let ir = resolve_clean("environment");
-    let generated = compose_core::emit(&ir);
+    let generated = compose_core::emit(&ir, &compose_core::Authored::none());
     let contents = |path: &str| {
         generated
             .file(path)

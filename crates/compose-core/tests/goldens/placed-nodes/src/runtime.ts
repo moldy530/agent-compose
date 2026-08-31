@@ -4612,6 +4612,93 @@ export async function callFunction(
 }
 
 // ---------------------------------------------------------------------------
+// Authored module implementations (grammar 6.1's `module:` binding)
+// ---------------------------------------------------------------------------
+
+/**
+ * One `module:` binding, as the composition wrote it (grammar 6.1, PRD resolved
+ * q48, q49).
+ *
+ * The *identity* of the call and nothing else: which tool, which file, and the
+ * environment the binding declared. The implementation is not here — it reaches
+ * [`callModule`] as an argument, through `./modules.ts`, because that is the one
+ * seam generated code is allowed to reach authored code across.
+ */
+export interface ModuleBinding {
+  /** The tool's address, as the composition spells it (grammar 2.2). */
+  readonly address: string;
+  /** The authored file, project-relative — the path it takes in the artifact. */
+  readonly path: string;
+  /** `env:` — what this implementation declared it reads (grammar 4.3 class 2). */
+  readonly env: readonly { readonly name: string; readonly value: readonly Interpolation[] }[];
+}
+
+/**
+ * What an authored module is, from this side: the tool's parsed input in, its
+ * declared result out.
+ *
+ * `./modules.ts` states the same shape *per tool*, over the tool's own schemas,
+ * and that is the one `tsc` holds an authored file to. This is the erased
+ * version the runtime dispatches through, and it takes `context` for
+ * [`HostFunction`]'s reason: a module tool reached as the sink of a **detached**
+ * dispatch finds that dispatch's key in `context.idempotency_key`, and finds it
+ * absent on every other call.
+ */
+export type ModuleImplementation<I, O> = (input: I, context: RunContext) => O | Promise<O>;
+
+/**
+ * Call an authored module implementation, in this process (grammar 6.1).
+ *
+ * **Parity is the point.** A module tool is a tool: its arguments are parsed
+ * against its declared `input:` before this is reached, its answer against its
+ * `output:` after, its node's `retry:`/`timeout:`/`on_error:` wrap the whole of
+ * it, and a model that called it wrongly gets the refusal back rather than the
+ * node failing (Decision D119). Only the binding differs, so only the journal's
+ * `surface` differs.
+ *
+ * **What identifies the call.** The address, the file the binding names, the
+ * declared environment **as written**, and the input. Whole, for [`runExec`]'s
+ * reason: a binding that moved in any of those is a call this run does not make,
+ * and the recorded answer is not its. The authored file's *contents* are not in
+ * it, exactly as a host function's registration is not in that surface's key —
+ * an implementation that changed is a new artifact hash rather than a new effect
+ * identity, and `docs/durability.md` §3.2's subject is the composition.
+ *
+ * **The environment is materialised first.** `env:` is the same declaration an
+ * `exec:` binding makes, and it means the same thing: these names hold these
+ * values when the implementation runs. An `exec:` puts them in the child's
+ * environment because that is where its implementation reads them; a module runs
+ * in this process, so they go in this process's `process.env` — which is where
+ * `process.env.SIGNING_KEY` inside authored TypeScript reads them. A binding
+ * that maps a name to itself (`SIGNING_KEY: "${SIGNING_KEY}"`, the ordinary
+ * spelling) writes back the value already there.
+ */
+export async function callModule<I, O>(
+  binding: ModuleBinding,
+  implementation: ModuleImplementation<I, O>,
+  input: I,
+  context: RunContext,
+): Promise<O> {
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "module",
+      address: binding.address,
+      path: binding.path,
+      env: binding.env.map((entry) => ({ name: entry.name, value: asWritten(entry.value) })),
+      input,
+    },
+    async () => {
+      for (const entry of binding.env) {
+        process.env[entry.name] = interpolate(entry.value);
+      }
+      return await implementation(input, context);
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The router (grammar 7.3, 7.4, 7.6)
 // ---------------------------------------------------------------------------
 

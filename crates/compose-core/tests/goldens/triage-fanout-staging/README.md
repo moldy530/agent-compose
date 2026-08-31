@@ -13,13 +13,14 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 
 | path | what it holds |
 |---|---|
-| `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
-| `src/artifact.ts` | what this tree **is**: a content hash over its own files, the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
+| `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, which files here the compiler did not write, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
+| `src/artifact.ts` | what this tree **is**: a content hash over its own files — the emitted ones and the authored ones the composition references — the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, and the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1) |
 | `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
 | `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
 | `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:`, the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
+| `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
 | `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
@@ -79,11 +80,11 @@ compile time, which is what keeps this directory committable and free of
 credentials.
 
 **The file list above is the boundary.** `agent-compose build` replaces exactly
-the files in that table and `agent-compose build --check` compares exactly them;
-nothing else in this directory is written, removed, or reported. A
-`node_modules/`, a lockfile, a `.env` — and any TypeScript you wrote — are yours,
-wherever they sit. `src/` is not a compiler-only directory: what makes a file the
-compiler's is being on that list.
+the files in that table and nothing else in this directory is written, removed,
+or reported. A `node_modules/`, a lockfile, a `.env` — and any TypeScript you
+wrote that the composition does not reference — are yours, wherever they sit.
+`src/` is not a compiler-only directory: what makes a file the compiler's is
+being on that list.
 
 Every file the compiler replaces carries the header above, which is how it tells
 its own work from yours: a `build` into a directory holding none of its files
@@ -92,10 +93,21 @@ refuses rather than overwriting what is there.
 `src/tools/` is where your own code goes. A `tool.*` in the composition may bind
 `module: ./src/tools/<name>.ts`, and `build` writes that file **once** — the
 typed signature, the contract as a doc comment, a body that throws — then never
-writes it again and never reads it. Fill it in and commit it: the tool's declared
-`input:` and `output:` are its contract, and `bun run typecheck` is what holds it
-there. The directory is a convention rather than a rule; the file list is the
-rule.
+writes it again and never reads it to re-emit it. Fill it in and commit it: the
+tool's declared `input:` and `output:` are its contract, `src/modules.ts` is
+where that contract is written down, and `bun run typecheck` is what holds the
+file to it. The directory is a convention rather than a rule; the file list is
+the rule.
+
+You edit those files **in the project** — beside `main.yml`, where the `module:`
+path is resolved. A build copies each one it references into this directory at
+the same relative path, because the composition references it and the artifact a
+worker fetches has to carry it: `src/artifact.ts` lists it and hashes it like
+every other entry, so editing an implementation is a new artifact hash and
+reaches every worker through the join handshake. `agent-compose build --check`
+compares those copies too — a copy that no longer matches what you wrote is a
+build to re-run, exactly like a generated file that drifted. Files under `src/`
+that the composition does not reference ship nowhere.
 
 ## Running it
 

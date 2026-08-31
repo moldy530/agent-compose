@@ -8,6 +8,7 @@
     "the whole directory out and stop regenerating it."
   ],
   "node_runner": "src/worker-node.ts",
+  "authored": [],
   "placements": [
   ]
 }

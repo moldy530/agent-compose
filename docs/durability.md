@@ -157,12 +157,12 @@ Every effect, and completeness is the invariant: **an effect that is not
 journaled is one a replay re-executes.** A reader verifies it the way the
 implementation enforces it — by finding the call sites. Every effect goes
 through `journaled(…)` or `EffectRecorder.claim(…)` in the emitted sources, and
-there are exactly seven of them, in four kinds:
+there are exactly eight of them, in four kinds:
 
 | kind | site in the emitted project | what the record holds |
 |---|---|---|
 | `model` | `callModel` in `src/runtime.ts` | §3.1 |
-| `tool` | `runExec`, `runBuiltin`, `runHttp`, `callFunction` in `src/runtime.ts` | §3.2 |
+| `tool` | `runExec`, `runBuiltin`, `runHttp`, `callFunction`, `callModule` in `src/runtime.ts` | §3.2 |
 | `store` | `runStoreOp` in `src/stores.ts` | §3.3 |
 | `human` | `runHuman` in `src/runtime.ts` | §3.4 |
 
@@ -177,17 +177,17 @@ That inventory is held **mechanically**, and by two tests in
 `crates/compose-core/src/codegen/journal.rs` that read it from opposite ends.
 
 `every_effect_site_reaches_the_journal_and_the_document_names_them_all` reads it
-from the seams: each of the seven functions above is read out of the emitted
+from the seams: each of the eight functions above is read out of the emitted
 modules, and the test fails when one does not reach the journal, when this table
-does not name it, or when an eighth site exists that this table does not.
+does not name it, or when a ninth site exists that this table does not.
 
 `nothing_in_the_emitted_runtime_calls_the_world_except_under_a_journaled_seam`
 reads it from the **primitives**, which is the direction the first cannot see.
 A surface added to `src/runtime.ts` that calls the world and is not journaled is
-a replay that issues it twice — and it is not one of the seven, contains no
+a replay that issues it twice — and it is not one of the eight, contains no
 `journaled(` and no `.claim(`, and is in no table, so nothing else in the
 repository would notice. So every call to the world in every emitted constant
-module is required to sit in a declaration the seven transitively reach.
+module is required to sit in a declaration the eight transitively reach.
 
 What counts as a call to the world is **derived rather than listed**, because a
 list of spellings is only as complete as the last person to extend it: `spawn(`
@@ -288,10 +288,22 @@ than a re-reading of it (§11.1).
 
 ### 3.2 A tool execution
 
-One record per `exec:`, `http:` or `function:` invocation, at either of the two
-surfaces a tool has — a node's own activity, and a tool an agent's model called.
-The record holds the value the binding answered, before the declared `output:`
-schema parses it; a failure is recorded and replayed as §3.1 replays one.
+One record per `exec:`, `http:`, `function:` or `module:` invocation, at either
+of the two surfaces a tool has — a node's own activity, and a tool an agent's
+model called. The record holds the value the binding answered, before the
+declared `output:` schema parses it; a failure is recorded and replayed as §3.1
+replays one.
+
+A **`module:` binding** (`docs/grammar.md` §6.1, PRD resolved q48) is one of
+these and nothing more: authored TypeScript running in this process rather than
+a subprocess or a request, journaled so that a resumed execution does not run it
+a second time. Its request identity is the tool's address, the file the binding
+names, the `env:` it declared as written, and the input the graph built. What is
+**not** in it is the file's contents — an implementation that changed is a
+different artifact hash (PRD resolved q49) rather than a different effect key,
+which is the posture a `function:` registration already takes: the identity is
+what the *composition* says, and the composition says which file, not what is
+in it.
 
 The request identity is the binding **as the composition wrote it** — the
 `${ENV}` references unresolved — plus the input the graph built. That is

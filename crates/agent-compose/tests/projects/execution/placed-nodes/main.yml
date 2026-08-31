@@ -131,6 +131,15 @@ triggers:
       path: "payload.body.path"
     respond: async
 
+  on_stamped:
+    type: http
+    flow: flow.stamped
+    path: /stampings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
   on_batch:
     type: http
     flow: flow.batch
@@ -228,6 +237,28 @@ tool.sign:
     args: ['{"signature":"signed"}']
     env:
       KEYCHAIN_PASSWORD: ${KEYCHAIN_PASSWORD}
+
+# The placed **module** tool (grammar §6.1, PRD resolved q48, q49). Authored
+# TypeScript, committed beside this file at `src/tools/stamp.ts`, and carried
+# into the artifact because the composition references it — which is the whole of
+# how it reaches a worker: the worker holds nothing but the artifact, fetches it
+# by hash and runs the node out of it.
+#
+# `${STAMP_MARKER}` is the other half. A `process.env` read inside TypeScript is
+# not something `References::of` can walk, so the binding declares it and the
+# per-placement partition carries it to `mac` and to nowhere else — the same
+# `docs/distributed.md` §9.1 answer `tool.sign`'s `${KEYCHAIN_PASSWORD}` gets,
+# reached through a different binding.
+tool.stamp:
+  description: Stamp a release with the marker the signing machine holds.
+  input:
+    path: { type: string }
+  output:
+    stamped: { type: string }
+  module:
+    path: ./src/tools/stamp.ts
+    env:
+      STAMP_MARKER: ${STAMP_MARKER}
 
 # The hub's own: unplaced, and reached from a `function:` node, where a tool's
 # own placement would be the whole answer if it had one (grammar §14.1).
@@ -513,6 +544,33 @@ flow.direct:
   edges:
     - { from: start, to: sign }
     - { from: sign, to: end }
+
+# The module binding's mesh consequence, made observable (PRD resolved q49). A
+# `function:` node over a **placed module tool**: the tool's own placement is the
+# whole of the answer (grammar §14.1), so the node is dispatched, and what runs
+# it is authored TypeScript the worker only ever saw inside the artifact it
+# fetched. The marker in the answer is the evidence — `src/tools/stamp.ts` spells
+# a different word when `${STAMP_MARKER}` is not in the process's environment, so
+# a partition that failed to carry it to `mac` would come back saying so.
+flow.stamped:
+  description: Stamp a release with authored code, on the machine that holds it.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    stamp:
+      function: tool.stamp
+      input:
+        path: "input.path"
+      writes:
+        stamped: signature
+  edges:
+    - { from: start, to: stamp }
+    - { from: stamp, to: end }
 
 flow.retried:
   description: The same sign-off, under a retry the hub can spend on it.

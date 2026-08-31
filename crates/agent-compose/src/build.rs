@@ -1,5 +1,5 @@
-//! `agent-compose build`: the emission set on disk, the check that it still
-//! matches, and the one file a build writes that it does not own.
+//! `agent-compose build`: the emitted tree on disk, the check that it still
+//! matches, and the two writes a build makes that are not its own code.
 //!
 //! `compose_core::emit` answers a set of `(path, contents)` pairs and touches
 //! nothing (see `compose_core::codegen`). This module is the half that does:
@@ -22,10 +22,28 @@
 //! * **checking** reports a file that is missing and one whose bytes differ —
 //!   the two ways a committed project can stop matching its spec (PRD §8:
 //!   "hand-edited generated code forks the source of truth", mitigated by
-//!   "`build --check` in CI"). There is no third way any more: a file the
-//!   emitter does not produce is not drift, because drift is a disagreement
-//!   about a file the compiler claims.
+//!   "`build --check` in CI"). There is no third way any more: a file the build
+//!   does not produce is not drift, because drift is a disagreement about a file
+//!   the compiler claims.
 //! * neither **removes** anything, anywhere.
+//!
+//! # The first write that is not the compiler's code: a carried implementation
+//!
+//! A `module:` binding's implementation, copied in at the same project-relative
+//! path (`GeneratedProject::carried`, PRD resolved q49). The *artifact* is "what
+//! `build` wrote plus the authored files the spec references", and a worker
+//! holds nothing but the artifact, so the tree the hub tars has to contain the
+//! file — and `src/modules.ts`, which imports it, has to resolve inside that
+//! tree rather than back out into somebody's checkout.
+//!
+//! It is a copy rather than a claim on the name. What the author edits is the
+//! project-side original beside `main.yml`, which is where `validate` looks for
+//! it and where a scaffold is written; the copy under `--out` is a build
+//! artifact like every generated file beside it, is compared by [`check`] for
+//! exactly that reason, and carries no generated-file header because the bytes
+//! are the author's. The boundary is unmoved: the composition decides which
+//! authored files travel, and the ones it does not name are still nobody's
+//! business but the author's.
 //!
 //! What that costs, said plainly: a module an older compiler release wrote and
 //! this one no longer emits stays where it is, importable, until somebody
@@ -52,25 +70,31 @@
 //! report sends the reader to `build` for; a per-file rule would answer that
 //! instruction with a refusal.
 //!
-//! # The one file a build writes and does not own, in the one tree that is not
-//! the output directory
+//! # The second: a scaffold, in the one tree that is not the output directory
 //!
 //! A `module:` binding names authored TypeScript, and `build` **scaffolds** it
 //! when it is absent: once, with the typed signature and a body that throws
-//! (`compose_core::codegen::authored`). A scaffold is not an emitted file — it is
-//! not in the manifest, `--check` never compares it, and a rebuild that finds it
-//! present writes nothing. `build` never reads what is in it.
+//! ([`scaffold`], `compose_core::codegen::authored`). A scaffold is not an
+//! emitted file — it is not in the manifest, nothing compares it against a
+//! template, and a rebuild that finds it present writes nothing. `build` never
+//! reads what is in it to decide what to write.
 //!
 //! It goes in the **project**, not in `--out`, and that is not an arbitrary
 //! choice: a `module:` path is project-relative, like an `imports:` entry
 //! (grammar 6.1, 1.4), and `agent-compose validate` — which takes no `--out` at
 //! all — is required to refuse a binding whose file is missing. One place the
-//! path can mean, and it is the entrypoint's own directory. So [`write`] takes
-//! two roots: the output directory it emits into, and the project the authored
-//! half lives in. The path is the same *inside the artifact*, which is exactly
-//! why a binding may not name a file the emitter writes — under that rule the
-//! authored file's project-relative name and its name in the shipped tree are
-//! one string with no collision possible.
+//! path can mean, and it is the entrypoint's own directory. The path is the same
+//! *inside the artifact*, which is exactly why a binding may not name a file the
+//! emitter writes — under that rule the authored file's project-relative name
+//! and its name in the shipped tree are one string with no collision possible.
+//!
+//! Two trees and two writes, in this order: [`scaffold`] into the project, then
+//! [`write`] into `--out`. The order is forced — the emitter hashes the authored
+//! bytes into the artifact, so they have to be on disk before there is a project
+//! to write — and it means a build refused over an occupied `--out` may have
+//! left a stub behind. That is not a half-done write to undo: a stub is the
+//! author's file, in the author's tree, written once, and the build that
+//! follows a fixed `--out` writes it no second time.
 //!
 //! `--check` does not scaffold, and does not stay silent either: a missing
 //! implementation is refused before this module is reached, by
@@ -131,10 +155,8 @@ impl fmt::Display for Drift {
 pub(crate) struct Written {
     /// How many files the emitter produced.
     pub(crate) files: usize,
-    /// The authored implementations this build scaffolded because they were
-    /// absent, as `(path, tool)`, sorted by path. A build that finds them all
-    /// present scaffolds nothing.
-    pub(crate) scaffolded: Vec<(String, String)>,
+    /// How many authored files the tree carries beside them (PRD resolved q49).
+    pub(crate) carried: usize,
 }
 
 /// Why a write did not happen.
@@ -162,31 +184,23 @@ impl From<io::Error> for Refusal {
 /// there.
 const GENERATED_MARKER: &str = "generated by agent-compose";
 
-/// Write the whole emission set into `out`, and scaffold into `root` the
-/// authored modules that are not there yet.
+/// Write the whole tree into `out`: the emission set, and the authored files
+/// the composition references beside it.
 ///
-/// **Two roots, because there are two trees.** `out` is the generated project;
-/// `root` is the project the composition was read from, which is where a
-/// `module:` path is resolved and therefore where an absent implementation is
-/// written (see the module header).
+/// Both, because both are what the artifact is (PRD resolved q49, and see the
+/// module header). The authored bytes came from the project root, and
+/// [`scaffold`] is what put a missing one there before the emitter was asked for
+/// a tree at all.
 ///
 /// A refusal is [`Refusal::NotOurs`] naming the paths, and nothing has been
-/// written when it happens, because the scan runs first. The scaffolds that do
-/// happen come back in [`Written::scaffolded`] and are reported, so "the build
-/// also wrote you a stub" is something the run says rather than something a
-/// later `git status` discovers.
-pub(crate) fn write(
-    project: &GeneratedProject,
-    scaffolds: &[Scaffold],
-    out: &Path,
-    root: &Path,
-) -> Result<Written, Refusal> {
+/// written when it happens, because the scan runs first.
+pub(crate) fn write(project: &GeneratedProject, out: &Path) -> Result<Written, Refusal> {
     let foreign = not_ours(project, out)?;
     if !foreign.is_empty() {
         return Err(Refusal::NotOurs(foreign));
     }
 
-    for file in project.files() {
+    for file in project.artifact() {
         let path = at(out, &file.path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -194,9 +208,28 @@ pub(crate) fn write(
         std::fs::write(&path, &file.contents)?;
     }
 
-    // **After** the emitted set, and only where the file is absent. A scaffold
-    // is a write `build` makes once; a rebuild finds the file there and leaves
-    // the author's bytes alone, without reading them (PRD resolved q48).
+    Ok(Written {
+        files: project.files().len(),
+        carried: project.carried().len(),
+    })
+}
+
+/// Write into `root` the authored implementations that are not there yet.
+///
+/// **Before the emission set, and in a different tree.** `root` is the project
+/// the composition was read from, which is where a `module:` path is resolved
+/// and therefore where an absent implementation is written (see the module
+/// header). It runs first because [`compose_core::emit`] hashes those files into
+/// the artifact, so they have to exist before there is a project to write — a
+/// build that scaffolded afterwards would emit an artifact list naming a file
+/// that was not there when the list was made.
+///
+/// A scaffold is a write `build` makes **once**: a rebuild finds the file there
+/// and leaves the author's bytes alone, without reading them (PRD resolved q48).
+/// The answer is what was written, as `(path, tool)`, sorted by path — reported,
+/// so "the build also wrote you a stub" is something the run says rather than
+/// something a later `git status` discovers.
+pub(crate) fn scaffold(scaffolds: &[Scaffold], root: &Path) -> io::Result<Vec<(String, String)>> {
     let mut scaffolded: Vec<(String, String)> = Vec::new();
     for scaffold in scaffolds {
         let path = at(root, &scaffold.path);
@@ -210,11 +243,7 @@ pub(crate) fn write(
         scaffolded.push((scaffold.path.clone(), scaffold.tool.clone()));
     }
     scaffolded.sort();
-
-    Ok(Written {
-        files: project.files().len(),
-        scaffolded,
-    })
+    Ok(scaffolded)
 }
 
 /// What a [`write`] would refuse over, answered without writing: the payload
@@ -234,12 +263,34 @@ pub(crate) fn not_ours(project: &GeneratedProject, out: &Path) -> io::Result<Vec
         return Ok(Vec::new());
     }
     let mut foreign: BTreeSet<String> = BTreeSet::new();
-    for path in project.paths() {
-        if occupied(&at(out, path))? {
-            foreign.insert(path.to_string());
+    for file in project.files() {
+        if occupied(&at(out, &file.path))? {
+            foreign.insert(file.path.clone());
+        }
+    }
+    // A **carried** file is the author's own bytes, so the question is a
+    // different one: the refusal exists to stop this compiler putting its output
+    // over somebody's file, and writing a file the bytes it already holds
+    // destroys nothing. That is not a nicety — `--out` may name the project
+    // itself, where the copy's destination *is* its source, and a rule asking
+    // only "does something exist here" would refuse every such build.
+    for file in project.carried() {
+        if replaced(&at(out, &file.path), &file.contents)? {
+            foreign.insert(file.path.clone());
         }
     }
     Ok(foreign.into_iter().collect())
+}
+
+/// Whether writing `contents` at this path would replace something else.
+///
+/// Nothing there, or exactly these bytes already, is not a replacement.
+fn replaced(path: &Path, contents: &str) -> io::Result<bool> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes != contents.as_bytes()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Whether the output directory already holds something this compiler wrote.
@@ -250,8 +301,8 @@ pub(crate) fn not_ours(project: &GeneratedProject, out: &Path) -> io::Result<Vec
 /// that happens to share a name. A directory holding none of them may be
 /// anything at all, and is treated as if it were the user's.
 fn claimed(project: &GeneratedProject, out: &Path) -> io::Result<bool> {
-    for path in project.paths() {
-        match generated(&at(out, path)) {
+    for file in project.files() {
+        match generated(&at(out, &file.path)) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -295,14 +346,17 @@ fn generated(path: &Path) -> io::Result<bool> {
     Ok(String::from_utf8_lossy(&head[..filled]).contains(GENERATED_MARKER))
 }
 
-/// Compare the emission set against the directory, writing nothing.
+/// Compare the tree a build would produce against the directory, writing
+/// nothing.
 ///
-/// Answers the drift, sorted by path. Exactly the emission set is compared:
-/// nothing else under the output directory is the compiler's to have an opinion
-/// about (see the module header).
+/// Answers the drift, sorted by path. Exactly that tree is compared — the
+/// emission set and the authored files the composition references, which is what
+/// a build writes and what the artifact hash covers; nothing else under the
+/// output directory is the compiler's to have an opinion about (see the module
+/// header).
 pub(crate) fn check(project: &GeneratedProject, out: &Path) -> io::Result<Vec<Drift>> {
     let mut drift = Vec::new();
-    for file in project.files() {
+    for file in project.artifact() {
         match std::fs::read(at(out, &file.path)) {
             Ok(bytes) if bytes == file.contents.as_bytes() => {}
             Ok(_) => drift.push(Drift {
@@ -348,7 +402,10 @@ mod tests {
     fn project() -> GeneratedProject {
         let resolution = compose_core::resolve(scratch_spec().as_path());
         assert!(resolution.diagnostics.is_empty());
-        compose_core::emit(&resolution.ir.expect("an artifact"))
+        compose_core::emit(
+            &resolution.ir.expect("an artifact"),
+            &compose_core::Authored::none(),
+        )
     }
 
     /// A one-file composition on disk, for the emitter to run over.
@@ -363,10 +420,15 @@ mod tests {
         entrypoint
     }
 
-    /// A composition with one `module:` binding: the project it emits, the
-    /// scaffolds it asks for, and the **project root** they are written into,
-    /// which is the entrypoint's own directory rather than `--out`.
-    fn with_module() -> (GeneratedProject, Vec<Scaffold>, PathBuf) {
+    /// A composition with one `module:` binding: its artifact, the scaffolds it
+    /// asks for, and the **project root** they are written into, which is the
+    /// entrypoint's own directory rather than `--out`.
+    ///
+    /// The project itself is not emitted here, because it cannot be: the
+    /// artifact carries the authored file's bytes, and the whole point of the
+    /// tests below is what happens before and after those bytes exist. Each one
+    /// emits where it means to (see [`built`]).
+    fn with_module() -> (compose_core::Ir, Vec<Scaffold>, PathBuf) {
         let directory = scratch("module-spec");
         let entrypoint = directory.join("main.yml");
         std::fs::write(
@@ -386,11 +448,17 @@ tool.sign:
         let resolution = compose_core::resolve(entrypoint.as_path());
         assert!(resolution.diagnostics.is_empty());
         let ir = resolution.ir.expect("an artifact");
-        (
-            compose_core::emit(&ir),
-            compose_core::codegen::authored::scaffolds(&ir),
-            directory,
-        )
+        let scaffolds = compose_core::codegen::authored::scaffolds(&ir);
+        (ir, scaffolds, directory)
+    }
+
+    /// The project one artifact emits, reading the authored files out of the
+    /// project root — which is what the CLI does between scaffolding and
+    /// writing (`main::emitted`).
+    fn built(ir: &compose_core::Ir, root: &Path) -> GeneratedProject {
+        let authored =
+            compose_core::Authored::read(ir, root).expect("every referenced module is readable");
+        compose_core::emit(ir, &authored)
     }
 
     fn scratch(purpose: &str) -> PathBuf {
@@ -411,10 +479,10 @@ tool.sign:
         let project = project();
         let out = scratch("clean");
         assert_eq!(
-            write(&project, &[], &out, &out).expect("the directory is writable"),
+            write(&project, &out).expect("the directory is writable"),
             Written {
                 files: project.files().len(),
-                scaffolded: Vec::new(),
+                carried: 0,
             }
         );
         assert_eq!(
@@ -427,7 +495,7 @@ tool.sign:
     fn an_edited_file_and_a_deleted_one_are_both_drift() {
         let project = project();
         let out = scratch("edited");
-        write(&project, &[], &out, &out).expect("writable");
+        write(&project, &out).expect("writable");
         std::fs::write(out.join("src/state.ts"), "// mine now\n").expect("writable");
         std::fs::remove_file(out.join("src/env.ts")).expect("removable");
         assert_eq!(
@@ -454,7 +522,7 @@ tool.sign:
     fn a_file_the_emitter_does_not_produce_is_left_alone_everywhere() {
         let project = project();
         let out = scratch("not-emitted");
-        write(&project, &[], &out, &out).expect("writable");
+        write(&project, &out).expect("writable");
 
         std::fs::create_dir_all(out.join("src/tools")).expect("writable");
         std::fs::write(out.join("src/tools/sign.ts"), "export default 1;\n").expect("writable");
@@ -474,10 +542,10 @@ tool.sign:
             "nothing outside the emitted list is drift"
         );
         assert_eq!(
-            write(&project, &[], &out, &out).expect("writable"),
+            write(&project, &out).expect("writable"),
             Written {
                 files: project.files().len(),
-                scaffolded: Vec::new(),
+                carried: 0,
             },
             "and nothing outside it is removed"
         );
@@ -506,7 +574,7 @@ tool.sign:
         // Not an emitted name, so not part of the refusal.
         std::fs::write(out.join("src/mine.ts"), "export const mine = 2;\n").expect("writable");
 
-        let refusal = write(&project, &[], &out, &out).expect_err("the write is refused");
+        let refusal = write(&project, &out).expect_err("the write is refused");
         let Refusal::NotOurs(paths) = refusal else {
             panic!("the refusal names the files, not an io error: {refusal:?}");
         };
@@ -549,16 +617,16 @@ tool.sign:
     fn a_hand_edited_generated_file_is_regenerated_rather_than_refused() {
         let project = project();
         let out = scratch("rebuild");
-        write(&project, &[], &out, &out).expect("writable");
+        write(&project, &out).expect("writable");
         std::fs::write(out.join("package-lock.json"), "{}\n").expect("writable");
         std::fs::write(out.join("src/state.ts"), "// mine now\n").expect("writable");
         std::fs::write(out.join("README.md"), "# mine now\n").expect("writable");
 
         assert_eq!(
-            write(&project, &[], &out, &out).expect("the second write is not refused"),
+            write(&project, &out).expect("the second write is not refused"),
             Written {
                 files: project.files().len(),
-                scaffolded: Vec::new(),
+                carried: 0,
             }
         );
         assert_eq!(check(&project, &out).expect("readable"), []);
@@ -582,23 +650,19 @@ tool.sign:
     /// and inside the artifact.
     #[test]
     fn an_absent_module_is_scaffolded_once_and_never_rewritten() {
-        let (project, scaffolds, root) = with_module();
+        let (ir, scaffolds, root) = with_module();
         let out = scratch("scaffold");
         assert_eq!(scaffolds.len(), 1);
 
-        let written = write(&project, &scaffolds, &out, &root).expect("writable");
+        let scaffolded = scaffold(&scaffolds, &root).expect("writable");
         assert_eq!(
-            written.scaffolded,
+            scaffolded,
             [("src/tools/sign.ts".to_string(), "tool.sign".to_string())],
             "the build reports what it wrote for the author"
         );
-        assert!(
-            !out.join("src/tools/sign.ts").exists(),
-            "the authored half goes in the project, not in the output directory"
-        );
         let stub = std::fs::read_to_string(root.join("src/tools/sign.ts")).expect("readable");
         assert!(
-            stub.contains("export default async function toolSign("),
+            stub.contains("const toolSign: ToolSignModule = async (input) => {"),
             "{stub}"
         );
         assert!(
@@ -608,16 +672,42 @@ tool.sign:
 
         // The author fills it in. A rebuild neither rewrites it nor mentions it.
         std::fs::write(root.join("src/tools/sign.ts"), "export default 1;\n").expect("writable");
-        let again = write(&project, &scaffolds, &out, &root).expect("writable");
-        assert_eq!(again.scaffolded, Vec::new());
+        assert_eq!(scaffold(&scaffolds, &root).expect("writable"), Vec::new());
         assert_eq!(
             std::fs::read_to_string(root.join("src/tools/sign.ts")).expect("readable"),
             "export default 1;\n"
         );
 
-        // And it is not part of what `--check` compares: the emitted file list
-        // is the boundary, and a scaffold is not on it.
+        // What the build then writes carries the author's bytes into the output
+        // tree, at the path the composition names them by (PRD resolved q49) —
+        // and `--check` compares that copy, because it is what the artifact
+        // hash covers.
+        let project = built(&ir, &root);
+        let written = write(&project, &out).expect("writable");
+        assert_eq!(
+            written,
+            Written {
+                files: project.files().len(),
+                carried: 1,
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("src/tools/sign.ts")).expect("readable"),
+            "export default 1;\n",
+            "the artifact carries what the spec references"
+        );
         assert_eq!(check(&project, &out).expect("readable"), []);
+
+        // …and a copy that stopped matching what the author wrote is drift, the
+        // same as a generated file somebody edited.
+        std::fs::write(out.join("src/tools/sign.ts"), "export default 2;\n").expect("writable");
+        assert_eq!(
+            check(&project, &out).expect("readable"),
+            [Drift {
+                path: "src/tools/sign.ts".to_string(),
+                state: State::Differs,
+            }]
+        );
     }
 
     /// An empty file counts as present: a scaffold is a write `build` makes
@@ -626,16 +716,43 @@ tool.sign:
     /// decide whether it was worth keeping.
     #[test]
     fn a_module_that_exists_is_never_scaffolded_over_however_empty() {
-        let (project, scaffolds, root) = with_module();
-        let out = scratch("scaffold-empty");
+        let (_, scaffolds, root) = with_module();
         std::fs::create_dir_all(root.join("src/tools")).expect("writable");
         std::fs::write(root.join("src/tools/sign.ts"), "").expect("writable");
 
-        let written = write(&project, &scaffolds, &out, &root).expect("writable");
-        assert_eq!(written.scaffolded, Vec::new());
+        assert_eq!(scaffold(&scaffolds, &root).expect("writable"), Vec::new());
         assert_eq!(
             std::fs::read_to_string(root.join("src/tools/sign.ts")).expect("readable"),
             ""
+        );
+    }
+
+    /// `--out` may name the project itself, and then a carried file's
+    /// destination *is* its source. Writing a file the bytes it already holds
+    /// replaces nothing, so the "somebody else's file at a name I emit" refusal
+    /// has nothing to say about it.
+    #[test]
+    fn a_carried_file_written_over_itself_is_not_somebody_elses() {
+        let (ir, scaffolds, root) = with_module();
+        scaffold(&scaffolds, &root).expect("writable");
+        let project = built(&ir, &root);
+
+        assert_eq!(
+            not_ours(&project, &root).expect("readable"),
+            Vec::<String>::new(),
+            "the project root holds the author's own bytes at that path"
+        );
+        write(&project, &root).expect("the write is not refused");
+        assert_eq!(check(&project, &root).expect("readable"), []);
+
+        // The other direction: a directory this compiler never built into, that
+        // holds a *different* file at a carried name, is one it refuses.
+        let out = scratch("carried-collision");
+        std::fs::create_dir_all(out.join("src/tools")).expect("writable");
+        std::fs::write(out.join("src/tools/sign.ts"), "// somebody else's\n").expect("writable");
+        assert_eq!(
+            not_ours(&project, &out).expect("readable"),
+            ["src/tools/sign.ts"]
         );
     }
 

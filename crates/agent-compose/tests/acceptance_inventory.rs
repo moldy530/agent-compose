@@ -232,6 +232,25 @@ const CODEGEN: &[Criterion] = &[
                 "a_refused_call_does_not_stop_the_calls_beside_it_in_one_answer",
                 Status::Live,
             ),
+            // Grammar 6.1's fourth implementation binding, executed (PRD
+            // resolved q48). Three rows because the claim is **parity** and
+            // parity is three separate things: the node surface, the tool-loop
+            // surface — where the comparison against an `exec:` twin is the
+            // assertion — and the policy chain that governs both. A module
+            // dispatched through a seam of its own could pass any one of them
+            // alone while behaving unlike a tool at the other two.
+            (
+                "a_module_tool_runs_at_a_function_node_and_reads_the_environment_it_declared",
+                Status::Live,
+            ),
+            (
+                "a_module_tool_in_a_loop_records_what_an_exec_tool_records_and_bounces_the_same_refusal",
+                Status::Live,
+            ),
+            (
+                "a_module_tool_is_retried_bounded_and_routed_around_like_every_other_binding",
+                Status::Live,
+            ),
             (
                 "an_answer_mixing_an_unoffered_call_with_an_offered_one_is_answered_in_both_chat_completions_shapes",
                 Status::Live,

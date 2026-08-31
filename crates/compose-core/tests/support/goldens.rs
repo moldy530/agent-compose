@@ -123,8 +123,23 @@ pub fn artifact(golden: &Golden) -> compose_core::Ir {
 }
 
 /// The project one golden is emitted as.
+///
+/// The authored files a `module:` binding names are read out of the golden's own
+/// **source project** — the checked-in tree beside its `main.yml`, exactly where
+/// `agent-compose build` reads them from. That is what makes a module golden a
+/// real test of the contract rather than of a fixture: the committed `.ts` is
+/// the author's, `tsc` runs over the copy this carries into the golden
+/// directory, and a schema change breaks the type check (PRD resolved q48, q49).
 pub fn emitted(golden: &Golden) -> GeneratedProject {
-    emit(&artifact(golden))
+    let ir = artifact(golden);
+    let root = repository().join(golden.project);
+    let authored = compose_core::Authored::read(&ir, &root).unwrap_or_else(|error| {
+        panic!(
+            "`{}` references a module that cannot be read: {error}",
+            golden.project
+        )
+    });
+    emit(&ir, &authored)
 }
 
 /// Every file under `root`, as `/`-separated relative paths, sorted.

@@ -2,12 +2,16 @@
 //!
 //! # The shape of the pass
 //!
-//! [`emit`] is a **pure function**. It takes an [`Ir`] and answers a
+//! [`emit`] is a **pure function**. It takes an [`Ir`] and the bytes of the
+//! authored files that IR references ([`authored::Authored`]), answers a
 //! [`GeneratedProject`] — a set of `(path, contents)` pairs — and it touches no
-//! filesystem, reads no environment, and consults no clock. The CLI is what
-//! writes the bytes ([`agent-compose build`]), and `build --check` is the same
-//! function run against what is already on disk. Three things follow, and each
-//! is a requirement rather than a convenience:
+//! filesystem, reads no environment, and consults no clock. The authored bytes
+//! are an *argument* precisely so that stays true: PRD resolved q49 puts files
+//! the compiler did not write inside the artifact it describes, and a pass that
+//! went and read them would be a pass that could answer differently twice. The
+//! CLI is what writes the bytes ([`agent-compose build`]), and `build --check`
+//! is the same function run against what is already on disk. Three things
+//! follow, and each is a requirement rather than a convenience:
 //!
 //! * **Determinism is structural.** PRD 5.12 asks for byte-identical output from
 //!   byte-identical input. A pass that cannot observe anything but its argument
@@ -52,6 +56,7 @@
 //! src/deployment.ts     the placements, and the env partition (distributed §9.1)
 //! src/env.ts            the hub's `${ENV}` references, and the launch check
 //! src/mesh.ts           the hub half of the worker protocol (distributed §3)
+//! src/modules.ts        the `module:` bindings' contracts, and the one seam
 //! src/runtime.ts        what a node does when it runs (grammar 8, 9)
 //! src/stores.ts         the local store backends (PRD 5.8, grammar 11)
 //! src/schemas.ts        every schema in the composition, as Zod (grammar 3.8)
@@ -82,6 +87,34 @@
 //! not this compiler's, wherever it sits; `src/tools/` ([`AUTHORED_ZONE`]) is
 //! where the scaffold puts an authored implementation and where the docs teach
 //! it, but that is a convention and the manifest is the answer.
+//!
+//! # The tree is wider than the emission set
+//!
+//! PRD resolved q49: **the artifact carries what the spec references.** A
+//! module-bound tool executes wherever its tool executes — on a worker, when
+//! placed or reached through attachment — and a worker holds nothing but the
+//! artifact, so the file the binding names has to be *in* the tree the hub
+//! serves. [`GeneratedProject`] therefore holds two lists:
+//!
+//! * [`GeneratedProject::files`] — the emission set, [`EMITTED_PATHS`] exactly.
+//!   Generated, header-carrying, byte-identical for byte-identical input.
+//! * [`GeneratedProject::carried`] — the authored files the composition
+//!   references, at the same project-relative path they are edited at. Their
+//!   bytes are the author's; the compiler copies them into the tree and never
+//!   reads them for anything else.
+//!
+//! [`GeneratedProject::artifact`] is the union, sorted, and it is what
+//! `ARTIFACT_FILES` lists and what `ARTIFACT_HASH` covers — so editing a tool
+//! implementation is a new artifact, and every worker is handed it through the
+//! join handshake with no new machinery (`docs/distributed.md` §4). A file under
+//! `src/` that nothing references ships nowhere.
+//!
+//! There are exactly **two** notions of file identity and this widens the second
+//! rather than adding a third: `build --check` compares the tree the build
+//! produced — both lists — and the artifact hash covers the tree it serves,
+//! which is the same tree. What the author edits is the project-side original;
+//! the copy in the output directory is a build artifact like everything else
+//! beside it, and a stale one is drift.
 //!
 //! What that costs, stated so it is not discovered: a module an older compiler
 //! release wrote and this one no longer emits is **left where it is**. It is
@@ -153,6 +186,7 @@ pub mod env;
 pub mod graph;
 pub mod journal;
 pub mod mesh;
+pub mod modules;
 pub mod names;
 pub mod pattern;
 pub mod policy;
@@ -201,6 +235,7 @@ pub const EMITTED_PATHS: &[&str] = &[
     "src/index.ts",
     "src/journal.ts",
     "src/mesh.ts",
+    "src/modules.ts",
     "src/runtime.ts",
     "src/schemas.ts",
     "src/serve.ts",
@@ -233,51 +268,118 @@ pub struct GeneratedFile {
 
 /// A whole generated project: what [`emit`] answers.
 ///
-/// The files are sorted by path and the set is complete — there is no "and also
-/// copy these" step anywhere. A consumer writes them, compares them, or hashes
-/// them; nothing else is needed to have the project.
+/// Two lists, both sorted by path, and between them the whole tree a build
+/// produces — there is no "and also copy these" step anywhere. A consumer
+/// writes them, compares them, or hashes them; nothing else is needed to have
+/// the project. See *The tree is wider than the emission set* above for why the
+/// second list exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GeneratedProject {
     files: Vec<GeneratedFile>,
+    carried: Vec<GeneratedFile>,
 }
 
 impl GeneratedProject {
-    /// Build a project from its files, sorting them by path.
+    /// Build a project from its emitted files and the authored ones it carries,
+    /// sorting both by path.
     ///
     /// # Panics
     ///
     /// Panics when two files claim one path. That is an emitter bug rather than
-    /// a composition error — every path here is derived from a fixed layout, not
-    /// from user input — and a silent last-one-wins would ship a project missing
-    /// a module.
-    fn new(mut files: Vec<GeneratedFile>) -> Self {
+    /// a composition error — every emitted path is derived from a fixed layout,
+    /// and a `module:` binding may not name one of them (grammar 6.1) — and a
+    /// silent last-one-wins would ship a project missing a module.
+    fn new(mut files: Vec<GeneratedFile>, mut carried: Vec<GeneratedFile>) -> Self {
         files.sort_by(|left, right| left.path.cmp(&right.path));
-        for pair in files.windows(2) {
-            assert!(
-                pair[0].path != pair[1].path,
-                "two generated files claim `{}`",
-                pair[0].path
-            );
+        carried.sort_by(|left, right| left.path.cmp(&right.path));
+        let mut every: Vec<&str> = files
+            .iter()
+            .chain(&carried)
+            .map(|file| file.path.as_str())
+            .collect();
+        every.sort_unstable();
+        for pair in every.windows(2) {
+            assert!(pair[0] != pair[1], "two files claim `{}`", pair[0]);
         }
-        Self { files }
+        Self { files, carried }
     }
 
-    /// Every file, sorted by path.
+    /// Every **emitted** file, sorted by path — [`EMITTED_PATHS`] exactly.
     #[must_use]
     pub fn files(&self) -> &[GeneratedFile] {
         &self.files
     }
 
-    /// The file at this path, if the project has one.
+    /// Every **authored** file this tree carries, sorted by path.
+    ///
+    /// The bytes are the author's, read from the project the composition was
+    /// resolved out of and written into the output directory unchanged (PRD
+    /// resolved q49).
+    #[must_use]
+    pub fn carried(&self) -> &[GeneratedFile] {
+        &self.carried
+    }
+
+    /// Every file of the tree — emitted and carried — sorted by path.
+    ///
+    /// The artifact: what `ARTIFACT_FILES` lists, what `ARTIFACT_HASH` covers,
+    /// and what a build writes.
+    pub fn artifact(&self) -> impl Iterator<Item = &GeneratedFile> {
+        Merged {
+            left: self.files.iter().peekable(),
+            right: self.carried.iter().peekable(),
+        }
+    }
+
+    /// The **emitted** file at this path, if the project has one.
     #[must_use]
     pub fn file(&self, path: &str) -> Option<&GeneratedFile> {
         self.files.iter().find(|file| file.path == path)
     }
 
-    /// Every path, sorted.
+    /// Every path of the tree, emitted and carried, sorted.
     pub fn paths(&self) -> impl Iterator<Item = &str> {
-        self.files.iter().map(|file| file.path.as_str())
+        self.artifact().map(|file| file.path.as_str())
     }
+}
+
+/// Two path-sorted runs of files, read as one path-sorted run.
+///
+/// A merge rather than a concatenate-and-sort so that [`GeneratedProject`] can
+/// answer its whole tree by reference — the caller of
+/// [`artifact`](GeneratedProject::artifact) is usually hashing or writing, and
+/// neither wants the clone a rebuilt vector would cost.
+struct Merged<'a, L: Iterator<Item = &'a GeneratedFile>, R: Iterator<Item = &'a GeneratedFile>> {
+    left: std::iter::Peekable<L>,
+    right: std::iter::Peekable<R>,
+}
+
+impl<'a, L: Iterator<Item = &'a GeneratedFile>, R: Iterator<Item = &'a GeneratedFile>> Iterator
+    for Merged<'a, L, R>
+{
+    type Item = &'a GeneratedFile;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.left.peek(), self.right.peek()) {
+            (Some(left), Some(right)) if right.path < left.path => self.right.next(),
+            (Some(_), _) => self.left.next(),
+            (None, _) => self.right.next(),
+        }
+    }
+}
+
+/// Every name the emitted project's one module namespace holds.
+///
+/// Built in one order, in one place, because two passes over the same IR have to
+/// answer the same names: [`emit`] writes `src/modules.ts` and `src/graph.ts`
+/// from it, and [`authored::scaffolds`] writes a stub that imports what
+/// `src/modules.ts` exports. A registry built differently on either side would
+/// scaffold a file importing a type nothing exports.
+fn registry(ir: &Ir) -> names::Names {
+    let mut names = names::Names::of(ir);
+    graph::declare(&mut names, ir);
+    modules::declare(&mut names, ir);
+    names
 }
 
 /// Lower one resolved composition to a TypeScript project.
@@ -286,10 +388,21 @@ impl GeneratedProject {
 /// refuses nothing, because everything it could refuse the validator has already
 /// refused with a span to point at. `build` runs the validator first and emits
 /// only on a clean report (PRD §7 M1).
+///
+/// `authored` is the bytes of every file a `module:` binding names, which the
+/// caller reads (see [`authored::Authored`]): this pass is pure, and PRD
+/// resolved q49 puts files it did not write inside the artifact it describes. A
+/// composition with no binding is emitted with [`authored::Authored::none`].
+///
+/// # Panics
+///
+/// Panics when `authored` is missing a file the composition references. Every
+/// caller builds it from the same enumeration this one reads, so a gap is a
+/// caller bug — and an artifact whose hash silently omitted an entry would be
+/// served under a name a worker's own verification then refuses.
 #[must_use]
-pub fn emit(ir: &Ir) -> GeneratedProject {
-    let mut names = names::Names::of(ir);
-    graph::declare(&mut names, ir);
+pub fn emit(ir: &Ir, authored: &authored::Authored) -> GeneratedProject {
+    let names = registry(ir);
     // The environment `readEnvironment()` checks is the **hub's own list**, which
     // is the whole composition's exactly when nothing is placed
     // (`docs/distributed.md` §9.1): a variable a placement takes off it is one
@@ -307,6 +420,7 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
         env::module(ir, &environment),
         journal::module(ir),
         mesh::module(ir),
+        modules::module(ir, &names),
         runtime::module(ir),
         stores::module(ir),
         schema::module(ir, &names),
@@ -319,12 +433,33 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
         worker::manifest(ir, &partition),
         project::index(ir),
     ];
+    // The authored half of the tree, at the same project-relative path it is
+    // edited at (PRD resolved q49). It goes in before the artifact module,
+    // because the hash is over the whole tree and a module tool that did not
+    // move it would let an edited implementation reach a worker under the hash
+    // of the tree that did not have it.
+    let carried: Vec<GeneratedFile> = crate::check::modules::bindings(ir)
+        .into_iter()
+        .map(|(address, module)| {
+            let path = module.path.value.as_str();
+            GeneratedFile {
+                path: path.to_string(),
+                contents: authored
+                    .get(path)
+                    .unwrap_or_else(|| {
+                        panic!("`{address}` is implemented by `{path}`, which was not read")
+                    })
+                    .to_string(),
+            }
+        })
+        .collect();
+
     // **Last, and over everything above.** The artifact's identity is a hash of
     // the tree, so the file that carries it is the one file the hash cannot
     // cover and the one file that has to be written after the rest exists (see
     // [`artifact`]).
-    files.push(artifact::module(ir, &files));
-    GeneratedProject::new(files)
+    files.push(artifact::module(ir, &files, &carried));
+    GeneratedProject::new(files, carried)
 }
 
 /// What this target cannot express, over a composition the validator accepted.
@@ -1010,7 +1145,7 @@ flow.f:
     #[test]
     fn every_generated_file_carries_the_header_and_ends_in_a_newline() {
         let ir = ir_of("version: \"0.1\"\n");
-        let project = emit(&ir);
+        let project = emit(&ir, &authored::Authored::none());
         assert!(!project.files().is_empty());
         for file in project.files() {
             assert!(
@@ -1044,16 +1179,83 @@ flow.f:
             "version: \"0.1\"\n",
             crate::codegen::test_support::EVERY_FORM,
         ] {
-            let project = emit(&ir_of(source));
+            let project = emit(&ir_of(source), &authored::Authored::none());
             assert_eq!(project.paths().collect::<Vec<_>>(), EMITTED_PATHS);
         }
+    }
+
+    /// A composition that binds a module emits **more** than the constant list:
+    /// the tree is the emission set plus what the spec references (PRD resolved
+    /// q49), and the two halves are separable.
+    #[test]
+    fn a_module_binding_widens_the_tree_without_moving_the_emission_set() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input: {}
+  output: {}
+  module: ./src/tools/sign.ts
+"#,
+        );
+        let project = emit(
+            &ir,
+            &authored::Authored::of([("src/tools/sign.ts".to_string(), "// yours\n".to_string())]),
+        );
+        assert_eq!(
+            project
+                .files()
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            EMITTED_PATHS,
+            "the compiler's claim on a directory does not depend on the spec"
+        );
+        assert_eq!(
+            project
+                .carried()
+                .iter()
+                .map(|file| (file.path.as_str(), file.contents.as_str()))
+                .collect::<Vec<_>>(),
+            [("src/tools/sign.ts", "// yours\n")]
+        );
+        let mut every = EMITTED_PATHS.to_vec();
+        every.push("src/tools/sign.ts");
+        every.sort_unstable();
+        assert_eq!(project.paths().collect::<Vec<_>>(), every);
+        assert!(
+            project.file("src/tools/sign.ts").is_none(),
+            "`file` answers the emission set, which is what `--check`'s \
+             generated-file questions are asked of"
+        );
+    }
+
+    /// A caller that did not read what the composition references is a bug, and
+    /// it is a loud one: an artifact whose hash silently omitted an entry would
+    /// be served under a name a worker's own verification then refuses.
+    #[test]
+    #[should_panic(expected = "which was not read")]
+    fn emitting_without_the_authored_bytes_is_refused_rather_than_guessed() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input: {}
+  output: {}
+  module: ./src/tools/sign.ts
+"#,
+        );
+        let _ = emit(&ir, &authored::Authored::none());
     }
 
     /// The one property the whole pass exists to have.
     #[test]
     fn emitting_twice_answers_the_same_bytes() {
         let ir = ir_of(crate::codegen::test_support::EVERY_FORM);
-        assert_eq!(emit(&ir), emit(&ir));
+        let authored = authored::Authored::none();
+        assert_eq!(emit(&ir, &authored), emit(&ir, &authored));
     }
 
     #[test]

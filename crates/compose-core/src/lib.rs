@@ -78,6 +78,7 @@ pub mod yaml;
 
 pub use check::check;
 pub use check::modules::missing as check_modules;
+pub use codegen::authored::Authored;
 pub use codegen::diagnostics as target_diagnostics;
 pub use codegen::{COMPILER_VERSION, GeneratedFile, GeneratedProject, emit};
 pub use diag::{Diagnostic, DiagnosticCode, Diagnostics, Severity, Span, Spanned};

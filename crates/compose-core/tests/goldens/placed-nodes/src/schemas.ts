@@ -269,6 +269,20 @@ export const flowSignedOffNodeApproveOutput = z.object({
 }).strict();
 export type FlowSignedOffNodeApproveOutput = z.infer<typeof flowSignedOffNodeApproveOutput>;
 
+/** `flow.stamped` — the module's parameters (grammar 7.5). */
+export const flowStampedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowStampedInputs = z.infer<typeof flowStampedInputs>;
+
+/**
+ * `flow.stamped` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowStampedOutputs = z.object({
+  signature: z.string(),
+}).strict();
+export type FlowStampedOutputs = z.infer<typeof flowStampedOutputs>;
+
 /** `flow.watched` — the module's parameters (grammar 7.5). */
 export const flowWatchedInputs = z.object({
   paths: z.array(z.string()).max(4),
@@ -306,6 +320,18 @@ export const toolSignOutput = z.object({
   signature: z.string(),
 }).strict();
 export type ToolSignOutput = z.infer<typeof toolSignOutput>;
+
+/** `tool.stamp` — its parameters (grammar 6). */
+export const toolStampInput = z.object({
+  path: z.string(),
+}).strict();
+export type ToolStampInput = z.infer<typeof toolStampInput>;
+
+/** `tool.stamp` — its result (grammar 6). */
+export const toolStampOutput = z.object({
+  stamped: z.string(),
+}).strict();
+export type ToolStampOutput = z.infer<typeof toolStampOutput>;
 
 /** State channel `approval` — its declared type (grammar 10.1). */
 export const stateApproval = z.string().describe("What the person on the other branch said.").default("");

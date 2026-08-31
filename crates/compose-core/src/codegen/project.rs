@@ -143,6 +143,64 @@ pub const NODE_ENGINE: &str = ">=22.18.0";
 /// PRD 5.12's determinism rule forbids.
 pub const PACKAGE_NAME: &str = "agent-compose-generated";
 
+/// Every package the generated `package.json` declares under `dependencies`:
+/// [`PINS`], plus what the composition's `module:` bindings pin (PRD resolved
+/// q49, D133).
+///
+/// One entry per package: [`PINS`] first, in the order this module declares
+/// them — which is the order the emitted `README.md` prints and the order they
+/// are argued in above — and then the module bindings' own, **sorted by name**.
+///
+/// Two orders rather than one because they answer to different things. The
+/// runtime's own set is a curated list a reader of this module walks top to
+/// bottom, and reordering it would put the substrate under the store driver for
+/// no reason a diff could explain. The declared set is the composition's, and it
+/// has to be a function of *what* was declared rather than of which tool
+/// declared it first — a package that moved between two `module:` bindings would
+/// otherwise rewrite `package.json` without changing what it means.
+///
+/// The declared set cannot disagree with itself or with [`PINS`] —
+/// `parse::binding` refuses a pin that contradicts one of these, and
+/// `check::modules` refuses two tools pinning one package at two versions — so
+/// this is a merge with nothing to reconcile, and the assertion says so rather
+/// than choosing.
+///
+/// # Panics
+///
+/// Panics on a package pinned at two versions, which the validator refuses with
+/// a span to point at. Reaching here with one is a front-end bug, and a silent
+/// last-one-wins would emit a manifest whose resolution is not the one either
+/// tool asked for.
+#[must_use]
+pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
+    let mut declared: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (address, module) in crate::check::modules::bindings(ir) {
+        for dependency in &module.dependencies {
+            let package = dependency.package.value.as_str();
+            let version = dependency.version.value.as_str();
+            let held: Option<String> = PINS
+                .iter()
+                .find(|(pinned, _)| *pinned == package)
+                .map(|(_, version)| (*version).to_string())
+                .or_else(|| declared.get(package).cloned());
+            if let Some(held) = held {
+                assert!(
+                    held == version,
+                    "`{address}` pins `{package}` to `{version}`, which this project already \
+                     holds at `{held}` — the validator refuses that (grammar 6.1)"
+                );
+                continue;
+            }
+            declared.insert(package.to_string(), version.to_string());
+        }
+    }
+    PINS.iter()
+        .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+        .chain(declared)
+        .collect()
+}
+
 /// `package.json`.
 #[must_use]
 pub fn package_json(ir: &Ir) -> super::GeneratedFile {
@@ -162,8 +220,12 @@ pub fn package_json(ir: &Ir) -> super::GeneratedFile {
         names::string(NODE_ENGINE)
     ));
     contents.push_str("  \"scripts\": {\n    \"typecheck\": \"tsc --noEmit\"\n  },\n");
-    contents.push_str(&dependency_block("dependencies", PINS, true));
-    contents.push_str(&dependency_block("devDependencies", DEV_PINS, false));
+    contents.push_str(&dependency_block("dependencies", &dependencies(ir), true));
+    let development: Vec<(String, String)> = DEV_PINS
+        .iter()
+        .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+        .collect();
+    contents.push_str(&dependency_block("devDependencies", &development, false));
     contents.push_str("}\n");
 
     super::GeneratedFile {
@@ -172,7 +234,7 @@ pub fn package_json(ir: &Ir) -> super::GeneratedFile {
     }
 }
 
-fn dependency_block(key: &str, pins: &[(&str, &str)], trailing_comma: bool) -> String {
+fn dependency_block(key: &str, pins: &[(String, String)], trailing_comma: bool) -> String {
     let mut text = format!("  \"{key}\": {{\n");
     for (index, (package, version)) in pins.iter().enumerate() {
         let comma = if index + 1 == pins.len() { "" } else { "," };
@@ -275,13 +337,14 @@ const README_BODY: &str = r#"
 
 | path | what it holds |
 |---|---|
-| `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
-| `src/artifact.ts` | what this tree **is**: a content hash over its own files, the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
+| `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, which files here the compiler did not write, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
+| `src/artifact.ts` | what this tree **is**: a content hash over its own files — the emitted ones and the authored ones the composition references — the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, and the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1) |
 | `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
 | `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
 | `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:`, the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
+| `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
 | `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
@@ -341,11 +404,11 @@ compile time, which is what keeps this directory committable and free of
 credentials.
 
 **The file list above is the boundary.** `agent-compose build` replaces exactly
-the files in that table and `agent-compose build --check` compares exactly them;
-nothing else in this directory is written, removed, or reported. A
-`node_modules/`, a lockfile, a `.env` — and any TypeScript you wrote — are yours,
-wherever they sit. `src/` is not a compiler-only directory: what makes a file the
-compiler's is being on that list.
+the files in that table and nothing else in this directory is written, removed,
+or reported. A `node_modules/`, a lockfile, a `.env` — and any TypeScript you
+wrote that the composition does not reference — are yours, wherever they sit.
+`src/` is not a compiler-only directory: what makes a file the compiler's is
+being on that list.
 
 Every file the compiler replaces carries the header above, which is how it tells
 its own work from yours: a `build` into a directory holding none of its files
@@ -354,10 +417,21 @@ refuses rather than overwriting what is there.
 `src/tools/` is where your own code goes. A `tool.*` in the composition may bind
 `module: ./src/tools/<name>.ts`, and `build` writes that file **once** — the
 typed signature, the contract as a doc comment, a body that throws — then never
-writes it again and never reads it. Fill it in and commit it: the tool's declared
-`input:` and `output:` are its contract, and `bun run typecheck` is what holds it
-there. The directory is a convention rather than a rule; the file list is the
-rule.
+writes it again and never reads it to re-emit it. Fill it in and commit it: the
+tool's declared `input:` and `output:` are its contract, `src/modules.ts` is
+where that contract is written down, and `bun run typecheck` is what holds the
+file to it. The directory is a convention rather than a rule; the file list is
+the rule.
+
+You edit those files **in the project** — beside `main.yml`, where the `module:`
+path is resolved. A build copies each one it references into this directory at
+the same relative path, because the composition references it and the artifact a
+worker fetches has to carry it: `src/artifact.ts` lists it and hashes it like
+every other entry, so editing an implementation is a new artifact hash and
+reaches every worker through the join handshake. `agent-compose build --check`
+compares those copies too — a copy that no longer matches what you wrote is a
+build to re-run, exactly like a generated file that drifted. Files under `src/`
+that the composition does not reference ship nowhere.
 
 ## Running it
 
@@ -1093,6 +1167,79 @@ mod tests {
     /// it, derived here rather than passed in because a test builds one IR.
     fn readme_of(ir: &Ir) -> crate::codegen::GeneratedFile {
         readme(ir, &crate::codegen::env::Partition::of(ir))
+    }
+
+    /// A `module:` binding's `dependencies:` are folded into the generated
+    /// manifest, which stays pure-generated (PRD resolved q49, D133).
+    ///
+    /// Three claims in one composition, because each is a different way the
+    /// fold can be wrong: the runtime's own pins keep their curated order and
+    /// their versions; two tools naming one package at one version fold into
+    /// **one** entry rather than two; and the declared set is sorted by package
+    /// name, so a package that moved between two bindings does not rewrite the
+    /// file.
+    #[test]
+    fn a_module_bindings_dependencies_are_folded_into_the_generated_manifest() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+tool.verify:
+  description: Verify a signature.
+  input: {}
+  output: {}
+  module:
+    path: ./src/tools/verify.ts
+    dependencies:
+      "@noble/hashes": "1.4.0"
+
+tool.sign:
+  description: Sign a payload.
+  input: {}
+  output: {}
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      "@noble/hashes": "1.4.0"
+      tweetnacl: "1.0.3"
+"#,
+        );
+        assert_eq!(
+            dependencies(&ir),
+            PINS.iter()
+                .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+                .chain([
+                    ("@noble/hashes".to_string(), "1.4.0".to_string()),
+                    ("tweetnacl".to_string(), "1.0.3".to_string()),
+                ])
+                .collect::<Vec<_>>(),
+            "the pins keep their order, the declared set is sorted after them, \
+             and one package agreed on twice is one entry"
+        );
+
+        let contents = package_json(&ir).contents;
+        let parsed: serde_json::Value = serde_json::from_str(&contents).expect("strict JSON");
+        let block = parsed["dependencies"]
+            .as_object()
+            .expect("a dependency block");
+        assert_eq!(block["@noble/hashes"], "1.4.0", "{contents}");
+        assert_eq!(block["tweetnacl"], "1.0.3", "{contents}");
+        assert_eq!(block.len(), PINS.len() + 2, "{contents}");
+        assert!(
+            contents.contains("generated by agent-compose"),
+            "the manifest is still wholly the compiler's: {contents}"
+        );
+    }
+
+    /// A composition binding no module emits the pins and nothing else, which is
+    /// what makes the fold above a *fold* rather than a rewrite.
+    #[test]
+    fn a_composition_with_no_module_binding_pins_exactly_the_runtimes_own_set() {
+        assert_eq!(
+            dependencies(&ir_of("version: \"0.1\"\n")),
+            PINS.iter()
+                .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

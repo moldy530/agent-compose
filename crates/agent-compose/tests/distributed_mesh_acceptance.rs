@@ -594,6 +594,72 @@ fn a_placed_node_runs_on_a_worker_and_its_answer_reaches_the_graph() {
     );
 }
 
+/// A placed **module** tool runs on the worker, out of the artifact it fetched
+/// (grammar §6.1, PRD resolved q48, q49).
+///
+/// This is the mesh consequence of putting authored code inside the emitted
+/// project, executed rather than asserted. The worker holds no checkout and no
+/// YAML — it is served a tarball of `ARTIFACT_FILES` and runs
+/// `src/worker-node.ts` out of it (§4) — so a `function:` node over a placed
+/// module tool can only work if the file the binding names is *in* that
+/// tarball. It is, because the artifact's file list widened to "what `build`
+/// wrote plus the authored files the spec references".
+///
+/// Two things are checked and each fails differently:
+///
+///   * the **answer**, which says the authored file crossed the wire and ran.
+///     No model is called for this flow at all: a `function:` node names the
+///     tool directly, so what runs on the worker is `src/tools/stamp.ts` and
+///     nothing else.
+///   * the **marker in it**, which says the declared `env:` reached the process
+///     that executes the tool. `${STAMP_MARKER}` is on `mac`'s manifest and not
+///     on the hub's, and the authored file spells `unmarked` when it is not set
+///     — so a partition that had dropped a module binding's declaration would
+///     come back with a different string rather than with a failure.
+#[test]
+fn a_placed_module_tool_runs_on_the_worker_out_of_the_artifact_it_fetched() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let _worker = mesh.worker("module");
+
+    let execution = mesh.start_execution("/stampings", &json!({ "path": "release.dmg" }));
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"],
+        json!(format!("release.dmg {}", harness::STAMP_MARKER_VALUE)),
+        "the authored module did not run on the worker with the environment its \
+         binding declared: {outputs:#}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        0,
+        "a `function:` node over a placed tool calls no model on either side"
+    );
+
+    // The partition, from both ends. The variable is on the placement's list…
+    assert!(
+        manifest_of(PLACEMENT).contains(&"STAMP_MARKER".to_string()),
+        "a module binding's declared environment is not on its placement's \
+         manifest: {:?}",
+        manifest_of(PLACEMENT)
+    );
+    // …and off the hub's own, which is what "reaches exactly the processes that
+    // can execute it" means (§9.1).
+    let hub_environment = std::fs::read_to_string(mesh.project.join("src/env.ts"))
+        .expect("the hub's own environment module is readable");
+    assert!(
+        !hub_environment.contains("STAMP_MARKER"),
+        "the hub demands a variable only the worker's tool reads: {hub_environment}"
+    );
+    // …and the artifact says which of its files the compiler did not write, so a
+    // reader of the tree can tell the two halves apart without a JavaScript
+    // runtime (PRD resolved q47).
+    let manifest = std::fs::read_to_string(mesh.project.join("manifest.json"))
+        .expect("the artifact's manifest is readable");
+    assert!(manifest.contains("\"src/tools/stamp.ts\""), "{manifest}");
+}
+
 /// A placed agent reads the conversation the node before it left, across the
 /// wire (§3.2, §4.3).
 ///

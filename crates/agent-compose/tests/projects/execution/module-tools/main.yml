@@ -1,0 +1,224 @@
+# Acceptance fixture: the `module:` binding, executed (grammar §6.1, PRD
+# resolved q48).
+#
+# The claim under test is **parity**. A module tool is a tool: it reaches the two
+# surfaces every tool has — a `function:` node's own activity and a tool an
+# agent's model called — its arguments and its result are held to the schemas the
+# composition declared, its node's `retry:`/`timeout:`/`on_error:` govern it, and
+# a call whose arguments the contract refuses goes back to the model rather than
+# ending the node (Decision D119). Only the binding differs, and the only thing
+# that differs *about* the binding is where the code lives: inside this project,
+# in `src/tools/`, held to the tool's schemas by `tsc`.
+#
+# So every flow here has a twin somewhere in the suite, and one of them has its
+# twin in this very file:
+#
+#   * `flow.direct` — a `function:` node over a module tool. What comes back is
+#     parsed against the tool's declared `output:` before it reaches state, which
+#     is what `flow.unfit`'s sibling in `activities` says about the other
+#     direction.
+#   * `flow.assisted` — the tool loop, with **both** bindings attached to one
+#     agent: `tool.stamp` is a module and `tool.shout` an `exec:`, they take the
+#     same argument and answer the same shape, and their trace records are
+#     therefore comparable field for field. The refusal is here too: `payload`
+#     declares `min_length: 1`, so an empty one is a call the model is asked to
+#     make again.
+#   * `flow.retried` — the policy chain over a module, at level 2. `tool.flaky`
+#     fails its first call and answers its second, and the node's `retry:` is
+#     what gets it there. A module runs **in this process**, so the counter it
+#     keeps is the plainest possible evidence that the second attempt really was
+#     a second call.
+#   * `flow.impatient` — the same chain's other two members. `tool.hang` never
+#     answers and never looks at `context.signal`, so what stops the node is the
+#     node's own `timeout:`, and what runs next is its `on_error:` fallback —
+#     which is `activities`' `flow.stubborn` with a module in place of a
+#     `function:` binding, and has to behave identically.
+#
+# `${STAMP_MARKER}` is grammar §6.1's declared environment: a module's
+# `process.env` read is not something the compiler can walk, so the binding says
+# what it reads and the partition carries it (PRD resolved q49). The value here
+# is the harness's.
+version: "0.1"
+
+defaults:
+  timeout: 30s
+  on_error: fail
+
+state:
+  stamped:
+    description: What the module tool answered, written by name.
+    type: string
+    default: ""
+  attempts:
+    description: How many times the flaky module was really called.
+    type: integer
+    default: 0
+  outcome:
+    description: What the impatient flow ended up with, whichever way it got there.
+    type: string
+    default: ""
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+tool.stamp:
+  description: Stamp a payload with this deployment's own marker.
+  input:
+    payload:
+      description: What to stamp.
+      type: string
+      min_length: 1
+  output:
+    stamped:
+      description: The payload with the marker on it.
+      type: string
+  module:
+    path: ./src/tools/stamp.ts
+    env:
+      STAMP_MARKER: ${STAMP_MARKER}
+
+# The `exec:` twin of the tool above: the same argument, the same result shape,
+# the same description length. What it is for is the comparison — two tool calls
+# in one loop whose trace records differ in nothing but the component behind
+# them.
+tool.shout:
+  description: Stamp a payload with this deployment's own marker.
+  input:
+    payload:
+      description: What to stamp.
+      type: string
+      min_length: 1
+  output:
+    stamped:
+      description: The payload with the marker on it.
+      type: string
+  exec:
+    command: printf
+    args: ["shouted"]
+
+tool.flaky:
+  description: Answer only once the caller has tried twice.
+  input: {}
+  output:
+    attempts:
+      description: How many calls this process has made.
+      type: integer
+  module:
+    path: ./src/tools/flaky.ts
+
+tool.hang:
+  description: Never answer, and never look at the deadline either.
+  input: {}
+  output:
+    waited:
+      description: Never produced.
+      type: boolean
+  module:
+    path: ./src/tools/hang.ts
+
+agent.stamper:
+  description: Stamps a payload, using whichever tool it is told to.
+  model: model.smart
+  prompt: |
+    Stamp the payload you are given, then report what came back.
+  tools: [tool.stamp, tool.shout]
+  max_tool_iterations: 4
+  input:
+    payload:
+      description: What to stamp.
+      type: string
+  output:
+    stamped:
+      description: What the tools reported.
+      type: string
+
+flow.direct:
+  description: Call a module tool from a node, with no model in the way.
+  inputs:
+    payload:
+      type: string
+      min_length: 1
+  outputs:
+    stamped:
+      type: string
+  nodes:
+    stamp:
+      function: tool.stamp
+      input:
+        payload: "input.payload"
+      writes:
+        stamped: stamped
+  edges:
+    - { from: start, to: stamp }
+    - { from: stamp, to: end }
+
+flow.assisted:
+  description: Reach the same tool through a model's tool loop.
+  inputs:
+    payload:
+      type: string
+      min_length: 1
+  outputs:
+    stamped:
+      type: string
+  nodes:
+    assist:
+      agent: agent.stamper
+      input:
+        payload: "input.payload"
+      writes:
+        stamped: stamped
+  edges:
+    - { from: start, to: assist }
+    - { from: assist, to: end }
+
+flow.retried:
+  description: Spend a retry on a module that fails its first call.
+  inputs: {}
+  outputs:
+    attempts:
+      type: integer
+  nodes:
+    settle:
+      function: tool.flaky
+      retry: { max: 2, backoff: 1ms }
+      writes:
+        attempts: attempts
+  edges:
+    - { from: start, to: settle }
+    - { from: settle, to: end }
+
+flow.impatient:
+  description: Bound a module that never answers, and route around it.
+  inputs: {}
+  outputs:
+    outcome:
+      type: string
+  nodes:
+    wait:
+      function: tool.hang
+      timeout: 250ms
+      on_error: { fallback: give_up }
+
+    # No edge targets this node: the fallback is the only way in, so a value it
+    # writes is proof the route was taken.
+    give_up:
+      exec:
+        command: printf
+        args: ['{"outcome":"gave up"}']
+        output:
+          outcome: { type: string }
+      writes:
+        outcome: outcome
+  edges:
+    - { from: start, to: wait }
+    - { from: wait, to: end }
+    - { from: give_up, to: end }

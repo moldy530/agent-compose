@@ -127,7 +127,7 @@ use crate::ast::flow::FlowContext;
 use crate::check::cycles::counted;
 use crate::check::graph::Graph as CheckedGraph;
 use crate::ir::Ir;
-use crate::ir::binding::{Bindings, Exec, Http, NodeInput, Writes};
+use crate::ir::binding::{Bindings, Exec, Http, Module, NodeInput, Writes};
 use crate::ir::definition::{Agent, DefinitionBody, Model, Tool};
 use crate::ir::flow::{
     Edge, Flow, ItemError, Map, MapDispatch, Node, NodeKind, ToolImplementation,
@@ -213,13 +213,14 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
 
     let surfaces = schema::surfaces(ir);
     let mut imported: Vec<String> = Vec::new();
+    let mut seams: Vec<String> = Vec::new();
     let mut body = String::new();
 
     body.push_str(&shapes(ir, names, &surfaces));
     body.push_str(&providers(ir, names));
     body.push_str(&models(ir, names));
     body.push_str(&stores(ir, names));
-    body.push_str(&tools(ir, names, &surfaces, &mut imported));
+    body.push_str(&tools(ir, names, &surfaces, &mut imported, &mut seams));
     body.push_str(&agents(ir, names, &surfaces, &mut imported));
 
     let mut registry: Vec<(String, String)> = Vec::new();
@@ -244,6 +245,18 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     contents.push_str("\nimport * as mesh from \"./mesh.ts\";\n");
     contents.push_str("import * as runtime from \"./runtime.ts\";\n");
     contents.push_str("import * as stores from \"./stores.ts\";\n");
+    // The seam, and only where there is one to reach: `./modules.ts` is emitted
+    // for every composition, and an import of a module this one never dispatches
+    // through would load the authored half of a project that has none.
+    seams.sort();
+    seams.dedup();
+    if !seams.is_empty() {
+        contents.push_str("import {\n");
+        for seam in &seams {
+            contents.push_str(&format!("  {seam},\n"));
+        }
+        contents.push_str("} from \"./modules.ts\";\n");
+    }
     imported.sort();
     imported.dedup();
     if !imported.is_empty() {
@@ -698,6 +711,7 @@ fn tools(
     names: &Names,
     surfaces: &[schema::Surface<'_>],
     imported: &mut Vec<String>,
+    seams: &mut Vec<String>,
 ) -> String {
     let mut text = String::new();
     for (address, definition) in &ir.definitions {
@@ -776,20 +790,21 @@ fn tools(
                     names::string(&format!("the result of `{address}`"))
                 ));
             }
-            // The registry seam that imports the authored module and the
-            // dispatch through it are the second half of PRD resolved q48 and
-            // are not in this release. The arguments are still parsed above —
-            // a call whose arguments the schema refuses is refused the same way
-            // whatever the binding is — and the node then says what it cannot
-            // do, naming the file, the way a store on a backend this release
-            // does not open says it (see the module header).
+            // Through the seam and nowhere else (PRD resolved q48): the
+            // implementation reaches this module as the typed `const`
+            // `./modules.ts` exports, so the one import of authored code in a
+            // generated project stays in the one file that is allowed to make
+            // it. Everything around the call is the shape the other three
+            // bindings have — the arguments parsed on the way in, the answer
+            // parsed on the way out, the whole call journaled — because grammar
+            // 6.1 makes "a tool" one thing and only the binding differs.
             ToolImplementation::Module { module } => {
+                let seam = names.value(&format!("{address}.module"));
+                seams.push(seam.to_string());
                 text.push_str(&format!(
-                    "  void input;\n  throw new Error(\n    {},\n  );\n",
-                    names::string(&format!(
-                        "`{address}` is bound to `{}`, and this build does not dispatch a module binding yet",
-                        module.path.value
-                    ))
+                    "  return runtime.parseResult(\n    {output_schema},\n    await runtime.callModule({}, {seam}, input, context),\n    {},\n  );\n",
+                    module_binding(module, address, "    "),
+                    names::string(&format!("the result of `{address}`"))
                 ));
             }
         }
@@ -2932,6 +2947,46 @@ fn exec_binding(
         "{inner}decoding: {},\n",
         decoding(output, EXEC_ENVELOPE, tool_surface)
     ));
+    text.push_str(&format!("{indent}}}"));
+    text
+}
+
+/// One `module:` binding, as the runtime's descriptor for it.
+///
+/// The tool's address and the file it names — the two things that say *which*
+/// call this is, and so the two the journal records it under — plus the `env:`
+/// the binding declared, carried **as written** for the reason
+/// [`interpolation`] gives every other class-2 surface: a resolved credential in
+/// an effect record is a credential in a trace a reader files.
+///
+/// What is deliberately not here is the implementation. It reaches the runtime
+/// as an argument (`runtime.callModule(binding, seam, …)`) rather than through
+/// the descriptor, because a descriptor is data the journal writes down and a
+/// function is not.
+fn module_binding(module: &Module, address: &str, indent: &str) -> String {
+    let inner = format!("{indent}  ");
+    let mut text = String::from("{\n");
+    text.push_str(&format!("{inner}address: {},\n", names::string(address)));
+    text.push_str(&format!(
+        "{inner}path: {},\n",
+        names::string(&module.path.value)
+    ));
+    if module.env.is_empty() {
+        text.push_str(&format!("{inner}env: [],\n"));
+    } else {
+        text.push_str(&format!("{inner}env: [\n"));
+        for entry in &module.env {
+            text.push_str(&format!(
+                "{inner}  {{ name: {}, value: {} }},\n",
+                names::string(&entry.name.value),
+                interpolation(
+                    &entry.value.value,
+                    &format!("{address}.module.env.{}", entry.name.value)
+                )
+            ));
+        }
+        text.push_str(&format!("{inner}],\n"));
+    }
     text.push_str(&format!("{indent}}}"));
     text
 }

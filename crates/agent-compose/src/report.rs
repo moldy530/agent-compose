@@ -169,6 +169,10 @@ pub(crate) struct Built<'a> {
     pub(crate) not_ours: &'a [String],
     /// What was written, when anything was.
     pub(crate) wrote: Option<&'a crate::build::Written>,
+    /// The authored implementations this build scaffolded because they were
+    /// absent, as `(path, tool)`, sorted by path (PRD resolved q48). Empty on a
+    /// `--check`, which never scaffolds, and on a build that found them all.
+    pub(crate) scaffolded: &'a [(String, String)],
     /// Whether the diagnostics are codegen's rather than the validator's.
     ///
     /// The two refuse for different reasons and a reader who has just seen
@@ -196,6 +200,7 @@ pub(crate) fn build_verdict(
         drift,
         not_ours,
         wrote,
+        scaffolded,
         target_only,
     } = *built;
     let renderer = if color {
@@ -245,20 +250,31 @@ pub(crate) fn build_verdict(
                 Level::WARNING
             },
             format!(
-                "wrote {} to `{out}` (target `{target}`){noted}{}",
+                "wrote {} to `{out}` (target `{target}`){}{noted}{}",
                 plural(written.files, "file"),
+                // The authored half of the tree, counted separately because it
+                // is a different claim: those bytes are the author's, carried
+                // in because the composition references them and the artifact
+                // has to hold them (PRD resolved q49).
+                if written.carried == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", carrying {} with them",
+                        plural(written.carried, "authored file")
+                    )
+                },
                 // A scaffold is the one thing a build writes that it does not
                 // own, and the one it will never write again, so it is said out
                 // loud rather than left for a later `git status` (PRD resolved
                 // q48).
-                if written.scaffolded.is_empty() {
+                if scaffolded.is_empty() {
                     String::new()
                 } else {
                     format!(
                         ", and scaffolded {} for you to write: {}",
-                        plural(written.scaffolded.len(), "tool implementation"),
-                        written
-                            .scaffolded
+                        plural(scaffolded.len(), "tool implementation"),
+                        scaffolded
                             .iter()
                             .map(|(path, tool)| format!("`{path}` (`{tool}`)"))
                             .collect::<Vec<_>>()

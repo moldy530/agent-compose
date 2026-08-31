@@ -247,6 +247,24 @@ fn artifact() -> compose_core::Ir {
     resolution.ir.expect("the fixture resolves")
 }
 
+/// The project the fixture emits, authored files and all.
+///
+/// The authored half is read out of the fixture's own directory, exactly as
+/// `build` reads it: the tree a hub serves is "what `build` wrote plus the
+/// authored files the spec references" (PRD resolved q49), and an expectation
+/// built from the emission set alone would say the tarball has an entry too
+/// many.
+fn emitted() -> compose_core::GeneratedProject {
+    let ir = artifact();
+    let root = harness::fixture(FIXTURE)
+        .parent()
+        .expect("the fixture has a directory")
+        .to_path_buf();
+    let authored =
+        compose_core::Authored::read(&ir, &root).expect("the fixture's modules are committed");
+    compose_core::emit(&ir, &authored)
+}
+
 /// A response body, for a failure message.
 fn body_of(response: &Response) -> String {
     format!(
@@ -422,13 +440,25 @@ fn every_join_refusal_is_the_status_and_the_shape_the_document_gives_it() {
         .as_str()
         .expect("the answer names the artifact")
         .to_string();
+    // Two variables held back, and they reach `mac`'s manifest through two
+    // different bindings: `${KEYCHAIN_PASSWORD}` is an `exec:` tool's `env:`,
+    // which `References::of` walks, and `${STAMP_MARKER}` is a `module:`
+    // binding's, which it cannot — a `process.env` read inside authored
+    // TypeScript is not something the compiler sees, so the YAML declares it and
+    // §9.1's executes-in closure carries it (PRD resolved q49). The join answer
+    // is where that declaration becomes load-bearing: a worker that cannot
+    // supply it is refused by name, and the refusal must not care which binding
+    // put the variable on the list.
     let short: Vec<String> = manifest_of("mac")
         .into_iter()
-        .filter(|name| name != "KEYCHAIN_PASSWORD")
+        .filter(|name| name != "KEYCHAIN_PASSWORD" && name != "STAMP_MARKER")
         .collect();
     let unmet = hub.joining(&[("artifact_hash", json!(hash)), ("env_ok", json!(short))]);
     assert_eq!(unmet.status, 403, "{}", body_of(&unmet));
-    assert_eq!(unmet.json()["variables"], json!(["KEYCHAIN_PASSWORD"]));
+    assert_eq!(
+        unmet.json()["variables"],
+        json!(["KEYCHAIN_PASSWORD", "STAMP_MARKER"])
+    );
     assert!(
         !body_of(&unmet).contains(TOKEN),
         "a refusal echoed a credential"
@@ -627,14 +657,21 @@ fn the_artifact_route_is_hash_addressed_and_takes_the_bearer_alone() {
     let malformed = hub.send(Hub::authorized("GET", "/workers/artifact/not-a-hash"));
     assert_eq!(malformed.status, 400, "{}", body_of(&malformed));
 
-    // The tarball is exactly what `build` wrote: the emitter's own file list.
-    let listed = compose_core::emit(&artifact());
+    // The tarball is exactly the tree this build produced: the emitter's own
+    // file list, **and** the authored files the composition references, which is
+    // what makes a `module:` tool runnable on a worker at all (PRD resolved
+    // q49).
+    let listed = emitted();
     let entries = tar_entries(&served.body);
     let mut expected: Vec<String> = listed.paths().map(str::to_string).collect();
     expected.sort();
     assert_eq!(
         entries, expected,
-        "the served tarball is not the emitted project"
+        "the served tarball is not the tree this build produced"
+    );
+    assert!(
+        entries.contains(&"src/tools/stamp.ts".to_string()),
+        "a worker fetching this artifact would have no implementation to run: {entries:?}"
     );
 }
 

@@ -19,7 +19,18 @@
 //!
 //! What the **Rust** half of a worker has to read, in a format it can read
 //! without a JavaScript runtime: the per-placement environment manifest §9.1
-//! partitions, and the path of the runner above.
+//! partitions, the path of the runner above, and which files of the tree the
+//! compiler did not write.
+//!
+//! That last list is PRD resolved q47 read where a reader without a JavaScript
+//! runtime is standing. "The manifest is the boundary" is a statement about
+//! *ownership*, and the tree stopped being wholly compiler-owned the moment a
+//! `module:` binding put authored TypeScript in it (resolved q49). `manifest.json`
+//! is the one file in an artifact that answers questions about the artifact in
+//! plain JSON, so it is where "these entries are the author's" is written down.
+//! It is **not** a second file list to check against: `build --check` compares
+//! the build's own two lists and the artifact hash covers the tree, and those
+//! remain the only two notions of file identity there are.
 //!
 //! It is the same partition [`super::deployment`] writes into `src/deployment.ts`
 //! and is derived from the same [`super::env::Partition`] — §9.1's "one partition
@@ -68,6 +79,28 @@ pub fn manifest(ir: &Ir, partition: &env::Partition) -> GeneratedFile {
     }
     contents.push_str("  ],\n");
     contents.push_str(&format!("  \"node_runner\": {},\n", names::string(RUNNER)));
+    // The authored half of the tree, by the path it takes inside the artifact —
+    // sorted and de-duplicated, which is what one entry per *file* rather than
+    // per binding means. Emitted as `[]` rather than omitted for the reason the
+    // empty `placements` array is: "this artifact carries no authored code" and
+    // "this manifest does not say" must not be the same answer.
+    let mut authored: Vec<&str> = crate::check::modules::bindings(ir)
+        .into_iter()
+        .map(|(_, module)| module.path.value.as_str())
+        .collect();
+    authored.sort_unstable();
+    authored.dedup();
+    contents.push_str("  \"authored\": [");
+    if authored.is_empty() {
+        contents.push_str("],\n");
+    } else {
+        contents.push('\n');
+        for (index, path) in authored.iter().enumerate() {
+            let comma = if index + 1 == authored.len() { "" } else { "," };
+            contents.push_str(&format!("    {}{comma}\n", names::string(path)));
+        }
+        contents.push_str("  ],\n");
+    }
     contents.push_str("  \"placements\": [\n");
     let placements: Vec<&env::Process> = partition
         .processes()
@@ -137,6 +170,38 @@ mod tests {
         assert!(written.contains("\"placements\": [\n  ]\n"), "{written}");
         assert!(
             written.contains(&format!("\"node_runner\": \"{RUNNER}\"")),
+            "{written}"
+        );
+        assert!(written.contains("\"authored\": [],\n"), "{written}");
+    }
+
+    /// The boundary, written where a reader with no JavaScript runtime finds it
+    /// (PRD resolved q47, q49): one entry per authored file the artifact
+    /// carries, in the path space the tree uses.
+    #[test]
+    fn the_manifest_names_the_authored_files_the_artifact_carries() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+tool.verify:
+  description: Verify a signature.
+  input: {}
+  output: {}
+  module: ./src/tools/verify.ts
+
+tool.sign:
+  description: Sign a payload.
+  input: {}
+  output: {}
+  module: ./src/tools/sign.ts
+"#,
+        );
+        let partition = env::Partition::of(&ir);
+        let written = manifest(&ir, &partition).contents;
+        assert!(
+            written.contains(
+                "  \"authored\": [\n    \"src/tools/sign.ts\",\n    \"src/tools/verify.ts\"\n  ],\n"
+            ),
             "{written}"
         );
     }
