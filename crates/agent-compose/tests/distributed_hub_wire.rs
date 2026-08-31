@@ -2139,27 +2139,43 @@ fn a_paused_result_this_hub_cannot_read_fails_the_dispatch_rather_than_the_worke
     );
 }
 
-/// The two other ways a `paused` is unreadable, each answered by the one
-/// failure §3.4 gives this route (§3.4, §8, `docs/durability.md` §4).
+/// **A pause names one node in every one of its fields**, and each way of
+/// naming two is answered by the one failure §3.4 gives this route (§3.4, §8,
+/// `docs/durability.md` §4).
 ///
-/// The first is the effect **key**. `pauseOf` holds the wait and the record's
-/// `site` to the dispatch's instance path, and the key is the field the record
-/// is actually written under: a body whose site is inside this dispatch and
-/// whose key is `stamp/0#model/0` would land a `human` record in another node's
-/// effect slot, where that node's own replay claims it and raises a
-/// `ReplayDivergence` — an unabsorbable failure of an execution the offending
+/// Every case here is a body the prefix rule cannot catch: the wait and the
+/// record's `site` both lie inside the dispatch's own instance path, so what
+/// separates them from a conforming pause is only that they disagree about
+/// *which* node inside it was reached.
+///
+/// The first is the effect **key**, which is the field the record is actually
+/// written under: a key of `stamp/0#model/0` would land a `human` record in
+/// another node's effect slot, where that node's own replay claims it and raises
+/// a `ReplayDivergence` — an unabsorbable failure of an execution the offending
 /// session was never dispatched into. The key is `<site>#human/<ordinal>` and
 /// nothing else.
 ///
 /// The second is the `human:` node itself. An answer is held to that node's
 /// `output:`, read off this hub's own copy of the descriptor (§4.3), so a pause
 /// naming a node the artifact does not declare is a question no surface could
-/// safely take — and it is refused *here*, before the dispatch is settled, so
-/// that both spellings of "this hub cannot read your pause" reach an operator as
-/// one failure class rather than as a bare throw out of a settlement already
+/// safely take.
+///
+/// The third and fourth are the identity's two halves, and they are the ones a
+/// faithful-looking body reaches. A `wait` that is not the record's `site` plants
+/// the question under one node's identity while journaling the answer into
+/// another's — a correct key for the wrong node, which is exactly what the key
+/// check above cannot see. And a path whose last frame is not the `node` named
+/// beside it holds the person to a *different* node's `timeout:`, `output:` and
+/// parser: the fixture declares two `human:` nodes called `ask`, one with a
+/// budget and one without, so this is the cheapest possible spelling of a real
+/// divergence rather than a hypothetical one.
+///
+/// All four are refused *here*, before the dispatch is settled, so that every
+/// spelling of "this hub cannot read your pause" reaches an operator as one
+/// failure class rather than as a bare throw out of a settlement already
 /// answered `204`.
 #[test]
-fn a_paused_result_naming_another_nodes_key_or_no_node_at_all_is_unreadable() {
+fn a_paused_result_that_does_not_name_one_node_throughout_is_unreadable() {
     for (case, mutate) in [
         (
             "another node's effect key",
@@ -2171,6 +2187,23 @@ fn a_paused_result_naming_another_nodes_key_or_no_node_at_all_is_unreadable() {
             "a node this artifact does not declare",
             |pause: &mut Value| {
                 pause["node"] = json!("consider");
+            },
+        ),
+        (
+            "an identity that is not the record's own site",
+            |pause: &mut Value| {
+                let wait = pause["wait"].as_str().expect("a wait").to_string();
+                pause["wait"] = json!(wait.replace("/escalation/0/", "/deadline/0/"));
+            },
+        ),
+        (
+            "an identity that ends at another node",
+            |pause: &mut Value| {
+                let wait = pause["wait"].as_str().expect("a wait").to_string();
+                let elsewhere = wait.replace("/ask/0", "/sign/0");
+                pause["wait"] = json!(elsewhere.clone());
+                pause["effect"]["site"] = json!(elsewhere.clone());
+                pause["effect"]["key"] = json!(format!("{elsewhere}#human/0"));
             },
         ),
     ] {

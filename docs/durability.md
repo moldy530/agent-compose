@@ -751,7 +751,8 @@ execution wrote.
 generation's clock, and a `human` node's own budget restarts when the wait
 re-parks — a wait the journal *holds* is not re-parked at all, and replays with
 the instants the recording generation measured (§3.4). A backoff's jitter is
-re-rolled.
+re-rolled. None of it changes what an effect answers, and a recorded effect is
+answered out of the record whatever the clock says.
 
 One wait re-parks with **what is left** of its budget rather than with a fresh
 one, and it is the one the journal can date: a pause a worker settled its
@@ -760,17 +761,18 @@ re-derives it knows when it took the question and spends the node's `timeout:`
 from there. A local pause has no such row — nothing is journaled for a wait
 nobody answered — so there is nothing to measure from and the budget starts
 again. The two differ in what a restart costs a person's remaining time, and in
-nothing else: same budget, same route, same record. None of it changes what an effect answers, and a recorded effect is
-answered out of the record whatever the clock says.
+nothing else: same budget, same route, same record. It is the one named
+divergence between a placed `human:` node and an unplaced one, and
+`docs/distributed.md` §3.4 states it as such.
 
-What it can change is *whether* a deadline fires, and that is a change in the
-**shape** of the run rather than in the identity of any effect. Replaying an
-attempt costs no wall clock, so a node whose `timeout:` ended its `retry:`
-ladder on the recording generation can have budget left to go round again on the
-resumed one. That next attempt claims a key the journal does not hold — which is
-the frontier, exactly as §5 defines it — so the effect is issued **live** and
-recorded, and the resumed execution has done something the recording one did
-not.
+What a resumed generation's clock can change is *whether* a deadline fires, and
+that is a change in the **shape** of the run rather than in the identity of any
+effect. Replaying an attempt costs no wall clock, so a node whose `timeout:`
+ended its `retry:` ladder on the recording generation can have budget left to go
+round again on the resumed one. That next attempt claims a key the journal does
+not hold — which is the frontier, exactly as §5 defines it — so the effect is
+issued **live** and recorded, and the resumed execution has done something the
+recording one did not.
 
 That is not a divergence and is not reported as one: nothing compares unequal,
 and neither does the reverse case, where a resumed generation's deadline fires
@@ -1194,6 +1196,27 @@ one under this build parks a fresh wait rather than finding a settled answer,
 which is the same thing a `retry:` does and not a re-issued effect. The clause a
 future change here has to read twice is the one above: a **column** added to
 `dispatches` is not covered by `CREATE TABLE IF NOT EXISTS` either.
+
+**The third of them is the `paused` dispatch outcome** (§3.8,
+`docs/distributed.md` §3.4), and it arrived under no clause at all — it is a new
+*shape* of an existing field, a settled row whose `outcome` carries a pause
+instead of an output, which is none of the four literally. It needed no bump
+anyway, and the direction is the whole of why: §11.3's criterion is a journal
+written by the **previous** version replaying *wrongly* under this one, and no
+such journal holds a paused outcome. Every settled row an older build wrote
+carries an output or an error, and this build reads both exactly as its
+predecessor did. The hazard runs the other way — an older build meeting a paused
+row it has no reading for — and that is the case §11's opening sentence already
+answers: a journal is refused by version, and a build is never asked to read a
+file a *newer* one wrote.
+
+That is the difference from the wire, and it is worth stating beside the bump
+rather than leaving a reader to derive it. `docs/distributed.md` §10.4 bumps
+`PROTOCOL_VERSION` to `2` for this same shape, because a peer is met **live**: a
+worker of this release can hand a hub of `1` a result that hub will read as a
+node which answered nothing, and no refusal stands between them until the version
+says so. A journal has one reader per file and one arrow of time, so the same
+new shape is compatible here and breaking there.
 
 ### 11.3 What requires a version bump
 

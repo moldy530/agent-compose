@@ -664,8 +664,29 @@ minutes behind it and a quarter of an hour on one ten minutes ahead, while the
 same node unplaced always gets five minutes. What the hub arms is the node's own
 `timeout:` out of its copy of the descriptor, spent from the instant it took the
 pause — the settled row's `settled_at`, so a restarted hub re-arms what is left
-rather than starting the budget again. Both readings are then on one clock, and
-the parity q46 requires is exact rather than approximate.
+rather than starting the budget again. Both readings are then on one clock, and a
+`timeout: 5m` node gets five minutes whichever machine asked the question, which
+is the parity q46 requires of a hub that stays up.
+
+**A restart is where the two stop being identical, and this document states the
+exception rather than leaving it to a diff.** A restarted hub re-derives a placed
+pause off its settled row, so it re-publishes the `paused_at` and `expires_at`
+its predecessor published and spends what is *left* of the budget. The same node
+unplaced has no such row — resolved q28 journals nothing for a wait nobody
+answered, so an unanswered local pause is re-parked from scratch — and its
+re-park stamps fresh instants and starts the budget again
+(`docs/durability.md` §5). A person answering a placed `timeout: 5m` pause four
+minutes into a restart has one minute left; unplaced, they have five. The placed
+half is the one durability asks for — §9's "a reader of the resumed document sees
+what the execution did, not what this process did" — and the gap does not close
+from the other side within this release: giving a local pause a budget to
+continue means journaling a wait nobody has answered, which is a change to
+*which sites are journaled at all* and so a `JOURNAL_VERSION` bump
+(`docs/durability.md` §11.3), not a wire question. So it is a single, named
+divergence from the parity bar, in the one dimension a record exists for on one
+side and not the other; everything else about the two waits — identity
+derivation, status shape, webhook kind, `on_timeout:` routing, resume payload
+validation — is the same code.
 
 `effect` is the
 journal record the **answer** will be written under, exactly as the worker's own
@@ -683,7 +704,22 @@ with them, by the derivation rather than by the prefix: it MUST be
 under and one naming another node's slot would be claimed by *that* node's replay
 as a divergence. `flow` and `node` MUST name a `human:` node the hub's own
 artifact declares, since the answer is held to that node's `output:` and a
-question nothing can validate an answer against is one no surface may take. A
+question nothing can validate an answer against is one no surface may take.
+
+**And all of them MUST name one node**, which is the same rule along the other
+axis. `wait` and `effect.site` MUST be the **same path**: a pause's identity *is*
+its effect site, derived once and sent twice, so a body carrying two paths would
+plant the question under one node's identity and journal the answer into
+another's slot — a correct key for the wrong node, which is precisely what the
+derivation check above cannot see. That path's last frame MUST name `node`
+(grammar §9.4's `<node id>/<ordinal>`), because the contract the answer is held
+to is `flow`.`node`'s: a pause whose identity reached a different node would arm
+that other node's `timeout:`, publish its `output:` and parse the answer with its
+parser. What a hub cannot check is which *flow* the path ran in — a frame above
+the node is a node id or a flow's local name, and nothing resolves one back to a
+declaration — so two `human:` nodes sharing an id in two flows are
+indistinguishable here, and a peer that crossed them is caught by the
+redispatch's own parse (resolved q29) rather than by this route. A
 `paused` that breaks any of those, or that is short of a member, is **not**
 answered with a status:
 this route's table is closed (§10.1) and a status outside it is a refusal a
@@ -728,9 +764,10 @@ same line of the same function an unplaced pause's expiry is decided by.
 **A hub restart between the pause and the answer costs nothing**, because the
 pause is journaled: the settled row carries it, and the replay that re-reaches
 the node re-derives the wait onto the new process's board — under the identity
-and the instants its predecessor published — unless the answer's record is
-already in the journal, in which case the wait is over and the redispatch is what
-replays past it.
+and the instants its predecessor published, and with what is left of its budget,
+which is the one place a placed pause and an unplaced one part company (above) —
+unless the answer's record is already in the journal, in which case the wait is
+over and the redispatch is what replays past it.
 
 This is a change an older peer would misread — a `1` peer sees a result with no
 `output` and reads it as a node that answered nothing — so `PROTOCOL_VERSION` is
@@ -1629,7 +1666,9 @@ worker is in the middle of running, and one between a placed pause and its
 answer), a hub opening a journal written before the dispatch board existed, a
 placed `human:` node whose question comes home and whose answer sends the node
 back to a worker — including the variant where the worker that asked is gone by
-the time the person decides — the refusals a worker stops on, and a fan-out
+the time the person decides, and the wait that is never answered at all, whose
+budget runs out on the hub and whose redispatch raises the node's own
+`on_timeout:` route on a worker — the refusals a worker stops on, and a fan-out
 queued onto a pool of one.
 `crates/compose-core/tests/placement_surface_landing.rs` holds the surface to
 where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in

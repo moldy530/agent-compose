@@ -837,6 +837,15 @@ function endingIn(value: unknown): Ending {
  * travels and what is journaled, since a second derivation is the divergence §3.4
  * carries the field to avoid — but a spelling that is not the one this hub would
  * have written is not a pause it can read.
+ *
+ * **And the two of them name one node**, which is the same rule read along the
+ * other axis. The identity and the site are one path — a worker derives both
+ * from one `instancePath` call — and that path's last frame is the `node` whose
+ * contract the answer is held to. A body that agreed with the dispatch on every
+ * prefix and disagreed with itself about *which* node it reached would plant the
+ * question under one node's identity and hold it to another node's `timeout:`,
+ * `output:` and parser, which the redispatch meets as a divergence rather than
+ * as a refusal. The two checks are cheap and the failure they close is not.
  */
 function pauseOf(row: DispatchRow, value: unknown): runtime.RemotePause | undefined {
   if (value === null || typeof value !== "object") return undefined;
@@ -869,7 +878,32 @@ function pauseOf(row: DispatchRow, value: unknown): runtime.RemotePause | undefi
   }
   if (typeof ordinal !== "number" || !Number.isInteger(ordinal)) return undefined;
   if (!under(wait, row.site) || !under(site, row.site)) return undefined;
+  // **The identity is the site**, one path and not two. `runtime.runHuman`
+  // derives both from a single `instancePath` call — the wait a pause is planted
+  // under *is* the effect site its answer is recorded at — so a body carrying two
+  // different paths is one no process of this release wrote, and taking it would
+  // put the question on the board under one node's identity while journaling the
+  // answer into another node's slot. That is the hazard the key check below is
+  // about, one field further out and past its reach: a key derived faithfully
+  // from a `site` that is not the `wait` is a correct key for the wrong node.
+  if (wait !== site) return undefined;
   if (key !== effectKey(site, "human", ordinal)) return undefined;
+  // …and the node that identity ends at is the node whose contract will hold the
+  // answer. `runtime.holdRemotePause` looks the descriptor up by `${flow}.${node}`
+  // and arms *its* `timeout:`, publishes *its* `output:` on the status route and
+  // parses the resume payload with *its* parser — so a pause whose identity
+  // reached some other node would hold a person to a contract the redispatched
+  // node does not share, and the mismatch would land as the `ReplayDivergence`
+  // resolved q29 makes unabsorbable, on an execution this session was dispatched
+  // into for a different node.
+  //
+  // What this **cannot** decide is which *flow* the path ran in: an instance
+  // frame is `<node id>/<ordinal>` or `<flow local name>/<ordinal>` (grammar
+  // §9.4), and nothing in this process resolves one back to a declaration. Two
+  // `human:` nodes sharing an id in two flows are therefore indistinguishable
+  // here, and a peer that crossed them is caught by the redispatch's own parse
+  // rather than by this route.
+  if (!namesNode(wait, node)) return undefined;
   const expiresAt = held["expires_at"];
   return {
     wait,
@@ -1715,6 +1749,23 @@ function under(path: string, root: string): boolean {
   return path === root || path.startsWith(`${root}/`);
 }
 
+/**
+ * Whether an instance path's **last frame** names `node` (grammar §9.4).
+ *
+ * A frame is `<name>/<ordinal>` where the ordinal is decimal and the name is an
+ * identifier (grammar §2.1), so the last `/` splits one off the other and what
+ * is left of it ends in the name. That last frame is a node's own — a `human:`
+ * node's wait id is `instancePath` at the node itself (`./runtime.ts`) — which
+ * makes this the whole of what §3.4 can hold a pause's `node` to.
+ */
+function namesNode(path: string, node: string): boolean {
+  const cut = path.lastIndexOf("/");
+  if (cut < 0) return false;
+  if (!/^[0-9]+$/.test(path.slice(cut + 1))) return false;
+  const frame = path.slice(0, cut);
+  return frame === node || frame.endsWith(`/${node}`);
+}
+
 /** One outcome off the wire, or `undefined` where it is not one. */
 function outcomeOf(value: unknown): JournalOutcome | undefined {
   if (value === null || typeof value !== "object") return undefined;
@@ -1822,7 +1873,7 @@ function settlementOf(row: DispatchRow, body: Record<string, unknown>): JournalO
       ? {
           kind: "error",
           name: "PausedResultUnreadable",
-          message: `this worker settled \`${row.id}\` paused with a pause this hub cannot read: a paused result names its \`wait\`, a \`flow\` and \`node\` this artifact declares as a \`human:\` node, what the person is \`shown\`, \`paused_at\`, and the \`effect\` record (\`key\`, \`site\`, \`ordinal\`, \`request\`) its answer is journaled under, whose \`key\` is \`<site>#human/<ordinal>\` — and the wait and the record both lie at or inside \`${row.site}\`, which is this dispatch's own instance path (docs/distributed.md §3.4, §8)`,
+          message: `this worker settled \`${row.id}\` paused with a pause this hub cannot read: a paused result names its \`wait\`, a \`flow\` and \`node\` this artifact declares as a \`human:\` node, what the person is \`shown\`, \`paused_at\`, and the \`effect\` record (\`key\`, \`site\`, \`ordinal\`, \`request\`) its answer is journaled under — where the \`wait\` and the record's \`site\` are the same instance path, that path's last frame names the \`node\`, the \`key\` is \`<site>#human/<ordinal>\`, and the whole of it lies at or inside \`${row.site}\`, which is this dispatch's own instance path (docs/distributed.md §3.4, §8)`,
         }
       : { kind: "value", value: { paused: pause } };
   }

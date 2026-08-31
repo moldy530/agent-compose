@@ -332,8 +332,15 @@ pub(crate) fn check_stores(ctx: &mut Ctx<'_>) {
                 binder.owner,
             ),
         );
-        // The chain, root-first: every hop between the `members:` entry and the
-        // binding the primary span already points at.
+        // The chain: every hop from the `members:` entry inward to the binding
+        // the primary span already points at, in route order — and then the
+        // entry itself, **last**, because it is the one label in the other file.
+        // A reader meets the composition's own lines in the order the walk took
+        // them and the deploy file's line at the end, which is where the repair
+        // is. `process_local_store_in_a_mesh.rs`'s
+        // `the_refusal_draws_the_chain_from_the_members_entry_to_the_binding`
+        // pins that order, so a reordering here is a test failure rather than a
+        // silent re-render.
         let mut previous = root;
         for step in hops {
             if let Some(site) = step.site {
