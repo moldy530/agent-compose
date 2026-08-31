@@ -2270,6 +2270,83 @@ fn a_paused_result_that_does_not_name_one_node_throughout_is_unreadable() {
     }
 }
 
+/// A result that carries **two endings** is unreadable, and neither of them is
+/// taken (§3.4).
+///
+/// "A result carries at most one of `output`, `error` and `paused`" is a clause
+/// with something to lose: a hub that read the pause and dropped the output
+/// beside it would plant a question about a node that had already answered, and
+/// the person would be asked something the execution was past — the one failure
+/// the third ending exists to remove. The other order is no better, and which of
+/// the two a sender meant is not a thing a hub can work out, so it works out
+/// neither and the attempt is what the body costs.
+///
+/// No worker of this release sends the pair, since a run that reached a pause
+/// has no output to report. So this is a clause about the *other*
+/// implementations §10.1 contemplates, and it is checked rather than left to the
+/// order the arms of the settlement happen to be written in.
+#[test]
+fn a_result_carrying_an_ending_beside_its_pause_is_unreadable() {
+    for (case, beside) in [
+        ("an output", json!({ "output": { "approval": "approved" } })),
+        (
+            "a failure",
+            json!({ "error": { "name": "Error", "message": "the node fell over" } }),
+        ),
+    ] {
+        let Some(hub) = hub() else {
+            return;
+        };
+        let worker = hub.worker();
+        let execution = hub.start("/escalations", &json!({ "path": "dist/app" }));
+        let dispatch = worker.dispatch(&hub);
+        let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+        let site = dispatch["instance_path"].as_str().expect("a site");
+
+        let mut body = json!({ "dispatch_id": id, "paused": paused_at(site) });
+        for (field, value) in beside.as_object().expect("one field beside the pause") {
+            body[field] = value.clone();
+        }
+        let taken = hub.send(worker.request("POST", "/workers/result").json(&body));
+        assert_eq!(
+            taken.status,
+            204,
+            "`{case}` beside a pause was answered outside §3.4's four statuses: {}",
+            body_of(&taken)
+        );
+
+        let ended = hub.until(&execution, "ended", |report| {
+            report["status"] == json!("completed") || report["status"] == json!("failed")
+        });
+        assert_eq!(ended["status"], json!("failed"), "`{case}`: {ended:#}");
+        let said = ended["error"].as_str().unwrap_or_default();
+        assert!(
+            said.contains("PausedResultUnreadable"),
+            "`{case}` beside a pause reached an operator as something other than the one failure \
+             this route gives a body it cannot read: {ended:#}"
+        );
+        assert!(
+            said.contains("at most one of"),
+            "the failure does not say what was wrong with the body: {ended:#}"
+        );
+
+        // **Neither ending was taken**: no wait on the board, and no answer in
+        // the node's own outputs — which is the half a hub that quietly
+        // preferred one of them would still pass the assertions above with.
+        assert!(
+            ended["interrupts"]
+                .as_array()
+                .is_none_or(|waits| waits.is_empty()),
+            "`{case}` beside a pause still planted the question: {ended:#}"
+        );
+        assert_ne!(
+            ended["outputs"]["approval"],
+            json!("approved"),
+            "`{case}` beside a pause was taken as the node's answer: {ended:#}"
+        );
+    }
+}
+
 /// A pause with a `timeout:` expires on the **node's own budget**, and the
 /// expiry redispatches (§3.4, grammar §8.7, PRD resolved q46).
 ///

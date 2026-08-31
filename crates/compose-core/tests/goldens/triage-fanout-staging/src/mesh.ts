@@ -1912,6 +1912,15 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
  * no hub would take. Nothing conforming reaches it: the handshake refuses a peer
  * of another release (§4.1), and this release's own runner writes the shape
  * [`pauseOf`] reads.
+ *
+ * **A body carrying two endings is one of those unreadable pauses**, and it is
+ * checked here rather than left to the order the arms are written in. §3.4: "a
+ * result carries at most one of `output`, `error` and `paused`". A peer that
+ * sent an output *and* a pause would otherwise be read as a pause silently —
+ * the answer dropped on the floor and a person asked a question the node had
+ * already got past, which is the one outcome this whole ending exists to
+ * remove. Which of the two the sender meant is not something a hub can decide,
+ * so it decides neither and costs the attempt.
  */
 function settlementOf(
   journal: Journal,
@@ -1920,6 +1929,18 @@ function settlementOf(
 ): JournalOutcome {
   const paused = body["paused"];
   if (paused !== undefined && paused !== null) {
+    const beside = ["output", "error"].filter(
+      (field) => body[field] !== undefined && body[field] !== null,
+    );
+    if (beside.length > 0) {
+      return {
+        kind: "error",
+        name: "PausedResultUnreadable",
+        message: `this worker settled \`${row.id}\` paused and carried ${beside
+          .map((field) => `\`${field}\``)
+          .join(" and ")} in the same body: a result carries at most one of \`output\`, \`error\` and \`paused\`, so a hub cannot tell whether this node answered or stopped at a question (docs/distributed.md §3.4)`,
+      };
+    }
     const pause = pauseOf(journal, row, paused);
     return pause === undefined
       ? {

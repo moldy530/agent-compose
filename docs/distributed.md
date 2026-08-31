@@ -653,9 +653,12 @@ dispatch, carrying the pause**, and the hub plants the wait on its own board
 ```
 
 `paused` is present exactly when the dispatch ended at a pause, and a result
-carries at most one of `output`, `error` and `paused`. Every member of it is
-REQUIRED except `expires_at`, which is present exactly when the node declares
-`timeout:` (grammar §8.7).
+carries at most one of `output`, `error` and `paused` — a body carrying two
+endings is refused the way an unreadable pause is (below), because which one the
+sender meant is not something a hub can decide, and reading the pause and
+dropping the output would ask a person a question the node had already answered.
+Every member of it is REQUIRED except `expires_at`, which is present exactly when
+the node declares `timeout:` (grammar §8.7).
 
 Every field is a fact **the worker derived and the hub cannot**, and nothing more
 travels than that. `wait` is the node's deterministic wait identity — its
