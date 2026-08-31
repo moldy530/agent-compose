@@ -1231,3 +1231,91 @@ fn a_human_node_a_placed_agent_reaches_fails_its_dispatch_with_a_named_diagnosis
         "the loop's first call was not made on the worker: {snapshot:#?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 9. A journal written before the board
+// ---------------------------------------------------------------------------
+
+/// The statement the surgery below makes about a journal, which is the shape of
+/// the file a build **before** the dispatch board wrote
+/// (`docs/durability.md` §3.8, §11.2).
+///
+/// `DROP TABLE` without `IF EXISTS` refuses a file that has no such table, so a
+/// build whose journal is not what this describes fails here rather than passing
+/// over an assumption that had quietly stopped being true.
+const JOURNAL_BEFORE_THE_DISPATCH_BOARD: &str = "DROP TABLE dispatches;\n";
+
+/// A journal written before the dispatch board existed opens under this build,
+/// replays the execution it holds, and takes this build's own board
+/// (`docs/durability.md` §11.2).
+///
+/// `JOURNAL_VERSION` did not move when the board arrived, and §11.2 is where the
+/// argument for that lives: the table is created on first open, as
+/// `CREATE TABLE IF NOT EXISTS`, and a dispatch row holds no §4 key and is never
+/// consumed by a replay — so an execution open in an older file replays
+/// identically and its frontier does not move. Until this test that argument was
+/// made only in prose, and every other test in the suite creates its journal
+/// fresh under the current schema, so a `NOT NULL` column added to `dispatches`
+/// without the `PRAGMA table_info` probe the migrations beside it use would
+/// leave `cargo test` green and every deployed hub unable to park a dispatch.
+/// §11.2's own delivery-ledger test is the sibling this is one of.
+///
+/// There is no older build in the tree to write the file, so the file is made: a
+/// real hub's journal, parked on a placed node, with the `dispatches` table
+/// dropped out from under it. What is then asserted is the three halves of the
+/// claim — it opens, the execution it holds runs to the end over the wire, and
+/// this build's board is written into the same file.
+#[test]
+fn a_journal_written_before_the_dispatch_board_opens_and_serves_under_this_build() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue_all(signing("signed-over-a-journal-that-had-no-board"));
+
+    // An execution open **at** a placed node, and no worker: the row on the
+    // board is exactly the kind a build before the board could not have written.
+    let execution = mesh.start_execution("/releases", &json!({ "path": "release.dmg" }));
+    mesh.until(&execution, "parked on its placement", |report| {
+        !report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    });
+
+    // The process goes down, and the board is taken out of the file it left.
+    // Stopped first, because the surgery is a writer and so is the hub.
+    mesh.served.stop();
+    harness::journal_sql(&mesh.project, JOURNAL_BEFORE_THE_DISPATCH_BOARD);
+    mesh.restart();
+
+    // It opened. The execution it holds is recovered, reaches the placed node
+    // again, and — finding no row where its predecessor left one — parks a fresh
+    // wait, which is what a worker then answers.
+    let worker = mesh.worker("older-journal");
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"],
+        "signed-over-a-journal-that-had-no-board",
+        "the recovered execution did not finish over the older journal; the worker said:\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        outputs["ticket"], "notarized",
+        "the hub's own node did not run in the recovered execution: {outputs:#}"
+    );
+
+    // …and the board this build writes is in the file that had none: a settled
+    // row, for the wait this run really parked.
+    let board = harness::journal_rows(
+        &mesh.project,
+        "SELECT status, placement, node FROM dispatches WHERE status = 'settled'",
+    );
+    let settled = board.as_array().expect("the query answers rows");
+    assert_eq!(
+        settled.len(),
+        1,
+        "this build wrote no settled dispatch into the journal it opened: {board:#}"
+    );
+    assert_eq!(settled[0]["placement"], PLACEMENT, "{board:#}");
+    assert_eq!(settled[0]["node"], "flow.release.sign", "{board:#}");
+}

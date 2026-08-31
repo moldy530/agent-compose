@@ -2,7 +2,7 @@
 
 **Journal version:** 1
 **Status:** Normative for the journal a compiled project writes and the replay it reads back
-**Companion artifacts:** [`docs/trace.md`](trace.md) (the keying this shares), [`docs/grammar.md`](grammar.md) §9.4 (idempotency keys), [`prd.md`](../prd.md) §5.8, §5.11, resolved questions 26–29
+**Companion artifacts:** [`docs/trace.md`](trace.md) (the keying this shares), [`docs/grammar.md`](grammar.md) §9.4 (idempotency keys), [`docs/distributed.md`](distributed.md) (the wire the dispatch ledger of §3.8 serves), [`prd.md`](../prd.md) §5.8, §5.11, resolved questions 26–29
 
 An execution of a compiled graph survives the process that started it. This
 document defines how: what is written, where, under what key, what a resumed
@@ -35,7 +35,8 @@ project a given compiler release builds — like `src/runtime.ts` and
 1. [The journal is not the trace](#1-the-journal-is-not-the-trace)
 2. [Where it lives, and what a crash can leave](#2-where-it-lives-and-what-a-crash-can-leave)
 3. [What is recorded](#3-what-is-recorded) — including
-   [callback deliveries](#37-a-callback-delivery)
+   [callback deliveries](#37-a-callback-delivery) and
+   [placement dispatches](#38-a-placement-dispatch)
 4. [Keys](#4-keys)
 5. [Replay, and the frontier](#5-replay-and-the-frontier)
 6. [Recovery: `serve` and `resume`](#6-recovery-serve-and-resume)
@@ -583,6 +584,60 @@ states. What the deliveries *report* — one webhook per parking, listing every
 pause then open — is `serve.ts`'s `parking` over `runtime.quiescent`, and PRD
 resolved q34 is where that rule is stated.
 
+### 3.8 A placement dispatch
+
+**The third ledger, and the second thing here that is not an effect.** A
+composition whose deploy target declares `placements:` runs some of its nodes in
+another process, and `docs/distributed.md` is the document for that wire. What
+belongs *here* is the one sentence of it this journal is the subject of: §8 rule
+3 of that document says dispatch state lives in the journal and nowhere else, so
+a placed node's dispatch is a row beside the effects rather than a scheduler's
+memory.
+
+One row per **placement wait** — a placed node instance the hub is waiting on —
+holding what a worker is handed and how the wait ended:
+
+| field | meaning |
+|---|---|
+| `execution`, `wait` | the identity, and the primary key. `wait` is `<instance path>/<ordinal>`, the deterministic identity `docs/distributed.md` §6.1 fixes, derived exactly the way §3.4's re-parking wait id is — so a resumed generation reaching the node again finds the row its predecessor left instead of opening a second dispatch for work a worker may already be running |
+| `id` | `dsp_…`, the handle the wire attributes a result by. The issuing hub's own, opaque to a worker, and **not** the identity: a re-park after a supersede is a new `id` at the same `wait` |
+| `placement`, `node`, `site` | where the work is queued — a placement, never a worker — and what it is |
+| `inputs`, `itemIndex`, `history`, `policy` | the dispatch payload: what the node's input phase built, plus the three facts about the node execution the hub holds that a worker cannot derive. On the row rather than in memory, so a hub restarted mid-dispatch hands over what its predecessor would have |
+| `status` | `parked`, `dispatched`, `settled` or `superseded` — the vocabulary below |
+| `session`, `parkedAt`, `dispatchedAt`, `settledAt`, `detail` | which worker session is holding it while one is, and the three instants of the wait, for the reason §3.4 keeps all three of a human wait's |
+| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take |
+
+**What `status` means** is the same kind of statement §3.6 makes about an
+execution, and the four are not interchangeable:
+
+* **`parked`** — on the board, and no session is holding it. This is the pause:
+  the node is waiting for a worker that claims its placement.
+* **`dispatched`** — a session was handed it and has not settled it.
+* **`settled`** — a worker's result ended it, and the outcome on the row is that
+  result. A resumed generation consumes it rather than dispatching again, which
+  is §5's replay discipline reaching this ledger.
+* **`superseded`** — the hub ended it *without* a result, which is the only way a
+  dispatch ends that a worker did not end. A resumed generation replays the
+  failure, so the node's `retry:`/`on_error:` chain does now what it did then.
+
+**It holds no §4 key and is never consumed by a replay of the effect frontier.**
+That is the property it shares with the delivery ledger and the reason it is a
+table of its own rather than a fifth `EffectKind`: the effects a placed node
+issues are journaled under **its own instance path**, by the ordinary rule, out
+of the batches the worker sends home — so the frontier is exactly where it would
+be had the node run on the hub, and a redispatch replays to it. The dispatch row
+is the *bookkeeping* around that, not a step in it. What a resumed execution
+reads off the row is which of the four states above the wait is in.
+
+**Where it is implemented.** The `dispatches` table and the `park`,
+`dispatchAt`, `dispatchOf`, `unsettledDispatches`, `claimDispatch`,
+`releaseDispatch`, `settleDispatch` and `supersedeDispatch` methods of the
+emitted `src/journal.ts`, read and written by `src/mesh.ts` alone — a worker
+never touches this journal, which is what keeps SQLite a valid backend for a
+mesh (`docs/distributed.md` §3.3, §8). `effectsUnder` is the one read the wire
+adds beside them: every effect at or inside one instance path, which is the
+`effect_history` a redispatched node replays to the frontier before going live.
+
 ## 4. Keys
 
 An effect's journal key is
@@ -1053,8 +1108,8 @@ At a given `JOURNAL_VERSION`:
 * every field this document names, under the name and with the meaning given
   here;
 * the key derivation of §4, and the vocabulary of `EffectKind`;
-* the `status` vocabulary of §3.6, and the `DeliveryEvent` and `DeliveryStatus`
-  vocabularies of §3.7;
+* the `status` vocabulary of §3.6, the `DeliveryEvent` and `DeliveryStatus`
+  vocabularies of §3.7, and the dispatch `status` vocabulary of §3.8;
 * the delivery id derivation of §3.7 — `<execution_id>:<ordinal>` — and that a
   retry of one delivery carries the id and the metadata its first attempt did;
 * that a record's payload round-trips: a value written by one generation is the
@@ -1100,6 +1155,19 @@ covered by `CREATE TABLE IF NOT EXISTS`, and needs the `PRAGMA table_info` probe
 the migrations beside it use — the delivery's own `trigger` is one such column,
 added to the ledger after it and nullable because no file written before it says
 what trigger a delivery it holds was for.
+
+**The dispatch board (§3.8) arrived under the same clause and owes the same
+test**, and it has one: `a_journal_written_before_the_dispatch_board_opens_and_serves_under_this_build`
+strips the `dispatches` table from a real journal and starts the hub over it.
+The argument is the delivery ledger's, made about the other ledger: the table is
+created on first open, a dispatch row holds no §4 key and is never consumed by a
+replay, so an execution open in a file written before the board replays
+identically and its frontier does not move. What such an execution does *not*
+have is a row for a placed node its own generation never reached — and reaching
+one under this build parks a fresh wait rather than finding a settled answer,
+which is the same thing a `retry:` does and not a re-issued effect. The clause a
+future change here has to read twice is the one above: a **column** added to
+`dispatches` is not covered by `CREATE TABLE IF NOT EXISTS` either.
 
 ### 11.3 What requires a version bump
 

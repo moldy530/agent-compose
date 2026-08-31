@@ -1097,6 +1097,12 @@ protocol equally.
    monotonic counter shared across executions, no "last row wins" read that spans
    them, no dispatch state held anywhere but the journal.
 
+What that third rule buys the journal is a ledger of its own, and it is the
+journal's document that defines it: `docs/durability.md` §3.8 is where a dispatch
+row's fields, its four-value `status`, and its relationship to the effect
+frontier are normative. A reader who wants to know what a hub restart re-derives
+from reads that section; this one says what the wire does with it.
+
 The assumption these forbid is the one that would make resolved q37's
 execution-sharded scale-out a *migration* instead of "run more hubs". Keeping it
 out is cheap now and expensive later, which is why it is an invariant rather than
@@ -1444,8 +1450,9 @@ fixture; and `crates/agent-compose/tests/distributed_mesh_acceptance.rs` runs a
 real hub and real workers and asks whether a distributed execution works — the
 steady state, a cold start, parking and wake, a mid-node disconnect and the
 replay that follows it, two hub restarts (one idle, one over a dispatch a worker
-is in the middle of running), the refusals a worker stops on, and a fan-out
-queued onto a pool of one.
+is in the middle of running), a hub opening a journal written before the
+dispatch board existed, the refusals a worker stops on, and a fan-out queued onto
+a pool of one.
 `crates/compose-core/tests/placement_surface_landing.rs` holds the surface to
 where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in
 `src/mesh.ts`, and neither in the composition's own lowering.
@@ -1474,7 +1481,19 @@ moved has to be as readable as the sentences are.
   `dispatch_id` at all. That route's table gives four statuses and §10.1 lets an
   implementation rely on them, so answering a fifth outside it would be a status
   a second implementation could meet and act on wrongly — a `4xx` this document
-  does not give the route reads as a refusal, and a refusal ends a worker.
+  does not give the route is a refusal no re-send improves, and the *only*
+  reading left for it. What such a status costs is a **dispatch** rather than a
+  worker, and that is the one place a refusal is not read the way §3.1 reads a
+  refused join: §3.1's terminality rests on "a second join would be refused
+  identically", which is a statement about this worker's right to be in this mesh
+  at all, and a body one hub would not take says nothing of the kind. A worker
+  that ended on one would leave the placement with none, and its replacement
+  would reach the same record and end the same way. So the attempt fails under
+  the node's own `retry:`/`on_error:` chain and the process goes on polling —
+  which is also why the two routes a worker POSTs to are mounted with a body
+  limit of their own rather than the framework's, since a `413` from underneath
+  a handler is precisely such a status and one an effect record can reach without
+  anything having gone wrong.
 - **§3.5's "an artifact it holds"**, which scopes a MUST that a hub of this
   release could not otherwise meet: it serves exactly one artifact, and the
   paragraph above says what that costs.
