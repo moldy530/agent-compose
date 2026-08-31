@@ -1365,6 +1365,35 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         observed["deliveredContext"],
         serde_json::json!(["exec_gate/fan/0/1", null])
     );
+    // …and the fourth binding kind, on the same field: a `module:` sink reads
+    // the key off the context it is called with, exactly as a `function:` one
+    // does, so `callModule` forwarding the caller's context is what makes
+    // at-least-once delivery to authored code a promise rather than a hope.
+    //
+    // The third argument rides along, because one call delivers both. Its
+    // second name is `__proto__` — a name grammar 4.3's environment-variable
+    // form accepts and `Object.prototype` answers to — and the value the
+    // implementation reads is the declared string rather than a prototype,
+    // which is the difference between an environment built by assignment and
+    // one built out of own properties. `src/modules.ts` types that name
+    // `string`; this is what makes the type true.
+    assert_eq!(
+        observed["deliveredModule"],
+        serde_json::json!([
+            {
+                "key": "exec_gate/fan/0/1",
+                "declared": "a literal",
+                "proto": "a value, not the prototype",
+                "text": "a1",
+            },
+            {
+                "key": null,
+                "declared": "a literal",
+                "proto": "a value, not the prototype",
+                "text": "a1",
+            },
+        ])
+    );
 
     // Grammar 8.6's key table: `max_concurrency` is a node-wide **admission**
     // bound over every in-flight dispatch, detached included. Six items, half of

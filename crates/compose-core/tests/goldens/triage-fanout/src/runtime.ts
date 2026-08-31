@@ -700,11 +700,14 @@ export interface RunContext {
    * key a receiver dedupes on for effects that are *meant* to repeat.
    *
    * **The name is normative.** Grammar 9.4's delivery surface says a
-   * `function:`-bound target "receives it as the `idempotency_key` field of its
-   * invocation context", and the invocation context of a host function is this
-   * object ([`HostFunction`]) — so this field *is* that surface and is spelled
-   * the way the spec spells it rather than the way the rest of this file spells
-   * a name. The other two carriers are named there too, and see [`runHttp`] and
+   * `function:`-bound and a `module:`-bound target each "receive it as the
+   * `idempotency_key` field of the invocation context they are called with",
+   * and that context is this object ([`HostFunction`],
+   * [`ModuleImplementation`]) — so this field *is* that surface for both, and is
+   * spelled the way the spec spells it rather than the way the rest of this file
+   * spells a name. One field for the two bindings that run in this process: a
+   * call made here has a context to put a key on and needs no wire to carry it.
+   * The other two carriers are named there too, and see [`runHttp`] and
    * [`runExec`] for the slot each puts it in.
    */
   readonly idempotency_key?: string;
@@ -4717,13 +4720,20 @@ export async function callModule<I, O, E extends ModuleEnv>(
       input,
     },
     async () => {
-      const environment: Record<string, string> = {};
-      for (const entry of binding.env) {
-        environment[entry.name] = interpolate(entry.value);
-      }
+      // `Object.fromEntries` rather than assignment into an object literal,
+      // because a declared name is data and one of them is a *setter* on
+      // `Object.prototype`: `environment["__proto__"] = "…"` is a silent no-op,
+      // so a binding declaring `__proto__` — which the validator's environment
+      // variable form accepts — would hand the implementation an `env.__proto__`
+      // holding `Object.prototype` where `./modules.ts` typed it `string`. This
+      // defines own properties, so every name the composition declared arrives
+      // as the value it declared.
+      const environment = Object.fromEntries(
+        binding.env.map((entry) => [entry.name, interpolate(entry.value)] as const),
+      );
       // The cast is the compiler's own guarantee rather than a claim about
       // arbitrary data: `E` is the type `./modules.ts` wrote from this binding's
-      // `env:`, and the loop above filled exactly those names from the same
+      // `env:`, and the map above filled exactly those names from the same
       // declaration. One emitter wrote both.
       return await implementation(input, context, environment as E);
     },
@@ -5158,12 +5168,12 @@ export interface DispatchRecord {
    * A **detached** delivery carries it to its sink on the surface grammar 9.4
    * fixes per binding kind — the `Idempotency-Key` header of an `http:`
    * binding, the `IDEMPOTENCY_KEY` variable in an `exec:` binding's
-   * environment, the `idempotency_key` field of the context a `function:`
-   * binding is invoked with — which is what makes at-least-once delivery a
-   * defensible trade rather than a lost message (PRD 5.6). It is recorded for
-   * every dispatch because it is the same derivation either way, and because it
-   * is the one place the flattened instance path of a nested fan-out is
-   * observable at all.
+   * environment, the `idempotency_key` field of the context a `function:` or a
+   * `module:` binding is invoked with — which is what makes at-least-once
+   * delivery a defensible trade rather than a lost message (PRD 5.6). It is
+   * recorded for every dispatch because it is the same derivation either way,
+   * and because it is the one place the flattened instance path of a nested
+   * fan-out is observable at all.
    */
   readonly idempotencyKey: string;
   /**

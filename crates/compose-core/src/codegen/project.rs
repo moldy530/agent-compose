@@ -348,6 +348,10 @@ const README_BODY: &str = r#"
 
 | path | what it holds |
 |---|---|
+| `.gitignore` | the three things a checkout of this directory leaves out: the install artifact, the `.env` the spec deliberately never contains, and the data this project's own stores keep |
+| `README.md` | this file |
+| `package.json` | the dependency set, each package pinned to the version this compiler release was built against — plus whatever a `module:` binding declared under `dependencies:` — the `typecheck` script, and the Node floor |
+| `tsconfig.json` | the type checker's settings: strict, `noEmit`, and the `.ts` import extensions both supported runtimes resolve |
 | `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, which files here the compiler did not write, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
 | `src/artifact.ts` | what this tree **is**: a content hash over its own files — the emitted ones and the authored ones the composition references — the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
@@ -415,15 +419,22 @@ compile time, which is what keeps this directory committable and free of
 credentials.
 
 **The file list above is the boundary.** `agent-compose build` replaces exactly
-the files in that table and nothing else in this directory is written, removed,
-or reported. A `node_modules/`, a lockfile, a `.env` — and any TypeScript you
-wrote that the composition does not reference — are yours, wherever they sit.
-`src/` is not a compiler-only directory: what makes a file the compiler's is
-being on that list.
+the files in that table — every one of them, `package.json` and this README
+included — plus a copy of each implementation the composition references, which
+is the section below. Nothing else in this directory is written, removed, or
+reported. A `node_modules/`, a lockfile, a `.env` — and any TypeScript you wrote
+that the composition does not reference — are yours, wherever they sit. `src/` is
+not a compiler-only directory, and the root is not a yours-only one: what makes a
+file the compiler's is being on that list.
 
-Every file the compiler replaces carries the header above, which is how it tells
-its own work from yours: a `build` into a directory holding none of its files
-refuses rather than overwriting what is there.
+Every file the compiler **generates** carries the header above, which is how it
+tells its own work from yours: a `build` into a directory holding none of its
+files refuses rather than overwriting what is there, naming the ones it would
+have replaced. A build writes one other kind of file here and it carries no
+header — a copy of an implementation you wrote, which the section below is
+about — so the two sentences are one rule: what a build writes is the table
+above plus the authored files the composition references, and it is the only
+thing it writes.
 
 `src/tools/` is where your own code goes. A `tool.*` in the composition may bind
 `module: ./src/tools/<name>.ts`, and `build` writes that file **once** — the
@@ -439,6 +450,17 @@ arrives as the **third argument** rather than through `process.env`: the values
 belong to the call, so nothing they hold reaches a later `exec:` child or a
 module running beside it, and `src/modules.ts` types the argument from the names
 the composition declared — a variable the YAML does not list does not compile.
+
+The **second** is the invocation context, and it carries what a host function's
+does. `context.signal` aborts when the node's `timeout:` budget runs out — the
+runtime races that deadline whether or not the implementation looks, so one that
+ignores it keeps running after the node it belonged to has failed, and whatever
+it returns is discarded. `context.idempotency_key` is set on exactly one call: a
+**detached** `map` dispatch that reached this tool as its sink, which is
+delivered at-least-once (grammar 9.4) and is the one delivery a sink has to
+dedupe. It is absent everywhere else, where a repeated call is what the
+composition asked for — and that same call is the one whose `signal` is not the
+map node's, because a detached delivery is off that node's clock.
 
 You edit those files **in the project** — beside `main.yml`, where the `module:`
 path is resolved. A build copies each one it references into this directory at
@@ -1656,6 +1678,40 @@ model.default:
                 "the section sits with the rest of what the project does"
             );
         }
+    }
+
+    /// The README's Layout table and [`crate::codegen::EMITTED_PATHS`] are one
+    /// list, in both directions.
+    ///
+    /// That table is **normative** in the emitted project rather than a summary
+    /// of it: the paragraph under it says "the file list above is the boundary",
+    /// so a reader decides whether a file is theirs by looking for its name
+    /// there. A row missing for a name the build replaces tells the owner of a
+    /// `package.json` they edited that it is theirs, right up until the next
+    /// build overwrites it; a row with nothing behind it promises a file the
+    /// project does not have. Neither is visible to a golden diff, which shows
+    /// what the README says and never what the emitter does — which is why this
+    /// reads the table back rather than trusting a reviewer to.
+    #[test]
+    fn the_readme_documents_every_emitted_file() {
+        let contents = readme_of(&ir_of("version: \"0.1\"\n")).contents;
+        let below = contents
+            .split_once("## Layout")
+            .expect("the layout table has a heading")
+            .1;
+        let table = below.split_once("\n## ").map_or(below, |(above, _)| above);
+        let listed: std::collections::BTreeSet<&str> = table
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `"))
+            .filter_map(|row| row.split_once('`'))
+            .map(|(path, _)| path)
+            .collect();
+        let emitted: std::collections::BTreeSet<&str> =
+            crate::codegen::EMITTED_PATHS.iter().copied().collect();
+        assert_eq!(
+            listed, emitted,
+            "the README's layout table and the file list `build` replaces disagree"
+        );
     }
 
     /// The two pin tables and the README's table are one list. A dependency

@@ -13,6 +13,10 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 
 | path | what it holds |
 |---|---|
+| `.gitignore` | the three things a checkout of this directory leaves out: the install artifact, the `.env` the spec deliberately never contains, and the data this project's own stores keep |
+| `README.md` | this file |
+| `package.json` | the dependency set, each package pinned to the version this compiler release was built against — plus whatever a `module:` binding declared under `dependencies:` — the `typecheck` script, and the Node floor |
+| `tsconfig.json` | the type checker's settings: strict, `noEmit`, and the `.ts` import extensions both supported runtimes resolve |
 | `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, which files here the compiler did not write, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
 | `src/artifact.ts` | what this tree **is**: a content hash over its own files — the emitted ones and the authored ones the composition references — the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
@@ -80,15 +84,22 @@ compile time, which is what keeps this directory committable and free of
 credentials.
 
 **The file list above is the boundary.** `agent-compose build` replaces exactly
-the files in that table and nothing else in this directory is written, removed,
-or reported. A `node_modules/`, a lockfile, a `.env` — and any TypeScript you
-wrote that the composition does not reference — are yours, wherever they sit.
-`src/` is not a compiler-only directory: what makes a file the compiler's is
-being on that list.
+the files in that table — every one of them, `package.json` and this README
+included — plus a copy of each implementation the composition references, which
+is the section below. Nothing else in this directory is written, removed, or
+reported. A `node_modules/`, a lockfile, a `.env` — and any TypeScript you wrote
+that the composition does not reference — are yours, wherever they sit. `src/` is
+not a compiler-only directory, and the root is not a yours-only one: what makes a
+file the compiler's is being on that list.
 
-Every file the compiler replaces carries the header above, which is how it tells
-its own work from yours: a `build` into a directory holding none of its files
-refuses rather than overwriting what is there.
+Every file the compiler **generates** carries the header above, which is how it
+tells its own work from yours: a `build` into a directory holding none of its
+files refuses rather than overwriting what is there, naming the ones it would
+have replaced. A build writes one other kind of file here and it carries no
+header — a copy of an implementation you wrote, which the section below is
+about — so the two sentences are one rule: what a build writes is the table
+above plus the authored files the composition references, and it is the only
+thing it writes.
 
 `src/tools/` is where your own code goes. A `tool.*` in the composition may bind
 `module: ./src/tools/<name>.ts`, and `build` writes that file **once** — the
@@ -104,6 +115,17 @@ arrives as the **third argument** rather than through `process.env`: the values
 belong to the call, so nothing they hold reaches a later `exec:` child or a
 module running beside it, and `src/modules.ts` types the argument from the names
 the composition declared — a variable the YAML does not list does not compile.
+
+The **second** is the invocation context, and it carries what a host function's
+does. `context.signal` aborts when the node's `timeout:` budget runs out — the
+runtime races that deadline whether or not the implementation looks, so one that
+ignores it keeps running after the node it belonged to has failed, and whatever
+it returns is discarded. `context.idempotency_key` is set on exactly one call: a
+**detached** `map` dispatch that reached this tool as its sink, which is
+delivered at-least-once (grammar 9.4) and is the one delivery a sink has to
+dedupe. It is absent everywhere else, where a repeated call is what the
+composition asked for — and that same call is the one whose `signal` is not the
+map node's, because a detached delivery is off that node's clock.
 
 You edit those files **in the project** — beside `main.yml`, where the `module:`
 path is resolved. A build copies each one it references into this directory at

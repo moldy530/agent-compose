@@ -3164,9 +3164,12 @@ reject either.
 **Delivery surface.** How the key reaches the sink is fixed per binding kind, so
 sinks can be written against a stable contract: an `http:`-bound target receives
 it as the `Idempotency-Key` request header; an `exec:`-bound target receives it
-as the `IDEMPOTENCY_KEY` environment variable; a `function:`-bound target
-receives it as the `idempotency_key` field of its invocation context. The key is
-delivery metadata, never part of the target's declared input schema.
+as the `IDEMPOTENCY_KEY` environment variable; a `function:`-bound and a
+`module:`-bound target each receive it as the `idempotency_key` field of the
+invocation context they are called with — one surface for the two bindings that
+run in the graph's own process, because a call in this process has a context to
+put it on and needs no wire to carry it. The key is delivery metadata, never part
+of the target's declared input schema.
 
 **Where a key is observable.** Both carriers record theirs in the run's trace —
 a dispatch record's `idempotencyKey` and a store record's — which is the one
