@@ -110,6 +110,26 @@ provider it names, and `validate` and `build` need none.
 nothing to look up, and always in step with the compiler you are holding.
 `agent-compose explain <code>` expands any diagnostic code a report carried.
 
+### Code you write by hand
+
+Most of a composition is declarative, and where it is not, a `tool.*` can bind a
+TypeScript file in the emitted project:
+
+```yaml
+tool.sign:
+  description: Sign a payload.
+  input:  { payload: { type: string } }
+  output: { signature: { type: string } }
+  module: ./src/tools/sign.ts
+```
+
+`build` writes that file **once** — the typed signature, the contract as a doc
+comment, a body that throws — and never writes it again. It overwrites and
+`--check`s only the files it emits, so your implementation sits in the same tree
+with no marker comments and nothing to merge; the tool's declared `input:` and
+`output:` are the contract, and `tsc` is what holds you to it. See
+`agent-compose docs tools`.
+
 ### With a coding agent
 
 ```sh

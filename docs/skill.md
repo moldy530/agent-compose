@@ -138,7 +138,13 @@ normative text.
   `agent-compose docs routing`, `agent-compose docs state`, and
   `agent-compose docs maps`.
 - **Do not hand-edit generated code.** It is a build artifact; `build --check`
-  in CI is what keeps the spec the source of truth.
+  in CI is what keeps the spec the source of truth. The code you *do* write by
+  hand goes in a file of its own: a `tool.*` may bind `module: ./src/tools/<name>.ts`,
+  and `agent-compose build main.yml` scaffolds that file once — typed signature,
+  contract, a body that throws — and never writes it again. `build` overwrites
+  and `--check`s only the files it emits, so your implementation lives in the
+  same tree with nothing to merge. `agent-compose docs tools` has the rules,
+  including the `env:` and exactly-pinned `dependencies:` a module declares.
 - **Never put a credential in a spec.** Where a secret may come from is a rule
   the compiler enforces rather than a convention you can keep by being careful;
   `agent-compose docs models` is where it is written.
