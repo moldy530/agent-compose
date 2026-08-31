@@ -781,9 +781,10 @@ contract on the wire.
 below rewritten: the dispatch ended with a result, so idempotency by
 `dispatch_id` is unchanged, a re-posted paused result is `204`, and a paused
 result for a dispatch the hub superseded is `409`. The **session is free** the
-moment it posts one, and may be dispatched other work while a person thinks — a
-worker gone between the pause and the answer therefore costs the execution
-nothing.
+moment it posts one, and may be dispatched other work while a person thinks — so
+a worker gone between the pause and the answer costs the execution nothing while
+the question is open, and costs it only the wait for a replacement once the
+answer arrives, which is the dispatching node's own budget and is below.
 
 What the hub does with it is the ordinary discipline and no new mechanism: it
 plants the wait on the existing board under the identity above (a third kind of
