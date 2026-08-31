@@ -862,8 +862,20 @@ function remote(fields = {}) {
   };
 }
 
-/** When this hub took the pause, which is what its budget is spent from. */
-const now = () => new Date().toISOString();
+/**
+ * The hub's writer, as `./mesh.ts`'s `answered` hands one in: what a local
+ * pause's `slot.keep` is, for a wait a worker opened.
+ *
+ * `wrote` is appended to inside the settlement and the promise's continuation
+ * appends to it after, so the order of the two is the reading that says the
+ * record was written **before** the answer was acknowledged
+ * (`docs/durability.md` §3.4).
+ */
+function writer(wrote) {
+  return (record) => {
+    wrote.push({ kept: record });
+  };
+}
 
 // The hub reads the contract off its own copy of the descriptor rather than off
 // anything that travelled (§4.3), which is what this registration is. Three
@@ -885,7 +897,17 @@ runtime.registerHumanNodes({
   const execution = "exec_remote_answered";
   runtime.openHumanWaits(execution, true);
   const pause = remote();
-  const held = outcomeOf(runtime.holdRemotePause(execution, pause, now()));
+  // The two events whose **order** is the durability rule: the record reaching
+  // the hub's writer, and the promise the resume route's `202` is answered off
+  // resolving. A record written in a later turn of the loop is one a process
+  // killed in between never wrote, and the person is asked again on the restart.
+  const wrote = [];
+  const promise = runtime.holdRemotePause(execution, pause, writer(wrote));
+  const held = outcomeOf(promise);
+  void promise.then(
+    () => wrote.push({ resolved: true }),
+    () => wrote.push({ rejected: true }),
+  );
   await settle();
   const published = runtime.humanWaits(execution);
   // A payload the node's `output:` refuses does **not** consume the wait.
@@ -910,6 +932,10 @@ runtime.registerHumanNodes({
   seen.settled = held.state;
   seen.record = held.value;
   seen.waiting_after_the_answer = runtime.humanWaits(execution).length;
+  // What the writer was handed, and when: the record itself, and before the
+  // promise the answer is acknowledged off resolved.
+  seen.wrote = wrote.map((event) => (event.kept === undefined ? "resolved" : "kept"));
+  seen.written_record = wrote.find((event) => event.kept !== undefined)?.kept;
   // …and a **second** answer is refused, exactly as a local pause's is: a wait
   // is settled once, and a delivery that re-settled one would journal a second
   // `human` record over an answer somebody already gave.
@@ -922,19 +948,27 @@ runtime.registerHumanNodes({
 }
 
 {
-  // The budget is the **composition's**, spent from the instant this hub took
-  // the pause: `descriptor.timeoutMs`, not the wire's `expiresAt`.
+  // The budget is the **composition's**, spent from the moment this hub plants
+  // the wait: `descriptor.timeoutMs`, not the wire's `expiresAt`.
   const execution = "exec_remote_expired";
   runtime.openHumanWaits(execution, true);
+  const wrote = [];
   const held = outcomeOf(
     runtime.holdRemotePause(
       execution,
       remote({ node: "decide", expiresAt: new Date(Date.now() + 30).toISOString() }),
-      now(),
+      writer(wrote),
     ),
   );
   await until(() => held.state !== "pending");
-  observed.remote_expired = { settled: held.state, record: held.value };
+  observed.remote_expired = {
+    settled: held.state,
+    record: held.value,
+    // An expiry is journaled through the same writer, and it has to be: a run
+    // that took `on_timeout:` past a wait whose expiry the journal does not hold
+    // would re-park on the resume and spend the budget again.
+    written_record: wrote.find((event) => event.kept !== undefined)?.kept,
+  };
   runtime.releaseHumanWaits(execution);
 }
 
@@ -951,7 +985,7 @@ runtime.registerHumanNodes({
     node: "confirm",
     expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
   });
-  const held = outcomeOf(runtime.holdRemotePause(execution, pause, now()));
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
   await settle();
   const seen = { settled_while_the_budget_runs: held.state };
   // …and the instant a reader is shown is still the pause's own
@@ -966,21 +1000,30 @@ runtime.registerHumanNodes({
 }
 
 {
-  // The other end of the same rule: a budget this hub has **already** spent
-  // expires on the next tick rather than never. A restarted hub re-derives a
-  // wait it took ten minutes ago from the settled row's own instant, so what it
-  // re-arms is what is left of a minute — here, nothing.
-  const execution = "exec_remote_spent";
+  // **Planting the wait is what arms it, every time it is planted.** A hub that
+  // re-derives an unanswered pause after a restart calls this function again,
+  // and what it gets is the node's whole `timeout:` — the same thing a resumed
+  // generation gives a local wait it re-parks (`docs/durability.md` §5), which
+  // is what PRD resolved q46's parity bar asks for. There is no instant to pass:
+  // the signature carries no elapsed time, so no caller can spend a
+  // predecessor's. Driven here as the second planting of one wait identity: the
+  // first runs out its short budget, the second is given the whole of it again.
+  const execution = "exec_remote_replanted";
   runtime.openHumanWaits(execution, true);
-  const held = outcomeOf(
-    runtime.holdRemotePause(
-      execution,
-      remote({ node: "confirm" }),
-      new Date(Date.now() - 600_000).toISOString(),
-    ),
-  );
-  await until(() => held.state !== "pending");
-  observed.remote_spent = { settled: held.state, record: held.value };
+  const pause = remote({ node: "decide" });
+  const first = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  await until(() => first.state !== "pending");
+  const replanted = Date.now();
+  const again = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  await until(() => again.state !== "pending");
+  observed.remote_replanted = {
+    first: first.state,
+    replanted: again.state,
+    // How long the **second** planting lasted, in whole milliseconds. A budget
+    // that carried its predecessor's spending would have run out on the next
+    // tick; the node declares thirty milliseconds and the second wait gets them.
+    lasted: Date.now() - replanted,
+  };
   runtime.releaseHumanWaits(execution);
 }
 
@@ -988,21 +1031,21 @@ runtime.registerHumanNodes({
   // The two settlements that are the run's own shape, not the composition's.
   const abandoned = "exec_remote_abandoned";
   runtime.openHumanWaits(abandoned, true);
-  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote(), now()));
+  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote(), () => {}));
   await settle();
   runtime.releaseHumanWaits(abandoned);
   await settle();
 
   const withdrawn = "exec_remote_withdrawn";
   runtime.openHumanWaits(withdrawn, true);
-  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote(), now()));
+  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote(), () => {}));
   await settle();
   runtime.closeHumanWaits(withdrawn);
   await settle();
 
   const unanswerable = "exec_remote_unanswerable";
   runtime.openHumanWaits(unanswerable, false);
-  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote(), now()));
+  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote(), () => {}));
   await settle();
 
   observed.remote_unsettled = {

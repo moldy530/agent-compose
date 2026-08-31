@@ -148,9 +148,10 @@ mod tests {
         );
     }
 
-    /// A placed pause's budget is spent on the **hub's** clock, off the
-    /// composition's own `timeout:` (`docs/distributed.md` §3.4, PRD resolved
-    /// q46).
+    /// A placed pause's budget is the composition's own `timeout:`, spent from
+    /// the moment the wait goes on the hub's board — the same number and the
+    /// same instant an unplaced pause's is (`docs/distributed.md` §3.4, PRD
+    /// resolved q46).
     ///
     /// `expires_at` travels because a reader of the execution has to see the
     /// wait the way the process that opened it recorded it (`docs/durability.md`
@@ -158,22 +159,95 @@ mod tests {
     /// one's. A timer armed off it would give a `timeout: 5m` node no time at
     /// all on a worker ten minutes behind and a quarter of an hour on one ten
     /// minutes ahead, while the same node unplaced always gets five minutes. So
-    /// the wire's instant is displayed and the descriptor's budget is armed,
-    /// spent from the instant this hub took the pause. Pinned as a grep because
-    /// the alternative is a test that has to move two machines' clocks apart;
-    /// `tests/toolchain/human-waits.mjs` drives the behaviour.
+    /// the wire's instant is displayed and the descriptor's budget is armed.
+    ///
+    /// **And it is armed whole, every time the wait is planted**, which is the
+    /// half a restart decides: a hub that re-derives an unanswered pause plants
+    /// it again, exactly as a resumed generation re-parks a local wait nobody
+    /// answered, and spending a predecessor's elapsed time out of the budget
+    /// would make "how long do I have" an answer a deploy file decides — which
+    /// q46's parity bar does not allow. Pinned as a grep because the alternative
+    /// is a test that has to move two machines' clocks apart;
+    /// `tests/toolchain/human-waits.mjs` drives the behaviour, and
+    /// `distributed_hub_wire.rs` drives the restart over real processes.
     #[test]
-    fn a_remote_pauses_budget_is_the_compositions_and_is_spent_on_this_hubs_clock() {
+    fn a_remote_pauses_budget_is_the_compositions_and_is_armed_whole_whenever_it_is_planted() {
+        let held = function_body("export async function holdRemotePause(");
+        let local = function_body("export async function runHuman(");
+        let armed =
+            "timer = setTimeout(() => settle(\"expired\", undefined), descriptor.timeoutMs);";
         assert!(
-            SOURCE.contains("const left = Math.max(0, descriptor.timeoutMs - spent);"),
-            "a pause a worker opened is not armed off the node's own `timeout:`"
+            local.contains(armed),
+            "the unplaced arming this one is held to has moved, so the two are no longer the same \
+             line: {local}"
         );
         assert!(
-            !SOURCE.contains("Date.parse(remote.expiresAt)"),
+            held.contains(armed),
+            "a pause a worker opened is armed with something other than the node's own \
+             `timeout:`, whole, from the moment the wait is planted: {held}"
+        );
+        assert!(
+            !held.contains("remote.expiresAt) -") && !held.contains("Date.parse(remote.expiresAt)"),
             "a wait's budget is armed off an instant another machine's clock stamped, so clock \
              skew between a hub and a worker shortens or lengthens a `timeout:` the same node \
-             unplaced would honour exactly"
+             unplaced would honour exactly: {held}"
         );
+        assert!(
+            !held.contains("descriptor.timeoutMs -"),
+            "a re-derived pause is armed with what is left of a predecessor's budget rather than \
+             with the node's own, so a hub restart costs a person time the same wait unplaced \
+             would have given them (PRD resolved q46): {held}"
+        );
+    }
+
+    /// The answer to a pause a worker opened is journaled **inside** the
+    /// settlement, where a local pause's is (`docs/durability.md` §3.4).
+    ///
+    /// [`runHuman`]'s `slot.keep` runs before its promise resolves, and the
+    /// reason is stated at length there: the resume route answers `202` off the
+    /// settlement, so a record written in a later turn of the event loop is one
+    /// a process killed in between never wrote — leaving a wait this board has
+    /// settled with nothing in the journal, which the next start re-derives off
+    /// the settled dispatch row and asks a second time. The hub's writer is
+    /// handed in as `keep` for exactly that ordering, and a write that throws
+    /// fails the node rather than hanging it.
+    #[test]
+    fn a_remote_pauses_answer_is_journaled_before_its_promise_resolves() {
+        let held = function_body("export async function holdRemotePause(");
+        let kept = held
+            .find("keep(settled);")
+            .expect("`holdRemotePause` writes the record through the caller's `keep`");
+        let resolved = held
+            .find("resolve(settled);")
+            .expect("`holdRemotePause` resolves with the record it wrote");
+        assert!(
+            kept < resolved,
+            "the record is written after the promise resolves, so the `202` the resume route \
+             answers can precede the write it acknowledges: {held}"
+        );
+    }
+
+    /// The body of one top-level declaration of the runtime.
+    ///
+    /// The same reader `codegen::mesh` and `codegen::serve` use, for the same
+    /// reason: a rule about what one function does is only a rule if it is read
+    /// off that function rather than off the file around it. The module is
+    /// formatted, so a top-level declaration opens at column zero and closes on
+    /// a line that is exactly `}`.
+    fn function_body(header: &str) -> String {
+        let mut lines = SOURCE.lines().skip_while(|line| !line.starts_with(header));
+        let opened = lines
+            .next()
+            .unwrap_or_else(|| panic!("`src/runtime.ts` declares `{header}…`"));
+        let mut held = String::from(opened);
+        for line in lines {
+            held.push('\n');
+            held.push_str(line);
+            if line == "}" {
+                return held;
+            }
+        }
+        panic!("`{header}…` has no closing brace in the first column")
     }
 
     /// The runtime is the same bytes for every composition: a project that

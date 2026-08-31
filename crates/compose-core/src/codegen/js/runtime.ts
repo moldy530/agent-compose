@@ -8138,23 +8138,30 @@ export async function runHuman(
  * at all on a worker ten minutes behind this hub, and a quarter of an hour on
  * one ten minutes ahead. What is armed is therefore `descriptor.timeoutMs` — the
  * composition's own budget, which is the same number the worker computed its
- * instant from — spent from `since`, an instant on **this** hub's clock: the
- * moment this process took the pause. A hub restarted mid-wait passes the
- * settled dispatch row's `settled_at`, so the budget keeps running across the
- * restart rather than starting again, and both readings stay on one clock.
+ * instant from — from the moment the wait goes on **this** board, which is the
+ * only instant a local pause's budget is ever spent from either. A hub that
+ * re-derives an unanswered pause after a restart plants it again and arms it
+ * again, exactly as a resumed generation re-parks a local wait: PRD resolved q46
+ * says a placed `human:` node means what the same node unplaced means, and "how
+ * long do I have" is not a dimension a deploy file may answer differently.
  *
- * Answers the record the hub journals: exactly the `JournaledWait` a local pause
- * writes through `slot.keep`, so the redispatch's `effect_history` hands the
- * worker a record its own replay consumes at the very claim that paused
- * ([`runHuman`]'s replay branch). The two settlements a *composition* declared
- * resolve; the two that are the run's own shape reject, exactly as they do for a
- * local pause — an abandoned wait unwinds the task, and a withdrawn answer
- * surface is a [`HumanInterrupt`].
+ * Answers the record the hub journals — through `keep`, the caller's writer,
+ * called **inside** the settlement for the reason [`runHuman`]'s own `slot.keep`
+ * is: a run that went on from a wait its own record does not hold would ask the
+ * person again on its next resume (`docs/durability.md` §3.4), so the write
+ * happens before the promise resolves and a write that throws fails the node
+ * rather than the wait. What it is handed is exactly the `JournaledWait` a local
+ * pause writes, so the redispatch's `effect_history` hands the worker a record
+ * its own replay consumes at the very claim that paused ([`runHuman`]'s replay
+ * branch). The two settlements a *composition* declared resolve; the two that
+ * are the run's own shape reject, exactly as they do for a local pause — an
+ * abandoned wait unwinds the task, and a withdrawn answer surface is a
+ * [`HumanInterrupt`].
  */
 export async function holdRemotePause(
   execution: string,
   remote: RemotePause,
-  since: string,
+  keep: (settled: JournaledWait) => void,
 ): Promise<JournaledWait> {
   const address = `${remote.flow}.${remote.node}`;
   const descriptor = humanNodes.get(address);
@@ -8208,20 +8215,43 @@ export async function holdRemotePause(
       // Told before the promise settles, so a deadline the dispatching node has
       // been holding still is running again by the time the redispatch is made.
       announce(execution);
-      if (outcome === "resumed") {
-        resolve({
-          ...instants,
-          settled: "resumed",
-          output: value,
-          settledAt: stopped(outcome).settledAt,
-        });
-      } else if (outcome === "expired") {
-        // Journaled as an expiry and **routed by the node**, not here: the
-        // redispatch replays this record, and `runHuman` raises the
+      if (outcome === "resumed" || outcome === "expired") {
+        // **Written before the promise resolves**, which is where [`runHuman`]
+        // writes a local pause's record and for the same reason: the caller of
+        // this promise answers the person `202` and the route returns, so a
+        // record appended after it is one a process killed in between never
+        // wrote — leaving a wait this board has settled, with nothing in the
+        // journal, which the next start re-derives off the settled dispatch row
+        // and asks a second time (`docs/durability.md` §3.4).
+        //
+        // An expiry is journaled the same way and **routed by the node**, not
+        // here: the redispatch replays this record, and `runHuman` raises the
         // [`HumanExpiry`] carrying the composition's own `on_timeout:` route
         // (grammar 8.7). That is the parity — the expiry of a placed pause is
         // decided by the same line of the same function as an unplaced one's.
-        resolve({ ...instants, settled: "expired", settledAt: stopped(outcome).settledAt });
+        const settled: JournaledWait =
+          outcome === "resumed"
+            ? {
+                ...instants,
+                settled: "resumed",
+                output: value,
+                settledAt: stopped(outcome).settledAt,
+              }
+            : { ...instants, settled: "expired", settledAt: stopped(outcome).settledAt };
+        try {
+          keep(settled);
+        } catch (error) {
+          // [`runHuman`]'s rule at its own `slot.keep`, which this arm is the
+          // other half of: the wait is already marked settled, so a throw that
+          // escaped would leave a promise nothing can ever settle and a node
+          // that never returns. It travels as the node's failure instead — the
+          // journal could not record what the person said, and a run that went
+          // on from a wait its own record does not hold is one whose resume
+          // would ask them again.
+          reject(error);
+          return true;
+        }
+        resolve(settled);
       } else if (outcome === "interrupted") {
         reject(new HumanInterrupt(remote.flow, remote.node, remote.wait, opened));
       } else {
@@ -8239,16 +8269,19 @@ export async function holdRemotePause(
     announce(execution);
 
     if (descriptor.timeoutMs !== undefined) {
-      // The **composition's** budget, spent from the moment this hub took the
-      // pause, on this hub's clock — see the note above on why the wire's
-      // `expires_at` is a fact to display and not a timer to arm. `since` is
-      // this process's own instant either way: the settlement it just took, or
-      // the settled row's `settled_at` when a restarted hub re-derives the wait,
-      // so a budget already spent expires on the next tick rather than never.
-      const took = Date.parse(since);
-      const spent = Number.isNaN(took) ? 0 : Math.max(0, Date.now() - took);
-      const left = Math.max(0, descriptor.timeoutMs - spent);
-      timer = setTimeout(() => settle("expired", undefined), left);
+      // The **composition's** budget, from the moment the wait goes on this
+      // board — the same line, the same number and the same instant as
+      // [`runHuman`]'s own timer, which is what parity means here. See the note
+      // above on why the wire's `expires_at` is a fact to display and not a
+      // timer to arm.
+      //
+      // **A restart re-arms it whole**, because the hub re-derives an unanswered
+      // pause by planting it again and this is the planting: a local wait nobody
+      // answered is re-parked with a fresh budget (`docs/durability.md` §5), and
+      // a placed one that spent its predecessor's budget instead would answer
+      // "how long do I have" differently for the same node under two deploy
+      // files — which PRD resolved q46 does not allow a placement to decide.
+      timer = setTimeout(() => settle("expired", undefined), descriptor.timeoutMs);
       if (typeof (timer as { unref?: () => void }).unref === "function") {
         (timer as { unref: () => void }).unref();
       }

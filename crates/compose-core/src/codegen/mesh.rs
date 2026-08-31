@@ -210,6 +210,12 @@ mod tests {
     /// node's slot, where that node's replay claims it and raises a divergence
     /// the offending session's execution can never absorb. Both readers of the
     /// wire are checked, since the effects route writes keys the same way.
+    ///
+    /// **The ordinal is a fourth**, and the one the key check cannot see: a key
+    /// derives faithfully from whatever ordinal travelled beside it, so an
+    /// answer journaled at an ordinal the redispatched node's own claim will
+    /// never reach is a question a person has already answered and the node asks
+    /// again.
     #[test]
     fn a_paused_result_may_not_name_a_node_its_dispatch_does_not_hold() {
         let read = function_body("function pauseOf(");
@@ -223,6 +229,13 @@ mod tests {
             read.contains("key !== effectKey(site, \"human\", ordinal)"),
             "a paused settlement is read without holding its effect `key` to the site and ordinal \
              beside it, so a session could journal its answer under another node's key: {read}"
+        );
+        assert!(
+            read.contains("ordinal !== claimedHumanOrdinal(journal, row.execution, site)"),
+            "a paused settlement is read without holding its `ordinal` to the one the \
+             redispatched node will claim at that site — and the key check above derives from \
+             whatever ordinal travelled, so it cannot see it: the answer would be journaled at a \
+             key nothing ever reads back, and the person would be asked again: {read}"
         );
         let batch = function_body("function recordOf(");
         assert!(

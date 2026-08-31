@@ -414,9 +414,11 @@ opened, the hub plants that wait on its own board and journals the answer *here*
 under the effect key the worker's own recorder claimed — and the node re-enters
 dispatch, so the redispatch's `effect_history` carries this record and the replay
 above is what consumes it. Every rule of this section reaches it unchanged,
-because it is the same record: all three instants are the pause's own, an
-unsettled wait records nothing and is re-derived, and a settlement the journal
-cannot record fails the node.
+because it is the same record: its three instants are the wait's own rather than
+the reading generation's — when the execution asked, when the generation holding
+the question would have stopped waiting, and when it stopped — an unsettled wait
+records nothing and is re-derived, and a settlement the journal cannot record
+fails the node.
 
 This is the record that makes §1 concrete. `docs/trace.md` §11 says outright
 that what a human answered "is not here"; it is here.
@@ -754,16 +756,15 @@ the instants the recording generation measured (§3.4). A backoff's jitter is
 re-rolled. None of it changes what an effect answers, and a recorded effect is
 answered out of the record whatever the clock says.
 
-One wait re-parks with **what is left** of its budget rather than with a fresh
-one, and it is the one the journal can date: a pause a worker settled its
-dispatch with (`docs/distributed.md` §3.4) is on the dispatch row, so a hub that
-re-derives it knows when it took the question and spends the node's `timeout:`
-from there. A local pause has no such row — nothing is journaled for a wait
-nobody answered — so there is nothing to measure from and the budget starts
-again. The two differ in what a restart costs a person's remaining time, and in
-nothing else: same budget, same route, same record. It is the one named
-divergence between a placed `human:` node and an unplaced one, and
-`docs/distributed.md` §3.4 states it as such.
+**Both kinds of wait re-park with a fresh budget**, including the one the journal
+could date. A pause a worker settled its dispatch with
+(`docs/distributed.md` §3.4) is on the dispatch row, so a hub that re-derives it
+*knows* when it took the question — and does not spend that on the timer: the
+wait is planted again, and planting is what arms it. A local pause has no such
+row and could not do otherwise. The two therefore cost a person's remaining time
+exactly the same, which is what PRD resolved q46 requires of them — "timeout,
+retry, on_error semantics … are the single-process ones" — and a restart is
+downtime nobody could have answered through, not budget somebody spent.
 
 What a resumed generation's clock can change is *whether* a deadline fires, and
 that is a change in the **shape** of the run rather than in the identity of any

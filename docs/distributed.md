@@ -662,31 +662,33 @@ and two machines' clocks disagree — so a hub that armed the wait's timer at
 `expires_at − now` would give a `timeout: 5m` node no time at all on a worker ten
 minutes behind it and a quarter of an hour on one ten minutes ahead, while the
 same node unplaced always gets five minutes. What the hub arms is the node's own
-`timeout:` out of its copy of the descriptor, spent from the instant it took the
-pause — the settled row's `settled_at`, so a restarted hub re-arms what is left
-rather than starting the budget again. Both readings are then on one clock, and a
-`timeout: 5m` node gets five minutes whichever machine asked the question, which
-is the parity q46 requires of a hub that stays up.
+`timeout:` out of its copy of the descriptor, from the moment the wait goes on
+its board — which is the only instant a local wait's budget is ever spent from
+either. Both readings are then on one clock, and a `timeout: 5m` node gets five
+minutes whichever machine asked the question, which is the parity q46 requires.
 
-**A restart is where the two stop being identical, and this document states the
-exception rather than leaving it to a diff.** A restarted hub re-derives a placed
-pause off its settled row, so it re-publishes the `paused_at` and `expires_at`
-its predecessor published and spends what is *left* of the budget. The same node
-unplaced has no such row — resolved q28 journals nothing for a wait nobody
-answered, so an unanswered local pause is re-parked from scratch — and its
-re-park stamps fresh instants and starts the budget again
-(`docs/durability.md` §5). A person answering a placed `timeout: 5m` pause four
-minutes into a restart has one minute left; unplaced, they have five. The placed
-half is the one durability asks for — §9's "a reader of the resumed document sees
-what the execution did, not what this process did" — and the gap does not close
-from the other side within this release: giving a local pause a budget to
-continue means journaling a wait nobody has answered, which is a change to
-*which sites are journaled at all* and so a `JOURNAL_VERSION` bump
-(`docs/durability.md` §11.3), not a wire question. So it is a single, named
-divergence from the parity bar, in the one dimension a record exists for on one
-side and not the other; everything else about the two waits — identity
-derivation, status shape, webhook kind, `on_timeout:` routing, resume payload
-validation — is the same code.
+**A restart re-arms it whole**, because a restarted hub re-derives a placed pause
+by *planting it again*: it publishes the `paused_at` its predecessor published
+(`docs/durability.md` §9 — a reader sees what the execution did) and gives the
+question the node's whole `timeout:` in front of it. That is what the same node
+unplaced does, for the same reason it does it: an unanswered local pause journals
+nothing (resolved q28), so a resumed generation re-parks it from scratch and its
+budget starts again (`docs/durability.md` §5). Five minutes after a restart, a
+`timeout: 5m` pause has the same time left on either side of the wire, and "how
+long do I have" is not a question a deploy file gets to answer. The hub *knows*
+when it took the pause — the settled row is dated — and does not spend that
+knowledge on the budget; a wait no process was holding is a wait nobody could
+have answered, and charging it to the person would be charging them for the
+downtime.
+
+`expires_at` moves with the arming, and only there. A deadline a reader is shown
+has to be the deadline that fires, so a re-derived wait publishes the budget's
+end as *this* generation measures it — the pair the pause carried gives the
+budget exactly, both instants being one worker clock — rather than an instant an
+outage longer than the budget has already passed, which would show a question as
+expired while the resume surface still takes its answer. `paused_at` does not
+move: when the execution asked is a fact about the run, and the placed pause is
+the only wait that still has it after a restart.
 
 `effect` is the
 journal record the **answer** will be written under, exactly as the worker's own
@@ -764,10 +766,11 @@ same line of the same function an unplaced pause's expiry is decided by.
 **A hub restart between the pause and the answer costs nothing**, because the
 pause is journaled: the settled row carries it, and the replay that re-reaches
 the node re-derives the wait onto the new process's board — under the identity
-and the instants its predecessor published, and with what is left of its budget,
-which is the one place a placed pause and an unplaced one part company (above) —
-unless the answer's record is already in the journal, in which case the wait is
-over and the redispatch is what replays past it.
+and the `paused_at` its predecessor published, and with the node's whole
+`timeout:` in front of it and a deadline that says so, exactly as a resumed
+generation re-parks a local wait nobody answered (above) — unless the answer's
+record is already in the journal, in which case the wait is over and the
+redispatch is what replays past it.
 
 This is a change an older peer would misread — a `1` peer sees a result with no
 `output` and reads it as a node that answered nothing — so `PROTOCOL_VERSION` is

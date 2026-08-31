@@ -1643,9 +1643,13 @@ fn a_placed_pause_that_runs_out_of_time_takes_its_on_timeout_route_on_a_worker()
 ///
 /// The pause is journaled — it is what settled the dispatch — so the process
 /// that replaces this one re-derives the wait rather than remembering it, under
-/// the identity and the instants its predecessor published. That is the same
+/// the identity and the `paused_at` its predecessor published. That is the same
 /// discipline every other open wait is recovered by, reaching the one kind of
 /// wait that was opened in another process entirely.
+///
+/// The wait this flow opens declares no `timeout:`, so nothing here is about a
+/// budget; `distributed_hub_wire.rs` is where the re-derived budget and the
+/// deadline published beside it are asserted.
 #[test]
 fn a_placed_pause_is_re_derived_by_a_hub_restarted_before_the_answer() {
     let Some(mut mesh) = Mesh::start() else {

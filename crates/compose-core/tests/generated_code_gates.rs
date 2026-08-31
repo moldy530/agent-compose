@@ -1857,6 +1857,22 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
         observed["remote_answered"]["record"]["settledAt"].is_string(),
         "the record does not say when the wait stopped waiting: {observed}"
     );
+    // **The hub's writer is handed the record inside the settlement**, before the
+    // promise the resume route answers `202` off resolves — which is where
+    // `runHuman` calls `slot.keep` and for its reason: a record written in a
+    // later turn of the loop is one a process killed in between never wrote, and
+    // the next start re-derives the pause off the settled dispatch row and asks
+    // the person a second time (`docs/durability.md` §3.4).
+    assert_eq!(
+        observed["remote_answered"]["wrote"],
+        json!(["kept", "resolved"]),
+        "the answer to a pause a worker opened is journaled after the promise it is acknowledged \
+         off resolves: {observed}"
+    );
+    assert_eq!(
+        observed["remote_answered"]["written_record"], observed["remote_answered"]["record"],
+        "the record handed to the hub's writer is not the one the node goes on with: {observed}"
+    );
     assert_eq!(
         observed["remote_answered"]["waiting_after_the_answer"],
         json!(0)
@@ -1888,6 +1904,11 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
         observed["remote_expired"]["record"].get("output").is_none(),
         "an expired wait recorded an answer nobody gave: {observed}"
     );
+    assert_eq!(
+        observed["remote_expired"]["written_record"], observed["remote_expired"]["record"],
+        "an expiry is not journaled through the writer an answer is, so a run could take \
+         `on_timeout:` past a wait whose expiry the journal does not hold: {observed}"
+    );
 
     // **The budget is the composition's, and the clock is this hub's.** The
     // pause driven here carries an `expires_at` an hour in this process's past —
@@ -1913,13 +1934,22 @@ fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
         "the wait a worker opened publishes no `expiresAt`, so a surface showing it would have to \
          re-derive one: {observed}"
     );
-    // The other end of the same rule: a budget already spent expires at once
-    // rather than never, which is what a hub restarted late into a wait re-arms.
-    assert_eq!(observed["remote_spent"]["settled"], json!("resolved"));
-    assert_eq!(
-        observed["remote_spent"]["record"]["settled"],
-        json!("expired"),
-        "a wait whose budget ran out before this process took it stayed open for ever: {observed}"
+    // **The budget is armed whole every time the wait is planted**, which is the
+    // half a hub restart decides: a process that re-derives an unanswered pause
+    // plants it again, exactly as a resumed generation re-parks a local wait
+    // nobody answered (`docs/durability.md` §5) — and PRD resolved q46 does not
+    // let a placement decide "how long do I have". The second planting of one
+    // identity is what stands in for the restart here, and it lasts the node's
+    // own thirty milliseconds rather than the nothing its predecessor left.
+    assert_eq!(observed["remote_replanted"]["first"], json!("resolved"));
+    assert_eq!(observed["remote_replanted"]["replanted"], json!("resolved"));
+    let lasted = observed["remote_replanted"]["lasted"]
+        .as_i64()
+        .unwrap_or(-1);
+    assert!(
+        lasted >= 25,
+        "a re-planted wait lasted {lasted}ms of the thirty its node declares, so a hub restart \
+         spends a person's budget on the downtime it was not open for: {observed}"
     );
 
     // The two settlements that are the run's own shape rather than the
