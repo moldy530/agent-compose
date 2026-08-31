@@ -613,12 +613,19 @@ re-driving it from a stale result is exactly the divergence
 is §6.3: the hub gave up on the session this dispatch was issued to, and the node
 has been through its `retry:` chain since.
 
+A body that names **no** `dispatch_id` is the same row and takes the same `409`,
+with a `null` where the dispatch would be named. This route's table is four
+statuses and §10.1 lets an implementation rely on them, so a result that cannot
+be attributed at all is not answered outside it — unlike §3.3, where a batch that
+is not a batch has a `400` row of its own, because that route also refuses
+*contents* and this one has none to refuse.
+
 | condition | status | body |
 |---|---|---|
 | this result settles the dispatch, or a result already settled it | `204` | empty |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and post this result again under the new session |
-| the `dispatch_id` is unknown, or the hub superseded the dispatch (§6.3) | `409` | names the dispatch. The result is discarded |
+| the `dispatch_id` is unknown, missing, or the hub superseded the dispatch (§6.3) | `409` | names the dispatch, or `null` where the body named none. The result is discarded |
 
 **`410` and `409` are different failures and a worker MUST NOT treat them
 alike.** `410` says *the hub does not know you*, and the result is still owed:
@@ -1408,7 +1415,10 @@ What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
 provisioning cycle of §4, one held poll at a time with a node running beside it
 (§2), effect batches as they happen, results, §2's backoff for transport
 failures, and the status discipline of §3 and §5. It executes each dispatch by
-spawning the node runner the artifact carries, one process per dispatch.
+spawning the node runner the artifact carries, one process per dispatch. Its
+store is the artifact in hand and the one it replaced, keyed by hash as §4 step 3
+says: a hub rolled back to the older of the two is answered off the disk, and no
+third tree accumulates.
 
 What is **not** built, and is named rather than missing: per-placement artifact
 slicing (§4.3), multi-hub (§8), worker-to-worker edges and Windows workers
@@ -1433,13 +1443,14 @@ holds the worker to every status this document gives it, against a hub that is a
 fixture; and `crates/agent-compose/tests/distributed_mesh_acceptance.rs` runs a
 real hub and real workers and asks whether a distributed execution works — the
 steady state, a cold start, parking and wake, a mid-node disconnect and the
-replay that follows it, a hub restart, the refusals a worker stops on, and a
-fan-out queued onto a pool of one.
+replay that follows it, two hub restarts (one idle, one over a dispatch a worker
+is in the middle of running), the refusals a worker stops on, and a fan-out
+queued onto a pool of one.
 `crates/compose-core/tests/placement_surface_landing.rs` holds the surface to
 where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in
 `src/mesh.ts`, and neither in the composition's own lowering.
 
-**Five clauses of this document were amended while that runtime landed**, and
+**Six clauses of this document were amended while that runtime landed**, and
 they are listed here rather than left to a diff: a document the implementation
 edited is a document the implementation is measured against, so which sentences
 moved has to be as readable as the sentences are.
@@ -1459,6 +1470,11 @@ moved has to be as readable as the sentences are.
   `{ dispatch_id, effects }`, and the two refusals that follow from naming it.
   The dispatch is what tells the hub whose execution the records are and inside
   which instance path — §8's single writer, stated as a route.
+- **§3.4's `409` row**, which now covers a result body that names no
+  `dispatch_id` at all. That route's table gives four statuses and §10.1 lets an
+  implementation rely on them, so answering a fifth outside it would be a status
+  a second implementation could meet and act on wrongly — a `4xx` this document
+  does not give the route reads as a refusal, and a refusal ends a worker.
 - **§3.5's "an artifact it holds"**, which scopes a MUST that a hub of this
   release could not otherwise meet: it serves exactly one artifact, and the
   paragraph above says what that costs.
@@ -1466,10 +1482,11 @@ moved has to be as readable as the sentences are.
   manifest *and* to every placement that reaches a store bound to it, because the
   credential that opens a store is spent in whichever process opens it.
 
-None of the five changes what a peer may rely on at this version (§10.1), and
+None of the six changes what a peer may rely on at this version (§10.1), and
 none is a change §10.3 would bump for: the first is a relaxation, the second and
-third name shapes rather than replace them, and no implementation of protocol 1
-older than this release exists to be made wrong by any of them.
+third name shapes rather than replace them, the fourth moves a body nothing was
+promised a status for into a row it already had, and no implementation of
+protocol 1 older than this release exists to be made wrong by any of them.
 
 This document is what both halves are held to — **except the rows of §13**,
 which are the clauses it does not settle. Those are not wire this document fixes,
@@ -1505,10 +1522,14 @@ The first two are **gaps**: a knob nobody has weighed, filled here
 conservatively, where the wire admits any answer additively — so what the PRD
 owes each is a decision rather than a correction, and the runtime that landed was
 written to those defaults and no further. Their absences are held rather than
-remembered: `crates/compose-core/src/codegen/mesh.rs` greps the emitted hub for a
-capacity of any spelling and for a containment surface of any spelling, and fails
-if either appears. Raising a default is what needs the PRD; keeping one needs a
-test.
+remembered, and `crates/compose-core/src/codegen/mesh.rs` says exactly how far
+that holding reaches: it **pins** the emitted session to the four fields §5 gives
+it, so a capacity arriving under a spelling nobody has used yet is still a failing
+test, and it **greps** the hub's code for the spellings the two rows have arrived
+under before — `capacity`, `maxDispatches`, `max_dispatches` for the first;
+`sandbox`, `seccomp`, `restrictions` for the second. A grep is a floor rather
+than a proof, which is why the first row has the pin as well. Raising a default
+is what needs the PRD; keeping one needs a test.
 
 The last two are **sharp edges**: a composition this compiler accepts, and runs
 worse than its author would expect. Each is here because the repair is a rule —
