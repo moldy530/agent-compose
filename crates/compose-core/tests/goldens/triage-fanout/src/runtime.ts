@@ -7381,9 +7381,13 @@ export function quiescent(execution: string): boolean {
  * `parked` webhook is owed (§6.6, PRD resolved q34).
  *
  * It is a registry rather than a direct call for one reason: `./runtime.ts` is
- * the module `./mesh.ts` imports, so a call the other way would close a cycle —
- * and a project whose composition places nothing must not pay for the mesh at
- * all. [`pausesUnder`] stays untouched, because its **other** reader is
+ * the module `./mesh.ts` imports, so a call the other way would close a cycle.
+ * Every emitted `./graph.ts` imports the mesh — a composition that places
+ * nothing still releases through it when a flow ends — and what such a project
+ * gets from this is a counter over an empty board, which answers `0` and leaves
+ * quiescence exactly what it was before placements existed.
+ *
+ * [`pausesUnder`] stays untouched, because its **other** reader is
  * [`runActivity`]'s deadline, and a placement wait is time a node's `timeout:`
  * does count: §6.5 makes the chain run "from dispatch", so queueing behind a
  * busy pool is inside the budget where waiting for a human is not (D102).
@@ -7403,9 +7407,10 @@ const parkedCounters: ParkedWork[] = [];
 /**
  * Register one more kind of parked work, for [`quiescent`] to count.
  *
- * Called at module scope by `./mesh.ts`, so a project that imports the mesh has
- * placement waits counted and one that does not has exactly the behaviour it had
- * before placements existed.
+ * Called at module scope by `./mesh.ts`, whose counter is the only registrant
+ * an emitted project has: a target with no `placements:` holds no placement
+ * waits, so the counter answers `0` and quiescence is what it was before
+ * placements existed.
  */
 export function registerParkedWork(counter: ParkedWork): void {
   parkedCounters.push(counter);
