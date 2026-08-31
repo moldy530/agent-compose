@@ -34,6 +34,23 @@
 //! A runner that exits without a result line has not answered, and §3.4 takes
 //! "its output, or its failure": the failure this posts names the exit status,
 //! which is what a `retry:` on the hub then spends an attempt on (§7.3).
+//!
+//! # A body this hub will not take costs the dispatch, not the worker
+//!
+//! §3.3 and §3.4 each give their route a closed table, and every status in the
+//! two that is not `204` is handled by name here. What is left over is a `4xx`
+//! **outside** both tables — a `413` from a hub or an intermediary with a
+//! smaller ceiling than this worker's, a `431`, a proxy's own refusal — and it
+//! is the one place a refusal is *not* read the way §3.1 reads a refused join.
+//! §3.1's terminality is about the join, where "a second join would be refused
+//! identically" is a statement about this worker's right to be here at all; a
+//! body one hub would not take says nothing of the kind. So [`Unsent`] separates
+//! the two: a status this worker cannot act on fails **this dispatch**, under
+//! the node's own `retry:`/`on_error:` chain like any other failed attempt, and
+//! the placement keeps its worker. Ending the process instead would leave the
+//! placement with none — and the replacement would reach the same record and die
+//! the same way, so one oversized effect would be a mesh that never runs that
+//! node again.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -42,13 +59,34 @@ use std::process::{Child, Command, Stdio};
 use serde_json::{Value, json};
 
 use super::wire::{Answer, Hub};
-use super::{Sessions, Stop};
+use super::{Sessions, Stop, note};
+
+/// Why a `POST` this dispatch made did not go through.
+///
+/// The two are different in exactly one way and it is the only way that matters:
+/// how much they cost. See the module docs' last section.
+enum Unsent {
+    /// This **worker** is winding down — a redeployment, or a credential the hub
+    /// refused. Nothing more is sent, on this dispatch or any other.
+    Stop(Stop),
+    /// This **dispatch** is over: a status §3.3 or §3.4 does not give the route,
+    /// which no re-send improves and which says nothing about the worker.
+    Rejected(String),
+}
+
+impl From<Stop> for Unsent {
+    fn from(stop: Stop) -> Self {
+        Self::Stop(stop)
+    }
+}
 
 /// One dispatch, executed.
 ///
-/// Answers `Ok(())` when the dispatch was settled — or answered `409`, which is
-/// a dispatch this worker no longer owns and is equally over (§3.4) — and
-/// `Err(Stop)` when the worker itself must wind down.
+/// Answers `Ok(())` when this worker is done with the dispatch, whichever way it
+/// became done: settled, answered `409` — a dispatch this worker no longer owns,
+/// and equally over (§3.4) — or left with the hub after a result it would not
+/// take ([`settle`]). `Err(Stop)` is the worker itself winding down, and nothing
+/// else.
 pub(crate) fn execute(
     hub: &Hub,
     sessions: &Sessions,
@@ -75,16 +113,24 @@ pub(crate) fn execute(
         // problem and not the graph's — but it is still an attempt that did not
         // answer, and the hub is owed a result for the dispatch it handed over.
         Err(reason) => {
-            return sender.result(&json!({
-                "dispatch_id": id,
-                "error": { "name": "WorkerRunnerUnusable", "message": reason },
-            }));
+            return settle(
+                &mut sender,
+                &json!({
+                    "dispatch_id": id,
+                    "error": { "name": "WorkerRunnerUnusable", "message": reason },
+                }),
+            );
         }
     };
 
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut result: Option<Value> = None;
     let mut unreadable: Option<String> = None;
+    // Set where a batch met a status §3.3 does not give the route: the records
+    // are not in the journal and nothing this worker does will put them there,
+    // so the attempt fails rather than settling with an output whose effects the
+    // replay of §7.2 could not skip.
+    let mut rejected: Option<String> = None;
     // Set where this worker stops reading before the runner stops writing, which
     // is the one case the child has to be **killed** rather than waited on: a
     // process writing into a pipe nobody drains blocks for ever, and a `wait`
@@ -106,11 +152,16 @@ pub(crate) fn execute(
         match said.get("type").and_then(Value::as_str) {
             Some("effect") => {
                 let record = said.get("effect").cloned().unwrap_or(Value::Null);
-                if let Err(stop) =
-                    sender.effects(&json!({ "dispatch_id": id, "effects": [record] }))
-                {
-                    abandoned = Some(stop);
-                    break;
+                match sender.effects(&json!({ "dispatch_id": id, "effects": [record] })) {
+                    Ok(()) => {}
+                    Err(Unsent::Stop(stop)) => {
+                        abandoned = Some(stop);
+                        break;
+                    }
+                    Err(Unsent::Rejected(detail)) => {
+                        rejected = Some(detail);
+                        break;
+                    }
                 }
             }
             Some("result") => {
@@ -142,16 +193,24 @@ pub(crate) fn execute(
         return Err(stop);
     }
 
-    let settling = match (result, unreadable) {
-        (Some(body), None) => body,
+    let settling = match (result, unreadable, rejected) {
+        // The refusal first, and ahead of a result the runner may already have
+        // written: a batch the journal never took is a frontier short of where
+        // this attempt actually got to, so settling with the node's own output
+        // would hand the execution a value whose effects nothing recorded.
+        (_, _, Some(detail)) => json!({
+            "dispatch_id": id,
+            "error": { "name": "WorkerEffectsRefused", "message": detail },
+        }),
+        (Some(body), None, None) => body,
         // §3.4's other half: a dispatch that produced no result is an attempt
         // that failed, and the hub is told so rather than left holding an
         // unsettled dispatch until its liveness window closes (§6.3).
-        (_, Some(reason)) => json!({
+        (_, Some(reason), None) => json!({
             "dispatch_id": id,
             "error": { "name": "WorkerRunnerUnreadable", "message": reason },
         }),
-        (None, None) => {
+        (None, None, None) => {
             let said = match status {
                 Ok(status) => status.code().map_or_else(
                     || "was killed by a signal".to_string(),
@@ -168,7 +227,34 @@ pub(crate) fn execute(
             })
         }
     };
-    sender.result(&settling)
+    settle(&mut sender, &settling)
+}
+
+/// Post the result that ends this dispatch, and say what a hub that would not
+/// take it costs.
+///
+/// A `409`, a `410` and a `204` are all `Ok` by the time [`Sender::result`]
+/// answers — §3.4's three meanings, each acted on there. What is left is a
+/// status that route does not give, and there is no second channel to report it
+/// through: the one thing the hub is owed for this dispatch is the very message
+/// it just refused. So the dispatch is left unsettled and the worker goes on,
+/// which costs that node the rest of its `timeout:` chain (§6.5) — bounded, and
+/// invisible unless this says so, which is why it is said. It is the same
+/// posture `super::settled` takes to a dispatch thread that panicked, and for
+/// the same reason: one dispatch that could not be finished is not a reason to
+/// take the placement's worker away.
+fn settle(sender: &mut Sender<'_>, body: &Value) -> Result<(), Stop> {
+    match sender.result(body) {
+        Ok(()) => Ok(()),
+        Err(Unsent::Stop(stop)) => Err(stop),
+        Err(Unsent::Rejected(detail)) => {
+            note(&format!(
+                "{detail}. This dispatch is left unsettled and this worker goes on: the hub holds \
+                 it until that node's `timeout:` fires (docs/distributed.md §6.5)"
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Start `bun <runner>` in the materialised tree, with the dispatch on its
@@ -216,7 +302,7 @@ struct Sender<'a> {
 impl Sender<'_> {
     /// `POST /workers/effects` (§3.3): `204` is done, `410` is re-sent under a
     /// new session, and a transport failure is retried under §2's backoff.
-    fn effects(&mut self, body: &Value) -> Result<(), Stop> {
+    fn effects(&mut self, body: &Value) -> Result<(), Unsent> {
         let mut backoff = super::Backoff::new();
         loop {
             let session = self.sessions.current()?;
@@ -226,10 +312,10 @@ impl Sender<'_> {
                     self.sessions.renew(session.generation)?;
                 }
                 Answer::Said(said) if said.status == 401 => {
-                    return Err(Stop::Refused(format!(
+                    return Err(Unsent::Stop(Stop::Refused(format!(
                         "this hub refused the join token at `/workers/effects`: {}",
                         said.detail()
-                    )));
+                    ))));
                 }
                 // A `409` here is a dispatch the hub cannot attribute, which is
                 // the one answer this route gives that is not about the batch:
@@ -242,8 +328,11 @@ impl Sender<'_> {
                     // A `4xx` this worker cannot act on: the batch is not one
                     // the hub will take however often it is sent, and holding
                     // the node hostage to it would stop the dispatch answering.
+                    // It costs the **dispatch** and not this process — see the
+                    // module docs — because a body one hub would not take says
+                    // nothing about whether this worker belongs here.
                     if (400..500).contains(&said.status) {
-                        return Err(Stop::Refused(format!(
+                        return Err(Unsent::Rejected(format!(
                             "this hub refused an effect batch of `{}` with {}: {}",
                             self.dispatch,
                             said.status,
@@ -268,7 +357,7 @@ impl Sender<'_> {
     /// and the result is **still owed**, and `409` says the hub knows this worker
     /// and does not want this result — so it is discarded and nothing is
     /// re-posted.
-    fn result(&mut self, body: &Value) -> Result<(), Stop> {
+    fn result(&mut self, body: &Value) -> Result<(), Unsent> {
         let mut backoff = super::Backoff::new();
         loop {
             let session = self.sessions.current()?;
@@ -279,14 +368,17 @@ impl Sender<'_> {
                     self.sessions.renew(session.generation)?;
                 }
                 Answer::Said(said) if said.status == 401 => {
-                    return Err(Stop::Refused(format!(
+                    return Err(Unsent::Stop(Stop::Refused(format!(
                         "this hub refused the join token at `/workers/result`: {}",
                         said.detail()
-                    )));
+                    ))));
                 }
                 Answer::Said(said) => {
+                    // Outside §3.4's four statuses, and so outside what any
+                    // re-post can improve. It costs this dispatch — see
+                    // [`settle`] — and not the placement's worker.
                     if (400..500).contains(&said.status) {
-                        return Err(Stop::Refused(format!(
+                        return Err(Unsent::Rejected(format!(
                             "this hub refused the result of `{}` with {}: {}",
                             self.dispatch,
                             said.status,

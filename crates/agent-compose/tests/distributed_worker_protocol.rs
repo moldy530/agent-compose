@@ -538,6 +538,15 @@ impl Worker {
             .join("\n")
     }
 
+    /// Whether this worker is still running, which is what a refusal that cost
+    /// only a dispatch must not change.
+    fn running(&mut self) -> bool {
+        self.child
+            .try_wait()
+            .expect("the worker can be waited on")
+            .is_none()
+    }
+
     /// Wait for this worker to exit on its own, and answer how it did.
     fn waited(&mut self) -> std::process::ExitStatus {
         let deadline = Instant::now() + PATIENCE;
@@ -1336,6 +1345,83 @@ fn an_effect_batch_answered_410_is_sent_again_and_never_dropped() {
         "the same batch, under a new session: {batches:#?}"
     );
     assert_ne!(batches[0].session, batches[1].session, "{batches:#?}");
+}
+
+/// A `4xx` §3.3 does **not** give the route costs this dispatch, and never the
+/// worker (§3.1, §3.3, §10.1).
+///
+/// Every status those two routes list is acted on by name; what is left is a
+/// `4xx` from **underneath** the handler — a body limit smaller than the record,
+/// an intermediary's own refusal — and the temptation is to read it the way §3.1
+/// reads a refused join. §3.1's terminality is about the join, where "a second
+/// join would be refused identically" is a statement about this worker's right
+/// to be in this mesh at all; a body one hub would not take says nothing of the
+/// kind. A worker that ended on it would leave the placement with no worker, and
+/// the replacement would reach the same record and end the same way — so one
+/// oversized effect would be a node the mesh never runs again.
+///
+/// So the attempt fails, named, and the process goes on: `413` here, which is
+/// exactly what a Fastify route left at its default limit answers, and the two
+/// halves asserted are the failure the hub is handed for the dispatch it was
+/// owed a result for, and the **next** dispatch running on the same process.
+#[test]
+fn an_effect_batch_refused_outside_its_table_fails_the_dispatch_and_keeps_the_worker() {
+    let hub = FixtureHub::start();
+    provisioning(&hub);
+    hub.script("/workers/poll", dispatch("dsp_refused"));
+    hub.script("/workers/poll", dispatch("dsp_after"));
+    hub.script(
+        "/workers/effects",
+        Reply::json(
+            413,
+            &json!({ "statusCode": 413, "code": "FST_ERR_CTP_BODY_TOO_LARGE" }),
+        ),
+    );
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let mut worker = Worker::start(&hub, "effects-413");
+    hub.until("settled both dispatches", |asked| {
+        asked
+            .iter()
+            .filter(|request| request.path == "/workers/result")
+            .count()
+            >= 2
+    });
+
+    let results = hub.asked_at("/workers/result");
+    let refused = &results[0].body;
+    assert_eq!(refused["dispatch_id"], "dsp_refused", "{refused:#}");
+    assert_eq!(
+        refused["error"]["name"],
+        "WorkerEffectsRefused",
+        "the refused batch did not fail its dispatch by name: {refused:#}\n{}",
+        worker.transcript()
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("413"),
+        "the failure does not name the status the hub gave: {refused:#}"
+    );
+
+    let after = &results[1].body;
+    assert_eq!(
+        after["dispatch_id"],
+        "dsp_after",
+        "the placement's next dispatch was not run: {after:#}\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        after["output"]["signature"], "from the fixture runner",
+        "{after:#}"
+    );
+    assert!(
+        worker.running(),
+        "one refused effect batch ended the worker, so the placement has none: {}",
+        worker.transcript()
+    );
 }
 
 /// A runner that dies without answering is an attempt that **failed**, and the

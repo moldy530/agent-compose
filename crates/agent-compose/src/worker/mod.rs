@@ -71,6 +71,7 @@
 //! | `/workers/join` | `400`, `401`, `403`, `409` | **stop**, non-zero, echoing the refusal (§3.1) |
 //! | `/workers/result` | `409` | discard the result, keep the session, go on polling (§3.4) |
 //! | `/workers/artifact` | `404` | join again — over a *hash*, not a session (§3.5) |
+//! | `/workers/effects`, `/workers/result` | a `4xx` those tables do not give | fail **this dispatch**, keep the worker ([`node`]) |
 //! | anything | no answer at all | [`Backoff`], and try again (§2) |
 //!
 //! The two rows a reader should not merge are the second and the first: §10.1
@@ -210,7 +211,20 @@ pub(crate) enum Stop {
     ///
     /// Not a failure: the provisioning cycle is re-entered over this hash, which
     /// is what "redeployment is automatic on the next join" means.
-    Redeployed(String),
+    Redeployed {
+        /// The hash the join named, which the fetch is over.
+        hash: String,
+        /// The session that join issued, where it issued one.
+        ///
+        /// The fetch presents it: §3.5 says "a worker SHOULD present its session
+        /// when it has one", and a worker leaving a join over an artifact it does
+        /// not hold *has* one — the hub issued it in the very answer that sent it
+        /// here. The route does not need it (the bearer is what authenticates a
+        /// fetch, and a hub MUST NOT require the header), so this is the SHOULD
+        /// met rather than a dependency: what it buys a hub is a transfer it can
+        /// attribute to the worker that is about to run under it.
+        session: Option<String>,
+    },
 }
 
 /// Nothing was reported.
@@ -266,9 +280,16 @@ pub(crate) fn run(options: &Options) -> ExitCode {
         match serve(options, &hub, &bun, &data_dir, &runtime) {
             Ok(()) => return ExitCode::from(CLEAN),
             Err(Stop::Refused(detail)) => return fail(&detail),
-            Err(Stop::Redeployed(hash)) => {
+            Err(Stop::Redeployed { hash, session }) => {
                 // The four filesystem steps of §4, over the hash the join named.
-                if let Err(reason) = provision(&hub, &bun, &data_dir, &hash, &mut backoff) {
+                if let Err(reason) = provision(
+                    &hub,
+                    &bun,
+                    &data_dir,
+                    &hash,
+                    session.as_deref(),
+                    &mut backoff,
+                ) {
                     return fail(&reason);
                 }
             }
@@ -288,6 +309,7 @@ fn provision(
     bun: &Path,
     data_dir: &Path,
     hash: &str,
+    session: Option<&str>,
     backoff: &mut Backoff,
 ) -> Result<(), String> {
     if let Some(tree) = artifact::adopt(data_dir, hash) {
@@ -296,7 +318,7 @@ fn provision(
         return Ok(());
     }
     let tarball = loop {
-        match hub.artifact(hash, None) {
+        match hub.artifact(hash, session) {
             Answer::Said(said) if said.status == 200 => break said.body,
             // §3.5: a worker meeting `404` for the hash its join returned
             // re-joins rather than retrying the fetch — the join is what
@@ -383,7 +405,10 @@ fn serve(
         // hold is exactly what `Stop::Redeployed` is, and `current()` above
         // answered one or the other.
         _ => {
-            return Err(Stop::Redeployed(String::new()));
+            return Err(Stop::Redeployed {
+                hash: String::new(),
+                session: Some(session.id.clone()),
+            });
         }
     };
 
@@ -632,9 +657,17 @@ impl Sessions {
                         .to_string();
                     // §4 step 1, and §5's redeployment rule read from this side:
                     // a session issued against an artifact this worker does not
-                    // hold is one it may not execute out of.
+                    // hold is one it may not execute out of. The session that
+                    // join issued goes with it: the fetch that follows presents
+                    // it, which is §3.5's SHOULD.
                     if Some(&serving) != self.joining.artifact.as_ref() {
-                        return Err(self.stop(Stop::Redeployed(serving)));
+                        return Err(self.stop(Stop::Redeployed {
+                            hash: serving,
+                            session: answered
+                                .get("worker_session")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        }));
                     }
                     let Some(id) = answered.get("worker_session").and_then(Value::as_str) else {
                         return Err(self.stop(Stop::Refused(
