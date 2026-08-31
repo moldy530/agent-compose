@@ -879,6 +879,51 @@ pub(crate) fn normalize_relative(path: &str) -> Option<String> {
     Some(segments.join("/"))
 }
 
+/// How two normalized `/`-separated paths cannot share one tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathConflict {
+    /// The same path, spelled the same way.
+    Same,
+    /// The same path on a case-insensitive filesystem, spelled differently.
+    Cased,
+    /// One is a directory prefix of the other, so one of them has to be a
+    /// directory and a file at once.
+    Nested,
+}
+
+/// Whether `left` and `right` can both exist in one checkout, and how they
+/// cannot.
+///
+/// Two paths conflict when they are the same name, when they are the same name
+/// to macOS and Windows, or when either is a **directory prefix** of the other:
+/// `src/graph.ts` and `src/graph.ts/impl.ts` need `src/graph.ts` to be a file
+/// and a directory in the same tree, which no filesystem offers and no tar
+/// archive can carry. All three are decided case-insensitively, for the reason
+/// grammar 1.4 gives a path one portable spelling (D80): a rule that answered
+/// differently on a case-sensitive host would accept a composition that destroys
+/// code on the next machine.
+///
+/// `None` when the two can sit side by side.
+#[must_use]
+pub(crate) fn path_conflict(left: &str, right: &str) -> Option<PathConflict> {
+    if left.eq_ignore_ascii_case(right) {
+        return Some(if left == right {
+            PathConflict::Same
+        } else {
+            PathConflict::Cased
+        });
+    }
+    // The separator test comes before the slice, and that ordering is what makes
+    // the slice safe: a byte equal to `/` is a character on its own, so
+    // `parent.len()` is a boundary in `child` by the time it is used as one.
+    let under = |parent: &str, child: &str| {
+        child.len() > parent.len()
+            && child.as_bytes()[parent.len()] == b'/'
+            && child[..parent.len()].eq_ignore_ascii_case(parent)
+    };
+    (under(left, right) || under(right, left)).then_some(PathConflict::Nested)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +966,41 @@ mod tests {
         // checked out into, and a bare `main.yml` entrypoint has no such name.
         assert_eq!(normalize_relative("../project/models.yml"), None);
         assert_eq!(normalize_relative("a/../../a/models.yml"), None);
+    }
+
+    /// The three ways two paths of one tree cannot both be there, and the
+    /// pairs that can.
+    #[test]
+    fn two_paths_conflict_when_no_one_checkout_holds_both() {
+        assert_eq!(
+            path_conflict("src/tools/sign.ts", "src/tools/sign.ts"),
+            Some(PathConflict::Same)
+        );
+        assert_eq!(
+            path_conflict("src/tools/sign.ts", "src/tools/Sign.ts"),
+            Some(PathConflict::Cased)
+        );
+        // Nesting, in both directions: which argument is the container is not
+        // something a caller should have to know.
+        assert_eq!(
+            path_conflict("src/graph.ts", "src/graph.ts/impl.ts"),
+            Some(PathConflict::Nested)
+        );
+        assert_eq!(
+            path_conflict("src/graph.ts/impl.ts", "src/graph.ts"),
+            Some(PathConflict::Nested)
+        );
+        // …and case-insensitively there too, for the reason the equality is:
+        // `src/Graph.ts/impl.ts` is inside the emitted file on macOS.
+        assert_eq!(
+            path_conflict("src/graph.ts", "src/Graph.ts/impl.ts"),
+            Some(PathConflict::Nested)
+        );
+        // A shared prefix that is not a whole segment is two ordinary names.
+        assert_eq!(path_conflict("src/graph.ts", "src/graph.ts.bak/a.ts"), None);
+        assert_eq!(path_conflict("src/a.ts", "src/ab.ts"), None);
+        assert_eq!(path_conflict("src/a.ts", "src/tools/a.ts"), None);
+        assert_eq!(path_conflict("src/graph.ts", "src/state.ts"), None);
     }
 
     #[test]

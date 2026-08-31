@@ -11,10 +11,13 @@ every worker's resolve the same tree (`docs/distributed.md` §4).
 That gives three rules. A key is an **npm package name**: at most 214 characters
 of lowercase letters, digits, `-`, `_` and `.`, optionally scoped as
 `@scope/name`, starting with none of `.`, `_` or `-`. A value is an **exact
-version**: `MAJOR.MINOR.PATCH`, with an optional `-prerelease` and `+build`.
+version**: `MAJOR.MINOR.PATCH`, with an optional `-prerelease` and `+build`, each
+tail a `.`-separated list of non-empty identifiers as semver writes them.
 `^1.2.3`, `~1.2.3`, `>=1`, `1.x`, `*`, `latest`, and every `git`, `file`, `npm`
 and `workspace` specifier are refused — each of them resolves to a different
-tree on a different day or on a different machine.
+tree on a different day or on a different machine — and so are the degenerate
+spellings `npm` itself rejects, like `1.2.3-` or `1.2.3-+`, which would otherwise
+fail at the install rather than here.
 
 And the pin has to be **the only one**. One `package.json` holds one version of
 a package, so a module pinning a package the generated project already pins, at

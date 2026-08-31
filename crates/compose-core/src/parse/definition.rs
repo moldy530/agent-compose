@@ -359,6 +359,17 @@ fn builtin_attachment(
     })
 }
 
+/// The implementation bindings a `tool.*` may carry, of which it carries
+/// **exactly one** (grammar 6.1).
+///
+/// A constant rather than four literals in a `match`, because two surfaces have
+/// to agree about it and one of them is prose: the parser reads it to decide
+/// which key a definition declared, and the `tools` topic's index summary names
+/// them for an agent choosing what to read (`docs::topics`, whose tests pin the
+/// two together). A binding added to the language and not to the summary is a
+/// surface an agent discovering this compiler never learns exists.
+pub(crate) const TOOL_IMPLEMENTATIONS: &[&str] = &["exec", "http", "function", "module"];
+
 fn tool(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ToolDef {
     let description = fields
         .require("description", cx)
@@ -370,9 +381,9 @@ fn tool(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ToolDef {
         schema::field_map(node, &format!("`output` of {subject}"), Surface::Result, cx)
     });
 
-    const BINDINGS: &[&str] = &["exec", "http", "function", "module"];
-    fields.note_known(BINDINGS);
-    let declared: Vec<&str> = BINDINGS
+    let bindings = TOOL_IMPLEMENTATIONS;
+    fields.note_known(bindings);
+    let declared: Vec<&str> = bindings
         .iter()
         .copied()
         .filter(|key| fields.contains(key))
@@ -386,7 +397,7 @@ fn tool(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ToolDef {
                     fields.span.clone(),
                     format!(
                         "{subject} declares no implementation: a tool carries exactly one of {}",
-                        list(BINDINGS)
+                        list(bindings)
                     ),
                 )
                 .with_help("`exec` runs a subprocess, `http` calls an endpoint, `function` names a host-registered function, `module` names a TypeScript file in this project"),

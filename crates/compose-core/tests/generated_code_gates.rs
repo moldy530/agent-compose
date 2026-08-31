@@ -30,6 +30,13 @@
 //!    field and the file. Everything else here is positive, and a contract that
 //!    stopped constraining would pass all of it — which is the one way PRD
 //!    resolved q48's "`tsc` is the merge tool" could quietly stop being true.
+//!    And a third half, `1c`, over the authored code **nobody wrote**: every
+//!    `module:` implementation in the corpus is hand-authored, so the stub
+//!    `build` scaffolds for an absent one is checked by nothing — and it is
+//!    written once and never rewritten, so a stub that stopped compiling is a
+//!    file the author already has and the compiler declines to replace. It
+//!    builds `tests/projects/scaffolded-modules` the way the command does —
+//!    scaffold, read back, emit — and type-checks the result.
 //! 2. **Construction** — Bun runs the emitted TypeScript and builds a
 //!    `StateGraph` over the state model. A channel spec LangGraph refuses is a
 //!    green `tsc` and a runtime failure, so type-checking alone would not catch
@@ -279,7 +286,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root};
+use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root, repository};
 use serde_json::{Value, json};
 use toolchain::{bun, installed, required, runner, runs};
 
@@ -602,6 +609,118 @@ fn a_schema_the_authored_module_no_longer_matches_fails_the_type_gate() {
         report.contains("'path'"),
         "…naming the field that moved:\n{report}"
     );
+}
+
+/// The composition whose whole authored half is scaffolded, and the modules it
+/// binds.
+///
+/// Committed with **no** `src/` beside it, which is the fixture's premise: the
+/// only implementations that exist are the ones `build` writes.
+const SCAFFOLDED: &str = "crates/compose-core/tests/projects/scaffolded-modules";
+const SCAFFOLDED_MODULES: &[&str] = &[
+    "src/tools/sealed.ts",
+    "src/tools/shape.ts",
+    "src/tools/sign.ts",
+];
+
+/// Gate 1c: the stub `build` writes for an absent `module:` binding compiles.
+///
+/// Gate 1 type-checks five golden projects and gate 1b proves the contract
+/// constrains them — and every authored file in both is one a **person** wrote.
+/// The other half of PRD resolved q48 is the half nobody types: `build`
+/// scaffolds an absent implementation once — the contract import, the doc
+/// comment, the throwing body — and then never writes that file again, so a stub
+/// that stopped compiling is a file the author already has and the compiler
+/// declines to replace. It would pass every gate here and fail in a terminal.
+///
+/// So this one runs the command's own order over a composition with **no**
+/// authored half at all: scaffold what is missing into the project, read it
+/// back, emit, and hand the result to the same `bun run typecheck` gate 1 uses.
+/// Three tools, because a stub's shape varies with its binding — an `env:` that
+/// is declared and one that is not, a description carrying a `*/`, and schemas
+/// reaching past the scalars — and the emitted contract has to name a type for
+/// each of them.
+#[test]
+fn a_scaffolded_module_implementation_type_checks_under_the_pinned_toolchain() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let source = repository().join(SCAFFOLDED);
+    assert_eq!(
+        files_under(&source),
+        ["main.yml"],
+        "the fixture's premise is that nothing authored is committed beside it"
+    );
+
+    // The project the author edits, and the output directory beside it — the two
+    // trees `agent-compose build` writes into, in the same relation.
+    let project = root.join("projects/typecheck-scaffold/scaffolded-modules");
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&project).expect("the scratch area is writable");
+    fs::copy(source.join("main.yml"), project.join("main.yml")).expect("the entrypoint copies");
+
+    let resolution = compose_core::resolve_with_target(project.join("main.yml"), "local");
+    assert!(
+        resolution.diagnostics.is_empty(),
+        "the fixture does not resolve: {:#?}",
+        resolution.diagnostics
+    );
+    let ir = resolution.ir.expect("a clean resolution has an artifact");
+    assert!(
+        compose_core::check(&ir).is_empty(),
+        "the fixture does not validate: {:#?}",
+        compose_core::check(&ir)
+    );
+    // The premise, asserted rather than assumed: `validate` refuses this project
+    // right now, once per binding, and names `build` as the repair.
+    let missing = compose_core::check_modules(&ir, &project);
+    assert_eq!(
+        missing.len(),
+        SCAFFOLDED_MODULES.len(),
+        "every binding's file is absent before the scaffold: {missing:#?}"
+    );
+
+    let scaffolds = compose_core::codegen::authored::scaffolds(&ir);
+    assert_eq!(
+        scaffolds
+            .iter()
+            .map(|scaffold| scaffold.path.as_str())
+            .collect::<Vec<_>>(),
+        SCAFFOLDED_MODULES,
+        "the fixture binds exactly the modules this gate is written for"
+    );
+    for scaffold in &scaffolds {
+        write_into(&project, &scaffold.path, &scaffold.contents);
+    }
+
+    let authored = compose_core::Authored::read(&ir, &project)
+        .expect("the scaffolds are there to be read back");
+    let built = compose_core::emit(&ir, &authored);
+    let out = project.join("build/local");
+    for file in built.artifact() {
+        write_into(&out, &file.path, &file.contents);
+    }
+
+    let output = bun()
+        .args(["run", "typecheck"])
+        .current_dir(&out)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "a scaffolded implementation does not type-check, so `build` writes a file its author \
+         cannot compile and will never rewrite:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Write one `/`-separated relative path under `root`, making its directories.
+fn write_into(root: &Path, relative: &str, contents: &str) {
+    let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    fs::create_dir_all(path.parent().expect("a relative path has a parent"))
+        .expect("the scratch area is writable");
+    fs::write(&path, contents).expect("the scratch area is writable");
 }
 
 /// Gate 2: every golden project constructs its graph, and its state model holds

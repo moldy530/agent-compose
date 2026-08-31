@@ -73,20 +73,45 @@ pub(crate) fn check(ctx: &mut Ctx) {
 /// implementation, the scaffold for it never written because the first one is
 /// already there. A composition that means two files on one machine and one on
 /// another is refused rather than resolved differently per host.
+///
+/// **And one tree.** The same rule covers a path *under* another — `sign.ts`
+/// and `sign.ts/helper.ts` — for the reason the emitted-name rule does
+/// (`parse::lexical::path_conflict`): one of them would have to be a file and a
+/// directory at once, so the scaffold writes one and then fails to make a
+/// directory for the other, and no tar could carry the pair either. Every
+/// spelling of "these two cannot share a checkout" is one predicate and one
+/// refusal.
 fn one_file_one_tool(ctx: &mut Ctx) {
-    let mut first: BTreeMap<String, (&str, &Spanned<String>)> = BTreeMap::new();
+    let mut seen: Vec<(&str, &Spanned<String>)> = Vec::new();
     let mut collisions: Vec<Diagnostic> = Vec::new();
     for (address, module) in bindings(ctx.ir) {
         let path = module.path.value.as_str();
-        match first.get(&path.to_ascii_lowercase()) {
-            Some((declared_by, first_path)) => {
-                let message = if first_path.value == module.path.value {
-                    format!("`{address}` and `{declared_by}` are both implemented by `{path}`")
-                } else {
-                    format!(
+        let conflict = seen.iter().find_map(|(declared_by, first_path)| {
+            crate::parse::lexical::path_conflict(&first_path.value, path)
+                .map(|kind| (*declared_by, *first_path, kind))
+        });
+        match conflict {
+            Some((declared_by, first_path, kind)) => {
+                use crate::parse::lexical::PathConflict;
+                let message = match kind {
+                    PathConflict::Same => {
+                        format!("`{address}` and `{declared_by}` are both implemented by `{path}`")
+                    }
+                    PathConflict::Cased => format!(
                         "`{address}` is implemented by `{path}`, which differs only in case from `{}` — `{declared_by}`'s",
                         first_path.value
-                    )
+                    ),
+                    PathConflict::Nested => {
+                        let relation = if path.len() > first_path.value.len() {
+                            "is inside"
+                        } else {
+                            "contains"
+                        };
+                        format!(
+                            "`{address}` is implemented by `{path}`, which {relation} `{}` — `{declared_by}`'s",
+                            first_path.value
+                        )
+                    }
                 };
                 collisions.push(
                     Diagnostic::error(
@@ -96,13 +121,11 @@ fn one_file_one_tool(ctx: &mut Ctx) {
                     )
                     .with_label(first_path.span.clone(), "first bound here")
                     .with_help(
-                        "an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract — and on macOS and Windows two spellings that differ only in case are one file: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)",
+                        "an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract — and no checkout holds two paths that are one file on macOS, or a name that is a file for one tool and a directory for another: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)",
                     ),
                 );
             }
-            None => {
-                first.insert(path.to_ascii_lowercase(), (address, &module.path));
-            }
+            None => seen.push((address, &module.path)),
         }
     }
     for collision in collisions {

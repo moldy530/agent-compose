@@ -600,10 +600,20 @@ fn launch(
     // the one thing `--format json` promises never to do.
     warned(entrypoint, target, &diagnostics);
 
-    let project = match emitted(entrypoint, &ir) {
-        Ok((project, _)) => project,
+    let (project, scaffolded) = match emitted(entrypoint, &ir) {
+        Ok(built) => built,
         Err(reason) => return fail(&reason),
     };
+    // The build these two verbs do on the way is silent, and this is the one
+    // thing about it that may not be: a scaffold is a write into the **author's
+    // tree**, made once and never again (PRD resolved q48), so `run` and `serve`
+    // say it in the same words `build` does rather than leaving a later
+    // `git status` to be where it is discovered. On stderr, for the reason
+    // `warned` is: the answer on this side is the child's stdout.
+    let _ = write(
+        &mut io::stderr().lock(),
+        &report::scaffold_notice(&scaffolded, report::color_enabled()),
+    );
     match build::write(&project, out) {
         Ok(_) => {}
         Err(build::Refusal::Io(error)) => {

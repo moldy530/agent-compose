@@ -414,6 +414,16 @@ tool.verify:
     /// convention (see [`super::AUTHORED_ZONE`]) and a binding may name
     /// `./lib/sign.ts`, so a predicate spelled `contains("tools/")` would be
     /// blind to exactly the import this rule exists to forbid.
+    ///
+    /// And it is the **quoted specifier anywhere in the file**, not a line that
+    /// starts with `import `. Every way one module can name another ends in that
+    /// string: a single-line import, the multi-line form this emitter already
+    /// writes for more than one name (`graph.rs` writes
+    /// `import {\n  toolStampModule,\n} from "./modules.ts";`, whose specifier
+    /// sits on a line beginning with `}`), an `export … from`, a side-effect
+    /// import, a dynamic `import(…)`. A line-shaped predicate would pass a
+    /// project that broke the rule in the emitter's own house style, which is
+    /// the one blind spot a test of a *direction* cannot afford.
     #[test]
     fn the_only_generated_import_of_authored_code_is_the_seam() {
         let ir = ir_of(ONE_BINDING_OUTSIDE_THE_ZONE);
@@ -434,12 +444,9 @@ tool.verify:
             .collect();
         assert_eq!(specifiers.len(), 2, "both bindings are carried");
         for file in project.files() {
-            let reaches = file.contents.lines().any(|line| {
-                line.starts_with("import ")
-                    && specifiers
-                        .iter()
-                        .any(|specifier| line.contains(&format!("\"{specifier}\"")))
-            });
+            let reaches = specifiers
+                .iter()
+                .any(|specifier| file.contents.contains(&format!("\"{specifier}\"")));
             assert_eq!(
                 reaches,
                 file.path == PATH,

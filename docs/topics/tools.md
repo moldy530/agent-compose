@@ -214,8 +214,12 @@ generates.
 it emits and touches nothing else in the output directory, so your
 implementation lives in the same tree without a marker comment or a manual
 section anywhere. The path is project-relative, ends in `.ts`, stays inside the
-project root, and may not be a name `build` writes (`src/graph.ts`,
-`package.json`, …). `src/tools/<name>.ts` is the conventional place.
+project root, is at most 100 bytes long — the artifact is served as a tar and
+that is what a header holds — and may neither be a name `build` writes
+(`src/graph.ts`, `package.json`, …) nor sit inside one. Two bindings may not
+name one file, two spellings of one file, or a path inside another's:
+`src/tools/<name>.ts` is the conventional place, and one file answers to one
+tool.
 
 **You never type the signature.** `validate` refuses a binding whose file is
 missing and names the repair; `agent-compose build <spec>` **scaffolds** it —

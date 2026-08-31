@@ -99,8 +99,10 @@ The one exception is a write rather than a removal: a `tool.*` bound to
 `module: ./src/tools/<name>.ts` gets that file **scaffolded once**, in the
 project beside the entrypoint, when it is not there. `validate` and
 `build --check` refuse a binding whose file is missing and name `build` as the
-repair; `build` writes the stub and never writes or reads that file again. See
-`agent-compose docs tools`.
+repair; `build` writes the stub and never writes or reads that file again. It is
+a write into your tree, so whichever verb makes it says so: `build` on its
+verdict line, and `run` and `serve` — which build on the way — on a line of their
+own before the launch. See `agent-compose docs tools`.
 
 A build also **carries** each such file into the output directory, at the same
 relative path — because the composition references it, and the output directory

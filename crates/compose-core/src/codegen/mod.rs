@@ -1184,6 +1184,26 @@ flow.f:
         }
     }
 
+    /// Every emitted name fits the tar header the artifact is served in.
+    ///
+    /// `docs/distributed.md` §3.5 packs [`EMITTED_PATHS`] and the authored files
+    /// beside them into a ustar archive, whose name field holds 100 bytes. The
+    /// authored half is bounded where it is written (`parse::binding`), and this
+    /// is the other half: a name added here that did not fit would make the
+    /// hub's artifact route throw for **every** composition, with nothing else in
+    /// the suite reaching it — the mesh tests run a build whose paths are all
+    /// short, and would go on passing until the day one was not.
+    #[test]
+    fn every_emitted_name_fits_the_header_the_artifact_is_served_in() {
+        for path in EMITTED_PATHS {
+            assert!(
+                path.len() <= 100,
+                "`{path}` is {} bytes, and a ustar header holds 100",
+                path.len()
+            );
+        }
+    }
+
     /// A composition that binds a module emits **more** than the constant list:
     /// the tree is the emission set plus what the spec references (PRD resolved
     /// q49), and the two halves are separable.

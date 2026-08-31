@@ -1360,19 +1360,28 @@ tree; a file under `src/` the composition does not reference ships nowhere.
 backslashes, no whitespace, no URLs — grammar §1.4's path form with a different
 extension, and for the same reason. Every prefix stays **inside the project
 root**, and a path that climbs out and returns is refused exactly as an
-`imports:` entry is. It also may not name a path `agent-compose build` writes
-(`src/graph.ts`, `package.json`, …): the emitted file list is the boundary
-between generated and authored code (PRD resolved q47), so a binding on one of
-those names would be authored code the next build destroys. The code for all
-three is `invalid-module-path`.
+`imports:` entry is. Normalized, it is at most **100 bytes**: the artifact is
+served to a worker as a tar and a ustar header holds a name in that many
+([`docs/distributed.md`](distributed.md) §3.5), so a longer path is a
+composition that validates and whose artifact no worker could ever fetch. It
+also may not name a path `agent-compose build` writes (`src/graph.ts`,
+`package.json`, …), **nor sit inside one**: the emitted file list is the
+boundary between generated and authored code (PRD resolved q47), so a binding on
+one of those names would be authored code the next build destroys, and
+`./src/graph.ts/impl.ts` would need `src/graph.ts` to be a file and a directory
+in one tree. The code for all of them is `invalid-module-path`.
 
-**Case is not what tells two paths apart.** A path here is a file name, and
-macOS and Windows hold `src/Graph.ts` and `src/graph.ts` in one place — so a
-binding whose path differs only in case from a name `build` emits is refused,
-and so are two bindings whose paths differ only in case from each other. Both
-would work on a case-sensitive filesystem and, on the others, silently write one
-file over another: a composition that is valid on one machine and destroys code
-on the next is not one this compiler accepts anywhere. Same code.
+**Case is not what tells two paths apart, and neither is nesting.** A path here
+is a file name, and macOS and Windows hold `src/Graph.ts` and `src/graph.ts` in
+one place — so a binding whose path differs only in case from a name `build`
+emits is refused, and so are two bindings whose paths differ only in case from
+each other. Both would work on a case-sensitive filesystem and, on the others,
+silently write one file over another: a composition that is valid on one machine
+and destroys code on the next is not one this compiler accepts anywhere. Two
+bindings where one path sits **inside** the other — `sign.ts` and
+`sign.ts/helper.ts` — are refused for the neighbouring reason: no checkout, and
+no tar, holds a name that is a file for one tool and a directory for another.
+Same code.
 
 **The file has to be there.** `validate` refuses a binding whose file does not
 exist, naming the repair: `agent-compose build` **scaffolds** a referenced module
@@ -7780,10 +7789,12 @@ and writes, removes and reports nothing else under the output directory. A
 `tool.*` may bind a fourth implementation, `module: <project-relative .ts>`,
 naming hand-authored TypeScript in that same tree; `build` scaffolds an absent
 one **once** and never writes it again. The path is refused when it is not
-project-relative and `.ts`, when any prefix climbs out of the project root, and
-when it names a file the emitter writes; the code is `invalid-module-path`. A
-binding whose file is missing is refused by `validate` and by `build --check`,
-naming `build` as the repair.
+project-relative and `.ts`, when any prefix climbs out of the project root, when
+it is longer than the 100 bytes a tar header holds, and when it names a file the
+emitter writes **or sits inside one**; the code is `invalid-module-path`, as is
+two bindings whose paths cannot share a checkout — the same file, two spellings
+of it, or one inside the other. A binding whose file is missing is refused by
+`validate` and by `build --check`, naming `build` as the repair.
 
 **Rationale.**
 
@@ -7802,6 +7813,20 @@ mechanism to carve out the authored zone, and gets the root files
 layout therefore stays: no `src/generated/` migration, and no golden churn from
 moved files. `src/tools/` is the *conventional* authored zone the scaffold uses
 and the docs teach, and it carries no rule.
+
+*Why the path rules are about the tree rather than the name.* "Not a name the
+emitter writes" is the rule a reader states, and on its own it lets through
+every path that *cannot coexist* with one: `./src/graph.ts/impl.ts` names
+nothing the emitter writes and needs `src/graph.ts` to be a file and a directory
+at once, so the build scaffolds into the author's checkout and then fails on a
+`create_dir_all` with an IO error rather than a diagnostic. The same shape
+reaches two bindings of one composition. So the comparison is over a path and
+its directories, case-insensitively, wherever two paths of this tree meet. The
+length bound is the same argument one layer out: the tree is served to a worker
+as a tar, a ustar header holds a name in 100 bytes, and every emitted name is a
+short compiler constant — so an authored path is the only way to write one that
+no worker could fetch, and it is refused with a span rather than thrown inside a
+hub's route.
 
 *Why no manual sections.* `/** Begin Manual Section **/` markers were the
 alternative and are rejected outright, named here so the pattern is not

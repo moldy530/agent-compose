@@ -268,18 +268,9 @@ pub(crate) fn build_verdict(
                 // own, and the one it will never write again, so it is said out
                 // loud rather than left for a later `git status` (PRD resolved
                 // q48).
-                if scaffolded.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        ", and scaffolded {} for you to write: {}",
-                        plural(scaffolded.len(), "tool implementation"),
-                        scaffolded
-                            .iter()
-                            .map(|(path, tool)| format!("`{path}` (`{tool}`)"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
+                match scaffold_phrase(scaffolded) {
+                    Some(phrase) => format!(", and {phrase}"),
+                    None => String::new(),
                 }
             ),
         ),
@@ -313,6 +304,57 @@ pub(crate) fn build_verdict(
         report.push_str(&drift_help(not_ours));
     }
     report
+}
+
+/// What a build wrote into the **author's** tree, as one clause, or `None` when
+/// it wrote nothing there.
+///
+/// One sentence with two readers, which is why it is a function rather than two
+/// `format!`s. `build` folds it onto the end of its own verdict; `run` and
+/// `serve` have no verdict to fold it onto and print it on a line of its own
+/// ([`scaffold_notice`]). A scaffold is the only write any of the three makes
+/// outside `--out`, and the only one they will never make again (PRD resolved
+/// q48) — so whichever verb made it says so, in the same words, rather than
+/// leaving a later `git status` to break the news.
+fn scaffold_phrase(scaffolded: &[(String, String)]) -> Option<String> {
+    if scaffolded.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "scaffolded {} for you to write: {}",
+        plural(scaffolded.len(), "tool implementation"),
+        scaffolded
+            .iter()
+            .map(|(path, tool)| format!("`{path}` (`{tool}`)"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// The line `run` and `serve` print when the build they did on the way wrote a
+/// stub into the project.
+///
+/// Empty when nothing was scaffolded, which is every launch after the first —
+/// these two verbs answer with the flow's own output and a line about the spec
+/// being fine is noise in front of it (see [`crate::warned`]). It goes through
+/// the same renderer `build`'s verdict does, at the same level, because it is
+/// the same claim.
+pub(crate) fn scaffold_notice(scaffolded: &[(String, String)], color: bool) -> String {
+    let Some(phrase) = scaffold_phrase(scaffolded) else {
+        return String::new();
+    };
+    let renderer = if color {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    }
+    .decor_style(DecorStyle::Ascii);
+    format!(
+        "{}\n",
+        renderer.render(&[Group::with_title(
+            Level::NOTE.no_name().primary_title(phrase.as_str())
+        )])
+    )
 }
 
 /// What to do about the drift just reported.

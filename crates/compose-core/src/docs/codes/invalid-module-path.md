@@ -5,7 +5,7 @@
 A `module:` binding names hand-authored TypeScript **inside the project**, and
 that file travels: it ships in the artifact every worker fetches, hash-addressed
 like everything else the build produced (`docs/distributed.md` §4). So its path
-has one portable spelling, and four rules hold it there.
+has one portable spelling, and five rules hold it there.
 
 It is **project-relative**: `/`-separated segments, each `.`, `..` or a name
 matching `[A-Za-z0-9_][A-Za-z0-9_.-]*`, the last ending in `.ts`. No leading
@@ -17,16 +17,26 @@ A path that climbs out and returns is refused even where it lands back inside,
 for the reason `imports:` refuses one: whether it re-enters the same project
 depends on the checkout's parent directory, which the spec cannot see.
 
-And it is **not a name `build` writes**. The emitted file list is the
-boundary between generated and authored code: `build` overwrites exactly the
-files it emits and touches nothing else, so a binding pointing at `src/graph.ts`
-would be asking for an authored file the next build destroys.
+It **fits the artifact**: at most 100 bytes once normalized, because the tree is
+served to a worker as a tar and that is what a ustar header holds
+(`docs/distributed.md` §3.5). Every name the compiler emits is a short constant,
+so an authored path is the only way to write an artifact no worker could fetch.
 
-Finally, **case does not make it a different name**. `src/Graph.ts` and
-`src/graph.ts` are one file on macOS and on Windows, so a path differing only in
-case from a name `build` emits is refused, and so are two bindings differing only
-in case from each other — either would work on Linux and quietly write one file
-over the other everywhere else.
+And it is **not a name `build` writes, nor inside one**. The emitted file list is
+the boundary between generated and authored code: `build` overwrites exactly the
+files it emits and touches nothing else, so a binding pointing at `src/graph.ts`
+would be asking for an authored file the next build destroys — and one pointing
+at `src/graph.ts/impl.ts` would need `src/graph.ts` to be a file and a directory
+in the same tree, which is a build that fails partway through rather than a spec
+that is refused.
+
+Finally, **case does not make it a different name, and neither does nesting**.
+`src/Graph.ts` and `src/graph.ts` are one file on macOS and on Windows, so a path
+differing only in case from a name `build` emits is refused, and so are two
+bindings differing only in case from each other — either would work on Linux and
+quietly write one file over the other everywhere else. Two bindings where one
+path sits inside the other are refused for the neighbouring reason: no checkout
+holds a name that is a file for one tool and a directory for another.
 
 ## A spec that triggers it
 

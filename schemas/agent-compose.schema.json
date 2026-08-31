@@ -1065,9 +1065,9 @@
     },
 
     "exactVersion": {
-      "description": "An exact semantic version: MAJOR.MINOR.PATCH with an optional -prerelease and +build. No range operator, no wildcard, no dist-tag, and no git/file/npm/workspace specifier - each of those resolves to a different tree on a different day or a different machine, and the artifact carries no lockfile to pin it (Decision D133).",
+      "description": "An exact semantic version: MAJOR.MINOR.PATCH with an optional -prerelease and +build, each tail a dot-separated list of non-empty identifiers as semver.org 9 and 10 write them. No range operator, no wildcard, no dist-tag, and no git/file/npm/workspace specifier - each of those resolves to a different tree on a different day or a different machine, and the artifact carries no lockfile to pin it (Decision D133).",
       "type": "string",
-      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.+-]+)?(\\+[0-9A-Za-z.+-]+)?$"
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
     },
 
     "flowDef": {

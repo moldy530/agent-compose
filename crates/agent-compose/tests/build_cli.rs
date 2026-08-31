@@ -1156,6 +1156,98 @@ tool.sign:
     );
 }
 
+/// The verbs that build on the way say what the build wrote into the author's
+/// tree (PRD resolved q48).
+///
+/// `run` and `serve` validate and build before they launch, and that build
+/// scaffolds an absent `module:` implementation exactly as a plain `build` does
+/// — a write into the *project*, made once and never again. A verb that made it
+/// silently would leave the one file the compiler cannot rewrite to be
+/// discovered by a later `git status`, and would say something different from
+/// the verb beside it about the same write. Both are asserted here: the first
+/// `run` announces it, and the second — with the file already there — says
+/// nothing, because nothing was written.
+///
+/// The launch itself fails, and that is not what is under test: a scratch
+/// project has no `node_modules/`, so the run stops at the precondition. The
+/// notice is printed before it and on **stderr**, which is where a launch's
+/// reports go — `run`'s stdout is the flow's answer.
+#[test]
+fn a_run_that_scaffolds_says_so_and_a_run_that_does_not_stays_quiet() {
+    let project = scratch("module-binding-launch");
+    let entrypoint = project.join("main.yml");
+    fs::write(
+        &entrypoint,
+        r#"version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+
+flow.sign:
+  description: Sign one payload.
+  inputs:
+    payload: { type: string, min_length: 1 }
+  outputs:
+    signature: { type: string }
+  nodes:
+    sign:
+      function: tool.sign
+      input:
+        payload: "input.payload"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }
+
+state:
+  signature: { description: What came back., type: string, default: "" }
+"#,
+    )
+    .expect("the entrypoint is writable");
+    let spec = entrypoint.to_str().expect("a UTF-8 scratch path");
+
+    let launch = || {
+        Command::cargo_bin("agent-compose")
+            .expect("the binary under test is built")
+            .env("NO_COLOR", "1")
+            .args(["run", spec, "flow.sign", "--input", "payload=hi"])
+            .output()
+            .expect("the command runs")
+    };
+
+    let first = launch();
+    assert!(
+        stderr(&first).contains(
+            "scaffolded 1 tool implementation for you to write: `src/tools/sign.ts` (`tool.sign`)"
+        ),
+        "a `run` that wrote into the project says so: {}",
+        stderr(&first)
+    );
+    assert!(
+        !stdout(&first).contains("scaffolded"),
+        "…on stderr, because stdout is the run's answer: {}",
+        stdout(&first)
+    );
+    assert!(
+        project.join("src/tools/sign.ts").is_file(),
+        "the stub landed in the project, beside `main.yml`: {:?}",
+        files_under(&project)
+    );
+
+    let second = launch();
+    assert!(
+        !stderr(&second).contains("scaffolded"),
+        "a `run` that scaffolds nothing says nothing about it: {}",
+        stderr(&second)
+    );
+}
+
 /// A `module:` binding's `dependencies:` reach the generated `package.json`, and
 /// an emitted name an authored file already holds stops the build (PRD resolved
 /// q47, q49).

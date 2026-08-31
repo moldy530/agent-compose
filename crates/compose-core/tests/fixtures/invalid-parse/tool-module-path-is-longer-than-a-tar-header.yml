@@ -1,0 +1,12 @@
+# rule: a `module:` path fits the artifact's tar header (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `src/tools/a_very_long_authored_module_name_that_no_ustar_header_could_ever_carry_into_a_tar_archive_at_all.ts` is 109 bytes long, and a path inside the artifact holds 100
+# at: 12:11
+# help: the artifact is served to every worker as a tar and a ustar header holds a name in 100 bytes (`docs/distributed.md` §3.5), so a longer path is an artifact no worker could fetch: shorten it — `src/tools/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q49)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/a_very_long_authored_module_name_that_no_ustar_header_could_ever_carry_into_a_tar_archive_at_all.ts

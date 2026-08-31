@@ -482,7 +482,20 @@ pub(crate) fn module_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<Mo
     })
 }
 
-/// Check a `module:` path against grammar 6.1's three rules, and hand back the
+/// The longest a `module:` path may be, in bytes.
+///
+/// A ustar header holds a name in 100 bytes, and the artifact is **served as a
+/// tar**: `docs/distributed.md` §3.5's `/workers/artifact/{hash}` packs every
+/// entry of `ARTIFACT_FILES`, which PRD resolved q49 widened to carry the
+/// authored files a composition references. Every emitted name is a compiler
+/// constant well under the limit, so before the module binding the bound could
+/// not be reached; an authored path is the composition's to write, and one byte
+/// over it would be a spec the validator accepted and no worker could ever fetch
+/// the artifact of. Refused here, with a span, rather than thrown inside a hub's
+/// route.
+const MODULE_PATH_BYTES: usize = 100;
+
+/// Check a `module:` path against grammar 6.1's rules, and hand back the
 /// **normalized** spelling — which is the name the artifact, the manifest and
 /// every diagnostic downstream use.
 fn module_path(written: &Spanned<String>, subject: &str, cx: &mut Cx) -> Option<Spanned<String>> {
@@ -511,6 +524,23 @@ fn module_path(written: &Spanned<String>, subject: &str, cx: &mut Cx) -> Option<
         );
         return None;
     };
+    if normalized.len() > MODULE_PATH_BYTES {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!(
+                    "`{normalized}` is {} bytes long, and a path inside the artifact holds {MODULE_PATH_BYTES}",
+                    normalized.len()
+                ),
+            )
+            .with_help(format!(
+                "the artifact is served to every worker as a tar and a ustar header holds a name in {MODULE_PATH_BYTES} bytes (`docs/distributed.md` §3.5), so a longer path is an artifact no worker could fetch: shorten it — `{}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q49)",
+                crate::codegen::AUTHORED_ZONE
+            )),
+        );
+        return None;
+    }
     // Case-insensitively, because the string is a **file name** before it is
     // anything else and macOS and Windows hold `src/Graph.ts` and `src/graph.ts`
     // in one place. A comparison that distinguished them would accept a
@@ -518,27 +548,42 @@ fn module_path(written: &Spanned<String>, subject: &str, cx: &mut Cx) -> Option<
     // author's implementation — a build that destroys code and a `--check` that
     // can never converge, on the machines a validator cannot see. One portable
     // spelling is the rule grammar 1.4 already applies to a path (D80).
-    if let Some(emitted) = crate::codegen::EMITTED_PATHS
+    //
+    // **Naming one is not the only way to collide with one.** A path *under* an
+    // emitted name — `src/graph.ts/impl.ts` — is a directory where the emitter
+    // writes a file, so one tree cannot hold both: the build scaffolds into the
+    // author's checkout, writes most of the emission set, and then fails on a
+    // `create_dir_all` with an IO error rather than a diagnostic. Equality alone
+    // would let it through, so the comparison is over the path *and its
+    // directories* (`lexical::path_conflict`).
+    if let Some((emitted, conflict)) = crate::codegen::EMITTED_PATHS
         .iter()
-        .find(|path| path.eq_ignore_ascii_case(&normalized))
+        .find_map(|path| lexical::path_conflict(path, &normalized).map(|kind| (*path, kind)))
     {
         let zone = crate::codegen::AUTHORED_ZONE;
-        let (message, help) = if *emitted == normalized {
-            (
+        let (message, help) = match conflict {
+            lexical::PathConflict::Same => (
                 format!("`{normalized}` is a file `agent-compose build` generates"),
                 format!(
                     "the compiler writes that file itself, so the implementation {subject} names would be overwritten by every build: put it somewhere `build` does not emit — `{zone}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)"
                 ),
-            )
-        } else {
-            (
+            ),
+            lexical::PathConflict::Cased => (
                 format!(
                     "`{normalized}` differs only in case from `{emitted}`, a file `agent-compose build` generates"
                 ),
                 format!(
                     "macOS and Windows hold those two spellings in one file, so on such a host the build would write `{emitted}` over the implementation {subject} names — and a composition that works on one machine and destroys code on another is not one this compiler emits: put it somewhere `build` does not emit — `{zone}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)"
                 ),
-            )
+            ),
+            lexical::PathConflict::Nested => (
+                format!(
+                    "`{normalized}` is inside `{emitted}`, a file `agent-compose build` generates"
+                ),
+                format!(
+                    "the compiler writes `{emitted}` as a file, so no directory of that name can sit beside it: one tree cannot hold both, and the build would refuse partway through the emission rather than at the spec: put the implementation {subject} names somewhere `build` does not emit — `{zone}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)"
+                ),
+            ),
         };
         cx.push(
             Diagnostic::error(
@@ -665,27 +710,64 @@ fn is_package_segment(text: &str) -> bool {
 /// `workspace` specifier, a URL — resolves to a different tree on a different
 /// day or on a different machine, which is the one thing a lockfile-less
 /// artifact cannot have (PRD resolved q49).
+///
+/// The tails are read the way semver.org §9 and §10 write them rather than as a
+/// bag of admitted characters: **build first**, at the first `+`, then the
+/// prerelease at the first `-` of what is left, each a `.`-separated list of
+/// non-empty identifiers. A looser reading admits degenerate spellings — `1.2.3-+`
+/// has an empty prerelease and `1.2.3-01` a numeric identifier with a leading
+/// zero — that `npm install` rejects on the emitted `package.json`, which is the
+/// failure the exactness rule exists to move to `validate`.
 fn is_exact_version(text: &str) -> bool {
-    let core = text.split(['-', '+']).next().unwrap_or_default();
-    if core.len() != text.len() {
-        // A prerelease or build tail: it must be non-empty and made of the
-        // characters semver admits there.
-        let tail = &text[core.len() + 1..];
-        if tail.is_empty()
-            || !tail
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+'))
-        {
-            return false;
-        }
+    // Build metadata is everything after the *first* `+`; a second one is not a
+    // separator but an illegal character, and `identifiers` refuses it.
+    let (rest, build) = match text.split_once('+') {
+        Some((rest, build)) => (rest, Some(build)),
+        None => (text, None),
+    };
+    if let Some(build) = build
+        && !identifiers(build, false)
+    {
+        return false;
+    }
+    // The core holds no `-`, so the prerelease starts at the first one.
+    let (core, prerelease) = match rest.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (rest, None),
+    };
+    if let Some(prerelease) = prerelease
+        && !identifiers(prerelease, true)
+    {
+        return false;
     }
     let parts: Vec<&str> = core.split('.').collect();
-    parts.len() == 3
-        && parts.iter().all(|part| {
+    parts.len() == 3 && parts.iter().all(|part| is_numeric_identifier(part))
+}
+
+/// Whether a semver tail is a `.`-separated list of identifiers.
+///
+/// `numeric` says whether an all-digit identifier is held to semver's
+/// no-leading-zero rule, which applies to a prerelease and not to build
+/// metadata.
+fn identifiers(text: &str, numeric: bool) -> bool {
+    !text.is_empty()
+        && text.split('.').all(|part| {
             !part.is_empty()
-                && part.bytes().all(|byte| byte.is_ascii_digit())
-                && (part.len() == 1 || !part.starts_with('0'))
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!numeric
+                    || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    || is_numeric_identifier(part))
         })
+}
+
+/// A run of digits with no leading zero past `0` — semver's numeric identifier,
+/// which each of `MAJOR`, `MINOR` and `PATCH` is.
+fn is_numeric_identifier(part: &str) -> bool {
+    !part.is_empty()
+        && part.bytes().all(|byte| byte.is_ascii_digit())
+        && (part.len() == 1 || !part.starts_with('0'))
 }
 
 /// The fields an inline `exec:` node binds from the child process itself, with
@@ -819,5 +901,63 @@ pub(crate) fn reject_env_collisions<'a>(
             .with_label(name.span.clone(), "this input field takes the same slot")
             .with_help("an object input is passed to the child as upper-snake-cased environment variables, so one of the two values would be silently discarded"),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dependency pin is exactly what `npm install` would accept as one, so
+    /// the refusal lands on the spec rather than on the emitted `package.json`
+    /// (PRD resolved q49, D133).
+    #[test]
+    fn a_pin_is_a_version_and_not_a_shape_that_resembles_one() {
+        assert!(is_exact_version("1.4.0"));
+        assert!(is_exact_version("0.0.0"));
+        assert!(is_exact_version("10.20.30"));
+        assert!(is_exact_version("1.0.0-alpha"));
+        assert!(is_exact_version("1.0.0-alpha.1"));
+        assert!(is_exact_version("1.0.0-0.3.7"));
+        assert!(is_exact_version("1.0.0-x-y-z.--"));
+        assert!(is_exact_version("1.0.0+20130313144700"));
+        assert!(is_exact_version("1.0.0-beta+exp.sha.5114f85"));
+
+        // A range, a wildcard, a tag, a specifier: what the rule is written for.
+        assert!(!is_exact_version("^1.4.0"));
+        assert!(!is_exact_version("~1.4.0"));
+        assert!(!is_exact_version(">=1.4.0"));
+        assert!(!is_exact_version("1.x"));
+        assert!(!is_exact_version("*"));
+        assert!(!is_exact_version("latest"));
+        assert!(!is_exact_version("npm:other@1.4.0"));
+
+        // The core is three numeric identifiers, no more and no fewer.
+        assert!(!is_exact_version("1.4"));
+        assert!(!is_exact_version("1.4.0.1"));
+        assert!(!is_exact_version("01.4.0"));
+        assert!(!is_exact_version("1.04.0"));
+        assert!(!is_exact_version(""));
+
+        // The degenerate tails: each is a string a looser reading admits and
+        // `npm` does not, so admitting one moves the failure from `validate` to
+        // an install of an emitted manifest.
+        assert!(!is_exact_version("1.2.3-"));
+        assert!(!is_exact_version("1.2.3+"));
+        assert!(!is_exact_version("1.2.3-+"));
+        assert!(!is_exact_version("1.2.3-alpha..1"));
+        assert!(!is_exact_version("1.2.3+build..1"));
+        assert!(!is_exact_version("1.2.3-01"));
+        assert!(!is_exact_version("1.2.3-alpha+"));
+        assert!(!is_exact_version("1.2.3-al pha"));
+        assert!(!is_exact_version("1.2.3+build+more"));
+
+        // Build metadata keeps no leading-zero rule — semver §10 says so, and a
+        // build number is not an ordering — and `-` is an identifier there, so
+        // `1.2.3+-` is a version rather than a degenerate tail. Asserted because
+        // it *looks* like one: the rule is semver's alphabet and not a guess at
+        // which spellings seem meaningful.
+        assert!(is_exact_version("1.2.3+001"));
+        assert!(is_exact_version("1.2.3+-"));
     }
 }
