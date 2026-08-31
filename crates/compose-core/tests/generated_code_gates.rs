@@ -2331,6 +2331,16 @@ fn the_artifact_hash_is_the_same_in_both_languages() {
 ///     as newly journaled — and the row must keep the outcome it has, which is
 ///     asserted beside it.
 ///
+///   * **`releaseDispatch` is a claim undone, and nothing else.** §7 makes
+///     dispatch at-least-once — "a hub that cannot tell whether a dispatch
+///     arrived re-issues it" — and the poll's own guard re-issues by putting the
+///     row back where a worker hung up before the answer was written. Three
+///     things have to hold of that and none is reachable over HTTP: the row
+///     returns to **its own place** in the park order rather than to the end of
+///     the queue, only the session holding it may hand it back, and a row that
+///     has moved on since — settled by a result, superseded by a deadline — is
+///     left exactly as it is.
+///
 ///   * **§3.2's four OPTIONAL payload fields are on the row**, and a row parked
 ///     without them carries none. That is what lets the poll answer omit the
 ///     keys rather than send `null`, and it is why a hub restarted mid-dispatch
@@ -2365,6 +2375,63 @@ fn the_dispatch_board_resumes_in_park_order_and_settles_once() {
     assert_eq!(
         order["ofExecution"], order["wanted"],
         "`dispatchesOf` promises park order too, and a status report reads it"
+    );
+    let insertion: Vec<i64> = order["insertion"]
+        .as_array()
+        .expect("the runner reports the insertion order it read back")
+        .iter()
+        .map(|held| {
+            held.as_i64().unwrap_or_else(|| {
+                panic!("a row read out of the journal carries no `order`: {order:#}")
+            })
+        })
+        .collect();
+    assert!(
+        insertion.windows(2).all(|pair| pair[0] < pair[1]),
+        "the tiebreak the board sorts by is not carried on the rows it answers with, so a \
+         synchronous reader of them — the status report — has to invent one of its own and can \
+         publish an order the queue does not drain in (docs/distributed.md §6.2): {order:#}"
+    );
+
+    let release = &observed["release"];
+    assert_eq!(release["claimed"], json!("dispatched"), "{release:#}");
+    assert_eq!(release["claimedBy"], json!("wrk_one"), "{release:#}");
+    assert_eq!(
+        release["releasedByAnother"],
+        json!(false),
+        "a session that is not holding the row handed it back, so any worker could take work off \
+         another's session (docs/distributed.md §7): {release:#}"
+    );
+    assert_eq!(release["released"], json!(true), "{release:#}");
+    assert_eq!(release["status"], json!("parked"), "{release:#}");
+    assert_eq!(
+        release["session"],
+        json!("absent"),
+        "a row put back on the board still names the session that could not receive it: {release:#}"
+    );
+    assert_eq!(release["dispatchedAt"], json!("absent"), "{release:#}");
+    assert_eq!(
+        release["orderAfterRelease"], release["wantedAfterRelease"],
+        "a released row did not go back to its own place in the park order: the item that has \
+         waited longest is no longer the one taken next, and its `timeout:` has been running the \
+         whole time (docs/distributed.md §6.2, §6.5): {release:#}"
+    );
+    assert_eq!(
+        release["releasedSettled"],
+        json!(false),
+        "a row a worker's result already settled was put back on the board: {release:#}"
+    );
+    assert_eq!(release["settledStatus"], json!("settled"), "{release:#}");
+    assert_eq!(
+        release["releasedSuperseded"],
+        json!(false),
+        "a row the hub superseded was put back on the board, so work the execution has gone past \
+         would be dispatched again (docs/distributed.md §6.3): {release:#}"
+    );
+    assert_eq!(
+        release["supersededStatusAfter"],
+        json!("superseded"),
+        "{release:#}"
     );
 
     let settlement = &observed["settlement"];

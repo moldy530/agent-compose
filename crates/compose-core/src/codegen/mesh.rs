@@ -115,6 +115,78 @@ mod tests {
         assert_eq!(mounted, WORKER_ROUTES);
     }
 
+    /// The two routes a worker POSTs to take a body larger than the framework's
+    /// default.
+    ///
+    /// §3.3 and §3.4 each close their route's table of statuses and §10.1 lets a
+    /// peer rely on them, so a `413` raised underneath the handler is a status
+    /// neither gives — and an effect record carries the canonical request and the
+    /// whole outcome, so a megabyte is a size this protocol expects rather than a
+    /// pathological one. The mount is read back out of the source for the reason
+    /// [`WORKER_ROUTES`] is: a limit set in a comment is not a limit.
+    #[test]
+    fn the_routes_a_worker_posts_to_take_more_than_the_frameworks_default_body() {
+        for path in ["/workers/effects", "/workers/result"] {
+            let mount = SOURCE
+                .lines()
+                .find(|line| {
+                    line.trim_start()
+                        .starts_with(&format!("app.post(\"{path}\""))
+                })
+                .unwrap_or_else(|| panic!("`src/mesh.ts` mounts `{path}`"));
+            assert!(
+                mount.contains("bodyLimit: BODY_LIMIT"),
+                "`{path}` is mounted at the framework's default body limit, so a record or a \
+                 result over a megabyte is answered `413` — a status `docs/distributed.md` §3.3 \
+                 and §3.4 do not give the route: {mount}"
+            );
+        }
+        assert!(
+            SOURCE.contains("const BODY_LIMIT = 256 * 1024 * 1024;"),
+            "`src/mesh.ts`'s read ceiling is not the one \
+             `crates/agent-compose/src/worker/wire.rs` reads an answer under, so the two \
+             directions of this wire carry different limits"
+        );
+    }
+
+    /// A dispatch claimed for a worker that had already hung up goes **back on
+    /// the board** (§7).
+    ///
+    /// §7 makes dispatch at-least-once: "a hub that cannot tell whether a
+    /// dispatch arrived re-issues it". The claim is not free of time — opening
+    /// the journal and taking the row is an `await` — so the latch that says
+    /// whether the worker is still there is read again after it, and a row
+    /// claimed for a socket nothing was written to is handed back rather than
+    /// left `dispatched`. What that would otherwise cost is not one liveness
+    /// window but the node's whole `timeout:` chain (§6.5): the worker on the
+    /// other end is alive and polling, so §6.3 never fires.
+    #[test]
+    fn a_dispatch_claimed_for_a_worker_that_hung_up_goes_back_on_the_board() {
+        let poll = function_body("async function poll(");
+        let claim = poll
+            .find("await taken(session)")
+            .expect("`poll` claims a dispatch");
+        let release = poll
+            .find("await released(")
+            .unwrap_or_else(|| panic!("`poll` never hands a claim back: {poll}"));
+        assert!(
+            release > claim,
+            "`poll` reads the hangup latch only before the claim, so a worker that went away \
+             inside it leaves a row `dispatched` to a session that never received it: {poll}"
+        );
+        let released = function_body("async function released(");
+        assert!(
+            released.contains("journal.releaseDispatch(id, session)"),
+            "a claim is handed back somewhere other than the journal, and \
+             `docs/distributed.md` §8 rule 3 keeps dispatch state nowhere else: {released}"
+        );
+        assert!(
+            released.contains("stirPolls()"),
+            "a row put back on the board wakes no held poll, so the placement's next worker \
+             waits out a whole hold for work that is ready: {released}"
+        );
+    }
+
     /// §13's first row, held to its conservative default in the code.
     ///
     /// "Session dispatch capacity is exactly one" is a question the PRD owes an

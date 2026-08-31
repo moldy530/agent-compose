@@ -278,6 +278,10 @@ class DispatchJournal implements Journal {
     throw new WorkerJournalReach("claim a dispatch");
   }
 
+  releaseDispatch(_id: string, _session: string): boolean {
+    throw new WorkerJournalReach("put a dispatch back on the board");
+  }
+
   settleDispatch(_id: string, _outcome: JournalOutcome): boolean {
     throw new WorkerJournalReach("settle a dispatch");
   }

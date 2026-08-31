@@ -1550,6 +1550,82 @@ fn an_unknown_session_is_gone_at_every_route_that_carries_one() {
     }
 }
 
+/// A record, and a result, larger than the framework's own default body limit
+/// are **taken** (§3.3, §3.4).
+///
+/// Each of those two routes has a closed table of statuses and §10.1 lets an
+/// implementation rely on them, so a `413` from underneath the handler is a
+/// status neither table gives — and a worker meeting a `4xx` it has no row for
+/// has to read it as a refusal. Fastify's default is a megabyte, which is not a
+/// pathological body here: an effect record carries the canonical request *and*
+/// the whole outcome, so one placed `tool.*` answering with a document, or one
+/// long tool loop's model call, is past it with nothing having gone wrong.
+///
+/// What the failure would look like is why this is asserted at two megabytes
+/// rather than at the boundary. The record never reaches the journal, so the
+/// `effect_history` the redispatch of §7.2 hands the retry is short of the
+/// frontier and the model call §7.3 promises is not paid for twice is re-issued
+/// — and the replacement worker reaches the same record and meets the same
+/// refusal, so the placement never gets past that node.
+///
+/// The other direction of this wire was raised for the same reason: the worker
+/// reads a poll answer up to the artifact's size, because an `effect_history` is
+/// every effect at a node instance and grows the same way
+/// (`crates/agent-compose/src/worker/wire.rs`). A ceiling on one that the other
+/// does not have is a mesh that can dispatch what it cannot be told about.
+#[test]
+fn an_effect_and_a_result_larger_than_a_megabyte_are_taken_rather_than_refused() {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/releases", &json!({ "path": "dist/app" }));
+    let dispatch = worker.dispatch(&hub);
+    let id = dispatch["dispatch_id"]
+        .as_str()
+        .expect("a dispatch id")
+        .to_string();
+
+    let large = "x".repeat(2 * 1024 * 1024);
+    let handed = worker.effects(
+        &hub,
+        &id,
+        &json!([{
+            "key": "sign/0#model/0",
+            "site": "sign/0",
+            "kind": "model",
+            "ordinal": 0,
+            "request": "{\"model\":\"model.smart\"}",
+            "outcome": { "kind": "value", "value": { "text": large } },
+        }]),
+    );
+    assert_eq!(
+        handed.status,
+        204,
+        "an effect batch over a megabyte was not journaled: {}",
+        body_of(&handed)
+    );
+
+    let settled = worker.settle(&hub, &id, &json!({ "signature": large }));
+    assert_eq!(
+        settled.status,
+        204,
+        "a result over a megabyte did not settle its dispatch: {}",
+        body_of(&settled)
+    );
+
+    // …and it is the answer the graph went on with, rather than a `204` over a
+    // body the framework had already thrown away.
+    let done = hub.until(&execution, "completed", |report| {
+        report["status"] == json!("completed")
+    });
+    assert_eq!(
+        done["outputs"]["signature"].as_str().map(str::len),
+        Some(large.len()),
+        "the placed node's answer did not survive the route it came home on"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // §6.3, §7.2, §7.3 — the mid-node disconnect
 // ---------------------------------------------------------------------------

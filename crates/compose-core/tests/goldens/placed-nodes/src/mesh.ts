@@ -95,6 +95,27 @@ export const PROTOCOL_VERSION = 1;
  */
 const WORKER_RUNTIME = { name: "bun", major: 1 };
 
+/**
+ * How large a body the two routes a worker **POSTs** to will take.
+ *
+ * Fastify's default is a megabyte, and a megabyte is the wrong number for these
+ * two: §3.3 and §3.4 give each route a closed table of statuses, and neither
+ * table has a `413` in it. A framework answering one outside the table is read
+ * by a worker as a refusal, and §10.1 lets it be — so an effect record larger
+ * than the default would take a placement down rather than cost a batch, and it
+ * is a record this protocol positively expects to see. An effect carries the
+ * canonical request *and* the whole outcome (`docs/durability.md` §3), so one
+ * long tool loop's `model` call, or a placed `tool.*` answering with a document,
+ * is past a megabyte without anything having gone wrong.
+ *
+ * The number is the artifact's rather than a message's, and it is the same one
+ * `crates/agent-compose/src/worker/wire.rs` reads an answer under: the two
+ * directions of this wire carry the same things — an `effect_history` out, the
+ * effects that grew it back — so a ceiling on one that the other does not have
+ * is a mesh that can dispatch what it cannot be told about.
+ */
+const BODY_LIMIT = 256 * 1024 * 1024;
+
 /** How long a poll is held before it is answered `204` (§2). */
 const POLL_HOLD_MS = 25_000;
 
@@ -694,18 +715,26 @@ export function placementWaits(execution: string): readonly PlacementWait[] {
 
 /**
  * Park order, as §6.2 means it and as `journal.unsettledDispatches` sorts by:
- * when it went on the board, and then the ordinal at its instance path.
+ * when it went on the board, and then the order it went on in.
  *
- * The ordinal is compared **numerically**, which is the whole of why this is a
- * function rather than `<`. A wait id is `<instance path>/<ordinal>` and both
- * halves carry integers, so a string compare puts `sign/10` before `sign/2` and
- * `fan/0/11/0` before `fan/0/2/0` — a report of a draining queue in an order
- * that is not the order it drains in. `./journal.ts` was given
- * `ORDER BY parked_at ASC, rowid ASC` for exactly this reason, and the report
- * that publishes the board has to agree with the board.
+ * **The tiebreak is the board's own**, not a second rule that resembles it.
+ * `parkedAt` is milliseconds and a fan-out parks its instances from one
+ * synchronous burst, so the tie is the ordinary case; `./journal.ts` breaks it
+ * with `ORDER BY parked_at ASC, rowid ASC`, and `DispatchRow.order` is that
+ * rowid carried on the row so this comparison can be the same comparison. A
+ * report that ordered a draining queue by anything else could name the next item
+ * as one other than the one the hub will hand out.
+ *
+ * `natural` is the fallback for a wait whose row this process has not cached —
+ * and it is a *natural* compare rather than `<` because a wait id is `<instance
+ * path>/<ordinal>` and both halves carry integers, so a string compare puts
+ * `sign/10` before `sign/2` and `fan/0/11/0` before `fan/0/2/0`.
  */
 function byParkOrder(left: PlacementWait, right: PlacementWait): number {
   if (left.parkedAt !== right.parkedAt) return left.parkedAt < right.parkedAt ? -1 : 1;
+  const here = rows.get(left.dispatch)?.order;
+  const there = rows.get(right.dispatch)?.order;
+  if (here !== undefined && there !== undefined && here !== there) return here < there ? -1 : 1;
   return natural(left.id, right.id);
 }
 
@@ -834,8 +863,15 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
 
   app.post("/workers/join", async (request, reply) => join(request, reply));
   app.get("/workers/poll", async (request, reply) => poll(request, reply, timings.holdMs));
-  app.post("/workers/effects", async (request, reply) => effects(request, reply));
-  app.post("/workers/result", async (request, reply) => result(request, reply));
+  // The two a worker POSTs to carry [`BODY_LIMIT`] rather than the framework's
+  // megabyte: a `413` is a status §3.3 and §3.4 do not give, and a worker acting
+  // on one outside their tables is a placement lost over one large record.
+  app.post("/workers/effects", { bodyLimit: BODY_LIMIT }, async (request, reply) =>
+    effects(request, reply),
+  );
+  app.post("/workers/result", { bodyLimit: BODY_LIMIT }, async (request, reply) =>
+    result(request, reply),
+  );
   app.get("/workers/artifact/:hash", async (request, reply) => artifact(request, reply));
 
   sweeping(timings.windowMs);
@@ -1081,9 +1117,14 @@ async function poll(
   // `session.seen` for a request that has demonstrably ended, extending §6.3's
   // "90 seconds since the last request on a session" by up to a whole hold; and
   // it would `claimDispatch` parked work for a socket nothing can be written to,
-  // marking the row `dispatched` against a session that will never settle it —
-  // so the node waits out the liveness window before anything supersedes it and
-  // loses an attempt to a dispatch it never received.
+  // marking the row `dispatched` against a session that never received it. What
+  // that second one costs is worth stating exactly, because it is *not* one
+  // liveness window: a worker whose poll an intermediary dropped is still there
+  // and still polling, so §6.3 never fires and nothing supersedes the row until
+  // that node's `timeout:` chain runs out from dispatch (§6.5) — the whole
+  // budget, spent on a message that was never delivered. So the latch is read
+  // twice, once before the board is looked at and once after the claim, and
+  // [`released`] is what the second read does about it.
   //
   // **Both events, because the two runtimes emit different ones.** A hangup
   // during a hold raises `aborted` on the *request* under Bun and `close` on the
@@ -1104,15 +1145,22 @@ async function poll(
     hungUp = true;
     for (const wake of [...holds]) wake();
   };
+  // `socket.destroyed` beside the latch, for a runtime that emits neither
+  // event: it is never true of a connection a hold is still open on, and it is
+  // what both runtimes agree about after a hangup.
+  //
+  // A function rather than the expression written twice, because it is **asked
+  // twice** and the second answer is not the first: everything between them is
+  // an `await`, and both halves of this can become true inside one. Written
+  // inline, a compiler that has narrowed the first read would fold the second
+  // into `false`, which is the one thing it may not be.
+  const away = (): boolean => hungUp || reply.raw.socket?.destroyed === true;
   request.raw.once("aborted", hangUp);
   reply.raw.once("close", hangUp);
   try {
     const deadline = Date.now() + holdMs;
     for (;;) {
-      // `socket.destroyed` beside the latch, for a runtime that emits neither
-      // event: it is never true of a connection a hold is still open on, and it
-      // is what both runtimes agree about after a hangup.
-      if (hungUp || reply.raw.socket?.destroyed === true) return reply.code(204).send();
+      if (away()) return reply.code(204).send();
       // The session's own request keeps it alive for the whole hold, not only
       // for the instant it arrived: a hold that outlived the window would let
       // the sweep declare the very worker whose poll it is holding gone.
@@ -1121,7 +1169,24 @@ async function poll(
       // subscribed: see [`boardMoved`].
       const seen = boardMoved;
       const dispatch = await taken(session);
-      if (dispatch !== undefined) return reply.code(200).send(dispatch);
+      if (dispatch !== undefined) {
+        // **Checked again, because the claim is not free of time.** The latch at
+        // the top of the loop was read before the board was; opening the journal
+        // and claiming a row is an `await`, and a worker that hung up inside it
+        // is one this hub has just marked a row `dispatched` for over a socket
+        // nothing can be written to. Nothing was sent, so §7's "a hub that
+        // cannot tell whether a dispatch arrived re-issues it" is not even a
+        // judgement call here: it demonstrably did not arrive, and the row goes
+        // back on the board in its own place rather than sitting `dispatched`
+        // until that node's `timeout:` fires (§6.5) — which is what it would do,
+        // because the worker on the other end is *alive* and its next poll
+        // refreshes the very liveness window that would otherwise supersede it.
+        if (away()) {
+          await released(String(dispatch["dispatch_id"]), session.id);
+          return reply.code(204).send();
+        }
+        return reply.code(200).send(dispatch);
+      }
       const left = deadline - Date.now();
       if (left <= 0) return reply.code(204).send();
       await held(Math.min(left, holdMs), seen, holds);
@@ -1186,6 +1251,34 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
     };
   }
   return undefined;
+}
+
+/**
+ * Undo one claim [`poll`] made for a worker that had already gone.
+ *
+ * The inverse of the claim in [`taken`], and everything that claim did is undone
+ * in the same order: the journal's row goes back to `parked` under its original
+ * `parked_at` — so it keeps its place in the park order §6.2 drains in, ahead of
+ * whatever queued behind it — this process's cache follows the journal, the wait
+ * this hub is holding is a pause again rather than a node running elsewhere, and
+ * the held polls are stirred so the placement's next worker is answered with it
+ * now instead of a hold later.
+ *
+ * A row the journal will not hand back is left alone and announced to nobody:
+ * `releaseDispatch` takes only a row still `dispatched` to *this* session, so a
+ * result that arrived in the meantime, or a deadline that superseded it, wins.
+ */
+async function released(id: string, session: string): Promise<void> {
+  const journal = await openJournal();
+  if (!journal.releaseDispatch(id, session)) return;
+  const parked = journal.dispatchOf(id);
+  if (parked !== undefined) rows.set(id, parked);
+  const local = awaiting.get(id);
+  if (local !== undefined) {
+    local.taken = false;
+    announceWaits(local.execution);
+  }
+  stirPolls();
 }
 
 /**
@@ -1280,11 +1373,12 @@ function held(milliseconds: number, seen: number, hangUps: Set<() => void>): Pro
  * **And it is read whole before any of it is written.** §3.3 says nothing about
  * atomicity, so this is a choice rather than a rule — but it is the only one
  * that makes the `400` mean what a worker reads it as. A refusal on this route
- * is the one answer no re-send improves, so a worker treats it as terminal; a
- * `400` sent after half the batch was already appended would end that worker
- * with a partly applied batch behind it, and the next reader of the journal
- * could not tell which half. Building every record first costs one pass over a
- * batch that is usually one record, and buys a refusal that changed nothing.
+ * is the one answer no re-send improves, so a worker takes it as the end of that
+ * dispatch; a `400` sent after half the batch was already appended would fail
+ * that attempt with a partly applied batch behind it, and the next reader of the
+ * journal could not tell which half. Building every record first costs one pass
+ * over a batch that is usually one record, and buys a refusal that changed
+ * nothing.
  */
 async function effects(request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   if (!authenticated(request)) return reply.code(401).send();

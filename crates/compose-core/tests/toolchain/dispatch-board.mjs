@@ -20,6 +20,15 @@
 //     `204` either way. A caller that trusted the answer to tell a first settle
 //     from a re-post would take the second result's outcome as newly journaled.
 //
+//   * **`releaseDispatch` is the exact inverse of a claim.** §7 makes dispatch
+//     at-least-once, and where the hub can tell an answer never reached the
+//     worker it was written for, re-issuing is putting the row back rather than
+//     waiting out the node's whole deadline. What has to hold of that is not
+//     reachable over HTTP either: the row goes back to its **own place** in the
+//     park order rather than to the end of the queue, only the session holding
+//     it may hand it back, and a row that has moved on — settled, or superseded
+//     — is left exactly as it is.
+//
 // `src/journal.ts` is a compiler constant, byte-identical in every project this
 // release builds, so driving it directly is driving what every project runs.
 //
@@ -92,6 +101,24 @@ const afterSupersede = journal.settleDispatch("dsp_board_1", {
 
 const unknown = journal.settleDispatch("dsp_board_nothing", { kind: "value", value: {} });
 
+// §7's at-least-once, from the journal's side: a claim, and the exact inverse of
+// it. `dsp_board_5` is picked out of the middle of the queue so that "back in
+// its own place" is a different answer from "back at either end".
+const claimed = journal.claimDispatch("dsp_board_5", "wrk_one");
+const releasedByAnother = journal.releaseDispatch("dsp_board_5", "wrk_two");
+const released = journal.releaseDispatch("dsp_board_5", "wrk_one");
+const afterRelease = journal.dispatchOf("dsp_board_5");
+const orderAfterRelease = journal
+  .unsettledDispatches()
+  .filter((row) => row.execution === execution)
+  .map((row) => row.wait);
+// …and the two rows that have moved on. Neither may be handed back, whoever
+// asks: one holds a worker's result and the other a hub's supersede, and a
+// release that took either would put work back on the board that the execution
+// has already gone past.
+const releasedSettled = journal.releaseDispatch("dsp_board_0", "wrk_one");
+const releasedSuperseded = journal.releaseDispatch("dsp_board_1", "wrk_one");
+
 // §3.2's OPTIONAL payload fields, journaled beside `inputs` and read back.
 journal.park({
   execution,
@@ -111,7 +138,34 @@ const payload = journal.dispatchOf("dsp_board_payload");
 
 process.stdout.write(
   `${JSON.stringify({
-    parkOrder: { wanted, order, ofExecution },
+    parkOrder: {
+      wanted,
+      order,
+      ofExecution,
+      // The tiebreak itself, carried on the row: `rowid`, which is what
+      // `ORDER BY parked_at ASC, rowid ASC` breaks a shared instant with and
+      // what a synchronous reader of these rows has to sort by to agree with
+      // the queue it is reporting on.
+      insertion: journal
+        .unsettledDispatches()
+        .filter((row) => row.execution === execution)
+        .map((row) => row.order ?? null),
+    },
+    release: {
+      claimed: claimed?.status ?? null,
+      claimedBy: claimed?.session ?? null,
+      releasedByAnother,
+      released,
+      status: afterRelease?.status ?? null,
+      session: afterRelease?.session ?? "absent",
+      dispatchedAt: afterRelease?.dispatchedAt ?? "absent",
+      orderAfterRelease,
+      wantedAfterRelease: wanted.slice(2),
+      releasedSettled,
+      settledStatus: journal.dispatchOf("dsp_board_0")?.status ?? null,
+      releasedSuperseded,
+      supersededStatusAfter: journal.dispatchOf("dsp_board_1")?.status ?? null,
+    },
     settlement: {
       first,
       again,

@@ -412,6 +412,23 @@ export interface DispatchRow {
   readonly outcome?: JournalOutcome;
   /** When it went on the board, as an ISO 8601 instant — the park order. */
   readonly parkedAt: string;
+  /**
+   * How this row breaks a `parkedAt` tie: where it went in, relative to every
+   * other row of this table.
+   *
+   * `parkedAt` is milliseconds and a fan-out parks its instances from one
+   * synchronous burst, so ties are the ordinary case rather than the odd one —
+   * and the board's own reads settle them with `ORDER BY parked_at ASC, rowid
+   * ASC` ([`INSERTION_ORDER`]). This is that same rowid, carried on the row so
+   * that a **synchronous** reader — the status report, which is built from a
+   * cache of these rows and cannot await a query — orders a draining queue by
+   * the rule the queue actually drains by, rather than by a second rule of its
+   * own that agrees with it most of the time.
+   *
+   * Present on a row read back **out of** the journal, which is every row any
+   * caller is handed; absent only on one a caller built to hand to [`park`].
+   */
+  readonly order?: number;
   /** When a session took it. */
   readonly dispatchedAt?: string;
   /** When it stopped being unsettled, however it stopped. */
@@ -588,6 +605,24 @@ export interface Journal {
    * arriving together are.
    */
   claimDispatch(id: string, session: string): DispatchRow | undefined;
+  /**
+   * Put a dispatch back on the board that a session was handed and **cannot have
+   * received** — the exact inverse of [`claimDispatch`], answering whether this
+   * call did it.
+   *
+   * `docs/distributed.md` §7 makes dispatch at-least-once: "a hub that cannot
+   * tell whether a dispatch arrived re-issues it". Where the hub can tell it did
+   * *not* arrive — the connection the answer was owed to ended before the answer
+   * was written — re-issuing is putting the row back rather than waiting out the
+   * node's deadline, and the row keeps its `parked_at` and its insertion order,
+   * so it keeps its place in the park order §6.2 drains in.
+   *
+   * `session` is in the predicate for the reason `claimDispatch`'s `status` is:
+   * only the session a row was handed to may hand it back, and a row that has
+   * moved on since — settled by a result, superseded by a deadline — is left
+   * exactly as it is.
+   */
+  releaseDispatch(id: string, session: string): boolean;
   /**
    * Settle one dispatch with what the worker answered (§3.4).
    *
@@ -988,20 +1023,22 @@ class SqliteJournal implements Journal {
 
   dispatchAt(execution: string, wait: string): DispatchRow | undefined {
     const found = this.#database.get(
-      "SELECT * FROM dispatches WHERE execution = ? AND wait = ?",
+      `SELECT rowid AS insertion_order, * FROM dispatches WHERE execution = ? AND wait = ?`,
       [execution, wait],
     ) as Row | null;
     return found === null ? undefined : dispatchOf(found);
   }
 
   dispatchOf(id: string): DispatchRow | undefined {
-    const found = this.#database.get("SELECT * FROM dispatches WHERE id = ?", [id]) as Row | null;
+    const found = this.#database.get("SELECT rowid AS insertion_order, * FROM dispatches WHERE id = ?", [
+      id,
+    ]) as Row | null;
     return found === null ? undefined : dispatchOf(found);
   }
 
   dispatchesOf(execution: string): readonly DispatchRow[] {
     const rows = this.#database.all(
-      `SELECT * FROM dispatches WHERE execution = ? ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
+      `SELECT rowid AS insertion_order, * FROM dispatches WHERE execution = ? ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
       [execution],
     ) as Row[];
     return rows.map((row) => dispatchOf(row));
@@ -1009,7 +1046,7 @@ class SqliteJournal implements Journal {
 
   unsettledDispatches(): readonly DispatchRow[] {
     const rows = this.#database.all(
-      `SELECT * FROM dispatches WHERE status IN ('parked', 'dispatched') ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
+      `SELECT rowid AS insertion_order, * FROM dispatches WHERE status IN ('parked', 'dispatched') ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
     ) as Row[];
     return rows.map((row) => dispatchOf(row));
   }
@@ -1024,6 +1061,14 @@ class SqliteJournal implements Journal {
     );
     const held = this.dispatchOf(id);
     return held?.status === "dispatched" && held.session === session ? held : undefined;
+  }
+
+  releaseDispatch(id: string, session: string): boolean {
+    this.#database.run(
+      "UPDATE dispatches SET status = 'parked', session = NULL, dispatched_at = NULL WHERE id = ? AND status = 'dispatched' AND session = ?",
+      [id, session],
+    );
+    return this.dispatchOf(id)?.status === "parked";
   }
 
   settleDispatch(id: string, outcome: JournalOutcome): boolean {
@@ -1082,6 +1127,7 @@ function dispatchOf(row: Row): DispatchRow {
   const itemIndex = row["item_index"];
   const history = row["history"];
   const policy = row["policy"];
+  const order = row["insertion_order"];
   return {
     execution: String(row["execution"]),
     wait: String(row["wait"]),
@@ -1108,6 +1154,7 @@ function dispatchOf(row: Row): DispatchRow {
               : ({ kind: "value", value: JSON.parse(String(payload)) as unknown } as const),
         }),
     parkedAt: String(row["parked_at"]),
+    ...(order === null || order === undefined ? {} : { order: Number(order) }),
     ...(dispatchedAt === null || dispatchedAt === undefined
       ? {}
       : { dispatchedAt: String(dispatchedAt) }),
