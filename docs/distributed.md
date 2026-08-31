@@ -1480,12 +1480,16 @@ Which gives, concretely:
 
 **One of a tool's `${ENV}` references is declared rather than walked, and the
 closure does not care.** A `module:` binding names hand-written TypeScript
-(`docs/grammar.md` §6.1), and a `process.env` read inside it is not something the
+(`docs/grammar.md` §6.1), and a variable read inside it is not something the
 walk above can see — so the binding declares its environment in the YAML, in the
 same shape an `exec:` block's `env:` takes, and those names enter this closure at
-the tool's own address like every other tool surface's (PRD resolved q49). What
-follows is the property that matters and it is unchanged: a module tool's
-variables reach exactly the processes that can execute it. Everything else in
+the tool's own address like every other tool surface's (PRD resolved q49). The
+declaration is also the implementation's only way to the values, which reach it
+as a typed argument rather than through `process.env` — so a variable this
+closure did not carry to a process is one that tool's code cannot read there,
+rather than one it silently reads from whatever else that machine was started
+with. What follows is the property that matters and it is unchanged: a module
+tool's variables reach exactly the processes that can execute it. Everything else in
 this section — the executes-in rule, the two worked cases, §9.2's `env_ok` — is
 written over the closure and not over how a name got into it.
 

@@ -4634,6 +4634,27 @@ export interface ModuleBinding {
 }
 
 /**
+ * The environment one `module:` binding declared, resolved for one call
+ * (grammar 4.3 class 2, 6.1).
+ *
+ * **A map of its own, never `process.env`.** An `exec:` binding's `env:` reaches
+ * its implementation as the *child's* environment, which no other call in this
+ * process shares; a module runs here, so its declaration is handed to it the
+ * same way — as an argument. Written into the ambient environment instead it
+ * would outlive the call it belongs to and reach every later `exec:` child,
+ * every other module, and whatever ran concurrently beside it, which is the one
+ * thing "these names hold these values **when this implementation runs**" does
+ * not say. It would also differ under replay, which never enters the
+ * implementation at all.
+ *
+ * `./modules.ts` states this per tool, over the names that binding declared, so
+ * a read of a variable the YAML does not list is a type error rather than an
+ * `undefined` at three in the morning. This is the erased version the runtime
+ * builds and passes.
+ */
+export type ModuleEnv = Readonly<Record<string, string>>;
+
+/**
  * What an authored module is, from this side: the tool's parsed input in, its
  * declared result out.
  *
@@ -4642,9 +4663,14 @@ export interface ModuleBinding {
  * version the runtime dispatches through, and it takes `context` for
  * [`HostFunction`]'s reason: a module tool reached as the sink of a **detached**
  * dispatch finds that dispatch's key in `context.idempotency_key`, and finds it
- * absent on every other call.
+ * absent on every other call. `E` is the binding's own [`ModuleEnv`], which the
+ * generated contract narrows to the names it declared.
  */
-export type ModuleImplementation<I, O> = (input: I, context: RunContext) => O | Promise<O>;
+export type ModuleImplementation<I, O, E extends ModuleEnv = ModuleEnv> = (
+  input: I,
+  context: RunContext,
+  env: E,
+) => O | Promise<O>;
 
 /**
  * Call an authored module implementation, in this process (grammar 6.1).
@@ -4664,18 +4690,19 @@ export type ModuleImplementation<I, O> = (input: I, context: RunContext) => O | 
  * an implementation that changed is a new artifact hash rather than a new effect
  * identity, and `docs/durability.md` §3.2's subject is the composition.
  *
- * **The environment is materialised first.** `env:` is the same declaration an
- * `exec:` binding makes, and it means the same thing: these names hold these
- * values when the implementation runs. An `exec:` puts them in the child's
- * environment because that is where its implementation reads them; a module runs
- * in this process, so they go in this process's `process.env` — which is where
- * `process.env.SIGNING_KEY` inside authored TypeScript reads them. A binding
- * that maps a name to itself (`SIGNING_KEY: "${SIGNING_KEY}"`, the ordinary
- * spelling) writes back the value already there.
+ * **The environment is resolved into an argument.** `env:` is the same
+ * declaration an `exec:` binding makes and it means the same thing — these names
+ * hold these values when the implementation runs — so it is delivered the way an
+ * `exec:`'s is: as the call's own environment, which nothing outside the call
+ * shares. An `exec:` builds a child's environment; this builds the third
+ * argument, and [`ModuleEnv`] says why it is not `process.env`. A binding that
+ * maps a name to itself (`SIGNING_KEY: "${SIGNING_KEY}"`, the ordinary spelling)
+ * hands on the value already there, resolved at the moment of the call like
+ * every other class-2 reference.
  */
-export async function callModule<I, O>(
+export async function callModule<I, O, E extends ModuleEnv>(
   binding: ModuleBinding,
-  implementation: ModuleImplementation<I, O>,
+  implementation: ModuleImplementation<I, O, E>,
   input: I,
   context: RunContext,
 ): Promise<O> {
@@ -4690,10 +4717,15 @@ export async function callModule<I, O>(
       input,
     },
     async () => {
+      const environment: Record<string, string> = {};
       for (const entry of binding.env) {
-        process.env[entry.name] = interpolate(entry.value);
+        environment[entry.name] = interpolate(entry.value);
       }
-      return await implementation(input, context);
+      // The cast is the compiler's own guarantee rather than a claim about
+      // arbitrary data: `E` is the type `./modules.ts` wrote from this binding's
+      // `env:`, and the loop above filled exactly those names from the same
+      // declaration. One emitter wrote both.
+      return await implementation(input, context, environment as E);
     },
   );
 }

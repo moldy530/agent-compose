@@ -70,6 +70,18 @@
 //! report sends the reader to `build` for; a per-file rule would answer that
 //! instruction with a refusal.
 //!
+//! **A carried path is under the same rule, and that is deliberate.** [`write`]
+//! puts an authored file down at its project-relative name too, so a directory
+//! this compiler has never built into is scanned for those names as well
+//! ([`not_ours`]) — a first build into somebody's tree does not put a
+//! composition's `src/tools/sign.ts` over a `src/tools/sign.ts` of theirs. Inside
+//! a directory it *has* built into, the scan is skipped for a carried path
+//! exactly as it is for an emitted one: the copy there is a build artifact, the
+//! drift report compares it, and "run `agent-compose build`" is the remedy it
+//! prints — which a refusal over the copy would make a lie. The author's file is
+//! the project-side original, and nothing here writes to that tree but
+//! [`scaffold`].
+//!
 //! # The second: a scaffold, in the one tree that is not the output directory
 //!
 //! A `module:` binding names authored TypeScript, and `build` **scaffolds** it
@@ -233,8 +245,22 @@ pub(crate) fn scaffold(scaffolds: &[Scaffold], root: &Path) -> io::Result<Vec<(S
     let mut scaffolded: Vec<(String, String)> = Vec::new();
     for scaffold in scaffolds {
         let path = at(root, &scaffold.path);
-        if path.exists() {
+        // The **same** predicate `validate` and `build --check` refuse over
+        // (`compose_core::module_is_present`), rather than a second reading of
+        // "there". A directory at the path is the case that separates them: with
+        // `Path::exists` here, `validate` would name this command as the repair
+        // and this command would write nothing and then fail on the read.
+        if compose_core::module_is_present(root, &scaffold.path) {
             continue;
+        }
+        if path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "cannot scaffold `{}` for `{}`: something that is not a file is already there",
+                    scaffold.path, scaffold.tool
+                ),
+            ));
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -711,9 +737,9 @@ tool.sign:
     }
 
     /// An empty file counts as present: a scaffold is a write `build` makes
-    /// where there is nothing at all, and "nothing at all" is a path that does
-    /// not exist. Anything else would mean reading what the author wrote to
-    /// decide whether it was worth keeping.
+    /// where there is nothing at all, and "nothing at all" is a path holding no
+    /// file. Anything else would mean reading what the author wrote to decide
+    /// whether it was worth keeping.
     #[test]
     fn a_module_that_exists_is_never_scaffolded_over_however_empty() {
         let (_, scaffolds, root) = with_module();
@@ -724,6 +750,41 @@ tool.sign:
         assert_eq!(
             std::fs::read_to_string(root.join("src/tools/sign.ts")).expect("readable"),
             ""
+        );
+    }
+
+    /// "There" means the same thing to this command and to the verbs that refuse
+    /// over it.
+    ///
+    /// A **directory** at a module path is the case that separates the two
+    /// readings: `validate` and `build --check` ask whether a *file* is there
+    /// and name `agent-compose build` as the repair, so a `build` that asked
+    /// merely whether something exists would write nothing, say nothing, and
+    /// then fail further down on a read — the named repair not repairing. It
+    /// refuses instead, naming the path and the tool.
+    #[test]
+    fn a_directory_at_a_module_path_is_refused_rather_than_scaffolded_around() {
+        let (ir, scaffolds, root) = with_module();
+        std::fs::create_dir_all(root.join("src/tools/sign.ts")).expect("writable");
+
+        // The two verbs agree that nothing is there…
+        let refusals = compose_core::check_modules(&ir, &root);
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert!(
+            refusals[0]
+                .message
+                .contains("`src/tools/sign.ts`, which does not exist"),
+            "{refusals:?}"
+        );
+        // …and the repair they name says so too, rather than writing nothing.
+        let refused =
+            scaffold(&scaffolds, &root).expect_err("a directory is not an implementation");
+        assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            refused
+                .to_string()
+                .contains("cannot scaffold `src/tools/sign.ts` for `tool.sign`"),
+            "{refused}"
         );
     }
 

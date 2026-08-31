@@ -342,8 +342,8 @@ fn drift_help(not_ours: &[String]) -> String {
     };
     format!(
         "help: `agent-compose build` will not regenerate this directory: it holds {noun} this \
-         compiler did not write at {noun} it emits ({}), and the build would have replaced \
-         {pronoun}. Point `--out` at a directory of its own, or move {pronoun} aside\n",
+         compiler did not write at {noun} this build writes ({}), and the build would have \
+         replaced {pronoun}. Point `--out` at a directory of its own, or move {pronoun} aside\n",
         not_ours
             .iter()
             .map(|path| format!("`{path}`"))
@@ -685,15 +685,18 @@ mod tests {
         assert_eq!(
             drift_help(&["src/graph.ts".to_string()]),
             "help: `agent-compose build` will not regenerate this directory: it holds a file this \
-             compiler did not write at a file it emits (`src/graph.ts`), and the build would have \
-             replaced it. Point `--out` at a directory of its own, or move it aside\n"
+             compiler did not write at a file this build writes (`src/graph.ts`), and the build \
+             would have replaced it. Point `--out` at a directory of its own, or move it aside\n"
         );
+        // The plural form, and a **carried** path in it: what the build writes
+        // is wider than what it emits (PRD resolved q49), so the sentence says
+        // "writes" — `src/tools/sign.ts` is a name this compiler never emits.
         assert_eq!(
-            drift_help(&["package.json".to_string(), "src/graph.ts".to_string()]),
+            drift_help(&["src/graph.ts".to_string(), "src/tools/sign.ts".to_string()]),
             "help: `agent-compose build` will not regenerate this directory: it holds files this \
-             compiler did not write at files it emits (`package.json`, `src/graph.ts`), and the \
-             build would have replaced them. Point `--out` at a directory of its own, or move \
-             them aside\n"
+             compiler did not write at files this build writes (`src/graph.ts`, \
+             `src/tools/sign.ts`), and the build would have replaced them. Point `--out` at a \
+             directory of its own, or move them aside\n"
         );
     }
 

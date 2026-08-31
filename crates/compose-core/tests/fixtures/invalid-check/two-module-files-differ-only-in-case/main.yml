@@ -1,0 +1,33 @@
+# rule: case is not what tells two authored files apart (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `tool.verify` is implemented by `src/tools/Sign.ts`, which differs only in case from `src/tools/sign.ts` — `tool.sign`'s
+# at: main.yml:33:11
+# label: main.yml:25:11 first bound here
+# help: an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract — and on macOS and Windows two spellings that differ only in case are one file: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)
+# count: 2
+#
+# Two files on Linux, one on macOS. `build` scaffolds the first and then finds
+# `Sign.ts` already there, so the second tool's contract would be bound to the
+# first tool's implementation — on some machines and not others, which is the one
+# outcome a composition may never have.
+#
+# The second diagnostic is the missing-file rule, and it is here because the
+# second spelling deliberately is not on disk: a checkout that carried both
+# would be the very thing this rule says cannot exist everywhere.
+version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+
+tool.verify:
+  description: Verify a signature.
+  input:
+    signature: { type: string }
+  output:
+    ok: { type: boolean }
+  module: ./src/tools/Sign.ts

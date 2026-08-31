@@ -239,8 +239,18 @@ const CODEGEN: &[Criterion] = &[
             // assertion — and the policy chain that governs both. A module
             // dispatched through a seam of its own could pass any one of them
             // alone while behaving unlike a tool at the other two.
+            //
+            // A fourth is about the one thing a module has that the other three
+            // bindings cannot have wrong, because they run somewhere else: its
+            // declared `env:` is the *call's*, and running in the graph's own
+            // process is exactly what makes "and nothing else in this process
+            // sees it" a claim worth executing (PRD resolved q49).
             (
                 "a_module_tool_runs_at_a_function_node_and_reads_the_environment_it_declared",
+                Status::Live,
+            ),
+            (
+                "a_module_tools_declared_environment_reaches_the_call_and_no_subprocess_after_it",
                 Status::Live,
             ),
             (

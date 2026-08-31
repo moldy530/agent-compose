@@ -511,17 +511,42 @@ fn module_path(written: &Spanned<String>, subject: &str, cx: &mut Cx) -> Option<
         );
         return None;
     };
-    if crate::codegen::EMITTED_PATHS.contains(&normalized.as_str()) {
+    // Case-insensitively, because the string is a **file name** before it is
+    // anything else and macOS and Windows hold `src/Graph.ts` and `src/graph.ts`
+    // in one place. A comparison that distinguished them would accept a
+    // composition here and then, on such a host, write the emitted file over the
+    // author's implementation — a build that destroys code and a `--check` that
+    // can never converge, on the machines a validator cannot see. One portable
+    // spelling is the rule grammar 1.4 already applies to a path (D80).
+    if let Some(emitted) = crate::codegen::EMITTED_PATHS
+        .iter()
+        .find(|path| path.eq_ignore_ascii_case(&normalized))
+    {
+        let zone = crate::codegen::AUTHORED_ZONE;
+        let (message, help) = if *emitted == normalized {
+            (
+                format!("`{normalized}` is a file `agent-compose build` generates"),
+                format!(
+                    "the compiler writes that file itself, so the implementation {subject} names would be overwritten by every build: put it somewhere `build` does not emit — `{zone}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)"
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "`{normalized}` differs only in case from `{emitted}`, a file `agent-compose build` generates"
+                ),
+                format!(
+                    "macOS and Windows hold those two spellings in one file, so on such a host the build would write `{emitted}` over the implementation {subject} names — and a composition that works on one machine and destroys code on another is not one this compiler emits: put it somewhere `build` does not emit — `{zone}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)"
+                ),
+            )
+        };
         cx.push(
             Diagnostic::error(
                 DiagnosticCode::InvalidModulePath,
                 written.span.clone(),
-                format!("`{normalized}` is a file `agent-compose build` generates"),
+                message,
             )
-            .with_help(format!(
-                "the compiler writes that file itself, so the implementation {subject} names would be overwritten by every build: put it somewhere `build` does not emit — `{}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)",
-                crate::codegen::AUTHORED_ZONE
-            )),
+            .with_help(help),
         );
         return None;
     }

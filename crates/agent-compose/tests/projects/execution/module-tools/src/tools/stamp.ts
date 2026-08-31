@@ -7,13 +7,14 @@ import type { ToolStampModule } from "../modules.ts";
  * annotation: `ToolStampModule` is generated from those two schemas, so a change
  * to either stops this file compiling (grammar 6.1, PRD resolved q48).
  *
- * `STAMP_MARKER` is read out of the environment, which is why the binding
- * declares it: `References::of` cannot walk a `process.env` read inside
- * TypeScript, so the YAML is where the environment partition learns of it (PRD
- * resolved q49).
+ * `STAMP_MARKER` arrives as the third argument rather than out of
+ * `process.env`, and `ToolStampModuleEnv` admits that name because the binding
+ * declares it: `References::of` cannot walk a variable read inside TypeScript,
+ * so the YAML is both where the environment partition learns of it and where
+ * this file's right to read it comes from (PRD resolved q49).
  */
-const toolStamp: ToolStampModule = (input) => ({
-  stamped: `${input.payload} ${process.env.STAMP_MARKER ?? "unmarked"}`,
+const toolStamp: ToolStampModule = (input, _context, env) => ({
+  stamped: `${input.payload} ${env.STAMP_MARKER}`,
 });
 
 export default toolStamp;

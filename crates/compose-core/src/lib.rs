@@ -78,6 +78,7 @@ pub mod yaml;
 
 pub use check::check;
 pub use check::modules::missing as check_modules;
+pub use check::modules::present as module_is_present;
 pub use codegen::authored::Authored;
 pub use codegen::diagnostics as target_diagnostics;
 pub use codegen::{COMPILER_VERSION, GeneratedFile, GeneratedProject, emit};

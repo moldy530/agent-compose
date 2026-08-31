@@ -9,9 +9,12 @@
 //!
 //! * **the contract.** One exported function type per module-bound tool,
 //!   written from that tool's own `input:` and `output:` through the Zod
-//!   [`super::schema`] already emits. A schema that moves is a type error in the
-//!   authored file naming the field that moved, which is what makes a marker
-//!   protocol unnecessary (D132).
+//!   [`super::schema`] already emits, beside a type for the `env:` the binding
+//!   declared — the argument the runtime hands the implementation instead of
+//!   writing the composition's variables into this process's own environment. A
+//!   schema that moves is a type error in the authored file naming the field
+//!   that moved, and so is a read of a variable the YAML never declared, which
+//!   is what makes a marker protocol unnecessary (D132).
 //! * **the seam.** One `import` per binding and one typed `const` per binding.
 //!   The annotation is the check: `export const toolSignModule: ToolSignModule =
 //!   toolSignModuleImplementation;` is an ordinary assignability test, so an
@@ -49,12 +52,14 @@ pub const PATH: &str = "src/modules.ts";
 
 /// Declare the names `src/modules.ts` exports, in the project's one namespace.
 ///
-/// Two per binding — the typed `const` the seam exposes and the local the
-/// authored default is imported as — so a tool called `modules` cannot collide
-/// with either (see [`Names::declare`](super::names::Names::declare)).
+/// Three per binding — the typed `const` the seam exposes, the environment type
+/// beside its contract, and the local the authored default is imported as — so a
+/// tool called `modules` cannot collide with any of them (see
+/// [`Names::declare`](super::names::Names::declare)).
 pub fn declare(names: &mut Names, ir: &Ir) {
     for (address, _) in crate::check::modules::bindings(ir) {
         names.declare(&format!("{address}.module"));
+        names.declare(&format!("{address}.module.env"));
         names.declare(&format!("{address}.module.implementation"));
     }
 }
@@ -128,8 +133,12 @@ fn contract(ir: &Ir, names: &Names, address: &str, binding: &Module) -> String {
     let output = names.value(&format!("{address}.output"));
     let value = names.value(&format!("{address}.module"));
     let ty = names.ty(&format!("{address}.module"));
+    let environment = names.ty(&format!("{address}.module.env"));
     let implementation = names.value(&format!("{address}.module.implementation"));
     let path = binding.path.value.as_str();
+
+    let mut text = String::from("\n");
+    text.push_str(&environment_type(binding, address, &environment));
 
     let mut doc: Vec<String> = vec![
         format!("`{address}` — {}", tool.description.value),
@@ -146,12 +155,15 @@ fn contract(ir: &Ir, names: &Names, address: &str, binding: &Module) -> String {
     doc.extend(authored::fields(&tool.input, "it takes no arguments"));
     doc.push("Answers:".to_string());
     doc.extend(authored::fields(&tool.output, "it answers nothing"));
+    doc.push(format!(
+        "Reads: `{environment}` — the third argument, never `process.env`."
+    ));
 
-    let mut text = String::from("\n");
+    text.push('\n');
     text.push_str(&names::doc("", &doc));
     text.push_str(&format!(
-        "export type {ty} = (\n  input: z.infer<typeof {input}>,\n  context: RunContext,\n) => \
-         z.infer<typeof {output}> | Promise<z.infer<typeof {output}>>;\n"
+        "export type {ty} = (\n  input: z.infer<typeof {input}>,\n  context: RunContext,\n  env: \
+         {environment},\n) => z.infer<typeof {output}> | Promise<z.infer<typeof {output}>>;\n"
     ));
     text.push('\n');
     text.push_str(&names::doc(
@@ -165,13 +177,64 @@ fn contract(ir: &Ir, names: &Names, address: &str, binding: &Module) -> String {
     text
 }
 
+/// One binding's declared environment, as a type.
+///
+/// The names the `env:` map wrote out and no others, because the values reach
+/// the implementation as an **argument** (`runtime.ModuleEnv`) rather than
+/// through `process.env`: a read of a variable the composition did not declare
+/// is a type error here instead of an `undefined` at run time, and the
+/// declaration is the same one that puts the variable on the manifest of every
+/// process that can execute the tool (`docs/distributed.md` §9.1). A binding
+/// that declares nothing gets a type that admits nothing, which says the same
+/// thing about the empty case.
+fn environment_type(binding: &Module, address: &str, name: &str) -> String {
+    let mut doc: Vec<String> = vec![
+        format!("`{address}`'s declared environment (grammar 6.1, 4.3 class 2)."),
+        String::new(),
+    ];
+    if binding.env.is_empty() {
+        doc.push(
+            "This binding declares no `env:`, so its implementation reads none: the type admits \
+             no property, and a variable it needs is one the composition declares."
+                .to_string(),
+        );
+        return format!(
+            "{}export type {name} = Record<never, string>;\n",
+            names::doc("", &doc)
+        );
+    }
+    doc.push(
+        "Handed to the implementation as its third argument, resolved at the moment of the call. \
+         `process.env` is not where these live: the values belong to this call rather than to the \
+         process, exactly as an `exec:` binding's belong to its child."
+            .to_string(),
+    );
+    doc.push(String::new());
+    doc.push("Reads:".to_string());
+    for entry in &binding.env {
+        doc.push(format!(
+            "  `{}` — `{}`",
+            entry.name.value,
+            entry.value.value.as_str()
+        ));
+    }
+    let mut text = names::doc("", &doc);
+    text.push_str(&format!("export type {name} = {{\n"));
+    for entry in &binding.env {
+        text.push_str(&format!("  readonly {}: string;\n", entry.name.value));
+    }
+    text.push_str("};\n");
+    text
+}
+
 const MODULE_DOC: &str = "\
 //
 // The generated half of every `module:` binding (grammar 6.1, PRD resolved q48).
 //
 // One exported type per module-bound tool — its contract, written from the
-// tool's own `input:` and `output:` — and one typed `const` beside it holding
-// the authored implementation. `src/graph.ts` dispatches through those consts.
+// tool's own `input:` and `output:` — the environment its binding declared
+// beside it, and one typed `const` holding the authored implementation.
+// `src/graph.ts` dispatches through those consts.
 //
 // This is the **only** generated module that imports authored code. The rule
 // runs one way: authored files may import anything this project generates, and
@@ -206,6 +269,34 @@ tool.verify:
       SIGNING_KEY: "${SIGNING_KEY}"
 "#;
 
+    /// The same two tools, with one binding **outside** the conventional zone.
+    ///
+    /// `AUTHORED_ZONE` is a convention rather than a rule, so the composition a
+    /// project-wide claim about authored code is tested over has to contain the
+    /// case a directory-name heuristic would miss.
+    const ONE_BINDING_OUTSIDE_THE_ZONE: &str = r#"version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+
+tool.verify:
+  description: Verify a signature.
+  input:
+    payload: { type: string }
+    signature: { type: string }
+  output:
+    ok: { type: boolean }
+  module:
+    path: ./lib/verify.ts
+    env:
+      SIGNING_KEY: "${SIGNING_KEY}"
+"#;
+
     fn emitted(source: &str) -> String {
         let ir = ir_of(source);
         module(&ir, &crate::codegen::registry(&ir)).contents
@@ -226,8 +317,8 @@ tool.verify:
         assert!(
             text.contains(
                 "export type ToolSignModule = (\n  input: z.infer<typeof toolSignInput>,\n  \
-                 context: RunContext,\n) => z.infer<typeof toolSignOutput> | \
-                 Promise<z.infer<typeof toolSignOutput>>;"
+                 context: RunContext,\n  env: ToolSignModuleEnv,\n) => z.infer<typeof \
+                 toolSignOutput> | Promise<z.infer<typeof toolSignOutput>>;"
             ),
             "{text}"
         );
@@ -240,6 +331,37 @@ tool.verify:
         assert!(
             text.contains("`payload` — string"),
             "the contract names the fields: {text}"
+        );
+    }
+
+    /// The declared environment is a **type**, per binding, and it is the third
+    /// argument rather than this process's own environment (PRD resolved q49).
+    ///
+    /// Two claims, because the empty case is the one that could be written as
+    /// "anything goes" without anybody noticing: a binding that declared
+    /// `SIGNING_KEY` admits that name and a binding that declared nothing admits
+    /// none, so a `process.env`-shaped read of an undeclared variable is a type
+    /// error in the authored file rather than an `undefined` at run time.
+    #[test]
+    fn a_bindings_declared_environment_is_a_type_of_its_own() {
+        let text = emitted(TWO_MODULE_TOOLS);
+        assert!(
+            text.contains(
+                "export type ToolVerifyModuleEnv = {\n  readonly SIGNING_KEY: string;\n};"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("`SIGNING_KEY` — `${SIGNING_KEY}`"),
+            "the type's doc names the reference as written: {text}"
+        );
+        assert!(
+            text.contains("export type ToolSignModuleEnv = Record<never, string>;"),
+            "a binding that declares nothing admits nothing: {text}"
+        );
+        assert!(
+            text.contains("  env: ToolVerifyModuleEnv,\n"),
+            "the contract takes it as an argument: {text}"
         );
     }
 
@@ -286,21 +408,38 @@ tool.verify:
     /// `./tools/*.ts` from `src/worker-node.ts` or from the barrel would break
     /// the one property that makes "generated code and authored code in one
     /// tree" a fixed shape rather than a growing surface.
+    ///
+    /// What counts as "reaches authored code" is read off the project's own
+    /// **carried** paths rather than off a directory name. `src/tools/` is a
+    /// convention (see [`super::AUTHORED_ZONE`]) and a binding may name
+    /// `./lib/sign.ts`, so a predicate spelled `contains("tools/")` would be
+    /// blind to exactly the import this rule exists to forbid.
     #[test]
     fn the_only_generated_import_of_authored_code_is_the_seam() {
-        let ir = ir_of(TWO_MODULE_TOOLS);
+        let ir = ir_of(ONE_BINDING_OUTSIDE_THE_ZONE);
         let project = super::super::emit(
             &ir,
             &crate::codegen::authored::Authored::of([
                 ("src/tools/sign.ts".to_string(), "// yours\n".to_string()),
-                ("src/tools/verify.ts".to_string(), "// yours\n".to_string()),
+                ("lib/verify.ts".to_string(), "// yours\n".to_string()),
             ]),
         );
+        // Every carried file, as the specifier a generated module would have to
+        // write to reach it: `../lib/verify.ts` and `./tools/sign.ts` from
+        // `src/`, which is where every generated module sits.
+        let specifiers: Vec<String> = project
+            .carried()
+            .iter()
+            .map(|file| authored::relative(PATH, &file.path))
+            .collect();
+        assert_eq!(specifiers.len(), 2, "both bindings are carried");
         for file in project.files() {
-            let reaches = file
-                .contents
-                .lines()
-                .any(|line| line.starts_with("import ") && line.contains("tools/"));
+            let reaches = file.contents.lines().any(|line| {
+                line.starts_with("import ")
+                    && specifiers
+                        .iter()
+                        .any(|specifier| line.contains(&format!("\"{specifier}\"")))
+            });
             assert_eq!(
                 reaches,
                 file.path == PATH,

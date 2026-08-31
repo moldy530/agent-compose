@@ -20,7 +20,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
 | `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
 | `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:`, the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
-| `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
+| `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, the type of the `env:` that binding declared, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
 | `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
@@ -98,6 +98,12 @@ tool's declared `input:` and `output:` are its contract, `src/modules.ts` is
 where that contract is written down, and `bun run typecheck` is what holds the
 file to it. The directory is a convention rather than a rule; the file list is
 the rule.
+
+What such a file reads out of the environment is its binding's `env:`, and it
+arrives as the **third argument** rather than through `process.env`: the values
+belong to the call, so nothing they hold reaches a later `exec:` child or a
+module running beside it, and `src/modules.ts` types the argument from the names
+the composition declared — a variable the YAML does not list does not compile.
 
 You edit those files **in the project** — beside `main.yml`, where the `module:`
 path is resolved. A build copies each one it references into this directory at

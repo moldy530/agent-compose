@@ -400,8 +400,8 @@ fn a_drift_a_rebuild_would_refuse_over_does_not_send_the_reader_to_build() {
     assert!(
         stderr(&drifted).contains(
             "help: `agent-compose build` will not regenerate this directory: it holds a file this \
-             compiler did not write at a file it emits (`package.json`), and the build would have \
-             replaced it. Point `--out` at a directory of its own, or move it aside"
+             compiler did not write at a file this build writes (`package.json`), and the build \
+             would have replaced it. Point `--out` at a directory of its own, or move it aside"
         ),
         "{}",
         stderr(&drifted)
@@ -1226,6 +1226,33 @@ tool.sign:
     assert_eq!(
         fs::read_to_string(elsewhere.join("src/modules.ts")).expect("readable"),
         "export const mine = 1;\n",
+        "nothing is overwritten before the scan decides"
+    );
+
+    // The same refusal over a **carried** name, which is the half the sentence
+    // has to be true about: `src/tools/sign.ts` is a file this build writes and
+    // one it never emits, so a message saying "a file it emits" would name the
+    // one distinction PRD resolved q47 exists to draw and get it backwards.
+    let carried = scratch("module-carried-occupied");
+    fs::create_dir_all(carried.join("src/tools")).expect("writable");
+    fs::write(carried.join("src/tools/sign.ts"), "// somebody else's\n").expect("writable");
+    let collided = build(&[
+        spec,
+        "--out",
+        carried.to_str().expect("a UTF-8 scratch path"),
+    ]);
+    assert_eq!(code(&collided), 2, "{}", stderr(&collided));
+    assert!(
+        stderr(&collided).contains(
+            "holds a file this compiler did not write at a file this build writes \
+             (`src/tools/sign.ts`)"
+        ),
+        "{}",
+        stderr(&collided)
+    );
+    assert_eq!(
+        fs::read_to_string(carried.join("src/tools/sign.ts")).expect("readable"),
+        "// somebody else's\n",
         "nothing is overwritten before the scan decides"
     );
 }

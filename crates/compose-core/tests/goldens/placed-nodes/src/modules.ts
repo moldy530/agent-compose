@@ -8,8 +8,9 @@
 // The generated half of every `module:` binding (grammar 6.1, PRD resolved q48).
 //
 // One exported type per module-bound tool — its contract, written from the
-// tool's own `input:` and `output:` — and one typed `const` beside it holding
-// the authored implementation. `src/graph.ts` dispatches through those consts.
+// tool's own `input:` and `output:` — the environment its binding declared
+// beside it, and one typed `const` holding the authored implementation.
+// `src/graph.ts` dispatches through those consts.
 //
 // This is the **only** generated module that imports authored code. The rule
 // runs one way: authored files may import anything this project generates, and
@@ -26,6 +27,18 @@ import type {
 import toolStampModuleImplementation from "./tools/stamp.ts";
 
 /**
+ * `tool.stamp`'s declared environment (grammar 6.1, 4.3 class 2).
+ *
+ * Handed to the implementation as its third argument, resolved at the moment of the call. `process.env` is not where these live: the values belong to this call rather than to the process, exactly as an `exec:` binding's belong to its child.
+ *
+ * Reads:
+ *   `STAMP_MARKER` — `${STAMP_MARKER}`
+ */
+export type ToolStampModuleEnv = {
+  readonly STAMP_MARKER: string;
+};
+
+/**
  * `tool.stamp` — Stamp a release with the marker the signing machine holds.
  *
  * The contract `src/tools/stamp.ts` satisfies, derived from the tool's own `input:` and `output:` (grammar 6.1). Change either schema and the authored file stops type-checking, naming the field that moved — which is the merge tool PRD resolved q48 chooses over marker comments.
@@ -34,10 +47,12 @@ import toolStampModuleImplementation from "./tools/stamp.ts";
  *   `path` — string
  * Answers:
  *   `stamped` — string
+ * Reads: `ToolStampModuleEnv` — the third argument, never `process.env`.
  */
 export type ToolStampModule = (
   input: z.infer<typeof toolStampInput>,
   context: RunContext,
+  env: ToolStampModuleEnv,
 ) => z.infer<typeof toolStampOutput> | Promise<z.infer<typeof toolStampOutput>>;
 
 /**

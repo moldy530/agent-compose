@@ -24,6 +24,12 @@
 //!    `compose_core::codegen::project::PINS` names, downloaded and resolved. The
 //!    command is the emitted `README.md`'s own, run through the emitted
 //!    `scripts.typecheck`, so a manifest that stopped declaring it fails here.
+//!    It has a **negative** half, numbered `1b` because it is the same command
+//!    read the other way: a staged golden whose emitted schema is moved under an
+//!    authored `module:` implementation must **fail** to compile, naming the
+//!    field and the file. Everything else here is positive, and a contract that
+//!    stopped constraining would pass all of it — which is the one way PRD
+//!    resolved q48's "`tsc` is the merge tool" could quietly stop being true.
 //! 2. **Construction** — Bun runs the emitted TypeScript and builds a
 //!    `StateGraph` over the state model. A channel spec LangGraph refuses is a
 //!    green `tsc` and a runtime failure, so type-checking alone would not catch
@@ -529,6 +535,73 @@ fn every_generated_project_type_checks_under_the_pinned_toolchain() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+}
+
+/// Gate 1b: the contract a `module:` binding is held to **bites**.
+///
+/// Every other type gate here is positive — the committed golden compiles — and
+/// a contract that stopped constraining would pass all of them. That is the one
+/// direction worth testing on purpose, because the whole of PRD resolved q48's
+/// answer to marker comments is "`tsc` is the merge tool": a `z.infer` that
+/// widened to `any`, an emitted signature that took `input: unknown`, or a
+/// schema form that lowered to a Zod object accepting anything would all leave
+/// `src/tools/stamp.ts` compiling against a schema it no longer matches, and the
+/// promise in four documents and a PRD entry would be untrue with nothing
+/// failing.
+///
+/// So: a staged golden whose **emitted schema** is moved under an authored file
+/// that was not, and the type gate is required to *fail*, naming the field and
+/// the file. The mutation is the smallest one a real schema change makes — a
+/// renamed field — and it is made in the emitted tree rather than in the
+/// composition, because what is under test is the contract's grip on the
+/// authored half rather than the emitter's own output.
+#[test]
+fn a_schema_the_authored_module_no_longer_matches_fails_the_type_gate() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let golden = GOLDENS
+        .iter()
+        .find(|golden| golden.directory == "placed-nodes")
+        .expect("the mesh golden is the one with a `module:` binding");
+    let project = staged(golden, root, "typecheck-stale");
+
+    let schemas = project.join("src/schemas.ts");
+    let before = fs::read_to_string(&schemas).expect("the emitted schemas are readable");
+    let declared = "export const toolStampInput = z.object({\n  path: z.string(),\n}).strict();";
+    assert!(
+        before.contains(declared),
+        "the fixture's premise moved; `toolStampInput` is not what this gate mutates:\n{before}"
+    );
+    let after = before.replace(
+        declared,
+        "export const toolStampInput = z.object({\n  target: z.string(),\n}).strict();",
+    );
+    fs::write(&schemas, &after).expect("the staged copy is writable");
+
+    let output = bun()
+        .args(["run", "typecheck"])
+        .current_dir(&project)
+        .output()
+        .expect("bun runs");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a renamed schema field left the authored module compiling, so the contract does not \
+         hold it to anything:\n{report}"
+    );
+    assert!(
+        report.contains("src/tools/stamp.ts"),
+        "the failure is in the file that has to change, and says so:\n{report}"
+    );
+    assert!(
+        report.contains("'path'"),
+        "…naming the field that moved:\n{report}"
+    );
 }
 
 /// Gate 2: every golden project constructs its graph, and its state model holds

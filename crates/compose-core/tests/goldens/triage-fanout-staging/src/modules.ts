@@ -8,8 +8,9 @@
 // The generated half of every `module:` binding (grammar 6.1, PRD resolved q48).
 //
 // One exported type per module-bound tool — its contract, written from the
-// tool's own `input:` and `output:` — and one typed `const` beside it holding
-// the authored implementation. `src/graph.ts` dispatches through those consts.
+// tool's own `input:` and `output:` — the environment its binding declared
+// beside it, and one typed `const` holding the authored implementation.
+// `src/graph.ts` dispatches through those consts.
 //
 // This is the **only** generated module that imports authored code. The rule
 // runs one way: authored files may import anything this project generates, and

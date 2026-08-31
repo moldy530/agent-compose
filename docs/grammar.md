@@ -1312,10 +1312,11 @@ compiling, naming the field that moved.
 
 **The generated half is one file.** `src/modules.ts` carries one exported
 function type per module-bound tool — written from that tool's `input:` and
-`output:` — and one typed `const` beside it holding the authored default export.
-It is the **only** generated module that imports authored code; authored code
-may import anything the project generates. A scaffold imports its own contract
-type from there, so the signature an author fills in is never typed by hand.
+`output:` — a type for the `env:` that binding declared, and one typed `const`
+beside them holding the authored default export. It is the **only** generated
+module that imports authored code; authored code may import anything the project
+generates. A scaffold imports its own contract type from there, so the signature
+an author fills in is never typed by hand.
 
 **Running one is running a tool.** A module tool executes **in the graph's own
 process** at both of a tool's surfaces — a `function:` node's activity and a tool
@@ -1328,15 +1329,22 @@ execution consumes the recorded answer rather than calling again
 ([`docs/durability.md`](durability.md) §3.2); the same tool-call record in the
 trace; and a model's arguments the schema refuses handed back to the model as a
 refusal rather than failing the node (D119). Only the binding differs. The
-implementation is handed `(input, context)`, where `context` is the invocation
-context §9.4's delivery surface names, exactly as a `function:` binding's is.
+implementation is handed `(input, context, env)`, where `context` is the
+invocation context §9.4's delivery surface names, exactly as a `function:`
+binding's is.
 
-**Declared `env:` is materialised before the call.** An `exec:` block's `env:`
-is added to the child's environment because that is where its implementation
-reads it; a module runs in this process, so each entry is set in `process.env`
-before the implementation is entered. `SIGNING_KEY: "${SIGNING_KEY}"` — the
-ordinary spelling — writes back the value already there; a binding that maps one
-name to another variable's value is how the two can differ.
+**Declared `env:` is the third argument, not `process.env`.** An `exec:` block's
+`env:` becomes the child's environment, which no other call in the process
+shares; a module runs in this process, so its declaration is handed to it the
+same way — as a value belonging to the call. `src/modules.ts` types it from the
+names the binding wrote out, so reading a variable the composition did not
+declare is a compile error rather than an `undefined`, and the values reach
+neither a later `exec:` child nor a module running concurrently beside it.
+`SIGNING_KEY: "${SIGNING_KEY}"` — the ordinary spelling — passes on the value the
+process was started with; a binding that maps one name to another variable's
+value is how the two can differ. A reference that is not set when the call is
+made fails the call naming the variable, exactly as it does in every other
+class-2 surface.
 
 **The file travels with the artifact.** It is edited in the project, beside the
 entrypoint, and `build` copies each referenced one into the output directory at
@@ -1357,6 +1365,14 @@ root**, and a path that climbs out and returns is refused exactly as an
 between generated and authored code (PRD resolved q47), so a binding on one of
 those names would be authored code the next build destroys. The code for all
 three is `invalid-module-path`.
+
+**Case is not what tells two paths apart.** A path here is a file name, and
+macOS and Windows hold `src/Graph.ts` and `src/graph.ts` in one place — so a
+binding whose path differs only in case from a name `build` emits is refused,
+and so are two bindings whose paths differ only in case from each other. Both
+would work on a case-sensitive filesystem and, on the others, silently write one
+file over another: a composition that is valid on one machine and destroys code
+on the next is not one this compiler accepts anywhere. Same code.
 
 **The file has to be there.** `validate` refuses a binding whose file does not
 exist, naming the repair: `agent-compose build` **scaffolds** a referenced module
@@ -2418,8 +2434,9 @@ other (Decisions
 ### 8.4 `function`
 
 Deterministic, graph-invoked use of a tool definition — the use half of PRD 5.5's
-def/use split. The tool's implementation binding (`exec`/`http`/`function`) is
-irrelevant here; what matters is that its `input` is a checked signature.
+def/use split. The tool's implementation binding (`exec`/`http`/`function`/
+`module`) is irrelevant here; what matters is that its `input` is a checked
+signature.
 
 ```yaml
 lookup:
@@ -7837,13 +7854,15 @@ dependencies are folded into the generated `package.json`.
 
 *Why env is declared.* The environment partition is computed by walking every
 `${ENV}` a composition writes ([`docs/distributed.md`](distributed.md) §9.1).
-A `process.env.SIGNING_KEY` inside authored TypeScript is not something that walk
+A variable read inside authored TypeScript is not something that walk
 can see, so a module tool would silently contribute nothing to any manifest: the
 worker that runs it would join clean and fail at its first call, which is the
 exact failure the partition exists to prevent. Declaring it in the YAML keeps one
 walk and one answer. The shape is `exec:`'s because the question is the same one
 — what does this implementation read — and a second spelling would be a second
-thing to learn.
+thing to learn. The declaration is also what the implementation *reads through*:
+the values arrive as a typed argument, so the YAML is not a promise about the
+code beside it but the only way the code can get at them.
 
 *Why dependencies are declared too, and exactly.* The worker's provisioning cycle
 runs `bun install` over the artifact it fetched (§4 step 4), and the artifact

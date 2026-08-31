@@ -204,5 +204,35 @@ tool.sign:
             ),
             "{written}"
         );
+
+        // …and it is the **tree's** answer rather than a second one. The array
+        // is derived from the bindings and the carried set is derived from the
+        // same place, so today they cannot disagree; asserting it is what keeps
+        // that true, because nothing reads this array back — a manifest field a
+        // reader trusts and no code consumes is exactly the kind that goes
+        // stale without failing anything.
+        let project = crate::codegen::emit(
+            &ir,
+            &crate::codegen::authored::Authored::of([
+                ("src/tools/sign.ts".to_string(), "// yours\n".to_string()),
+                ("src/tools/verify.ts".to_string(), "// yours\n".to_string()),
+            ]),
+        );
+        let listed: Vec<&str> = written
+            .lines()
+            .skip_while(|line| !line.starts_with("  \"authored\": ["))
+            .skip(1)
+            .take_while(|line| !line.starts_with("  ],"))
+            .map(|line| line.trim().trim_end_matches(',').trim_matches('"'))
+            .collect();
+        assert_eq!(
+            listed,
+            project
+                .carried()
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            "the manifest and the tree disagree about which files are the author's"
+        );
     }
 }

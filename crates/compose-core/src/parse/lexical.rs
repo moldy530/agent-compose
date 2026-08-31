@@ -796,7 +796,13 @@ pub(crate) fn keyword<T: Copy>(
 ///
 /// `.` and `..` are handled by the callers, which give them meaning rather than
 /// treating them as names.
-fn is_path_segment(segment: &str) -> bool {
+///
+/// **The charset lives here for both path surfaces.** A `module:` binding reads
+/// it through [`is_relative_path`] and an `imports:` entry through
+/// `super::section::import_problem`, which needs the tests separately — it
+/// reports *why* a path is not one rather than only that it is not — but not a
+/// second copy of the alphabet. Two copies agree on the day they are written.
+pub(crate) fn is_path_segment(segment: &str) -> bool {
     let mut bytes = segment.bytes();
     bytes
         .next()
@@ -807,10 +813,12 @@ fn is_path_segment(segment: &str) -> bool {
 /// Whether a written path takes grammar 1.4's portable form, with `extensions`
 /// as the endings its last segment may take.
 ///
-/// One reader for both path surfaces this grammar has — an `imports:` entry and
-/// a `module:` binding — because "one portable spelling" (grammar 1.4) is a
-/// property of paths in this DSL rather than of one key that carries them. What
-/// differs between them is the extension and nothing else.
+/// A `module:` binding's whole verdict, and the *charset* half of an `imports:`
+/// entry's — which `super::section::import_problem` reads through
+/// [`is_path_segment`], because that surface answers with the reason a path is
+/// not portable rather than with a bare `false`. "One portable spelling"
+/// (grammar 1.4) is a property of paths in this DSL rather than of one key that
+/// carries them, so the alphabet is written once whatever asks.
 #[must_use]
 pub(crate) fn is_relative_path(path: &str, extensions: &[&str]) -> bool {
     if path.is_empty() || path.starts_with('/') || path.contains('\\') {

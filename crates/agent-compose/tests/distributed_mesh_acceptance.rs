@@ -613,9 +613,10 @@ fn a_placed_node_runs_on_a_worker_and_its_answer_reaches_the_graph() {
 ///     nothing else.
 ///   * the **marker in it**, which says the declared `env:` reached the process
 ///     that executes the tool. `${STAMP_MARKER}` is on `mac`'s manifest and not
-///     on the hub's, and the authored file spells `unmarked` when it is not set
-///     — so a partition that had dropped a module binding's declaration would
-///     come back with a different string rather than with a failure.
+///     on the hub's, and the authored file reads it out of the argument the
+///     binding's declaration produces — so a partition that had dropped that
+///     declaration would fail the call naming the variable, and one that carried
+///     it to the wrong process would fail on the machine that ran the tool.
 #[test]
 fn a_placed_module_tool_runs_on_the_worker_out_of_the_artifact_it_fetched() {
     let Some(mesh) = Mesh::start() else {

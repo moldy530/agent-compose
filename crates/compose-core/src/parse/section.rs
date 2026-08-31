@@ -143,15 +143,14 @@ fn import_problem(path: &str) -> Option<ImportProblem> {
 }
 
 /// Whether one `/`-separated segment matches grammar 1.4's charset.
+///
+/// The alphabet is [`lexical::is_path_segment`]'s, which is also what a
+/// `module:` binding's path is read against: one rule, one place it is written,
+/// so tightening or loosening it moves both surfaces rather than one. What this
+/// adds is the two segments that are not names — `.` and `..`, which the caller
+/// resolves rather than spells.
 fn is_portable_segment(segment: &str) -> bool {
-    if segment == "." || segment == ".." {
-        return true;
-    }
-    let mut bytes = segment.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+    segment == "." || segment == ".." || lexical::is_path_segment(segment)
 }
 
 const REDUCERS: &[(&str, Reduce)] = &[
@@ -1161,6 +1160,29 @@ mod tests {
             (Vec::new(), 3),
             "every refused entry counts"
         );
+    }
+
+    /// The two path surfaces admit the same segment spellings, because they read
+    /// the same charset (grammar 1.4, Decision D80).
+    ///
+    /// Stated as a comparison rather than as a list of accepted names: what
+    /// would go wrong is not a particular character but *drift* — a change made
+    /// for `module:` paths that an `imports:` entry silently did not take, which
+    /// is what a second copy of the alphabet buys. The subject is one segment,
+    /// so each spelling is put in a whole path of the surface's own extension.
+    #[test]
+    fn both_path_surfaces_read_one_portable_charset() {
+        for segment in [
+            "sign", "a-b", "a_b", "a.b", "_a", "9a", "-a", ".a", "a b", "a+b", "", "é",
+        ] {
+            let entry = format!("{segment}.yml");
+            let binding = format!("{segment}.ts");
+            assert_eq!(
+                super::import_problem(&entry).is_none(),
+                crate::parse::lexical::is_relative_path(&binding, &[".ts"]),
+                "`{segment}` is admitted by one path surface and refused by the other"
+            );
+        }
     }
 
     /// A verbatim repeat is refused too, and is deliberately *not* counted: the

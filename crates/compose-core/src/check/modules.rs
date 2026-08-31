@@ -65,27 +65,43 @@ pub(crate) fn check(ctx: &mut Ctx) {
 /// file are two contracts over one default export — and only one of them could
 /// ever be the file `build` wrote. The refusal names both, because either is the
 /// one to change.
+///
+/// **One file** is decided case-insensitively, for the reason
+/// `parse::binding`'s emitted-name rule is: these paths become file names, and
+/// macOS and Windows hold `Sign.ts` and `sign.ts` in one place — so on such a
+/// host the second tool's contract would be bound to the first tool's
+/// implementation, the scaffold for it never written because the first one is
+/// already there. A composition that means two files on one machine and one on
+/// another is refused rather than resolved differently per host.
 fn one_file_one_tool(ctx: &mut Ctx) {
-    let mut first: BTreeMap<&str, (&str, &Spanned<String>)> = BTreeMap::new();
+    let mut first: BTreeMap<String, (&str, &Spanned<String>)> = BTreeMap::new();
     let mut collisions: Vec<Diagnostic> = Vec::new();
     for (address, module) in bindings(ctx.ir) {
-        match first.get(module.path.value.as_str()) {
-            Some((declared_by, path)) => collisions.push(
-                Diagnostic::error(
-                    DiagnosticCode::InvalidModulePath,
-                    module.path.span.clone(),
+        let path = module.path.value.as_str();
+        match first.get(&path.to_ascii_lowercase()) {
+            Some((declared_by, first_path)) => {
+                let message = if first_path.value == module.path.value {
+                    format!("`{address}` and `{declared_by}` are both implemented by `{path}`")
+                } else {
                     format!(
-                        "`{address}` and `{declared_by}` are both implemented by `{}`",
-                        module.path.value
+                        "`{address}` is implemented by `{path}`, which differs only in case from `{}` — `{declared_by}`'s",
+                        first_path.value
+                    )
+                };
+                collisions.push(
+                    Diagnostic::error(
+                        DiagnosticCode::InvalidModulePath,
+                        module.path.span.clone(),
+                        message,
+                    )
+                    .with_label(first_path.span.clone(), "first bound here")
+                    .with_help(
+                        "an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract — and on macOS and Windows two spellings that differ only in case are one file: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)",
                     ),
-                )
-                .with_label(path.span.clone(), "first bound here")
-                .with_help(
-                    "an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)",
-                ),
-            ),
+                );
+            }
             None => {
-                first.insert(module.path.value.as_str(), (address, &module.path));
+                first.insert(path.to_ascii_lowercase(), (address, &module.path));
             }
         }
     }
@@ -157,7 +173,7 @@ fn dependencies_agree(ctx: &mut Ctx) {
 pub fn missing(ir: &Ir, root: &Path) -> Vec<Diagnostic> {
     let mut found = Diagnostics::new();
     for (address, module) in bindings(ir) {
-        if at(root, &module.path.value).is_file() {
+        if present(root, &module.path.value) {
             continue;
         }
         found.push(
@@ -176,6 +192,20 @@ pub fn missing(ir: &Ir, root: &Path) -> Vec<Diagnostic> {
     }
     found.sort();
     found.into_vec()
+}
+
+/// Whether one `module:` binding's implementation is **there**, at
+/// `root`-relative `path`.
+///
+/// One predicate for the two verbs that ask, which is the point of it being
+/// public: [`missing`] refuses a binding whose file is not there and names
+/// `agent-compose build` as the repair, and `build` writes the stub for exactly
+/// the files this answers `false` for. Two spellings of "there" would let
+/// `validate` name a repair the build then declines to make — a directory at the
+/// path is the case that separates `Path::exists` from this.
+#[must_use]
+pub fn present(root: &Path, path: &str) -> bool {
+    at(root, path).is_file()
 }
 
 /// Where a `/`-separated project-relative path lands on this host.

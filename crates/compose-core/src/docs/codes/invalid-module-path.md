@@ -5,7 +5,7 @@
 A `module:` binding names hand-authored TypeScript **inside the project**, and
 that file travels: it ships in the artifact every worker fetches, hash-addressed
 like everything else the build produced (`docs/distributed.md` §4). So its path
-has one portable spelling, and three rules hold it there.
+has one portable spelling, and four rules hold it there.
 
 It is **project-relative**: `/`-separated segments, each `.`, `..` or a name
 matching `[A-Za-z0-9_][A-Za-z0-9_.-]*`, the last ending in `.ts`. No leading
@@ -21,6 +21,12 @@ And it is **not a name `build` writes**. The emitted file list is the
 boundary between generated and authored code: `build` overwrites exactly the
 files it emits and touches nothing else, so a binding pointing at `src/graph.ts`
 would be asking for an authored file the next build destroys.
+
+Finally, **case does not make it a different name**. `src/Graph.ts` and
+`src/graph.ts` are one file on macOS and on Windows, so a path differing only in
+case from a name `build` emits is refused, and so are two bindings differing only
+in case from each other — either would work on Linux and quietly write one file
+over the other everywhere else.
 
 ## A spec that triggers it
 

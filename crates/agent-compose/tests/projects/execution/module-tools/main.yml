@@ -33,11 +33,16 @@
 #     node's own `timeout:`, and what runs next is its `on_error:` fallback —
 #     which is `activities`' `flow.stubborn` with a module in place of a
 #     `function:` binding, and has to behave identically.
+#   * `flow.sealed` — the declared environment, from both sides. `tool.sealed`
+#     is handed a name this process does not have, and the `exec:` node after it
+#     asks a **subprocess** whether it can see that name: the values belong to
+#     the call rather than to the process, exactly as an `exec:` binding's belong
+#     to its child.
 #
-# `${STAMP_MARKER}` is grammar §6.1's declared environment: a module's
-# `process.env` read is not something the compiler can walk, so the binding says
-# what it reads and the partition carries it (PRD resolved q49). The value here
-# is the harness's.
+# `${STAMP_MARKER}` is grammar §6.1's declared environment: a variable read
+# inside authored TypeScript is not something the compiler can walk, so the
+# binding says what it reads, the partition carries it, and the call is handed
+# it (PRD resolved q49). The value here is the harness's.
 version: "0.1"
 
 defaults:
@@ -55,6 +60,14 @@ state:
     default: 0
   outcome:
     description: What the impatient flow ended up with, whichever way it got there.
+    type: string
+    default: ""
+  marker:
+    description: What the sealed module was handed under a name this process does not have.
+    type: string
+    default: ""
+  leaked:
+    description: What a subprocess started after that call could see of it.
     type: string
     default: ""
 
@@ -103,6 +116,23 @@ tool.shout:
   exec:
     command: printf
     args: ["shouted"]
+
+# The environment's other half: a binding whose declared name is one this
+# process does **not** have, holding a value it does. `SEALED_MARKER` therefore
+# exists nowhere but inside a call to this tool — so a subprocess started
+# afterwards seeing it would be the runtime writing a composition's secrets into
+# the ambient environment, which is what `flow.sealed` below is watching for.
+tool.sealed:
+  description: Answer with the marker its binding declared, under a name this process lacks.
+  input: {}
+  output:
+    marker:
+      description: What the binding's declared environment held.
+      type: string
+  module:
+    path: ./src/tools/sealed.ts
+    env:
+      SEALED_MARKER: ${STAMP_MARKER}
 
 tool.flaky:
   description: Answer only once the caller has tried twice.
@@ -179,6 +209,40 @@ flow.assisted:
   edges:
     - { from: start, to: assist }
     - { from: assist, to: end }
+
+flow.sealed:
+  description: A module's declared environment belongs to the call and not to the process.
+  inputs: {}
+  outputs:
+    marker:
+      type: string
+    leaked:
+      type: string
+  nodes:
+    seal:
+      function: tool.sealed
+      writes:
+        marker: marker
+
+    # A subprocess of the same process, started **after** the module ran. Its
+    # environment is this process's, so `SEALED_MARKER` reaching it would mean
+    # the runtime had put a binding's declaration there — where every later
+    # `exec:` tool, on every flow, would inherit it. `printenv` exits 1 for a
+    # name it cannot find, which is why the accepted list has both codes.
+    inspect:
+      exec:
+        command: printenv
+        args: [SEALED_MARKER]
+        expect_exit: [0, 1]
+        output:
+          exit_code: { type: integer }
+          stdout: { type: string }
+      writes:
+        stdout: leaked
+  edges:
+    - { from: start, to: seal }
+    - { from: seal, to: inspect }
+    - { from: inspect, to: end }
 
 flow.retried:
   description: Spend a retry on a module that fails its first call.

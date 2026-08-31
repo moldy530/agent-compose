@@ -1074,15 +1074,19 @@ fn build_project(
     }
 }
 
-/// The refusal a build writes when an authored file already holds a name the
-/// compiler emits (PRD resolved q47).
+/// The refusal a build writes when a file that is not this compiler's already
+/// holds a name the build would put down (PRD resolved q47, q49).
 ///
-/// **Both sides, named.** The compiler's claim on an output directory is the
-/// file list it emits and nothing else, so the only way a build can collide with
-/// authored code is a name it has to write that somebody else's file is at —
-/// and a message saying only "refused" leaves the reader to guess which of the
-/// emitted names it was. So it names the directory, the paths, and what the
-/// compiler was going to do to them.
+/// **Both sides, named.** What a build writes into `--out` is the file list it
+/// emits plus the authored files the composition references, so the only way it
+/// can collide with somebody's work is a name it has to write that their file is
+/// at — and a message saying only "refused" leaves the reader to guess which
+/// name it was. So it names the directory, the paths, and what the compiler was
+/// going to do to them.
+///
+/// "A file it emits" would be the wrong sentence for half of them: a carried
+/// implementation is a name the compiler **writes** and deliberately does not
+/// emit, which is the distinction PRD resolved q47 exists to draw.
 fn occupied(out: &Path, paths: &[String]) -> String {
     let (noun, pronoun) = if paths.len() == 1 {
         ("a file", "it")
@@ -1090,11 +1094,11 @@ fn occupied(out: &Path, paths: &[String]) -> String {
         ("files", "them")
     };
     format!(
-        "`{}` holds {noun} this compiler did not write at {noun} it emits ({}), and this build \
-         would have replaced {pronoun}: what a build owns is the file list it emits, and in a \
-         directory holding none of its own files it claims none of those names — the \
-         generated-file header is how it tells its work from yours. Point `--out` at a directory \
-         of its own, or move {pronoun} aside",
+        "`{}` holds {noun} this compiler did not write at {noun} this build writes ({}), and this \
+         build would have replaced {pronoun}: what a build writes is the file list it emits plus \
+         the authored files the composition references, and in a directory holding none of its \
+         own files it claims none of those names — the generated-file header is how it tells its \
+         work from yours. Point `--out` at a directory of its own, or move {pronoun} aside",
         out.display(),
         paths
             .iter()

@@ -182,12 +182,18 @@ typecheck` is the gate.
 // src/tools/sign.ts
 import type { ToolSignModule } from "../modules.ts";
 
-const toolSign: ToolSignModule = async (input) => ({
-  signature: await sign(input.payload, process.env.SIGNING_KEY),
+const toolSign: ToolSignModule = async (input, _context, env) => ({
+  signature: await sign(input.payload, env.SIGNING_KEY),
 });
 
 export default toolSign;
 ```
+
+The third argument is the `env:` the binding declared, typed from those names:
+`env.SIGNING_KEY` compiles because the YAML lists it, and a variable it does not
+list is a type error rather than an `undefined` at run time. It is a value of
+this call rather than the process's own environment, so nothing it holds leaks
+into a later `exec:` child or into a module running beside it.
 
 **It is a tool, and nothing about running it is special.** The call happens in
 the graph's own process, and everything around it is what every other binding
@@ -227,8 +233,8 @@ is a new artifact, and every worker is handed it through the join handshake.
 you wrote is a build to re-run. A file under `src/` the composition does not
 reference ships nowhere.
 
-**Say what it reads and what it imports.** The compiler cannot walk a
-`process.env` read inside your TypeScript, and it ships no lockfile beside the
+**Say what it reads and what it imports.** The compiler cannot walk a variable
+read inside your TypeScript, and it ships no lockfile beside the
 artifact, so `env:` and `dependencies:` are declarations rather than discoveries.
 Declared variables reach exactly the processes that can execute the tool — the
 same per-placement partition every other tool's do — and dependencies are folded

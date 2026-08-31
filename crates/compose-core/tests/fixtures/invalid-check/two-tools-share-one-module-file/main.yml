@@ -3,7 +3,7 @@
 # message: `tool.verify` and `tool.sign` are both implemented by `src/tools/sign.ts`
 # at: main.yml:27:11
 # label: main.yml:19:11 first bound here
-# help: an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)
+# help: an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract — and on macOS and Windows two spellings that differ only in case are one file: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)
 #
 # One file, two contracts: the scaffold is written from one tool's schemas and
 # the registry seam imports it under that tool's interface, so only one of the

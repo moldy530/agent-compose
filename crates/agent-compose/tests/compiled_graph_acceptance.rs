@@ -4489,6 +4489,54 @@ fn a_module_tool_runs_at_a_function_node_and_reads_the_environment_it_declared()
     assert_eq!(entry["outcome"], "completed", "{entry}");
 }
 
+/// A module's declared `env:` belongs to the **call**, not to the process
+/// (grammar 6.1, PRD resolved q49).
+///
+/// The declaration means "these names hold these values when this
+/// implementation runs", and the two halves of that sentence are both checked
+/// here because only one of them is visible from the tool's own answer.
+/// `tool.sealed` declares `SEALED_MARKER`, a name this process does not have,
+/// holding the value of one it does — so:
+///
+///   * the **marker it answers with** says the value reached the code. Without
+///     it the second assertion would pass over an environment that was empty
+///     for a reason having nothing to do with containment.
+///   * the **subprocess started after it** says the value went nowhere else.
+///     `flow.sealed`'s second node is an ordinary `exec:` whose child inherits
+///     this process's environment, so a runtime that materialised a binding's
+///     `env:` into `process.env` would hand `SEALED_MARKER` to it — and to every
+///     other `exec:` tool in the composition, on every flow, for the life of the
+///     process. Under `serve`, that is one execution's credentials reaching
+///     another's subprocesses.
+///
+/// It is an assertion about *absence*, which is why the fixture goes out of its
+/// way to make the name unavailable by any other route: `printenv` answers with
+/// what the child really has, and nothing else in this project sets that name.
+#[test]
+fn a_module_tools_declared_environment_reaches_the_call_and_no_subprocess_after_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let Some(run) = harness::invoke("module-tools", "flow.sealed", &[], &provider) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["marker"],
+        json!(harness::STAMP_MARKER_VALUE),
+        "the module was not handed the environment its binding declared"
+    );
+    assert_eq!(
+        run.outputs()["leaked"],
+        json!(""),
+        "a module binding's declared environment escaped into the process, so every \
+         subprocess started afterwards holds it"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        0,
+        "neither node in this flow calls a model"
+    );
+}
+
 /// The same tool through an agent's **tool loop**, beside its `exec:` twin —
 /// and the two trace records differ in nothing but the component behind them.
 ///
