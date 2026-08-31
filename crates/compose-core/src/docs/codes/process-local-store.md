@@ -131,8 +131,12 @@ storage_backends:
 deployment rather than a repair today: `validate` and `build` take it, and the
 first store op throws — production `storage_backends` (Redis, Postgres, pgvector,
 S3 and the rest of grammar §14.3's vocabulary) land behind the store plugin
-interface in M3 (PRD §7). That is the order the two repairs are in above, and it
-is the order the diagnostic puts them in too.
+interface in M3 (PRD §7). That is why the repair a build runs is first here and
+the caveat is last. The **diagnostic** makes the same two points in the other
+order — it names the networked backend first, because that is the shape the
+deployment is heading for, and then ends on this same sentence — so both texts
+leave a reader at the edit this release can actually run, whichever of the two
+they met first.
 
 **Under `--target local` the backend repair is not available at all**, and the
 diagnostic says so: `local` substitutes local storage for every store

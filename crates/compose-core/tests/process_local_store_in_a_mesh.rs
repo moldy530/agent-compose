@@ -600,6 +600,13 @@ fn the_local_target_refuses_and_names_the_repair_it_admits() {
 /// the test that fails when the release grows the backends and the caveat is
 /// left behind: a `redis` store that no longer throws makes the sentence below
 /// wrong, and the fixtures' exact `# help:` lines come with it.
+///
+/// **The order the two are named in is pinned as well**, because
+/// `src/docs/codes/process-local-store.md` tells a reader what it is — the
+/// document leads with the repair a build runs and says so, and says the
+/// diagnostic leads with the other. Nothing else holds those two texts together,
+/// and a reader who checks one against the other is exactly the reader the
+/// `explain` document is for.
 #[test]
 fn the_repair_names_the_half_a_build_of_this_release_can_run() {
     let caveat = "refuses at the first store op";
@@ -632,6 +639,25 @@ fn the_repair_names_the_half_a_build_of_this_release_can_run() {
                         release runs"
         ),
         "the message never names the repair this release can actually run: {named}"
+    );
+
+    // **The order of the two, which the `explain` document describes.** The
+    // networked backend is named first because it is the shape the deployment is
+    // heading for, and the caveat is last because it is what a reader has to
+    // leave with. `src/docs/codes/process-local-store.md` states that ordering
+    // and contrasts it with its own, so a message reordered here without the
+    // document is a document that describes another compiler's output.
+    let backend = named
+        .find("bind `redis` or `postgres` instead")
+        .expect("the design's repair is offered");
+    let composition = named
+        .find("take the component that binds it out of `placements:`")
+        .expect("the repair a build runs is offered");
+    let last = named.find(caveat).expect("the caveat is offered");
+    assert!(
+        backend < composition && composition < last,
+        "the two repairs are no longer named backend-first with the caveat last, which is the \
+         order `agent-compose explain process-local-store` tells a reader to expect: {named}"
     );
 
     // …and under `local`, where the first repair is a target of its own rather
