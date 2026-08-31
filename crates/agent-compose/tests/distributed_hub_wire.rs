@@ -2247,48 +2247,103 @@ fn a_paused_result_that_does_not_name_one_node_throughout_is_unreadable() {
             },
         ),
     ] {
-        let Some(hub) = hub() else {
-            return;
-        };
-        let worker = hub.worker();
-        let execution = hub.start("/escalations", &json!({ "path": "dist/app" }));
-        let dispatch = worker.dispatch(&hub);
-        let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
-        let site = dispatch["instance_path"].as_str().expect("a site");
-
-        let mut pause = paused_at(site);
-        mutate(&mut pause);
-        let taken = hub.send(
-            worker
-                .request("POST", "/workers/result")
-                .json(&json!({ "dispatch_id": id, "paused": pause })),
-        );
-        assert_eq!(
-            taken.status,
-            204,
-            "`{case}` was answered outside §3.4's four statuses: {}",
-            body_of(&taken)
-        );
-
-        let ended = hub.until(&execution, "ended", |report| {
-            report["status"] == json!("completed") || report["status"] == json!("failed")
-        });
-        assert_eq!(ended["status"], json!("failed"), "`{case}`: {ended:#}");
-        assert!(
-            ended["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("PausedResultUnreadable"),
-            "`{case}` reached an operator as something other than the one failure this route \
-             gives an unreadable pause: {ended:#}"
-        );
-        assert!(
-            ended["interrupts"]
-                .as_array()
-                .is_none_or(|waits| waits.is_empty()),
-            "`{case}` reached the board: {ended:#}"
-        );
+        assert_the_pause_is_unreadable(case, mutate);
     }
+}
+
+/// **A `paused` short of a required member is unreadable**, which is the rule
+/// §3.4 states of every member but `expires_at` — including the one whose value
+/// the hub never spends.
+///
+/// `paused_at` is the case worth writing down, because §3.4 is explicit that its
+/// *value* is spent nowhere: the wait a hub plants is dated off the hub's own
+/// clock, and the worker's reading is filed on the settled dispatch row for a
+/// reader asking when that machine reached the node. A field nothing routes off
+/// invites the reading that nothing checks it either — and `pauseOf` does check
+/// it, because the settled row is the only record of what the worker did and a
+/// row short of that fact is not that record. This is the assertion that keeps
+/// the document and the hub from drifting apart over it.
+///
+/// `shown` and the record's `request` are the same rule at the two other places
+/// a body can be short: what the person is asked, and the canonical request the
+/// redispatched node's replay compares its own claim against.
+#[test]
+fn a_paused_result_short_of_a_required_member_is_unreadable() {
+    for (case, mutate) in [
+        (
+            "no `paused_at`",
+            (|pause: &mut Value| {
+                pause
+                    .as_object_mut()
+                    .expect("a pause is an object")
+                    .remove("paused_at");
+            }) as fn(&mut Value),
+        ),
+        ("no `shown`", |pause: &mut Value| {
+            pause
+                .as_object_mut()
+                .expect("a pause is an object")
+                .remove("shown");
+        }),
+        ("no `request` on the record", |pause: &mut Value| {
+            pause["effect"]
+                .as_object_mut()
+                .expect("a record is an object")
+                .remove("request");
+        }),
+    ] {
+        assert_the_pause_is_unreadable(case, mutate);
+    }
+}
+
+/// Settle one dispatch with a `paused` body `mutate` has broken, and assert the
+/// hub answers it the one way §3.4 gives this route: `204` on the wire, because
+/// the route's table is closed and a fifth status would be a refusal a worker
+/// stops for; the dispatch settled as a `PausedResultUnreadable` failure, which
+/// is the node's own attempt and nothing more; and **nothing on the board**,
+/// because a question the hub could not read whole is one no surface may show.
+fn assert_the_pause_is_unreadable(case: &str, mutate: impl Fn(&mut Value)) {
+    let Some(hub) = hub() else {
+        return;
+    };
+    let worker = hub.worker();
+    let execution = hub.start("/escalations", &json!({ "path": "dist/app" }));
+    let dispatch = worker.dispatch(&hub);
+    let id = dispatch["dispatch_id"].as_str().expect("an id").to_string();
+    let site = dispatch["instance_path"].as_str().expect("a site");
+
+    let mut pause = paused_at(site);
+    mutate(&mut pause);
+    let taken = hub.send(
+        worker
+            .request("POST", "/workers/result")
+            .json(&json!({ "dispatch_id": id, "paused": pause })),
+    );
+    assert_eq!(
+        taken.status,
+        204,
+        "`{case}` was answered outside §3.4's four statuses: {}",
+        body_of(&taken)
+    );
+
+    let ended = hub.until(&execution, "ended", |report| {
+        report["status"] == json!("completed") || report["status"] == json!("failed")
+    });
+    assert_eq!(ended["status"], json!("failed"), "`{case}`: {ended:#}");
+    assert!(
+        ended["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("PausedResultUnreadable"),
+        "`{case}` reached an operator as something other than the one failure this route \
+         gives an unreadable pause: {ended:#}"
+    );
+    assert!(
+        ended["interrupts"]
+            .as_array()
+            .is_none_or(|waits| waits.is_empty()),
+        "`{case}` reached the board: {ended:#}"
+    );
 }
 
 /// A result that carries **two endings** is unreadable, and neither of them is

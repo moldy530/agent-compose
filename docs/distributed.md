@@ -700,13 +700,21 @@ before its question, which is the entry `docs/durability.md` §3.4 refuses by
 name. The journal keeps the pair the board published, so the answered pause's own
 trace entry (`docs/trace.md` §3.4) is the entry an unplaced pause writes.
 
-So the two instants are the members of a `paused` body **no hub check backs**,
-and deliberately: the checks below refuse a pause over a field the hub would
-otherwise have *used*, and these are the fields it never uses. `paused_at`'s rule
-— REQUIRED — and `expires_at`'s — present exactly when the node declares
-`timeout:` — are producer obligations, kept by a worker because the settled row
-is where they are read back. Refusing a pause over either would cost a node its
-attempt for a disagreement about a row nothing routes off.
+So neither instant's **value** is one a hub routes off, and the two are checked
+differently for that reason. `expires_at` is the one member of a `paused` body
+**no hub check backs**, and deliberately: the checks below refuse a pause over a
+field the hub would otherwise have *used*, and its rule — present exactly when
+the node declares `timeout:` — is a producer obligation, kept by a worker
+because the settled row is where it is read back. Refusing a pause over it would
+cost a node its attempt for a disagreement about a row nothing routes off, and a
+member whose absence is itself meaningful is one a hub cannot tell a mistake
+from. `paused_at` is REQUIRED and is checked as every other required member is —
+a body short of it is unreadable, by the rule below — because it is the one fact
+the settled dispatch row exists to carry about the machine that reached the
+node, and a row short of it is not that record. What the check does **not** do is
+spend the value: the hub dates the wait it plants off its own clock, and files
+the worker's reading beside the rest of the row for a reader asking when *that*
+machine got there.
 
 **A restart re-arms it whole**, because a restarted hub re-derives a placed pause
 by *planting it again*: it dates the wait its own now and gives the question the
@@ -1213,11 +1221,15 @@ Its first request carries a session the hub has forgotten, so it is answered
 answered `409` and discarded (§3.4) — the superseded row, because this
 declaration is what superseded it. It is never the `204` row: that one is a
 dispatch a **result** ended, and this is one the hub ended without one, which is
-the whole of why §3.4 gives the two endings two verbs. The effect batches it
-still holds are a different matter and **are** journaled: they are keyed by
-effect key and scoped to their execution, not to a session or a dispatch (§3.3),
-so a batch in flight when the lid closed reaches the journal on the re-send and
-the retry replays it instead of re-issuing it (§7.2).
+the whole of why §3.4 gives a dispatch's two end states two verbs — *settled* and
+*superseded*. The third ending a result may carry cuts across that axis rather
+than adding to it: a paused result settles its dispatch exactly as an answer
+does, so a pause taken here would still be the `204` row and never this one. The
+effect batches the worker still holds are a different matter and **are**
+journaled: they are keyed by effect key and scoped to their execution, not to a
+session or a dispatch (§3.3), so a batch in flight when the lid closed reaches
+the journal on the re-send and the retry replays it instead of re-issuing it
+(§7.2).
 
 PRD resolved q39 puts this as "heartbeat loss re-parks what was queued to the
 vanished worker". The phrase is written in the vocabulary of a push model, where

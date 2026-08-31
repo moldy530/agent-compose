@@ -1270,6 +1270,33 @@ fn assert_is_the_pause_the_composition_declares(wait: &Value, execution: &str) {
     );
 }
 
+/// **This report holds no placement wait**, asserted against a report that is
+/// demonstrably still publishing wait state.
+///
+/// `placement_waits` is *omitted* from a report holding none
+/// (`runtime.ts`'s `executionReport`), so "absent or empty" is the shape being
+/// asserted — and on its own that is one-sided: a status route that stopped
+/// publishing the key at all would satisfy it while the property it exists for,
+/// "a paused dispatch is settled rather than parked", had quietly become
+/// unobservable. The companion is what closes that: the same document publishes
+/// the pause as an `interrupts` entry, so the report's wait state is live and
+/// what it does not carry is a placement wait rather than a key that went away.
+fn assert_holds_no_placement_wait(report: &Value, what: &str) {
+    assert!(
+        report["interrupts"]
+            .as_array()
+            .is_some_and(|open| !open.is_empty()),
+        "this report publishes no open question at all, so `placement_waits` says nothing about \
+         whether a placed dispatch is parked: {report:#}"
+    );
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{what}: {report:#}"
+    );
+}
+
 /// A `human:` node a **placed** agent reaches parks on the hub's board, and the
 /// answer sends the node back to a worker (§3.4, PRD resolved q46).
 ///
@@ -1353,23 +1380,18 @@ fn a_pause_a_placed_agent_reaches_comes_home_and_its_answer_sends_the_node_back(
         json!(["approve", "reject"]),
         "the delivery published a contract other than the `human:` node's own: {announced:#}"
     );
-    assert!(
-        announced["placement_waits"]
-            .as_array()
-            .is_none_or(Vec::is_empty),
-        "the parking announced a placement wait for a dispatch a pause settled: {announced:#}"
+    assert_holds_no_placement_wait(
+        &announced,
+        "the parking announced a placement wait for a dispatch a pause settled",
     );
 
     // **Settled, not parked.** A paused result ends the dispatch, so the hub is
     // holding no placement wait for this node and the session that posted it may
     // be dispatched other work.
     let report = mesh.report(&execution);
-    assert!(
-        report["placement_waits"]
-            .as_array()
-            .is_none_or(Vec::is_empty),
-        "the hub is still holding a placement wait for a dispatch a paused result settled: \
-         {report:#}"
+    assert_holds_no_placement_wait(
+        &report,
+        "the hub is still holding a placement wait for a dispatch a paused result settled",
     );
     let settled = harness::journal_rows(
         &mesh.project,
