@@ -48,6 +48,11 @@
 //! implementation from deciding otherwise, so there is no capacity anywhere in
 //! this module.
 //!
+//! How long a hold lasts is the **hub's**, and §10.2 makes lengthening it a
+//! change no version bump announces — "which a worker learns by waiting". So
+//! this worker waits: [`Hold`] is the ceiling a poll is given, it starts at §2's
+//! twenty-five seconds, and it grows when a hub is slower than that.
+//!
 //! One node runs at a time, and that is the capacity. A dispatch answered while
 //! one is running is **queued**, never waited on: waiting would stop the poll,
 //! and a poll that stops is a worker the hub declares gone (§6.3). The hub hands
@@ -108,13 +113,77 @@ use wire::{Answer, Hub};
 /// number `src/mesh.ts` declares.
 const PROTOCOL: u32 = compose_core::codegen::mesh::PROTOCOL_VERSION;
 
-/// The default poll hold this worker waits out (§2), as a client-side bound.
+/// How long this worker waits out a held `GET` before presuming the connection
+/// dead — §2's poll hold, **learned** rather than fixed.
 ///
-/// Not a knob: the hold belongs to the hub, and this is only how long a `GET`
-/// may take before the connection is presumed dead. A hub configured shorter
-/// answers sooner and this never notices; a hub configured longer is one this
-/// worker is not built against.
-const POLL_HOLD: Duration = Duration::from_secs(25);
+/// The hold belongs to the hub: §2 gives it as 25 seconds and lets an
+/// implementation make it configurable, and §10.2 files *lengthening* it among
+/// the changes that need no version bump — "which a worker learns by waiting".
+/// A worker with a hard ceiling of its own does not learn it. Against a hub
+/// holding longer than that ceiling, every idle poll would abort client-side and
+/// be read as a transport failure: §2's backoff would climb to thirty seconds,
+/// a healthy mesh would emit a continuous stream of false failures, and the
+/// heartbeat the whole of §6 is built on would go quiet for the gaps between
+/// them — all under a knob `docs/topics/cli.md` invites an operator to turn.
+///
+/// So the number only ever grows, from two things this worker can observe:
+///
+/// * an answer that took **longer** than the hold it expected — that hub holds
+///   at least that long;
+/// * a poll that reached this worker's own ceiling with nothing on it. That is
+///   either a hub holding longer still or a connection that died, and the two
+///   are indistinguishable from here — so the expectation doubles and the next
+///   poll waits it out, which is what learning by waiting is. The waiting is its
+///   own pacing: a hub that never answers is polled at ever longer intervals
+///   rather than hammered, so no backoff is owed on top of it.
+///
+/// [`Hold::MOST`] is where the learning stops, and past it a silent connection
+/// goes back to [`Backoff`]: a hold that long is well beyond the intermediary
+/// idle timeouts §2 sizes the hold against, so a hub that has said nothing for
+/// five minutes is one that has hung rather than one that is holding.
+pub(crate) struct Hold {
+    expected: Duration,
+}
+
+impl Hold {
+    /// §2's hold, which is what a hub that configures nothing keeps.
+    const DEFAULT: Duration = Duration::from_secs(25);
+
+    /// The longest hold this worker will learn.
+    const MOST: Duration = Duration::from_secs(300);
+
+    const fn new() -> Self {
+        Self {
+            expected: Self::DEFAULT,
+        }
+    }
+
+    /// What the next poll waits out, before [`wire::POLL_MARGIN`].
+    const fn expected(&self) -> Duration {
+        self.expected
+    }
+
+    /// A poll the hub answered, after `waited`.
+    fn answered(&mut self, waited: Duration) {
+        if waited > self.expected {
+            self.expected = waited.min(Self::MOST);
+        }
+    }
+
+    /// A poll that produced nothing after `waited`: whether that was this
+    /// worker's own ceiling rather than the hub, in which case the hold grew.
+    fn waited_out(&mut self, waited: Duration) -> bool {
+        // A second of slack, because the ceiling is a deadline the client
+        // enforces and a poll that raced it by a millisecond is the same event.
+        if waited + Duration::from_secs(1) < self.expected + wire::POLL_MARGIN
+            || self.expected >= Self::MOST
+        {
+            return false;
+        }
+        self.expected = (self.expected * 2).min(Self::MOST);
+        true
+    }
+}
 
 /// What `agent-compose worker` was asked to be.
 pub(crate) struct Options {
@@ -320,6 +389,10 @@ fn serve(
 
     let sessions = Arc::new(sessions);
     let mut backoff = Backoff::new();
+    // What this worker believes this hub's hold is, which §10.2 makes something
+    // it learns rather than something it knows. One per cycle: a re-join that
+    // brought a new artifact is a hub that may have been reconfigured with it.
+    let mut hold = Hold::new();
     std::thread::scope(|scope| -> Result<(), Stop> {
         // At most one **running**, because §2 hands a session one dispatch at a
         // time and §13 forbids this implementation from deciding otherwise.
@@ -350,7 +423,16 @@ fn serve(
                         node::execute(&hub, &sessions, &tree, bun, &runner, &dispatch)
                     }));
             }
-            match hub.poll(&session.id, POLL_HOLD) {
+            let began = std::time::Instant::now();
+            let answered = hub.poll(&session.id, hold.expected());
+            let waited = began.elapsed();
+            // An answer that took longer than the hold this worker expected is
+            // the hub saying what its hold is (§10.2), and the next poll waits
+            // that long before presuming anything.
+            if matches!(answered, Answer::Said(_)) {
+                hold.answered(waited);
+            }
+            match answered {
                 Answer::Said(said) if said.status == 200 => {
                     backoff.reset();
                     // **Queued, and the poll goes on.** A dispatch answered to a
@@ -392,7 +474,23 @@ fn serve(
                     said.status,
                     said.detail()
                 )),
-                Answer::Unreachable(reason) => backoff.wait(&reason),
+                Answer::Unreachable(reason) => {
+                    // A poll that came back with nothing at this worker's own
+                    // ceiling is a hub holding longer than it expected — §10.2's
+                    // compatible change, learned the only way a worker can learn
+                    // it. The next poll waits the longer interval out, and that
+                    // waiting is its own pacing, so this is not a transport
+                    // failure and owes the backoff nothing.
+                    if hold.waited_out(waited) {
+                        note(&format!(
+                            "this hub holds a poll longer than this worker waited ({reason}); \
+                             waiting up to {:?} for the next one (docs/distributed.md §2, §10.2)",
+                            hold.expected()
+                        ));
+                    } else {
+                        backoff.wait(&reason);
+                    }
+                }
             }
             // A session the *node* thread renewed is the one this poll must use.
             session = sessions.current()?;
@@ -728,6 +826,56 @@ fn fail(reason: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hub that holds longer than §2's default is waited out rather than
+    /// reported dead (§10.2: "which a worker learns by waiting").
+    ///
+    /// The schedule, from a worker's side: the first poll waits §2's hold plus
+    /// the margin, comes back with nothing, and the expectation doubles — so a
+    /// hub configured to hold ninety seconds is being waited out by the third
+    /// poll, and the answer that arrives then is what fixes the number. What
+    /// this is written against is the alternative: a fixed ceiling turns every
+    /// idle poll on such a hub into a transport failure, which climbs the
+    /// backoff of §2 and leaves the heartbeat quiet between the retries.
+    #[test]
+    fn a_hub_that_holds_longer_than_the_default_is_learned_rather_than_backed_off_from() {
+        let mut hold = Hold::new();
+        assert_eq!(hold.expected(), Duration::from_secs(25));
+
+        // The hub holds 90 seconds; this worker gives up at 25 + 30 and grows.
+        let ceiling = hold.expected() + wire::POLL_MARGIN;
+        assert!(hold.waited_out(ceiling), "the ceiling was not recognised");
+        assert_eq!(hold.expected(), Duration::from_secs(50));
+        let ceiling = hold.expected() + wire::POLL_MARGIN;
+        assert!(hold.waited_out(ceiling));
+        assert_eq!(hold.expected(), Duration::from_secs(100));
+
+        // …which is past the hub's hold, so the next poll is answered at 90 and
+        // that is what the expectation becomes for good.
+        hold.answered(Duration::from_secs(90));
+        assert_eq!(hold.expected(), Duration::from_secs(100));
+        assert!(
+            !hold.waited_out(Duration::from_secs(90)),
+            "an answer inside the ceiling was read as the ceiling"
+        );
+
+        // An answer longer than the expectation raises it directly, and a
+        // shorter one never lowers it: the ceiling is a bound on waiting, and a
+        // worker that lowered it would have to learn the same hold twice.
+        hold.answered(Duration::from_secs(140));
+        assert_eq!(hold.expected(), Duration::from_secs(140));
+        hold.answered(Duration::from_millis(30));
+        assert_eq!(hold.expected(), Duration::from_secs(140));
+
+        // The learning stops, and past it a silent connection is a hub that has
+        // hung rather than one that is holding — so the backoff gets it back.
+        hold.answered(Duration::from_secs(10_000));
+        assert_eq!(hold.expected(), Hold::MOST);
+        assert!(
+            !hold.waited_out(Hold::MOST + wire::POLL_MARGIN),
+            "the hold grew past the longest one this worker learns"
+        );
+    }
 
     /// §2's schedule, exactly: one second, doubling, capped at thirty.
     #[test]
