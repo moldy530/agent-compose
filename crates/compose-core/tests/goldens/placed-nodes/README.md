@@ -368,6 +368,32 @@ run. The trace document is still written, with `status: "interrupted"` and the
 pause on the entry of the node it stopped at, and the answer goes to `serve`'s
 resume route instead.
 
+## A pause a worker opens
+
+A placed component can reach a `human` node — an agent placed on a machine, with
+a `flow.*` in its `tools:` that asks somebody a question — and everything above
+is still true of it. The wait board is the hub's, so the question comes home: the
+worker settles its dispatch *paused*, the hub puts the wait on the same board a
+local pause goes on, and the status route publishes it with the same `wait_id`,
+the same `output_schema` and the same `resume_url`. Answer it at that URL.
+
+Two things are worth knowing about what happens next, because they are visible in
+the status route while they happen. The worker is **free** the moment it asks —
+the dispatch is over, and that machine may be given other work, or be switched
+off, while a person thinks. And the answer sends the node **back through
+dispatch**: it is queued to its placement again, and if nothing is claiming that
+placement at that moment the execution shows a `placement_waits` entry until a
+worker joins. What the node does *not* do is start over — the effects it had
+already journaled, a model call above all, are replayed rather than re-issued,
+and it goes live at the point it stopped.
+
+Both instants on such an entry are **this** machine's, exactly as they are on a
+pause opened here: the question is dated when the wait lands on this board and
+`expires_at` is that instant plus the node's whole `timeout:`, so the gap between
+the two is the budget you wrote, whichever machine reached the node. The worker's
+own clock does not reach the status route — a deadline shown to a person has to be
+the deadline this process will fire, and two machines' clocks disagree.
+
 ## Pinned versions
 
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a

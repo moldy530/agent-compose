@@ -12755,13 +12755,22 @@ fn a_run_asked_to_stop_takes_its_command_with_it() {
     // the moment the test sees it the fork it is about has certainly happened.
     // Thirty seconds is `agent.worker`'s bound, which nothing here reaches: what
     // ends this command is the signal, not the deadline.
+    //
+    // **The subshell's own sleep is the window the signal has to arrive in**, and
+    // it is twenty seconds rather than a handful because the thing being measured
+    // is not a delay this test controls: the marker is polled, the signal is
+    // delivered, and the runtime's handler then sweeps the group — three steps
+    // that take milliseconds on an idle machine and are all schedulable under a
+    // loaded one. A window narrow enough for load to close is a test that fails
+    // for a reason that is not the defect, and the escape is checked from the
+    // fork rather than from here, so widening it costs no margin.
     provider.enqueue(Script::new(
         SONNET,
         Outcome::tool_calls(vec![ToolCall::new(
             "bash",
             json!({
                 "command":
-                    "( printf started > started.txt; sleep 4; printf escaped > escaped.txt ); \
+                    "( printf started > started.txt; sleep 20; printf escaped > escaped.txt ); \
                      echo done"
             }),
         )]),
@@ -12777,12 +12786,26 @@ fn a_run_asked_to_stop_takes_its_command_with_it() {
         String::from_utf8_lossy(&built.stderr)
     );
 
+    // When the fork happened, on this process's clock. The escape is due a fixed
+    // number of seconds *after that instant*, so it is the instant the check
+    // below waits from: measuring from the run's end instead would make the
+    // margin depend on how long the signal took to be delivered, which is the
+    // one quantity this test has no control over.
+    let marked = std::cell::Cell::new(None::<std::time::Instant>);
     let stopped = harness::stop_run(
         &project,
         &["run", "flow.work", "--input", "goal=start something long"],
         &environment,
         libc::SIGINT,
-        || started.exists(),
+        || {
+            if !started.exists() {
+                return false;
+            }
+            if marked.get().is_none() {
+                marked.set(Some(std::time::Instant::now()));
+            }
+            true
+        },
     );
 
     let status = stopped.status.expect(
@@ -12799,7 +12822,15 @@ fn a_run_asked_to_stop_takes_its_command_with_it() {
         stopped.took
     );
 
-    std::thread::sleep(Duration::from_secs(8));
+    // Past the instant the escape was due — the fork, plus its own sleep, plus a
+    // margin — rather than a flat wait from here, so what the file system is
+    // asked is "did the work outlive the run" and not "did it outlive the run by
+    // more than this test happened to wait".
+    let due = marked.get().expect("the marker was seen") + Duration::from_secs(23);
+    let now = std::time::Instant::now();
+    if due > now {
+        std::thread::sleep(due - now);
+    }
     assert!(
         !escaped.exists(),
         "the command the stopped run was in the middle of wrote `{}` after the \

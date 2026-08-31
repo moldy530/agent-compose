@@ -1,0 +1,68 @@
+# rule: the store rule reads the attachment closure, so a store an unplaced agent binds inside a placed agent's tool loop is refused too (grammar 14.1 rule 5, `docs/distributed.md` §9.1)
+# code: process-local-store
+# message: `store.notes` is on the process-local `sqlite_vec` backend (the alias `notes_db`, defined by the `mesh` target), and `agent.filer` that binds it executes in placement `mac`
+# at: main.yml:31:12
+# label: main.yml:52:11 `agent.signer` reaches `flow.file_one` here
+# label: main.yml:43:14 `flow.file_one` reaches `agent.filer` here
+# label: deploy/mesh.yml:8:15 `agent.signer` is a member of placement `mac`
+# help: a mesh runs this store's component in more than one process — several workers may claim one placement, and the hub dispatches whatever else reaches the store — and each one opens its own copy, so a write on one side is never a read on another: bind `chroma`, `pgvector` or `qdrant` instead, whose variables the environment partition already carries to every placement that reaches the store, or take the component that binds it out of `placements:` so only the hub ever opens it. This release opens only the process-local backends — a networked one compiles and then refuses at the first store op, since production `storage_backends` land behind the store plugin interface in M3 (PRD §7) — so taking the component out of `placements:` is the repair a build of this release runs (grammar 14.1 rule 5, PRD resolved q45)
+# target: mesh
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+provider.embed:
+  kind: openai
+  api_key: ${EMBED_KEY}
+model.m:
+  provider: provider.p
+  id: some-model
+store.notes:
+  kind: vector
+  scope: execution
+  description: What this run has filed.
+  backend: notes_db
+  embed:
+    model: text-embedding-3-small
+    provider: provider.embed
+agent.filer:
+  model: model.m
+  prompt: File what you are given.
+  stores: [store.notes]
+  input:
+    text: { type: string }
+  output:
+    filed: { type: string }
+flow.file_one:
+  description: File one note.
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    file:
+      agent: agent.filer
+      input:
+        text: "input.text"
+  edges:
+    - { from: start, to: file }
+    - { from: file, to: end }
+agent.signer:
+  model: model.m
+  prompt: Sign the release, filing notes as you go.
+  tools: [flow.file_one]
+  input:
+    text: { type: string }
+  output:
+    verdict: { type: string }
+flow.release:
+  inputs:
+    text: { type: string }
+  outputs: {}
+  nodes:
+    sign:
+      agent: agent.signer
+      input:
+        text: "input.text"
+  edges:
+    - { from: start, to: sign }
+    - { from: sign, to: end }

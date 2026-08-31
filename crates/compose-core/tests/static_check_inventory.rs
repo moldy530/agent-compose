@@ -254,6 +254,19 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // The other half of grammar 14.1 that needs two files, and it needs a
+        // third fact besides: which backend the *target* resolves the store to
+        // (11.3, 14.3). The pass it runs over is `codegen/env.rs`'s partition
+        // rather than a walk of its own — "can execute in a placement's
+        // process" is the question that module already answers, and two
+        // derivations of one closure is the drift the partition exists to
+        // prevent (`docs/distributed.md` §9.1).
+        rule: "a store on a process-local backend is opened by no placement's process (14.1 rule 5, D131)",
+        pass: "check/placements.rs, over codegen/env.rs",
+        codes: &["process-local-store"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "the effective write map is injective (8.0, D93)",
         pass: "check/channels.rs",
         codes: &["conflicting-writes"],

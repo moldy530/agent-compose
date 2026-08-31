@@ -49,6 +49,7 @@ export const environmentReferences: readonly EnvironmentReference[] = [
   {
     name: "OPS_BIN",
     sites: [
+      "flow.deadline.node.lapse.exec.command",
       "tool.notarize.exec.command",
     ],
   },

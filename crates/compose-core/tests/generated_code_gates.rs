@@ -1786,6 +1786,334 @@ fn the_wait_board_behaved(observed: &Value) {
         observed["unanswerable"],
         json!({ "settled": "HumanInterrupt", "published": [] })
     );
+
+    a_pause_a_worker_opened_is_a_pause(observed);
+}
+
+/// A pause a **worker** opened is this board's own entry, and behaves as a local
+/// one does (`docs/distributed.md` §3.4, PRD resolved q46).
+///
+/// The parity bar the resolution sets is "a placed `human:` node must mean what
+/// the same node unplaced means", and the sections above are the local half of
+/// exactly these readings — so a divergence shows as two assertions in one file
+/// disagreeing rather than as a served hub behaving oddly.
+///
+/// Split out for [`the_wait_board_behaved`]'s own reason: gate 13 re-runs this
+/// runner under the Node fallback, and one function is what keeps the two
+/// columns from drifting into different verdicts.
+fn a_pause_a_worker_opened_is_a_pause(observed: &Value) {
+    // Published as a pause is published, under the identity the worker derived
+    // — and with the **contract this hub holds**, read out of the descriptor
+    // registry rather than off anything the wire carried (§4.3).
+    assert_eq!(
+        observed["remote_answered"]["published"],
+        json!([{
+            "id": "escalate/0/sign/0",
+            "flow": "flow.sign_off",
+            "node": "sign",
+            "shown": { "question": "ship it?" },
+            "schema": {
+                "type": "object",
+                "properties": { "decision": { "enum": ["approve", "reject"] } },
+                "required": ["decision"],
+                "additionalProperties": false,
+            },
+        }]),
+        "a worker's pause is not published the way a local one is: {observed}"
+    );
+    // …and dated where it was planted rather than where it was asked. Both
+    // instants of a published wait are the holding generation's, which is what
+    // makes the pair an interval on either side of the wire (§3.4, PRD resolved
+    // q46's parity bar); the wire's instant is on the settled dispatch row,
+    // which is the record of what that machine's clock said.
+    assert_eq!(
+        observed["remote_answered"]["published_paused_at_is_an_instant"],
+        json!(true),
+        "a worker's pause is published with no date on it: {observed}"
+    );
+    assert_eq!(
+        observed["remote_answered"]["published_paused_at_is_the_wires"],
+        json!(false),
+        "the wait publishes the instant the worker's clock stamped rather than the one this hub \
+         planted it at, so a reader is shown a pair read off two machines: {observed}"
+    );
+    // Counted by `pausesUnder`, which is the reading `runActivity` holds a
+    // dispatching node's deadline still by (D102): the time a person spends
+    // thinking is not time the placed node's `timeout:` counts, exactly as it is
+    // not time an unplaced one's counts.
+    assert_eq!(observed["remote_answered"]["held_under"], json!(1));
+    assert_eq!(observed["remote_answered"]["held_elsewhere"], json!(0));
+    // A payload the node's `output:` refuses is a `mismatch` and consumes
+    // nothing, which is the resume-payload validation §3.4 promises is the
+    // single-process one.
+    assert_eq!(observed["remote_answered"]["refused"], json!("mismatch"));
+    assert_eq!(
+        observed["remote_answered"]["waiting_after_a_mismatch"],
+        json!(1)
+    );
+    // …and the answer settles it into exactly the record `runHuman` writes for a
+    // pause the hub held itself, which is what the redispatch replays.
+    assert_eq!(observed["remote_answered"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["remote_answered"]["record"]["settled"],
+        json!("resumed")
+    );
+    assert_eq!(
+        observed["remote_answered"]["record"]["output"],
+        json!({ "decision": "approve" })
+    );
+    assert_eq!(
+        observed["remote_answered"]["record_carries_the_published_pause"],
+        json!(true),
+        "the record holds an instant the board never published, so the answered pause's trace \
+         entry reports a wait the execution was never under (docs/trace.md §3.4): {observed}"
+    );
+    assert!(
+        observed["remote_answered"]["record"]["settledAt"].is_string(),
+        "the record does not say when the wait stopped waiting: {observed}"
+    );
+    // **The hub's writer is handed the record inside the settlement**, before the
+    // promise the resume route answers `202` off resolves — which is where
+    // `runHuman` calls `slot.keep` and for its reason: a record written in a
+    // later turn of the loop is one a process killed in between never wrote, and
+    // the next start re-derives the pause off the settled dispatch row and asks
+    // the person a second time (`docs/durability.md` §3.4).
+    assert_eq!(
+        observed["remote_answered"]["wrote"],
+        json!(["kept", "resolved"]),
+        "the answer to a pause a worker opened is journaled after the promise it is acknowledged \
+         off resolves: {observed}"
+    );
+    assert_eq!(
+        observed["remote_answered"]["written_record"], observed["remote_answered"]["record"],
+        "the record handed to the hub's writer is not the one the node goes on with: {observed}"
+    );
+    assert_eq!(
+        observed["remote_answered"]["waiting_after_the_answer"],
+        json!(0)
+    );
+    // …and a second answer is refused with the sentence a local pause's second
+    // answer is refused with. A delivery that re-settled it would journal a
+    // second `human` record over an answer somebody already gave — the record
+    // below says the first one stands.
+    assert_eq!(
+        observed["remote_answered"]["twice"],
+        json!("settled"),
+        "a wait a worker opened took a second answer: {observed}"
+    );
+    assert_eq!(
+        observed["remote_answered"]["record_after_the_second_answer"],
+        observed["remote_answered"]["record"],
+        "the second answer rewrote the record the first one settled: {observed}"
+    );
+
+    // An expiry settles into the record whose replay raises the node's own
+    // `on_timeout:` — the composition's route, decided by the same line of the
+    // same function an unplaced pause's expiry is decided by.
+    assert_eq!(observed["remote_expired"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["remote_expired"]["record"]["settled"],
+        json!("expired")
+    );
+    assert!(
+        observed["remote_expired"]["record"].get("output").is_none(),
+        "an expired wait recorded an answer nobody gave: {observed}"
+    );
+    assert_eq!(
+        observed["remote_expired"]["written_record"], observed["remote_expired"]["record"],
+        "an expiry is not journaled through the writer an answer is, so a run could take \
+         `on_timeout:` past a wait whose expiry the journal does not hold: {observed}"
+    );
+
+    // **The budget is the composition's, and the clock is this hub's.** The
+    // pause driven here carries an `expires_at` an hour in this process's past —
+    // what a worker an hour behind stamps on a question it just asked — and the
+    // node's own `timeout:` is a minute. Armed off the wire the wait would have
+    // expired on the next tick and no person could ever have answered it; armed
+    // off the descriptor it is still open, and takes the answer.
+    assert_eq!(
+        observed["remote_skewed"]["settled_while_the_budget_runs"],
+        json!("pending"),
+        "a worker's clock decided when this hub's wait expired, so a `timeout:` the composition \
+         declares means something different on every machine: {observed}"
+    );
+    assert_eq!(observed["remote_skewed"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["remote_skewed"]["record"]["settled"],
+        json!("resumed")
+    );
+    // …and the deadline a reader is shown is the deadline that fires. The wire's
+    // instant is an hour in this process's past, so a board that republished it
+    // would show the question as expired for the whole minute the resume surface
+    // still takes its answer — a status route contradicting the resume route.
+    assert_eq!(
+        observed["remote_skewed"]["published_expires_at_is_the_wires"],
+        json!(false),
+        "the wait publishes the instant the worker's clock stamped rather than the one this hub \
+         armed, so a surface shows a deadline that is not the one that will fire: {observed}"
+    );
+    assert_eq!(
+        observed["remote_skewed"]["published_expires_at_is_ahead"],
+        json!(true),
+        "the wait publishes a deadline this process is already past while its own timer runs on: \
+         {observed}"
+    );
+    assert_eq!(
+        observed["remote_skewed"]["record_dates_the_deadline_it_published"],
+        json!(true),
+        "the record holds a deadline other than the one the board published, so a replayed wait \
+         reports a budget the execution was never under: {observed}"
+    );
+    // **And the pair those rules leave is one clock's**, which is PRD resolved
+    // q46's parity bar for status visibility: the same node unplaced dates both
+    // members off one reading, so `expires_at − paused_at` is the node's
+    // `timeout:` — and a placed pause has to publish the same. The worker driven
+    // here runs an hour ahead, which is what makes the reading decidable rather
+    // than a rounding: a board that had kept the wire's `pausedAt` beside its own
+    // deadline would publish a question dated an hour from now expiring a minute
+    // from now, an *inverted* pair. The assertions below pin the three halves of
+    // it — neither published member came off the wire, the dating is this
+    // planting's, and the gap is the whole minute the composition declares.
+    assert_eq!(
+        observed["remote_planting"]["settled_while_the_budget_runs"],
+        json!("pending"),
+        "a wait a worker dated in this hub's future was settled before anyone could answer it: \
+         {observed}"
+    );
+    assert_eq!(
+        observed["remote_planting"]["published_paused_at_is_the_wires"],
+        json!(false),
+        "the wait publishes the instant the worker's clock stamped rather than the one this hub \
+         planted it at, so a reader is shown a pair read off two machines (docs/distributed.md \
+         §3.4): {observed}"
+    );
+    assert_eq!(
+        observed["remote_planting"]["published_expires_at_is_the_wires"],
+        json!(false),
+        "the wait publishes the worker's deadline rather than the one this hub armed: {observed}"
+    );
+    let budget = observed["remote_planting"]["budget_from_the_planting_ms"]
+        .as_i64()
+        .unwrap_or(-1);
+    assert!(
+        (60_000..=65_000).contains(&budget),
+        "the deadline published is {budget}ms after the planting, where the node declares a \
+         minute: a worker's clock moved the budget: {observed}"
+    );
+    let dated = observed["remote_planting"]["dated_from_the_planting_ms"]
+        .as_i64()
+        .unwrap_or(i64::MAX);
+    assert!(
+        (0..=5_000).contains(&dated),
+        "the wait is dated {dated}ms from the planting, where a wait a process opens is dated the \
+         instant it opens it: a worker's clock decided when this hub's question was asked: \
+         {observed}"
+    );
+    let gap = observed["remote_planting"]["published_gap_ms"]
+        .as_i64()
+        .unwrap_or(0);
+    assert_eq!(
+        gap, 60_000,
+        "`expires_at − paused_at` came back {gap}ms, where the node declares a minute: the two \
+         published members are no longer one clock's reading and its budget, so a reader \
+         computing what is left of a question measures the offset between two machines instead \
+         (docs/distributed.md §3.4, PRD resolved q46): {observed}"
+    );
+    assert_eq!(
+        observed["remote_planting"]["settled"],
+        json!("resolved"),
+        "a wait planted from a wildly skewed pause could not be answered: {observed}"
+    );
+    assert_eq!(
+        observed["remote_planting"]["record_carries_the_published_pair"],
+        json!(true),
+        "the journaled record holds a pair the board never published, so the answered pause's \
+         trace entry reports instants the execution was never under (docs/trace.md §3.4): \
+         {observed}"
+    );
+    // …and a node with no `timeout:` publishes no deadline, whatever the wire
+    // dated the pause: grammar 8.7 makes that wait unbounded, and an instant
+    // nothing will fire is not one a surface may show.
+    assert_eq!(
+        observed["remote_unbounded"],
+        json!({ "settled": "pending", "published_expires_at": null }),
+        "a pause under a node that declares no `timeout:` published an expiry nothing will ever \
+         fire: {observed}"
+    );
+    // A pause naming a `human:` node this build no longer declares is resolved
+    // q29's disagreement — a journal that does not describe this run — rather
+    // than a bare failure a node's `on_error:` could absorb. Only a restart on a
+    // rebuilt artifact reaches it: the result route refuses such a pause before
+    // the dispatch is settled.
+    assert_eq!(
+        observed["remote_unregistered"],
+        json!({
+            "settled": "ReplayDivergence",
+            "names_the_record": true,
+            "published": 0,
+        }),
+        "a pause naming a node this build does not declare did not fail as a divergence naming \
+         the record its answer would have been written under: {observed}"
+    );
+    // **The budget is armed whole every time the wait is planted**, which is the
+    // half a hub restart decides: a process that re-derives an unanswered pause
+    // plants it again, exactly as a resumed generation re-parks a local wait
+    // nobody answered (`docs/durability.md` §5) — and PRD resolved q46 does not
+    // let a placement decide "how long do I have". The second planting of one
+    // identity is what stands in for the restart here, and it lasts the node's
+    // own thirty milliseconds rather than the nothing its predecessor left.
+    assert_eq!(observed["remote_replanted"]["first"], json!("resolved"));
+    assert_eq!(observed["remote_replanted"]["replanted"], json!("resolved"));
+    let lasted = observed["remote_replanted"]["lasted"]
+        .as_i64()
+        .unwrap_or(-1);
+    assert!(
+        lasted >= 25,
+        "a re-planted wait lasted {lasted}ms of the thirty its node declares, so a hub restart \
+         spends a person's budget on the downtime it was not open for: {observed}"
+    );
+
+    // The two settlements that are the run's own shape rather than the
+    // composition's reach a remote pause exactly as they reach a local one.
+    assert_eq!(
+        observed["remote_unsettled"],
+        json!({
+            "abandoned": "HumanAbandoned",
+            "withdrawn": "HumanInterrupt",
+            "unanswerable": "HumanInterrupt",
+        }),
+        "a worker's pause survives a run that stopped waiting for it: {observed}"
+    );
+
+    // …and the other end of the wire: the identity a worker sends home is the
+    // one the **same** `runHuman` opens locally at the same view, which is the
+    // whole of what "the same wait identity derivation" means.
+    assert_eq!(
+        observed["travelling"]["opened"],
+        json!(["escalate/0/sign/0"])
+    );
+    assert_eq!(
+        observed["travelling"]["carried"],
+        json!({
+            "name": "RemoteHumanPause",
+            "wait": "escalate/0/sign/0",
+            "flow": "flow.sign_off",
+            "node": "sign",
+            "shown": { "question": "ship it?" },
+            "effect": {
+                "key": "escalate/0/sign/0#human/0",
+                "site": "escalate/0/sign/0",
+                "ordinal": 0,
+                "request": "{\"node\":\"sign\"}",
+            },
+            "travels_as_an_interrupt": true,
+        }),
+        "a pause reached where pauses settle home did not carry what §3.4 puts on the wire: \
+         {observed}"
+    );
+    // Nothing was parked where the pause travelled: a worker holds no board, and
+    // a wait left on one there is a question no surface could ever reach.
+    assert_eq!(observed["travelling"]["published"], json!([]));
 }
 
 /// Gate 20: the terminal a `run` answers a pause at, driven directly.

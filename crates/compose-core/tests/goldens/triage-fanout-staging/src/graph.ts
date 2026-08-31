@@ -1819,3 +1819,16 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
   "flow.triage.scan":
     async (input, context) => ({ output: await toolRepoGrep(input, context) }),
 };
+
+/**
+ * Every `human:` node this composition declares, by `<flow address>.<node id>`.
+ *
+ * Read by the hub alone, and for one thing: a pause a **worker** opened settles
+ * its dispatch paused (`docs/distributed.md` §3.4), and the hub plants the wait
+ * on its own board under the identity the worker derived. What an answer is held
+ * to, and what a status route publishes as the contract, are then this node's own
+ * — the artifact is everywhere (§4.3), so the descriptor never travels.
+ */
+runtime.registerHumanNodes({
+  "flow.triage.approve": flowTriageNodeApproveHuman,
+});

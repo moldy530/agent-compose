@@ -148,6 +148,214 @@ mod tests {
         );
     }
 
+    /// A placed pause's budget is the composition's own `timeout:`, spent from
+    /// the moment the wait goes on the hub's board — the same number and the
+    /// same instant an unplaced pause's is (`docs/distributed.md` §3.4, PRD
+    /// resolved q46).
+    ///
+    /// The wire's `expires_at` is stamped by the **worker's** clock, which is
+    /// not this one's. A timer armed off it would give a `timeout: 5m` node no
+    /// time at all on a worker ten minutes behind and a quarter of an hour on
+    /// one ten minutes ahead, while the same node unplaced always gets five
+    /// minutes. So the descriptor's budget is what is armed.
+    ///
+    /// **And it is armed whole, every time the wait is planted**, which is the
+    /// half a restart decides: a hub that re-derives an unanswered pause plants
+    /// it again, exactly as a resumed generation re-parks a local wait nobody
+    /// answered, and spending a predecessor's elapsed time out of the budget
+    /// would make "how long do I have" an answer a deploy file decides — which
+    /// q46's parity bar does not allow. Pinned as a grep because the alternative
+    /// is a test that has to move two machines' clocks apart;
+    /// `tests/toolchain/human-waits.mjs` drives the behaviour, and
+    /// `distributed_hub_wire.rs` drives the restart over real processes.
+    ///
+    /// **And what it publishes is what it armed.** The `expiresAt` on the board
+    /// entry and on the record is derived here, off the instant this planting
+    /// spends the budget from — [`runHuman`]'s own line, which is what the
+    /// assertion holds it to. Republishing the wire's instant would show a
+    /// question as expired while the resume surface still takes its answer, on
+    /// the first planting behind a slow worker's clock as surely as on a
+    /// re-derivation after a long outage.
+    #[test]
+    fn a_remote_pauses_budget_is_the_compositions_and_is_armed_whole_whenever_it_is_planted() {
+        let held = function_body("export async function holdRemotePause(");
+        let local = function_body("export async function runHuman(");
+        let armed =
+            "timer = setTimeout(() => settle(\"expired\", undefined), descriptor.timeoutMs);";
+        assert!(
+            local.contains(armed),
+            "the unplaced arming this one is held to has moved, so the two are no longer the same \
+             line: {local}"
+        );
+        assert!(
+            held.contains(armed),
+            "a pause a worker opened is armed with something other than the node's own \
+             `timeout:`, whole, from the moment the wait is planted: {held}"
+        );
+        assert!(
+            !held.contains("descriptor.timeoutMs -"),
+            "a re-derived pause is armed with what is left of a predecessor's budget rather than \
+             with the node's own, so a hub restart costs a person time the same wait unplaced \
+             would have given them (PRD resolved q46): {held}"
+        );
+        let dated = ": new Date(began + descriptor.timeoutMs).toISOString();";
+        assert!(
+            local.contains(dated),
+            "the unplaced derivation this one is held to has moved, so the two are no longer the \
+             same line: {local}"
+        );
+        assert!(
+            held.contains(dated),
+            "a pause a worker opened publishes a deadline derived from something other than the \
+             instant its own timer is armed from, so a reader is shown an expiry that is not the \
+             one that will fire: {held}"
+        );
+        assert!(
+            !held.contains("remote.expiresAt"),
+            "the wire's `expires_at` is read where the wait is planted — armed off, or republished \
+             onto the board or the record — so another machine's clock decides how long a \
+             `timeout:` lasts or what a status route says about it (docs/distributed.md §3.4): \
+             {held}"
+        );
+    }
+
+    /// A planted pause is dated by the planting, off the same reading its
+    /// deadline is armed from (`docs/distributed.md` §3.4, PRD resolved q46).
+    ///
+    /// The other half of the rule above, and the one PRD resolved q46 names
+    /// "status visibility": a wait a process opens is dated when that process
+    /// opens it, so the pair a status route publishes is the node's `timeout:`
+    /// apart. A hub that kept the wire's `paused_at` beside a deadline of its own
+    /// would publish two machines' readings — an interval of nothing, negative
+    /// once a worker's lead passes the budget — and would journal, on a worker
+    /// running ahead of it, the entry `docs/durability.md` §3.4 refuses by name:
+    /// one whose answer arrives before its question.
+    ///
+    /// Pinned as a grep for the reason above it, and against [`runHuman`]'s own
+    /// line so that the two datings cannot drift apart;
+    /// `tests/toolchain/human-waits.mjs`'s `remote_planting` block and
+    /// `distributed_hub_wire.rs` drive the behaviour itself.
+    #[test]
+    fn a_remote_pause_is_dated_by_the_planting_that_arms_it() {
+        let held = function_body("export async function holdRemotePause(");
+        let local = function_body("export async function runHuman(");
+        let dated = "const pausedAt = new Date(began).toISOString();";
+        assert!(
+            local.contains(dated),
+            "the unplaced dating this one is held to has moved, so the two are no longer the same \
+             line: {local}"
+        );
+        assert!(
+            held.contains(dated),
+            "a pause a worker opened is dated by something other than the instant this hub plants \
+             it at, so the pair a status route publishes is not the node's `timeout:` apart the \
+             way the same node unplaced publishes it: {held}"
+        );
+        assert!(
+            !held.contains("remote.pausedAt"),
+            "the wire's `paused_at` is republished onto the board or the record, so a reader is \
+             shown a pair read off two machines' clocks and a fast worker's pause journals an \
+             answer that arrives before its question (docs/distributed.md §3.4): {held}"
+        );
+    }
+
+    /// The answer to a pause a worker opened is journaled **inside** the
+    /// settlement, where a local pause's is (`docs/durability.md` §3.4).
+    ///
+    /// [`runHuman`]'s `slot.keep` runs before its promise resolves, and the
+    /// reason is stated at length there: the resume route answers `202` off the
+    /// settlement, so a record written in a later turn of the event loop is one
+    /// a process killed in between never wrote — leaving a wait this board has
+    /// settled with nothing in the journal, which the next start re-derives off
+    /// the settled dispatch row and asks a second time. The hub's writer is
+    /// handed in as `keep` for exactly that ordering, and a write that throws
+    /// fails the node rather than hanging it.
+    #[test]
+    fn a_remote_pauses_answer_is_journaled_before_its_promise_resolves() {
+        let held = function_body("export async function holdRemotePause(");
+        let kept = held
+            .find("keep(settled);")
+            .expect("`holdRemotePause` writes the record through the caller's `keep`");
+        let resolved = held
+            .find("resolve(settled);")
+            .expect("`holdRemotePause` resolves with the record it wrote");
+        assert!(
+            kept < resolved,
+            "the record is written after the promise resolves, so the `202` the resume route \
+             answers can precede the write it acknowledges: {held}"
+        );
+    }
+
+    /// A `builtin.bash` command's stop sweep is armed **before** the shell is
+    /// forked (grammar 5.5, Decision D124).
+    ///
+    /// A stop signal has a *disposition* before it has a listener: until the
+    /// first `process.on` for it, the platform installs no handler and the
+    /// kernel's default ends this process where it stands. So a shell forked
+    /// before the arming is a shell whose group a `Ctrl-C` in the window between
+    /// the two would leave running, with the graph that started it gone — the
+    /// orphan D124 exists to close, reached at the one moment it is easiest to
+    /// reach. Armed first, the window cannot reopen: a listener runs between
+    /// turns of the event loop, and the spawn and the `holdCommand` beside it
+    /// are one turn.
+    ///
+    /// Pinned as an **order** rather than as a behaviour because the behaviour
+    /// is a race: the acceptance suite's
+    /// `a_run_asked_to_stop_takes_its_command_with_it` sends its signal as soon
+    /// as the command's own marker appears, and on an idle machine the runtime
+    /// wins that race whichever way round these two lines are — it lost it under
+    /// load, which is how the window was found. What is decidable here is the
+    /// ordering that makes the race unreachable.
+    #[test]
+    fn a_commands_stop_sweep_is_armed_before_the_shell_is_forked() {
+        let forked = function_body("function forkBoundShell(");
+        let armed = forked
+            .find("armCommandSweep();")
+            .expect("`forkBoundShell` arms the stop sweep");
+        let spawned = forked
+            .find("return spawn(\"bash\", [\"-c\", command], {")
+            .expect("`forkBoundShell` forks the shell");
+        assert!(
+            armed < spawned,
+            "the sweep is armed after the shell is forked, so a stop signal arriving in between \
+             is met by the kernel's default disposition: the graph ends and the command's process \
+             group is left running inside `root:` (grammar 5.5, Decision D124): {forked}"
+        );
+        // …and the fork has **one** call site, which is what makes the ordering
+        // above a property of the runtime rather than of one function: a second
+        // `spawn` of the shell would carry its own ordering, and the window this
+        // closes is reopened by whichever one forgets.
+        assert_eq!(
+            SOURCE.matches("spawn(\"bash\"").count(),
+            1,
+            "a `builtin.bash` shell is forked somewhere other than `forkBoundShell`, which is the \
+             one call site that arms the stop sweep first"
+        );
+    }
+
+    /// The body of one top-level declaration of the runtime.
+    ///
+    /// The same reader `codegen::mesh` and `codegen::serve` use, for the same
+    /// reason: a rule about what one function does is only a rule if it is read
+    /// off that function rather than off the file around it. The module is
+    /// formatted, so a top-level declaration opens at column zero and closes on
+    /// a line that is exactly `}`.
+    fn function_body(header: &str) -> String {
+        let mut lines = SOURCE.lines().skip_while(|line| !line.starts_with(header));
+        let opened = lines
+            .next()
+            .unwrap_or_else(|| panic!("`src/runtime.ts` declares `{header}…`"));
+        let mut held = String::from(opened);
+        for line in lines {
+            held.push('\n');
+            held.push_str(line);
+            if line == "}" {
+                return held;
+            }
+        }
+        panic!("`{header}…` has no closing brace in the first column")
+    }
+
     /// The runtime is the same bytes for every composition: a project that
     /// declares nothing and one that declares everything differ in `graph.ts`,
     /// and this is what makes that true.

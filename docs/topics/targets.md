@@ -214,7 +214,7 @@ tool — rather than load assignment.
 | `hub.join_token` | the bearer credential a worker joins with, as an `${ENV}` reference — required wherever `placements:` is non-empty |
 | `hub.public_url` | the absolute `http`/`https` base every ingress URL derives from; no wildcard, because this is your URL rather than an allowlist pattern |
 
-Five rules, each a compile error — grammar §14.1's four about a placement, in
+Six rules, each a compile error — grammar §14.1's five about a placement, in
 its numbering, and then §14.2's about the token:
 
 - **§14.1 rule 1** — `members:` is required, non-empty, and names each component
@@ -234,6 +234,22 @@ its numbering, and then §14.2's about the token:
   untouched: a placed tool reached from a `function:` node, or anything inside a
   flow instantiated by a `flow:` node, keeps its own placement, and there its own
   placement is the whole answer.
+- **rule 5** — a store on a **process-local** backend is refused where a
+  placement can open it. `memory`, `sqlite`, `sqlite_vec` and `local_fs` have no
+  server in the middle: the process that reaches the store opens the bytes, and a
+  mesh runs a placed component in more than one process by design — several
+  workers may claim one placement, and the hub dispatches whatever else reaches
+  the same store. Each would open its own copy, so a write on one side is never a
+  read on another. The rule reads rule 4's closure rather than `members:`, refuses
+  at every `scope:`, and applies under `--target local` too, where a hub and its
+  workers are still separate processes. The repair is to bind a **networked**
+  backend — whose variables the environment partition already carries to every
+  placement that reaches the store — or to take the component that binds it out
+  of `placements:`. Under `local` there is no `storage_backends:` to edit, so the
+  repair there is a target of its own. **This release opens only the local
+  backends**, so the second repair is the one a build of it runs: a networked
+  backend compiles and refuses at the first store op until the store plugin
+  interface lands in M3.
 - **§14.2** — `hub.join_token` is required wherever placements are, and takes an
   `${ENV}` reference, never a literal. **Holding it is being trusted with the
   mesh**: the whole artifact, the right to claim any placement, and the journal's

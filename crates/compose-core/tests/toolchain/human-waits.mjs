@@ -812,4 +812,407 @@ const observed = {};
   runtime.releaseHumanWaits(execution);
 }
 
+// ---------------------------------------------------------------------------
+// A pause a **worker** opened (`docs/distributed.md` §3.4, PRD resolved q46)
+// ---------------------------------------------------------------------------
+//
+// The parity bar q46 sets is "a placed `human:` node must mean what the same node
+// unplaced means", and this is where that is decidable: the sections above drove
+// a local pause through this board, and these drive a remote one through the
+// *same* board and read the same observations back. What a served hub can show
+// is the status shape and the resume; what only this can show is that the wait
+// is the board's own entry — counted by `pausesUnder`, so the dispatching node's
+// budget is held still (D102); refused by a mismatched payload without consuming
+// the turn; abandoned when the run ends; and settled into exactly the record a
+// local pause writes through `slot.keep`, which is what the redispatch replays.
+
+/** A recorder that holds nothing, so a claim lands at the frontier. */
+function claiming(key, site) {
+  return {
+    child: () => claiming(key, site),
+    claim: () => ({
+      key,
+      site,
+      kind: "human",
+      ordinal: 0,
+      request: '{"node":"sign"}',
+      held: undefined,
+      keep: (value) => value,
+      fail: () => {},
+    }),
+  };
+}
+
+/** The pause a worker settles its dispatch with, as §3.4 carries one home. */
+function remote(fields = {}) {
+  const node = fields.node ?? "sign";
+  return {
+    wait: `escalate/0/${node}/0`,
+    flow: "flow.sign_off",
+    node,
+    shown: { question: "ship it?" },
+    pausedAt: "2026-08-31T09:14:02.113Z",
+    effect: {
+      key: `escalate/0/${node}/0#human/0`,
+      site: `escalate/0/${node}/0`,
+      ordinal: 0,
+      request: `{"node":"${node}"}`,
+    },
+    ...fields,
+  };
+}
+
+/**
+ * The hub's writer, as `./mesh.ts`'s `answered` hands one in: what a local
+ * pause's `slot.keep` is, for a wait a worker opened.
+ *
+ * `wrote` is appended to inside the settlement and the promise's continuation
+ * appends to it after, so the order of the two is the reading that says the
+ * record was written **before** the answer was acknowledged
+ * (`docs/durability.md` §3.4).
+ */
+function writer(wrote) {
+  return (record) => {
+    wrote.push({ kept: record });
+  };
+}
+
+// The hub reads the contract off its own copy of the descriptor rather than off
+// anything that travelled (§4.3), which is what this registration is. Three
+// nodes, because the budget is read off the descriptor too: `sign` declares no
+// `timeout:` and waits, `decide` declares a short one, and `confirm` declares a
+// long one — which is what makes "the wire's `expires_at` is not the timer"
+// decidable below.
+runtime.registerHumanNodes({
+  "flow.sign_off.sign": descriptor(),
+  "flow.sign_off.decide": descriptor({ node: "decide", timeoutMs: 30, onTimeout: "__end__" }),
+  "flow.sign_off.confirm": descriptor({
+    node: "confirm",
+    timeoutMs: 60_000,
+    onTimeout: "__end__",
+  }),
+});
+
+{
+  const execution = "exec_remote_answered";
+  runtime.openHumanWaits(execution, true);
+  const pause = remote();
+  // The two events whose **order** is the durability rule: the record reaching
+  // the hub's writer, and the promise the resume route's `202` is answered off
+  // resolving. A record written in a later turn of the loop is one a process
+  // killed in between never wrote, and the person is asked again on the restart.
+  const wrote = [];
+  const promise = runtime.holdRemotePause(execution, pause, writer(wrote));
+  const held = outcomeOf(promise);
+  void promise.then(
+    () => wrote.push({ resolved: true }),
+    () => wrote.push({ rejected: true }),
+  );
+  await settle();
+  const published = runtime.humanWaits(execution);
+  // A payload the node's `output:` refuses does **not** consume the wait.
+  const refused = runtime.deliverHumanAnswer(execution, pause.wait, { decision: "maybe" });
+  const plantedAt = published[0]?.pausedAt;
+  const seen = {
+    published: published.map((wait) => ({
+      id: wait.id,
+      flow: wait.flow,
+      node: wait.node,
+      shown: wait.shown,
+      schema: wait.schema,
+    })),
+    // …dated where it was planted rather than where it was asked: the wire's
+    // instant is another machine's clock, and the pair a reader is shown has to
+    // be one clock's (`docs/distributed.md` §3.4).
+    published_paused_at_is_an_instant: typeof plantedAt === "string",
+    published_paused_at_is_the_wires: plantedAt === pause.pausedAt,
+    // The reading `runActivity` holds a dispatching node's deadline still by.
+    held_under: runtime.pausesUnder(execution, "escalate/0"),
+    held_elsewhere: runtime.pausesUnder(execution, "stamp/0"),
+    refused: refused.ok === false ? refused.reason : "taken",
+    waiting_after_a_mismatch: runtime.humanWaits(execution).length,
+  };
+  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await settle();
+  seen.settled = held.state;
+  seen.record = held.value;
+  // The journal keeps the instant the board published, so the answered pause's
+  // trace entry is the entry an unplaced pause writes.
+  seen.record_carries_the_published_pause = held.value?.pausedAt === plantedAt;
+  seen.waiting_after_the_answer = runtime.humanWaits(execution).length;
+  // What the writer was handed, and when: the record itself, and before the
+  // promise the answer is acknowledged off resolved.
+  seen.wrote = wrote.map((event) => (event.kept === undefined ? "resolved" : "kept"));
+  seen.written_record = wrote.find((event) => event.kept !== undefined)?.kept;
+  // …and a **second** answer is refused, exactly as a local pause's is: a wait
+  // is settled once, and a delivery that re-settled one would journal a second
+  // `human` record over an answer somebody already gave.
+  const twice = runtime.deliverHumanAnswer(execution, pause.wait, { decision: "reject" });
+  await settle();
+  seen.twice = twice.ok === false ? twice.reason : "taken";
+  seen.record_after_the_second_answer = held.value;
+  observed.remote_answered = seen;
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // The budget is the **composition's**, spent from the moment this hub plants
+  // the wait: `descriptor.timeoutMs`, not the wire's `expiresAt`.
+  const execution = "exec_remote_expired";
+  runtime.openHumanWaits(execution, true);
+  const wrote = [];
+  const held = outcomeOf(
+    runtime.holdRemotePause(
+      execution,
+      remote({ node: "decide", expiresAt: new Date(Date.now() + 30).toISOString() }),
+      writer(wrote),
+    ),
+  );
+  await until(() => held.state !== "pending");
+  observed.remote_expired = {
+    settled: held.state,
+    record: held.value,
+    // An expiry is journaled through the same writer, and it has to be: a run
+    // that took `on_timeout:` past a wait whose expiry the journal does not hold
+    // would re-park on the resume and spend the budget again.
+    written_record: wrote.find((event) => event.kept !== undefined)?.kept,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // **A worker's clock is not this hub's**, and a wait's budget may not depend
+  // on the difference. `expiresAt` here is an hour in this process's past — what
+  // a worker an hour behind would stamp on a pause it opened a moment ago — and
+  // the node's own budget is a minute, so the wait is still open. Armed off the
+  // wire it would have expired on the next tick, `on_timeout:` would have routed,
+  // and nobody could ever have answered a question the composition gave a minute.
+  const execution = "exec_remote_skewed";
+  runtime.openHumanWaits(execution, true);
+  const pause = remote({
+    node: "confirm",
+    expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
+  });
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  await settle();
+  const seen = { settled_while_the_budget_runs: held.state };
+  // …and the deadline a reader is shown is the one this hub will fire, derived
+  // beside the arming rather than taken off the wire. The wire's instant is an
+  // hour past, so publishing it would show the question as expired for the whole
+  // minute the resume surface still takes its answer.
+  const shown = runtime.humanWaits(execution)[0]?.expiresAt;
+  seen.published_expires_at_is_the_wires = shown === pause.expiresAt;
+  seen.published_expires_at_is_ahead =
+    typeof shown === "string" && shown > new Date().toISOString();
+  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await settle();
+  seen.settled = held.state;
+  seen.record = held.value;
+  // The record holds the deadline the board published, which is the one the
+  // timer was armed for: a replayed wait shows what this execution was under.
+  seen.record_dates_the_deadline_it_published = held.value?.expiresAt === shown;
+  observed.remote_skewed = seen;
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // **The pair a reader is shown is one clock's**, which is PRD resolved q46's
+  // parity bar for status visibility: the same node unplaced dates both members
+  // off one `Date.now()` reading, so a placed one must too. This worker's clock
+  // runs an hour *ahead* of this process's — it dates the question an hour from
+  // here and stamps the deadline its own minute of budget gives it — and neither
+  // instant reaches the board. What the planting publishes is its own now and
+  // its own now plus the descriptor's minute, so `expiresAt − pausedAt` is
+  // exactly the `timeout:` the composition declares. A board that had kept the
+  // wire's `pausedAt` would publish an *inverted* pair here: a deadline a minute
+  // from now beside a question asked an hour from now.
+  const execution = "exec_remote_planting";
+  runtime.openHumanWaits(execution, true);
+  const asked = new Date(Date.now() + 3_600_000).toISOString();
+  const pause = remote({
+    node: "confirm",
+    pausedAt: asked,
+    expiresAt: new Date(Date.parse(asked) + 60_000).toISOString(),
+  });
+  const planted = Date.now();
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  await settle();
+  const shown = runtime.humanWaits(execution)[0];
+  const seen = {
+    // Open, because the budget armed is the descriptor's and is spent from here.
+    settled_while_the_budget_runs: held.state,
+    published_paused_at_is_the_wires: shown?.pausedAt === pause.pausedAt,
+    published_expires_at_is_the_wires: shown?.expiresAt === pause.expiresAt,
+    // What the composition's minute is worth from the instant this hub planted
+    // the wait.
+    budget_from_the_planting_ms:
+      typeof shown?.expiresAt === "string" ? Date.parse(shown.expiresAt) - planted : null,
+    // …and how far the *dating* is from that same instant, which is what says
+    // the question was dated here rather than an hour from here.
+    dated_from_the_planting_ms:
+      typeof shown?.pausedAt === "string" ? Date.parse(shown.pausedAt) - planted : null,
+    // …and what subtracting one published member from the other says, which is
+    // the node's `timeout:` and nothing else.
+    published_gap_ms:
+      typeof shown?.expiresAt === "string"
+        ? Date.parse(shown.expiresAt) - Date.parse(shown.pausedAt)
+        : null,
+  };
+  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await settle();
+  seen.settled = held.state;
+  // The journal keeps the pair the board published, so the answered pause's own
+  // trace entry is the entry an unplaced pause writes (`docs/trace.md` §3.4).
+  seen.record_carries_the_published_pair =
+    held.value?.pausedAt === shown?.pausedAt && held.value?.expiresAt === shown?.expiresAt;
+  observed.remote_planting = seen;
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // …and a node the artifact gives no `timeout:` publishes no deadline at all,
+  // however the wire dated the pause. Grammar 8.7 makes that wait unbounded, so
+  // there is no timer — and an instant nothing will ever fire is not one a
+  // status route may show. `sign` declares none; the pause carries an hour.
+  const execution = "exec_remote_unbounded";
+  runtime.openHumanWaits(execution, true);
+  const dated = remote({ expiresAt: new Date(Date.now() + 3_600_000).toISOString() });
+  const held = outcomeOf(runtime.holdRemotePause(execution, dated, () => {}));
+  await settle();
+  observed.remote_unbounded = {
+    settled: held.state,
+    published_expires_at: runtime.humanWaits(execution)[0]?.expiresAt ?? null,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // **A composition that has stopped declaring the node the pause names.**
+  // Unreachable while one generation holds the pause — `./mesh.ts`'s `pauseOf`
+  // refuses it before the dispatch is settled — but a hub restarted on a rebuilt
+  // artifact re-derives an unanswered pause straight off the settled row, where
+  // no route reads the body again. That is resolved q29's disagreement exactly,
+  // so it is that class, named at the record the answer would have been written
+  // under, and travels past every policy rather than being absorbed as a node
+  // failure.
+  const execution = "exec_remote_unregistered";
+  runtime.openHumanWaits(execution, true);
+  const gone = outcomeOf(
+    runtime.holdRemotePause(execution, remote({ node: "withdrawn" }), () => {}),
+  );
+  await settle();
+  observed.remote_unregistered = {
+    settled: gone.state,
+    names_the_record: (gone.value ?? "").includes("escalate/0/withdrawn/0#human/0"),
+    published: runtime.humanWaits(execution).length,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // **Planting the wait is what arms it, every time it is planted.** A hub that
+  // re-derives an unanswered pause after a restart calls this function again,
+  // and what it gets is the node's whole `timeout:` — the same thing a resumed
+  // generation gives a local wait it re-parks (`docs/durability.md` §5), which
+  // is what PRD resolved q46's parity bar asks for. There is no instant to pass:
+  // the signature carries no elapsed time, so no caller can spend a
+  // predecessor's. Driven here as the second planting of one wait identity: the
+  // first runs out its short budget, the second is given the whole of it again.
+  const execution = "exec_remote_replanted";
+  runtime.openHumanWaits(execution, true);
+  const pause = remote({ node: "decide" });
+  const first = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  await until(() => first.state !== "pending");
+  const replanted = Date.now();
+  const again = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  await until(() => again.state !== "pending");
+  observed.remote_replanted = {
+    first: first.state,
+    replanted: again.state,
+    // How long the **second** planting lasted, in whole milliseconds. A budget
+    // that carried its predecessor's spending would have run out on the next
+    // tick; the node declares thirty milliseconds and the second wait gets them.
+    lasted: Date.now() - replanted,
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+{
+  // The two settlements that are the run's own shape, not the composition's.
+  const abandoned = "exec_remote_abandoned";
+  runtime.openHumanWaits(abandoned, true);
+  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote(), () => {}));
+  await settle();
+  runtime.releaseHumanWaits(abandoned);
+  await settle();
+
+  const withdrawn = "exec_remote_withdrawn";
+  runtime.openHumanWaits(withdrawn, true);
+  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote(), () => {}));
+  await settle();
+  runtime.closeHumanWaits(withdrawn);
+  await settle();
+
+  const unanswerable = "exec_remote_unanswerable";
+  runtime.openHumanWaits(unanswerable, false);
+  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote(), () => {}));
+  await settle();
+
+  observed.remote_unsettled = {
+    abandoned: dropped.state,
+    withdrawn: closed.state,
+    unanswerable: raised.state,
+  };
+  runtime.releaseHumanWaits(withdrawn);
+  runtime.releaseHumanWaits(unanswerable);
+}
+
+// …and the other end of the same wire, **last**, because the switch it turns on
+// is the process's and is never turned off: a worker runs one dispatch and exits
+// (`./worker-node.ts`). What it proves is the half no served hub can: the wait
+// identity a worker sends home is derived by the *same* `runHuman` at the *same*
+// view a local pause is derived by, so a placed node's question is addressed by
+// the id an unplaced one would have opened.
+{
+  const execution = "exec_travelling";
+  runtime.openHumanWaits(execution, true);
+  park(execution, ["escalate", "0"]);
+  await settle();
+  const opened = runtime.humanWaits(execution).map((wait) => wait.id);
+  runtime.releaseHumanWaits(execution);
+  await settle();
+
+  runtime.dispatchPausesHome();
+  const away = "exec_travelled";
+  const recorder = claiming("escalate/0/sign/0#human/0", "escalate/0/sign/0");
+  let carried = { name: "no throw" };
+  try {
+    // No board at all, which is what a worker is: nothing here opens one.
+    await runtime.runHuman(
+      descriptor(),
+      { question: "ship it?" },
+      { execution: { id: away, session_key: "" }, node: "sign", effects: recorder },
+      viewAt(["escalate", "0"], away),
+    );
+  } catch (error) {
+    carried = {
+      name: error?.name,
+      wait: error?.remote?.wait,
+      flow: error?.remote?.flow,
+      node: error?.remote?.node,
+      shown: error?.remote?.shown,
+      effect: error?.remote?.effect,
+      // Every ladder between a `human` node and this wire lets an interrupt
+      // through untouched, and a pause is one — which is why `on_error: skip`
+      // cannot absorb it on its way to the result line.
+      travels_as_an_interrupt: runtime.interruptOf(error) !== undefined,
+    };
+  }
+  observed.travelling = {
+    opened,
+    carried,
+    published: runtime.humanWaits(away).map((wait) => wait.id),
+  };
+}
+
 process.stdout.write(JSON.stringify(observed));

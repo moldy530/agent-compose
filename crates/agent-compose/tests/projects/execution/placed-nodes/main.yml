@@ -23,13 +23,32 @@
 #     number of live sessions claiming `mac`, and the rest are undispatched.
 #     Twelve because park order is published as well as resumed, and nothing
 #     under ten waits can tell a numeric ordering from a lexicographic one.
-#   * `flow.escalated` is `docs/distributed.md` §13's fourth row, made runnable:
-#     a placed agent attaching a `flow.*` with a `human:` node in it. Grammar
-#     §14.1 rule 4 runs everything an attached flow reaches in the attaching
-#     agent's placement, so that question is asked on a **worker**, where there
-#     is no wait board to ask it on — and what the runtime does about that is a
-#     named failure rather than a bare interrupt, which is the row's "what
-#     stands in the meantime" and what the acceptance suite asserts.
+#   * `flow.escalated` is `docs/distributed.md` §3.4's third ending (PRD resolved
+#     q46): a placed agent attaching a `flow.*` with a `human:` node in it.
+#     Grammar §14.1 rule 4 runs everything an attached flow reaches in the
+#     attaching agent's placement, so that question is **asked on a worker** —
+#     and the wait comes home. The dispatch settles paused, the hub plants the
+#     wait on its own board, the ordinary resume surface answers it, and the node
+#     re-enters dispatch with the answered pause in its effect history. Under a
+#     tool loop rather than at the flow's top level, because that is the shape
+#     with something to lose: the loop's first model call happens before the
+#     question, and the redispatch has to replay it rather than pay for it twice.
+#     The agent attaches **two** such flows, one whose question waits and one
+#     whose question has a `timeout:`, so the wait's other ending — the budget
+#     runs out, and the redispatch raises the node's own `on_timeout:` — is
+#     reachable from the same agent, the same trigger and the same placement.
+#   * `flow.abandoned` is that escalation answered after its asking machine
+#     left, under the `retry:` §6.4 says a placement worth sleeping on wants —
+#     kept apart from `flow.escalated`, whose malformed-pause wire cases need a
+#     dispatch failure to end the run rather than spend an attempt.
+#   * `flow.impatient` is the same escalation under a dispatching node whose own
+#     `timeout:` a test can wait out: `docs/distributed.md` §6.5 puts the
+#     redispatch's queueing *inside* that budget, so a node whose budget runs out
+#     before any worker claims the redispatch fails on it and the pause's
+#     `on_timeout:` route is never reached. That is the one interval a mesh adds
+#     to a wait, and the only place a placed pause is not indistinguishable from
+#     a local one — which is worth a flow of its own precisely because it is a
+#     divergence rather than a parity.
 #   * `flow.watched` is §6.4's distinction: a `map` over `flow.signed_off`, whose
 #     instances each dispatch a placed node and then ask a person about the
 #     answer. Two of them run at once, so one can reach its question while the
@@ -136,10 +155,37 @@ triggers:
     respond: async
     callback: "payload.body.callback_url"
 
+  # The third lifecycle-webhook trigger, and the one that watches a pause a
+  # **worker** opened: `docs/distributed.md` §3.4 makes a placed `human:` node's
+  # wait land on the hub's own board, so the `parked` delivery it fires has to be
+  # the one a local pause fires — same event, same report, same `interrupts:`.
+  # A `callback:` is what makes that comparable rather than asserted.
   on_escalated:
     type: http
     flow: flow.escalated
     path: /escalations
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+    callback: "payload.body.callback_url"
+
+  # The same escalation whose asking machine leaves — see `flow.abandoned`.
+  on_abandoned:
+    type: http
+    flow: flow.abandoned
+    path: /abandoned-escalations
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # The same escalation with a dispatching node a test can outlive — see
+  # `flow.impatient`.
+  on_impatient:
+    type: http
+    flow: flow.impatient
+    path: /impatient-escalations
     method: POST
     input:
       path: "payload.body.path"
@@ -225,16 +271,23 @@ agent.signer:
       type: string
       min_length: 1
 
-# Placed, and it attaches a flow with a question for a person in it. Grammar
-# §14.1 rule 4: everything an attached `flow.*` reaches runs where the attaching
-# agent runs, so `flow.escalation`'s `human:` node is asked on the worker — which
-# is the shape `docs/distributed.md` §13's fourth row is about.
+# Placed, and it attaches two flows with a question for a person in each.
+# Grammar §14.1 rule 4: everything an attached `flow.*` reaches runs where the
+# attaching agent runs, so both `human:` nodes are asked on the worker — which is
+# the shape `docs/distributed.md` §3.4's paused result carries home.
+#
+# **Two, because a wait's other ending needs a budget to reach.** The two flows
+# differ in one line: `flow.escalation`'s question waits until somebody answers
+# it, and `flow.deadline`'s runs out. Which of them a run reaches is the model
+# script's to decide — the loop calls one tool or the other — so one agent, one
+# trigger and one placement serve both endings, and the pair reads as what it is:
+# the same node with and without `timeout:`.
 agent.escalator:
   description: Decide a release by asking a person at the machine that holds it.
   model: model.smart
   prompt: |
     Ask a person about the path you are given, and report what they answered.
-  tools: [flow.escalation]
+  tools: [flow.escalation, flow.deadline]
   input:
     path:
       type: string
@@ -269,6 +322,55 @@ flow.escalation:
     - { from: start, to: ask }
     - { from: ask, to: end }
 
+# The same question with a **budget** on it (grammar §8.7), attached to the same
+# placed agent — so the wait it opens is planted on the hub's board by
+# `docs/distributed.md` §3.4's paused result and then ends the *other* way: the
+# budget runs out, the hub journals the expiry as the pause's record, the node is
+# redispatched, and the replay raises this node's own `on_timeout:` route.
+#
+# Two seconds because the whole of it is real: a test waits out this budget on a
+# hub while a worker sits idle, and the wall clock is grammar §8.7's own — the
+# same one an unplaced `human:` node's `timeout:` is spent against.
+flow.deadline:
+  description: Ask a person whether a release may go ahead, before a deadline.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    ask:
+      human:
+        input:
+          path: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+        timeout: 2s
+        on_timeout: lapse
+      input:
+        path: "input.path"
+      writes:
+        decision: approval
+
+    # No edge targets this node: `on_timeout:` is the only way in, so a value it
+    # writes is proof the route was taken rather than the question answered — and
+    # it is written on the **worker**, where the redispatched node replays the
+    # expiry the hub journaled.
+    lapse:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"decision":"nobody answered in time"}']
+        output:
+          decision: { type: string }
+      writes:
+        decision: approval
+  edges:
+    - { from: start, to: ask }
+    - { from: ask, to: end }
+    - { from: lapse, to: end }
+
 flow.escalated:
   description: Reach a person's question from a node that runs on a worker.
   inputs:
@@ -281,6 +383,74 @@ flow.escalated:
   nodes:
     escalate:
       agent: agent.escalator
+      input:
+        path: "input.path"
+      writes:
+        approval: approval
+  edges:
+    - { from: start, to: escalate }
+    - { from: escalate, to: end }
+
+# The same question, from a machine that leaves while the person thinks. What
+# distinguishes it from `flow.escalated` is the one key its node adds: the
+# `retry:` `docs/distributed.md` §6.4 says a placement worth sleeping on wants.
+# An answer can land while the asking worker's dead session is still inside its
+# liveness window, in which case the hub hands the redispatch to the session
+# that is gone and the expiry supersedes it — an **attempt**, not the run
+# (§6.3), but only where a retry makes the next attempt reachable; the answer's
+# other timing parks the redispatch directly and spends nothing. `flow.escalated`
+# stays retry-less on purpose: the wire suite's malformed-pause cases need a
+# dispatch failure to be the run's ending, not the first attempt of two.
+flow.abandoned:
+  description: Answer a question whose asking machine left while the person thought.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    escalate:
+      agent: agent.escalator
+      retry: { max: 2, backoff: 1ms }
+      input:
+        path: "input.path"
+      writes:
+        approval: approval
+  edges:
+    - { from: start, to: escalate }
+    - { from: escalate, to: end }
+
+# The same escalation, under a dispatching node whose own budget a test can wait
+# out — which is what makes `docs/distributed.md` §6.5's other half observable.
+#
+# A wait holds this node's `timeout:` still while the question is open, and
+# settling it starts the budget running again: what runs next is a redispatch
+# waiting for a session to claim it, and queueing is inside the budget. So a
+# placement nobody is claiming when the wait settles costs the node its budget
+# and the pause's own `on_timeout:` route is never reached, where the same node
+# unplaced would have taken that route in the same instant the wait expired.
+#
+# **Fifteen seconds, and the number is doing work.** It has to be long enough
+# that everything before the question — a worker claiming the dispatch, spawning
+# `src/worker-node.ts`, and one model call — fits inside it on a loaded machine
+# with room to spare, and short enough that a test can spend it. `flow.escalated`
+# takes the `defaults:` minute instead, because every test of it wants the budget
+# to be the thing that never happens.
+flow.impatient:
+  description: The same escalation, on a node that will not wait all day.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    escalate:
+      agent: agent.escalator
+      timeout: 15s
       input:
         path: "input.path"
       writes:

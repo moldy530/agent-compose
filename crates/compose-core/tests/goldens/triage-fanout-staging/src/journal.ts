@@ -1614,6 +1614,18 @@ export interface EffectSlot {
   readonly site: string;
   readonly kind: EffectKind;
   readonly ordinal: number;
+  /**
+   * This effect's **identity**, canonicalised — the string a record carries as
+   * its `request` and a replay compares verbatim.
+   *
+   * Carried on the slot for the one caller that has to journal a record it
+   * cannot write itself: a `human` pause opened on a worker is settled by the
+   * hub, which appends the answered record on the far side of the wire
+   * (`docs/distributed.md` §3.4). The identity travels with the pause rather
+   * than being derived a second time there, because a second derivation is a
+   * `ReplayDivergence` the day the two spellings part.
+   */
+  readonly request: string;
   readonly held: JournalOutcome | undefined;
   /**
    * Record what the live effect answered, and answer with the value the
@@ -1627,9 +1639,24 @@ export interface EffectSlot {
 }
 
 /**
+ * The journal key one effect is written under (`docs/durability.md` §4).
+ *
+ * The one derivation of it, exported because it has a **second** reader: the
+ * hub, checking that the key a worker carried home on a paused result is the one
+ * this composition would have written at that site (`./mesh.ts`'s `pauseOf`).
+ * The key is the journal's primary key, so a body naming another node's key
+ * would land a record in another node's slot — and a check that re-spelled the
+ * derivation itself would be the second spelling `docs/distributed.md` §3.4
+ * carries the field to avoid.
+ */
+export function effectKey(site: string, kind: EffectKind, ordinal: number): string {
+  return `${site}#${kind}/${ordinal}`;
+}
+
+/**
  * The keys one effect site derives, and the record behind them.
  *
- * A key is
+ * A key is [`effectKey`]'s
  *
  * ```text
  * <site> "#" <kind> "/" <ordinal>
@@ -1692,7 +1719,7 @@ export class EffectRecorder {
     const counter = `${this.#site}#${kind}`;
     const ordinal = this.#session.ordinals.get(counter) ?? 0;
     this.#session.ordinals.set(counter, ordinal + 1);
-    const key = `${counter}/${ordinal}`;
+    const key = effectKey(this.#site, kind, ordinal);
     const site = this.#site;
     const session = this.#session;
     const identity = canonical(request);
@@ -1754,6 +1781,7 @@ export class EffectRecorder {
       site,
       kind,
       ordinal,
+      request: identity,
       held,
       keep: (value) => {
         // Recorded **and returned** as the journal now holds it, so this

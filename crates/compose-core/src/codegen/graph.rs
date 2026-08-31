@@ -238,6 +238,7 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
     }
     body.push_str(&registry_source(ir, names, &registry, &mut imported));
     body.push_str(&placed_source(ir, names));
+    body.push_str(&human_registry(ir, names));
 
     contents.push_str("\nimport { END, START, StateGraph } from \"@langchain/langgraph\";\n");
     contents.push_str("\nimport * as mesh from \"./mesh.ts\";\n");
@@ -4083,6 +4084,71 @@ const PLACED_DOC: &str = "\n\
 * (grammar §14.1's three ways a graph reaches a placed component).\n \
 */\n";
 
+/// `registerHumanNodes`: this composition's `human` nodes, by
+/// `<flow address>.<node id>` (`docs/distributed.md` §3.4, PRD resolved q46).
+///
+/// A local pause never reads this — [`human_descriptor`] emits the descriptor
+/// beside the node that raises it, and `runtime.runHuman` is handed it directly.
+/// The one reader is the **hub**, planting a pause a worker settled its dispatch
+/// with: `runtime.holdRemotePause` looks the node up by the address the paused
+/// result named, and holds the answer to *this* node's `parse` and publishes
+/// *this* node's `schema`.
+///
+/// So the parity PRD resolved q46 demands — "a placed `human:` node must mean
+/// what the same node unplaced means" — is a lookup rather than a second
+/// contract on the wire. It is possible at all because the whole artifact is
+/// everywhere (`docs/distributed.md` §4.3): the hub holds the very descriptor
+/// the worker paused on, so nothing about the contract has to travel.
+///
+/// Emitted only where a composition declares a `human:` node, and unconditional
+/// on placements: registering costs a map lookup nothing reads in a project with
+/// no mesh, and making it conditional would make the emitted graph depend on the
+/// deploy target — which no other part of this module does.
+fn human_registry(ir: &Ir, names: &Names) -> String {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (address, definition) in &ir.definitions {
+        let DefinitionBody::Flow(flow) = &definition.body else {
+            continue;
+        };
+        for node in &flow.nodes {
+            if !matches!(node.kind, NodeKind::Human { .. }) {
+                continue;
+            }
+            let id = node.id.value.as_str();
+            entries.push((
+                format!("{address}.{id}"),
+                names
+                    .value(&format!("{address}.node.{id}.human"))
+                    .to_string(),
+            ));
+        }
+    }
+    if entries.is_empty() {
+        return String::new();
+    }
+    // Sorted, so the emitted call is ordered by what it holds rather than by the
+    // order the flows happened to be walked in ([`super`]'s ordering rule).
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut text = String::from(HUMAN_REGISTRY_DOC);
+    text.push_str("runtime.registerHumanNodes({\n");
+    for (key, value) in entries {
+        text.push_str(&format!("  {}: {value},\n", names::string(&key)));
+    }
+    text.push_str("});\n");
+    text
+}
+
+const HUMAN_REGISTRY_DOC: &str = "\n\
+/**\n \
+* Every `human:` node this composition declares, by `<flow address>.<node id>`.\n \
+*\n \
+* Read by the hub alone, and for one thing: a pause a **worker** opened settles\n \
+* its dispatch paused (`docs/distributed.md` §3.4), and the hub plants the wait\n \
+* on its own board under the identity the worker derived. What an answer is held\n \
+* to, and what a status route publishes as the contract, are then this node's own\n \
+* — the artifact is everywhere (§4.3), so the descriptor never travels.\n \
+*/\n";
+
 /// Which placement claims this component, if one does (grammar §14.1).
 ///
 /// The first claim wins, exactly as `check::placements` and `codegen::env` read
@@ -4597,6 +4663,86 @@ flow.f:
         assert!(
             emitted.contains("ends: [END, \"rescue\"],"),
             "the control-transfer target is an end of the node that transfers to it:\n{emitted}"
+        );
+        // …and the same descriptor is registered under the node's address, which
+        // is how a **hub** reaches it: a pause a worker opened settles its
+        // dispatch (`docs/distributed.md` §3.4, PRD resolved q46), and the wait
+        // the hub plants is held to this node's own `schema` and `parse` rather
+        // than to a second contract that travelled.
+        assert!(
+            emitted.contains(
+                "runtime.registerHumanNodes({\n  \"flow.f.ask\": flowFNodeAskHuman,\n});"
+            ),
+            "the `human:` node is not registered for the hub to plant a worker's pause \
+             under:\n{emitted}"
+        );
+    }
+
+    /// Every `human:` node is registered, sorted, and a composition with none
+    /// registers nothing (`docs/distributed.md` §3.4).
+    ///
+    /// The registry is what a hub looks a paused result's `flow` and `node` up
+    /// in, so a node missing from it is a pause the hub can publish no contract
+    /// for and a resume nothing could validate. Sorted for [`super`]'s ordering
+    /// rule — the emitted record is ordered by what it holds rather than by the
+    /// order the flows happened to be walked in — and absent altogether where
+    /// there is nothing to register, because an empty call is noise in every
+    /// project that never pauses.
+    #[test]
+    fn every_human_node_is_registered_under_its_address_and_none_is_registered_otherwise() {
+        let emitted = emit(&format!(
+            r#"{PREAMBLE}
+flow.zed:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    later:
+      human:
+        input: {{ question: {{ type: string }} }}
+        output: {{ decision: {{ enum: [approve, reject] }} }}
+      input: {{ question: "input.goal" }}
+  edges:
+    - {{ from: start, to: later }}
+    - {{ from: later, to: end }}
+
+flow.a:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    first:
+      human:
+        input: {{ question: {{ type: string }} }}
+        output: {{ decision: {{ enum: [approve, reject] }} }}
+      input: {{ question: "input.goal" }}
+  edges:
+    - {{ from: start, to: first }}
+    - {{ from: first, to: end }}
+"#
+        ));
+        assert!(
+            emitted.contains(
+                "runtime.registerHumanNodes({\n  \"flow.a.first\": flowANodeFirstHuman,\n  \
+                 \"flow.zed.later\": flowZedNodeLaterHuman,\n});"
+            ),
+            "the registry is not every `human:` node this composition declares, in address \
+             order:\n{emitted}"
+        );
+
+        let none = emit(&format!(
+            r#"{PREAMBLE}
+flow.f:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{ draft: {{ type: string }} }}
+  nodes:
+    write: {{ agent: agent.reviewer }}
+  edges:
+    - {{ from: start, to: write }}
+    - {{ from: write, to: end }}
+"#
+        ));
+        assert!(
+            !none.contains("registerHumanNodes"),
+            "a composition with no `human:` node registers an empty map:\n{none}"
         );
     }
 

@@ -7,7 +7,7 @@
 //
 // The hub: the five `/workers/*` routes, the dispatch board behind them, and the
 // seam a placed node reaches the mesh through (`docs/distributed.md`, PRD
-// resolved q37–q44).
+// resolved q37–q46).
 //
 // This module is the whole of what "the hub" means in that document. It is
 // byte-identical in every project this compiler release builds, like
@@ -33,6 +33,13 @@
 // durable is the journal's — §8 rule 3 forbids dispatch state anywhere else — and
 // everything in memory here is either advisory (the session table, §5) or a
 // promise this process is holding for a node it is running.
+//
+// A result ends a dispatch in one of **three** ways, and the third is why
+// [`dispatchPlaced`] is a loop rather than one await: a `human:` node reached on
+// a worker settles its dispatch *paused* (§3.4, PRD resolved q46), the wait is
+// planted on the hub's one board — `./runtime.ts`'s, the same board a local
+// pause goes on — and the answer sends the node back through dispatch with the
+// answered pause in its effect history.
 //
 // # What is deliberately absent
 //
@@ -62,12 +69,14 @@ import { joinTokenEnv, placements } from "./deployment.ts";
 import {
   type DispatchRow,
   type EffectKind,
+  type Journal,
   type JournalOutcome,
   type JournalRecord,
+  effectKey,
   openJournal,
   replayedFailure,
 } from "./journal.ts";
-import { registerParkedWork } from "./runtime.ts";
+import { holdRemotePause, registerParkedWork, registersHumanNode } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 
 // ---------------------------------------------------------------------------
@@ -81,8 +90,14 @@ import type * as runtime from "./runtime.ts";
  * `compose_core::codegen::mesh::PROTOCOL_VERSION` is the compiler's copy of this
  * number and a test reads this line back to keep the two from drifting — the
  * same cross-language pin the trace format and the journal version already have.
+ *
+ * **`2` since PRD resolved q46**: a result may settle a dispatch *paused*
+ * (§3.4), and a peer of version `1` would read that result as a node that
+ * answered with no output rather than as a wait for a person — §10.3's "a change
+ * that would make a peer of the previous version behave **wrongly** rather than
+ * be refused", exactly. §10 records the bump and why it costs nothing.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /**
  * The runtime a worker executes this artifact under, as §4.1 compares it: a
@@ -433,6 +448,21 @@ interface Awaiting {
   taken: boolean;
 }
 
+/**
+ * How one dispatch ended, from the node's side.
+ *
+ * §3.4 gives a dispatch **three** endings, and the third is what PRD resolved
+ * q46 added: a result may settle a dispatch *paused*, carrying the wait a
+ * `human:` node opened on the worker. Paused is a way of being **settled** — the
+ * dispatch ended with a result, the session is free, and a re-post is `204` — so
+ * it is a shape of the settled outcome rather than a fourth `DispatchStatus`.
+ * What the node does with it is [`dispatchPlaced`]'s loop: plant the wait, wait
+ * for the answer, and re-enter dispatch with the answered pause in the history.
+ */
+type Ending =
+  | { readonly kind: "answer"; readonly answer: PlacedAnswer }
+  | { readonly kind: "paused"; readonly pause: runtime.RemotePause };
+
 /** The dispatches this process is awaiting, by `dispatch_id`. */
 const awaiting = new Map<string, Awaiting>();
 
@@ -484,20 +514,30 @@ export class DispatchSuperseded extends Error {
  *
  *  * a **resumed hub** reaches this node again and finds the row its predecessor
  *    left, under the identity §6.1 fixes — settled, and the answer is consumed
- *    rather than the work redone; superseded, and the failure is replayed so the
- *    node's `retry:` ladder does now what it did then; still open, and this
- *    process goes on holding it;
+ *    rather than the work redone; settled *paused*, and the wait is re-derived
+ *    onto this hub's board unless its answer is already journaled; superseded,
+ *    and the failure is replayed so the node's `retry:` ladder does now what it
+ *    did then; still open, and this process goes on holding it;
  *  * a **worker** is handed the row's inputs and its `effect_history`, and
  *    replays to the frontier before going live (§7.2);
  *  * the **liveness sweep** supersedes it where the session holding it stopped
  *    making requests (§6.3), which fails this attempt under the node's own
  *    `retry:`/`on_error:` chain exactly as a local failure would.
  *
- * The node's `timeout:` is **not** held still while this waits. §6.5 makes the
- * chain run from dispatch and §2 says so outright — "a `timeout:` on a placed
- * node is a bound on queueing plus execution, not on execution alone" — which is
- * the opposite of a `human` node's rule (D102) and is why `runtime.pausesUnder`
- * is left alone and only `runtime.quiescent` learns about placement waits.
+ * The node's `timeout:` is **not** held still while a *placement* wait waits.
+ * §6.5 makes the chain run from dispatch and §2 says so outright — "a `timeout:`
+ * on a placed node is a bound on queueing plus execution, not on execution
+ * alone" — which is why a parked dispatch adds nothing to `runtime.pausesUnder`
+ * and only `runtime.quiescent` learns about placement waits.
+ *
+ * **A pause is the other rule**, and not an exception to this one. A dispatch
+ * that settles paused puts a `human` wait on this hub's board under this node's
+ * own instance path ([`answered`]), so `runtime.pausesUnder` counts it and
+ * `runActivity` holds the node's deadline still for as long as the question is
+ * open — which is D102 reaching a placed node exactly as it reaches the same
+ * node unplaced, since what the budget bounds is the work the instance does and
+ * never the time a person spends thinking. Queueing is inside the budget;
+ * thinking is outside it, on both sides of the wire.
  */
 export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAnswer> {
   // A process that executes placed nodes answers this itself ([`executeLocally`]),
@@ -507,66 +547,120 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   const site = options.path.join("/");
   if (!mounted) throw new PlacementUnreachable(options.node, options.placement);
   const journal = await openJournal();
-  const wait = `${site}/${nextOrdinal(options.execution, site)}`;
-  const row = journal.park({
-    execution: options.execution,
-    wait,
-    id: `dsp_${globalThis.crypto.randomUUID()}`,
-    placement: options.placement,
-    node: options.node,
-    site,
-    inputs: options.inputs,
-    // §3.2's OPTIONAL payload fields, journaled beside `inputs` and for its
-    // reason: the row **is** the dispatch (§8 rule 3), so the poll answer is
-    // read out of the row at hand-over rather than out of this process's memory,
-    // and a hub restarted mid-dispatch hands over what its predecessor would.
-    ...(options.itemIndex === undefined ? {} : { itemIndex: options.itemIndex }),
-    ...(options.history === undefined ? {} : { history: options.history }),
-    ...(options.policy === undefined ? {} : { policy: options.policy }),
-    status: "parked",
-    parkedAt: new Date().toISOString(),
-  });
+  // **A loop, because a pause is not the end of the node** (§3.4, PRD resolved
+  // q46). A dispatch that settles paused hands this node a question rather than
+  // an answer: the wait goes on the hub's board under the identity the worker
+  // derived, the answer is journaled as the pause's own effect record, and the
+  // node **re-enters dispatch** — a fresh row at the next ordinal of this
+  // instance path, parking again if nothing claims the placement (resolved q39),
+  // and carrying the answered pause in its `effect_history` so the redispatched
+  // node replays past the question rather than asking it again (§7.2).
+  //
+  // Every other ending leaves this loop on its first turn, which is why the two
+  // reads that decide it are the first thing after the park.
+  for (;;) {
+    const wait = `${site}/${nextOrdinal(options.execution, site)}`;
+    const row = journal.park({
+      execution: options.execution,
+      wait,
+      id: `dsp_${globalThis.crypto.randomUUID()}`,
+      placement: options.placement,
+      node: options.node,
+      site,
+      inputs: options.inputs,
+      // §3.2's OPTIONAL payload fields, journaled beside `inputs` and for its
+      // reason: the row **is** the dispatch (§8 rule 3), so the poll answer is
+      // read out of the row at hand-over rather than out of this process's
+      // memory, and a hub restarted mid-dispatch hands over what its predecessor
+      // would.
+      ...(options.itemIndex === undefined ? {} : { itemIndex: options.itemIndex }),
+      ...(options.history === undefined ? {} : { history: options.history }),
+      ...(options.policy === undefined ? {} : { policy: options.policy }),
+      status: "parked",
+      parkedAt: new Date().toISOString(),
+    });
 
-  // A row a previous generation already finished with. Consumed rather than
-  // redone, which is `docs/durability.md` §5's replay discipline reaching the one
-  // effect this module owns.
-  if (row.status === "settled") return absorb(options, answerOf(row));
-  if (row.status === "superseded") {
-    throw new DispatchSuperseded(
-      options.node,
-      options.placement,
-      row.detail ?? "the hub ended this dispatch without a result",
-    );
-  }
-  // …and a row some dead process had handed to a session: sessions are this
-  // process's only (§5), so one it did not issue is one whose holder this hub
-  // has ended. **Superseded, never put back on the board** — see
-  // [`supersedeOrphans`], which is where the same rule is applied at start and
-  // where the reasoning is. This is its belt-and-braces: a row that reached here
-  // still `dispatched` is one that start could not read.
-  if (row.status === "dispatched" && !sessions.has(row.session ?? "")) {
-    journal.supersedeDispatch(row.id, ORPHANED);
-    throw new DispatchSuperseded(options.node, options.placement, ORPHANED);
-  }
-  const taken = row.status === "dispatched";
-  rows.set(row.id, row);
+    // A row a previous generation already finished with. Consumed rather than
+    // redone, which is `docs/durability.md` §5's replay discipline reaching the
+    // one effect this module owns.
+    if (row.status === "settled") {
+      const ending = endingOf(row);
+      if (ending.kind === "answer") return absorb(options, ending.answer);
+      // **A pause a dead hub was holding**, re-derived rather than remembered
+      // (§5's first rule). Which of the two things this generation owes it is
+      // decided by the journal and by nothing else: an answered pause has its
+      // effect record, and the wait is over — the redispatch below is what
+      // replays past it. A pause with no record is one nobody answered, so this
+      // process plants it again, under the identity its predecessor published —
+      // dated by this planting and with the node's whole `timeout:` in front of
+      // it, exactly as a resumed generation re-parks a local wait nobody
+      // answered (§5, PRD resolved q46's parity bar). Planting is one function
+      // for both generations ([`answered`]), so the pair a reader is shown is
+      // derived once and here as there.
+      if (journal.lookup(options.execution, ending.pause.effect.key) === undefined) {
+        await answered(journal, options, ending.pause);
+      }
+      continue;
+    }
+    if (row.status === "superseded") {
+      throw new DispatchSuperseded(
+        options.node,
+        options.placement,
+        row.detail ?? "the hub ended this dispatch without a result",
+      );
+    }
+    // …and a row some dead process had handed to a session: sessions are this
+    // process's only (§5), so one it did not issue is one whose holder this hub
+    // has ended. **Superseded, never put back on the board** — see
+    // [`supersedeOrphans`], which is where the same rule is applied at start and
+    // where the reasoning is. This is its belt-and-braces: a row that reached
+    // here still `dispatched` is one that start could not read.
+    if (row.status === "dispatched" && !sessions.has(row.session ?? "")) {
+      journal.supersedeDispatch(row.id, ORPHANED);
+      throw new DispatchSuperseded(options.node, options.placement, ORPHANED);
+    }
+    rows.set(row.id, row);
 
-  return await new Promise<PlacedAnswer>((resolve, reject) => {
+    const ending = await awaited(journal, options, row, site);
+    if (ending.kind === "answer") return absorb(options, ending.answer);
+    await answered(journal, options, ending.pause);
+  }
+}
+
+/**
+ * Hold this process's promise for one dispatch, until a worker settles it or the
+ * hub ends it.
+ *
+ * Everything about the wait that is not the loop above: the entry the status
+ * report and the parked-work counter read, the abort that supersedes a dispatch
+ * whose node ran out of time, and the stir that hands a held poll the wait that
+ * has just gone on the board.
+ */
+function awaited(
+  journal: Journal,
+  options: DispatchOptions,
+  row: DispatchRow,
+  site: string,
+): Promise<Ending> {
+  return new Promise<Ending>((resolve, reject) => {
     const held: Awaiting = {
       execution: options.execution,
       site,
-      taken,
+      taken: row.status === "dispatched",
       settle: (outcome) => {
         finish();
         if (outcome.kind === "error") reject(replayedFailure(outcome));
-        else resolve(absorb(options, outcome.value as PlacedAnswer));
+        else resolve(endingIn(outcome.value));
       },
     };
     const abort = (): void => {
       // The node's own deadline ran out (§6.5: the chain runs from dispatch, so
       // queueing is inside the budget). The hub is done with the dispatch, so
       // the row is ended rather than left for a worker to take work nothing
-      // will read the answer of.
+      // will read the answer of. **Synchronously**, and the journal is the
+      // caller's for that reason: a row left `parked` for one turn of the loop
+      // is a row a poll in that turn could claim, handing a worker work whose
+      // answer nothing will read.
       const reason =
         options.signal?.reason instanceof Error
           ? options.signal.reason.message
@@ -595,6 +689,63 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     // on the board, and §6.2's wake is "a joining worker's claims are scanned
     // against the open placement-waits" — which a held poll re-runs when stirred.
     stirPolls();
+  });
+}
+
+/**
+ * Plant one worker's pause on **this hub's** wait board, wait for it to be
+ * answered, and journal the answer as the pause's own effect record
+ * (§3.4, PRD resolved q46).
+ *
+ * The two halves are the whole of what q46 asks for, and neither is new
+ * machinery: `runtime.holdRemotePause` puts the wait on the one board every
+ * local pause goes on — so the status route publishes it, the resume route
+ * answers it, the `parked` webhook fires for it and the dispatching node's
+ * deadline is held still while it waits — and the record below is exactly the
+ * one `runtime.runHuman` writes for a pause the hub held itself, at the key the
+ * worker's own recorder claimed. The redispatch after it hands that record back
+ * in `effect_history` (§7.2), and the replay consumes it at the very claim that
+ * paused: the node goes live *past* the question, re-issuing nothing already
+ * paid for.
+ *
+ * **The write is the node's to fail on**, exactly as it is locally: a journal
+ * that will not take the answer leaves a run that would ask the person again on
+ * its next resume (`docs/durability.md` §3.4), so the throw travels as this
+ * node's failure rather than being swallowed. It is also **inside** the
+ * settlement rather than after it, which is the other half of the same rule: the
+ * resume route answers `202` when `settle` returns, so a record appended in a
+ * later turn of the loop is one a process killed in between never wrote. The
+ * writer below is what `runtime.holdRemotePause` calls where `runtime.runHuman`
+ * calls `slot.keep`.
+ *
+ * The wait's budget is the node's own `timeout:`, spent from the moment
+ * `holdRemotePause` puts it on the board — never the worker-stamped
+ * `expires_at`, which is another machine's clock. That planting is where the
+ * wait is dated too, off the reading the deadline is armed from, which is why
+ * nothing here touches the instants a pause carried: both plantings, the live
+ * one and a restart's, hand the pause on exactly as it came off the wire, and
+ * the pair a reader is shown is the one the planting derived (§3.4).
+ */
+async function answered(
+  journal: Journal,
+  options: DispatchOptions,
+  pause: runtime.RemotePause,
+): Promise<void> {
+  await holdRemotePause(options.execution, pause, (settled) => {
+    journal.append({
+      execution: options.execution,
+      key: pause.effect.key,
+      site: pause.effect.site,
+      kind: "human",
+      ordinal: pause.effect.ordinal,
+      // The identity the **worker's** recorder derived, carried home on the
+      // pause rather than derived a second time here: a second derivation is a
+      // `ReplayDivergence` on the redispatch the day the two spellings part.
+      request: pause.effect.request,
+      outcome: { kind: "value", value: settled },
+      refused: false,
+      recordedAt: new Date().toISOString(),
+    });
   });
 }
 
@@ -638,14 +789,180 @@ function absorb(options: DispatchOptions, answer: PlacedAnswer): PlacedAnswer {
 const ORPHANED =
   "the hub process holding this dispatch was replaced, so the session it was issued to ended (docs/distributed.md §5)";
 
-/** What a settled row answers a node with. */
-function answerOf(row: DispatchRow): PlacedAnswer {
+/** How a settled row ended: with the node's answer, or with a pause. */
+function endingOf(row: DispatchRow): Ending {
   const outcome = row.outcome;
   if (outcome === undefined) {
     throw new Error(`\`${row.id}\` is settled and carries no outcome`);
   }
   if (outcome.kind === "error") throw replayedFailure(outcome);
-  return outcome.value as PlacedAnswer;
+  return endingIn(outcome.value);
+}
+
+/**
+ * The same reading of a settled outcome's **value**, for the live path.
+ *
+ * A paused settlement is `{ paused: … }` and a node's answer is a
+ * [`PlacedAnswer`], which carries `output` and never `paused` — so the key is
+ * the discriminant, and it is written by [`pauseOf`] alone: nothing a worker
+ * sends reaches this shape except through that reader.
+ */
+function endingIn(value: unknown): Ending {
+  if (value !== null && typeof value === "object") {
+    const paused = (value as Record<string, unknown>)["paused"];
+    if (paused !== undefined) {
+      return { kind: "paused", pause: paused as runtime.RemotePause };
+    }
+  }
+  return { kind: "answer", answer: value as PlacedAnswer };
+}
+
+/**
+ * One paused settlement off the wire, or `undefined` where it is not one
+ * (§3.4).
+ *
+ * Read whole and refused whole, the way [`recordOf`] reads an effect record and
+ * for a sharper version of the same reason: a pause short of its wait identity
+ * is a wait no resume could address, and one short of its effect fields is an
+ * answer the journal could not record — so a half-read pause would put a
+ * question on the board that nothing could ever take off it.
+ *
+ * **Held to the dispatch's own instance path**, both halves of it, which is
+ * §3.3's rule about a record's `site` reaching the one route that also plants a
+ * wait: the hub is the single writer (§8), so no session may journal an effect
+ * into a node it was never dispatched — and no session may put a question on the
+ * board under another node's identity, which is the same rule about the other
+ * ledger. `row` is what the hub already holds; nothing here is read off the body.
+ *
+ * **And the `key` is held to it too**, because the key is what the record is
+ * actually written under (`answered`) and a `site` inside this dispatch with a
+ * key outside it would journal a `human` record into some other node's effect
+ * slot — where that node's own replay claims it and raises a `ReplayDivergence`
+ * an execution this session was never dispatched into cannot absorb. An effect
+ * key is `<site>#<kind>/<ordinal>` (`./journal.ts`'s `EffectRecorder.claim`), so
+ * the check is the derivation: this pause's own site, `human`, and the ordinal it
+ * carries. Nothing is *taken* from the derivation — the worker's spelling is what
+ * travels and what is journaled, since a second derivation is the divergence §3.4
+ * carries the field to avoid — but a spelling that is not the one this hub would
+ * have written is not a pause it can read.
+ *
+ * **And the two of them name one node**, which is the same rule read along the
+ * other axis. The identity and the site are one path — a worker derives both
+ * from one `instancePath` call — and that path's last frame is the `node` whose
+ * contract the answer is held to. A body that agreed with the dispatch on every
+ * prefix and disagreed with itself about *which* node it reached would plant the
+ * question under one node's identity and hold it to another node's `timeout:`,
+ * `output:` and parser, which the redispatch meets as a divergence rather than
+ * as a refusal. The two checks are cheap and the failure they close is not.
+ *
+ * **And the ordinal is the one the redispatch will claim**, which is the same
+ * rule one field further in. The key check above is a *derivation* and so is
+ * blind to the ordinal it derives from — `site#human/3` is a faithful key for
+ * ordinal 3 — but the record is only ever read back by the redispatched node's
+ * own claim at that site, and a claim counts from zero over the records this
+ * execution already holds (`./journal.ts`'s `EffectRecorder.claim`). An answer
+ * journaled at an ordinal that claim will never reach is a question a person has
+ * answered and the node asks again, which is the one failure §3.4 exists to
+ * remove; so the ordinal a pause carries is held to [`claimedHumanOrdinal`], the
+ * number this hub would give the next `human` claim at that site. A worker of
+ * this release always sends exactly that — the pause it settles on is its own
+ * first live claim, after replaying whatever `effect_history` carried — and §3.4
+ * states the rule, which is what makes it something a second implementation may
+ * rely on (§10.1) rather than infer from a refusal it is forbidden to read.
+ */
+function pauseOf(
+  journal: Journal,
+  row: DispatchRow,
+  value: unknown,
+): runtime.RemotePause | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const held = value as Record<string, unknown>;
+  const wait = held["wait"];
+  const flow = held["flow"];
+  const node = held["node"];
+  const pausedAt = held["paused_at"];
+  const shown = held["shown"];
+  if (typeof wait !== "string" || wait === "") return undefined;
+  if (typeof flow !== "string" || typeof node !== "string") return undefined;
+  // A node this artifact declares, asked here rather than where the wait is
+  // planted: the answer a person gives is held to that node's `output:`, so a
+  // pause naming a node the hub does not register is a question nothing could
+  // validate an answer against — and the honest cost of it is the dispatch, one
+  // failure with one name, rather than a raw throw out of a settlement the
+  // route has already answered `204`.
+  if (!registersHumanNode(`${flow}.${node}`)) return undefined;
+  if (typeof pausedAt !== "string") return undefined;
+  if (shown === null || typeof shown !== "object" || Array.isArray(shown)) return undefined;
+  const effect = held["effect"];
+  if (effect === null || typeof effect !== "object") return undefined;
+  const record = effect as Record<string, unknown>;
+  const key = record["key"];
+  const site = record["site"];
+  const ordinal = record["ordinal"];
+  const request = record["request"];
+  if (typeof key !== "string" || typeof site !== "string" || typeof request !== "string") {
+    return undefined;
+  }
+  if (typeof ordinal !== "number" || !Number.isInteger(ordinal)) return undefined;
+  if (!under(wait, row.site) || !under(site, row.site)) return undefined;
+  // **The identity is the site**, one path and not two. `runtime.runHuman`
+  // derives both from a single `instancePath` call — the wait a pause is planted
+  // under *is* the effect site its answer is recorded at — so a body carrying two
+  // different paths is one no process of this release wrote, and taking it would
+  // put the question on the board under one node's identity while journaling the
+  // answer into another node's slot. That is the hazard the key check below is
+  // about, one field further out and past its reach: a key derived faithfully
+  // from a `site` that is not the `wait` is a correct key for the wrong node.
+  if (wait !== site) return undefined;
+  if (key !== effectKey(site, "human", ordinal)) return undefined;
+  if (ordinal !== claimedHumanOrdinal(journal, row.execution, site)) return undefined;
+  // …and the node that identity ends at is the node whose contract will hold the
+  // answer. `runtime.holdRemotePause` looks the descriptor up by `${flow}.${node}`
+  // and arms *its* `timeout:`, publishes *its* `output:` on the status route and
+  // parses the resume payload with *its* parser — so a pause whose identity
+  // reached some other node would hold a person to a contract the redispatched
+  // node does not share, and the mismatch would land as the `ReplayDivergence`
+  // resolved q29 makes unabsorbable, on an execution this session was dispatched
+  // into for a different node.
+  //
+  // What this **cannot** decide is which *flow* the path ran in: an instance
+  // frame is `<node id>/<ordinal>` or `<flow local name>/<ordinal>` (grammar
+  // §9.4), and nothing in this process resolves one back to a declaration. Two
+  // `human:` nodes sharing an id in two flows are therefore indistinguishable
+  // here, and a peer that crossed them is caught by the redispatch's own parse
+  // rather than by this route.
+  if (!namesNode(wait, node)) return undefined;
+  const expiresAt = held["expires_at"];
+  return {
+    wait,
+    flow,
+    node,
+    shown: shown as Record<string, unknown>,
+    pausedAt,
+    ...(typeof expiresAt === "string" ? { expiresAt } : {}),
+    effect: { key, site, ordinal, request },
+  };
+}
+
+/**
+ * The ordinal the **next** `human` claim at one instance path will take
+ * (`./journal.ts`'s `EffectRecorder.claim`).
+ *
+ * A claim counts effects of its kind at its site from zero, over a session
+ * seeded by the `effect_history` the dispatch carried — and that history is
+ * every record this execution holds at or inside the site (`effectsUnder`). So
+ * the ordinal a redispatched node will claim for the question it is about to ask
+ * is the number of `human` records already recorded **at that site**, which is
+ * what a paused result has to name for its answer to be the one that node reads
+ * back. Records deeper inside the site belong to other claims and are not
+ * counted: an ordinal is per site, not per subtree.
+ */
+function claimedHumanOrdinal(journal: Journal, execution: string, site: string): number {
+  let claimed = 0;
+  for (const record of journal.effectsUnder(execution, site)) {
+    if (record.kind === "human" && record.site === site) claimed += 1;
+  }
+  return claimed;
 }
 
 /**
@@ -1405,7 +1722,7 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
       return reply.code(400).send({
         dispatch_id: id,
         error:
-          "every record carries a `key`, a `site` at or inside the dispatch's `instance_path`, a `kind`, an `ordinal`, a canonical `request` and an `outcome`",
+          "every record carries a `site` at or inside the dispatch's `instance_path`, a `kind`, an `ordinal`, a canonical `request`, an `outcome`, and the `key` those three derive — `<site>#<kind>/<ordinal>`",
       });
     }
     records.push(record);
@@ -1448,7 +1765,12 @@ function recordOf(row: DispatchRow, entry: unknown): JournalRecord | undefined {
   // and the hub reads the execution off the row, so no session can write an
   // effect into an execution it was never dispatched — and the site is held to
   // the dispatch's own instance path for the same reason (§8's single writer).
-  if (site !== row.site && !site.startsWith(`${row.site}/`)) return undefined;
+  // The **key** with it, since the key is what the row is written under: a site
+  // inside this dispatch carrying a key outside it would put this record in
+  // another node's slot, where that node's replay claims it and diverges. See
+  // [`pauseOf`], which holds the other ledger to the same derivation.
+  if (!under(site, row.site)) return undefined;
+  if (key !== effectKey(site, kind as EffectKind, ordinal)) return undefined;
   const settled = outcomeOf(outcome);
   if (settled === undefined) return undefined;
   const at = held["recorded_at"];
@@ -1463,6 +1785,34 @@ function recordOf(row: DispatchRow, entry: unknown): JournalRecord | undefined {
     refused: held["refused"] === true,
     recordedAt: typeof at === "string" ? at : new Date().toISOString(),
   };
+}
+
+/**
+ * Whether a path is **at, or inside,** one instance path (grammar §9.4).
+ *
+ * The prefix relation the paths already carry, which is what §3.3 and §3.4 hold
+ * a record's `site` and a pause's identity to: `sign/0` holds `sign/0/tool.sign/0`
+ * and holds nothing of `stamp/0`'s.
+ */
+function under(path: string, root: string): boolean {
+  return path === root || path.startsWith(`${root}/`);
+}
+
+/**
+ * Whether an instance path's **last frame** names `node` (grammar §9.4).
+ *
+ * A frame is `<name>/<ordinal>` where the ordinal is decimal and the name is an
+ * identifier (grammar §2.1), so the last `/` splits one off the other and what
+ * is left of it ends in the name. That last frame is a node's own — a `human:`
+ * node's wait id is `instancePath` at the node itself (`./runtime.ts`) — which
+ * makes this the whole of what §3.4 can hold a pause's `node` to.
+ */
+function namesNode(path: string, node: string): boolean {
+  const cut = path.lastIndexOf("/");
+  if (cut < 0) return false;
+  if (!/^[0-9]+$/.test(path.slice(cut + 1))) return false;
+  const frame = path.slice(0, cut);
+  return frame === node || frame.endsWith(`/${node}`);
 }
 
 /** One outcome off the wire, or `undefined` where it is not one. */
@@ -1532,29 +1882,7 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   // makes at-least-once dispatch safe on the return path too.
   if (row.status === "settled") return reply.code(204).send();
 
-  const outcome: JournalOutcome =
-    body["error"] === undefined || body["error"] === null
-      ? {
-          kind: "value",
-          value: {
-            output: body["output"],
-            ...(body["history"] === undefined ? {} : { history: body["history"] }),
-            ...(body["models"] === undefined ? {} : { models: body["models"] }),
-            ...(body["tool_dispatches"] === undefined
-              ? {}
-              : { toolDispatches: body["tool_dispatches"] }),
-            // The fourth collector, which travels because it cannot be read off
-            // the answer on this side — see [`PlacedAnswer.stores`]. Journaled
-            // with the rest of the outcome, so a replayed row reports what the
-            // node's stores did as well as what its models did.
-            ...(body["stores"] === undefined ? {} : { stores: body["stores"] }),
-          },
-        }
-      : {
-          kind: "error",
-          name: String((body["error"] as Record<string, unknown>)["name"] ?? "Error"),
-          message: String((body["error"] as Record<string, unknown>)["message"] ?? ""),
-        };
+  const outcome: JournalOutcome = settlementOf(journal, row, body);
   journal.settleDispatch(id, outcome);
   rows.delete(id);
   const held = awaiting.get(id);
@@ -1563,8 +1891,88 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   // item in the queue — and the poll that will hand it over is one this process
   // is holding right now. Without the stir it waits out its hold first, which
   // turns a queue of eight into eight holds of idling (see [`stirPolls`]).
+  //
+  // A **paused** result settles the dispatch exactly as an answer does, which is
+  // §3.4's own reading of the third ending: the worker is free the moment the
+  // pause comes home, and may be dispatched other work while a person thinks.
   stirPolls();
   return reply.code(204).send();
+}
+
+/**
+ * What one result body settles its dispatch with: an output, a failure, or a
+ * pause (§3.4).
+ *
+ * The third is PRD resolved q46's addition and is read here rather than in the
+ * route for one reason worth stating: a `paused` this hub cannot read is
+ * answered as a **failure of the dispatch**, not as a status. §3.4's table gives
+ * this route four statuses and §10.1 lets a peer rely on them, so a fifth over a
+ * malformed body would be a refusal a worker stops for — while the honest cost
+ * of an unreadable pause is the node's attempt, under its own `retry:`/
+ * `on_error:` chain, exactly as `src/worker/node.rs` costs a dispatch for a body
+ * no hub would take. Nothing conforming reaches it: the handshake refuses a peer
+ * of another release (§4.1), and this release's own runner writes the shape
+ * [`pauseOf`] reads.
+ *
+ * **A body carrying two endings is one of those unreadable pauses**, and it is
+ * checked here rather than left to the order the arms are written in. §3.4: "a
+ * result carries at most one of `output`, `error` and `paused`". A peer that
+ * sent an output *and* a pause would otherwise be read as a pause silently —
+ * the answer dropped on the floor and a person asked a question the node had
+ * already got past, which is the one outcome this whole ending exists to
+ * remove. Which of the two the sender meant is not something a hub can decide,
+ * so it decides neither and costs the attempt.
+ */
+function settlementOf(
+  journal: Journal,
+  row: DispatchRow,
+  body: Record<string, unknown>,
+): JournalOutcome {
+  const paused = body["paused"];
+  if (paused !== undefined && paused !== null) {
+    const beside = ["output", "error"].filter(
+      (field) => body[field] !== undefined && body[field] !== null,
+    );
+    if (beside.length > 0) {
+      return {
+        kind: "error",
+        name: "PausedResultUnreadable",
+        message: `this worker settled \`${row.id}\` paused and carried ${beside
+          .map((field) => `\`${field}\``)
+          .join(" and ")} in the same body: a result carries at most one of \`output\`, \`error\` and \`paused\`, so a hub cannot tell whether this node answered or stopped at a question (docs/distributed.md §3.4)`,
+      };
+    }
+    const pause = pauseOf(journal, row, paused);
+    return pause === undefined
+      ? {
+          kind: "error",
+          name: "PausedResultUnreadable",
+          message: `this worker settled \`${row.id}\` paused with a pause this hub cannot read: a paused result names its \`wait\`, a \`flow\` and \`node\` this artifact declares as a \`human:\` node, what the person is \`shown\`, \`paused_at\`, and the \`effect\` record (\`key\`, \`site\`, \`ordinal\`, \`request\`) its answer is journaled under — where the \`wait\` and the record's \`site\` are the same instance path, that path's last frame names the \`node\`, the \`ordinal\` is the one this execution's next \`human\` claim at that site takes, the \`key\` is \`<site>#human/<ordinal>\`, and the whole of it lies at or inside \`${row.site}\`, which is this dispatch's own instance path (docs/distributed.md §3.4, §8)`,
+        }
+      : { kind: "value", value: { paused: pause } };
+  }
+  return body["error"] === undefined || body["error"] === null
+    ? {
+        kind: "value",
+        value: {
+          output: body["output"],
+          ...(body["history"] === undefined ? {} : { history: body["history"] }),
+          ...(body["models"] === undefined ? {} : { models: body["models"] }),
+          ...(body["tool_dispatches"] === undefined
+            ? {}
+            : { toolDispatches: body["tool_dispatches"] }),
+          // The fourth collector, which travels because it cannot be read off
+          // the answer on this side — see [`PlacedAnswer.stores`]. Journaled
+          // with the rest of the outcome, so a replayed row reports what the
+          // node's stores did as well as what its models did.
+          ...(body["stores"] === undefined ? {} : { stores: body["stores"] }),
+        },
+      }
+    : {
+        kind: "error",
+        name: String((body["error"] as Record<string, unknown>)["name"] ?? "Error"),
+        message: String((body["error"] as Record<string, unknown>)["message"] ?? ""),
+      };
 }
 
 /** `GET /workers/artifact/{hash}` (§3.5). */

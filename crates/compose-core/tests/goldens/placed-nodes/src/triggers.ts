@@ -181,6 +181,20 @@ export interface ManualTrigger {
 
 export const httpTriggers: readonly HttpTrigger[] = [
   {
+    name: "on_abandoned",
+    flow: "flow.abandoned",
+    path: "/abandoned-escalations",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
     name: "on_batch",
     flow: "flow.batch",
     path: "/batches",
@@ -227,6 +241,21 @@ export const httpTriggers: readonly HttpTrigger[] = [
     name: "on_escalated",
     flow: "flow.escalated",
     path: "/escalations",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+    callback: (payload) => text("payload.body.callback_url", roots(payload), "`callback` of the trigger `on_escalated`"),
+  },
+  {
+    name: "on_impatient",
+    flow: "flow.impatient",
+    path: "/impatient-escalations",
     method: "POST",
     respond: "async",
     readsBody: true,

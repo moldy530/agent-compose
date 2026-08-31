@@ -494,6 +494,14 @@ pub enum DiagnosticCode {
     /// absent is decided by a sibling section, and the repair is a choice of
     /// two.
     MissingJoinToken,
+    /// A store on a backend the reaching process opens for itself is bound by
+    /// something a placement executes, so a mesh would run it in more than one
+    /// process and each would hold its own copy (grammar 14.1 rule 5, PRD
+    /// resolved q45, Decision D131). Its own class rather than a
+    /// [`ConflictingPlacement`](Self::ConflictingPlacement): nothing here holds
+    /// two answers to which worker runs one thing — one answer is enough, and
+    /// what it forks is the store.
+    ProcessLocalStore,
 }
 
 impl DiagnosticCode {
@@ -572,6 +580,7 @@ impl DiagnosticCode {
         Self::UnsupportedPlacement,
         Self::ConflictingPlacement,
         Self::MissingJoinToken,
+        Self::ProcessLocalStore,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -644,6 +653,7 @@ impl DiagnosticCode {
             Self::UnsupportedPlacement => "unsupported-placement",
             Self::ConflictingPlacement => "conflicting-placement",
             Self::MissingJoinToken => "missing-join-token",
+            Self::ProcessLocalStore => "process-local-store",
         }
     }
 }
@@ -876,7 +886,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::MissingJoinToken as usize + 1,
+            DiagnosticCode::ProcessLocalStore as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

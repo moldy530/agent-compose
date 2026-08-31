@@ -1,7 +1,7 @@
 # agent-compose — Distributed Execution
 
-**Protocol version:** 1 — carried on every join, and §10 fixes what it pins and
-when it bumps
+**Protocol version:** 2 — carried on every join, and §10 fixes what it pins and
+when it bumps; §10.4 lists the bumps
 **Status:** Normative for the hub/worker protocol a compiled project speaks. Both
 halves are built — the static surface it describes (`hub:` and `placements:`) is
 enforced by `validate`, a build emits the hub, and `agent-compose worker` is the
@@ -9,7 +9,7 @@ spoke. §12 says what that means, file by file.
 **Companion artifacts:** [`docs/durability.md`](durability.md) (the journal this
 writes into, and the replay it extends over the wire),
 [`docs/grammar.md`](grammar.md) §14.1, §14.2 (the deploy-layer surface), §9.4
-(idempotency keys), [`prd.md`](../prd.md) §5.10, §5.12, resolved questions 37–44
+(idempotency keys), [`prd.md`](../prd.md) §5.10, §5.12, resolved questions 37–46
 
 A graph does not have to run in one process. This document defines how it runs
 in several: what a hub is, what a worker is, the wire they speak, what happens
@@ -79,11 +79,19 @@ horizontal scaling is the execution, never the node. Scaling out later means
 sharding executions across hubs over the Postgres journal slot (resolved q27),
 which §8 is written to keep possible.
 
-That clause is about executions sharing with **each other**, and it says nothing
-about the two processes inside one: a `store.*` on a process-local backend is a
-different physical store on a worker from the one on the hub, whichever execution
-opened it. Nothing refuses that pairing today, and §13's third row is where it
-stands.
+That clause is about executions sharing with **each other**, and the two
+processes *inside* one are a separate question that now has its own answer. A
+`store.*` on a process-local backend — `memory`, `sqlite`, `sqlite_vec`,
+`local_fs` — is a different physical store on a worker from the one on the hub,
+whichever execution opened it, and a placement is several processes by design
+(§1.1). So `validate` **refuses** the pairing: grammar §14.1 rule 5 is a compile
+error wherever a component that can execute in a placement's process binds such a
+store, at every scope and under `--target local` too (PRD resolved q45). A mesh
+that shares one store binds a **networked** backend, whose variables §9.1's
+partition already carries to every placement that reaches it — and until this
+compiler release opens one (production `storage_backends` land behind the store
+plugin interface in M3, PRD §7), a mesh whose composition needs a store keeps the
+component that binds it on the hub.
 
 Peer partition — each machine owning a subgraph and its own journal — is
 **rejected**, and named here so it is not re-proposed as an optimisation. It
@@ -210,6 +218,16 @@ not admit more work than the mesh can run writes the `max_concurrency:` those
 workers can serve; and a `timeout:` on a placed node is a bound on **queueing
 plus execution**, not on execution alone.
 
+What it is not a bound on is *thinking*. A dispatch that settles paused (§3.4)
+puts a `human` wait on the hub's board under the dispatching node's own instance
+path, and grammar D102's rule — "a budget above a wait does not run while the
+wait is open" — reaches it there exactly as it reaches the same node unplaced. So
+a placed node given `timeout: 10m` fails if ten minutes of queueing and work go
+by, and does not fail because an approver took a day: the clock stops while the
+question is open and starts again when it is answered. A composition that wants
+the approval itself bounded writes the `human:` block's own `timeout:`, which is
+the one line that bounds a wait on either side of the wire.
+
 A worker's `POST`s do not wait behind its poll: effect batches (§3.3) and
 results (§3.4) are issued as they happen, concurrently with the held `GET`. "One
 outstanding `GET`" bounds the polling, not the connection count.
@@ -300,7 +318,7 @@ has forgotten.
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "compiler": "0.4.1",
   "runtime": "bun 1.1.34",
   "claims": ["mac", "gpu"],
@@ -318,7 +336,7 @@ Answer:
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "compiler": "0.4.1",
   "worker_session": "wrk_9f1c8a3e…",
   "artifact": { "hash": "sha256:…", "url": "/workers/artifact/sha256:…" },
@@ -556,17 +574,20 @@ stays a valid backend for a personal mesh — there is still exactly one writer
 (PRD resolved q42).
 
 Each record carries its **effect key**, derived by the execution-derived rule
-grammar §9.4 fixes, and insertion is **idempotent by that key**: a record the
-journal already holds is accepted and dropped. A batch is therefore safe to
-re-send after a transport failure, and a worker SHOULD re-send rather than
-guess.
+grammar §9.4 fixes — `<site>#<kind>/<ordinal>`, which the hub re-derives from the
+record's own three fields and refuses a record that disagrees with, since the key
+is what the row is written under and one naming another node's slot would be
+claimed by that node's replay as a divergence. Insertion is **idempotent by that
+key**: a record the journal already holds is accepted and dropped. A batch is
+therefore safe to re-send after a transport failure, and a worker SHOULD re-send
+rather than guess.
 
 | condition | status | body |
 |---|---|---|
 | the batch is journaled | `204` | empty. Every record in it was inserted or was already held |
 | the token does not verify | `401` | no detail, as everywhere (§3.1) |
 | the session is unknown | `410` | names the rule of §3: join again, and send this batch again under the new session |
-| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field or naming a `site` outside the dispatch's | `400` | names what a batch and a record carry |
+| the body is not a batch — a missing `dispatch_id`, a missing `effects` array, or a record short of a field, naming a `site` outside the dispatch's, or carrying a `key` its own `site`, `kind` and `ordinal` do not derive | `400` | names what a batch and a record carry |
 | the `dispatch_id` names no dispatch this hub holds | `409` | names the dispatch. The batch is discarded, as at §3.4 |
 
 The last two rows are not about the batch's *contents* the way the first three
@@ -590,12 +611,248 @@ an effect the replay of §7 cannot skip.
 
 ### 3.4 `POST /workers/result`
 
-Carries the session and the `dispatch_id`. The node's outcome: its output, or
-its failure.
+Carries the session and the `dispatch_id`. The node's outcome: its output, its
+failure, or **the pause it stopped at**.
 
 **Idempotent by `dispatch_id`.** A second result for a dispatch an earlier one
 already **settled** is accepted and dropped, which is what makes at-least-once
 dispatch (§7) safe on the return path as well as the outbound one.
+
+#### The third ending: a result may settle a dispatch *paused*
+
+A `human:` node is reachable on a worker — grammar §14.1 rule 4 runs everything
+an attached `flow.*` reaches in the attaching agent's placement, and "the signing
+machine pauses for approval" is a shape a mesh is *for*, since the machine
+holding the capability is exactly where an approval-gated node belongs. The wait
+board is not: it is the hub's, which is what keeps wait-board unity (PRD resolved
+q43) and what a status report publishes, a resume route answers and a recovery
+re-derives.
+
+So a pause is neither held on the worker nor failed. **The result settles the
+dispatch, carrying the pause**, and the hub plants the wait on its own board
+(PRD resolved q46):
+
+```json
+{
+  "dispatch_id": "dsp_…",
+  "paused": {
+    "wait": "escalate/0/escalation/0/ask/0",
+    "flow": "flow.escalation",
+    "node": "ask",
+    "shown": { "…": "…" },
+    "paused_at": "2026-08-31T09:14:02.113Z",
+    "expires_at": "2026-09-01T09:14:02.113Z",
+    "effect": {
+      "key": "escalate/0/escalation/0/ask/0#human/0",
+      "site": "escalate/0/escalation/0/ask/0",
+      "ordinal": 0,
+      "request": "{\"node\":\"ask\",\"shown\":{…},\"wait\":\"escalate/0/escalation/0/ask/0\"}"
+    }
+  }
+}
+```
+
+`paused` is present exactly when the dispatch ended at a pause, and a result
+carries at most one of `output`, `error` and `paused` — a body carrying two
+endings is refused the way an unreadable pause is (below), because which one the
+sender meant is not something a hub can decide, and reading the pause and
+dropping the output would ask a person a question the node had already answered.
+Every member of it is REQUIRED except `expires_at`, which is present exactly when
+the node declares `timeout:` (grammar §8.7).
+
+Every field is a fact **the worker derived and the hub cannot**, and nothing more
+travels than that. `wait` is the node's deterministic wait identity — its
+instance path plus an ordinal, grammar §9.4 — so the hub plants the wait a local
+run would have opened at that site, and a resume prepared against one generation
+finds it in the next (§6.1's property, for the same reason). `shown` is the
+node's evaluated `input:`, which is what the person is asked.
+
+**The two instants are the worker's record of its own clock, and neither is the
+wait's.** `paused_at` is when that machine reached the node; `expires_at` is what
+its own trace entry recorded for the pause (`docs/trace.md` §3.4) — `paused_at`
+plus the node's `timeout:`, on the same clock. They travel because the pause
+happened on another machine and the settled dispatch row is the only record of
+what that machine did (`docs/durability.md` §3.8), and they are **never armed and
+never republished**. Two machines' clocks disagree, so a hub that armed the wait
+at `expires_at − now` would give a `timeout: 5m` node no time at all on a worker
+ten minutes behind it and a quarter of an hour on one ten minutes ahead, while
+the same node unplaced always gets five minutes; and a hub that published
+`paused_at` beside a deadline of its own would publish a pair read off two clocks,
+whose difference is the machines' offset rather than the node's `timeout:` —
+negative once a worker's lead exceeds the budget — where the same node unplaced
+dates both members off one reading.
+
+**So the hub dates the wait where it plants it**, off one `Date.now()` reading,
+and arms the node's own `timeout:` out of its copy of the descriptor from that
+same instant — the only instant a local wait's budget is ever spent from either.
+Both members of the pair it publishes are that reading's: `expires_at` is the
+deadline it will fire, on the clock it published it from, and `paused_at` is when
+the generation holding the question began holding it. A `timeout: 5m` node is
+therefore shown as asked now and expiring in five minutes whichever machine
+reached it, the five minutes a reader is shown are the five minutes the resume
+surface will take an answer through, and `expires_at − paused_at` is the node's
+`timeout:` on either side of the wire. That is PRD resolved q46's parity bar for
+status visibility, held rather than documented around; publishing the wire's
+instants instead would break it twice over — a question shown as expired for the
+whole time it is answerable behind a slow worker's clock, which is a status route
+contradicting the resume route, and a journaled record whose answer arrives
+before its question, which is the entry `docs/durability.md` §3.4 refuses by
+name. The journal keeps the pair the board published, so the answered pause's own
+trace entry (`docs/trace.md` §3.4) is the entry an unplaced pause writes.
+
+So neither instant's **value** is one a hub routes off, and the two are checked
+differently for that reason. `expires_at` is the one member of a `paused` body
+**no hub check backs**, and deliberately: the checks below refuse a pause over a
+field the hub would otherwise have *used*, and its rule — present exactly when
+the node declares `timeout:` — is a producer obligation, kept by a worker
+because the settled row is where it is read back. Refusing a pause over it would
+cost a node its attempt for a disagreement about a row nothing routes off, and a
+member whose absence is itself meaningful is one a hub cannot tell a mistake
+from. `paused_at` is REQUIRED and is checked as every other required member is —
+a body short of it is unreadable, by the rule below — because it is the one fact
+the settled dispatch row exists to carry about the machine that reached the
+node, and a row short of it is not that record. What the check does **not** do is
+spend the value: the hub dates the wait it plants off its own clock, and files
+the worker's reading beside the rest of the row for a reader asking when *that*
+machine got there.
+
+**A restart re-arms it whole**, because a restarted hub re-derives a placed pause
+by *planting it again*: it dates the wait its own now and gives the question the
+node's whole `timeout:` in front of it, with a published deadline that says so.
+That is what the same node unplaced does, for the same reason it does it: an
+unanswered local pause journals nothing (resolved q28), so a resumed generation
+re-parks it from scratch, re-dated, and its budget starts again
+(`docs/durability.md` §5). Five minutes after a restart, a `timeout: 5m` pause
+has the same time left and reads the same on either side of the wire, and "how
+long do I have" is not a question a deploy file gets to answer. The hub *knows*
+when the worker took the pause — the settled row is dated — and does not spend
+that knowledge on the budget or on the date it shows; a wait no process was
+holding is a wait nobody could have answered, and charging it to the person would
+be charging them for the downtime.
+
+**The `human:` block's `timeout:` is the only clock the question is under.** The
+*dispatching* node's `timeout:` — a bound on queueing plus execution (§2, §6.5) —
+is held still while the wait is open, because the wait is planted under that
+node's instance path and grammar D102 says a budget above a wait does not run
+while one is open. A placed node's budget therefore bounds what the instance
+*does*, on either side of the wire, and never what a person takes to answer.
+
+`effect` is the
+journal record the **answer** will be written under, exactly as the worker's own
+recorder claimed it (`docs/durability.md` §4) — the key the redispatched node
+will look up, and the canonical `request` it will compare against.
+
+**Both identities are held to the dispatch's own `instance_path`**, at or inside
+it, exactly as §3.3 holds a record's `site`. It is §8's single writer stated for
+the route that also plants a wait: no session may journal an effect into a node
+it was never dispatched, and none may put a question on the board under another
+node's identity — which the resume surface would then answer. The `key` is held
+with them, by the derivation rather than by the prefix: it MUST be
+`<site>#human/<ordinal>` for the `site` and `ordinal` beside it
+(`docs/durability.md` §4), because the key is the field the record is written
+under and one naming another node's slot would be claimed by *that* node's replay
+as a divergence. `flow` and `node` MUST name a `human:` node the hub's own
+artifact declares, since the answer is held to that node's `output:` and a
+question nothing can validate an answer against is one no surface may take.
+
+**And `ordinal` MUST be the number of `human` records this execution's journal
+already holds at `effect.site`** — counted at the site itself, since an ordinal
+is per site and not per subtree. That is the ordinal the *next* `human` claim at
+that site takes (`docs/durability.md` §4), and the redispatched node's own claim
+is what reads the answer back: a record written at any other ordinal is one no
+claim ever reaches, so the person is asked a second time — the one failure this
+whole ending exists to remove. It is stated here rather than left to the key
+check, which derives faithfully from whatever ordinal travelled beside it and so
+cannot see this. A worker of this release always sends exactly this number,
+because the pause it settles on is its own first live claim after replaying the
+`effect_history` the dispatch carried (§7.2), and the two derivations — the
+worker's claims-in-session and the hub's records-in-journal — count the same
+records.
+
+**And all of them MUST name one node**, which is the same rule along the other
+axis. `wait` and `effect.site` MUST be the **same path**: a pause's identity *is*
+its effect site, derived once and sent twice, so a body carrying two paths would
+plant the question under one node's identity and journal the answer into
+another's slot — a correct key for the wrong node, which is precisely what the
+derivation check above cannot see. That path's last frame MUST name `node`
+(grammar §9.4's `<node id>/<ordinal>`), because the contract the answer is held
+to is `flow`.`node`'s: a pause whose identity reached a different node would arm
+that other node's `timeout:`, publish its `output:` and parse the answer with its
+parser. What a hub cannot check is which *flow* the path ran in — a frame above
+the node is a node id or a flow's local name, and nothing resolves one back to a
+declaration — so two `human:` nodes sharing an id in two flows are
+indistinguishable here, and a peer that crossed them is caught by the
+redispatch's own parse (resolved q29) rather than by this route. A
+`paused` that breaks any of those, or that is short of a member, is **not**
+answered with a status:
+this route's table is closed (§10.1) and a status outside it is a refusal a
+worker stops for, so the hub settles the dispatch as a *failure* naming what was
+wrong, and the node's own `retry:`/`on_error:` chain runs over it. The placement
+keeps its worker; the attempt is what an unreadable pause costs.
+
+What does **not** travel is the contract: the answer's schema and the parser that
+holds an answer to it are the hub's own, read out of the artifact it is already
+serving. That is §4.3 being load-bearing again — the whole artifact is
+everywhere, so the hub holds the very descriptor the worker paused on — and it is
+what makes the parity PRD resolved q46 requires a lookup rather than a second
+contract on the wire.
+
+**A paused result is SETTLED**, which is why it needs none of the machinery
+below rewritten: the dispatch ended with a result, so idempotency by
+`dispatch_id` is unchanged, a re-posted paused result is `204`, and a paused
+result for a dispatch the hub superseded is `409`. The **session is free** the
+moment it posts one, and may be dispatched other work while a person thinks — so
+a worker gone between the pause and the answer costs the execution nothing while
+the question is open, and costs it only the wait for a replacement once the
+answer arrives, which is the dispatching node's own budget and is below.
+
+What the hub does with it is the ordinary discipline and no new mechanism: it
+plants the wait on the existing board under the identity above (a third kind of
+wait beside a `human` pause and a placement wait — the *same* kind as the first,
+in fact, reached over the wire), fires the lifecycle webhook a local pause fires,
+and publishes the same status a local pause publishes. The existing resume
+surface answers it. The answer is journaled as the pause's own effect record, at
+`effect.key`, and the node then **re-enters dispatch**: a fresh row at the next
+ordinal of that instance path, queued to its placement and parked if nothing
+claims it (resolved q39's machinery), whose `effect_history` carries the answered
+pause — so the replay of §7.2 consumes it at the very claim that paused and the
+node goes live *past* the question. A model call made before the pause is
+replayed, not re-issued, which is §7.3's promise reaching the one case that used
+to be outside it.
+
+A wait whose budget runs out is the same path with the other settlement: the
+expiry is journaled as the pause's record, the node is redispatched, and the
+replay raises the node's own `on_timeout:` route (grammar §8.7) — decided by the
+same line of the same function an unplaced pause's expiry is decided by.
+
+**The one interval a mesh adds is the redispatch's own queueing**, and it is
+inside the dispatching node's budget rather than outside it. The wait held that
+budget still (above); settling it — with an answer or with an expiry — starts it
+running again, and what runs next is a fresh row waiting for a session to claim
+it, which §6.5 makes part of what the node's `timeout:` bounds. So a node whose
+own budget runs out before any worker takes the redispatch fails on that budget,
+and neither the person's answer nor the pause's `on_timeout:` route is reached —
+where the same node unplaced would have taken the route in the same process, in
+the same instant the wait expired. That is the one place a placed pause is not
+indistinguishable from a local one, and it is the placed shape of "fail if the
+machine is not up in ten minutes" rather than a second rule: the budget the
+author wrote on the *dispatching* node is the one that bounds waiting for a
+machine, on this side of a wait exactly as on the other.
+
+**A hub restart between the pause and the answer costs nothing**, because the
+pause is journaled: the settled row carries it, and the replay that re-reaches
+the node re-derives the wait onto the new process's board — under the identity
+its predecessor published, dated by this planting, and with the node's whole
+`timeout:` in front of it and a deadline that says so, exactly as a resumed
+generation re-parks a local wait nobody answered (above) — unless the answer's
+record is already in the journal, in which case the wait is over and the
+redispatch is what replays past it.
+
+This is a change an older peer would misread — a `1` peer sees a result with no
+`output` and reads it as a node that answered nothing — so `PROTOCOL_VERSION` is
+**2** (§10).
+
+#### The two verbs
 
 **A dispatch ends in one of two states, and this document gives them two verbs**
 — they are not synonyms and the table below turns on the difference. A dispatch
@@ -964,11 +1221,15 @@ Its first request carries a session the hub has forgotten, so it is answered
 answered `409` and discarded (§3.4) — the superseded row, because this
 declaration is what superseded it. It is never the `204` row: that one is a
 dispatch a **result** ended, and this is one the hub ended without one, which is
-the whole of why §3.4 gives the two endings two verbs. The effect batches it
-still holds are a different matter and **are** journaled: they are keyed by
-effect key and scoped to their execution, not to a session or a dispatch (§3.3),
-so a batch in flight when the lid closed reaches the journal on the re-send and
-the retry replays it instead of re-issuing it (§7.2).
+the whole of why §3.4 gives a dispatch's two end states two verbs — *settled* and
+*superseded*. The third ending a result may carry cuts across that axis rather
+than adding to it: a paused result settles its dispatch exactly as an answer
+does, so a pause taken here would still be the `204` row and never this one. The
+effect batches the worker still holds are a different matter and **are**
+journaled: they are keyed by effect key and scoped to their execution, not to a
+session or a dispatch (§3.3), so a batch in flight when the lid closed reaches
+the journal on the re-send and the retry replays it instead of re-issuing it
+(§7.2).
 
 PRD resolved q39 puts this as "heartbeat loss re-parks what was queued to the
 vanished worker". The phrase is written in the vocabulary of a push model, where
@@ -1015,6 +1276,21 @@ is running the whole time.
 "Fail if the machine is not up in ten minutes" is already spellable: the node's
 `timeout:`/`on_error:` chain applies from dispatch (grammar §9). No key is added
 for placements.
+
+The one interval that chain does not count is a pause the dispatch settled on
+(§3.4): the wait is planted under the dispatching node's instance path, so
+grammar D102 holds the node's budget still while the question is open, exactly as
+it does for an unplaced node with a wait inside it (§2). "Fail if nobody approves
+in ten minutes" is therefore the `human:` block's own `timeout:`, not the placed
+node's — the same line it is without a mesh.
+
+**The budget starts running again the moment the wait settles**, so the
+redispatch that carries the answer — or the expiry — queues inside what is left
+of it, exactly as the first dispatch did. A node that has spent its `timeout:`
+waiting for a machine fails on it, and the answer or the `on_timeout:` route
+behind that redispatch is never reached (§3.4). Both halves are this section's
+one rule read at the two ends of a wait: thinking is outside the budget, and
+waiting for a machine is inside it.
 
 ### 6.6 The lifecycle webhook
 
@@ -1188,6 +1464,19 @@ Which gives, concretely:
 - a variable reachable in two processes belongs to both. Two placed agents
   attaching one unplaced tool is the ordinary case, and the tool's secrets go to
   both placements.
+
+**This closure has a second reader, and it is one walk rather than two.** Grammar
+§14.1 rule 5 refuses a store on a process-local backend wherever a component that
+can execute in a placement's process binds it (PRD resolved q45), and "can
+execute in a placement's process" is the question this section answers — so
+`validate` asks *this* partition rather than deriving the set again. Two
+derivations of one closure agree on the day they are written; that is the whole
+reason the partition is computed once and shipped in the artifact, and a static
+rule reading a second copy would reintroduce exactly the drift §9.1 exists to
+prevent. The two answers it needs are the set above and the **route** into it:
+which `members:` entry the process came from, and which attachment carried it to
+the binding — which is what lets the refusal point at lines rather than at a
+verdict.
 
 Worked, because this is the case the rule exists for: `tool.sign` carries
 `KEYCHAIN_PASSWORD` in its `exec.env`, `agent.signer` attaches it, and the deploy
@@ -1365,6 +1654,23 @@ refuses the mixed pair first, and `PROTOCOL_VERSION` is what remains for the
 case the triple stops covering — a worker binary somebody upgrades separately,
 or a second implementation of this document.
 
+### 10.4 The bumps
+
+| version | what changed, and why it is a bump |
+|---|---|
+| **1** | this document, as the runtime that landed with it speaks it |
+| **2** | §3.4's **paused** result (PRD resolved q46, 2026-08-31). A result may settle a dispatch with the wait a `human:` node opened, and a peer of `1` would read one as a node that answered with no output — a node that "quietly means something else", which is §10.3's first row exactly, and its third: `paused` changes what a result *is*. The same release also **enforces** §3.3's effect-key derivation at `/workers/effects`: a record carrying a `key` its own `site`, `kind` and `ordinal` do not derive is `400` where it was journaled before. That is not what the bump is for and needs none of its own — the derivation is the rule §3.3 and grammar §9.4 already stated, so a conforming `1` peer sends what it always sent, and one that spelled a key its own fields do not derive is now *refused* rather than left to write into another node's slot, which is what §10 says a protocol check is for. It is recorded here because this table is where a second implementation reads what moved |
+
+**The bump to 2 costs nothing in practice, and saying so is the point of
+recording it.** A worker and the hub it talks to are built from one compiler
+release, so the handshake triple (§4.1) already refuses a mixed pair at the join
+— by compiler version, before `protocol` could ever be the deciding field. What
+the bump buys is the case the triple does not cover: a worker binary somebody
+upgraded separately, or a second implementation of this document, either of which
+would otherwise settle a placed pause into silence. It is a version number doing
+what §10 says it is for — refusing a peer rather than letting one be wrong — and
+not an upgrade any operator of this release has to plan for.
+
 ---
 
 ## 11. Out of v1 scope
@@ -1405,16 +1711,21 @@ describes.
 What `validate` enforces: everything grammar §14.1 and §14.2 state — a
 placement's name and members, the `flow.*` deferral, disjointness, repeated
 members, the colocation rule for an attached tool and for what an attached flow
-reaches, the conditional join token, and the `public_url:` shape. A deploy file that breaks one of those is a
+reaches, the refusal of a store on a process-local backend that a placement's
+process could open (§14.1 rule 5, PRD resolved q45), the conditional join token,
+and the `public_url:` shape. A deploy file that breaks one of those is a
 compile error.
 
 What a **build** emits for a target that declares `placements:`: the hub. The
 five routes of §3 on the served app, the artifact server of §3.5 over a content
 hash the tree carries, the dispatch board with placement waits on it (§6), the
-liveness sweep of §6.3, idempotent effect ingestion (§3.3), and the environment
-partition of §9.1 — emitted into the artifact, so the hub checking a join's
-`env_ok` and a worker computing one read one answer under one hash. A placed
-component's node is dispatch-and-await rather than a call (§7).
+liveness sweep of §6.3, idempotent effect ingestion (§3.3), the *paused* ending
+of §3.4 — a `human:` node a worker reaches lands on the hub's own wait board, is
+answered through the ordinary resume surface, and sends the node back through
+dispatch with the answered pause in its history — and the environment partition of
+§9.1, emitted into the artifact, so the hub checking a join's `env_ok` and a
+worker computing one read one answer under one hash. A placed component's node is
+dispatch-and-await rather than a call (§7).
 
 What **`agent-compose worker`** is: the spoke. `--hub <url> --claim <name>…
 --token-env <VAR> [--data-dir <path>]`, a complete protocol client — the
@@ -1428,9 +1739,8 @@ third tree accumulates.
 
 What is **not** built, and is named rather than missing: per-placement artifact
 slicing (§4.3), multi-hub (§8), worker-to-worker edges and Windows workers
-(§11) — and the four questions of §13, each held to what stands for it there:
-two knobs nobody has weighed, and two shapes this compiler accepts and runs
-worse than an author would expect.
+(§11) — and the two questions of §13, each held to what stands for it there:
+two knobs nobody has weighed.
 
 **A hub of this release serves exactly one artifact: its own tree.** That is the
 fourth named absence, and it is named here because §3.5's table has a row for a
@@ -1449,10 +1759,17 @@ holds the worker to every status this document gives it, against a hub that is a
 fixture; and `crates/agent-compose/tests/distributed_mesh_acceptance.rs` runs a
 real hub and real workers and asks whether a distributed execution works — the
 steady state, a cold start, parking and wake, a mid-node disconnect and the
-replay that follows it, two hub restarts (one idle, one over a dispatch a worker
-is in the middle of running), a hub opening a journal written before the
-dispatch board existed, the refusals a worker stops on, and a fan-out queued onto
-a pool of one.
+replay that follows it, three hub restarts (one idle, one over a dispatch a
+worker is in the middle of running, and one between a placed pause and its
+answer), a hub opening a journal written before the dispatch board existed, a
+placed `human:` node whose question comes home and whose answer sends the node
+back to a worker — including the variant where the worker that asked is gone by
+the time the person decides, the wait that is never answered at all, whose budget
+runs out on the hub and whose redispatch raises the node's own `on_timeout:`
+route on a worker, and the one interval a mesh adds to a wait, where the
+dispatching node spends its own budget on a redispatch no worker claims and that
+route is never reached (§6.5) — the refusals a worker stops on, and a fan-out
+queued onto a pool of one.
 `crates/compose-core/tests/placement_surface_landing.rs` holds the surface to
 where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in
 `src/mesh.ts`, and neither in the composition's own lowering.
@@ -1517,14 +1834,14 @@ nothing implements past them.
 
 ## 13. What this document does not settle
 
-Four questions are **open**, and each one is here because a normative document
+Two questions are **open**, and each one is here because a normative document
 may fix a wire and may not fix a design decision the PRD has not made. `prd.md`
 is the single source of truth for design decisions; this document is downstream
 of it, and §12's "held to" stops at this table.
 
 **So this section is a gate, not a note.** The project's discipline is that a new
 design question lands in the PRD's Open Questions and is resolved there before
-the affected area is implemented. These four are that list *staged*, which is as
+the affected area is implemented. These two are that list *staged*, which is as
 far as this document can take them: entering a question in the PRD's Open
 Questions, and resolving it there, is a change to `prd.md` and a reviewed
 decision of its own — never something a downstream document performs by
@@ -1535,42 +1852,42 @@ that reads a "what stands in the meantime" cell as wire has decided a PRD
 question in a downstream document, which is the thing this section exists to
 prevent.
 
-The rows come in two shapes, and the difference is what a reader owes each.
+Both remaining rows are the same shape: a **gap** — a knob nobody has weighed,
+filled here conservatively, where the wire admits any answer additively. So what
+the PRD owes each is a decision rather than a correction, and the runtime that
+landed was written to those defaults and no further. Their absences are held
+rather than remembered, and `crates/compose-core/src/codegen/mesh.rs` says
+exactly how far that holding reaches: it **pins** the emitted session to the four
+fields §5 gives it, so a capacity arriving under a spelling nobody has used yet is
+still a failing test, and it **greps** the hub's code for the spellings the two
+rows have arrived under before — `capacity`, `maxDispatches`, `max_dispatches`
+for the first; `sandbox`, `seccomp`, `restrictions` for the second. A grep is a
+floor rather than a proof, which is why the first row has the pin as well. Raising
+a default is what needs the PRD; keeping one needs a test.
 
-The first two are **gaps**: a knob nobody has weighed, filled here
-conservatively, where the wire admits any answer additively — so what the PRD
-owes each is a decision rather than a correction, and the runtime that landed was
-written to those defaults and no further. Their absences are held rather than
-remembered, and `crates/compose-core/src/codegen/mesh.rs` says exactly how far
-that holding reaches: it **pins** the emitted session to the four fields §5 gives
-it, so a capacity arriving under a spelling nobody has used yet is still a failing
-test, and it **greps** the hub's code for the spellings the two rows have arrived
-under before — `capacity`, `maxDispatches`, `max_dispatches` for the first;
-`sandbox`, `seccomp`, `restrictions` for the second. A grep is a floor rather
-than a proof, which is why the first row has the pin as well. Raising a default
-is what needs the PRD; keeping one needs a test.
-
-The last two are **sharp edges**: a composition this compiler accepts, and runs
-worse than its author would expect. Each is here because the repair is a rule —
-a compile error over a shape that compiles today, or a wire that carries
-something this document's wire does not — and a rule with no resolved entry
-behind it is exactly what this section holds. What stands for each is stated in
-its cell, and neither is a silent failure by the time a reader meets it: one is
-diagnosed where it happens, the other is what this row exists to say out loud.
-(This table also held a row for a contradiction between resolved q40's mismatch
-clause and §4.1's repair, until q40's amendment of 2026-08-30 resolved it; §4.1
-now states that rule as settled wire.)
+**Three rows have left this table by being answered, which is what the table is
+for.** It held a row for a contradiction between resolved q40's mismatch clause
+and §4.1's repair, until q40's amendment of 2026-08-30 resolved it; §4.1 now
+states that rule as settled wire. It held a row for **a placed component's
+`store.*` on a process-local backend** — a *sharp edge*, a composition this
+compiler accepted and ran worse than its author would expect — until PRD resolved
+q45 (2026-08-31) answered it with a refusal: grammar §14.1 rule 5 is now a
+compile error over that shape, at every scope and under `--target local` too, and
+§1 and §9.1 state it as a rule rather than as a hazard. And it held the other
+sharp edge, **a `human:` node a placed component reaches**, until PRD resolved
+q46 (2026-08-31) answered it with a third ending on the wire: §3.4's *paused*
+result carries the wait home, the hub plants it on the one board, and the answer
+sends the node back through dispatch. That row's own note said the repair would
+be a breaking change and a reason for the PRD to weigh it rather than to pre-empt
+one here — which is what happened: the resolution took the decision, and
+`PROTOCOL_VERSION` moved to 2 (§10.4).
 
 | | what is unsettled | what stands in the meantime |
 |---|---|---|
 | **a session's dispatch capacity** (§2, §6.3) | how many dispatches one worker session may hold. Resolved q38 fixes that a placement's pool is several workers, and resolved q37 that scale comes from more processes; neither says anything about one session. Raising the number changes what heartbeat loss costs an execution — the difference between failing an attempt and handing work back to the board — which is why it is not a hub's knob | one, as §2 states it — a v1 default this document proposes, which no resolved entry contradicts and none has weighed. The wire admits any other answer additively (an OPTIONAL capacity at join, §10.2), so the runtime may build against one; **raising** it is what the PRD has to answer first |
 | **containment beyond the process boundary** (§11) | resolved q31 fixed v1 containment at root plus timeout and deferred containers, seccomp and "any deploy-target-level restriction (refusing bash on a distributed placement is a placement fact)" **to the distribution work**. The distribution resolutions did not take it up, and q44's out-list does not name it, so nothing has decided whether a placement may carry a sandbox or a capability restriction | no such key exists, in the grammar or on the wire; a worker runs the artifact with its own privileges. Grammar D128 retires the reserved `network:` key on the ground that no *resolved* containment story backs it, which is a statement about today rather than about what a later resolution may add |
-| **a placed component's `store.*` on a process-local backend** (§1, §9.1; PRD open q45) | whether a placed component may reach a store whose backend is process-local — and if not, whether the refusal covers every scope or a narrower one. Resolved q37's "executions share nothing by construction — global-scope stores are already external backends", which §1 restates, is a premise about *global scope* rather than a rule about placements, and no resolved entry speaks to the pair. The repair is a **breaking** grammar rule: a composition placing an `agent.*` whose `stores:` name a `memory`, `sqlite` or `local_fs` store compiles clean today | nothing refuses it, and the two processes each open **their own copy** — the worker's under its data directory's materialised artifact, the hub's under the built project — so a write on one side is not a read on the other, and the flow carries on with data that is not there. This holds under `--target local` too, where grammar §14.1 admits a hub and its workers on one machine. What an author who needs one store across a mesh does today is bind a **networked** backend; §9.1's partition already carries that half, since such a backend's variables belong to every placement that reaches a store bound to it |
-| **a `human:` node a placed component reaches** (§3.4, §4.3; PRD open q46) | how a pause opened on a worker reaches the hub's wait board. PRD resolved q43 names wait-board unity among the grounds for choosing this protocol over `RemoteGraph`, and §4.3 has a placement decide which *process* runs a node rather than what a node means — but neither fixes a carriage for a pause, and §3.4's result carries a node's output or its failure with no third shape. Both repairs are rules: a third terminal outcome on this wire plus a remote wait on the board, or a static refusal of the composition | the dispatch **fails**, and fails named: `src/worker-node.ts` reports the pause as a `PlacedHumanWait` whose message says a worker holds no wait board and points here, so the node's `retry:`/`on_error:` chain runs over a failure that says what happened rather than over a bare interrupt. The composition still compiles, because refusing it is the other candidate repair and this table is where a rule with no resolution behind it waits |
 
-No row here blocks the runtime: each names what stands until the PRD answers.
-The first two arrive additively rather than as a re-cut, which is what lets the
-runtime build against their defaults; the last two may not — a compile error over
-a shape that compiles today is a breaking change, and that is a reason for the
-PRD to weigh them rather than a reason to pre-empt one here. What every row
-blocks is the same thing: an implementation deciding one of them quietly.
+Neither row blocks the runtime: each names what stands until the PRD answers, and
+both arrive additively rather than as a re-cut, which is what lets the runtime
+build against their defaults. What they block is the same thing the three
+answered rows blocked: an implementation deciding one of them quietly.

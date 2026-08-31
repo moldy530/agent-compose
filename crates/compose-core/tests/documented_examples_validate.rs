@@ -189,7 +189,7 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
 /// the harness above writes for it. Rather than exempt these codes from carrying
 /// a runnable example — which is what
 /// [`EXPLANATIONS_WITHOUT_A_RUNNABLE_EXAMPLE`] would have meant, and would have
-/// left three checks with nothing running them — the explanation carries its
+/// left four checks with nothing running them — the explanation carries its
 /// deploy file in the document, and both halves are run: the first block must
 /// report the code, and every further block must clear it.
 ///
@@ -199,6 +199,7 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
 const EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE: &[&str] = &[
     "conflicting-placement",
     "missing-join-token",
+    "process-local-store",
     "unsupported-placement",
 ];
 

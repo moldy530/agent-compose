@@ -407,6 +407,28 @@ wait id — the id is the node's instance path (`docs/grammar.md` §9.4), so it 
 deterministic and identical across process generations — and a resume request
 that arrives after the restart finds it.
 
+**A wait a placed node opened is this record too**, written by the hub rather
+than by the process that asked. `docs/distributed.md` §3.4 makes a pause the
+third way a dispatch ends: the worker settles its dispatch with the wait it
+opened, the hub plants that wait on its own board and journals the answer *here*,
+under the effect key the worker's own recorder claimed — and the node re-enters
+dispatch, so the redispatch's `effect_history` carries this record and the replay
+above is what consumes it. Every rule of this section reaches it unchanged,
+because it is the same record: its three instants are the wait's own rather than
+the reading generation's — when the hub began holding the question, when it
+would have stopped waiting, and when it stopped — an unsettled wait records
+nothing and is re-derived, and a settlement the journal cannot record fails the
+node.
+
+All three are the **hub's** clock, and the paragraph above is why: a record that
+took `pausedAt` off the wire — the worker's reading of its own clock — and
+`settledAt` off this one would file, on a worker running ahead of the hub, an
+entry whose answer arrives before its question. So the wait is dated where it is
+planted, exactly as a local one is dated where it is parked, and the pair a
+reader is shown is the node's `timeout:` apart on either side of the wire (PRD
+resolved q46's parity bar). What the worker's clock said is not lost: it is on
+the settled dispatch row (§3.8), which is the record of what that machine did.
+
 This is the record that makes §1 concrete. `docs/trace.md` §11 says outright
 that what a human answered "is not here"; it is here.
 
@@ -605,7 +627,7 @@ holding what a worker is handed and how the wait ended:
 | `inputs`, `itemIndex`, `history`, `policy` | the dispatch payload: what the node's input phase built, plus the three facts about the node execution the hub holds that a worker cannot derive. On the row rather than in memory, so a hub restarted mid-dispatch hands over what its predecessor would have |
 | `status` | `parked`, `dispatched`, `settled` or `superseded` — the vocabulary below |
 | `session`, `parkedAt`, `dispatchedAt`, `settledAt`, `detail` | which worker session is holding it while one is, and the three instants of the wait, for the reason §3.4 keeps all three of a human wait's |
-| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take |
+| `outcome` | what the worker answered, once one did: a value or a failure, in the shape §3.1's outcomes take — or, on a dispatch a **pause** ended, the wait itself (`docs/distributed.md` §3.4) |
 
 **What `status` means** is the same kind of statement §3.6 makes about an
 execution, and the four are not interchangeable:
@@ -615,7 +637,19 @@ execution, and the four are not interchangeable:
 * **`dispatched`** — a session was handed it and has not settled it.
 * **`settled`** — a worker's result ended it, and the outcome on the row is that
   result. A resumed generation consumes it rather than dispatching again, which
-  is §5's replay discipline reaching this ledger.
+  is §5's replay discipline reaching this ledger. **A pause is one of the three
+  ways a result ends a dispatch** (`docs/distributed.md` §3.4), so the outcome
+  here may be the wait a `human:` node opened rather than the node's answer — and
+  a resumed generation consumes that too, by re-deriving the wait onto its own
+  board unless §3.4's answer record is already in the journal, in which case the
+  wait is over and the next dispatch at that instance path is what replays past
+  it. **The two instants on such an outcome are the worker's**, and this row is
+  the only place they are kept: `paused_at` is when that machine reached the
+  `human:` node and `expires_at` is what its own trace entry showed, both read
+  off its clock. Neither is a deadline this hub ever armed and neither is the
+  wait's — §3.4's record and the status route both date the wait where the hub
+  planted it — so this row answers "when did that machine ask", and the human
+  wait record answers "what was the question under".
 * **`superseded`** — the hub ended it *without* a result, which is the only way a
   dispatch ends that a worker did not end. A resumed generation replays the
   failure, so the node's `retry:`/`on_error:` chain does now what it did then.
@@ -737,14 +771,28 @@ the instants the recording generation measured (§3.4). A backoff's jitter is
 re-rolled. None of it changes what an effect answers, and a recorded effect is
 answered out of the record whatever the clock says.
 
-What it can change is *whether* a deadline fires, and that is a change in the
-**shape** of the run rather than in the identity of any effect. Replaying an
-attempt costs no wall clock, so a node whose `timeout:` ended its `retry:`
-ladder on the recording generation can have budget left to go round again on the
-resumed one. That next attempt claims a key the journal does not hold — which is
-the frontier, exactly as §5 defines it — so the effect is issued **live** and
-recorded, and the resumed execution has done something the recording one did
-not.
+**Both kinds of wait re-park with a fresh budget**, including the one the journal
+could date. A pause a worker settled its dispatch with
+(`docs/distributed.md` §3.4) is on the dispatch row, so a hub that re-derives it
+*knows* when the worker took the question — and does not spend that on the
+timer, or on the date it publishes: the wait is planted again, planting is what
+arms it, and **both** instants the planting publishes and later journals are that
+arming's own, since a deadline a reader is shown has to be the deadline that
+fires and a wait's `pausedAt` is when the generation holding it began holding it.
+A local pause has no such row and could not do otherwise. The two therefore cost
+a person's remaining time exactly the same and are dated the same way, which is
+what PRD resolved q46 requires of them — "timeout, retry, on_error semantics …
+are the single-process ones" — and a restart is downtime nobody could have
+answered through, not budget somebody spent.
+
+What a resumed generation's clock can change is *whether* a deadline fires, and
+that is a change in the **shape** of the run rather than in the identity of any
+effect. Replaying an attempt costs no wall clock, so a node whose `timeout:`
+ended its `retry:` ladder on the recording generation can have budget left to go
+round again on the resumed one. That next attempt claims a key the journal does
+not hold — which is the frontier, exactly as §5 defines it — so the effect is
+issued **live** and recorded, and the resumed execution has done something the
+recording one did not.
 
 That is not a divergence and is not reported as one: nothing compares unequal,
 and neither does the reverse case, where a resumed generation's deadline fires
@@ -1168,6 +1216,27 @@ one under this build parks a fresh wait rather than finding a settled answer,
 which is the same thing a `retry:` does and not a re-issued effect. The clause a
 future change here has to read twice is the one above: a **column** added to
 `dispatches` is not covered by `CREATE TABLE IF NOT EXISTS` either.
+
+**The third of them is the `paused` dispatch outcome** (§3.8,
+`docs/distributed.md` §3.4), and it arrived under no clause at all — it is a new
+*shape* of an existing field, a settled row whose `outcome` carries a pause
+instead of an output, which is none of the four literally. It needed no bump
+anyway, and the direction is the whole of why: §11.3's criterion is a journal
+written by the **previous** version replaying *wrongly* under this one, and no
+such journal holds a paused outcome. Every settled row an older build wrote
+carries an output or an error, and this build reads both exactly as its
+predecessor did. The hazard runs the other way — an older build meeting a paused
+row it has no reading for — and that is the case §11's opening sentence already
+answers: a journal is refused by version, and a build is never asked to read a
+file a *newer* one wrote.
+
+That is the difference from the wire, and it is worth stating beside the bump
+rather than leaving a reader to derive it. `docs/distributed.md` §10.4 bumps
+`PROTOCOL_VERSION` to `2` for this same shape, because a peer is met **live**: a
+worker of this release can hand a hub of `1` a result that hub will read as a
+node which answered nothing, and no refusal stands between them until the version
+says so. A journal has one reader per file and one arrow of time, so the same
+new shape is compatible here and breaking there.
 
 ### 11.3 What requires a version bump
 

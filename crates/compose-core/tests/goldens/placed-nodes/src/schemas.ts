@@ -66,6 +66,20 @@ export const agentSignerOutput = z.object({
 }).strict();
 export type AgentSignerOutput = z.infer<typeof agentSignerOutput>;
 
+/** `flow.abandoned` — the module's parameters (grammar 7.5). */
+export const flowAbandonedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowAbandonedInputs = z.infer<typeof flowAbandonedInputs>;
+
+/**
+ * `flow.abandoned` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowAbandonedOutputs = z.object({
+  approval: z.string(),
+}).strict();
+export type FlowAbandonedOutputs = z.infer<typeof flowAbandonedOutputs>;
+
 /** `flow.batch` — the module's parameters (grammar 7.5). */
 export const flowBatchInputs = z.object({
   paths: z.array(z.string()).max(12),
@@ -93,6 +107,40 @@ export const flowConversationOutputs = z.object({
   signature: z.string(),
 }).strict();
 export type FlowConversationOutputs = z.infer<typeof flowConversationOutputs>;
+
+/** `flow.deadline` — the module's parameters (grammar 7.5). */
+export const flowDeadlineInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowDeadlineInputs = z.infer<typeof flowDeadlineInputs>;
+
+/**
+ * `flow.deadline` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowDeadlineOutputs = z.object({
+  approval: z.string(),
+}).strict();
+export type FlowDeadlineOutputs = z.infer<typeof flowDeadlineOutputs>;
+
+/** `flow.deadline` node `ask` — what the human is shown (grammar 8.7). */
+export const flowDeadlineNodeAskInput = z.object({
+  path: z.string(),
+}).strict();
+export type FlowDeadlineNodeAskInput = z.infer<typeof flowDeadlineNodeAskInput>;
+
+/**
+ * `flow.deadline` node `ask` — what the human returns, routable like any structured output (grammar 8.7).
+ */
+export const flowDeadlineNodeAskOutput = z.object({
+  decision: z.enum(["approve", "reject"]),
+}).strict();
+export type FlowDeadlineNodeAskOutput = z.infer<typeof flowDeadlineNodeAskOutput>;
+
+/** `flow.deadline` node `lapse` — what the subprocess produces (grammar 8.2). */
+export const flowDeadlineNodeLapseOutput = z.object({
+  decision: z.string(),
+}).strict();
+export type FlowDeadlineNodeLapseOutput = z.infer<typeof flowDeadlineNodeLapseOutput>;
 
 /** `flow.direct` — the module's parameters (grammar 7.5). */
 export const flowDirectInputs = z.object({
@@ -149,6 +197,20 @@ export const flowEscalationNodeAskOutput = z.object({
   decision: z.enum(["approve", "reject"]),
 }).strict();
 export type FlowEscalationNodeAskOutput = z.infer<typeof flowEscalationNodeAskOutput>;
+
+/** `flow.impatient` — the module's parameters (grammar 7.5). */
+export const flowImpatientInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowImpatientInputs = z.infer<typeof flowImpatientInputs>;
+
+/**
+ * `flow.impatient` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowImpatientOutputs = z.object({
+  approval: z.string(),
+}).strict();
+export type FlowImpatientOutputs = z.infer<typeof flowImpatientOutputs>;
 
 /** `flow.release` — the module's parameters (grammar 7.5). */
 export const flowReleaseInputs = z.object({

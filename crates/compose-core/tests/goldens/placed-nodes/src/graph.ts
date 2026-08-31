@@ -23,12 +23,17 @@ import {
   agentBrieferOutput,
   agentEscalatorOutput,
   agentSignerOutput,
+  flowAbandonedInputs,
   flowBatchInputs,
   flowConversationInputs,
+  flowDeadlineInputs,
+  flowDeadlineNodeAskOutput,
+  flowDeadlineNodeLapseOutput,
   flowDirectInputs,
   flowEscalatedInputs,
   flowEscalationInputs,
   flowEscalationNodeAskOutput,
+  flowImpatientInputs,
   flowReleaseInputs,
   flowRetriedInputs,
   flowSignedOffInputs,
@@ -57,6 +62,22 @@ const stateShape: runtime.Shape = {
     },
     "ticket": "string",
   },
+};
+
+/** `flow.abandoned` — the `input` root inside it (grammar 7.5). */
+const flowAbandonedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.abandoned` node `escalate` — the `escalate.output` root its guards read.
+ */
+const flowAbandonedNodeEscalateShape: runtime.Shape = {
+  "properties": {
+    "approval": "string"
+  }
 };
 
 /** `flow.batch` — the `input` root inside it (grammar 7.5). */
@@ -88,6 +109,27 @@ const flowConversationNodeBriefShape: runtime.Shape = {
 const flowConversationNodeSignShape: runtime.Shape = {
   "properties": {
     "signature": "string"
+  }
+};
+
+/** `flow.deadline` — the `input` root inside it (grammar 7.5). */
+const flowDeadlineShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/** `flow.deadline` node `ask` — the `ask.output` root its guards read. */
+const flowDeadlineNodeAskShape: runtime.Shape = {
+  "properties": {
+    "decision": "string"
+  }
+};
+
+/** `flow.deadline` node `lapse` — the `lapse.output` root its guards read. */
+const flowDeadlineNodeLapseShape: runtime.Shape = {
+  "properties": {
+    "decision": "string"
   }
 };
 
@@ -132,6 +174,22 @@ const flowEscalationShape: runtime.Shape = {
 const flowEscalationNodeAskShape: runtime.Shape = {
   "properties": {
     "decision": "string"
+  }
+};
+
+/** `flow.impatient` — the `input` root inside it (grammar 7.5). */
+const flowImpatientShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.impatient` node `escalate` — the `escalate.output` root its guards read.
+ */
+const flowImpatientNodeEscalateShape: runtime.Shape = {
+  "properties": {
+    "approval": "string"
   }
 };
 
@@ -346,6 +404,31 @@ const agentEscalator: runtime.AgentBinding = {
           call,
         ),
     },
+    {
+      name: "deadline",
+      address: "flow.deadline",
+      description: "Ask a person whether a release may go ahead, before a deadline.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context, call) =>
+        runtime.callSubflowTool(
+          { name: "deadline", binding: flowDeadlineBinding, inputs: flowDeadlineInputs },
+          args,
+          context,
+          call,
+        ),
+    },
   ],
   maxToolIterations: 8,
 };
@@ -399,6 +482,85 @@ const agentSigner: runtime.AgentBinding = {
     },
   ],
   maxToolIterations: 8,
+};
+
+// --- flow.abandoned ---
+
+/** `flow.abandoned` node `escalate` — `agent.escalator` (grammar 8.1). */
+const flowAbandonedNodeEscalate: runtime.NodeDescriptor = {
+  flow: "flow.abandoned",
+  node: "escalate",
+  // Grammar 9.3, resolved: `retry` from the node, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    retry: {
+      max: 2,
+      backoffMs: 1,
+      multiplier: 2,
+      jitter: true,
+    },
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowAbandonedShape, state: stateShape, output: flowAbandonedNodeEscalateShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.abandoned.escalate",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "escalate"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentEscalatorOutput, answer.output, "the answer of `agent.escalator`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "approval", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.abandoned` — its nodes, its `start` edges, and the compiled graph. */
+function flowAbandoned() {
+  return new StateGraph(State)
+    .addNode("escalate", (state: GraphState) => runtime.runNode(flowAbandonedNodeEscalate, state), {
+      ends: [END],
+    })
+    .addEdge(START, "escalate")
+    .compile();
+}
+
+/**
+ * `flow.abandoned`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowAbandonedGraph = flowAbandoned();
+
+/**
+ * `flow.abandoned` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowAbandonedBinding: runtime.SubflowBinding = {
+  address: "flow.abandoned",
+  outputs: ["approval"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowAbandonedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowAbandonedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
 // --- flow.batch ---
@@ -606,6 +768,125 @@ const flowConversationBinding: runtime.SubflowBinding = {
       ...options,
       streamMode: "values",
       outputKeys: flowConversationGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.deadline ---
+
+/**
+ * `flow.deadline` node `ask` — the pause it holds: what the human is shown, and what an answer has to fit (grammar 8.7, PRD 5.11).
+ */
+const flowDeadlineNodeAskHuman: runtime.HumanDescriptor = {
+  flow: "flow.deadline",
+  node: "ask",
+  timeoutMs: 2000,
+  onTimeout: "lapse",
+  schema: {
+    "additionalProperties": false,
+    "properties": {
+      "decision": {
+        "enum": [
+          "approve",
+          "reject"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "decision"
+    ],
+    "type": "object"
+  },
+  parse: (payload) => runtime.parseResult(flowDeadlineNodeAskOutput, payload, "the answer to `flow.deadline` node `ask`"),
+};
+
+/** `flow.deadline` node `ask` — a human-in-the-loop pause (grammar 8.7). */
+const flowDeadlineNodeAsk: runtime.NodeDescriptor = {
+  flow: "flow.deadline",
+  node: "ask",
+  // Grammar 9.3, resolved: `retry` from exempt (Decision D102), `timeout` from exempt (Decision D102), `on_error` from `defaults:`.
+  policy: {
+    onError: "fail",
+  },
+  exempt: true,
+  shapes: { input: flowDeadlineShape, state: stateShape, output: flowDeadlineNodeAskShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runHuman(flowDeadlineNodeAskHuman, input, context, view),
+  writes: [
+    { field: "decision", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.deadline` node `lapse` — an inline subprocess (grammar 8.2). */
+const flowDeadlineNodeLapse: runtime.NodeDescriptor = {
+  flow: "flow.deadline",
+  node: "lapse",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowDeadlineShape, state: stateShape, output: flowDeadlineNodeLapseShape },
+  input: () => ({}),
+  run: async (input, context) => ({
+    output: runtime.parseResult(
+      flowDeadlineNodeLapseOutput,
+      await runtime.runExec({
+        command: [{ env: "OPS_BIN", site: "flow.deadline.node.lapse.exec.command" }, "/echo"],
+        args: [
+          ["{\"decision\":\"nobody answered in time\"}"],
+        ],
+        env: [],
+        expectExit: [0],
+        decoding: { envelope: [], decoded: ["decision"], empty: false },
+      }, input, context),
+      "the result of `flow.deadline` node `lapse`",
+    ),
+  }),
+  writes: [
+    { field: "decision", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.deadline` — its nodes, its `start` edges, and the compiled graph. */
+function flowDeadline() {
+  return new StateGraph(State)
+    .addNode("ask", (state: GraphState) => runtime.runNode(flowDeadlineNodeAsk, state), {
+      ends: [END, "lapse"],
+    })
+    .addNode("lapse", (state: GraphState) => runtime.runNode(flowDeadlineNodeLapse, state), {
+      ends: [END],
+    })
+    .addEdge(START, "ask")
+    .compile();
+}
+
+/**
+ * `flow.deadline`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowDeadlineGraph = flowDeadline();
+
+/**
+ * `flow.deadline` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowDeadlineBinding: runtime.SubflowBinding = {
+  address: "flow.deadline",
+  outputs: ["approval"],
+  recursionLimit: 27,
+  stream: (initial, options) =>
+    flowDeadlineGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowDeadlineGraph.outputChannels,
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
@@ -830,6 +1111,79 @@ const flowEscalationBinding: runtime.SubflowBinding = {
       ...options,
       streamMode: "values",
       outputKeys: flowEscalationGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.impatient ---
+
+/** `flow.impatient` node `escalate` — `agent.escalator` (grammar 8.1). */
+const flowImpatientNodeEscalate: runtime.NodeDescriptor = {
+  flow: "flow.impatient",
+  node: "escalate",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the node, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 15000,
+    onError: "fail",
+  },
+  shapes: { input: flowImpatientShape, state: stateShape, output: flowImpatientNodeEscalateShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.impatient.escalate",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "escalate"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentEscalatorOutput, answer.output, "the answer of `agent.escalator`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "approval", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.impatient` — its nodes, its `start` edges, and the compiled graph. */
+function flowImpatient() {
+  return new StateGraph(State)
+    .addNode("escalate", (state: GraphState) => runtime.runNode(flowImpatientNodeEscalate, state), {
+      ends: [END],
+    })
+    .addEdge(START, "escalate")
+    .compile();
+}
+
+/**
+ * `flow.impatient`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowImpatientGraph = flowImpatient();
+
+/**
+ * `flow.impatient` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowImpatientBinding: runtime.SubflowBinding = {
+  address: "flow.impatient",
+  outputs: ["approval"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowImpatientGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowImpatientGraph.outputChannels,
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
@@ -1283,6 +1637,22 @@ export interface CompiledFlow {
  * flow rather than every triggered one.
  */
 export const flows: Readonly<Record<string, CompiledFlow>> = {
+  "flow.abandoned": {
+    address: "flow.abandoned",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["approval"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowAbandonedInputs, inputs, "the `inputs:` of `flow.abandoned`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowAbandonedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowAbandonedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.batch": {
     address: "flow.batch",
     inputs: ["paths"],
@@ -1313,6 +1683,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowConversationGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.deadline": {
+    address: "flow.deadline",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["approval"],
+    sessionStores: [],
+    recursionLimit: 27,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowDeadlineInputs, inputs, "the `inputs:` of `flow.deadline`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowDeadlineGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowDeadlineGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.direct": {
@@ -1361,6 +1747,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowEscalationGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.impatient": {
+    address: "flow.impatient",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["approval"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowImpatientInputs, inputs, "the `inputs:` of `flow.impatient`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowImpatientGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowImpatientGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
   "flow.release": {
@@ -1837,6 +2239,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
         toolDispatches: answer.toolDispatches,
       };
     },
+  "flow.abandoned.escalate":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentEscalator,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
   "flow.conversation.sign":
     async (input, context, site) => {
       const answer = await runtime.callAgent(
@@ -1856,6 +2274,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
   "flow.direct.sign":
     async (input, context) => ({ output: await toolSign(input, context) }),
   "flow.escalated.escalate":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentEscalator,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
+  "flow.impatient.escalate":
     async (input, context, site) => {
       const answer = await runtime.callAgent(
         agentEscalator,
@@ -1920,3 +2354,18 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
       };
     },
 };
+
+/**
+ * Every `human:` node this composition declares, by `<flow address>.<node id>`.
+ *
+ * Read by the hub alone, and for one thing: a pause a **worker** opened settles
+ * its dispatch paused (`docs/distributed.md` §3.4), and the hub plants the wait
+ * on its own board under the identity the worker derived. What an answer is held
+ * to, and what a status route publishes as the contract, are then this node's own
+ * — the artifact is everywhere (§4.3), so the descriptor never travels.
+ */
+runtime.registerHumanNodes({
+  "flow.deadline.ask": flowDeadlineNodeAskHuman,
+  "flow.escalation.ask": flowEscalationNodeAskHuman,
+  "flow.signed_off.approve": flowSignedOffNodeApproveHuman,
+});

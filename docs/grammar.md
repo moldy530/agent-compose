@@ -2707,6 +2707,31 @@ agent's `tools:`:
   pause with nothing to deliver an answer to (§8.6 rule 7, Decision
   [D118](#d118-a-detached-dispatch-reaches-no-human-node)).
 
+A **placed** component may reach one, and it is not a third entry on that list:
+"the signing machine pauses for approval" is a shape a mesh is for, since the
+machine holding the capability is where an approval-gated node belongs. Nothing
+about the node changes — §14.1 rule 4 runs everything an attached `flow.*`
+reaches in the attaching agent's placement, so the question is *asked* on a
+worker, and the wait it opens comes home: the dispatch settles **paused**, the
+hub plants the wait on its own board under the identity §9.4 gives it, and the
+two surfaces above answer it exactly as they answer any other pause (PRD resolved
+q46, `docs/distributed.md` §3.4). The answer sends the node back through
+dispatch, so the timeout, the `on_error:` chain, the status shape and the
+lifecycle webhook are the single-process ones reached over the wire.
+
+What the wire does add is an **interval**, and it is the one place the two are
+not the same. A wait holds the dispatching node's `timeout:` still while the
+question is open
+([D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)), and
+settling it starts that budget running again — so the redispatch that carries the
+answer, or the expiry, queues inside what is left of it (§9.2,
+`docs/distributed.md` §6.5). A placed node that spends its budget waiting for a
+worker to take that redispatch fails on the budget, and neither the answer nor
+this block's own `on_timeout:` route is reached, where the same node unplaced
+would have routed in the instant the wait settled. It is the placed shape of a
+`timeout:` that bounds waiting for a machine rather than a second rule about
+waits, and it is worth knowing when the two budgets are written on one node.
+
 ### 8.8 `store`
 
 Deterministic, graph-invoked store operation — the second consumption surface of
@@ -3299,6 +3324,12 @@ position, so it accepts `provider.*` and nothing else (§2.3).
 - An alias referenced by a store but undefined in the active target is a compile
   error naming the target. `local` is exempt for the reason above: it resolves no
   aliases, so it cannot fail to find one (§14).
+- **Which backend a store resolves to decides whether a mesh may reach it.** A
+  backend the reaching process opens for itself — `memory`, `sqlite`,
+  `sqlite_vec`, `local_fs` — is one store per process, so §14.1 rule 5 refuses it
+  wherever a component that can execute in a placement's process binds it. The
+  rule is stated there because it is about placements; it is named here because
+  this is the line that decides which backend a store has.
 - `scope: session` requires the execution to have a session identity, and that
   identity comes from the trigger. The check quantifies over **declared**
   triggers (§13): a declared `http`, `schedule`, or `event` trigger whose target
@@ -4327,9 +4358,10 @@ placements:
     members: [agent.embedder]
 ```
 
-**Four rules, each a compile error, and they are numbered because other
-documents cite them by number** (Decision
-[D129](#d129-placement-members-are-agents-and-tools-disjoint-and-colocated-with-what-attaches-them)):
+**Five rules, each a compile error, and they are numbered because other
+documents cite them by number** (Decisions
+[D129](#d129-placement-members-are-agents-and-tools-disjoint-and-colocated-with-what-attaches-them),
+[D131](#d131-a-process-local-store-is-refused-where-a-placement-can-open-it)):
 
 1. **`members:` is required and non-empty**, and names each component **once**.
    A placement with no members is a claim nothing is ever dispatched under; a
@@ -4370,11 +4402,48 @@ documents cite them by number** (Decision
    A placed component's own placement governs it wherever it is reached without
    an attaching agent: a `function:` node (§8.4), an `agent:` node, or a flow
    instantiated by a `flow:` node (§8.5), all of which the hub schedules.
+5. **A store on a process-local backend is refused where a placement can open
+   it.** A store whose backend resolves (§11.3) to one the reaching process
+   **opens for itself** — `memory`, `sqlite`, `sqlite_vec`, `local_fs` — is a
+   compile error wherever a component that can execute in a placement's process
+   binds it: an agent's `stores:` (§11.5), or a `store:` node (§11.4) of a flow
+   that runs there. There is no server in the middle of such a store — the bytes
+   are a heap map, a SQLite file, a directory — and a mesh runs a placed
+   component in **more than one process by design**: several workers may claim
+   one placement, and the hub dispatches whatever else in the composition
+   reaches the same store. Each opens its own copy, so a write on one side is
+   never a read on another and the flow carries on with data that is not there.
+
+   *"Can execute in a placement's process" is rule 4's closure, not `members:`*:
+   a member, plus an attached `tool.*` and every `agent.*` and `tool.*` an
+   attached `flow.*` reaches. It is the same set the per-placement environment
+   manifest is computed over
+   ([`docs/distributed.md`](distributed.md) §9.1), and the compiler shares that
+   walk rather than deriving it twice.
+
+   *It refuses at every `scope:`*, because an execution spans processes the
+   moment one of its nodes is dispatched to a worker — and under every target
+   whose deploy layer declares `placements:`, `--target local` included, where
+   `local` substitutes local storage for every store and a hub and its workers
+   are still separate processes. A target that declares no placement is one
+   process and is untouched, and so is a store only the hub ever opens.
+
+   *The repair the design carries* is a **networked** backend (§14.3) — `redis`,
+   `postgres`, `chroma`, `pgvector`, `qdrant`, `s3`, `gcs` — whose variables
+   §9.1's partition already routes to every placement that reaches a store bound
+   to it. Under `local` there is no such edit, since that target admits no
+   `storage_backends:` at all, so a `local` mesh that has to share a store is a
+   target of its own (PRD resolved q45). *The repair this release runs* is the
+   other one: take the component that binds the store out of `placements:`, so
+   only the hub opens it. Both are named in the diagnostic, in that order,
+   because a compiler release opens only the process-local backends — a
+   networked one compiles and refuses at the first store op, since production
+   `storage_backends` land behind the store plugin interface in M3 (PRD §7).
 
 And one thing that is **not** a rule, because it is what happens when no rule
 applies: **a component in no placement executes on the hub.** That is the
 default and is never a diagnostic — `placements:` names the exceptions — which
-is why the numbered list above stops at four.
+is why the numbered list above stops at five.
 
 `--target local` needs no placement at all, and admits them: a `local` target
 with placements is the hub and its workers on one machine, which is how a mesh
@@ -7134,7 +7203,12 @@ reaches an `exec:` tool's child. That would have traded one orphan for another,
 so the runtime closes it directly — while a command is running, `SIGINT` and
 `SIGTERM` sweep the live groups and are then re-raised, leaving the exit
 behaviour, the exit status and `serve`'s own shutdown exactly as they were. The
-handlers exist only for as long as a command does.
+handlers exist only for as long as a command does, and they are installed
+**before the shell is forked**: until a stop signal has a handler it has the
+kernel's default disposition, so one arriving in the instant between a fork and
+the runtime's own registration of it would end the graph and leave that group
+running — the orphan this decision is about, reached at the one moment it is
+easiest to reach.
 
 **What is still out of reach**, and is said rather than implied: a process that
 *left* the group on purpose — `setsid`, a shell that turned job control on
@@ -7498,6 +7572,75 @@ resolved q41 exists to forbid that. Per-placement credentials are an additive
 later hardening. Saying so in the grammar is the same discipline §13.3 applies to
 a constant-time comparison: a security property a reader could assume wrongly is
 worse than one they have to look up. *PRD 5.10, resolved q37, q38, q41, q44.*
+
+### D131. A process-local store is refused where a placement can open it
+
+A `store.*` whose backend resolves to `memory`, `sqlite`, `sqlite_vec` or
+`local_fs` is a compile error when any component that can execute in a
+placement's process binds it — through an agent's `stores:` or a flow's `store:`
+node. The refusal applies at every `scope:` and under every target that declares
+`placements:`, `--target local` included. A target with no placements, and a
+store only the hub ever opens, are untouched. The code is
+`process-local-store`.
+
+**Rationale**, one clause at a time.
+
+*Why a rule at all.* Such a backend has no server in the middle: the process
+that reaches the store opens the bytes, so two processes reaching one address
+hold two stores. A mesh runs a placed component in more than one process **by
+design** — several workers may claim one placement (PRD resolved q38's pools),
+and the hub dispatches whatever else in the composition reaches the same store —
+so the pairing forks state silently. The worker writes into its copy under its
+data directory, the hub reads the one beside the built project, the read comes
+back empty, and the flow carries on. Nothing throws, nothing is logged, and no
+runtime check can tell the empty read from a key that was never written. PRD
+resolved q45 fixes it as a `validate` refusal on exactly that ground: a mesh
+with silently forked state is the class of bug this compiler exists to make
+unwritable.
+
+*Why the criterion is the backend and not a keyword list.* What matters is
+whether the store is **opened in-process**, which is a property of the storage
+provider (§14.3) rather than of a store's declaration or a target's name. The
+four above are that set today; a provider added later is classified by the same
+question, and a networked one — `redis`, `postgres`, `chroma`, `pgvector`,
+`qdrant`, `s3`, `gcs` — is a connection to something outside every process that
+dials it, which is what makes two processes two readers of one store.
+
+*Why execution rather than membership.* The rule reads exactly the closure rule 4
+reads, and for the same reason: the whole artifact reaches every worker (PRD
+resolved q40), so a placement decides which *process* runs a node. An unplaced
+agent binding the store is refused when a placed agent attaches the flow that
+reaches it, because that agent's store op happens inside the placed agent's tool
+loop. A rule written over `members:` would miss precisely that case, and the
+per-placement environment manifest already computes the same closure
+([`docs/distributed.md`](distributed.md) §9.1) — so the compiler **shares** that
+walk. Two derivations of one closure would agree on the day they were written and
+disagree later, which is the failure the partition itself exists to prevent.
+
+*Why every scope.* `scope: execution` looks like the exemption and is not: an
+execution spans processes the moment one of its nodes is dispatched to a worker,
+so an execution-scoped store forks exactly as a global one does, one node later.
+Scope fixes a store's *lifetime*, and nothing about a lifetime makes two file
+handles one store.
+
+*Why `--target local` too.* `local` is the target where a mesh is developed —
+§14 admits `hub:` and `placements:` under it, which is a hub and its workers on
+one machine — and those are still separate processes with separate data
+directories. Exempting `local` would make the failure appear only in the
+deployment that has the least room to debug it, which inverts what the zero-infra
+guarantee is for. It also makes the diagnostic's repair target-dependent: under a
+named target the fix is one line of `storage_backends:`, and under `local` there
+is no such line, so the message says the fix is a target of its own rather than
+naming a key `local` refuses (D87).
+
+*Why not a runtime refusal instead.* A build could emit a store binding that
+throws on a worker, and that is the shape §13 of `docs/distributed.md` recorded
+while the question was open. It costs an author the same edit and finds it later,
+in a deployment rather than in an editor; and it cannot be complete, because the
+hub's own copy of the store works perfectly — the failure is only ever visible as
+a read that comes back empty. A static rule is decidable from the two files and
+says so before anything runs (PRD G3). *PRD 5.8, 5.10, resolved q38, q40, q41,
+q45.*
 
 ---
 

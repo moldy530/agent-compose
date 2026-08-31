@@ -387,7 +387,7 @@ fn accepted(hash: &str, session: &str) -> Reply {
     Reply::json(
         200,
         &json!({
-            "protocol": 1,
+            "protocol": compose_core::codegen::mesh::PROTOCOL_VERSION,
             "compiler": compose_core::codegen::COMPILER_VERSION,
             "worker_session": session,
             "artifact": { "hash": hash, "url": format!("/workers/artifact/{hash}") },
@@ -637,7 +637,11 @@ fn a_cold_start_joins_twice_and_only_the_second_join_carries_a_report() {
         "a join is a `POST` (§3): {joins:#?}"
     );
     let first = &joins[0].body;
-    assert_eq!(first["protocol"], 1, "{first:#}");
+    assert_eq!(
+        first["protocol"],
+        compose_core::codegen::mesh::PROTOCOL_VERSION,
+        "{first:#}"
+    );
     assert_eq!(
         first["compiler"],
         compose_core::codegen::COMPILER_VERSION,
@@ -789,8 +793,8 @@ fn every_join_refusal_stops_the_worker_after_exactly_one_join() {
         (401u16, json!(null), "401"),
         (
             409,
-            json!({ "protocol": 2, "worker_protocol": 1, "error": "this hub speaks protocol 2 and the worker speaks 1" }),
-            "protocol 2",
+            json!({ "protocol": 99, "worker_protocol": 1, "error": "this hub speaks protocol 99 and the worker speaks 1" }),
+            "protocol 99",
         ),
         (
             409,
@@ -1421,6 +1425,175 @@ fn an_effect_batch_refused_outside_its_table_fails_the_dispatch_and_keeps_the_wo
         worker.running(),
         "one refused effect batch ended the worker, so the placement has none: {}",
         worker.transcript()
+    );
+}
+
+/// A node runner that stops at a question, and goes on past one it has been
+/// answered (`docs/distributed.md` §3.4, §7.2).
+///
+/// The whole of what `src/worker-node.ts` does about a `human:` node, in the
+/// least of it a test about this route needs: with no answered pause in
+/// `effect_history` it writes a **paused** result line; with one, it writes an
+/// ordinary result carrying what the person said. What is under test here is the
+/// **worker's** half — that it posts the line as §3.4's third ending and goes on
+/// polling — so the runner is the fixture and the worker is real.
+const PAUSING_RUNNER: &str = r#"// A pausing node runner for `tests/distributed_worker_protocol.rs`.
+let held = "";
+for await (const chunk of process.stdin) held += chunk;
+const dispatch = JSON.parse(held);
+const line = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+const site = `${dispatch.instance_path}/ask/0`;
+const answered = (dispatch.effect_history ?? []).find(
+  (record) => record.key === `${site}#human/0`,
+);
+if (answered === undefined) {
+  line({
+    type: "result",
+    paused: {
+      wait: site,
+      flow: "flow.escalation",
+      node: "ask",
+      shown: { path: "release.dmg" },
+      paused_at: "2026-08-31T09:14:02.113Z",
+      expires_at: "2026-09-01T09:14:02.113Z",
+      effect: { key: `${site}#human/0`, site, ordinal: 0, request: '{"node":"ask"}' },
+    },
+  });
+} else {
+  line({ type: "result", output: { decision: answered.outcome.value.output.decision } });
+}
+"#;
+
+/// An artifact whose node runner is [`PAUSING_RUNNER`].
+fn pausing_artifact() -> (String, Vec<u8>) {
+    let files: Vec<(&str, &[u8])> = vec![
+        ("manifest.json", MANIFEST.as_bytes()),
+        ("runner.ts", PAUSING_RUNNER.as_bytes()),
+        (
+            "package.json",
+            b"{ \"name\": \"fixture-pausing\", \"private\": true }\n",
+        ),
+    ];
+    let hash = compose_core::codegen::artifact::hash_of(files.iter().copied());
+    let mut blocks = Vec::new();
+    for (path, bytes) in &files {
+        blocks.extend(tar_entry(path, bytes));
+    }
+    blocks.extend(std::iter::repeat_n(0u8, 1024));
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&blocks).expect("the encoder takes it");
+    (hash, encoder.finish().expect("the encoder finishes"))
+}
+
+/// A runner that stops at a pause settles its dispatch **paused**, and the
+/// worker goes on polling (§3.4, PRD resolved q46).
+///
+/// The third ending needs no rule of its own on this side, and that is the
+/// property under test: a paused line is one more shape of the result line, so it
+/// is posted to `/workers/result` under §3.4's own statuses and the worker is
+/// free the moment the hub takes it. A worker that had *held* the pause instead
+/// would stop polling, and §6.3 would declare it gone inside a liveness window
+/// while a person was still reading the question.
+///
+/// The second dispatch is the redispatch a resume makes, carrying the answered
+/// pause in its `effect_history` (§7.2): the runner consumes it and answers, and
+/// the worker posts that result on the same session. What that proves about the
+/// worker is that it neither remembered the pause nor treated the settlement as
+/// the end of its own life.
+#[test]
+fn a_runner_that_pauses_settles_its_dispatch_paused_and_the_worker_keeps_polling() {
+    let hub = FixtureHub::start();
+    let (hash, tarball) = pausing_artifact();
+    hub.always("/workers/join", accepted(&hash, "wrk_ready"));
+    hub.always("/workers/artifact", Reply::bytes(200, tarball));
+    hub.script("/workers/poll", dispatch("dsp_asking"));
+    hub.script("/workers/poll", Reply::empty(204));
+    hub.script(
+        "/workers/poll",
+        Reply::json(
+            200,
+            &json!({
+                "dispatch_id": "dsp_answered",
+                "execution_id": "exec_fixture",
+                "node": "flow.release.sign",
+                "instance_path": "sign/0",
+                "inputs": { "path": "release.dmg" },
+                "effect_history": [{
+                    "key": "sign/0/ask/0#human/0",
+                    "site": "sign/0/ask/0",
+                    "kind": "human",
+                    "ordinal": 0,
+                    "request": "{\"node\":\"ask\"}",
+                    "outcome": {
+                        "kind": "value",
+                        "value": {
+                            "pausedAt": "2026-08-31T09:14:02.113Z",
+                            "settled": "resumed",
+                            "settledAt": "2026-08-31T09:20:00.000Z",
+                            "output": { "decision": "approve" },
+                        },
+                    },
+                    "refused": false,
+                    "recorded_at": "2026-08-31T09:20:00.000Z",
+                }],
+            }),
+        ),
+    );
+    hub.always("/workers/poll", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let worker = Worker::start(&hub, "pausing-runner");
+    hub.until("settled both dispatches", |asked| {
+        asked
+            .iter()
+            .filter(|request| request.path == "/workers/result")
+            .count()
+            >= 2
+    });
+
+    let results = hub.asked_at("/workers/result");
+    let paused = &results[0].body;
+    assert_eq!(paused["dispatch_id"], "dsp_asking", "{paused:#}");
+    assert!(
+        paused.get("output").is_none() && paused.get("error").is_none(),
+        "a paused result carries a pause and neither of the other two endings: {paused:#}"
+    );
+    assert_eq!(paused["paused"]["wait"], "sign/0/ask/0", "{paused:#}");
+    assert_eq!(paused["paused"]["flow"], "flow.escalation", "{paused:#}");
+    assert_eq!(paused["paused"]["node"], "ask", "{paused:#}");
+    assert_eq!(
+        paused["paused"]["effect"]["key"], "sign/0/ask/0#human/0",
+        "the pause does not name the record its answer is journaled under: {paused:#}"
+    );
+    // Both instants travel, and unchanged: §3.4 makes `expires_at` OPTIONAL —
+    // present exactly when the node declares `timeout:` — and this worker
+    // neither drops it nor re-takes it from its own clock. What a hub does with
+    // it is a reader's business (`docs/durability.md` §9): the budget it arms is
+    // the node's own, and this is the field a status route publishes.
+    assert_eq!(
+        paused["paused"]["paused_at"], "2026-08-31T09:14:02.113Z",
+        "{paused:#}"
+    );
+    assert_eq!(
+        paused["paused"]["expires_at"], "2026-09-01T09:14:02.113Z",
+        "the wait's budget did not reach the hub, so nothing there could publish when the \
+         question stops being answerable: {paused:#}"
+    );
+
+    // …and the worker kept polling: the second dispatch reached it on the same
+    // session, which it could not have if it had gone quiet holding a question.
+    let answered = &results[1].body;
+    assert_eq!(answered["dispatch_id"], "dsp_answered", "{answered:#}");
+    assert_eq!(
+        answered["output"],
+        json!({ "decision": "approve" }),
+        "the redispatch did not replay past the answered pause; the worker said:\n{}",
+        worker.transcript()
+    );
+    assert_eq!(
+        results[0].session.as_deref(),
+        results[1].session.as_deref(),
+        "the worker re-joined between the pause and the redispatch, which no status asked it to"
     );
 }
 

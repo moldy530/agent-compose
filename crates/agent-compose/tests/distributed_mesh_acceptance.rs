@@ -1,5 +1,5 @@
 //! A mesh, end to end, in the processes it really runs in
-//! (`docs/distributed.md`, PRD resolved q37–q44).
+//! (`docs/distributed.md`, PRD resolved q37–q46).
 //!
 //! Every test here starts a **hub** — `agent-compose serve` over the
 //! `placed-nodes` fixture, resolved for its `mesh` target — and one or more
@@ -64,6 +64,10 @@ use std::time::{Duration, Instant};
 
 use mock_provider::{Client, MockProvider, Outcome, Request, Response, Script, ToolCall};
 use serde_json::{Value, json};
+
+/// The wire version this build's hub speaks (§10), read off the compiler rather
+/// than written out — see `tests/distributed_hub_wire.rs`'s own copy.
+const PROTOCOL: u32 = compose_core::codegen::mesh::PROTOCOL_VERSION;
 
 /// The credential every worker in this file presents.
 const TOKEN: &str = "a-join-token-nobody-else-has";
@@ -213,6 +217,36 @@ impl Mesh {
         panic!("`{execution}` never {what}; its last report was {last:#}");
     }
 
+    /// Wait until this execution is holding a pause, and answer that pause.
+    ///
+    /// The **hub's** report is what is read, and that is the assertion as much
+    /// as the wait: a pause a worker opened is published exactly where a local
+    /// one is (`docs/distributed.md` §3.4, PRD resolved q46).
+    fn paused(&self, execution: &str) -> Value {
+        let report = self.until(execution, "opened a pause", |report| {
+            report["interrupts"]
+                .as_array()
+                .is_some_and(|waits| !waits.is_empty())
+                || report["status"] == "failed"
+        });
+        assert_eq!(
+            report["status"], "interrupted",
+            "a pause a worker opened did not reach the hub's board: {report:#}"
+        );
+        report["interrupts"][0].clone()
+    }
+
+    /// Answer one pause through the surface a local pause is answered through.
+    fn resume(&self, execution: &str, wait: &str, payload: &Value) -> Response {
+        self.send(
+            Request::post(format!(
+                "/executions/{execution}/resume?wait={}",
+                urlencoded(wait)
+            ))
+            .json(payload),
+        )
+    }
+
     /// Wait until this execution has completed, and answer its outputs.
     fn completed(&self, execution: &str) -> Value {
         let report = self.until(execution, "completed", |report| {
@@ -232,7 +266,7 @@ impl Mesh {
             Request::post("/workers/join")
                 .header("authorization", format!("Bearer {TOKEN}"))
                 .json(&json!({
-                    "protocol": 1,
+                    "protocol": PROTOCOL,
                     "compiler": compose_core::codegen::COMPILER_VERSION,
                     "runtime": "bun 1.2.3",
                     "claims": [PLACEMENT],
@@ -253,7 +287,7 @@ impl Mesh {
             Request::post("/workers/join")
                 .header("authorization", format!("Bearer {TOKEN}"))
                 .json(&json!({
-                    "protocol": 1,
+                    "protocol": PROTOCOL,
                     "compiler": compose_core::codegen::COMPILER_VERSION,
                     "runtime": "bun 1.2.3",
                     "claims": [PLACEMENT],
@@ -452,6 +486,16 @@ fn manifest_of(placement: &str) -> Vec<String> {
     .names()
     .map(str::to_string)
     .collect()
+}
+
+/// One wait id, as a query value spells it.
+///
+/// A wait id is `<instance path>/<ordinal>` and every component is an identifier
+/// or a decimal (grammar §9.4), so the slashes are the whole of the escaping —
+/// but they are escaped rather than assumed, because the id under test is
+/// derived on a worker and this test should fail on what it is asserting.
+fn urlencoded(wait: &str) -> String {
+    wait.replace('/', "%2F")
 }
 
 /// A response body, for a failure message.
@@ -1150,85 +1194,657 @@ fn a_fan_out_onto_a_one_worker_placement_runs_one_item_at_a_time() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. The pause a worker cannot hold (§13's fourth row)
+// 8. A placed pause comes home (§3.4, PRD resolved q46)
 // ---------------------------------------------------------------------------
 
-/// A `human:` node a **placed** component reaches fails its dispatch, by name.
+/// The three model calls `agent.escalator` makes across a pause: the loop's
+/// request for the attached flow, the loop's answer once a person has decided,
+/// and the pinned structured output that ends the node.
 ///
-/// The wait board is the hub's: it is what a status report publishes, what the
-/// resume route answers and what a recovery re-parks (§1, PRD resolved q4/q28).
-/// A worker holds none of it — and grammar §14.1 rule 4 puts everything an
-/// attached `flow.*` reaches in the attaching agent's placement, so
-/// `agent.escalator`'s `flow.escalation` asks its question on the worker.
-/// §3.4 gives a result an output or a failure and no third shape for a pause, so
-/// carrying one home is `docs/distributed.md` §13's fourth row and is not built.
+/// **The first is made before the pause and the other two after it**, on two
+/// dispatches of one node — which is what makes the count in each test below an
+/// assertion about replay rather than a tally: a redispatch that re-issued the
+/// pre-pause call would make four requests out of a three-script queue.
+fn escalating(approval: &str) -> Vec<Script> {
+    vec![
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "escalation",
+                json!({ "path": "release.dmg" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("the person decided")),
+        Script::new(SONNET, Outcome::structured(json!({ "approval": approval }))),
+    ]
+}
+
+/// The pause `flow.escalation`'s `ask` node opens, as a hub-side wait would
+/// publish it — asserted field by field, because parity is the acceptance bar.
 ///
-/// What **is** built is the diagnosis, and that is what this asserts: the run
-/// fails, and what reaches the operator is a `PlacedHumanWait` saying a worker
-/// holds no wait board and naming the way out — rather than the bare
-/// `HumanInterrupt` a single-process run raises, whose text points at `serve`'s
-/// resume route and at an interactive `run`, neither of which is true here.
+/// PRD resolved q46: "a placed `human:` node must mean what the same node
+/// unplaced means: timeout/retry/on_error semantics, status visibility,
+/// lifecycle webhooks and the resume surface are the single-process ones,
+/// reached over the wire". The status shape is the half a test can read
+/// directly, and every key here is `src/serve.ts`'s `question()` — the one
+/// function both kinds of pause are published through, which is why the schema
+/// and the resume URL are the node's own rather than something that travelled.
+fn assert_is_the_pause_the_composition_declares(wait: &Value, execution: &str) {
+    let id = wait["wait_id"].as_str().unwrap_or_default();
+    assert!(
+        id.ends_with("/ask/0"),
+        "the wait is not addressed by the identity grammar §9.4 gives the `ask` node: {wait:#}"
+    );
+    assert!(
+        id.starts_with("escalate/0/"),
+        "the wait's identity is not derived under the placed node's own instance path, so a \
+         resume prepared against one generation would not find it in the next \
+         (docs/distributed.md §6.1): {wait:#}"
+    );
+    assert_eq!(wait["flow"], "flow.escalation", "{wait:#}");
+    assert_eq!(wait["node"], "ask", "{wait:#}");
+    assert_eq!(
+        wait["input"],
+        json!({ "path": "release.dmg" }),
+        "the pause does not show what the node's `input:` evaluated to: {wait:#}"
+    );
+    // The composition's own contract, read off the hub's copy of the descriptor
+    // rather than off anything the wire carried (§4.3): the artifact is
+    // everywhere, so the schema a UI is handed is this node's `output:`.
+    assert_eq!(
+        wait["output_schema"]["properties"]["decision"]["enum"],
+        json!(["approve", "reject"]),
+        "the published contract is not the `human:` node's own `output:`: {wait:#}"
+    );
+    assert_eq!(
+        wait["resume_url"],
+        json!(format!(
+            "/executions/{execution}/resume?wait={}",
+            urlencoded(id)
+        )),
+        "the pause is not answered through the surface every other pause is: {wait:#}"
+    );
+    assert!(
+        wait["paused_at"].is_string(),
+        "the pause does not say when the wait began: {wait:#}"
+    );
+}
+
+/// **This report holds no placement wait**, asserted against a report that is
+/// demonstrably still publishing wait state.
 ///
-/// The provider's transcript is asserted beside it, because the pause happens
-/// **inside the tool loop**: the loop's first call is made on the worker and the
-/// pinned output call that would have ended the node never is.
+/// `placement_waits` is *omitted* from a report holding none
+/// (`runtime.ts`'s `executionReport`), so "absent or empty" is the shape being
+/// asserted — and on its own that is one-sided: a status route that stopped
+/// publishing the key at all would satisfy it while the property it exists for,
+/// "a paused dispatch is settled rather than parked", had quietly become
+/// unobservable. The companion is what closes that: the same document publishes
+/// the pause as an `interrupts` entry, so the report's wait state is live and
+/// what it does not carry is a placement wait rather than a key that went away.
+fn assert_holds_no_placement_wait(report: &Value, what: &str) {
+    assert!(
+        report["interrupts"]
+            .as_array()
+            .is_some_and(|open| !open.is_empty()),
+        "this report publishes no open question at all, so `placement_waits` says nothing about \
+         whether a placed dispatch is parked: {report:#}"
+    );
+    assert!(
+        report["placement_waits"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "{what}: {report:#}"
+    );
+}
+
+/// A `human:` node a **placed** agent reaches parks on the hub's board, and the
+/// answer sends the node back to a worker (§3.4, PRD resolved q46).
+///
+/// Grammar §14.1 rule 4 puts everything an attached `flow.*` reaches in the
+/// attaching agent's placement, so `agent.escalator`'s `flow.escalation` asks its
+/// question on the **worker**. The wait board is the hub's — it is what a status
+/// report publishes, what the resume route answers and what a recovery
+/// re-derives (§1, PRD resolved q4/q28) — so the dispatch settles *paused* and
+/// the wait comes home.
+///
+/// Six things are checked and each fails differently:
+///
+///  * the pause is on the hub's board, published as any pause is;
+///  * the dispatch is **settled**, not parked — the worker is free while a
+///    person thinks, which is §3.4's whole reason for making paused a way of
+///    being settled;
+///  * the resume surface takes the answer;
+///  * the node re-enters dispatch and finishes **on a worker**;
+///  * the pre-pause model call is **not re-issued** — the answered pause rides
+///    the redispatch's `effect_history` and the replay goes live past it (§7.2);
+///  * the answer is journaled as the pause's own effect record.
 #[test]
-fn a_human_node_a_placed_agent_reaches_fails_its_dispatch_with_a_named_diagnosis() {
+fn a_pause_a_placed_agent_reaches_comes_home_and_its_answer_sends_the_node_back() {
     let Some(mesh) = Mesh::start() else {
         return;
     };
-    // One call, and only one: the loop asks for the attached flow, the flow
-    // reaches the question, and nothing comes back to the model.
-    mesh.provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "escalation",
-            json!({ "path": "release.dmg" }),
-        )]),
-    ));
-    let _worker = mesh.worker("escalation");
+    mesh.provider
+        .enqueue_all(escalating("approved by a person"));
+    let receiver = harness::Receiver::start().expect("a loopback port");
+    let worker = mesh.worker("escalation");
 
-    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
-    let report = mesh.until(&execution, "ended", |report| {
-        report["status"] == "completed" || report["status"] == "failed"
-    });
+    let execution = mesh.start_execution(
+        "/escalations",
+        &json!({
+            "path": "release.dmg",
+            "callback_url": format!("{}/hook", receiver.base_url),
+        }),
+    );
+    let wait = mesh.paused(&execution);
+    assert_is_the_pause_the_composition_declares(&wait, &execution);
+
+    // **The same lifecycle webhook a local pause fires** (§6.6, PRD resolved
+    // q34). A parking is an execution that has stopped advancing on its own, and
+    // one whose only open work is a question nobody has answered is that
+    // whichever process asked it — so the delivery is `parked`, its body is the
+    // report the status route serves, and the wait it names is this one.
+    //
+    // Searched rather than counted, because this execution has **two** parkings
+    // in it and which of them is announced is a race a test should not decide:
+    // the dispatch parks first if no worker has claimed `mac` yet (§6.4's first
+    // row), and the pause parks second. What is asserted is that the second one
+    // is announced, and announced as a question rather than as a machine.
+    let announced = {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let held = receiver.of_event("parked");
+            if let Some(found) = held
+                .iter()
+                .find(|delivered| delivered.body["interrupts"][0]["wait_id"] == wait["wait_id"])
+            {
+                break found.body.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no `parked` webhook announced the pause the worker opened; the deliveries were \
+                 {:#?}",
+                held.iter().map(|one| one.body.clone()).collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert_eq!(announced["execution_id"], json!(execution));
     assert_eq!(
-        report["status"], "failed",
-        "a pause reached on a worker did not fail the run: {report:#}"
+        announced["status"],
+        json!("interrupted"),
+        "an execution holding a worker's question is interrupted, exactly as one holding its \
+         own is: {announced:#}"
+    );
+    assert_eq!(
+        announced["interrupts"][0]["output_schema"]["properties"]["decision"]["enum"],
+        json!(["approve", "reject"]),
+        "the delivery published a contract other than the `human:` node's own: {announced:#}"
+    );
+    assert_holds_no_placement_wait(
+        &announced,
+        "the parking announced a placement wait for a dispatch a pause settled",
     );
 
-    let said = report["error"].as_str().unwrap_or_default();
-    assert!(
-        said.contains("PlacedHumanWait"),
-        "the failure is not named for what it is: {report:#}"
+    // **Settled, not parked.** A paused result ends the dispatch, so the hub is
+    // holding no placement wait for this node and the session that posted it may
+    // be dispatched other work.
+    let report = mesh.report(&execution);
+    assert_holds_no_placement_wait(
+        &report,
+        "the hub is still holding a placement wait for a dispatch a paused result settled",
     );
-    assert!(
-        said.contains("wait board"),
-        "the failure does not say why a worker cannot hold the pause: {report:#}"
+    let settled = harness::journal_rows(
+        &mesh.project,
+        "SELECT status, node FROM dispatches ORDER BY rowid",
     );
-    assert!(
-        said.contains("§13"),
-        "the failure does not point at the row that records this: {report:#}"
-    );
-    // The interrupt a single-process run raises tells its reader to answer
-    // through `serve`'s resume route. This hub **is** a `serve`, and there is no
-    // wait on its board to answer, so that text reaching an operator here would
-    // send them looking for a pause that was never opened.
-    assert!(
-        !said.contains("resume"),
-        "the failure still tells the operator to answer a pause that never opened: {report:#}"
-    );
-    // Nothing was published either: the pause never reached the hub's board,
-    // which is the whole of why this is a failure rather than a parking.
-    assert!(
-        report["interrupts"].is_null(),
-        "a pause reached on a worker was published on the hub's board: {report:#}"
+    assert_eq!(
+        settled,
+        json!([{ "status": "settled", "node": "flow.escalated.escalate" }]),
+        "the paused dispatch is not settled on the board: {settled:#}"
     );
 
+    // The ordinary resume surface, with the payload the node's `output:` admits.
+    let id = wait["wait_id"].as_str().expect("the wait names itself");
+    let answered = mesh.resume(&execution, id, &json!({ "decision": "approve" }));
+    assert_eq!(answered.status, 202, "{}", body_of(&answered));
+    assert_eq!(answered.json()["wait"], json!(id), "{}", body_of(&answered));
+
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["approval"],
+        "approved by a person",
+        "the node did not finish after the answer; the worker said:\n{}",
+        worker.transcript()
+    );
+
+    // **The redispatch is a second dispatch of the same node**, and it settled
+    // with the answer: the node re-entered dispatch rather than being resumed in
+    // place, which is what makes the pause the hub's and the work the worker's.
+    let board = harness::journal_rows(
+        &mesh.project,
+        "SELECT status, placement, node FROM dispatches ORDER BY rowid",
+    );
+    assert_eq!(
+        board,
+        json!([
+            { "status": "settled", "placement": PLACEMENT, "node": "flow.escalated.escalate" },
+            { "status": "settled", "placement": PLACEMENT, "node": "flow.escalated.escalate" },
+        ]),
+        "the answered pause did not send the node back through dispatch: {board:#}"
+    );
+
+    // **The pre-pause model call was replayed, not re-issued.** Three scripts,
+    // three requests: the loop's first call was made once, before the pause, and
+    // the redispatch consumed it out of `effect_history` (§7.2, §7.3's "a model
+    // call already paid for is not paid for twice").
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the redispatch re-issued a model call the journal already held: {requests:#?}"
+    );
     let snapshot = mesh.provider.snapshot();
     assert!(
         snapshot.is_drained(),
-        "the loop's first call was not made on the worker: {snapshot:#?}"
+        "the escalating agent did not make the three calls it was scripted: {snapshot:#?}"
+    );
+
+    // …and the answer is in the journal as the pause's own effect record, which
+    // is what the redispatch replayed and what a second resume would find.
+    let human = harness::journal_rows(
+        &mesh.project,
+        "SELECT key, kind FROM effects WHERE kind = 'human'",
+    );
+    let records = human.as_array().expect("the query answers rows");
+    assert_eq!(
+        records.len(),
+        1,
+        "the answered pause is not journaled once as a `human` effect: {human:#}"
+    );
+    // At the pause's **own site**, which for a `human` node is the wait's own
+    // identity (`docs/durability.md` §4): the key the replaying node claims is
+    // derived from the very path the pause was opened at, so the record the hub
+    // wrote and the record the redispatch looks up cannot be two.
+    assert_eq!(
+        records[0]["key"],
+        json!(format!("{id}#human/0")),
+        "the answer is journaled under a key the redispatched node would not look up: {human:#}"
+    );
+}
+
+/// The worker is **gone** when the answer arrives: the redispatch parks, and a
+/// fresh worker takes it (§6.2, §6.4, PRD resolved q39).
+///
+/// This is the property a paused result buys that a held wait could not: the
+/// dispatch is settled, so the worker that asked the question is free and may
+/// leave. When the answer comes, the node re-enters dispatch like any placed
+/// node with nobody claiming its placement — it parks on the board, in park
+/// order, and the wake is a join.
+#[test]
+fn a_placed_pause_answered_after_its_worker_left_parks_until_another_joins() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue_all(escalating("approved after the mac left"));
+    let mut asked = mesh.worker("escalation-asked");
+
+    let execution =
+        mesh.start_execution("/abandoned-escalations", &json!({ "path": "release.dmg" }));
+    let wait = mesh.paused(&execution);
+    let id = wait["wait_id"]
+        .as_str()
+        .expect("the wait names itself")
+        .to_string();
+
+    // The machine that asked the question goes away while the person thinks.
+    asked.kill();
+
+    let answered = mesh.resume(&execution, &id, &json!({ "decision": "approve" }));
+    assert_eq!(answered.status, 202, "{}", body_of(&answered));
+
+    // The redispatch has nobody to take it, so it is a **pause** rather than a
+    // failure (§6.4's first row): on the board, and costing the execution
+    // nothing but its own `timeout:`. Not necessarily at once, though: the dead
+    // worker's session is presumed live until the window of §2 expires, so a
+    // hub may first hand the redispatch to the session that is gone — and the
+    // expiry then supersedes it and parks the retry (§6.3). Both readings end
+    // on the board, so the board's **parked** row is what is waited for, never
+    // the first row to appear.
+    let parked = mesh.until(&execution, "parked its redispatch", |report| {
+        report["placement_waits"]
+            .as_array()
+            .is_some_and(|waits| waits.iter().any(|wait| wait["status"] == "parked"))
+    });
+    assert_eq!(
+        parked["status"], "running",
+        "an execution waiting for a machine is running, not interrupted: {parked:#}"
+    );
+    assert_eq!(
+        parked["placement_waits"][0]["status"], "parked",
+        "the redispatch was handed to a session that is gone: {parked:#}"
+    );
+
+    // …and the wake is a join.
+    let fresh = mesh.worker("escalation-answering");
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["approval"],
+        "approved after the mac left",
+        "the fresh worker did not finish the answered node; it said:\n{}",
+        fresh.transcript()
+    );
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the worker that took the redispatch re-issued the call the first one made: {requests:#?}"
+    );
+}
+
+/// The three calls `agent.escalator` makes when it asks the question with a
+/// **budget** on it, and nobody answers.
+///
+/// The same three as [`escalating`] — the loop's request for the attached flow,
+/// the loop's answer once the tool has returned, and the pinned structured
+/// output that ends the node — with the first naming the *other* attached flow.
+/// Which of the two questions a run reaches is this queue's to decide, which is
+/// what lets one agent, one trigger and one placement serve both endings of a
+/// wait.
+fn expiring(approval: &str) -> Vec<Script> {
+    vec![
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "deadline",
+                json!({ "path": "release.dmg" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("nobody was at the machine")),
+        Script::new(SONNET, Outcome::structured(json!({ "approval": approval }))),
+    ]
+}
+
+/// A placed pause **runs out of time**, and the redispatch takes the node's own
+/// `on_timeout:` route on a worker (§3.4, grammar §8.7, PRD resolved q46).
+///
+/// The other ending of a wait, end to end and in real processes: the question is
+/// asked on the worker, the wait is planted on the hub's board with the budget
+/// `flow.deadline`'s `ask` declares, nobody answers it, the hub journals the
+/// expiry as the pause's own record, and the node re-enters dispatch carrying
+/// it. What the replay then does is the whole of the parity claim — it raises
+/// the `HumanExpiry` the *composition's* `on_timeout:` routes, at the same line
+/// of the same function an unplaced pause's expiry is raised at — and the proof
+/// is `lapse`, a node no edge targets: a value it wrote reached the model, so
+/// the route was taken rather than the question answered.
+///
+/// The wait is deliberately **not** read off the board here. Its budget is two
+/// seconds of real time and this test starts two processes, so a report that
+/// caught the question open would be a race a test should not run; the wire
+/// suite asserts the publication, and what is asserted here is what only real
+/// processes can show.
+#[test]
+fn a_placed_pause_that_runs_out_of_time_takes_its_on_timeout_route_on_a_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(expiring("nobody approved it"));
+    let worker = mesh.worker("escalation-expiring");
+
+    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["approval"],
+        "nobody approved it",
+        "the node did not finish after its wait expired; the worker said:\n{}",
+        worker.transcript()
+    );
+
+    // **The expiry is journaled as the pause's own record**, which is what the
+    // redispatch replayed: one `human` effect, settled `expired`, carrying no
+    // answer — a wait nobody answered may not journal one.
+    let human = harness::journal_rows(
+        &mesh.project,
+        "SELECT key, payload FROM effects WHERE kind = 'human'",
+    );
+    let records = human.as_array().expect("the query answers rows");
+    assert_eq!(
+        records.len(),
+        1,
+        "the expiry is not journaled once as a `human` effect: {human:#}"
+    );
+    let payload = records[0]["payload"].as_str().unwrap_or_default();
+    assert!(
+        payload.contains("\"settled\":\"expired\""),
+        "the wait was journaled as something other than an expiry: {human:#}"
+    );
+    assert!(
+        !payload.contains("\"output\""),
+        "an expired wait was journaled with an answer nobody gave: {human:#}"
+    );
+    assert!(
+        payload.contains("\"expiresAt\""),
+        "the record does not say when the budget ran out: {human:#}"
+    );
+
+    // …and the node went back through dispatch to reach its route: two settled
+    // rows at one instance path, the second of which is the one that replayed
+    // the expiry.
+    let board = harness::journal_rows(
+        &mesh.project,
+        "SELECT status, placement, node FROM dispatches ORDER BY rowid",
+    );
+    assert_eq!(
+        board,
+        json!([
+            { "status": "settled", "placement": PLACEMENT, "node": "flow.escalated.escalate" },
+            { "status": "settled", "placement": PLACEMENT, "node": "flow.escalated.escalate" },
+        ]),
+        "the expired pause did not send the node back through dispatch: {board:#}"
+    );
+
+    // **`on_timeout:` routed, and it routed on the worker.** `lapse` is reached
+    // by no edge, so the only way its value exists is the route the replayed
+    // expiry raised — and it comes back to the model as the attached flow's
+    // answer, which is where this test can read it.
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the redispatch re-issued a model call the journal already held: {requests:#?}"
+    );
+    let said = serde_json::to_string(&requests[1]).expect("a request serializes");
+    assert!(
+        said.contains("nobody answered in time"),
+        "the attached flow answered without taking its `on_timeout:` route, so the expiry ended \
+         the node rather than routing it: {said}"
+    );
+    let snapshot = mesh.provider.snapshot();
+    assert!(
+        snapshot.is_drained(),
+        "the escalating agent did not make the three calls it was scripted: {snapshot:#?}"
+    );
+}
+
+/// The **one interval a mesh adds** to a wait, and the one place a placed pause
+/// is not indistinguishable from a local one (§3.4, §6.5, PRD resolved q46).
+///
+/// A settled wait — answered or expired — starts the dispatching node's budget
+/// running again, and what runs next is a redispatch waiting for a session to
+/// claim it. §6.5 puts that queueing *inside* the budget, which is what "fail if
+/// the machine is not up in ten minutes" means; so a placement nobody is
+/// claiming when the wait settles costs the node its budget, and the pause's own
+/// `on_timeout:` route is never reached — where the same node unplaced takes
+/// that route in the same process, in the instant the wait expires.
+///
+/// It is a divergence rather than a parity, which is why it is written down
+/// rather than left to be met: an author reading `on_timeout: lapse` beside
+/// `timeout: 15s` should be able to find out that the second can eat the first.
+/// The two halves were each documented and their interaction was not, and this
+/// is the test that keeps the sentence honest.
+///
+/// `flow.impatient` exists for the budget: `flow.escalated`'s node takes the
+/// fixture's minute, which no test can wait out. Everything else here is that
+/// flow's own — the same agent, the same attached `flow.deadline`, and the same
+/// two-second question.
+#[test]
+fn a_placed_pauses_route_is_lost_when_the_node_spends_its_budget_waiting_for_a_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    // The **first** of the same three calls, and the only one this run reaches:
+    // the loop asks for `flow.deadline`, the question is opened on the worker,
+    // and the node never comes back to be told what happened.
+    let mut scripted = expiring("nobody approved it");
+    scripted.truncate(1);
+    mesh.provider.enqueue_all(scripted);
+    let mut asked = mesh.worker("escalation-impatient");
+
+    let execution =
+        mesh.start_execution("/impatient-escalations", &json!({ "path": "release.dmg" }));
+    // The question comes home, which holds the node's budget still…
+    mesh.paused(&execution);
+    // …and the machine that asked it goes away, so nothing will claim the
+    // redispatch the expiry makes.
+    asked.kill();
+
+    let ended = mesh.until(&execution, "ended", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        ended["status"], "failed",
+        "the node outlived the budget it was given while its redispatch sat on the board: \
+         {ended:#}"
+    );
+    let said = ended["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("timed out") && said.contains("15000ms"),
+        "the execution ended on something other than the dispatching node's own budget, which is \
+         what §6.5 says bounds waiting for a machine: {ended:#}"
+    );
+
+    // **The wait really did expire**, so what was lost is the route and not the
+    // question: one `human` record, settled `expired`, exactly as in the test
+    // above.
+    let human = harness::journal_rows(
+        &mesh.project,
+        "SELECT payload FROM effects WHERE kind = 'human'",
+    );
+    let records = human.as_array().expect("the query answers rows");
+    assert_eq!(
+        records.len(),
+        1,
+        "the wait did not settle, so this run never reached the interval under test: {human:#}"
+    );
+    assert!(
+        records[0]["payload"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\"settled\":\"expired\""),
+        "the wait ended some other way: {human:#}"
+    );
+
+    // …and the redispatch was made and then given up on, which is the interval
+    // itself: a second row at the same instance path, superseded by the hub
+    // rather than settled by a worker.
+    let board = harness::journal_rows(
+        &mesh.project,
+        "SELECT status, node FROM dispatches ORDER BY rowid",
+    );
+    assert_eq!(
+        board,
+        json!([
+            { "status": "settled", "node": "flow.impatient.escalate" },
+            { "status": "superseded", "node": "flow.impatient.escalate" },
+        ]),
+        "the expiry did not redispatch, or the redispatch was not the row the budget ended: \
+         {board:#}"
+    );
+
+    // **`lapse` was never reached**, on either side of the wire: no second model
+    // call carrying its value back to the loop, and nothing written to the
+    // channel it writes.
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the flow got past the question it never had a worker to route: {requests:#?}"
+    );
+    assert_ne!(
+        ended["outputs"]["approval"],
+        json!("nobody answered in time"),
+        "the `on_timeout:` route ran without a worker to run it on: {ended:#}"
+    );
+}
+
+/// The **hub** goes away between the question and the answer, and the wait comes
+/// back (§5, `docs/durability.md` §6).
+///
+/// The pause is journaled — it is what settled the dispatch — so the process
+/// that replaces this one re-derives the wait rather than remembering it, under
+/// the identity its predecessor published and dated by its own planting. That is
+/// the same discipline every other open wait is recovered by, reaching the one
+/// kind of wait that was opened in another process entirely.
+///
+/// The wait this flow opens declares no `timeout:`, so nothing here is about a
+/// budget; `distributed_hub_wire.rs` is where the re-derived budget and the
+/// deadline published beside it are asserted.
+#[test]
+fn a_placed_pause_is_re_derived_by_a_hub_restarted_before_the_answer() {
+    let Some(mut mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider
+        .enqueue_all(escalating("approved across a restart"));
+    let mut asked = mesh.worker("escalation-before-restart");
+
+    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let before = mesh.paused(&execution);
+    let id = before["wait_id"]
+        .as_str()
+        .expect("the wait names itself")
+        .to_string();
+
+    // Both processes of the pause go: the one that asked, and the one holding
+    // the question. Nothing is left in memory anywhere.
+    asked.kill();
+    mesh.restart();
+
+    // The replay reaches the placed node, finds the row its predecessor settled
+    // paused, and re-derives the wait — **under the same identity**, which is
+    // what lets a resume prepared against the dead process still land.
+    let after = mesh.until(&execution, "re-derived its pause", |report| {
+        report["interrupts"]
+            .as_array()
+            .is_some_and(|waits| !waits.is_empty())
+    });
+    assert_eq!(after["interrupts"][0]["wait_id"], json!(id), "{after:#}");
+    // …and **re-dated by the planting**, exactly as a re-parked local wait is
+    // (`docs/durability.md` §3.4, §5): the generation holding a question is the
+    // one that dates it, so the pair a reader is shown is this process's and
+    // never a mixture of two.
+    assert!(
+        after["interrupts"][0]["paused_at"].as_str() > before["paused_at"].as_str(),
+        "the re-derived wait kept the instant its predecessor published rather than the one this \
+         planting dated it at, so a restart leaves a pair no single clock read: {after:#}"
+    );
+
+    let fresh = mesh.worker("escalation-after-restart");
+    let answered = mesh.resume(&execution, &id, &json!({ "decision": "approve" }));
+    assert_eq!(answered.status, 202, "{}", body_of(&answered));
+
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["approval"],
+        "approved across a restart",
+        "the recovered execution did not finish after the answer; the worker said:\n{}",
+        fresh.transcript()
+    );
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the restart cost the execution a model call it had already paid for: {requests:#?}"
     );
 }
 

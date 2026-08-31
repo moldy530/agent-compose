@@ -243,7 +243,7 @@ pub fn emit(ir: &Ir) -> GeneratedProject {
     let mut files = vec![
         project::package_json(ir),
         project::tsconfig_json(ir),
-        project::readme(ir),
+        project::readme(ir, &partition),
         project::gitignore(ir),
         cel::module(ir),
         deployment::module(ir, &partition),
