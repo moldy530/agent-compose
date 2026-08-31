@@ -1620,6 +1620,36 @@ fn a_vanished_session_supersedes_its_dispatch_and_the_retry_carries_the_history(
     );
     assert_eq!(elsewhere.status, 400, "{}", body_of(&elsewhere));
 
+    // …and a batch is refused **whole**. The record that fails it here is the
+    // second, and the first is one this dispatch could legitimately have made:
+    // a `400` that had already journaled it would leave the execution holding
+    // an effect from a batch the hub says it did not take, and a worker reads a
+    // `4xx` on this route as terminal — so nobody sends it again to find out.
+    // The history the redispatch carries below is what says it was not written.
+    let partly = first.effects(
+        &hub,
+        &id,
+        &json!([
+            {
+                "key": "sign/0#model/1",
+                "site": "sign/0",
+                "kind": "model",
+                "ordinal": 1,
+                "request": "{\"model\":\"model.smart\"}",
+                "outcome": { "kind": "value", "value": { "text": "the rest of a signature" } },
+            },
+            {
+                "key": "stamp/0#tool/0",
+                "site": "stamp/0",
+                "kind": "tool",
+                "ordinal": 0,
+                "request": "{}",
+                "outcome": { "kind": "value", "value": {} },
+            },
+        ]),
+    );
+    assert_eq!(partly.status, 400, "{}", body_of(&partly));
+
     // …and then the laptop closes. Nothing else is sent on this session, so the
     // liveness window runs out and the hub declares it gone.
     let second = Worker {
@@ -1642,8 +1672,9 @@ fn a_vanished_session_supersedes_its_dispatch_and_the_retry_carries_the_history(
     assert_eq!(
         history.len(),
         2,
-        "the redispatch did not carry both effects the first attempt journaled — its own and the \
-         one its tool loop made under it (§3.2, §7.2): {redispatch:#}"
+        "the redispatch carried something other than the two effects the first attempt journaled \
+         — its own and the one its tool loop made under it (§3.2, §7.2). A third is the first \
+         record of the batch that was refused, which a `400` says was not taken: {redispatch:#}"
     );
     let keys: Vec<&str> = history
         .iter()

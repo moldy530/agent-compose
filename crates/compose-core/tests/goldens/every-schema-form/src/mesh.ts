@@ -1276,6 +1276,15 @@ function held(milliseconds: number, seen: number, hangUps: Set<() => void>): Pro
  * session, and not by dispatch", precisely so the journal takes them from
  * whichever session hands them over — and a superseded attempt's effects are
  * exactly the ones its retry must replay rather than re-issue.
+ *
+ * **And it is read whole before any of it is written.** §3.3 says nothing about
+ * atomicity, so this is a choice rather than a rule — but it is the only one
+ * that makes the `400` mean what a worker reads it as. A refusal on this route
+ * is the one answer no re-send improves, so a worker treats it as terminal; a
+ * `400` sent after half the batch was already appended would end that worker
+ * with a partly applied batch behind it, and the next reader of the journal
+ * could not tell which half. Building every record first costs one pass over a
+ * batch that is usually one record, and buys a refusal that changed nothing.
  */
 async function effects(request: FastifyRequest, reply: FastifyReply): Promise<unknown> {
   if (!authenticated(request)) return reply.code(401).send();
@@ -1295,6 +1304,7 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
   if (row === undefined) {
     return reply.code(409).send({ dispatch_id: id, error: `no dispatch \`${id}\`` });
   }
+  const records: JournalRecord[] = [];
   for (const entry of batch) {
     const record = recordOf(row, entry);
     if (record === undefined) {
@@ -1304,6 +1314,9 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
           "every record carries a `key`, a `site` at or inside the dispatch's `instance_path`, a `kind`, an `ordinal`, a canonical `request` and an `outcome`",
       });
     }
+    records.push(record);
+  }
+  for (const record of records) {
     // **Workers SEND, the hub INSERTS** (§3.3), idempotently by effect key: a
     // record the journal already holds is accepted and dropped, which is what
     // makes a batch safe to re-send after a transport failure.
