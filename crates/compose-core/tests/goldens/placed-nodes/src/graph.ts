@@ -23,6 +23,7 @@ import {
   agentBrieferOutput,
   agentEscalatorOutput,
   agentSignerOutput,
+  flowAbandonedInputs,
   flowBatchInputs,
   flowConversationInputs,
   flowDeadlineInputs,
@@ -61,6 +62,22 @@ const stateShape: runtime.Shape = {
     },
     "ticket": "string",
   },
+};
+
+/** `flow.abandoned` — the `input` root inside it (grammar 7.5). */
+const flowAbandonedShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.abandoned` node `escalate` — the `escalate.output` root its guards read.
+ */
+const flowAbandonedNodeEscalateShape: runtime.Shape = {
+  "properties": {
+    "approval": "string"
+  }
 };
 
 /** `flow.batch` — the `input` root inside it (grammar 7.5). */
@@ -465,6 +482,85 @@ const agentSigner: runtime.AgentBinding = {
     },
   ],
   maxToolIterations: 8,
+};
+
+// --- flow.abandoned ---
+
+/** `flow.abandoned` node `escalate` — `agent.escalator` (grammar 8.1). */
+const flowAbandonedNodeEscalate: runtime.NodeDescriptor = {
+  flow: "flow.abandoned",
+  node: "escalate",
+  // Grammar 9.3, resolved: `retry` from the node, `timeout` from `defaults:`, `on_error` from `defaults:`.
+  policy: {
+    retry: {
+      max: 2,
+      backoffMs: 1,
+      multiplier: 2,
+      jitter: true,
+    },
+    timeoutMs: 60000,
+    onError: "fail",
+  },
+  shapes: { input: flowAbandonedShape, state: stateShape, output: flowAbandonedNodeEscalateShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.abandoned.escalate",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "escalate"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentEscalatorOutput, answer.output, "the answer of `agent.escalator`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "approval", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.abandoned` — its nodes, its `start` edges, and the compiled graph. */
+function flowAbandoned() {
+  return new StateGraph(State)
+    .addNode("escalate", (state: GraphState) => runtime.runNode(flowAbandonedNodeEscalate, state), {
+      ends: [END],
+    })
+    .addEdge(START, "escalate")
+    .compile();
+}
+
+/**
+ * `flow.abandoned`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowAbandonedGraph = flowAbandoned();
+
+/**
+ * `flow.abandoned` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowAbandonedBinding: runtime.SubflowBinding = {
+  address: "flow.abandoned",
+  outputs: ["approval"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowAbandonedGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowAbandonedGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
 // --- flow.batch ---
@@ -1541,6 +1637,22 @@ export interface CompiledFlow {
  * flow rather than every triggered one.
  */
 export const flows: Readonly<Record<string, CompiledFlow>> = {
+  "flow.abandoned": {
+    address: "flow.abandoned",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["approval"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowAbandonedInputs, inputs, "the `inputs:` of `flow.abandoned`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowAbandonedGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowAbandonedGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.batch": {
     address: "flow.batch",
     inputs: ["paths"],
@@ -2115,6 +2227,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
     async (input, context, site) => {
       const answer = await runtime.callAgent(
         agentSigner,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
+  "flow.abandoned.escalate":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentEscalator,
         input,
         site.history ?? [],
         context,

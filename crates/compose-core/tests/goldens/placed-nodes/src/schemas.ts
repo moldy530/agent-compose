@@ -66,6 +66,20 @@ export const agentSignerOutput = z.object({
 }).strict();
 export type AgentSignerOutput = z.infer<typeof agentSignerOutput>;
 
+/** `flow.abandoned` — the module's parameters (grammar 7.5). */
+export const flowAbandonedInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowAbandonedInputs = z.infer<typeof flowAbandonedInputs>;
+
+/**
+ * `flow.abandoned` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowAbandonedOutputs = z.object({
+  approval: z.string(),
+}).strict();
+export type FlowAbandonedOutputs = z.infer<typeof flowAbandonedOutputs>;
+
 /** `flow.batch` — the module's parameters (grammar 7.5). */
 export const flowBatchInputs = z.object({
   paths: z.array(z.string()).max(12),

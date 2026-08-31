@@ -37,6 +37,10 @@
 #     whose question has a `timeout:`, so the wait's other ending — the budget
 #     runs out, and the redispatch raises the node's own `on_timeout:` — is
 #     reachable from the same agent, the same trigger and the same placement.
+#   * `flow.abandoned` is that escalation answered after its asking machine
+#     left, under the `retry:` §6.4 says a placement worth sleeping on wants —
+#     kept apart from `flow.escalated`, whose malformed-pause wire cases need a
+#     dispatch failure to end the run rather than spend an attempt.
 #   * `flow.impatient` is the same escalation under a dispatching node whose own
 #     `timeout:` a test can wait out: `docs/distributed.md` §6.5 puts the
 #     redispatch's queueing *inside* that budget, so a node whose budget runs out
@@ -165,6 +169,16 @@ triggers:
       path: "payload.body.path"
     respond: async
     callback: "payload.body.callback_url"
+
+  # The same escalation whose asking machine leaves — see `flow.abandoned`.
+  on_abandoned:
+    type: http
+    flow: flow.abandoned
+    path: /abandoned-escalations
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
 
   # The same escalation with a dispatching node a test can outlive — see
   # `flow.impatient`.
@@ -369,12 +383,36 @@ flow.escalated:
   nodes:
     escalate:
       agent: agent.escalator
-      # The retry §6.4 says a placement worth sleeping on wants. An answer can
-      # land while the asking worker's dead session is still inside its liveness
-      # window, in which case the hub hands the redispatch to the session that
-      # is gone and the expiry supersedes it — an **attempt**, not the run
-      # (§6.3), but only where a retry makes the next attempt reachable. The
-      # answer's other timing parks the redispatch directly and spends nothing.
+      input:
+        path: "input.path"
+      writes:
+        approval: approval
+  edges:
+    - { from: start, to: escalate }
+    - { from: escalate, to: end }
+
+# The same question, from a machine that leaves while the person thinks. What
+# distinguishes it from `flow.escalated` is the one key its node adds: the
+# `retry:` `docs/distributed.md` §6.4 says a placement worth sleeping on wants.
+# An answer can land while the asking worker's dead session is still inside its
+# liveness window, in which case the hub hands the redispatch to the session
+# that is gone and the expiry supersedes it — an **attempt**, not the run
+# (§6.3), but only where a retry makes the next attempt reachable; the answer's
+# other timing parks the redispatch directly and spends nothing. `flow.escalated`
+# stays retry-less on purpose: the wire suite's malformed-pause cases need a
+# dispatch failure to be the run's ending, not the first attempt of two.
+flow.abandoned:
+  description: Answer a question whose asking machine left while the person thought.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    escalate:
+      agent: agent.escalator
       retry: { max: 2, backoff: 1ms }
       input:
         path: "input.path"

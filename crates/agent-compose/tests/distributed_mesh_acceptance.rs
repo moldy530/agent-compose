@@ -1489,7 +1489,8 @@ fn a_placed_pause_answered_after_its_worker_left_parks_until_another_joins() {
         .enqueue_all(escalating("approved after the mac left"));
     let mut asked = mesh.worker("escalation-asked");
 
-    let execution = mesh.start_execution("/escalations", &json!({ "path": "release.dmg" }));
+    let execution =
+        mesh.start_execution("/abandoned-escalations", &json!({ "path": "release.dmg" }));
     let wait = mesh.paused(&execution);
     let id = wait["wait_id"]
         .as_str()
