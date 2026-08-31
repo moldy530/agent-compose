@@ -411,6 +411,44 @@ fn dispatch(id: &str) -> Reply {
     )
 }
 
+/// The same dispatch, carrying at least `bytes` of journaled `effect_history`.
+///
+/// The records are shaped the way `/workers/effects` writes them, because that
+/// is what §7.2 hands back: "the journaled record of effects this node instance
+/// already issued", read out of the journal at redispatch.
+fn dispatch_carrying(id: &str, bytes: usize) -> Reply {
+    // A request large enough that a handful of records is a payload no message
+    // limit would admit, and small enough that the archive of them is quick to
+    // build: a `request` is the canonical text of a model call, which is where
+    // the size of a real history comes from.
+    let filler = "x".repeat(256 * 1024);
+    let mut history: Vec<Value> = Vec::new();
+    while history.len() * filler.len() < bytes {
+        let ordinal = history.len();
+        history.push(json!({
+            "key": format!("sign/0#model/{ordinal}"),
+            "site": "sign/0",
+            "kind": "model",
+            "ordinal": ordinal,
+            "request": filler,
+            "outcome": { "kind": "value", "value": "a turn this node already took" },
+            "refused": false,
+            "recorded_at": "2026-08-30T00:00:00.000Z",
+        }));
+    }
+    Reply::json(
+        200,
+        &json!({
+            "dispatch_id": id,
+            "execution_id": "exec_fixture",
+            "node": "flow.release.sign",
+            "instance_path": "sign/0",
+            "inputs": { "path": "release.dmg" },
+            "effect_history": history,
+        }),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The worker under test
 // ---------------------------------------------------------------------------
@@ -1122,6 +1160,60 @@ fn a_dispatch_is_run_and_its_effects_go_home_before_its_result() {
     assert_eq!(
         settled["output"]["signature"], "from the fixture runner",
         "{settled:#}"
+    );
+}
+
+/// A dispatch whose `effect_history` is larger than any message-sized ceiling
+/// is read, run and settled (§3.2, §7.2).
+///
+/// The poll answer is the one body on this wire that **grows with the
+/// execution**: §7.2 hands a redispatched node every effect the journal holds at
+/// its instance path, and a placed `agent:` with a long tool loop — or one
+/// already through two `retry:` attempts — carries the canonical request and the
+/// whole of the outcome for each of them.
+///
+/// A worker that capped its reading at a message's size would lose such a
+/// dispatch in the worst available way. The hub has already claimed it to this
+/// session, so the answer is not repeated: every later poll is `204` while the
+/// session holds an unsettled dispatch (§2), the session goes on polling so
+/// nothing supersedes it (§6.3), and the node waits out its whole `timeout:`
+/// chain — failing over a payload the worker declined to read, with a diagnostic
+/// about a deadline.
+#[test]
+fn a_dispatch_whose_history_is_larger_than_a_message_is_read_and_settled() {
+    let hub = FixtureHub::start();
+    provisioning(&hub);
+    hub.script(
+        "/workers/poll",
+        dispatch_carrying("dsp_replayed", 12 * 1024 * 1024),
+    );
+    hub.always("/workers/effects", Reply::empty(204));
+    hub.always("/workers/result", Reply::empty(204));
+
+    let worker = Worker::start(&hub, "large-history");
+    let asked = hub.until("settled the dispatch", |asked| {
+        asked
+            .iter()
+            .any(|request| request.path == "/workers/result")
+    });
+    let settled = asked
+        .iter()
+        .find(|request| request.path == "/workers/result")
+        .unwrap_or_else(|| {
+            panic!(
+                "the worker settled nothing: {asked:#?}\n{}",
+                worker.transcript()
+            )
+        });
+    assert_eq!(
+        settled.body["dispatch_id"], "dsp_replayed",
+        "{:#}",
+        settled.body
+    );
+    assert_eq!(
+        settled.body["output"]["signature"], "from the fixture runner",
+        "{:#}",
+        settled.body
     );
 }
 

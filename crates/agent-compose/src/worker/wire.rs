@@ -97,15 +97,18 @@ impl Hub {
 
     /// `GET /workers/poll` (§3.2), held for up to `hold`.
     ///
-    /// The receive timeout is the hold plus room for the hub to answer it: a
-    /// client that gave up at exactly the hold would race the `204` the hub is
-    /// about to send, and every such race is a re-join for nothing.
+    /// The receive timeout is the hold plus [`POLL_MARGIN`]: a client that gave
+    /// up at exactly the hold would race the `204` the hub is about to send, and
+    /// every such race is a re-join for nothing. `hold` is what the *caller*
+    /// believes this hub holds for, which §2 makes a number a hub may configure
+    /// — so it is a parameter rather than a constant here, and [`super::Hold`]
+    /// is what learns it.
     pub(crate) fn poll(&self, session: &str, hold: Duration) -> Answer {
         let request = self
             .agent
             .get(self.url("/workers/poll"))
             .config()
-            .timeout_recv_response(Some(hold + Duration::from_secs(30)))
+            .timeout_recv_response(Some(hold + POLL_MARGIN))
             .build()
             .header("authorization", format!("Bearer {}", self.token))
             .header("x-worker-session", session);
@@ -149,7 +152,7 @@ impl Hub {
         if let Some(session) = session {
             request = request.header("x-worker-session", session);
         }
-        answer_with_limit(request.call(), ARTIFACT_LIMIT)
+        answer(request.call())
     }
 
     fn post(&self, path: &str, session: Option<&str>, body: &Value, wait: Duration) -> Answer {
@@ -172,27 +175,39 @@ impl Hub {
     }
 }
 
-/// How large an artifact this worker will take.
+/// How much longer than the hold a poll waits for the answer to arrive.
 ///
-/// A ceiling rather than none, because the body is read into memory before it is
-/// verified (§4 step 2) and a hub that answered a hash with an endless stream
-/// would otherwise be a worker that ran out of it. Generous: the artifact is a
-/// generated TypeScript project, and 256 MiB is orders above one.
-const ARTIFACT_LIMIT: u64 = 256 * 1024 * 1024;
+/// See [`Hub::poll`], and [`super::Hold`] for the hold itself.
+pub(crate) const POLL_MARGIN: Duration = Duration::from_secs(30);
+
+/// How large an answer this worker will read into memory.
+///
+/// One ceiling for every route, and it is the **artifact's** size rather than a
+/// message's, because two of the five bodies grow without a bound of their own:
+///
+/// * the artifact (§3.5), which is read whole before it is verified (§4 step 2),
+///   so it is in memory either way;
+/// * a poll's `effect_history` (§3.2, §7.2), which is every effect the journal
+///   holds at this node instance — a long tool loop, or a node already through
+///   two `retry:` attempts, and each record carries the canonical request and
+///   the whole of the outcome.
+///
+/// The second is why a message-sized limit is the wrong one. A poll answer this
+/// worker cannot read is a dispatch the hub has already **claimed** to this
+/// session: it never reaches [`super`]'s `200` arm, so it is never executed and
+/// never settled, and the node waits out its whole `timeout:` chain over a
+/// payload the worker declined rather than over anything that went wrong. A
+/// ceiling is still here rather than none, because a hub answering with an
+/// endless stream would otherwise be a worker that ran out of memory — and where
+/// it is reached the diagnostic names it, so what happened is readable.
+const ANSWER_LIMIT: u64 = 256 * 1024 * 1024;
 
 fn answer(sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Answer {
-    answer_with_limit(sent, 8 * 1024 * 1024)
-}
-
-fn answer_with_limit(
-    sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
-    limit: u64,
-) -> Answer {
     match sent {
         Ok(response) => {
             let status = response.status().as_u16();
             let mut body = response.into_body();
-            match body.with_config().limit(limit).read_to_vec() {
+            match body.with_config().limit(ANSWER_LIMIT).read_to_vec() {
                 Ok(bytes) => Answer::Said(Said {
                     status,
                     body: bytes,
@@ -201,7 +216,9 @@ fn answer_with_limit(
                 // the status line said: the answer is incomplete, and this
                 // protocol has no partial reading of one.
                 Err(error) => Answer::Unreachable(format!(
-                    "the hub answered {status} and the body did not arrive: {error}"
+                    "the hub answered {status} and the body did not arrive (this worker reads at \
+                     most {} MiB of one): {error}",
+                    ANSWER_LIMIT / (1024 * 1024)
                 )),
             }
         }
