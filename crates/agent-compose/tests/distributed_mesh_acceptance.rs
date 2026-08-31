@@ -1638,6 +1638,117 @@ fn a_placed_pause_that_runs_out_of_time_takes_its_on_timeout_route_on_a_worker()
     );
 }
 
+/// The **one interval a mesh adds** to a wait, and the one place a placed pause
+/// is not indistinguishable from a local one (§3.4, §6.5, PRD resolved q46).
+///
+/// A settled wait — answered or expired — starts the dispatching node's budget
+/// running again, and what runs next is a redispatch waiting for a session to
+/// claim it. §6.5 puts that queueing *inside* the budget, which is what "fail if
+/// the machine is not up in ten minutes" means; so a placement nobody is
+/// claiming when the wait settles costs the node its budget, and the pause's own
+/// `on_timeout:` route is never reached — where the same node unplaced takes
+/// that route in the same process, in the instant the wait expires.
+///
+/// It is a divergence rather than a parity, which is why it is written down
+/// rather than left to be met: an author reading `on_timeout: lapse` beside
+/// `timeout: 15s` should be able to find out that the second can eat the first.
+/// The two halves were each documented and their interaction was not, and this
+/// is the test that keeps the sentence honest.
+///
+/// `flow.impatient` exists for the budget: `flow.escalated`'s node takes the
+/// fixture's minute, which no test can wait out. Everything else here is that
+/// flow's own — the same agent, the same attached `flow.deadline`, and the same
+/// two-second question.
+#[test]
+fn a_placed_pauses_route_is_lost_when_the_node_spends_its_budget_waiting_for_a_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    // The **first** of the same three calls, and the only one this run reaches:
+    // the loop asks for `flow.deadline`, the question is opened on the worker,
+    // and the node never comes back to be told what happened.
+    let mut scripted = expiring("nobody approved it");
+    scripted.truncate(1);
+    mesh.provider.enqueue_all(scripted);
+    let mut asked = mesh.worker("escalation-impatient");
+
+    let execution =
+        mesh.start_execution("/impatient-escalations", &json!({ "path": "release.dmg" }));
+    // The question comes home, which holds the node's budget still…
+    mesh.paused(&execution);
+    // …and the machine that asked it goes away, so nothing will claim the
+    // redispatch the expiry makes.
+    asked.kill();
+
+    let ended = mesh.until(&execution, "ended", |report| {
+        report["status"] == "completed" || report["status"] == "failed"
+    });
+    assert_eq!(
+        ended["status"], "failed",
+        "the node outlived the budget it was given while its redispatch sat on the board: \
+         {ended:#}"
+    );
+    let said = ended["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("timed out") && said.contains("15000ms"),
+        "the execution ended on something other than the dispatching node's own budget, which is \
+         what §6.5 says bounds waiting for a machine: {ended:#}"
+    );
+
+    // **The wait really did expire**, so what was lost is the route and not the
+    // question: one `human` record, settled `expired`, exactly as in the test
+    // above.
+    let human = harness::journal_rows(
+        &mesh.project,
+        "SELECT payload FROM effects WHERE kind = 'human'",
+    );
+    let records = human.as_array().expect("the query answers rows");
+    assert_eq!(
+        records.len(),
+        1,
+        "the wait did not settle, so this run never reached the interval under test: {human:#}"
+    );
+    assert!(
+        records[0]["payload"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\"settled\":\"expired\""),
+        "the wait ended some other way: {human:#}"
+    );
+
+    // …and the redispatch was made and then given up on, which is the interval
+    // itself: a second row at the same instance path, superseded by the hub
+    // rather than settled by a worker.
+    let board = harness::journal_rows(
+        &mesh.project,
+        "SELECT status, node FROM dispatches ORDER BY rowid",
+    );
+    assert_eq!(
+        board,
+        json!([
+            { "status": "settled", "node": "flow.impatient.escalate" },
+            { "status": "superseded", "node": "flow.impatient.escalate" },
+        ]),
+        "the expiry did not redispatch, or the redispatch was not the row the budget ended: \
+         {board:#}"
+    );
+
+    // **`lapse` was never reached**, on either side of the wire: no second model
+    // call carrying its value back to the loop, and nothing written to the
+    // channel it writes.
+    let requests = mesh.provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the flow got past the question it never had a worker to route: {requests:#?}"
+    );
+    assert_ne!(
+        ended["outputs"]["approval"],
+        json!("nobody answered in time"),
+        "the `on_timeout:` route ran without a worker to run it on: {ended:#}"
+    );
+}
+
 /// The **hub** goes away between the question and the answer, and the wait comes
 /// back (§5, `docs/durability.md` §6).
 ///

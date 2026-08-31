@@ -184,6 +184,20 @@ export const flowEscalationNodeAskOutput = z.object({
 }).strict();
 export type FlowEscalationNodeAskOutput = z.infer<typeof flowEscalationNodeAskOutput>;
 
+/** `flow.impatient` — the module's parameters (grammar 7.5). */
+export const flowImpatientInputs = z.object({
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),
+}).strict();
+export type FlowImpatientInputs = z.infer<typeof flowImpatientInputs>;
+
+/**
+ * `flow.impatient` — the module's result, materialized from the state channels of the same names at quiescence (grammar 7.5, 7.6.3).
+ */
+export const flowImpatientOutputs = z.object({
+  approval: z.string(),
+}).strict();
+export type FlowImpatientOutputs = z.infer<typeof flowImpatientOutputs>;
+
 /** `flow.release` — the module's parameters (grammar 7.5). */
 export const flowReleaseInputs = z.object({
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }),

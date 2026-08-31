@@ -37,6 +37,14 @@
 #     whose question has a `timeout:`, so the wait's other ending — the budget
 #     runs out, and the redispatch raises the node's own `on_timeout:` — is
 #     reachable from the same agent, the same trigger and the same placement.
+#   * `flow.impatient` is the same escalation under a dispatching node whose own
+#     `timeout:` a test can wait out: `docs/distributed.md` §6.5 puts the
+#     redispatch's queueing *inside* that budget, so a node whose budget runs out
+#     before any worker claims the redispatch fails on it and the pause's
+#     `on_timeout:` route is never reached. That is the one interval a mesh adds
+#     to a wait, and the only place a placed pause is not indistinguishable from
+#     a local one — which is worth a flow of its own precisely because it is a
+#     divergence rather than a parity.
 #   * `flow.watched` is §6.4's distinction: a `map` over `flow.signed_off`, whose
 #     instances each dispatch a placed node and then ask a person about the
 #     answer. Two of them run at once, so one can reach its question while the
@@ -157,6 +165,17 @@ triggers:
       path: "payload.body.path"
     respond: async
     callback: "payload.body.callback_url"
+
+  # The same escalation with a dispatching node a test can outlive — see
+  # `flow.impatient`.
+  on_impatient:
+    type: http
+    flow: flow.impatient
+    path: /impatient-escalations
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
 
   # `session_key:` is here for `docs/distributed.md` §3.2's payload: the
   # execution identity a placed node runs under is the hub's to derive, and this
@@ -350,6 +369,43 @@ flow.escalated:
   nodes:
     escalate:
       agent: agent.escalator
+      input:
+        path: "input.path"
+      writes:
+        approval: approval
+  edges:
+    - { from: start, to: escalate }
+    - { from: escalate, to: end }
+
+# The same escalation, under a dispatching node whose own budget a test can wait
+# out — which is what makes `docs/distributed.md` §6.5's other half observable.
+#
+# A wait holds this node's `timeout:` still while the question is open, and
+# settling it starts the budget running again: what runs next is a redispatch
+# waiting for a session to claim it, and queueing is inside the budget. So a
+# placement nobody is claiming when the wait settles costs the node its budget
+# and the pause's own `on_timeout:` route is never reached, where the same node
+# unplaced would have taken that route in the same instant the wait expired.
+#
+# **Fifteen seconds, and the number is doing work.** It has to be long enough
+# that everything before the question — a worker claiming the dispatch, spawning
+# `src/worker-node.ts`, and one model call — fits inside it on a loaded machine
+# with room to spare, and short enough that a test can spend it. `flow.escalated`
+# takes the `defaults:` minute instead, because every test of it wants the budget
+# to be the thing that never happens.
+flow.impatient:
+  description: The same escalation, on a node that will not wait all day.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    approval:
+      type: string
+  nodes:
+    escalate:
+      agent: agent.escalator
+      timeout: 15s
       input:
         path: "input.path"
       writes:

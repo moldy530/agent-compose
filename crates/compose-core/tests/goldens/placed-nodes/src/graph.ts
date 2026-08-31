@@ -32,6 +32,7 @@ import {
   flowEscalatedInputs,
   flowEscalationInputs,
   flowEscalationNodeAskOutput,
+  flowImpatientInputs,
   flowReleaseInputs,
   flowRetriedInputs,
   flowSignedOffInputs,
@@ -156,6 +157,22 @@ const flowEscalationShape: runtime.Shape = {
 const flowEscalationNodeAskShape: runtime.Shape = {
   "properties": {
     "decision": "string"
+  }
+};
+
+/** `flow.impatient` — the `input` root inside it (grammar 7.5). */
+const flowImpatientShape: runtime.Shape = {
+  "properties": {
+    "path": "string"
+  }
+};
+
+/**
+ * `flow.impatient` node `escalate` — the `escalate.output` root its guards read.
+ */
+const flowImpatientNodeEscalateShape: runtime.Shape = {
+  "properties": {
+    "approval": "string"
   }
 };
 
@@ -1001,6 +1018,79 @@ const flowEscalationBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.impatient ---
+
+/** `flow.impatient` node `escalate` — `agent.escalator` (grammar 8.1). */
+const flowImpatientNodeEscalate: runtime.NodeDescriptor = {
+  flow: "flow.impatient",
+  node: "escalate",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the node, `on_error` from `defaults:`.
+  policy: {
+    timeoutMs: 15000,
+    onError: "fail",
+  },
+  shapes: { input: flowImpatientShape, state: stateShape, output: flowImpatientNodeEscalateShape },
+  input: (roots, view) => ({
+    "path": runtime.toJson(runtime.evaluate("input.path", roots)),
+  }),
+  run: async (input, context, view) => {
+    const answer = await mesh.dispatchPlaced({
+      placement: "mac",
+      node: "flow.impatient.escalate",
+      execution: view.run.execution.id,
+      itemIndex: view.run.execution.item_index,
+      path: runtime.instancePath(view, "escalate"),
+      inputs: input,
+      history: runtime.historyTurns(view.state["messages"] as unknown[]),
+      policy: view.run.policy,
+      signal: context.signal,
+      stores: context.storeRecords,
+    });
+    return {
+      output: runtime.parseResult(agentEscalatorOutput, answer.output, "the answer of `agent.escalator`"),
+      history: answer.history,
+      models: answer.models,
+      toolDispatches: answer.toolDispatches,
+    };
+  },
+  writes: [
+    { field: "approval", channel: "approval", reduce: "set" },
+  ],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.impatient` — its nodes, its `start` edges, and the compiled graph. */
+function flowImpatient() {
+  return new StateGraph(State)
+    .addNode("escalate", (state: GraphState) => runtime.runNode(flowImpatientNodeEscalate, state), {
+      ends: [END],
+    })
+    .addEdge(START, "escalate")
+    .compile();
+}
+
+/**
+ * `flow.impatient`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowImpatientGraph = flowImpatient();
+
+/**
+ * `flow.impatient` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowImpatientBinding: runtime.SubflowBinding = {
+  address: "flow.impatient",
+  outputs: ["approval"],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowImpatientGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowImpatientGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 // --- flow.release ---
 
 /** `flow.release` node `sign` — `agent.signer` (grammar 8.1). */
@@ -1547,6 +1637,22 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         outputKeys: flowEscalationGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
+  "flow.impatient": {
+    address: "flow.impatient",
+    inputs: ["path"],
+    inputKinds: { "path": "string", },
+    outputs: ["approval"],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowImpatientInputs, inputs, "the `inputs:` of `flow.impatient`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowImpatientGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowImpatientGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
   "flow.release": {
     address: "flow.release",
     inputs: ["path"],
@@ -2040,6 +2146,22 @@ export const placedNodes: Readonly<Record<string, mesh.PlacedRun>> = {
   "flow.direct.sign":
     async (input, context) => ({ output: await toolSign(input, context) }),
   "flow.escalated.escalate":
+    async (input, context, site) => {
+      const answer = await runtime.callAgent(
+        agentEscalator,
+        input,
+        site.history ?? [],
+        context,
+        { path: site.path, policy: site.policy },
+      );
+      return {
+        output: answer.output,
+        history: answer.history,
+        models: answer.models,
+        toolDispatches: answer.toolDispatches,
+      };
+    },
+  "flow.impatient.escalate":
     async (input, context, site) => {
       const answer = await runtime.callAgent(
         agentEscalator,

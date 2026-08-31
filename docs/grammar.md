@@ -2719,6 +2719,19 @@ q46, `docs/distributed.md` §3.4). The answer sends the node back through
 dispatch, so the timeout, the `on_error:` chain, the status shape and the
 lifecycle webhook are the single-process ones reached over the wire.
 
+What the wire does add is an **interval**, and it is the one place the two are
+not the same. A wait holds the dispatching node's `timeout:` still while the
+question is open
+([D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)), and
+settling it starts that budget running again — so the redispatch that carries the
+answer, or the expiry, queues inside what is left of it (§9.2,
+`docs/distributed.md` §6.5). A placed node that spends its budget waiting for a
+worker to take that redispatch fails on the budget, and neither the answer nor
+this block's own `on_timeout:` route is reached, where the same node unplaced
+would have routed in the instant the wait settled. It is the placed shape of a
+`timeout:` that bounds waiting for a machine rather than a second rule about
+waits, and it is worth knowing when the two budgets are written on one node.
+
 ### 8.8 `store`
 
 Deterministic, graph-invoked store operation — the second consumption surface of

@@ -796,6 +796,20 @@ expiry is journaled as the pause's record, the node is redispatched, and the
 replay raises the node's own `on_timeout:` route (grammar §8.7) — decided by the
 same line of the same function an unplaced pause's expiry is decided by.
 
+**The one interval a mesh adds is the redispatch's own queueing**, and it is
+inside the dispatching node's budget rather than outside it. The wait held that
+budget still (above); settling it — with an answer or with an expiry — starts it
+running again, and what runs next is a fresh row waiting for a session to claim
+it, which §6.5 makes part of what the node's `timeout:` bounds. So a node whose
+own budget runs out before any worker takes the redispatch fails on that budget,
+and neither the person's answer nor the pause's `on_timeout:` route is reached —
+where the same node unplaced would have taken the route in the same process, in
+the same instant the wait expired. That is the one place a placed pause is not
+indistinguishable from a local one, and it is the placed shape of "fail if the
+machine is not up in ten minutes" rather than a second rule: the budget the
+author wrote on the *dispatching* node is the one that bounds waiting for a
+machine, on this side of a wait exactly as on the other.
+
 **A hub restart between the pause and the answer costs nothing**, because the
 pause is journaled: the settled row carries it, and the replay that re-reaches
 the node re-derives the wait onto the new process's board — under the identity
@@ -1236,6 +1250,14 @@ grammar D102 holds the node's budget still while the question is open, exactly a
 it does for an unplaced node with a wait inside it (§2). "Fail if nobody approves
 in ten minutes" is therefore the `human:` block's own `timeout:`, not the placed
 node's — the same line it is without a mesh.
+
+**The budget starts running again the moment the wait settles**, so the
+redispatch that carries the answer — or the expiry — queues inside what is left
+of it, exactly as the first dispatch did. A node that has spent its `timeout:`
+waiting for a machine fails on it, and the answer or the `on_timeout:` route
+behind that redispatch is never reached (§3.4). Both halves are this section's
+one rule read at the two ends of a wait: thinking is outside the budget, and
+waiting for a machine is inside it.
 
 ### 6.6 The lifecycle webhook
 
@@ -1709,9 +1731,11 @@ worker is in the middle of running, and one between a placed pause and its
 answer), a hub opening a journal written before the dispatch board existed, a
 placed `human:` node whose question comes home and whose answer sends the node
 back to a worker — including the variant where the worker that asked is gone by
-the time the person decides, and the wait that is never answered at all, whose
-budget runs out on the hub and whose redispatch raises the node's own
-`on_timeout:` route on a worker — the refusals a worker stops on, and a fan-out
+the time the person decides, the wait that is never answered at all, whose budget
+runs out on the hub and whose redispatch raises the node's own `on_timeout:`
+route on a worker, and the one interval a mesh adds to a wait, where the
+dispatching node spends its own budget on a redispatch no worker claims and that
+route is never reached (§6.5) — the refusals a worker stops on, and a fan-out
 queued onto a pool of one.
 `crates/compose-core/tests/placement_surface_landing.rs` holds the surface to
 where it lands: the deploy layer's facts in `src/deployment.ts`, the wire in
