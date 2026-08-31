@@ -730,6 +730,7 @@ fn tools(
                     ToolImplementation::Exec { .. } => "a subprocess",
                     ToolImplementation::Http { .. } => "an HTTP request",
                     ToolImplementation::Function { .. } => "a host-registered function",
+                    ToolImplementation::Module { .. } => "an authored module",
                 }
             )],
         ));
@@ -773,6 +774,22 @@ fn tools(
                     "  return runtime.parseResult(\n    {output_schema},\n    await runtime.callFunction({}, input, context),\n    {},\n  );\n",
                     names::string(function.name.value.as_str()),
                     names::string(&format!("the result of `{address}`"))
+                ));
+            }
+            // The registry seam that imports the authored module and the
+            // dispatch through it are the second half of PRD resolved q48 and
+            // are not in this release. The arguments are still parsed above —
+            // a call whose arguments the schema refuses is refused the same way
+            // whatever the binding is — and the node then says what it cannot
+            // do, naming the file, the way a store on a backend this release
+            // does not open says it (see the module header).
+            ToolImplementation::Module { module } => {
+                text.push_str(&format!(
+                    "  void input;\n  throw new Error(\n    {},\n  );\n",
+                    names::string(&format!(
+                        "`{address}` is bound to `{}`, and this build does not dispatch a module binding yet",
+                        module.path.value
+                    ))
                 ));
             }
         }

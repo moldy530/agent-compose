@@ -1,0 +1,33 @@
+# rule: one package is pinned to one version across every `module:` binding (grammar 6.1, Decision D133)
+# code: invalid-dependency
+# message: `tool.verify` pins `@noble/hashes` to `1.5.0` and `tool.sign` pins it to `1.4.0`
+# at: main.yml:33:24
+# label: main.yml:22:24 first pinned here
+# help: the generated `package.json` holds one version of `@noble/hashes` and the artifact ships no lockfile to reconcile two, so both tools have to name one release (PRD resolved q49)
+#
+# The generated `package.json` is one document with one entry per package, and
+# no lockfile ships beside it, so a composition declaring two versions has no
+# build at all — which is why this is a refusal rather than a resolution.
+version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      "@noble/hashes": "1.4.0"
+
+tool.verify:
+  description: Verify a signature.
+  input:
+    signature: { type: string }
+  output:
+    ok: { type: boolean }
+  module:
+    path: ./src/tools/verify.ts
+    dependencies:
+      "@noble/hashes": "1.5.0"

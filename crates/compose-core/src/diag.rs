@@ -321,6 +321,18 @@ pub enum DiagnosticCode {
     UnsupportedVersion,
     /// An `imports:` entry is not a relative path to a spec file.
     InvalidImportPath,
+    /// A `module:` binding's path is not a project-relative path to a
+    /// TypeScript file inside the project, or names a file `build` emits
+    /// (grammar 6.1, PRD resolved q48). Its own class rather than an
+    /// [`InvalidImportPath`](Self::InvalidImportPath): the two paths point at
+    /// different kinds of file, take different extensions, and are repaired by
+    /// different edits, so a corpus asserting on one would be asserting about
+    /// the other's rule.
+    InvalidModulePath,
+    /// A `module:` binding's `dependencies:` entry is not a package name at an
+    /// exact version, or is one two declarations disagree about (grammar 6.1,
+    /// PRD resolved q49).
+    InvalidDependency,
 
     // --- construct shape --------------------------------------------------
     /// A mapping carries a key the construct does not define.
@@ -527,6 +539,8 @@ impl DiagnosticCode {
         Self::MisplacedSection,
         Self::UnsupportedVersion,
         Self::InvalidImportPath,
+        Self::InvalidModulePath,
+        Self::InvalidDependency,
         Self::UnknownKey,
         Self::MissingKey,
         Self::WrongType,
@@ -600,6 +614,8 @@ impl DiagnosticCode {
             Self::MisplacedSection => "misplaced-section",
             Self::UnsupportedVersion => "unsupported-version",
             Self::InvalidImportPath => "invalid-import-path",
+            Self::InvalidModulePath => "invalid-module-path",
+            Self::InvalidDependency => "invalid-dependency",
             Self::UnknownKey => "unknown-key",
             Self::MissingKey => "missing-key",
             Self::WrongType => "wrong-type",

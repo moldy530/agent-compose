@@ -192,3 +192,40 @@ pub struct FunctionBinding {
     /// The block's own span.
     pub span: Span,
 }
+
+/// A `module:` implementation binding: a hand-authored TypeScript file inside
+/// the project, under the contract the tool's own `input:`/`output:` fixes
+/// (grammar 6.1, PRD resolved q48, q49).
+///
+/// The scalar form — `module: ./src/tools/sign.ts` — is the same block with
+/// nothing but its `path:`, so a tool that reads no environment and pulls in no
+/// package writes one line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModuleBlock {
+    /// `path:` — the project-relative path of the authored file, `/`-separated
+    /// and ending in `.ts`.
+    pub path: Option<Spanned<String>>,
+    /// `env:` — the environment this module's code may read. Declared rather
+    /// than walked, because `References::of` cannot follow a `process.env` read
+    /// inside arbitrary TypeScript (PRD resolved q49); interpolable, exactly as
+    /// an `exec:` block's `env:` is (grammar 4.3 class 2).
+    pub env: Vec<InterpolatedEntry>,
+    /// `dependencies:` — the npm packages the module imports, each pinned to an
+    /// exact version (PRD resolved q49).
+    pub dependencies: Vec<DependencyEntry>,
+    /// The block's own span. For the scalar form this is the path's own span,
+    /// which is the only region the binding occupies.
+    pub span: Span,
+}
+
+/// One `dependencies:` entry of a [`ModuleBlock`]: a package name and the exact
+/// version it is pinned to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyEntry {
+    /// The package name, kept raw: npm names are not identifiers.
+    pub package: Spanned<String>,
+    /// The exact version. Never a range — the artifact ships no lockfile, so a
+    /// pin is what keeps the hub's install and every worker's resolving one
+    /// tree (PRD resolved q49).
+    pub version: Spanned<String>,
+}

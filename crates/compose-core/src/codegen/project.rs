@@ -340,16 +340,24 @@ naming every variable that is missing rather than the first (PRD 5.9, grammar
 compile time, which is what keeps this directory committable and free of
 credentials.
 
-`src/` is owned by the compiler: `agent-compose build` replaces the modules it
-emits, removes the ones it no longer emits, and `agent-compose build --check`
-reports either as drift. `package.json`, `tsconfig.json`, `.gitignore` and this
-README are generated too, and a rebuild replaces them. Everything else in this
-directory — `node_modules/`, a lockfile, a `.env` — is yours and is never
-removed.
+**The file list above is the boundary.** `agent-compose build` replaces exactly
+the files in that table and `agent-compose build --check` compares exactly them;
+nothing else in this directory is written, removed, or reported. A
+`node_modules/`, a lockfile, a `.env` — and any TypeScript you wrote — are yours,
+wherever they sit. `src/` is not a compiler-only directory: what makes a file the
+compiler's is being on that list.
 
-Every file the compiler replaces or removes carries the header above, which is
-how it tells its own work from yours: a `build` into a directory holding none of
-its files refuses rather than overwriting what is there.
+Every file the compiler replaces carries the header above, which is how it tells
+its own work from yours: a `build` into a directory holding none of its files
+refuses rather than overwriting what is there.
+
+`src/tools/` is where your own code goes. A `tool.*` in the composition may bind
+`module: ./src/tools/<name>.ts`, and `build` writes that file **once** — the
+typed signature, the contract as a doc comment, a body that throws — then never
+writes it again and never reads it. Fill it in and commit it: the tool's declared
+`input:` and `output:` are its contract, and `bun run typecheck` is what holds it
+there. The directory is a convention rather than a rule; the file list is the
+rule.
 
 ## Running it
 

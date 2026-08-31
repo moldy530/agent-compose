@@ -1,0 +1,18 @@
+# rule: a `module:` binding's authored file exists (grammar 6.1, Decision D132)
+# code: io-error
+# message: `tool.sign` is implemented by `src/tools/sign.ts`, which does not exist
+# at: main.yml:18:11
+# help: run `agent-compose build`: it scaffolds a referenced module it cannot find — the typed signature, the contract as a doc comment, and a body that throws — once, and never writes that file again (grammar 6.1, PRD resolved q48)
+#
+# The repair is a command rather than an edit, which is why the diagnostic names
+# it: `build` writes the stub, `validate` and `build --check` say it is not
+# there. This project has no `src/` at all, so there is nothing to find.
+version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts

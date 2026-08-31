@@ -1,0 +1,14 @@
+# rule: a `module:` path is compile-time identity and interpolates nothing (grammar 4.3 class 3, 6.1)
+# code: unexpected-env-ref
+# message: `path` never interpolates environment references, but it contains `${TOOLS}`
+# at: 14:11
+# help: write `$${TOOLS}` for a literal `${TOOLS}`
+# count: 2
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    path: "${TOOLS}/sign.ts"

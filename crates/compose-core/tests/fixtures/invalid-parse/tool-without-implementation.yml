@@ -1,8 +1,8 @@
 # rule: a tool declares exactly one implementation binding (grammar 6, Decision D25)
 # code: missing-key
-# message: tool definition `tool.probe` declares no implementation: a tool carries exactly one of `exec`, `http`, `function`
+# message: tool definition `tool.probe` declares no implementation: a tool carries exactly one of `exec`, `http`, `function`, `module`
 # at: 7:3
-# help: `exec` runs a subprocess, `http` calls an endpoint, `function` names a host-registered function
+# help: `exec` runs a subprocess, `http` calls an endpoint, `function` names a host-registered function, `module` names a TypeScript file in this project
 tool.probe:
   description: Probe the deployment.
   input: {}

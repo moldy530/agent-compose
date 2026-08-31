@@ -45,6 +45,7 @@
 //! | [`components`] | 7.5, 7.7, 13.3 | recursion, and a `respond: sync` trigger's flow reaching a `human` node |
 //! | [`placements`] | 14.1 | an attached tool's placement against the placement of every agent that attaches it, and a store on a process-local backend against the processes that can open it |
 //! | [`fanout`] | 8.6 | `map.over` dominance, and `detach:` under a durably checkpointed target |
+//! | [`modules`] | 6.1 | the dependency set of every `module:` binding, read for one version per package |
 //!
 //! Where a rule splits across the two families — `map.over` resolves a path in
 //! [`maps`] and proves dominance in [`fanout`] — each half is stated where its
@@ -79,6 +80,7 @@ pub(crate) mod graph;
 pub(crate) mod guards;
 pub(crate) mod maps;
 pub(crate) mod model;
+pub mod modules;
 pub(crate) mod placements;
 pub(crate) mod providers;
 pub(crate) mod reach;
@@ -114,6 +116,7 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
     placements::check(&mut ctx);
     placements::check_stores(&mut ctx);
     components::check(&mut ctx);
+    modules::check(&mut ctx);
 
     let ir = ctx.ir;
     for (address, definition) in &ir.definitions {

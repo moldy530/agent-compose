@@ -791,9 +791,129 @@ pub(crate) fn keyword<T: Copy>(
     None
 }
 
+/// Whether one `/`-separated segment is a portable file-name segment
+/// (grammar 1.4's path form): `[A-Za-z0-9_][A-Za-z0-9_.-]*`.
+///
+/// `.` and `..` are handled by the callers, which give them meaning rather than
+/// treating them as names.
+fn is_path_segment(segment: &str) -> bool {
+    let mut bytes = segment.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+/// Whether a written path takes grammar 1.4's portable form, with `extensions`
+/// as the endings its last segment may take.
+///
+/// One reader for both path surfaces this grammar has — an `imports:` entry and
+/// a `module:` binding — because "one portable spelling" (grammar 1.4) is a
+/// property of paths in this DSL rather than of one key that carries them. What
+/// differs between them is the extension and nothing else.
+#[must_use]
+pub(crate) fn is_relative_path(path: &str, extensions: &[&str]) -> bool {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') {
+        return false;
+    }
+    if path.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments
+        .iter()
+        .any(|segment| !matches!(*segment, "." | "..") && !is_path_segment(segment))
+    {
+        return false;
+    }
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    extensions
+        .iter()
+        .any(|extension| last.len() > extension.len() && last.ends_with(extension))
+}
+
+/// Normalize a `/`-separated relative path lexically, or `None` when it climbs
+/// out of the project root.
+///
+/// Lexical rather than filesystem-based on purpose: resolving symlinks would
+/// make the composition depend on the machine it is resolved on, which PRD 5.12
+/// forbids.
+///
+/// The root is a fence rather than a floor: a `..` that pops past position 0
+/// fails the path even when a later segment would climb back in. Deciding
+/// `../proj/f.yml` would mean comparing `proj` against the name of the directory
+/// the project was checked out into — so the same composition would resolve on
+/// one machine and not on another, which is the thing grammar 1.4's
+/// one-portable-spelling rule and PRD 5.12 both exist to prevent. It cannot even
+/// be asked uniformly: an entrypoint given as a bare `main.yml` has `""` for a
+/// root, and `""` has no name to compare against.
+///
+/// Shared by the two path surfaces for the reason [`is_relative_path`] is
+/// shared: `imports:` and a `module:` binding are both project-relative names,
+/// and two normalizers would be two answers to where the root is.
+#[must_use]
+pub(crate) fn normalize_relative(path: &str) -> Option<String> {
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "." | "" => {}
+            ".." => {
+                segments.pop()?;
+            }
+            name => segments.push(name),
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(segments.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_paths_take_one_portable_form() {
+        assert!(is_relative_path("src/tools/sign.ts", &[".ts"]));
+        assert!(is_relative_path("./src/tools/sign.ts", &[".ts"]));
+        assert!(is_relative_path("a/../b.ts", &[".ts"]));
+        assert!(!is_relative_path("/opt/sign.ts", &[".ts"]));
+        assert!(!is_relative_path("src\\tools\\sign.ts", &[".ts"]));
+        assert!(!is_relative_path("src/my tool.ts", &[".ts"]));
+        assert!(!is_relative_path("https://host/sign.ts", &[".ts"]));
+        assert!(!is_relative_path("src/tools/sign.js", &[".ts"]));
+        assert!(!is_relative_path("src/tools/.ts", &[".ts"]));
+        assert!(!is_relative_path("", &[".ts"]));
+        assert!(is_relative_path("models.yml", &[".yml", ".yaml"]));
+    }
+
+    #[test]
+    fn paths_normalize_lexically() {
+        assert_eq!(
+            normalize_relative("agents/reviewer.yml").as_deref(),
+            Some("agents/reviewer.yml")
+        );
+        assert_eq!(
+            normalize_relative("./models.yml").as_deref(),
+            Some("models.yml")
+        );
+        assert_eq!(normalize_relative("a/./b.yml").as_deref(), Some("a/b.yml"));
+        assert_eq!(normalize_relative("a/../b.yml").as_deref(), Some("b.yml"));
+        assert_eq!(
+            normalize_relative("a/b/../../c.yml").as_deref(),
+            Some("c.yml")
+        );
+        assert_eq!(normalize_relative("../outside.yml"), None);
+        assert_eq!(normalize_relative("a/../../outside.yml"), None);
+        // A path that climbs out and back in is refused too: whether it landed
+        // inside would depend on the name of the directory the project was
+        // checked out into, and a bare `main.yml` entrypoint has no such name.
+        assert_eq!(normalize_relative("../project/models.yml"), None);
+        assert_eq!(normalize_relative("a/../../a/models.yml"), None);
+    }
 
     #[test]
     fn identifier_grammar() {

@@ -1,44 +1,81 @@
-//! `agent-compose build`: the emission set on disk, and the check that it still
-//! matches.
+//! `agent-compose build`: the emission set on disk, the check that it still
+//! matches, and the one file a build writes that it does not own.
 //!
 //! `compose_core::emit` answers a set of `(path, contents)` pairs and touches
 //! nothing (see `compose_core::codegen`). This module is the half that does:
 //! writing that set into a directory, and — under `--check` — comparing it
 //! against what is already there without writing anything.
 //!
-//! # What the compiler owns
+//! # The manifest is the boundary
 //!
-//! Ownership is claimed by the **generated-file header**, not by a path.
-//! `<out>/src/` is the compiler's *directory* — it is the one place a build
-//! removes files from — but the five files it writes at the root
-//! (`package.json`, `tsconfig.json`, `README.md`, `.gitignore`, `manifest.json`)
-//! sit in a directory that may be someone's project, so being emitted is not on
-//! its own a licence to replace what is already there. So:
+//! PRD resolved q47: **`build` overwrites and `--check`s exactly its own emitted
+//! file list, and never writes, deletes, or reports anything else under the
+//! output directory.** `compose_core::codegen::EMITTED_PATHS` is that list, and
+//! it is the whole of the compiler's claim on a directory. So:
 //!
-//! * **writing** replaces every emitted file and **removes** any other file under
-//!   `src/` *that this compiler wrote*, then prunes the directories **that
-//!   removal** left empty. A module that was renamed between two compiler
-//!   releases would otherwise linger, still importable, and `--check` would
-//!   report it forever on a project that had just been rebuilt. A file under
-//!   `src/` with no generated-file header is not the compiler's to delete, and
-//!   an emitted path already occupied in a directory the compiler has never
-//!   built into is not its to replace; either one stops the write instead — see
-//!   [`write`] — because `--out` can name a directory the compiler never made.
-//!   An empty directory under `src/` is neither: it holds nothing to lose and
-//!   nothing to refuse over, so it is simply left where it is
-//!   ([`prune_emptied_directories`]).
-//! * **checking** reports a file that is missing, one whose bytes differ, and one
-//!   under `src/` that the emitter did not produce — the three ways a committed
-//!   project can stop matching its spec (PRD §8: "hand-edited generated code
-//!   forks the source of truth", mitigated by "`build --check` in CI"). It also
-//!   answers, through [`not_ours`], whether a rebuild would *fix* what it found,
-//!   because a drift report ends in a remedy and the two ways a directory can
-//!   drift are not the two the write treats alike: a stale module the compiler
-//!   wrote and somebody's own file are both "under `src/` and not emitted", and
-//!   `build` removes the first and refuses over the second.
-//! * neither **removes** anything outside `src/`. `node_modules/`, a lockfile, and
-//!   a `.env` live in `<out>` beside the generated files, and a build that deleted
-//!   them would make the output directory unusable as a project directory.
+//! * **writing** replaces every emitted file and removes nothing at all. A file
+//!   the compiler does not emit is not the compiler's, wherever it sits — a
+//!   `node_modules/`, a `.env`, and the hand-authored TypeScript a `module:`
+//!   binding names are all the same case, and the last of them is why the rule
+//!   has to be stated this way rather than "everything under `src/` is ours"
+//!   (grammar 6.1).
+//! * **checking** reports a file that is missing and one whose bytes differ —
+//!   the two ways a committed project can stop matching its spec (PRD §8:
+//!   "hand-edited generated code forks the source of truth", mitigated by
+//!   "`build --check` in CI"). There is no third way any more: a file the
+//!   emitter does not produce is not drift, because drift is a disagreement
+//!   about a file the compiler claims.
+//! * neither **removes** anything, anywhere.
+//!
+//! What that costs, said plainly: a module an older compiler release wrote and
+//! this one no longer emits stays where it is, importable, until somebody
+//! deletes it. The alternative was a walk of `src/` that removed whatever
+//! carried the generated-file header — which is what made a build a read of its
+//! own previous output, and is the machinery q47 removes so that authored code
+//! can live in the same tree with no marker protocol guarding it.
+//!
+//! # The two things a build refuses over
+//!
+//! **An emitted name an authored file already holds.** `--out` can name any
+//! path — an existing Node project, an ejected copy, `.` — and a first build
+//! into one that replaced `package.json`, `README.md` or `src/graph.ts` because
+//! they happened to share a name would destroy somebody's project and report
+//! nothing. [`claimed`] asks the question once, for the whole directory: a
+//! directory holding even one file this compiler wrote is one it has built into,
+//! and every emitted path in it is a build artifact. A directory holding none of
+//! them may be anything, and an emitted path already occupied there stops the
+//! write, naming both sides.
+//!
+//! The question is about the *directory* rather than about each file on purpose.
+//! Inside a directory this compiler built, a generated file somebody edited —
+//! header and all — is exactly what PRD §8 says to regenerate and what the drift
+//! report sends the reader to `build` for; a per-file rule would answer that
+//! instruction with a refusal.
+//!
+//! # The one file a build writes and does not own, in the one tree that is not
+//! the output directory
+//!
+//! A `module:` binding names authored TypeScript, and `build` **scaffolds** it
+//! when it is absent: once, with the typed signature and a body that throws
+//! (`compose_core::codegen::authored`). A scaffold is not an emitted file — it is
+//! not in the manifest, `--check` never compares it, and a rebuild that finds it
+//! present writes nothing. `build` never reads what is in it.
+//!
+//! It goes in the **project**, not in `--out`, and that is not an arbitrary
+//! choice: a `module:` path is project-relative, like an `imports:` entry
+//! (grammar 6.1, 1.4), and `agent-compose validate` — which takes no `--out` at
+//! all — is required to refuse a binding whose file is missing. One place the
+//! path can mean, and it is the entrypoint's own directory. So [`write`] takes
+//! two roots: the output directory it emits into, and the project the authored
+//! half lives in. The path is the same *inside the artifact*, which is exactly
+//! why a binding may not name a file the emitter writes — under that rule the
+//! authored file's project-relative name and its name in the shipped tree are
+//! one string with no collision possible.
+//!
+//! `--check` does not scaffold, and does not stay silent either: a missing
+//! implementation is refused before this module is reached, by
+//! `compose_core::check_modules`, with the diagnostic naming `build` as the
+//! repair — the same sentence `validate` prints.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -46,6 +83,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use compose_core::GeneratedProject;
+use compose_core::codegen::authored::Scaffold;
 
 /// One way the directory disagrees with what the compiler would emit.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -56,15 +94,13 @@ pub(crate) struct Drift {
     pub(crate) state: State,
 }
 
-/// The three ways a generated project can stop matching its spec.
+/// The two ways a generated project can stop matching its spec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum State {
     /// The compiler emits it and the directory does not have it.
     Missing,
     /// Both have it and the bytes differ.
     Differs,
-    /// The directory has it under `src/` and the compiler does not emit it.
-    Unexpected,
 }
 
 impl State {
@@ -72,7 +108,6 @@ impl State {
         match self {
             Self::Missing => "missing",
             Self::Differs => "differs",
-            Self::Unexpected => "unexpected",
         }
     }
 
@@ -81,7 +116,6 @@ impl State {
         match self {
             Self::Missing => "is not in the output directory",
             Self::Differs => "differs from what the spec produces",
-            Self::Unexpected => "is under `src/` and is not generated",
         }
     }
 }
@@ -97,9 +131,10 @@ impl fmt::Display for Drift {
 pub(crate) struct Written {
     /// How many files the emitter produced.
     pub(crate) files: usize,
-    /// Files removed from under `src/` because the emitter no longer produces
-    /// them, sorted.
-    pub(crate) removed: Vec<String>,
+    /// The authored implementations this build scaffolded because they were
+    /// absent, as `(path, tool)`, sorted by path. A build that finds them all
+    /// present scaffolds nothing.
+    pub(crate) scaffolded: Vec<(String, String)>,
 }
 
 /// Why a write did not happen.
@@ -107,8 +142,8 @@ pub(crate) struct Written {
 pub(crate) enum Refusal {
     /// The filesystem said no.
     Io(io::Error),
-    /// The write would have replaced or removed files this compiler did not
-    /// write. The paths, sorted.
+    /// The write would have replaced files this compiler did not write. The
+    /// paths, sorted.
     NotOurs(Vec<String>),
 }
 
@@ -120,54 +155,33 @@ impl From<io::Error> for Refusal {
 
 /// The marker every generated file opens with (`compose_core::codegen::header`).
 ///
-/// Ownership of `src/` is claimed by *this* string rather than by the directory
-/// existing: it is the only evidence on disk that a file came from a spec.
+/// Ownership of an emitted **name** is claimed by *this* string rather than by
+/// the path existing: it is the only evidence on disk that a file came from a
+/// spec. A scaffolded module deliberately does not carry it — it is the
+/// author's, and the compiler's only interaction with it is asking whether it is
+/// there.
 const GENERATED_MARKER: &str = "generated by agent-compose";
 
-/// Write the whole emission set, and remove whatever else is under `src/`.
+/// Write the whole emission set into `out`, and scaffold into `root` the
+/// authored modules that are not there yet.
 ///
-/// # The check before the write
+/// **Two roots, because there are two trees.** `out` is the generated project;
+/// `root` is the project the composition was read from, which is where a
+/// `module:` path is resolved and therefore where an absent implementation is
+/// written (see the module header).
 ///
-/// `src/` is the compiler's directory (see the module header), and a build that
-/// removes a stale module from it is doing its job. But "the compiler's
-/// directory" is a claim about a directory the compiler *made*, and `--out` can
-/// name any path — an existing Node project, a checkout of an ejected copy, `.`.
-/// Deleting a `src/` full of someone's own TypeScript, silently, on the first
-/// build into it, is not a rule about generated code; it is data loss.
-///
-/// The same sentence, word for word, covers the five files the emitter writes at
-/// the root. A `package.json` naming somebody's application, a hand-written
-/// `README.md`, a `.gitignore` with their own entries in it: all five are paths
-/// this compiler emits, and a first build that replaced them because they
-/// happened to share a name would destroy exactly as much as an emptied `src/`,
-/// while reporting *less* — an overwrite leaves no [`Written::removed`] entry to
-/// notice.
-///
-/// So there are two questions, and they are asked of different things:
-///
-/// * **Is this directory one this compiler has built into?** [`claimed`] answers
-///   it once, for the whole write, by looking for [`GENERATED_MARKER`] at any
-///   path the emitter produces. If nothing there is this compiler's, then an
-///   emitted path that is already occupied belongs to somebody else and the
-///   write stops.
-/// * **Is this individual file one this compiler wrote?** Asked only of files
-///   under `src/` that the emitter does *not* produce, because the answer decides
-///   whether to **delete** them.
-///
-/// The first question is about the directory rather than about each file on
-/// purpose. Inside a directory this compiler built, a generated file that has
-/// been hand-edited — header and all — is exactly what PRD §8 says to
-/// regenerate, and what the drift report tells the reader to run `build` for; a
-/// rule that refused it would send them to a command that then refuses too.
-/// Outside one, no file at an emitted path has ever been the compiler's.
-///
-/// Either refusal is [`Refusal::NotOurs`] naming the paths, and nothing has been
-/// written or deleted when it happens, because both scans run first. The
-/// removals that do happen come back in [`Written::removed`] and are reported, so
-/// "the build also deleted three files" is something the run says rather than
-/// something a later `git status` discovers.
-pub(crate) fn write(project: &GeneratedProject, out: &Path) -> Result<Written, Refusal> {
-    let Existing { stale, foreign } = existing(project, out)?;
+/// A refusal is [`Refusal::NotOurs`] naming the paths, and nothing has been
+/// written when it happens, because the scan runs first. The scaffolds that do
+/// happen come back in [`Written::scaffolded`] and are reported, so "the build
+/// also wrote you a stub" is something the run says rather than something a
+/// later `git status` discovers.
+pub(crate) fn write(
+    project: &GeneratedProject,
+    scaffolds: &[Scaffold],
+    out: &Path,
+    root: &Path,
+) -> Result<Written, Refusal> {
+    let foreign = not_ours(project, out)?;
     if !foreign.is_empty() {
         return Err(Refusal::NotOurs(foreign));
     }
@@ -179,56 +193,28 @@ pub(crate) fn write(project: &GeneratedProject, out: &Path) -> Result<Written, R
         }
         std::fs::write(&path, &file.contents)?;
     }
-    for path in &stale {
-        std::fs::remove_file(at(out, path))?;
+
+    // **After** the emitted set, and only where the file is absent. A scaffold
+    // is a write `build` makes once; a rebuild finds the file there and leaves
+    // the author's bytes alone, without reading them (PRD resolved q48).
+    let mut scaffolded: Vec<(String, String)> = Vec::new();
+    for scaffold in scaffolds {
+        let path = at(root, &scaffold.path);
+        if path.exists() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &scaffold.contents)?;
+        scaffolded.push((scaffold.path.clone(), scaffold.tool.clone()));
     }
-    prune_emptied_directories(out, &stale)?;
+    scaffolded.sort();
 
     Ok(Written {
         files: project.files().len(),
-        removed: stale,
+        scaffolded,
     })
-}
-
-/// What is already in the output directory, sorted into the two answers
-/// [`write`]'s two questions reach.
-struct Existing {
-    /// Under `src/`, not emitted, and carrying the generated-file header: the
-    /// write's to remove.
-    stale: Vec<String>,
-    /// Paths this compiler did not write that the write would have replaced or
-    /// removed. Any one of them stops it ([`Refusal::NotOurs`]).
-    foreign: Vec<String>,
-}
-
-/// Ask the directory both of [`write`]'s questions, touching nothing.
-fn existing(project: &GeneratedProject, out: &Path) -> io::Result<Existing> {
-    let emitted: BTreeSet<&str> = project.paths().collect();
-    let mut stale = Vec::new();
-    let mut foreign = Vec::new();
-    // What is under `src/` and is not emitted: this compiler's to remove when it
-    // wrote it, and not its to remove otherwise.
-    for path in owned_files(out)? {
-        if emitted.contains(path.as_str()) {
-            continue;
-        }
-        if generated(&at(out, &path))? {
-            stale.push(path);
-        } else {
-            foreign.push(path);
-        }
-    }
-    // …and, in a directory this compiler has never built into, what *is* emitted
-    // and already there — which the write would replace.
-    if !claimed(project, out)? {
-        for path in project.paths() {
-            if occupied(&at(out, path))? {
-                foreign.push(path.to_string());
-            }
-        }
-    }
-    foreign.sort();
-    Ok(Existing { stale, foreign })
 }
 
 /// What a [`write`] would refuse over, answered without writing: the payload
@@ -237,20 +223,28 @@ fn existing(project: &GeneratedProject, out: &Path) -> io::Result<Existing> {
 ///
 /// `--check` needs this for a reason `write` does not have: its report ends in a
 /// remedy, and "run `agent-compose build`" is the wrong one for a directory
-/// `build` declines to touch. The two ways a file can be "under `src/` and not
-/// emitted" are indistinguishable in a [`Drift`] — a module an older compiler
-/// release wrote and somebody's own TypeScript are both [`State::Unexpected`] —
-/// and they are the two the write treats *differently*, so the report cannot
-/// tell them apart on its own. Reading the answer off the same scan the write
+/// `build` declines to touch. Reading the answer off the same scan the write
 /// makes is what keeps the help from promising something the next command
 /// refuses.
 pub(crate) fn not_ours(project: &GeneratedProject, out: &Path) -> io::Result<Vec<String>> {
-    Ok(existing(project, out)?.foreign)
+    // In a directory this compiler has built into, every emitted path is its
+    // own to replace — including one whose header an edit removed, which is what
+    // PRD §8 says to regenerate.
+    if claimed(project, out)? {
+        return Ok(Vec::new());
+    }
+    let mut foreign: BTreeSet<String> = BTreeSet::new();
+    for path in project.paths() {
+        if occupied(&at(out, path))? {
+            foreign.insert(path.to_string());
+        }
+    }
+    Ok(foreign.into_iter().collect())
 }
 
 /// Whether the output directory already holds something this compiler wrote.
 ///
-/// The evidence is [`GENERATED_MARKER`] at any path the emitter produces: a
+/// The evidence is [`GENERATED_MARKER`] at a path the emitter produces: a
 /// directory holding even one of this compiler's files is one it has built into,
 /// and every emitted path in it is a build artifact rather than somebody's file
 /// that happens to share a name. A directory holding none of them may be
@@ -283,9 +277,9 @@ fn occupied(path: &Path) -> io::Result<bool> {
 /// Whether a file on disk carries the generated-file header.
 ///
 /// Only the first bytes are read: the marker is on the first line of every
-/// emitted file, and a `src/` holding something large that is not ours should not
-/// be loaded into memory to find that out. A file that is not UTF-8 is not one
-/// this compiler wrote.
+/// emitted file, and something large that is not ours should not be loaded into
+/// memory to find that out. A file that is not UTF-8 is not one this compiler
+/// wrote.
 fn generated(path: &Path) -> io::Result<bool> {
     use std::io::Read;
 
@@ -303,7 +297,9 @@ fn generated(path: &Path) -> io::Result<bool> {
 
 /// Compare the emission set against the directory, writing nothing.
 ///
-/// Answers the drift, sorted by path.
+/// Answers the drift, sorted by path. Exactly the emission set is compared:
+/// nothing else under the output directory is the compiler's to have an opinion
+/// about (see the module header).
 pub(crate) fn check(project: &GeneratedProject, out: &Path) -> io::Result<Vec<Drift>> {
     let mut drift = Vec::new();
     for file in project.files() {
@@ -320,18 +316,6 @@ pub(crate) fn check(project: &GeneratedProject, out: &Path) -> io::Result<Vec<Dr
             Err(error) => return Err(error),
         }
     }
-
-    let emitted: BTreeSet<&str> = project.paths().collect();
-    for unexpected in owned_files(out)?
-        .into_iter()
-        .filter(|path| !emitted.contains(path.as_str()))
-    {
-        drift.push(Drift {
-            path: unexpected,
-            state: State::Unexpected,
-        });
-    }
-
     drift.sort();
     Ok(drift)
 }
@@ -341,79 +325,6 @@ fn at(out: &Path, path: &str) -> PathBuf {
     let mut full = out.to_path_buf();
     full.extend(path.split('/'));
     full
-}
-
-/// Every file under `<out>/src`, as `/`-separated paths relative to `<out>`,
-/// sorted.
-///
-/// A missing `src/` is not an error: it is what a first build finds.
-fn owned_files(out: &Path) -> io::Result<Vec<String>> {
-    let root = out.join(compose_core::codegen::OWNED_DIRECTORY);
-    let mut found = Vec::new();
-    let mut queue = vec![root.clone()];
-    while let Some(directory) = queue.pop() {
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                queue.push(path);
-                continue;
-            }
-            let relative = path
-                .strip_prefix(out)
-                .expect("the walk started inside the output directory");
-            found.push(
-                relative
-                    .components()
-                    .map(|component| component.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/"),
-            );
-        }
-    }
-    found.sort();
-    Ok(found)
-}
-
-/// Remove the directories **this write** emptied: the ancestors, under `src/`,
-/// of the files it removed, deepest first.
-///
-/// A module that moved between two compiler releases leaves its directory
-/// behind, and a rebuild that left it there would report drift forever on a
-/// project it had just rebuilt — so the removal has to take the directory with
-/// it. What it must not take is a directory the compiler never created. An empty
-/// `src/vendor/` is not a file, so [`owned_files`] does not see it, [`claimed`]
-/// has nothing to refuse over it, and a sweep of every empty directory under
-/// `src/` deleted it on the *first* build into the directory — the one case the
-/// module header says is not the compiler's to touch.
-///
-/// Scoping it to the ancestors of what was removed is the whole of the fix: a
-/// directory this write did not empty is a directory it has no claim on,
-/// whatever else is or is not in it.
-fn prune_emptied_directories(out: &Path, removed: &[String]) -> io::Result<()> {
-    let root = out.join(compose_core::codegen::OWNED_DIRECTORY);
-    let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
-    for path in removed {
-        let mut directory = at(out, path);
-        while directory.pop() && directory.starts_with(&root) {
-            directories.insert(directory.clone());
-        }
-    }
-    // Deepest first, so a directory holding only directories this write emptied
-    // is empty by the time it is reached.
-    let mut directories: Vec<PathBuf> = directories.into_iter().collect();
-    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for directory in directories {
-        if std::fs::read_dir(&directory).is_ok_and(|mut entries| entries.next().is_none()) {
-            std::fs::remove_dir(&directory)?;
-        }
-    }
-    Ok(())
 }
 
 /// Where `--out` points when it was not given: `<project>/build/<target>`.
@@ -452,6 +363,36 @@ mod tests {
         entrypoint
     }
 
+    /// A composition with one `module:` binding: the project it emits, the
+    /// scaffolds it asks for, and the **project root** they are written into,
+    /// which is the entrypoint's own directory rather than `--out`.
+    fn with_module() -> (GeneratedProject, Vec<Scaffold>, PathBuf) {
+        let directory = scratch("module-spec");
+        let entrypoint = directory.join("main.yml");
+        std::fs::write(
+            &entrypoint,
+            r#"version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+"#,
+        )
+        .expect("the entrypoint is writable");
+        let resolution = compose_core::resolve(entrypoint.as_path());
+        assert!(resolution.diagnostics.is_empty());
+        let ir = resolution.ir.expect("an artifact");
+        (
+            compose_core::emit(&ir),
+            compose_core::codegen::authored::scaffolds(&ir),
+            directory,
+        )
+    }
+
     fn scratch(purpose: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -470,10 +411,10 @@ mod tests {
         let project = project();
         let out = scratch("clean");
         assert_eq!(
-            write(&project, &out).expect("the directory is writable"),
+            write(&project, &[], &out, &out).expect("the directory is writable"),
             Written {
                 files: project.files().len(),
-                removed: Vec::new(),
+                scaffolded: Vec::new(),
             }
         );
         assert_eq!(
@@ -486,7 +427,7 @@ mod tests {
     fn an_edited_file_and_a_deleted_one_are_both_drift() {
         let project = project();
         let out = scratch("edited");
-        write(&project, &out).expect("writable");
+        write(&project, &[], &out, &out).expect("writable");
         std::fs::write(out.join("src/state.ts"), "// mine now\n").expect("writable");
         std::fs::remove_file(out.join("src/env.ts")).expect("removable");
         assert_eq!(
@@ -504,171 +445,85 @@ mod tests {
         );
     }
 
-    /// `src/` is the compiler's directory: a module *it* wrote that the emitter
-    /// no longer produces is drift, and a rebuild removes it and says so.
-    /// Everything outside is the user's and is left alone.
+    /// The boundary, in the direction that changed: a file the emitter does not
+    /// produce is not the compiler's, wherever it sits. It is not drift, it is
+    /// not removed, and it does not stop a rebuild — which is what makes an
+    /// authored `src/tools/sign.ts` able to live beside generated modules at all
+    /// (PRD resolved q47).
     #[test]
-    fn a_stale_generated_module_is_drift_and_a_rebuild_removes_it() {
+    fn a_file_the_emitter_does_not_produce_is_left_alone_everywhere() {
         let project = project();
-        let out = scratch("stale");
-        write(&project, &out).expect("writable");
-        std::fs::create_dir_all(out.join("src/nodes")).expect("writable");
+        let out = scratch("not-emitted");
+        write(&project, &[], &out, &out).expect("writable");
+
+        std::fs::create_dir_all(out.join("src/tools")).expect("writable");
+        std::fs::write(out.join("src/tools/sign.ts"), "export default 1;\n").expect("writable");
+        // …including one an older compiler release wrote, which the build no
+        // longer claims.
         std::fs::write(
-            out.join("src/nodes/old.ts"),
+            out.join("src/old.ts"),
             "// This file was generated by agent-compose 0.0.1 from `main.yml`.\n",
         )
         .expect("writable");
         std::fs::create_dir_all(out.join("node_modules/left")).expect("writable");
         std::fs::write(out.join("node_modules/left/index.js"), "//\n").expect("writable");
-        std::fs::write(out.join("package-lock.json"), "{}\n").expect("writable");
 
         assert_eq!(
             check(&project, &out).expect("readable"),
-            [Drift {
-                path: "src/nodes/old.ts".to_string(),
-                state: State::Unexpected,
-            }]
+            [],
+            "nothing outside the emitted list is drift"
         );
-
         assert_eq!(
-            write(&project, &out).expect("writable").removed,
-            ["src/nodes/old.ts".to_string()],
-            "a removal is part of what the write reports"
-        );
-        assert_eq!(check(&project, &out).expect("readable"), []);
-        assert!(
-            !out.join("src/nodes").exists(),
-            "the directory it left behind is pruned too"
-        );
-        assert!(
-            out.join("node_modules/left/index.js").is_file(),
-            "nothing outside `src/` is removed"
-        );
-        assert!(out.join("package-lock.json").is_file());
-    }
-
-    /// The prune takes the directories *this write* emptied and no others.
-    ///
-    /// An empty directory under `src/` is invisible to every refusal the write
-    /// makes: `owned_files` collects files, so there is nothing to call foreign,
-    /// and `claimed` has no header to read. A sweep of every empty directory
-    /// under `src/` therefore deleted one on the **first** build into a
-    /// directory — which is exactly the case the module header says is not the
-    /// compiler's to touch.
-    #[test]
-    fn a_directory_the_write_did_not_empty_is_left_where_it_is() {
-        let project = project();
-        let out = scratch("keep-directory");
-        std::fs::create_dir_all(out.join("src/keepme")).expect("writable");
-        std::fs::create_dir_all(out.join("src/nested/deeper")).expect("writable");
-
-        assert_eq!(
-            write(&project, &out).expect("writable"),
+            write(&project, &[], &out, &out).expect("writable"),
             Written {
                 files: project.files().len(),
-                removed: Vec::new(),
+                scaffolded: Vec::new(),
             },
-            "an empty directory is not a file the write has anything to say about"
+            "and nothing outside it is removed"
         );
-        assert!(
-            out.join("src/keepme").is_dir() && out.join("src/nested/deeper").is_dir(),
-            "a first build emptied a directory it never created"
-        );
-
-        // …and the directory a removal *does* empty still goes, at any depth.
-        std::fs::write(
-            out.join("src/nested/deeper/old.ts"),
-            "// This file was generated by agent-compose 0.0.1 from `main.yml`.\n",
-        )
-        .expect("writable");
         assert_eq!(
-            write(&project, &out).expect("writable").removed,
-            ["src/nested/deeper/old.ts".to_string()]
+            std::fs::read_to_string(out.join("src/tools/sign.ts")).expect("readable"),
+            "export default 1;\n"
         );
-        assert!(
-            !out.join("src/nested").exists(),
-            "the empty chain the removal left behind is pruned to `src/`"
-        );
-        assert!(out.join("src/keepme").is_dir(), "and nothing beside it is");
+        assert!(out.join("src/old.ts").is_file());
+        assert!(out.join("node_modules/left/index.js").is_file());
     }
 
-    /// A `src/` the compiler did not write is not a `src/` it may empty.
-    ///
-    /// The scenario is a plausible `--out`: an existing Node project, or an
-    /// ejected copy being re-synced. The first build into one used to delete
-    /// every file under `src/` it did not emit, report nothing, and exit `0`.
+    /// A directory this compiler never built into is not one it may overwrite —
+    /// under `src/` or at the root.
     #[test]
-    fn a_src_directory_the_compiler_did_not_write_stops_the_build() {
+    fn emitted_names_someone_else_holds_stop_the_build() {
         let project = project();
         let out = scratch("not-ours");
-        std::fs::create_dir_all(out.join("src/deep")).expect("writable");
-        std::fs::write(out.join("src/deep/mine.ts"), "export const mine = 1;\n").expect("writable");
-        std::fs::write(out.join("src/also-mine.ts"), "export const x = 2;\n").expect("writable");
-
-        let refusal = write(&project, &out).expect_err("the write is refused");
-        let Refusal::NotOurs(paths) = refusal else {
-            panic!("the refusal names the files, not an io error: {refusal:?}");
-        };
-        assert_eq!(paths, ["src/also-mine.ts", "src/deep/mine.ts"]);
-        assert_eq!(
-            std::fs::read_to_string(out.join("src/deep/mine.ts")).expect("readable"),
-            "export const mine = 1;\n",
-            "nothing is deleted before the scan decides"
-        );
-        assert!(
-            !out.join("src/schemas.ts").exists(),
-            "and nothing is written either: the refusal is total"
-        );
-    }
-
-    /// The four files the emitter writes at the root are not its to overwrite
-    /// either.
-    ///
-    /// The `src/` scan above cannot see this one: the scenario is a real Node
-    /// project whose sources are not under `src/`, so there is nothing under
-    /// `src/` to find and the write used to replace `package.json`, `README.md`,
-    /// `tsconfig.json` and `.gitignore` in place — no refusal, no
-    /// [`Written::removed`] entry, exit `0`, originals gone.
-    #[test]
-    fn root_files_the_compiler_did_not_write_stop_the_build() {
-        let project = project();
-        let out = scratch("root-not-ours");
+        std::fs::create_dir_all(out.join("src")).expect("writable");
+        std::fs::write(out.join("src/graph.ts"), "export const mine = 1;\n").expect("writable");
         std::fs::write(
             out.join("package.json"),
             "{\"name\":\"my-real-app\",\"version\":\"3.2.1\"}\n",
         )
         .expect("writable");
         std::fs::write(out.join("README.md"), "# My real project\n").expect("writable");
-        std::fs::write(out.join(".gitignore"), "dist/\n").expect("writable");
-        std::fs::create_dir_all(out.join("lib")).expect("writable");
-        std::fs::write(out.join("lib/index.ts"), "export const mine = 1;\n").expect("writable");
+        // Not an emitted name, so not part of the refusal.
+        std::fs::write(out.join("src/mine.ts"), "export const mine = 2;\n").expect("writable");
 
-        let refusal = write(&project, &out).expect_err("the write is refused");
+        let refusal = write(&project, &[], &out, &out).expect_err("the write is refused");
         let Refusal::NotOurs(paths) = refusal else {
             panic!("the refusal names the files, not an io error: {refusal:?}");
         };
-        assert_eq!(
-            paths,
-            [".gitignore", "README.md", "package.json"],
-            "every emitted path already held by someone else's file, and only those: \
-             `tsconfig.json` is not there, so it is not in the refusal"
-        );
+        assert_eq!(paths, ["README.md", "package.json", "src/graph.ts"]);
         assert_eq!(
             std::fs::read_to_string(out.join("package.json")).expect("readable"),
             "{\"name\":\"my-real-app\",\"version\":\"3.2.1\"}\n",
             "nothing is overwritten before the scan decides"
         );
-        assert_eq!(
-            std::fs::read_to_string(out.join("README.md")).expect("readable"),
-            "# My real project\n"
-        );
         assert!(
-            !out.join("src").exists(),
+            !out.join("src/schemas.ts").exists(),
             "and nothing is written either: the refusal is total"
         );
 
         // `--check` was always right about these: it reports them as drift
-        // rather than replacing them.
+        // rather than replacing them, and `not_ours` is what tells the report
+        // that `build` would refuse rather than settle it.
         let drift = check(&project, &out).expect("readable");
         assert!(
             drift.contains(&Drift {
@@ -676,6 +531,10 @@ mod tests {
                 state: State::Differs,
             }),
             "{drift:?}"
+        );
+        assert_eq!(
+            not_ours(&project, &out).expect("readable"),
+            ["README.md", "package.json", "src/graph.ts"]
         );
     }
 
@@ -690,88 +549,93 @@ mod tests {
     fn a_hand_edited_generated_file_is_regenerated_rather_than_refused() {
         let project = project();
         let out = scratch("rebuild");
-        write(&project, &out).expect("writable");
+        write(&project, &[], &out, &out).expect("writable");
         std::fs::write(out.join("package-lock.json"), "{}\n").expect("writable");
         std::fs::write(out.join("src/state.ts"), "// mine now\n").expect("writable");
         std::fs::write(out.join("README.md"), "# mine now\n").expect("writable");
 
         assert_eq!(
-            write(&project, &out).expect("the second write is not refused"),
+            write(&project, &[], &out, &out).expect("the second write is not refused"),
             Written {
                 files: project.files().len(),
-                removed: Vec::new(),
+                scaffolded: Vec::new(),
             }
         );
         assert_eq!(check(&project, &out).expect("readable"), []);
         assert!(
             out.join("package-lock.json").is_file(),
-            "a file the emitter does not produce and does not own is untouched"
+            "a file the emitter does not produce is untouched"
+        );
+        assert_eq!(
+            not_ours(&project, &out).expect("readable"),
+            Vec::<String>::new()
         );
     }
 
-    /// `--check` can tell the two halves of [`State::Unexpected`] apart, which
-    /// is what its remedy depends on.
+    /// Scaffold-once, in all three of its states: absent, written, and then
+    /// left alone whatever the author put in it (PRD resolved q48).
     ///
-    /// Both files below are "under `src/` and not emitted" and the drift report
-    /// gives them the same state, but a rebuild **removes** the one carrying the
-    /// header and **refuses** over the other. A report that could not tell them
-    /// apart would send a reader from a drift it can act on to an exit `2`.
+    /// It also pins **where**: the stub lands in the project, beside `main.yml`,
+    /// and not in `--out`. That is the only reading under which `validate` —
+    /// which has no `--out` — can be required to refuse a binding whose file is
+    /// missing, and it is what makes the path one string in the spec, on disk,
+    /// and inside the artifact.
     #[test]
-    fn a_check_learns_which_drift_a_rebuild_would_refuse_over() {
-        let project = project();
-        let out = scratch("what-a-rebuild-would-do");
-        write(&project, &out).expect("writable");
+    fn an_absent_module_is_scaffolded_once_and_never_rewritten() {
+        let (project, scaffolds, root) = with_module();
+        let out = scratch("scaffold");
+        assert_eq!(scaffolds.len(), 1);
 
-        // A module an older release wrote: drift, and a rebuild's to remove.
-        std::fs::write(
-            out.join("src/old.ts"),
-            "// This file was generated by agent-compose 0.0.1 from `main.yml`.\n",
-        )
-        .expect("writable");
+        let written = write(&project, &scaffolds, &out, &root).expect("writable");
         assert_eq!(
-            check(&project, &out).expect("readable"),
-            [Drift {
-                path: "src/old.ts".to_string(),
-                state: State::Unexpected,
-            }]
+            written.scaffolded,
+            [("src/tools/sign.ts".to_string(), "tool.sign".to_string())],
+            "the build reports what it wrote for the author"
         );
-        assert_eq!(
-            not_ours(&project, &out).expect("readable"),
-            Vec::<String>::new(),
-            "a stale generated module is drift `build` settles"
-        );
-
-        // Somebody's own file: the same state, and a rebuild refuses over it.
-        std::fs::write(out.join("src/mine.ts"), "export const mine = 1;\n").expect("writable");
-        assert_eq!(
-            check(&project, &out).expect("readable"),
-            [
-                Drift {
-                    path: "src/mine.ts".to_string(),
-                    state: State::Unexpected,
-                },
-                Drift {
-                    path: "src/old.ts".to_string(),
-                    state: State::Unexpected,
-                },
-            ],
-            "the report cannot tell them apart"
-        );
-        assert_eq!(
-            not_ours(&project, &out).expect("readable"),
-            ["src/mine.ts".to_string()],
-            "and this is the answer that can"
-        );
-
-        // …and it is the write's own answer: the same paths, from the same scan.
-        let refusal = write(&project, &out).expect_err("the write is refused");
-        let Refusal::NotOurs(paths) = refusal else {
-            panic!("the refusal names the files, not an io error: {refusal:?}");
-        };
-        assert_eq!(paths, ["src/mine.ts".to_string()]);
         assert!(
-            out.join("src/old.ts").is_file(),
-            "the refusal is total, so the stale module it would have removed is still there"
+            !out.join("src/tools/sign.ts").exists(),
+            "the authored half goes in the project, not in the output directory"
+        );
+        let stub = std::fs::read_to_string(root.join("src/tools/sign.ts")).expect("readable");
+        assert!(
+            stub.contains("export default async function toolSign("),
+            "{stub}"
+        );
+        assert!(
+            !stub.contains(GENERATED_MARKER),
+            "a scaffold is not generated: {stub}"
+        );
+
+        // The author fills it in. A rebuild neither rewrites it nor mentions it.
+        std::fs::write(root.join("src/tools/sign.ts"), "export default 1;\n").expect("writable");
+        let again = write(&project, &scaffolds, &out, &root).expect("writable");
+        assert_eq!(again.scaffolded, Vec::new());
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/tools/sign.ts")).expect("readable"),
+            "export default 1;\n"
+        );
+
+        // And it is not part of what `--check` compares: the emitted file list
+        // is the boundary, and a scaffold is not on it.
+        assert_eq!(check(&project, &out).expect("readable"), []);
+    }
+
+    /// An empty file counts as present: a scaffold is a write `build` makes
+    /// where there is nothing at all, and "nothing at all" is a path that does
+    /// not exist. Anything else would mean reading what the author wrote to
+    /// decide whether it was worth keeping.
+    #[test]
+    fn a_module_that_exists_is_never_scaffolded_over_however_empty() {
+        let (project, scaffolds, root) = with_module();
+        let out = scratch("scaffold-empty");
+        std::fs::create_dir_all(root.join("src/tools")).expect("writable");
+        std::fs::write(root.join("src/tools/sign.ts"), "").expect("writable");
+
+        let written = write(&project, &scaffolds, &out, &root).expect("writable");
+        assert_eq!(written.scaffolded, Vec::new());
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/tools/sign.ts")).expect("readable"),
+            ""
         );
     }
 

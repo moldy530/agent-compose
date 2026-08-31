@@ -370,7 +370,7 @@ fn tool(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ToolDef {
         schema::field_map(node, &format!("`output` of {subject}"), Surface::Result, cx)
     });
 
-    const BINDINGS: &[&str] = &["exec", "http", "function"];
+    const BINDINGS: &[&str] = &["exec", "http", "function", "module"];
     fields.note_known(BINDINGS);
     let declared: Vec<&str> = BINDINGS
         .iter()
@@ -389,7 +389,7 @@ fn tool(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ToolDef {
                         list(BINDINGS)
                     ),
                 )
-                .with_help("`exec` runs a subprocess, `http` calls an endpoint, `function` names a host-registered function"),
+                .with_help("`exec` runs a subprocess, `http` calls an endpoint, `function` names a host-registered function, `module` names a TypeScript file in this project"),
             );
             None
         }
@@ -446,7 +446,8 @@ fn implementation(
     let node = match key {
         "exec" => fields.take_entry("exec"),
         "http" => fields.take_entry("http"),
-        _ => fields.take_entry("function"),
+        "function" => fields.take_entry("function"),
+        _ => fields.take_entry("module"),
     }?;
     let context = format!("the `{key}` binding of {subject}");
     match key {
@@ -456,7 +457,10 @@ fn implementation(
         "http" => {
             binding::http_block(&node.value, &context, false, cx).map(ToolImplementation::Http)
         }
-        _ => binding::function_binding(&node.value, &context, cx).map(ToolImplementation::Function),
+        "function" => {
+            binding::function_binding(&node.value, &context, cx).map(ToolImplementation::Function)
+        }
+        _ => binding::module_block(&node.value, &context, cx).map(ToolImplementation::Module),
     }
 }
 

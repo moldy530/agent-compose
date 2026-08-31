@@ -1,0 +1,12 @@
+# rule: every prefix of a `module:` path stays inside the project root (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `../shared/sign.ts` climbs out of the project root
+# at: 12:11
+# help: a module implementation is part of the composition and ships inside the artifact every worker fetches, so every prefix of its path stays inside the project root — the entrypoint's own directory (grammar 6.1, `docs/distributed.md` §4)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ../shared/sign.ts

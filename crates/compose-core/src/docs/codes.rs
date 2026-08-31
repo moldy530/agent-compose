@@ -71,6 +71,8 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::MisplacedSection => include_str!("codes/misplaced-section.md"),
         DiagnosticCode::UnsupportedVersion => include_str!("codes/unsupported-version.md"),
         DiagnosticCode::InvalidImportPath => include_str!("codes/invalid-import-path.md"),
+        DiagnosticCode::InvalidModulePath => include_str!("codes/invalid-module-path.md"),
+        DiagnosticCode::InvalidDependency => include_str!("codes/invalid-dependency.md"),
         DiagnosticCode::UnknownKey => include_str!("codes/unknown-key.md"),
         DiagnosticCode::MissingKey => include_str!("codes/missing-key.md"),
         DiagnosticCode::WrongType => include_str!("codes/wrong-type.md"),

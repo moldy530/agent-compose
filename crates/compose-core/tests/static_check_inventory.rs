@@ -480,6 +480,43 @@ const GRAMMAR: &[Check] = &[
         ],
         evidence: Evidence::Fixture,
     },
+    // The `module:` binding of resolved q48 and q49, split across three passes
+    // by the evidence each rule needs. The **path form**, the fence around the
+    // project root, the collision with a name `build` emits, the exactness of a
+    // version and the collision with the generated project's own pins are all
+    // one file against a constant, so they are the parser's — the same split
+    // D120's credential rule takes. What needs the whole composition is
+    // agreement *between* tools, and what needs the filesystem is whether the
+    // file is there.
+    Check {
+        rule: "a `module:` path is project-relative TypeScript inside the project, at a name `build` does not emit (6.1, D132)",
+        pass: "parse/binding.rs",
+        codes: &["invalid-module-path", "missing-key", "unexpected-env-ref"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "a `module:` dependency is an npm package at an exact version the generated project does not contradict (6.1, D133)",
+        pass: "parse/binding.rs",
+        codes: &["invalid-dependency"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        rule: "the `module:` bindings of a composition agree: one file per tool, one version per package (6.1, D132, D133)",
+        pass: "check/modules.rs",
+        codes: &["invalid-module-path", "invalid-dependency"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The one rule in this file that reads the **filesystem**, which is why
+        // it is not part of `check` at all: `build` scaffolds an absent module
+        // rather than refusing over it, so a rule every verb ran would stop the
+        // command that repairs it. `validate` and `build --check` run it; see
+        // `check::modules`.
+        rule: "a `module:` binding's authored file is on disk (6.1, D132)",
+        pass: "check/modules.rs",
+        codes: &["io-error"],
+        evidence: Evidence::Fixture,
+    },
     Check {
         rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
         pass: "cel/mod.rs, over check/expr.rs",

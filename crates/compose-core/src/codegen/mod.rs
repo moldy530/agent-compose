@@ -73,11 +73,24 @@
 //! `src/artifact.ts` is emitted **last and over the rest**, because what it
 //! carries is a hash of them (`docs/distributed.md` §4, and see [`artifact`]).
 //!
-//! `src/` is **compiler-owned**: `build` removes files under it that it did not
-//! emit, and `build --check` reports them as drift. Nothing outside `src/` is
-//! ever removed, because that is where a user's `node_modules`, lockfile, and
-//! `.env` live — a directory the compiler writes into is not a directory it owns
-//! outright.
+//! **The manifest is the boundary** (PRD resolved q47). [`EMITTED_PATHS`] is
+//! this list and is the compiler's whole claim on an output directory: `build`
+//! overwrites exactly it, `build --check` compares exactly it, and nothing else
+//! under the output directory is written, removed, or reported — not a
+//! `node_modules/`, not a `.env`, and not the hand-authored TypeScript a
+//! `module:` binding names (grammar 6.1). A file this compiler does not emit is
+//! not this compiler's, wherever it sits; `src/tools/` ([`AUTHORED_ZONE`]) is
+//! where the scaffold puts an authored implementation and where the docs teach
+//! it, but that is a convention and the manifest is the answer.
+//!
+//! What that costs, stated so it is not discovered: a module an older compiler
+//! release wrote and this one no longer emits is **left where it is**. It is
+//! not drift, because drift is a disagreement about a file the compiler claims,
+//! and it does not claim that one any more. The alternative — a walk of `src/`
+//! that deletes what carries a generated-file header — is what made `build` a
+//! read of its own previous output rather than a pure function of the spec, and
+//! it is exactly the machinery resolved q47 removes so that authored code can
+//! live in the same tree without a marker protocol guarding it.
 //!
 //! ## Why there is no build step
 //!
@@ -132,6 +145,7 @@
 //! `tests/placement_surface_landing.rs` is what says so in executable form.
 
 pub mod artifact;
+pub mod authored;
 pub mod cel;
 pub mod cli;
 pub mod deployment;
@@ -158,11 +172,54 @@ use crate::ir::schema::TypeForm;
 /// The compiler release this build is, as it appears in every generated header.
 pub const COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The directory inside a generated project that the compiler owns outright.
+/// Every path [`emit`] writes, sorted — the compiler's whole claim on an output
+/// directory (PRD resolved q47).
 ///
-/// `build` removes files under it that it did not emit and `build --check`
-/// reports them; see the module docs.
-pub const OWNED_DIRECTORY: &str = "src";
+/// The list is a **constant** rather than a walk because it is the same for
+/// every composition: the layout is fixed, and what varies is the contents of
+/// each file rather than which files there are.
+/// [`the_file_set_is_the_documented_layout_for_every_composition`] is what holds
+/// that, over two compositions with nothing in common.
+///
+/// It is a constant here so that the *front end* can read it: a `module:`
+/// binding naming a path this list carries is refused where it is written
+/// (grammar 6.1), rather than at a build that would have to choose between
+/// overwriting the author's file and refusing to emit its own.
+///
+/// [`the_file_set_is_the_documented_layout_for_every_composition`]: tests::the_file_set_is_the_documented_layout_for_every_composition
+pub const EMITTED_PATHS: &[&str] = &[
+    ".gitignore",
+    "README.md",
+    "manifest.json",
+    "package.json",
+    "src/artifact.ts",
+    "src/cel.ts",
+    "src/cli.ts",
+    "src/deployment.ts",
+    "src/env.ts",
+    "src/graph.ts",
+    "src/index.ts",
+    "src/journal.ts",
+    "src/mesh.ts",
+    "src/runtime.ts",
+    "src/schemas.ts",
+    "src/serve.ts",
+    "src/state.ts",
+    "src/stores.ts",
+    "src/triggers.ts",
+    "src/worker-node.ts",
+    "tsconfig.json",
+];
+
+/// The directory a scaffolded module implementation is conventionally written
+/// under (PRD resolved q47).
+///
+/// A **convention**, not a rule: ownership of a file is membership in
+/// [`EMITTED_PATHS`], so a `module:` binding may name any project-relative path
+/// that list does not carry. This is where the docs point and where an author
+/// who follows them ends up, which is what makes `src/tools/` worth naming once
+/// rather than leaving each reader to invent.
+pub const AUTHORED_ZONE: &str = "src/tools";
 
 /// One file of a generated project.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -974,36 +1031,22 @@ flow.f:
         }
     }
 
+    /// [`EMITTED_PATHS`] is the compiler's whole claim on an output directory
+    /// (PRD resolved q47), and everything downstream reads it as a constant: the
+    /// front end refuses a `module:` binding that names one of these, `build`
+    /// writes and `--check`s exactly this list, and nothing else under the
+    /// output directory is touched. So the constant has to be the emitter's own
+    /// answer for **every** composition, not for the one a test happened to
+    /// pick — two with nothing in common is the cheapest way to say so.
     #[test]
-    fn the_file_set_is_sorted_and_is_the_documented_layout() {
-        let ir = ir_of("version: \"0.1\"\n");
-        let project = emit(&ir);
-        assert_eq!(
-            project.paths().collect::<Vec<_>>(),
-            [
-                ".gitignore",
-                "README.md",
-                "manifest.json",
-                "package.json",
-                "src/artifact.ts",
-                "src/cel.ts",
-                "src/cli.ts",
-                "src/deployment.ts",
-                "src/env.ts",
-                "src/graph.ts",
-                "src/index.ts",
-                "src/journal.ts",
-                "src/mesh.ts",
-                "src/runtime.ts",
-                "src/schemas.ts",
-                "src/serve.ts",
-                "src/state.ts",
-                "src/stores.ts",
-                "src/triggers.ts",
-                "src/worker-node.ts",
-                "tsconfig.json",
-            ]
-        );
+    fn the_file_set_is_the_documented_layout_for_every_composition() {
+        for source in [
+            "version: \"0.1\"\n",
+            crate::codegen::test_support::EVERY_FORM,
+        ] {
+            let project = emit(&ir_of(source));
+            assert_eq!(project.paths().collect::<Vec<_>>(), EMITTED_PATHS);
+        }
     }
 
     /// The one property the whole pass exists to have.

@@ -928,13 +928,15 @@
         "output": { "description": "Result schema.", "$ref": "#/$defs/outputFieldMap" },
         "exec": { "description": "Subprocess implementation.", "$ref": "#/$defs/execImpl" },
         "http": { "description": "HTTP implementation.", "$ref": "#/$defs/httpImpl" },
-        "function": { "description": "Host-registered function implementation (escape hatch; breaks spec portability).", "$ref": "#/$defs/functionImpl" }
+        "function": { "description": "Host-registered function implementation (escape hatch; breaks spec portability).", "$ref": "#/$defs/functionImpl" },
+        "module": { "description": "Hand-authored TypeScript inside this project, held to the tool's declared input/output by the type checker (grammar 6.1, Decisions D132, D133).", "$ref": "#/$defs/moduleImpl" }
       },
       "additionalProperties": false,
       "oneOf": [
         { "description": "exec implementation", "required": ["exec"] },
         { "description": "http implementation", "required": ["http"] },
-        { "description": "function implementation", "required": ["function"] }
+        { "description": "function implementation", "required": ["function"] },
+        { "description": "module implementation", "required": ["module"] }
       ]
     },
     "expectExit": {
@@ -1020,6 +1022,52 @@
         "name": { "description": "Registry key of the host function.", "$ref": "#/$defs/identifier" }
       },
       "additionalProperties": false
+    },
+
+    "modulePath": {
+      "description": "A project-relative path to a TypeScript file inside the project: `/`-separated segments, each `.`, `..`, or a name matching [A-Za-z0-9_][A-Za-z0-9_.-]*, the last ending in `.ts`. No leading `/`, no backslashes, no whitespace, no URLs. `validate` additionally refuses a path whose prefix climbs out of the project root and one naming a file `build` emits, neither of which a per-file schema can decide (grammar 6.1, Decision D132).",
+      "type": "string",
+      "pattern": "^((\\.|\\.\\.|[A-Za-z0-9_][A-Za-z0-9_.-]*)/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\\.ts$"
+    },
+
+    "moduleImpl": {
+      "description": "A hand-authored TypeScript module inside this project. The scalar form is the path alone; the object form adds the environment the code may read and the packages it imports. `build` scaffolds an absent file once - typed signature, contract as a doc comment, a body that throws - and never writes it again, and `validate` refuses a binding whose file is missing (grammar 6.1, Decisions D132, D133).",
+      "oneOf": [
+        { "description": "The path alone.", "$ref": "#/$defs/modulePath" },
+        {
+          "type": "object",
+          "required": ["path"],
+          "properties": {
+            "path": { "description": "The authored file, project-relative.", "$ref": "#/$defs/modulePath" },
+            "env": {
+              "description": "The environment variables this module's code may read. Declared rather than discovered: a `process.env` read inside TypeScript is not something the compiler can walk, and the per-placement environment manifest is computed from these names (docs/distributed.md 9.1, Decision D133).",
+              "type": "object",
+              "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
+            },
+            "dependencies": {
+              "description": "npm packages this module imports, each pinned to an EXACT version. The artifact ships no lockfile, so the pin is what makes the hub's install and every worker's resolve one tree. `validate` additionally refuses a package the generated project pins at another version, and two tools pinning one package at two versions (Decision D133).",
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/packageName" },
+              "additionalProperties": { "$ref": "#/$defs/exactVersion" }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+
+    "packageName": {
+      "description": "An npm package name: at most 214 characters of lowercase letters, digits, `-`, `_` and `.`, optionally scoped as @scope/name, starting with none of `.`, `_` or `-`.",
+      "type": "string",
+      "maxLength": 214,
+      "pattern": "^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$"
+    },
+
+    "exactVersion": {
+      "description": "An exact semantic version: MAJOR.MINOR.PATCH with an optional -prerelease and +build. No range operator, no wildcard, no dist-tag, and no git/file/npm/workspace specifier - each of those resolves to a different tree on a different day or a different machine, and the artifact carries no lockfile to pin it (Decision D133).",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.+-]+)?(\\+[0-9A-Za-z.+-]+)?$"
     },
 
     "flowDef": {

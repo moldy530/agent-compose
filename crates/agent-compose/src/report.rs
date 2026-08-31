@@ -163,9 +163,9 @@ pub(crate) struct Built<'a> {
     /// How the output directory disagrees, under `--check`.
     pub(crate) drift: &'a [crate::build::Drift],
     /// What a rebuild would refuse over, under `--check`
-    /// (`crate::build::not_ours`): the files in the output directory this
-    /// compiler did not write and would have replaced or removed. Empty when a
-    /// rebuild would go through, which is what makes it the remedy.
+    /// (`crate::build::not_ours`): the emitted names in the output directory
+    /// that this compiler did not write and the build would have replaced.
+    /// Empty when a rebuild would go through, which is what makes it the remedy.
     pub(crate) not_ours: &'a [String],
     /// What was written, when anything was.
     pub(crate) wrote: Option<&'a crate::build::Written>,
@@ -247,19 +247,20 @@ pub(crate) fn build_verdict(
             format!(
                 "wrote {} to `{out}` (target `{target}`){noted}{}",
                 plural(written.files, "file"),
-                // A removal is the one thing a build does that the caller did not
-                // ask for by name, so it is said out loud rather than left for a
-                // later `git status`.
-                if written.removed.is_empty() {
+                // A scaffold is the one thing a build writes that it does not
+                // own, and the one it will never write again, so it is said out
+                // loud rather than left for a later `git status` (PRD resolved
+                // q48).
+                if written.scaffolded.is_empty() {
                     String::new()
                 } else {
                     format!(
-                        ", and removed {} it no longer emits: {}",
-                        plural(written.removed.len(), "generated file"),
+                        ", and scaffolded {} for you to write: {}",
+                        plural(written.scaffolded.len(), "tool implementation"),
                         written
-                            .removed
+                            .scaffolded
                             .iter()
-                            .map(|path| format!("`{path}`"))
+                            .map(|(path, tool)| format!("`{path}` (`{tool}`)"))
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
@@ -306,14 +307,14 @@ pub(crate) fn build_verdict(
 ///
 /// It is not the answer for every directory that drifts, though, and a help line
 /// that said so anyway would send a reader from an exit `1` they can act on to an
-/// exit `2` they cannot. `build` replaces and removes only files carrying its own
-/// generated-file header (see [`crate::build::write`]), so a `src/` holding
-/// somebody's own TypeScript, or a `package.json` in a directory this compiler
-/// has never built into, is drift a rebuild **refuses** rather than fixes — and
-/// a [`Drift`](crate::build::Drift) line cannot tell that case from the stale
-/// module beside it, because both are the same state. `crate::build::not_ours`
-/// answers it off the same scan the write makes, so the remedy printed here is
-/// the one the next command actually performs.
+/// exit `2` they cannot. A `build` into a directory holding none of its own
+/// files refuses rather than replacing what is there (see
+/// [`crate::build::write`]), so a `package.json` naming somebody's application,
+/// or a `src/graph.ts` of their own, is drift a rebuild **refuses** rather than
+/// fixes — and a [`Drift`](crate::build::Drift) line cannot tell that case from a
+/// generated file somebody edited, because both are `differs`.
+/// `crate::build::not_ours` answers it off the same scan the write makes, so the
+/// remedy printed here is the one the next command actually performs.
 fn drift_help(not_ours: &[String]) -> String {
     if not_ours.is_empty() {
         return "help: run `agent-compose build` to regenerate\n".to_string();
@@ -325,8 +326,8 @@ fn drift_help(not_ours: &[String]) -> String {
     };
     format!(
         "help: `agent-compose build` will not regenerate this directory: it holds {noun} this \
-         compiler did not write ({}), and the build would have replaced or removed {pronoun}. \
-         Point `--out` at a directory of its own, or move {pronoun} aside\n",
+         compiler did not write at {noun} it emits ({}), and the build would have replaced \
+         {pronoun}. Point `--out` at a directory of its own, or move {pronoun} aside\n",
         not_ours
             .iter()
             .map(|path| format!("`{path}`"))
@@ -666,17 +667,17 @@ mod tests {
             "help: run `agent-compose build` to regenerate\n"
         );
         assert_eq!(
-            drift_help(&["src/mine.ts".to_string()]),
+            drift_help(&["src/graph.ts".to_string()]),
             "help: `agent-compose build` will not regenerate this directory: it holds a file this \
-             compiler did not write (`src/mine.ts`), and the build would have replaced or removed \
-             it. Point `--out` at a directory of its own, or move it aside\n"
+             compiler did not write at a file it emits (`src/graph.ts`), and the build would have \
+             replaced it. Point `--out` at a directory of its own, or move it aside\n"
         );
         assert_eq!(
-            drift_help(&["package.json".to_string(), "src/mine.ts".to_string()]),
+            drift_help(&["package.json".to_string(), "src/graph.ts".to_string()]),
             "help: `agent-compose build` will not regenerate this directory: it holds files this \
-             compiler did not write (`package.json`, `src/mine.ts`), and the build would have \
-             replaced or removed them. Point `--out` at a directory of its own, or move them \
-             aside\n"
+             compiler did not write at files it emits (`package.json`, `src/graph.ts`), and the \
+             build would have replaced them. Point `--out` at a directory of its own, or move \
+             them aside\n"
         );
     }
 

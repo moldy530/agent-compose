@@ -40,6 +40,8 @@ const PARSER_CODES: &[&str] = &[
     "misplaced-section",
     "unsupported-version",
     "invalid-import-path",
+    "invalid-module-path",
+    "invalid-dependency",
     "unknown-key",
     "missing-key",
     "wrong-type",

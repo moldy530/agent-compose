@@ -1132,7 +1132,7 @@ tool.web_search:
 | `description` | string (non-empty) | **yes** | LLM-facing; the selection signal (PRD 5.5) |
 | `input` | field map (input surface) | **yes** | tool parameters; `{}` for no-arg tools |
 | `output` | field map (result surface, §3.5) | **yes** | result schema; makes edges serializable (PRD 5.7) |
-| `exec` \| `http` \| `function` | block | **exactly one** | implementation binding |
+| `exec` \| `http` \| `function` \| `module` | block | **exactly one** | implementation binding |
 
 ### 6.1 Implementation bindings
 
@@ -1276,6 +1276,83 @@ function:
 The registry entry's signature is checked against `input`/`output` at build; a
 missing registration is a build error, and any composition using a `function`
 binding is flagged as non-portable in `validate` output.
+
+**`module`** — a hand-authored TypeScript file **inside this project** (PRD
+resolved q48):
+
+```yaml
+module: ./src/tools/sign.ts     # the scalar form: a path and nothing else
+```
+
+```yaml
+module:
+  path: ./src/tools/sign.ts
+  env:
+    SIGNING_KEY: "${SIGNING_KEY}"     # what this code may read
+  dependencies:
+    "@noble/hashes": "1.4.0"          # what it imports, pinned exactly
+```
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `path` | string | **yes** | project-relative, `/`-separated, ending in `.ts`; the scalar form is this key alone |
+| `env` | map env-var-name (`[A-Za-z_][A-Za-z0-9_]*`) → string (interpolable) | no | the environment the module's code may read (§4.3 class 2) |
+| `dependencies` | map npm-package-name → **exact** version | no | folded into the generated `package.json` |
+
+The two forms are one block: `module: ./src/tools/sign.ts` is the mapping with
+nothing but its `path:`, which is what a tool that reads no environment and
+imports no package writes.
+
+This is the **only** binding whose implementation lives inside the composition,
+and the difference from the three above is the point. What an `exec:` runs "is
+nobody's contract"; a module is held to the tool's own `input:`/`output:` by the
+type checker, because codegen emits a typed interface from those schemas and the
+authored file has to satisfy it. Change a schema and the authored file stops
+compiling, naming the field that moved.
+
+**The path.** `/`-separated segments, each `.`, `..` or a name matching
+`[A-Za-z0-9_][A-Za-z0-9_.-]*`, the last ending in `.ts`; no leading `/`, no
+backslashes, no whitespace, no URLs — grammar §1.4's path form with a different
+extension, and for the same reason. Every prefix stays **inside the project
+root**, and a path that climbs out and returns is refused exactly as an
+`imports:` entry is. It also may not name a path `agent-compose build` writes
+(`src/graph.ts`, `package.json`, …): the emitted file list is the boundary
+between generated and authored code (PRD resolved q47), so a binding on one of
+those names would be authored code the next build destroys. The code for all
+three is `invalid-module-path`.
+
+**The file has to be there.** `validate` refuses a binding whose file does not
+exist, naming the repair: `agent-compose build` **scaffolds** a referenced module
+it cannot find — the typed signature, the contract as a doc comment, and a body
+that throws — writes it **once**, and never writes that file again. A `build`
+into a tree where the file already exists leaves the author's bytes exactly
+alone, and does not read them. `build --check` refuses the same way `validate`
+does, because a committed project missing an implementation does not run.
+
+`src/tools/<name>.ts` is the conventional place, and where the scaffold writes;
+it is a convention rather than a rule, since what decides whether a file is the
+compiler's is membership in the emitted file list.
+
+**The environment is declared, not discovered.** An `${ENV}` inside arbitrary
+TypeScript is not something the compiler can walk, so `env:` is where a module
+says what it reads — the same shape and the same class-2 interpolation an
+`exec:` block's `env:` has (§4.3). Those names then flow into the per-placement
+environment manifest by the executes-in closure like every other tool's
+([`docs/distributed.md`](distributed.md) §9.1), which is what makes a module tool
+on a placed agent get its secret on the worker and nowhere else. There is **no**
+collision rule against the tool's `input:` here: D66 exists because an `exec:`
+tool's input *arrives* as environment variables, and a module's arrives as a
+typed argument.
+
+**Dependencies are exact.** The artifact carries no lockfile — a lockfile is what
+an install produces, not what a build writes — so the pin in the spec is what
+makes the hub's install and every worker's resolve one tree. A range (`^`, `~`,
+`>`, `<`, `*`, `x`), a dist-tag, and every `git`, `file`, `npm` and `workspace`
+specifier are compile errors; so is pinning a package the generated project
+already pins at another version, and so are two tools pinning one package at two
+versions, each naming both sides. The code is `invalid-dependency`. What is
+accepted is folded into the generated `package.json`, which stays
+pure-generated (D132, D133).
 
 **Empty result schema.** `output: {}` (legal at every result surface except an
 agent's, §3.9) declares a tool with no result: stdout, the response body, or the
@@ -7641,6 +7718,111 @@ hub's own copy of the store works perfectly — the failure is only ever visible
 a read that comes back empty. A static rule is decidable from the two files and
 says so before anything runs (PRD G3). *PRD 5.8, 5.10, resolved q38, q40, q41,
 q45.*
+
+### D132. The emitted file list is the boundary, and `module:` is the way across it
+
+`agent-compose build` **overwrites and `--check`s exactly the files it emits**,
+and writes, removes and reports nothing else under the output directory. A
+`tool.*` may bind a fourth implementation, `module: <project-relative .ts>`,
+naming hand-authored TypeScript in that same tree; `build` scaffolds an absent
+one **once** and never writes it again. The path is refused when it is not
+project-relative and `.ts`, when any prefix climbs out of the project root, and
+when it names a file the emitter writes; the code is `invalid-module-path`. A
+binding whose file is missing is refused by `validate` and by `build --check`,
+naming `build` as the repair.
+
+**Rationale.**
+
+*Why a boundary at all.* Until now custom logic lived entirely outside the
+emitted project, and the tree was wholly compiler-owned. A module binding puts
+authored code inside it, so something has to answer "who owns this file" for
+every path — and answer it the same way for `build`, for `--check`, and for the
+artifact a worker fetches.
+
+*Why the manifest rather than a directory.* `build` already enumerates exactly
+what it wrote (`ARTIFACT_FILES`, `manifest.json`), so membership in that list is
+an answer that already exists and cannot drift from what the build does. A
+directory rule — "everything under `src/` is the compiler's" — needs a second
+mechanism to carve out the authored zone, and gets the root files
+(`package.json`, `README.md`) wrong in the other direction. The flat `src/`
+layout therefore stays: no `src/generated/` migration, and no golden churn from
+moved files. `src/tools/` is the *conventional* authored zone the scaffold uses
+and the docs teach, and it carries no rule.
+
+*Why no manual sections.* `/** Begin Manual Section **/` markers were the
+alternative and are rejected outright, named here so the pattern is not
+re-proposed. They make `build` a read-modify-write of its own previous output
+rather than a pure function of the spec, which breaks the byte-identical goldens
+the codegen tests rest on; they split file identity between a `--check` checksum
+over generated spans and an artifact hash over whole bytes; and marker drift
+becomes a silent way to lose user code — the sharpest hazard for the autonomous
+agent workflows this project is built for. Stub-once scaffolding plus a generated
+typed interface meets the ergonomic need with none of that.
+
+*What it costs, stated.* A module an older compiler release wrote and this one no
+longer emits is left where it is. It is not drift, because drift is a
+disagreement about a file the compiler claims. The alternative was a walk that
+deleted whatever carried the generated-file header, which is the read-of-its-own-
+output this decision removes.
+
+*Why the type checker holds the contract.* `tsc` is already a gate on every
+generated project, and codegen already knows the tool's `input:`/`output:` — so
+emitting a typed interface from them makes a schema change a precise type error
+in the authored file rather than a merge. Import direction is a rule: authored
+code may import generated modules freely, and generated code reaches authored
+code only through the single registry seam.
+
+*Why scaffold once rather than never or always.* Never means the author types a
+signature the compiler could have written, and gets it subtly wrong. Always means
+`build` overwrites the implementation. Once is the only version where the
+compiler's whole interaction with the file is `exists()` — it never reads what is
+there, so there is nothing to merge and nothing to lose.
+
+*Why `--check` refuses a missing file when `build` writes one.* They answer
+different questions. `build` is the repair; `--check` is a verdict about a
+committed tree, and a tree missing an implementation does not run. A `build` that
+refused first could never write the stub it was refusing over, which is why the
+existence check is not one of the rules `validate` shares with every verb.
+*PRD 5.12, §8, resolved q47, q48.*
+
+### D133. A module binding declares its environment and pins its dependencies exactly
+
+A `module:` binding carries `env:` — a map of environment variable names to
+interpolable values, the same shape `exec:` uses — and `dependencies:`, a map of
+npm package name to an **exact** version. Ranges, dist-tags and `git`/`file`/
+`npm`/`workspace` specifiers are compile errors, as is a package pinned at two
+versions by two tools or at a version the generated project's own pins
+contradict. The code is `invalid-dependency`. Declared variables flow into the
+per-placement environment manifest by the executes-in closure; accepted
+dependencies are folded into the generated `package.json`.
+
+**Rationale.**
+
+*Why env is declared.* The environment partition is computed by walking every
+`${ENV}` a composition writes ([`docs/distributed.md`](distributed.md) §9.1).
+A `process.env.SIGNING_KEY` inside authored TypeScript is not something that walk
+can see, so a module tool would silently contribute nothing to any manifest: the
+worker that runs it would join clean and fail at its first call, which is the
+exact failure the partition exists to prevent. Declaring it in the YAML keeps one
+walk and one answer. The shape is `exec:`'s because the question is the same one
+— what does this implementation read — and a second spelling would be a second
+thing to learn.
+
+*Why dependencies are declared too, and exactly.* The worker's provisioning cycle
+runs `bun install` over the artifact it fetched (§4 step 4), and the artifact
+ships **no lockfile** — a lockfile is what an install produces, not what a build
+writes, and hashing one into a build artifact would make the artifact depend on
+the machine that resolved it. So the exact pin in the spec is the only thing that
+makes the hub's install and every worker's resolve the same tree. A range
+resolves differently on different days; a dist-tag and a `git` ref resolve
+differently on different machines. Exactness also makes the collision with the
+runtime's own pins decidable statically, in one file, against a constant.
+
+*Why a collision is refused rather than merged.* One `package.json` holds one
+version of a package. There is no reading of "`zod` at 4.4.3 and `zod` at 3.9.0"
+that a single generated manifest can express, and picking one silently would
+change what the other tool's code runs against. The refusal names both sides
+because either is the one to change. *PRD 5.9, 5.10, resolved q41, q45, q49.*
 
 ---
 

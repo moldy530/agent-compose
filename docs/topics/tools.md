@@ -82,7 +82,7 @@ flow.search:
 | `description` | **yes** | LLM-facing; it is the selection signal |
 | `input` | **yes** | parameters; `{}` for a no-argument tool |
 | `output` | **yes** | result schema; `{}` for a tool with no result |
-| `exec` \| `http` \| `function` | **exactly one** | the implementation binding |
+| `exec` \| `http` \| `function` \| `module` | **exactly one** | the implementation binding |
 
 Tool definitions carry **no** `retry`/`timeout`/`on_error`. Policy is a property
 of a use site — the node — and resolves through the chain in
@@ -152,6 +152,53 @@ function:
 A host-registered function: the escape hatch. The registry entry's signature is
 checked against `input`/`output` at build, a missing registration is a build
 error, and any composition using one is flagged as non-portable.
+
+## `module`
+
+The one binding whose implementation lives **inside** the project: a TypeScript
+file you write, in the same tree `build` emits.
+
+```yaml
+module: ./src/tools/sign.ts     # the scalar form: a path and nothing else
+```
+
+```yaml
+module:
+  path: ./src/tools/sign.ts
+  env:
+    SIGNING_KEY: "${SIGNING_KEY}"   # what this code may read
+  dependencies:
+    "@noble/hashes": "1.4.0"        # what it imports, pinned exactly
+```
+
+What an `exec:` or an `http:` reaches is nobody's contract. A module is held to
+the tool's declared `input:`/`output:` by the **type checker**: codegen emits a
+typed interface from those schemas, and the authored file has to satisfy it — so
+a schema change is a type error naming the field that moved, in the file that has
+to change.
+
+**Where the file goes, and who owns it.** `build` overwrites and `--check`s
+exactly the files it emits, and touches nothing else in the output directory, so
+your implementation lives in the same tree without a marker comment or a manual
+section anywhere. The path is project-relative, ends in `.ts`, stays inside the
+project root, and may not be a name `build` writes (`src/graph.ts`,
+`package.json`, …). `src/tools/<name>.ts` is the conventional place.
+
+**You never type the signature.** `validate` refuses a binding whose file is
+missing and names the repair; `agent-compose build <spec>` **scaffolds** it —
+typed signature, the contract as a doc comment, a body that throws — writes it
+**once**, and never writes that file again. Fill it in, commit it, rebuild: your
+bytes are left exactly alone.
+
+**Say what it reads and what it imports.** The compiler cannot walk a
+`process.env` read inside your TypeScript, and it ships no lockfile beside the
+artifact, so `env:` and `dependencies:` are declarations rather than discoveries.
+Declared variables reach exactly the processes that can execute the tool — the
+same per-placement partition every other tool's do — and dependencies are folded
+into the generated `package.json`, which is why they must be **exact** versions:
+no `^`, `~`, `>`, `<`, `*` or `x`, no dist-tags, and no `git`/`file`/`npm`/
+`workspace` specifiers. Two tools may share a package at one version; two
+versions of one package is a compile error naming both.
 
 ## Empty result schema
 

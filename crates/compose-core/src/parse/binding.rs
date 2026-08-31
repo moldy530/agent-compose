@@ -1,8 +1,8 @@
 //! Bindings and implementation blocks (grammar 6.1, 8.0, 8.2, 8.3).
 
 use crate::ast::binding::{
-    Binding, Bindings, ExecBlock, FunctionBinding, HttpBlock, HttpMethod, InterpolatedEntry,
-    NodeInput, WriteEntry, Writes,
+    Binding, Bindings, DependencyEntry, ExecBlock, FunctionBinding, HttpBlock, HttpMethod,
+    InterpolatedEntry, ModuleBlock, NodeInput, WriteEntry, Writes,
 };
 use crate::ast::schema::{ScalarKind, Surface, TypeForm};
 use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
@@ -416,6 +416,251 @@ pub(crate) fn function_binding(node: &Node, subject: &str, cx: &mut Cx) -> Optio
         name,
         span: node.span.clone(),
     })
+}
+
+/// The extension a `module:` binding's path takes.
+///
+/// One, and it is `.ts`: the generated project is TypeScript run from source
+/// with no build step (see `codegen`), so a `.js` beside it would be a second
+/// authoring language nothing type-checks, and a `.d.ts` names no
+/// implementation at all.
+const MODULE_EXTENSION: &str = ".ts";
+
+const MODULE_PATH_RULE: &str = "a `module:` path is `/`-separated, each segment `.`, `..`, or a name matching `[A-Za-z0-9_][A-Za-z0-9_.-]*`, and the last segment ends in `.ts`: no leading `/`, no backslashes, no whitespace, no URLs (grammar 6.1)";
+
+/// Read a `module:` implementation binding (grammar 6.1, PRD resolved q48).
+///
+/// Two spellings of one block. The **scalar** form,
+/// `module: ./src/tools/sign.ts`, is the block with nothing but its `path:`,
+/// which is what a tool reading no environment and importing no package writes;
+/// the **mapping** form adds `env:` and `dependencies:`. They are one shape
+/// rather than two because everything downstream — the artifact's file list, the
+/// environment partition, the generated `package.json` — reads the same three
+/// values whichever way they were written.
+pub(crate) fn module_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<ModuleBlock> {
+    if let Yaml::String(_) = &node.value {
+        // `lexical::text` rather than `expect_string`, so the scalar form is the
+        // same class-3 surface the block form's `path:` is: a path is compile-
+        // time identity, and an `${ENV}` in one is refused rather than carried
+        // (grammar 4.3, Decision D92).
+        let path = lexical::text(node, "`module`", cx)
+            .and_then(|written| module_path(&written, subject, cx));
+        return Some(ModuleBlock {
+            path,
+            env: Vec::new(),
+            dependencies: Vec::new(),
+            span: node.span.clone(),
+        });
+    }
+
+    let mapping = expect_mapping(node, subject, cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), subject);
+    let path = fields
+        .require("path", cx)
+        .and_then(|node| lexical::text(node, "`path`", cx))
+        .and_then(|written| module_path(&written, subject, cx));
+    // Interpolable, exactly as an `exec:` block's `env:` is (grammar 4.3
+    // class 2): what a machine calls its keychain is a property of the machine.
+    // There is no collision rule against the tool's `input:` here — the D66 one
+    // an `exec:` obeys exists because an `exec:` tool's input *arrives* as
+    // environment variables, and a module's arrives as a typed argument.
+    let env = fields
+        .take("env")
+        .map(|node| interpolated_map(node, "`env`", NameForm::EnvVar, cx))
+        .unwrap_or_default();
+    let dependencies = fields
+        .take("dependencies")
+        .map(|node| dependency_map(node, subject, cx))
+        .unwrap_or_default();
+    fields.finish(cx);
+
+    Some(ModuleBlock {
+        path,
+        env,
+        dependencies,
+        span: node.span.clone(),
+    })
+}
+
+/// Check a `module:` path against grammar 6.1's three rules, and hand back the
+/// **normalized** spelling — which is the name the artifact, the manifest and
+/// every diagnostic downstream use.
+fn module_path(written: &Spanned<String>, subject: &str, cx: &mut Cx) -> Option<Spanned<String>> {
+    let text = written.value.as_str();
+    if !lexical::is_relative_path(text, &[MODULE_EXTENSION]) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!("`{text}` is not a project-relative path to a TypeScript file"),
+            )
+            .with_help(MODULE_PATH_RULE),
+        );
+        return None;
+    }
+    let Some(normalized) = lexical::normalize_relative(text) else {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!("`{text}` climbs out of the project root"),
+            )
+            .with_help(
+                "a module implementation is part of the composition and ships inside the artifact every worker fetches, so every prefix of its path stays inside the project root — the entrypoint's own directory (grammar 6.1, `docs/distributed.md` §4)",
+            ),
+        );
+        return None;
+    };
+    if crate::codegen::EMITTED_PATHS.contains(&normalized.as_str()) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!("`{normalized}` is a file `agent-compose build` generates"),
+            )
+            .with_help(format!(
+                "the compiler writes that file itself, so the implementation {subject} names would be overwritten by every build: put it somewhere `build` does not emit — `{}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)",
+                crate::codegen::AUTHORED_ZONE
+            )),
+        );
+        return None;
+    }
+    Some(Spanned::new(normalized, written.span.clone()))
+}
+
+/// Read a `module:` binding's `dependencies:` map (grammar 6.1, PRD resolved
+/// q49).
+fn dependency_map(node: &Node, subject: &str, cx: &mut Cx) -> Vec<DependencyEntry> {
+    let Some(mapping) = expect_mapping(node, "`dependencies`", cx) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for entry in mapping.entries() {
+        let package = entry.key.clone();
+        if !is_package_name(&package.value) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidDependency,
+                    package.span.clone(),
+                    format!("`{}` is not an npm package name", package.value),
+                )
+                .with_help(
+                    "a package name is at most 214 characters of lowercase letters, digits, `-`, `_` and `.`, optionally scoped as `@scope/name`, and starts with none of `.`, `_` or `-`",
+                ),
+            );
+            continue;
+        }
+        let Some(version) = lexical::text(&entry.value, "a dependency version", cx) else {
+            continue;
+        };
+        if !is_exact_version(&version.value) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidDependency,
+                    version.span.clone(),
+                    format!(
+                        "{subject} pins `{}` to `{}`, which is not an exact version",
+                        package.value, version.value
+                    ),
+                )
+                .with_help(
+                    "the artifact carries no lockfile, so a pin is what keeps the hub's install and every worker's resolving one tree: write an exact `MAJOR.MINOR.PATCH` — no `^`, `~`, `>`, `<`, `*` or `x`, and no `git`, `file`, `npm` or `workspace` specifier (PRD resolved q49)",
+                ),
+            );
+            continue;
+        }
+        // One `package.json` holds one version of a package, and the generated
+        // half of it is fixed per compiler release (`codegen::project::PINS`),
+        // so a module pinning a runtime dependency at another version is a
+        // conflict decidable right here — in one file, against a constant.
+        if let Some((_, pinned)) = crate::codegen::project::PINS
+            .iter()
+            .chain(crate::codegen::project::DEV_PINS)
+            .find(|(name, _)| *name == package.value)
+            && *pinned != version.value
+        {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidDependency,
+                    version.span.clone(),
+                    format!(
+                        "`{}` is pinned to `{}` here and to `{pinned}` by the generated project",
+                        package.value, version.value
+                    ),
+                )
+                .with_help(format!(
+                    "a generated project's own dependency set is fixed by the compiler release that wrote it, and one `package.json` holds one version of a package: pin `{}` at `{pinned}`, or reach for a package the generated runtime does not (grammar 6.1)",
+                    package.value
+                )),
+            );
+            continue;
+        }
+        entries.push(DependencyEntry { package, version });
+    }
+    entries
+}
+
+/// Whether a string is an npm package name.
+///
+/// The published rule, minus the parts that are advice: at most 214 characters,
+/// lowercase, made of letters, digits, `-`, `_` and `.`, optionally scoped as
+/// `@scope/name`, and starting with none of `.`, `_` or `-`.
+fn is_package_name(text: &str) -> bool {
+    if text.is_empty() || text.len() > 214 {
+        return false;
+    }
+    let bare = match text.strip_prefix('@') {
+        Some(scoped) => {
+            let Some((scope, name)) = scoped.split_once('/') else {
+                return false;
+            };
+            if !is_package_segment(scope) {
+                return false;
+            }
+            name
+        }
+        None => text,
+    };
+    is_package_segment(bare)
+}
+
+fn is_package_segment(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with(['.', '_', '-'])
+        && text.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+/// Whether a version string is an exact semantic version.
+///
+/// `MAJOR.MINOR.PATCH`, each a run of digits with no leading zero past `0`,
+/// with an optional `-prerelease` and `+build`. Everything npm accepts *besides*
+/// one of these — a range operator, a wildcard, a dist-tag, a `git`/`file`/`npm`/
+/// `workspace` specifier, a URL — resolves to a different tree on a different
+/// day or on a different machine, which is the one thing a lockfile-less
+/// artifact cannot have (PRD resolved q49).
+fn is_exact_version(text: &str) -> bool {
+    let core = text.split(['-', '+']).next().unwrap_or_default();
+    if core.len() != text.len() {
+        // A prerelease or build tail: it must be non-empty and made of the
+        // characters semver admits there.
+        let tail = &text[core.len() + 1..];
+        if tail.is_empty()
+            || !tail
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'+'))
+        {
+            return false;
+        }
+    }
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        })
 }
 
 /// The fields an inline `exec:` node binds from the child process itself, with
