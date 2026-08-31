@@ -94,10 +94,33 @@
 //! attachments reach) and the active target's deploy layer (which placement
 //! claims each), so it is a check rather than a parser or resolver rule:
 //! neither of the two files decides it alone.
+//!
+//! # The second rule: a store only one process can see
+//!
+//! [`check_stores`] is grammar 14.1 rule 5 (PRD resolved q45, Decision D131),
+//! and it is here rather than in [`super::stores`] because it is decided by the
+//! same fact the rule above is: **where a component executes**. A store on a
+//! backend the reaching process opens for itself — `memory`, `sqlite`,
+//! `sqlite_vec`, `local_fs` — is one store per process, and a mesh runs a placed
+//! component in more than one process by design: several workers claim one name
+//! (PRD resolved q38's pools) and the hub dispatches whatever else reaches it.
+//! So each opens its own copy, a write on one side is never a read on another,
+//! and the flow carries on with data that is not there.
+//!
+//! What it reads is the **environment partition** — `codegen::env::Partition`,
+//! `docs/distributed.md` §9.1 — rather than a walk of its own, and that is the
+//! point rather than an economy. §9.1's closure is already the answer to "which
+//! processes can this surface execute in", including everything reached through
+//! attachment, and a second derivation of it would agree on the day it was
+//! written. The partition also records *how* each process arrived, so the
+//! diagnostic points at the `stores:` entry or `store:` node that binds the
+//! store, at every attachment between it and the `members:` entry, and at that
+//! entry — the chain rather than the verdict.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::Namespace;
+use crate::codegen::env::{Partition, Process};
 use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
 use crate::ir::definition::DefinitionBody;
 
@@ -232,4 +255,132 @@ fn where_it_runs(on: Option<&&Spanned<crate::ast::common::Ident>>) -> String {
         || "no placement, so it runs on the hub".to_string(),
         |held| format!("placement `{}`", held.value),
     )
+}
+
+/// Refuse every store on a process-local backend that a placement's process can
+/// open (grammar 14.1 rule 5, PRD resolved q45, Decision D131).
+pub(crate) fn check_stores(ctx: &mut Ctx<'_>) {
+    // A target that declares no placement has one process, so no store forks
+    // and nothing here is computed — including the partition, which is the only
+    // expensive thing this pass does.
+    if ctx
+        .ir
+        .deploy
+        .placements
+        .as_ref()
+        .is_none_or(|section| section.entries.is_empty())
+    {
+        return;
+    }
+    let partition = Partition::of(ctx.ir);
+
+    let mut reports = Vec::new();
+    for (address, definition) in &ctx.ir.definitions {
+        let DefinitionBody::Store(store) = &definition.body else {
+            continue;
+        };
+        let backend = crate::ir::deploy::backend_of(ctx.ir, store);
+        if !backend.provider.opens_in_process() {
+            continue;
+        }
+        // The first placement in name order. Several placements reaching one
+        // store is one fault with one repair — the backend — so it is reported
+        // once, on the route the labels can actually draw.
+        let Some((process, placement)) =
+            partition
+                .processes_of(address)
+                .find_map(|process| match process {
+                    Process::Placement(name) => Some((process, name)),
+                    Process::Hub => None,
+                })
+        else {
+            continue;
+        };
+        // The route starts at the `members:` entry that holds the placement and
+        // ends at the store, so it has at least two steps: a `store.*` is never
+        // a member of a placement (grammar 14.1 rule 2), so it never holds one
+        // in its own right. `hops` is everything between them.
+        let route = partition.route(address, process);
+        let [root, hops @ .., opened] = route.as_slice() else {
+            continue;
+        };
+        let binder = hops.last().unwrap_or(root);
+        let mut report = Diagnostic::error(
+            DiagnosticCode::ProcessLocalStore,
+            opened.site.unwrap_or(&definition.span).clone(),
+            format!(
+                "`{address}` is on the process-local `{}` backend ({}), and `{}` that binds it \
+                 executes in placement `{placement}`",
+                backend.provider.as_str(),
+                backend.from,
+                binder.owner,
+            ),
+        );
+        // The chain, root-first: every hop between the `members:` entry and the
+        // binding the primary span already points at.
+        let mut previous = root;
+        for step in hops {
+            if let Some(site) = step.site {
+                report = report.with_label(
+                    site.clone(),
+                    format!("`{}` reaches `{}` here", previous.owner, step.owner),
+                );
+            }
+            previous = step;
+        }
+        if let Some(site) = root.site {
+            report = report.with_label(
+                site.clone(),
+                format!("`{}` is a member of placement `{placement}`", root.owner),
+            );
+        }
+        reports.push(report.with_help(repair(ctx, backend.provider)));
+    }
+    for report in reports {
+        ctx.push(report);
+    }
+}
+
+/// What the author writes instead, which is a different sentence under `local`.
+///
+/// Under any named target the repair is the one that already works: bind a
+/// networked backend, whose credentials §9.1's partition already carries to
+/// every placement that reaches the store. Under `local` there is no such
+/// edit — the target substitutes local storage for **every** store
+/// unconditionally and refuses a `storage_backends:` block outright (grammar 14,
+/// Decision D87) — so offering one would send an author to a key the next
+/// compile refuses.
+fn repair(ctx: &Ctx<'_>, provider: crate::ast::deploy::BackendProvider) -> String {
+    // Only the ones that serve this store's kind: a `kv` store cannot be bound
+    // to `s3`, so offering it would be a repair the next compile refuses
+    // (grammar 14.3).
+    let networked: Vec<String> = crate::ast::deploy::BackendProvider::networked()
+        .filter(|other| other.kind() == provider.kind())
+        .map(|other| format!("`{}`", other.as_str()))
+        .collect();
+    let list = match networked.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => "a networked backend".to_string(),
+    };
+    if ctx.ir.target == crate::DEFAULT_TARGET {
+        format!(
+            "a mesh runs this store's component in more than one process — several workers may \
+             claim one placement, and the hub dispatches whatever else reaches the store — and each \
+             one opens its own copy, so a write on one side is never a read on another. `local` \
+             substitutes local storage for every store and admits no `storage_backends:`, so a \
+             mesh that shares this store is a target of its own: declare `deploy/<target>.yml` \
+             binding it to {list}, or take the component that binds it out of `placements:` so \
+             only the hub ever opens it (grammar 14, 14.1 rule 5, PRD resolved q45)"
+        )
+    } else {
+        format!(
+            "a mesh runs this store's component in more than one process — several workers may \
+             claim one placement, and the hub dispatches whatever else reaches the store — and each \
+             one opens its own copy, so a write on one side is never a read on another: bind {list} \
+             instead, whose variables the environment partition already carries to every placement \
+             that reaches the store, or take the component that binds it out of `placements:` so \
+             only the hub ever opens it (grammar 14.1 rule 5, PRD resolved q45)"
+        )
+    }
 }

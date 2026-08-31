@@ -120,6 +120,15 @@ the zero-infrastructure guarantee: a project with production storage in
 `deploy/staging.yml` still validates and runs locally. See
 `agent-compose docs targets`.
 
+**A backend the reaching process opens for itself cannot be reached from a
+mesh.** `memory`, `sqlite`, `sqlite_vec` and `local_fs` have no server in the
+middle, so two processes reaching one such store hold two stores — and a target
+that declares `placements:` runs a placed component in more than one process by
+design. Binding one from anything a placement's process can execute is
+`process-local-store`, at every `scope:` and under `local` too. The repair is a
+networked backend, whose variables the deployment already routes to every
+placement that reaches the store.
+
 `scope: session` requires the execution to have a session identity, and that
 identity comes from the trigger. A declared `http`, `schedule`, or `event`
 trigger whose flow **reaches** a session-scoped store must declare

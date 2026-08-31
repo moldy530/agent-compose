@@ -89,6 +89,7 @@ const CHECK_CODES: &[&str] = &[
     "conflicting-keys",
     "duplicate-route",
     "conflicting-placement",
+    "process-local-store",
 ];
 
 struct Anchor {

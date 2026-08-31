@@ -1,0 +1,53 @@
+# rule: `local` substitutes local storage for every store, so a `local` mesh reaching one through a `store:` node is refused and told the repair `local` admits (grammar 14, 14.1 rule 5, Decision D87)
+# code: process-local-store
+# message: `store.artifacts` is on the process-local `local_fs` backend (the `local` target substitutes local storage for every store unconditionally), and `flow.keep_one` that binds it executes in placement `mac`
+# at: main.yml:27:14
+# label: main.yml:37:11 `agent.builder` reaches `flow.keep_one` here
+# label: deploy/local.yml:8:15 `agent.builder` is a member of placement `mac`
+# help: a mesh runs this store's component in more than one process — several workers may claim one placement, and the hub dispatches whatever else reaches the store — and each one opens its own copy, so a write on one side is never a read on another. `local` substitutes local storage for every store and admits no `storage_backends:`, so a mesh that shares this store is a target of its own: declare `deploy/<target>.yml` binding it to `s3` or `gcs`, or take the component that binds it out of `placements:` so only the hub ever opens it (grammar 14, 14.1 rule 5, PRD resolved q45)
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+store.artifacts:
+  kind: blob
+  scope: session
+  description: The bundles this session produced.
+flow.keep_one:
+  description: Keep one built bundle.
+  inputs:
+    scheme: { type: string }
+    bundle: { type: string }
+  outputs: {}
+  nodes:
+    keep:
+      store: store.artifacts
+      op: put
+      key: "input.scheme"
+      value: "input.bundle"
+  edges:
+    - { from: start, to: keep }
+    - { from: keep, to: end }
+agent.builder:
+  model: model.m
+  prompt: Build the requested scheme and keep the bundle.
+  tools: [flow.keep_one]
+  input:
+    scheme: { type: string }
+  output:
+    bundle: { type: string }
+flow.release:
+  inputs:
+    scheme: { type: string }
+  outputs: {}
+  nodes:
+    build:
+      agent: agent.builder
+      input:
+        scheme: "input.scheme"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

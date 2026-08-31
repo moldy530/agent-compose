@@ -202,6 +202,43 @@ impl BackendProvider {
             Self::LocalFs | Self::S3 | Self::Gcs => StoreKind::Blob,
         }
     }
+
+    /// Whether the process reaching a store on this backend **opens the store
+    /// itself**, rather than dialling a service that holds it.
+    ///
+    /// The criterion is where the bytes live, not the keyword: a heap map, a
+    /// SQLite file — with or without the vector extension — and a directory of
+    /// blobs are all opened by whichever process reaches them, so two processes
+    /// reaching one such store hold two stores. Everything else here is a
+    /// connection to something outside the process, which is what makes two
+    /// processes reaching it two readers of one store.
+    ///
+    /// It is what grammar 14.1 rule 5 refuses a placement over (PRD resolved
+    /// q45, Decision D131), and it is a property of the *provider* rather than
+    /// of a store or a target, so it is stated on the vocabulary that names
+    /// them.
+    #[must_use]
+    pub const fn opens_in_process(self) -> bool {
+        match self {
+            Self::Memory | Self::Sqlite | Self::SqliteVec | Self::LocalFs => true,
+            Self::Redis
+            | Self::Postgres
+            | Self::Chroma
+            | Self::Pgvector
+            | Self::Qdrant
+            | Self::S3
+            | Self::Gcs => false,
+        }
+    }
+
+    /// The networked providers, in declaration order — what an author binds
+    /// instead of a process-local one (grammar 14.1 rule 5).
+    pub fn networked() -> impl Iterator<Item = Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|provider| !provider.opens_in_process())
+    }
 }
 
 /// The `event_sources:` section — reserved grammar (grammar 14.4).

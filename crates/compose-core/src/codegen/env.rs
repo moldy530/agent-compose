@@ -49,10 +49,11 @@
 //! and a compiler that guessed would refuse a legitimately empty value with a
 //! message about it being absent.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use crate::ast::common::{Interpolated, Namespace};
 use crate::ast::deploy::PluginValue;
+use crate::diag::Span;
 use crate::ir::Ir;
 use crate::ir::binding::{Exec, Http, InterpolatedEntry};
 use crate::ir::definition::{DefinitionBody, Model};
@@ -140,12 +141,52 @@ fn backend_owner(site: &str) -> String {
 /// fifth clause is not weakened by that — nothing moves off the hub's list —
 /// exactly as being reached from a placed agent's loop adds a placement to an
 /// unplaced agent's variables without moving them.
+///
+/// # Why the answer records *how* it got there
+///
+/// Two passes read this partition and each needs a different half of one walk.
+/// [`References::for_process`] needs the membership — which variables a process
+/// holds — and `check::placements` needs the **route**: grammar 14.1 rule 5
+/// refuses a process-local store reached from a placement, and a diagnostic
+/// that named only the verdict would leave an author with "this store forks"
+/// and no line to look at. So every arrival records the edge that carried it,
+/// and [`Partition::route`] walks those edges back to the `members:` entry that
+/// started them.
+///
+/// The alternative — deciding the refusal here and rebuilding the chain in the
+/// check — is the one shape this type exists to rule out: two derivations of one
+/// closure agree on the day they are written, and a diagnostic pointing at a
+/// path the partition did not take is worse than none.
 #[derive(Debug, Default)]
 pub struct Partition {
-    /// Owner key to the processes it can execute in.
-    runs: BTreeMap<String, BTreeSet<Process>>,
+    /// Owner key to the processes it can execute in, each with the edge that
+    /// carried it there.
+    runs: BTreeMap<String, BTreeMap<Process, Carried>>,
     /// Every process this deployment has, hub first.
     processes: Vec<Process>,
+}
+
+/// How one surface came to run in one process: the edge that carried it there.
+#[derive(Clone, Debug)]
+struct Carried {
+    /// The owner it was carried from — absent where the process is the
+    /// surface's own: a `members:` entry, or a component the hub dispatches.
+    from: Option<String>,
+    /// Where that edge is written. Absent where no line of any file wrote it —
+    /// the hub-dispatchable default of §9.1's second clause, which is a rule
+    /// rather than a reference.
+    site: Option<Span>,
+}
+
+/// One surface on the way from a placement's `members:` entry to a component it
+/// reaches ([`Partition::route`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Step<'a> {
+    /// The surface this step reached.
+    pub owner: &'a str,
+    /// Where the edge that reached it is written — the `members:` entry for the
+    /// first step, and the attachment, node or list entry for every one after.
+    pub site: Option<&'a Span>,
 }
 
 impl Partition {
@@ -153,7 +194,7 @@ impl Partition {
     #[must_use]
     pub fn of(ir: &Ir) -> Self {
         let claims = claims(ir);
-        let mut runs: BTreeMap<String, BTreeSet<Process>> = BTreeMap::new();
+        let mut runs: BTreeMap<String, BTreeMap<Process, Carried>> = BTreeMap::new();
         let mut processes = vec![Process::Hub];
         if let Some(section) = ir.deploy.placements.as_ref() {
             for placement in section.entries.values() {
@@ -161,38 +202,62 @@ impl Partition {
             }
         }
 
+        /// Record that `owner` runs in `process`, reached by `how`.
+        ///
+        /// The **first** arrival is the one kept, which is what makes a route
+        /// deterministic: the fixed point below walks the definitions in address
+        /// order, so the edge recorded is the first one that reached this owner
+        /// and not whichever the last round happened to try.
+        fn arrive(
+            runs: &mut BTreeMap<String, BTreeMap<Process, Carried>>,
+            owner: &str,
+            process: Process,
+            how: Carried,
+        ) -> bool {
+            match runs.entry(owner.to_string()).or_default().entry(process) {
+                Entry::Vacant(slot) => {
+                    slot.insert(how);
+                    true
+                }
+                Entry::Occupied(_) => false,
+            }
+        }
+
+        /// A process that is this surface's own rather than one carried into it.
+        fn own(site: Option<&Span>) -> Carried {
+            Carried {
+                from: None,
+                site: site.cloned(),
+            }
+        }
+
         // The deploy layer and the trigger table are the hub's, always
         // (§9.1's fifth clause).
-        runs.entry(DEPLOY_OWNER.to_string())
-            .or_default()
-            .insert(Process::Hub);
+        arrive(&mut runs, DEPLOY_OWNER, Process::Hub, own(None));
         // …and each `storage_backends:` entry is the hub's too, unconditionally
         // and for the same clause. The pass below **adds** the placements whose
         // components open a store bound to it; nothing takes it off the hub's
         // list, so an entry no store binds keeps the membership it always had.
         if let Some(backends) = ir.deploy.storage_backends.as_ref() {
-            for kind in backends.defaults.keys() {
-                runs.entry(backend_owner(&format!(
-                    "deploy.storage_backends.defaults.{kind}"
-                )))
-                .or_default()
-                .insert(Process::Hub);
+            for (kind, config) in &backends.defaults {
+                let owner = backend_owner(&format!("deploy.storage_backends.defaults.{kind}"));
+                arrive(&mut runs, &owner, Process::Hub, own(Some(&config.span)));
             }
-            for alias in backends.aliases.keys() {
-                runs.entry(backend_owner(&format!(
-                    "deploy.storage_backends.aliases.{alias}"
-                )))
-                .or_default()
-                .insert(Process::Hub);
+            for (alias, config) in &backends.aliases {
+                let owner = backend_owner(&format!("deploy.storage_backends.aliases.{alias}"));
+                arrive(&mut runs, &owner, Process::Hub, own(Some(&config.span)));
             }
         }
 
         // Membership — §9.1's first clause — and unconditional hub
         // dispatchability, its second.
-        for (address, placement) in &claims {
-            runs.entry(address.clone())
-                .or_default()
-                .insert(Process::Placement(placement.clone()));
+        for (address, claim) in &claims {
+            arrive(
+                &mut runs,
+                address,
+                Process::Placement(claim.placement.clone()),
+                own(Some(&claim.at)),
+            );
         }
         for (address, definition) in &ir.definitions {
             match &definition.body {
@@ -200,17 +265,13 @@ impl Partition {
                 // (grammar Decision D64), so its own nodes' bindings are the
                 // hub's whatever else reaches them.
                 DefinitionBody::Flow(_) => {
-                    runs.entry(address.clone())
-                        .or_default()
-                        .insert(Process::Hub);
+                    arrive(&mut runs, address, Process::Hub, own(None));
                 }
                 // …and so is every unplaced agent, for the same reason read one
                 // level in: an `agent:` node of some flow is a node the hub's
                 // scheduler starts.
                 DefinitionBody::Agent(_) if !claims.contains_key(address) => {
-                    runs.entry(address.clone())
-                        .or_default()
-                        .insert(Process::Hub);
+                    arrive(&mut runs, address, Process::Hub, own(None));
                 }
                 _ => {}
             }
@@ -227,7 +288,7 @@ impl Partition {
                 let mut hub_dispatched = |address: &crate::ast::common::Address| {
                     let key = address.to_string();
                     if !claims.contains_key(&key) {
-                        runs.entry(key).or_default().insert(Process::Hub);
+                        arrive(&mut runs, &key, Process::Hub, own(None));
                     }
                 };
                 match &node.kind {
@@ -257,54 +318,66 @@ impl Partition {
         while moved {
             moved = false;
             for (address, definition) in &ir.definitions {
-                let held = runs.get(address).cloned().unwrap_or_default();
+                let held: Vec<Process> = runs
+                    .get(address)
+                    .map(|held| held.keys().cloned().collect())
+                    .unwrap_or_default();
                 if held.is_empty() {
                     continue;
                 }
-                let mut carry = |target: &str, placeable: bool| {
+                let mut carry = |target: &str, placeable: bool, site: &Span| {
                     if placeable && claims.contains_key(target) {
                         return;
                     };
-                    let into = runs.entry(target.to_string()).or_default();
                     for process in &held {
-                        if into.insert(process.clone()) {
-                            moved = true;
-                        }
+                        moved |= arrive(
+                            &mut runs,
+                            target,
+                            process.clone(),
+                            Carried {
+                                from: Some(address.clone()),
+                                site: Some(site.clone()),
+                            },
+                        );
                     }
                 };
                 match &definition.body {
                     DefinitionBody::Agent(agent) => {
                         for provider in providers_of(ir, &agent.model.value.to_string()) {
-                            carry(&provider, false);
+                            carry(&provider, false, &agent.model.span);
                         }
                         for attached in &agent.tools {
-                            carry(&attached.value.to_string(), true);
+                            carry(&attached.value.to_string(), true, &attached.span);
                         }
                         // A store an agent attaches is opened by the synthesized
                         // tool its own loop calls (grammar §11.5), so it is
                         // opened wherever the agent runs. Not placeable: a
                         // `store.*` is not a `members:` entry (grammar §14.1).
                         for attached in &agent.stores {
-                            carry(&attached.value.to_string(), false);
+                            carry(&attached.value.to_string(), false, &attached.span);
                         }
                     }
                     DefinitionBody::Flow(flow) => {
                         for node in &flow.nodes {
                             match &node.kind {
-                                NodeKind::Agent { agent } => carry(&agent.value.to_string(), true),
-                                NodeKind::Function { function } => {
-                                    carry(&function.value.to_string(), true);
+                                NodeKind::Agent { agent } => {
+                                    carry(&agent.value.to_string(), true, &agent.span);
                                 }
-                                NodeKind::Flow { flow, .. } => carry(&flow.value.to_string(), true),
+                                NodeKind::Function { function } => {
+                                    carry(&function.value.to_string(), true, &function.span);
+                                }
+                                NodeKind::Flow { flow, .. } => {
+                                    carry(&flow.value.to_string(), true, &flow.span);
+                                }
                                 NodeKind::Map { map } => {
                                     for target in crate::check::reach::targets(&map.dispatch) {
-                                        carry(&target.value.to_string(), true);
+                                        carry(&target.value.to_string(), true, &target.span);
                                     }
                                 }
                                 // A `store:` node is opened by whichever process
                                 // runs this flow's instance (grammar §11.4).
                                 NodeKind::Store { store, .. } => {
-                                    carry(&store.value.to_string(), false);
+                                    carry(&store.value.to_string(), false, &store.span);
                                 }
                                 _ => {}
                             }
@@ -332,10 +405,21 @@ impl Partition {
             let Some(site) = crate::ir::deploy::backend_of(ir, store).site else {
                 continue;
             };
-            let held = runs.get(address).cloned().unwrap_or_default();
-            let into = runs.entry(backend_owner(&site)).or_default();
+            let held: Vec<Process> = runs
+                .get(address)
+                .map(|held| held.keys().cloned().collect())
+                .unwrap_or_default();
+            let owner = backend_owner(&site);
             for process in held {
-                into.insert(process);
+                arrive(
+                    &mut runs,
+                    &owner,
+                    process,
+                    Carried {
+                        from: Some(address.clone()),
+                        site: None,
+                    },
+                );
             }
         }
 
@@ -347,10 +431,13 @@ impl Partition {
         for address in ir.definitions.keys() {
             runs.entry(address.clone()).or_default();
         }
-        for held in runs.values_mut() {
-            if held.is_empty() {
-                held.insert(Process::Hub);
-            }
+        let orphans: Vec<String> = runs
+            .iter()
+            .filter(|(_, held)| held.is_empty())
+            .map(|(owner, _)| owner.clone())
+            .collect();
+        for owner in orphans {
+            arrive(&mut runs, &owner, Process::Hub, own(None));
         }
 
         Self { runs, processes }
@@ -362,13 +449,74 @@ impl Partition {
         self.processes.iter()
     }
 
+    /// Every process the surface `owner` can execute in, the hub first.
+    pub fn processes_of(&self, owner: &str) -> impl Iterator<Item = &Process> {
+        self.runs.get(owner).into_iter().flat_map(BTreeMap::keys)
+    }
+
+    /// How `owner` came to run in `process`: the surfaces from the one that
+    /// holds the process itself to `owner`, in that order.
+    ///
+    /// The first step is where the process **starts** — a placement's
+    /// `members:` entry, for a [`Process::Placement`] — and each step after it
+    /// is the edge that carried the process one component further in. The last
+    /// step is `owner` itself.
+    ///
+    /// Empty where `owner` does not run in `process` at all. A one-step route is
+    /// a surface holding the process in its own right, with nothing to walk.
+    #[must_use]
+    pub fn route(&self, owner: &str, process: &Process) -> Vec<Step<'_>> {
+        let mut walked = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut at = owner;
+        loop {
+            // The **key** rather than the argument, so every step borrows from
+            // this partition and a route outlives the string it was asked about.
+            let Some((held, how)) = self
+                .runs
+                .get_key_value(at)
+                .and_then(|(held, runs)| runs.get(process).map(|how| (held.as_str(), how)))
+            else {
+                // Only reachable for the `owner` this was called with: every
+                // `from` was written by an arrival that carried this process.
+                return Vec::new();
+            };
+            if !seen.insert(held) {
+                // Unreachable by construction — an arrival is recorded once, so
+                // no owner is its own ancestor — and cheap insurance against a
+                // future edge that made it otherwise, since the alternative is a
+                // compiler that hangs.
+                break;
+            }
+            walked.push(Step {
+                owner: held,
+                site: how.site.as_ref(),
+            });
+            let Some(from) = how.from.as_deref() else {
+                break;
+            };
+            at = from;
+        }
+        walked.reverse();
+        walked
+    }
+
     /// Whether the surface `owner` holds can execute in `process`.
     #[must_use]
     fn holds(&self, owner: &str, process: &Process) -> bool {
         self.runs
             .get(owner)
-            .is_some_and(|held| held.contains(process))
+            .is_some_and(|held| held.contains_key(process))
     }
+}
+
+/// One placement's claim on a component: the name, and the `members:` entry
+/// that wrote it.
+struct Claim {
+    /// The placement's name.
+    placement: String,
+    /// Where the component is named in that placement's `members:`.
+    at: Span,
 }
 
 /// Which placement claims each component, by address (grammar §14.1).
@@ -376,7 +524,7 @@ impl Partition {
 /// The first claim wins, exactly as `check::placements` reads it: a component
 /// two placements name is already a compile error, and reading it twice here
 /// would make this pass's answer depend on which report the author fixes.
-fn claims(ir: &Ir) -> BTreeMap<String, String> {
+fn claims(ir: &Ir) -> BTreeMap<String, Claim> {
     let mut claims = BTreeMap::new();
     let Some(section) = ir.deploy.placements.as_ref() else {
         return claims;
@@ -385,7 +533,10 @@ fn claims(ir: &Ir) -> BTreeMap<String, String> {
         for member in &placement.members {
             claims
                 .entry(member.value.to_string())
-                .or_insert_with(|| placement.name.value.to_string());
+                .or_insert_with(|| Claim {
+                    placement: placement.name.value.to_string(),
+                    at: member.span.clone(),
+                });
         }
     }
     claims
@@ -946,6 +1097,30 @@ placements:\n  mac:\n    members: [agent.outer]\n",
         assert!(
             !hub.contains(&"OUTER_KEY".to_string()),
             "`agent.outer` is placed, so the hub never spends its provider's credential: {hub:?}"
+        );
+
+        // …and the route into `mac` is the chain that put it there, which is
+        // what grammar 14.1 rule 5's refusal draws for an author (D131). It
+        // starts at the `members:` entry and ends at the surface asked about.
+        let route: Vec<&str> = partition
+            .route("agent.inner", &Process::Placement("mac".to_string()))
+            .into_iter()
+            .map(|step| step.owner)
+            .collect();
+        assert_eq!(route, ["agent.outer", "flow.review", "agent.inner"]);
+        let placed = partition.route("agent.outer", &Process::Placement("mac".to_string()));
+        assert_eq!(
+            placed.len(),
+            1,
+            "a surface holding the process in its own right has nothing to walk"
+        );
+        assert!(
+            placed[0].site.is_some(),
+            "the first step is the `members:` entry, so it has a line to point at"
+        );
+        assert!(
+            partition.route("agent.outer", &Process::Hub).is_empty(),
+            "a placed agent has no hub execution, so there is no route into one"
         );
     }
 
