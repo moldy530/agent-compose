@@ -72,6 +72,34 @@ export function sinkAuth(): OutboundAuth | undefined {
   return traceSink?.auth;
 }
 
+/**
+ * The variables `trace_sink.auth:` names that resolved to **nothing**.
+ *
+ * The deploy layer's half of `./serve.ts`'s `blankCredentials`, and it lives
+ * here because `traceSink` does — a second reader of the sink's shape would be a
+ * second place to forget one of its two halves. Grammar §14.5 rule 3 makes the
+ * sink's `auth:` §13.3's block "unchanged", and §13.3 says what an empty one is:
+ * not a missing setting but an open door, refused at launch naming the variable.
+ * A collector reached with `Authorization: Bearer ` and nothing after it, or with
+ * a signature computed over a key of no bytes, is a deployment that believes it
+ * is authenticating and is not.
+ *
+ * Both halves are asked about rather than one: a sink may declare `bearer:` and
+ * `hmac:` together, and an empty key beside a good token is still a signature
+ * anybody can forge.
+ */
+export function blankSinkCredentials(): readonly string[] {
+  const auth = traceSink?.auth;
+  const blank: string[] = [];
+  if (auth?.bearer !== undefined && secret(auth.bearer.tokenEnv) === "") {
+    blank.push(auth.bearer.tokenEnv);
+  }
+  if (auth?.hmac !== undefined && secret(auth.hmac.secretEnv) === "") {
+    blank.push(auth.hmac.secretEnv);
+  }
+  return blank;
+}
+
 /** What a settled execution hands the exporter besides its entries. */
 export interface SettledTrace {
   readonly execution: string;
@@ -606,8 +634,14 @@ export function pause(milliseconds: number): Promise<void> {
  *
  * What that presence check does **not** cover is a variable set to the empty
  * string, which it counts as set — so the empty string this answers is a real
- * answer rather than only the unreachable one, and it is refused wherever it is
- * read (see `./serve.ts`'s `blankCredentials` and `verified`).
+ * answer rather than only the unreachable one, and it is refused at every
+ * surface that would spend or compare it: `./serve.ts`'s `blankCredentials`
+ * refuses the app at launch over any of the five — a trigger's `auth:` and
+ * `callback_auth:`, and the deploy layer's `trace_sink.auth:` ([`blankSinkCredentials`])
+ * — `verified` refuses an inbound comparison against one for the window a launch
+ * check cannot cover, and `./cli.ts`'s `shipped` leaves a trace export in the
+ * journal rather than signing it with nothing, which is that same launch refusal
+ * for a command that has no launch.
  *
  * It lives here, in the module that **spends** a credential, and `./serve.ts`
  * verifies with the same reader: two readings of one variable that disagreed

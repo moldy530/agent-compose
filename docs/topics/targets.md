@@ -257,7 +257,12 @@ Four things worth knowing:
 
 The `auth:` credential is a deploy-layer variable, so it belongs to the hub's
 environment manifest: the hub owns the trace and is the process that ships it, so
-no worker is ever asked for a token it would never spend.
+no worker is ever asked for a token it would never spend. It is held to the same
+rule every other credential is: one that resolves to the **empty string** refuses
+the app at launch, naming the variable, because an empty token is an
+`Authorization: Bearer ` with nothing after it and an empty HMAC key signs a body
+anybody can sign. A `run` has no launch to refuse at, so it says the same thing
+on stderr and leaves the export in the journal for a start that can sign it.
 
 ## `hub` and `placements` — the distributed surface
 

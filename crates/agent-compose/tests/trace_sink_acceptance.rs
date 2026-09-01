@@ -30,6 +30,7 @@
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
 
+use std::collections::HashSet;
 use std::net::TcpListener;
 use std::time::Duration;
 
@@ -99,14 +100,44 @@ fn closed_port() -> String {
 
 /// The one span every export has, and the whole of what a structural assertion
 /// needs to find first.
+///
+/// Found by **what makes it the root** and never by position: the root is the
+/// span whose parent is not in this export — absent, because nothing traced into
+/// the run, or a caller's span id, because something did (`docs/trace.md` §12.3).
+/// Every other span hangs off one emitted beside it.
+///
+/// Position would be the shorter spelling and the wrong one. `src/otlp.ts`
+/// happens to push the root ahead of its walk over the entries, so `spans[0]` is
+/// the root today — and a helper leaning on that would go on passing while
+/// silently answering with a *child* if that order ever moved, because every span
+/// in an export carries the same `traceId` and a child's `parentSpanId` is a
+/// well-formed id that is merely the wrong one.
+///
+/// Exactly one span qualifies, and that is asserted rather than assumed: two
+/// would be two trees in one request, which is not a shape this mapping has.
 fn root_span(body: &Value) -> &Value {
     let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
         .as_array()
         .unwrap_or_else(|| panic!("an OTLP export carries spans: {body:#}"));
-    spans
+    let emitted: HashSet<&str> = spans
         .iter()
-        .find(|span| span.get("parentSpanId").is_none() || span["name"].as_str().is_some())
-        .expect("an export has a first span")
+        .filter_map(|span| span["spanId"].as_str())
+        .collect();
+    let mut roots =
+        spans.iter().filter(
+            |span| match span.get("parentSpanId").and_then(Value::as_str) {
+                None => true,
+                Some(parent) => !emitted.contains(parent),
+            },
+        );
+    let root = roots
+        .next()
+        .unwrap_or_else(|| panic!("an export has a root span: {body:#}"));
+    assert!(
+        roots.next().is_none(),
+        "an export has exactly one root span: {body:#}"
+    );
+    root
 }
 
 /// **A settled execution's trace reaches the address the target names, signed
@@ -806,5 +837,268 @@ fn a_callback_and_a_trace_export_are_two_deliveries_of_one_settle() {
     assert_eq!(
         exported[0].header("x-agentcompose-delivery"),
         Some(format!("{execution}:1").as_str())
+    );
+}
+
+/// **A generation that journaled the webhook and died still exports on
+/// recovery** (`docs/trace.md` §1.4, `docs/durability.md` §3.7, §6.1).
+///
+/// The other side of the coin the test above turns over. A settle under a target
+/// declaring both a `callback:` and a `trace_sink:` writes **two** rows, one
+/// after the other, while the lifecycle row is still open — and a process killed
+/// between them leaves an execution that is still `open` with only the webhook
+/// down. The start that recovers it replays it back to the same hook, and the
+/// question that hook asks there decides everything: a guard reading "is there a
+/// `settled` row already?" would find the dead generation's webhook, conclude the
+/// settle was made, and return — and that execution's trace would never be
+/// exported by anything, ever, because `resumeDeliveries` can only finish rows
+/// that exist. Silent, permanent, and against §1.4's "a recovered execution's"
+/// alike.
+///
+/// **The state is made rather than raced**, which is the only way a test reaches
+/// it: a real settle is journaled, and then the journal is put back into the
+/// shape the kill would have left it in — the export row removed, the lifecycle
+/// row reopened. That is what `journal_sql` is for here as elsewhere, and it is
+/// honest because both halves of the state are what a generation really wrote.
+///
+/// Two claims come out of it, and they are opposite guards rather than one: the
+/// export is journaled and sent by the second generation, and the webhook is
+/// **not journaled again** — a second `settled` row would be a second delivery
+/// id, which is a subscriber told that one execution finished twice. That is
+/// what asking about the delivery's *kind* buys, and it is why removing the
+/// early return did not cost it.
+#[test]
+fn a_generation_that_journaled_only_the_webhook_still_exports_on_recovery() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let subscriber = harness::Receiver::start().expect("a loopback subscriber");
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-half-journaled",
+        FIXTURE,
+        TARGET,
+        &sink_target(&format!("{}/v1/traces", collector.base_url), None, false),
+    );
+    let Some(project) = harness::scratch_project("sink-half-journaled") else {
+        return;
+    };
+    let environment = environment(&provider);
+
+    let execution;
+    {
+        let Some(first) = harness::serve_target_into(&project, &entrypoint, TARGET, &environment)
+        else {
+            return;
+        };
+        let app = Client::new(&first.base_url).expect("a client for the generated app");
+        let started = app
+            .send(Request::post("/watched-greetings").json(&json!({
+                "subject": "a generation that got half way",
+                "callback_url": format!("{}/done", subscriber.base_url),
+            })))
+            .expect("the trigger's route answers");
+        assert_eq!(started.status, 202, "{}", started.text());
+        execution = started.json()["execution_id"]
+            .as_str()
+            .expect("an execution id")
+            .to_string();
+        // Both rows really down and both deliveries really made, so what the
+        // surgery below removes is a row this deployment wrote rather than one
+        // this test invented.
+        subscriber.wait_for_event("settled", 1, PATIENCE);
+        collector.wait_for_event("settled", 1, PATIENCE);
+    }
+
+    // The state a process killed between the two intents leaves behind.
+    harness::journal_sql(
+        &project,
+        &format!(
+            "DELETE FROM deliveries WHERE execution = '{execution}' AND kind = 'trace_sink';\n\
+             UPDATE executions SET status = 'open', ended_at = NULL WHERE id = '{execution}';"
+        ),
+    );
+    let halfway = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT kind FROM deliveries WHERE execution = '{execution}' ORDER BY ordinal ASC"
+        ),
+    );
+    assert_eq!(
+        halfway.as_array().map(Vec::len),
+        Some(1),
+        "the surgery leaves exactly the webhook: {halfway:#}"
+    );
+    assert_eq!(halfway[0]["kind"], "callback", "{halfway:#}");
+
+    let Some(_second) = harness::serve_target_into(&project, &entrypoint, TARGET, &environment)
+    else {
+        return;
+    };
+
+    // The claim: a second export arrives — the recovered execution's — and the
+    // journal holds its row again.
+    let exported = collector.wait_for_event("settled", 2, PATIENCE);
+    assert_eq!(
+        exported[1].body["execution_id"], execution,
+        "the recovered execution's trace is the one that shipped: {:#}",
+        exported[1].body
+    );
+    let finished = harness::journal_rows(
+        &project,
+        &format!(
+            "SELECT kind, status FROM deliveries WHERE execution = '{execution}' \
+             ORDER BY ordinal ASC"
+        ),
+    );
+    assert_eq!(finished[1]["kind"], "trace_sink", "{finished:#}");
+    assert_eq!(
+        finished[1]["status"], "delivered",
+        "the export the recovery journaled was never sent: {finished:#}"
+    );
+
+    // …and the webhook the dead generation already journaled is **not** journaled
+    // a second time. Asserted on the ledger and on the delivery ids rather than
+    // on the count of POSTs, because the count is not the promise: a row the kill
+    // caught between its attempt and its outcome is `pending`, and the resume walk
+    // finishing it is at-least-once delivery working (a receiver dedupes on the
+    // id). What would be the bug is a *second* `settled` row — a second id — which
+    // is a receiver being told one execution finished twice.
+    assert_eq!(
+        finished.as_array().map(Vec::len),
+        Some(2),
+        "one webhook and one export, and no more: {finished:#}"
+    );
+    assert_eq!(finished[0]["kind"], "callback", "{finished:#}");
+    assert_eq!(
+        subscriber.distinct("settled"),
+        [format!("{execution}:0")],
+        "a settle is announced once per execution across generations: {:?}",
+        subscriber.distinct("settled")
+    );
+}
+
+/// **A sink credential set to nothing refuses the app at launch, naming the
+/// variable** (grammar §13.3, §14.5 rule 3).
+///
+/// `trace_sink.auth:` is §13.3's outbound block unchanged, and §13.3 is explicit
+/// about what an empty credential is: not a missing setting but an open door,
+/// refused at launch. `src/env.ts` counts `TRACE_SINK_TOKEN=` as present — §4.3's
+/// own rule, and the right one for a `base_url:` — so without a check of its own
+/// the deployment would serve, and every trace it ever exported would go out
+/// under an `Authorization: Bearer ` with nothing after it. The collector answers
+/// `401`, the deliveries exhaust on the ledger, and nothing in a run says so:
+/// exactly the silence at-least-once delivery is built to keep.
+///
+/// Asserted with the sink's `hmac:` half emptied as well as its `bearer:` half,
+/// because a signature over a key of no bytes is the worse of the two and the
+/// quieter: it is a header a receiver can verify, computed with nothing.
+#[test]
+fn a_sink_credential_set_to_nothing_refuses_the_app_at_launch() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-blank-credential",
+        FIXTURE,
+        TARGET,
+        &sink_target(&format!("{}/v1/traces", collector.base_url), None, true),
+    );
+    let Some(project) = harness::scratch_project("sink-blank-credential") else {
+        return;
+    };
+    for blanked in [harness::DELIVERY_TOKEN, harness::DELIVERY_SECRET] {
+        let mut held = environment(&provider);
+        for entry in &mut held {
+            if entry.0 == blanked {
+                entry.1 = String::new();
+            }
+        }
+        let refused = harness::serve_refused_target(&project, &entrypoint, TARGET, &held);
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "a variable the deployment has to fix is a usage error: {said}"
+        );
+        assert!(
+            said.contains(blanked),
+            "…and the refusal names what to set: {said}"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stdout).is_empty(),
+            "nothing was served: a readiness line would mean the routes were mounted: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+    }
+}
+
+/// **A `run` whose sink credential resolved to nothing leaves the export in the
+/// journal rather than signing it with nothing** (grammar §13.3, §14.5).
+///
+/// The launch refusal above is `serve`'s, and a command has no launch to put one
+/// in — but PRD resolved q50 puts the sink "wherever executions settle, `run`
+/// included", so a command really does spend this credential. Three things are
+/// therefore true at once and each is a separate half of the resolution: the run
+/// **succeeds** and prints its answer, because a credential is not an outcome; the
+/// collector is sent **nothing**, because a delivery signed with nothing is worse
+/// than a delivery not made; and the row is left **`pending`** with no attempt
+/// against it, so the next `serve` — which will refuse to start until the
+/// variable is set — is what finally sends it.
+#[test]
+fn a_run_whose_sink_credential_is_blank_journals_the_export_and_sends_nothing() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-blank-run",
+        FIXTURE,
+        TARGET,
+        &sink_target(&format!("{}/v1/traces", collector.base_url), None, true),
+    );
+    let Some(project) = harness::scratch_project("sink-blank-run") else {
+        return;
+    };
+    let mut held = environment(&provider);
+    for entry in &mut held {
+        if entry.0 == harness::DELIVERY_TOKEN {
+            entry.1 = String::new();
+        }
+    }
+
+    let run = harness::run_target(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.greet",
+        &[("subject", "a token that expanded to nothing")],
+        &held,
+    );
+    run.succeeded();
+    assert_eq!(
+        run.outputs(),
+        json!({ "greeting": "hello", "noted": "seen" }),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        run.stderr().contains(harness::DELIVERY_TOKEN),
+        "the command says which variable stopped the export: {}",
+        run.stderr()
+    );
+
+    let owed = harness::journal_rows(
+        &project,
+        "SELECT kind, status, attempts FROM deliveries ORDER BY ordinal ASC",
+    );
+    assert_eq!(owed[0]["kind"], "trace_sink", "{owed:#}");
+    assert_eq!(
+        owed[0]["status"], "pending",
+        "the export is left for a start that can sign it: {owed:#}"
+    );
+    assert_eq!(
+        owed[0]["attempts"], "[]",
+        "…with no attempt spent against its schedule: {owed:#}"
+    );
+    assert!(
+        collector.of_event("settled").is_empty(),
+        "a delivery signed with nothing was sent anyway: {:?}",
+        collector.of_event("settled")
     );
 }

@@ -152,6 +152,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
   JOURNAL_RETRY_MS,
   beingWorked,
+  blankSinkCredentials,
   insisting,
   message,
   pause,
@@ -584,8 +585,8 @@ function verified(trigger: HttpTrigger, request: FastifyRequest): Refusal | unde
 }
 
 /**
- * Every credential this composition's triggers declare that resolved to
- * **nothing**, by variable name.
+ * Every credential this deployment declares that resolved to **nothing**, by
+ * variable name.
  *
  * `src/env.ts` decides *presence*, and presence there is `!== undefined`: a
  * variable set to the empty string is set (grammar 4.3). That is the right rule
@@ -597,6 +598,14 @@ function verified(trigger: HttpTrigger, request: FastifyRequest): Refusal | unde
  * held to it at launch — one refusal a deployment meets on its first start,
  * rather than a route that answers `401` to the caller holding the right token
  * or a delivery signed with nothing.
+ *
+ * **Five surfaces rather than four**, because the deploy layer spends a
+ * credential of its own: `trace_sink.auth:` is §13.3's outbound block unchanged
+ * (grammar §14.5 rule 3), and a sink signed with nothing is the same open door
+ * one delivery further out — every settled execution's trace pushed to a
+ * collector under an `Authorization: Bearer ` with nothing after it. It is asked
+ * about in [`blankSinkCredentials`], beside the sink's own shape, and named here
+ * so that one launch refusal covers everything this app can present.
  */
 function blankCredentials(): readonly string[] {
   const blank: string[] = [];
@@ -611,14 +620,23 @@ function blankCredentials(): readonly string[] {
     if (delivery?.bearer !== undefined) named(delivery.bearer.tokenEnv);
     if (delivery?.hmac !== undefined) named(delivery.hmac.secretEnv);
   }
+  for (const variable of blankSinkCredentials()) named(variable);
   return blank;
 }
 
-/** What a trigger's `auth:` or `callback_auth:` named and this process cannot use. */
+/**
+ * What a trigger's `auth:` or `callback_auth:`, or the deploy layer's
+ * `trace_sink.auth:`, named and this process cannot use.
+ *
+ * The sentence names **the deployment** rather than a trigger, because after
+ * grammar §14.5 the credential may belong to the target instead: an operator
+ * reading it is pointed at the variable, which is the half that repairs it
+ * either way.
+ */
 export class BlankCredentialError extends Error {
   constructor(blank: readonly string[]) {
     super(
-      `${blank.map((name) => `\`${name}\``).join(", ")} ${blank.length === 1 ? "is" : "are"} set to the empty string, and a trigger of this composition ${blank.length === 1 ? "verifies or signs with it" : "verifies or signs with them"}: an empty credential admits every caller and signs every delivery, so this app refuses to serve until ${blank.length === 1 ? "it is given a value" : "they are given values"} (grammar 13.3)`,
+      `${blank.map((name) => `\`${name}\``).join(", ")} ${blank.length === 1 ? "is" : "are"} set to the empty string, and this deployment ${blank.length === 1 ? "verifies or signs with it" : "verifies or signs with them"}: an empty credential admits every caller and signs every delivery, so this app refuses to serve until ${blank.length === 1 ? "it is given a value" : "they are given values"} (grammar 13.3, 14.5)`,
     );
     this.name = "BlankCredentialError";
   }
@@ -1253,6 +1271,18 @@ function recorded(execution: Execution, answer: FlowRun | undefined, error: unkn
  * And the intent is **insisted on** rather than tried once, because this is the
  * last moment anything comes back to it: see [`insisting`] and the comment on
  * the write itself.
+ *
+ * **Two intents, each guarded by its own question**, and that is the whole of
+ * why the webhook's guard is written around it rather than in front of both. A
+ * settle journals a `callback` row and a `trace_sink` row where a target
+ * declares each, and a process killed between them leaves an execution that is
+ * still `open` with only the first one down. The start that recovers it replays
+ * it back to this hook, and a guard covering both would read the webhook row a
+ * dead generation left, conclude the settle was done, and return — leaving that
+ * execution's trace unexported for the life of the journal, against
+ * `docs/trace.md` §1.4's "a recovered execution's" alike. So each intent asks
+ * about **its own** kind: [`settledAlready`] about the webhook,
+ * [`shipTrace`]'s `exportedAlready` about the export.
  */
 async function closed(
   execution: Execution,
@@ -1270,24 +1300,32 @@ async function closed(
   // [`resumeDeliveries`] and delivered under the ordinal it was allocated;
   // announcing a second one here would tell a receiver that an execution
   // finished twice.
-  if (await settledAlready(execution.id)) return;
-  // **The one write in this file that nothing at all would come back to**, and
-  // so the one that is insisted on where it stands rather than left for a later
-  // write to carry ([`insisting`]). The row closes as this returns: after that
-  // `recover` walks no `open` execution for it and [`resumeDeliveries`] finds no
-  // `pending` row, so an intent the journal would not take here — a second
-  // process holding the file past the lock wait, a disk momentarily full, both
-  // states `docs/durability.md` §2 says a healthy deployment reaches — is a
-  // settle nothing ever announces, owed to a caller who was handed a `202` and
-  // by resolved q34's own reasoning is not polling.
-  //
-  // The ladder runs **while the row is still open**, which is also what makes a
-  // process killed part-way through it recoverable: the execution is still
-  // `open`, so the next start replays it to the same end and reaches this hook
-  // again. Bounded like every other ladder here (§3.7): its end is a sentence on
-  // stderr and a status route that still holds the answer.
-  await insisting(() => deliver(execution, "settled", []));
+  if (!(await settledAlready(execution.id))) {
+    // **The one write in this file that nothing at all would come back to**, and
+    // so the one that is insisted on where it stands rather than left for a later
+    // write to carry ([`insisting`]). The row closes as this returns: after that
+    // `recover` walks no `open` execution for it and [`resumeDeliveries`] finds no
+    // `pending` row, so an intent the journal would not take here — a second
+    // process holding the file past the lock wait, a disk momentarily full, both
+    // states `docs/durability.md` §2 says a healthy deployment reaches — is a
+    // settle nothing ever announces, owed to a caller who was handed a `202` and
+    // by resolved q34's own reasoning is not polling.
+    //
+    // The ladder runs **while the row is still open**, which is also what makes a
+    // process killed part-way through it recoverable: the execution is still
+    // `open`, so the next start replays it to the same end and reaches this hook
+    // again. Bounded like every other ladder here (§3.7): its end is a sentence on
+    // stderr and a status route that still holds the answer.
+    await insisting(() => deliver(execution, "settled", []));
+  }
   await insisting(() =>
+    // Reached whether or not the webhook was journaled a moment ago, and that is
+    // this hook's second half rather than its continuation: the export is owed by
+    // **every** settled execution (grammar §14.5), including one whose webhook a
+    // dead generation already put down. [`shipping`] is a no-op under a target
+    // that declares no sink and idempotent under one that does, so arriving here
+    // twice across generations costs a journal read.
+    //
     // The outcome is derived from what the run answered rather than read back
     // off the execution, for the reason [`recorded`] derives it there: the two
     // must agree, and one derivation cannot disagree with itself. The third

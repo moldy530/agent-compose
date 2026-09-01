@@ -4783,7 +4783,11 @@ execution nothing.
 The credential is a **deploy-layer** variable and belongs to the hub's
 environment manifest (PRD resolved q41): the hub owns the trace and is the
 process that ships it, so a worker is never asked for a token it would never
-spend (`docs/distributed.md` §9.1).
+spend (`docs/distributed.md` §9.1). It is §13.3's credential in this too: one
+that resolves to the **empty string** refuses `serve` at launch naming the
+variable, and a `run` — which has no launch to refuse at, and settles executions
+under this target all the same — says so on stderr and leaves the export
+`pending` on the ledger rather than signing it with nothing.
 
 ---
 

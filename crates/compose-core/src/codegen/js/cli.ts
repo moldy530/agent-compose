@@ -134,6 +134,7 @@ import process from "node:process";
 
 import {
   CallbackRetryError,
+  blankSinkCredentials,
   insisting,
   shipTrace,
   sinkAuth,
@@ -398,9 +399,27 @@ async function execute(job: Job): Promise<number> {
  * After the answer is on stdout and never before it, and its own failure is its
  * own: a collector that is down is not this run's outcome and does not touch its
  * exit code.
+ *
+ * **A credential that resolved to nothing stops the sending and nothing else.**
+ * `src/serve.ts` refuses to start an app holding one, which is the launch check
+ * grammar §13.3 describes and a command has no launch to put it in: this run's
+ * work is done and its answer is printed, so the honest thing left is to leave
+ * the row where a `serve` start will find it rather than to POST a trace under
+ * an `Authorization: Bearer ` with nothing after it, or signed with a key of no
+ * bytes. The row stays `pending` with no attempt recorded against it, and the
+ * next start delivers it — after refusing to serve until the variable is set.
  */
 async function shipped(record: runtime.DeliveryRecord | undefined): Promise<void> {
   if (record === undefined) return;
+  const blank = blankSinkCredentials();
+  if (blank.length > 0) {
+    process.stderr.write(
+      `\`${record.id}\` was not sent and stays in the journal: ${blank
+        .map((name) => `\`${name}\``)
+        .join(", ")} ${blank.length === 1 ? "is" : "are"} set to the empty string, and this target's \`trace_sink:\` signs with ${blank.length === 1 ? "it" : "them"} (grammar 13.3, 14.5)\n`,
+    );
+    return;
+  }
   try {
     await workDelivery(record, sinkAuth(), false);
   } catch (error) {
