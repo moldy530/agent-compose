@@ -498,6 +498,14 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
     if let Some(hub) = artifact.pointer("/deploy/hub") {
         found.insert((COMPONENTS, "hub".to_string()), Slice::own(hub.clone()));
     }
+    // …and `trace_sink:` the same way, for the same reason: one block of three
+    // keys, at one address (`docs/plan.md` §4, §8).
+    if let Some(sink) = artifact.pointer("/deploy/trace_sink") {
+        found.insert(
+            (COMPONENTS, "trace_sink".to_string()),
+            Slice::own(sink.clone()),
+        );
+    }
     for (name, source) in section(&artifact, &["deploy", "event_sources"]) {
         found.insert(
             (COMPONENTS, format!("event_source.{name}")),
@@ -506,7 +514,7 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
     }
     accounted(
         artifact.get("deploy").unwrap_or(&Value::Null),
-        &["hub", "placements", "event_sources"],
+        &["hub", "placements", "trace_sink", "event_sources"],
         "the deploy layer",
     );
 
@@ -1243,6 +1251,45 @@ event_sources:
     stream: triage-reports
     consumer_group: agent-compose"#;
 
+/// A trace sink planted under the same anchor, and the two edits a plan has to
+/// report about one (grammar §14.5, `docs/plan.md` §4).
+///
+/// Planted for [`EVENT_SOURCE`]'s reason and one of its own: `local` admits the
+/// section — a laptop's `run` settles executions like any other target — but the
+/// example carries no sink under `local`, and a section a plan stopped reporting
+/// would let a deployment repoint every trace it emits, or switch the wire
+/// format under a collector, with nothing in the review.
+///
+/// The second edit moves `format:` rather than `url:` on purpose: the default is
+/// applied in the IR, so `format: envelope` and no `format:` at all are the same
+/// artifact, and the pair that has to be reported is the one where the *decided*
+/// value moves.
+const TRACE_SINK: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  auth:
+    bearer:
+      token: ${TRACE_SINK_TOKEN}"#;
+const TRACE_SINK_REPOINTED: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+trace_sink:
+  url: "https://collector.eu.internal.example/v1/traces"
+  auth:
+    bearer:
+      token: ${TRACE_SINK_TOKEN}"#;
+const TRACE_SINK_AS_OTLP: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  format: otlp
+  auth:
+    bearer:
+      token: ${TRACE_SINK_TOKEN}"#;
+
 /// A placement planted under the same anchor, and the two edits a plan has to
 /// report about one (grammar §14.1, `docs/plan.md` §4).
 ///
@@ -1604,6 +1651,24 @@ const CASES: &[Case] = &[
         what: "an event source's stream repointed",
         before: &[("deploy/local.yml", HUB, EVENT_SOURCE)],
         after: &[("deploy/local.yml", HUB, EVENT_SOURCE_MOVED)],
+        differs: true,
+    },
+    Case {
+        what: "a trace sink repointed at another collector",
+        before: &[("deploy/local.yml", HUB, TRACE_SINK)],
+        after: &[("deploy/local.yml", HUB, TRACE_SINK_REPOINTED)],
+        differs: true,
+    },
+    Case {
+        what: "a trace sink switched to the OTLP wire format",
+        before: &[("deploy/local.yml", HUB, TRACE_SINK)],
+        after: &[("deploy/local.yml", HUB, TRACE_SINK_AS_OTLP)],
+        differs: true,
+    },
+    Case {
+        what: "a trace sink added to a target that had none",
+        before: &[],
+        after: &[("deploy/local.yml", HUB, TRACE_SINK)],
         differs: true,
     },
     // --- Every remaining key of one component, swept a component at a time. ---

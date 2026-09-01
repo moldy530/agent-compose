@@ -1,6 +1,6 @@
 # agent-compose — Plan Format
 
-**Plan version:** `1`
+**Plan version:** `2`
 
 This document is **normative** for `agent-compose plan --format json`. It is the
 whole of what a consumer of that document may rely on, and §12 is the contract:
@@ -37,7 +37,8 @@ which is a report rather than a contract.
   - [12.1 What a reader may rely on](#121-what-a-reader-may-rely-on)
   - [12.2 What is a compatible change](#122-what-is-a-compatible-change)
   - [12.3 What requires a version bump](#123-what-requires-a-version-bump)
-  - [12.4 How the two are held together](#124-how-the-two-are-held-together)
+  - [12.4 What version `2` changed](#124-what-version-2-changed)
+  - [12.5 How the two are held together](#125-how-the-two-are-held-together)
 - [13. The human report](#13-the-human-report)
 
 ## 1. What a plan is
@@ -90,7 +91,7 @@ know rather than guessing.
 
 | field | meaning |
 |---|---|
-| `plan_version` | the shape of this document — `1`, and the first key so a reader can dispatch on it |
+| `plan_version` | the shape of this document — `2`, and the first key so a reader can dispatch on it |
 | `before` | the composition compared **from**, as §2.2 describes it |
 | `after` | the composition compared **to** |
 | `components` | §4's array. Empty when nothing in it changed |
@@ -260,6 +261,7 @@ is accounted for.
 | `"trigger"` | an entry of `triggers:` |
 | `"placement"` | an entry of the active target's `placements:` |
 | `"hub"` | the active target's `hub:` block |
+| `"trace_sink"` | the active target's `trace_sink:` block |
 | `"event_source"` | an entry of the active target's `event_sources:` |
 
 **What this section owns.** Every component arriving or leaving, and every field
@@ -276,8 +278,8 @@ Concretely, two components have fields held elsewhere:
   and what it is for. Its whole delivery surface is §6's.
 
 Everything else — an agent, a tool, a store, a provider, a model, a placement, the
-`hub:` block, an event source — reports every field of its resolved definition
-here.
+`hub:` block, the `trace_sink:` block, an event source — reports every field of
+its resolved definition here.
 
 One field of every entry is never reported: the key the artifact repeats
 **inside** the value, so that an entry read on its own still names what it is.
@@ -293,8 +295,9 @@ Which field it is depends on what the entry is, and this is all of them:
 | a trigger | `name` |
 | a `state:` channel (§5) | `name` |
 
-The `hub:` block is not in that table and needs no row: it is a singleton rather
-than an entry under a key, so nothing inside it repeats one.
+The `hub:` and `trace_sink:` blocks are not in that table and need no row: each
+is a singleton rather than an entry under a key, so nothing inside one repeats
+one.
 
 A definition's `namespace` — the tag its body is written under (grammar 2.2) — is
 equal by construction for the same reason: it follows from the address. It is
@@ -480,6 +483,7 @@ Every record names its subject by an address, and the spelling is fixed:
 | a trigger | `trigger.` and the name it is declared under: `trigger.on_request` |
 | a placement | `placement.` and the name it is declared under: `placement.mac` |
 | the `hub:` block | `hub` |
+| the `trace_sink:` block | `trace_sink` |
 | an event source | `event_source.` and its logical name: `event_source.bug_reports` |
 | a node | the flow's address, a `.`, and the flow-local node id: `flow.review_loop.draft` |
 | an edge | the flow's address, a `.`, the source, `->`, and the target: `flow.review_loop.draft->review` |
@@ -631,9 +635,9 @@ a reason:
 * **`storage_backends:`** — the deploy layer's backend bindings. `plan` resolves
   the built-in `local` target on both sides (§1), and grammar 14 makes
   `storage_backends:` a compile error under `local` (Decision D87), so no
-  artifact this command can build carries one. The three sections `local` *does*
-  admit — `hub:`, `placements:` and `event_sources:` — are compared, and appear
-  in §4.
+  artifact this command can build carries one. The four sections `local` *does*
+  admit — `hub:`, `placements:`, `trace_sink:` and `event_sources:` — are
+  compared, and appear in §4.
 * **a declared-but-empty section**, as against an absent one. The IR draws that
   distinction — `state:` written with no channels is not `state:` unwritten — and
   a plan reports the channels, the triggers and the placements themselves rather
@@ -799,7 +803,18 @@ comparison*, not across compiler releases.
 * changing which section owns a field (§4), because a reader watching one section
   would stop seeing an edit it was watching for.
 
-### 12.4 How the two are held together
+### 12.4 What version `2` changed
+
+One member, added to one closed vocabulary: `component` gained `"trace_sink"`,
+and §8 gained the address `trace_sink` that goes with it. The deploy layer grew
+a section — `trace_sink:`, where every settled execution's trace ships
+(`docs/grammar.md` §14.5, PRD resolved q50) — and §12.3 makes a reader entitled
+to exhaust `component`, so a plan naming a kind version `1` never listed is a
+bump rather than an addition a reader could have absorbed. Nothing else moved:
+every key, every address spelling, the ordering and the location rule are
+version `1`'s.
+
+### 12.5 How the two are held together
 
 `crates/compose-core/tests/plan_format_inventory.rs` reads the record types out
 of `crates/compose-core/src/plan/` and holds each of them to this file: every
