@@ -1,0 +1,1090 @@
+{
+  "name": "retried-instances",
+  "about": "Two attempts of one retried `flow:` node, and two attempts of one agent node's tool loop. Both shapes file records at the SAME instance path — grammar §9.4 reuses a key for a repeated attempt on purpose (`docs/trace.md` §8) — and both carry entries beneath them. It is the case a span id derived from the bare instance path collapses: the two `mid` spans would differ and their two `leaf` children would not, so a collector would merge two subflow attempts into one span. Every id below has to be distinct.",
+  "context": {
+    "target": "staging",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000ab",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T12:00:00.000Z",
+    "endedAt": "2026-09-01T12:00:09.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.pipeline",
+    "execution_id": "exec_retried",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.pipeline",
+        "node": "outer",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 2,
+        "writes": [
+          "report"
+        ],
+        "inner": [
+          {
+            "step": 1,
+            "flow": "flow.middle",
+            "node": "mid",
+            "traversal": 0,
+            "outcome": "failed",
+            "attempts": 1,
+            "error": "NodeFailure: the first attempt's instance died inside the boundary",
+            "inner": [
+              {
+                "step": 1,
+                "flow": "flow.leaf",
+                "node": "leaf",
+                "traversal": 0,
+                "outcome": "failed",
+                "attempts": 1,
+                "error": "NodeFailure: `exec:` exited 1"
+              }
+            ]
+          },
+          {
+            "step": 1,
+            "flow": "flow.middle",
+            "node": "mid",
+            "traversal": 0,
+            "outcome": "completed",
+            "attempts": 1,
+            "writes": [
+              "summary"
+            ],
+            "inner": [
+              {
+                "step": 1,
+                "flow": "flow.leaf",
+                "node": "leaf",
+                "traversal": 0,
+                "outcome": "completed",
+                "attempts": 1,
+                "writes": [
+                  "digest"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "step": 2,
+        "flow": "flow.pipeline",
+        "node": "ask",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 2,
+        "writes": [
+          "verdict"
+        ],
+        "models": [
+          {
+            "model": "model.smart",
+            "servedBy": "model.smart",
+            "fallback": 0,
+            "failovers": [],
+            "toolCalls": [
+              {
+                "name": "enrich",
+                "target": "flow.enrich",
+                "outcome": "failed",
+                "instance": "exec_retried/ask/0/enrich/0",
+                "error": "SubflowFailure: `flow.enrich` produced no answer"
+              }
+            ]
+          },
+          {
+            "model": "model.smart",
+            "servedBy": "model.smart",
+            "fallback": 0,
+            "failovers": [],
+            "toolCalls": [
+              {
+                "name": "enrich",
+                "target": "flow.enrich",
+                "outcome": "completed",
+                "instance": "exec_retried/ask/0/enrich/0"
+              }
+            ]
+          }
+        ],
+        "toolDispatches": [
+          {
+            "index": 0,
+            "target": "flow.enrich",
+            "outcome": "failed",
+            "attempts": 1,
+            "idempotencyKey": "exec_retried/ask/0/enrich/0",
+            "error": "SubflowFailure: `flow.enrich` produced no answer",
+            "inner": [
+              {
+                "step": 1,
+                "flow": "flow.enrich",
+                "node": "lookup",
+                "traversal": 0,
+                "outcome": "failed",
+                "attempts": 1,
+                "error": "NodeFailure: the lookup timed out"
+              }
+            ]
+          },
+          {
+            "index": 0,
+            "target": "flow.enrich",
+            "outcome": "completed",
+            "attempts": 1,
+            "idempotencyKey": "exec_retried/ask/0/enrich/0",
+            "inner": [
+              {
+                "step": 1,
+                "flow": "flow.enrich",
+                "node": "lookup",
+                "traversal": 0,
+                "outcome": "completed",
+                "attempts": 1,
+                "writes": [
+                  "facts"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.pipeline"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000ab"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "4cb5b185f35551be",
+                "name": "flow.pipeline",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_retried"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.pipeline"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "e4225a2c89ea8c53",
+                "parentSpanId": "4cb5b185f35551be",
+                "name": "outer",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/outer/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.pipeline"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "outer"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "report"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "beca1f8411a93ddd",
+                "parentSpanId": "e4225a2c89ea8c53",
+                "name": "mid",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/outer/0/mid/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.middle"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "mid"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: the first attempt's instance died inside the boundary"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: the first attempt's instance died inside the boundary"
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "622e415bc76b12fb",
+                "parentSpanId": "beca1f8411a93ddd",
+                "name": "leaf",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/outer/0/mid/0/leaf/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.leaf"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "leaf"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: `exec:` exited 1"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: `exec:` exited 1"
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "f8d8040eee21b8a9",
+                "parentSpanId": "e4225a2c89ea8c53",
+                "name": "mid",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/outer/0/mid/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.middle"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "mid"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "summary"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "698cca9feda65170",
+                "parentSpanId": "f8d8040eee21b8a9",
+                "name": "leaf",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/outer/0/mid/0/leaf/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.leaf"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "leaf"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "digest"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "6d2739ffe4a2dfb3",
+                "parentSpanId": "4cb5b185f35551be",
+                "name": "ask",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/ask/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.pipeline"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "ask"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "verdict"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "66d8e8c5447e5ac1",
+                "parentSpanId": "6d2739ffe4a2dfb3",
+                "name": "model.smart",
+                "kind": 3,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.served_by",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.fallback",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.failovers",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788264000000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "enrich"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.target",
+                        "value": {
+                          "stringValue": "flow.enrich"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "failed"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_retried/ask/0/enrich/0"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.error",
+                        "value": {
+                          "stringValue": "SubflowFailure: `flow.enrich` produced no answer"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [
+                  {
+                    "traceId": "438149b1150edc7971edf9aef9293b82",
+                    "spanId": "a1a8cd8bb0cd25d3",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_retried/ask/0/enrich/0"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "c15f31c7a236ff1c",
+                "parentSpanId": "6d2739ffe4a2dfb3",
+                "name": "model.smart",
+                "kind": 3,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.served_by",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.fallback",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.failovers",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788264000000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "enrich"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.target",
+                        "value": {
+                          "stringValue": "flow.enrich"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "completed"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_retried/ask/0/enrich/0"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [
+                  {
+                    "traceId": "438149b1150edc7971edf9aef9293b82",
+                    "spanId": "a1a8cd8bb0cd25d3",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_retried/ask/0/enrich/0"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "a1a8cd8bb0cd25d3",
+                "parentSpanId": "6d2739ffe4a2dfb3",
+                "name": "flow.enrich",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/ask/0/enrich/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.carrier",
+                    "value": {
+                      "stringValue": "tool"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.index",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.target",
+                    "value": {
+                      "stringValue": "flow.enrich"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "SubflowFailure: `flow.enrich` produced no answer"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "SubflowFailure: `flow.enrich` produced no answer"
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "53e6f43f24d810ee",
+                "parentSpanId": "a1a8cd8bb0cd25d3",
+                "name": "lookup",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/ask/0/enrich/0/lookup/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.enrich"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "lookup"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: the lookup timed out"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: the lookup timed out"
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "a4dd475d0f4e785b",
+                "parentSpanId": "6d2739ffe4a2dfb3",
+                "name": "flow.enrich",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/ask/0/enrich/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.carrier",
+                    "value": {
+                      "stringValue": "tool"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.index",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.target",
+                    "value": {
+                      "stringValue": "flow.enrich"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "438149b1150edc7971edf9aef9293b82",
+                "spanId": "180961042acfb2fe",
+                "parentSpanId": "a4dd475d0f4e785b",
+                "name": "lookup",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264009000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_retried/ask/0/enrich/0/lookup/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.enrich"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "lookup"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "facts"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

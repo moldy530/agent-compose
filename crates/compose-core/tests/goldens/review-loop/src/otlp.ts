@@ -249,7 +249,7 @@ export function exportRequest(
             { code: 0 },
   });
 
-  walk(state, document.entries, document.execution_id, rootId);
+  walk(state, document.entries, document.execution_id, document.execution_id, rootId);
 
   return {
     resourceSpans: [
@@ -315,16 +315,29 @@ function resourceAttributes(
 /**
  * Emit one array of entries as spans under `parent`, and everything under them.
  *
- * `prefix` is the instance path the frames of these entries hang off (grammar
- * §9.4, `docs/trace.md` §8): the execution id at the root, an enclosing entry's
- * own path under `inner`, and a dispatch record's `idempotencyKey` under a
- * dispatched instance — which is the same path that record already carries, read
- * rather than derived a second time.
+ * Two prefixes travel down this walk, and they are **not** the same string:
+ *
+ *  * `prefix` is the instance path the frames of these entries hang off (grammar
+ *    §9.4, `docs/trace.md` §8): the execution id at the root, an enclosing
+ *    entry's own path under `inner`, and a dispatch record's `idempotencyKey`
+ *    under a dispatched instance — which is the same path that record already
+ *    carries, read rather than derived a second time. It is what
+ *    `agentcompose.instance_path` reports, so it stays exactly what the trace
+ *    says and gains nothing this module invented.
+ *  * `keyPrefix` is what span ids are hashed from: the same walk, with each step
+ *    **disambiguated** by its position in the array that held it. An instance
+ *    path is not unique — see [`walk`]'s note on the position below — so a
+ *    descendant keyed off the bare path would collide with the descendant of its
+ *    same-path sibling, which is one span to a collector where there were two.
+ *
+ * Keeping them apart is the whole of it: the reported path stays true, and the
+ * id stays unique.
  */
 function walk(
   state: Emission,
   entries: readonly TraceEntry[],
   prefix: string,
+  keyPrefix: string,
   parent: string,
 ): void {
   entries.forEach((entry, position) => {
@@ -335,7 +348,11 @@ function walk(
     // effect reuses its key, which is what at-least-once means. Two spans of one
     // id would be one span to a collector, so the discriminator resolved q51
     // allows is the entry's index in the array that holds it.
-    const key = `${path}#${position}`;
+    //
+    // It is built on `keyPrefix` rather than on `path` so that the
+    // disambiguation is **inherited**: two same-path siblings differ here, and
+    // everything under them differs because of it.
+    const key = `${keyPrefix}/${entry.node}/${entry.traversal}#${position}`;
     const spanId = spanIdOf(state.document.execution_id, "entry", key);
     state.spans.push({
       traceId: state.traceId,
@@ -361,9 +378,9 @@ function walk(
     (entry.models ?? []).forEach((call, made) => {
       modelSpan(state, entry, call, made, key, spanId);
     });
-    dispatchSpans(state, entry.dispatches ?? [], spanId, "map");
-    dispatchSpans(state, entry.toolDispatches ?? [], spanId, "tool");
-    walk(state, entry.inner ?? [], path, spanId);
+    dispatchSpans(state, entry.dispatches ?? [], key, spanId, "map");
+    dispatchSpans(state, entry.toolDispatches ?? [], key, spanId, "tool");
+    walk(state, entry.inner ?? [], path, key, spanId);
   });
 }
 
@@ -371,11 +388,12 @@ function walk(
 function dispatchSpans(
   state: Emission,
   records: readonly DispatchRecord[],
+  entryKey: string,
   entrySpan: string,
   carrier: "map" | "tool",
 ): void {
   records.forEach((record, position) => {
-    const spanId = dispatchSpanId(state, record, position);
+    const spanId = dispatchSpanId(state, entryKey, carrier, record, position);
     state.spans.push({
       traceId: state.traceId,
       spanId,
@@ -408,7 +426,13 @@ function dispatchSpans(
               // dispatch nothing ever observed: neither is an outcome to colour.
               { code: 0 },
     });
-    walk(state, record.inner ?? [], record.idempotencyKey, spanId);
+    walk(
+      state,
+      record.inner ?? [],
+      record.idempotencyKey,
+      dispatchKey(entryKey, carrier, record, position),
+      spanId,
+    );
   });
 }
 
@@ -486,7 +510,7 @@ function modelSpan(
     if (record === undefined) continue;
     links.push({
       traceId: state.traceId,
-      spanId: dispatchSpanId(state, record, found),
+      spanId: dispatchSpanId(state, entryKey, "tool", record, found),
       attributes: [text("agentcompose.instance_path", made.instance)],
     });
   }
@@ -519,12 +543,39 @@ function modelSpan(
   });
 }
 
-/** One dispatch record's span id — its instance path, plus its position. */
-function dispatchSpanId(state: Emission, record: DispatchRecord, position: number): string {
+/**
+ * One dispatch record's key: its entry's key, its carrier, its instance path and
+ * its position in the array that held it.
+ *
+ * All four earn their place. The **entry's key** because an idempotency key is
+ * derived from its entry's instance path, so two same-path entries file
+ * dispatches under the same keys; the **carrier** because `dispatches:` and
+ * `toolDispatches:` are two arrays whose positions both start at zero; the
+ * **path** because it is what the span is *about*; and the **position** because
+ * one carrier can file one key twice — `docs/trace.md` §8's map-item retry
+ * re-runs a tool loop and reuses its keys.
+ */
+function dispatchKey(
+  entryKey: string,
+  carrier: "map" | "tool",
+  record: DispatchRecord,
+  position: number,
+): string {
+  return `${entryKey}/${carrier}/${record.idempotencyKey}#${position}`;
+}
+
+/** One dispatch record's span id, over [`dispatchKey`]. */
+function dispatchSpanId(
+  state: Emission,
+  entryKey: string,
+  carrier: "map" | "tool",
+  record: DispatchRecord,
+  position: number,
+): string {
   return spanIdOf(
     state.document.execution_id,
     "dispatch",
-    `${record.idempotencyKey}#${position}`,
+    dispatchKey(entryKey, carrier, record, position),
   );
 }
 

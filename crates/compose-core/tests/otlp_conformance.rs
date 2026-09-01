@@ -52,6 +52,11 @@ fn corpus() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otlp-conformance")
 }
 
+/// The `traceparent` corpus: one file, because each case is one string.
+fn traceparent_corpus() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/traceparent-conformance.json")
+}
+
 /// Every fixture, by file name, oldest-sorted so a failure names a stable one.
 fn fixtures() -> Vec<(String, Value)> {
     let mut files: Vec<PathBuf> = fs::read_dir(corpus())
@@ -128,6 +133,97 @@ fn the_emitted_exporter_answers_the_conformance_corpus() {
         "the emitted OTLP exporter answers the shared corpus differently from what it holds; \
          `docs/trace.md` §12 is the mapping and PRD resolved q51 is why this corpus stands in \
          for an SDK. Regenerate with `UPDATE_GOLDENS=1` only after reading the diff."
+    );
+}
+
+/// **The inbound `traceparent`, arm by arm, through the emitted parser.**
+///
+/// The export corpus above cannot ask this. An ignored header and a refused one
+/// produce the same well-formed export — the run derives a trace id of its own
+/// either way — so every refusal in `docs/trace.md` §12.3 is invisible from the
+/// bytes and has to be asked of the function. A guard that stopped guarding would
+/// otherwise leave the whole suite green while the exporter adopted a reserved
+/// version or minted an all-zero trace id a collector drops.
+#[test]
+fn the_emitted_parser_answers_the_traceparent_corpus() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(root);
+    let mut command = runner("traceparent-conformance.mjs");
+    command.arg(&project).arg(traceparent_corpus());
+    let output = command.output().expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the traceparent corpus did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "[]",
+        "the emitted `parseTraceparent` answers the shared corpus differently from what it \
+         holds; `docs/trace.md` §12.3 is what a header is allowed to be and PRD resolved q51's \
+         first amendment is why an inbound one matters at all"
+    );
+}
+
+/// **Every refusal arm is reached by some case, and no case invents an arm.**
+///
+/// The structural half of the corpus above, and the one that keeps it from
+/// decaying: a suite that ran the parser over four valid headers would be green
+/// and would prove nothing about the refusals. `codegen::otlp`'s
+/// `TRACEPARENT_REFUSALS` is the list, its
+/// `the_header_parser_has_the_guards_the_corpus_answers` is what stops a guard
+/// being added without one, and this is what stops a case being deleted.
+#[test]
+fn every_traceparent_refusal_arm_has_a_case() {
+    let source = fs::read_to_string(traceparent_corpus()).expect("the traceparent corpus is there");
+    let cases: Vec<Value> = serde_json::from_str(&source).expect("…and is an array of cases");
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut accepted = 0;
+    for held in &cases {
+        let name = held["name"]
+            .as_str()
+            .expect("a case has a name")
+            .to_string();
+        assert!(
+            names.insert(name.clone()),
+            "two traceparent cases are named `{name}`; a divergence has to name one"
+        );
+        assert!(
+            held["about"].is_string(),
+            "the case `{name}` says nothing about what it is for"
+        );
+        match held["refuses"].as_str() {
+            Some(arm) => {
+                assert!(
+                    held["expected"].is_null(),
+                    "the case `{name}` names the arm `{arm}` and still expects a parse"
+                );
+                named.insert(arm.to_string());
+            }
+            None => {
+                assert!(
+                    held["expected"].is_object(),
+                    "the case `{name}` refuses nothing, so it expects a parsed header"
+                );
+                accepted += 1;
+            }
+        }
+    }
+    let wanted: BTreeSet<String> = compose_core::codegen::otlp::TRACEPARENT_REFUSALS
+        .iter()
+        .map(|held| (*held).to_string())
+        .collect();
+    assert_eq!(
+        named, wanted,
+        "the corpus covers a different set of refusal arms than \
+         `codegen::otlp::TRACEPARENT_REFUSALS` names"
+    );
+    assert!(
+        accepted > 0,
+        "a corpus of refusals alone would not notice a parser that refused everything"
     );
 }
 
@@ -296,6 +392,69 @@ fn every_expectation_is_a_well_formed_export() {
             }
         }
     }
+}
+
+/// **The uniqueness above is asked of data that could break it.**
+///
+/// `every_expectation_is_a_well_formed_export` refuses two spans of one id, which
+/// is worth nothing if no fixture can produce two. The shape that can is the one
+/// §8 builds on purpose: a repeated attempt at one effect **reuses its instance
+/// path**, so a retried `flow:` node files two `inner` instances at one path and a
+/// retried tool loop files two dispatch records at one idempotency key. Derive a
+/// span id from the bare path and the two siblings still differ — they carry
+/// their own position — while everything *beneath* them collides, which a
+/// collector renders as one span with two parents.
+///
+/// So this insists the corpus holds that shape: two spans at one instance path,
+/// each with children of its own. It is the guard on the guard, and without it a
+/// fixture deleted in good faith would silently disarm §12.2.
+#[test]
+fn the_corpus_holds_two_spans_at_one_instance_path_with_children() {
+    let mut found: Vec<String> = Vec::new();
+    for (file, fixture) in fixtures() {
+        let spans = fixture["expected"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut children: BTreeMap<String, usize> = BTreeMap::new();
+        for span in &spans {
+            if let Some(parent) = span["parentSpanId"].as_str() {
+                *children.entry(parent.to_string()).or_default() += 1;
+            }
+        }
+        let mut at_path: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for span in &spans {
+            let Some(id) = span["spanId"].as_str() else {
+                continue;
+            };
+            for attribute in span["attributes"].as_array().into_iter().flatten() {
+                if attribute["key"] == "agentcompose.instance_path"
+                    && let Some(path) = attribute["value"]["stringValue"].as_str()
+                {
+                    at_path
+                        .entry(path.to_string())
+                        .or_default()
+                        .push(id.to_string());
+                }
+            }
+        }
+        for (path, ids) in at_path {
+            if ids.len() >= 2
+                && ids
+                    .iter()
+                    .all(|id| children.get(id).copied().unwrap_or_default() >= 1)
+            {
+                found.push(format!("{file}: {path}"));
+            }
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "no fixture files two records at one instance path with entries beneath them, so \
+         `every_expectation_is_a_well_formed_export`'s span-id uniqueness is asserted over data \
+         that cannot violate it. `docs/trace.md` §8 is the shape: a retried `flow:` node's two \
+         instances, or a retried tool loop's two dispatch records."
+    );
 }
 
 /// **The caller's trace is adopted, not merely noted** (`docs/trace.md` §12.3).

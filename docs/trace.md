@@ -1383,12 +1383,21 @@ retry and what lets the conformance corpus pin exact output.
   `model`) and its **key**, newline-separated, truncated to the first 8 bytes.
   The kind word is in the hash so that an entry and a dispatch at one instance
   path cannot collide.
-* The **key** is the instance path of §8 wherever there is one, plus a positional
-  discriminator: `<instance path>#<index in the array that holds the record>` for
-  an entry and for a dispatch record, and `<entry key>/model/<index>` for a model
-  call. The position is load-bearing rather than decorative — §8's derivation
-  deliberately gives two attempts of a retried `flow:` node the same path, and
-  two spans of one id would be one span to a collector.
+* The **key** is a *path through the document*, not the instance path: each step
+  names the record and appends its **position** in the array that held it, and
+  every step is built on its parent's key rather than on the instance path. So an
+  entry's key is `<key of whatever ran it>/<node>/<traversal>#<index among its
+  siblings>`, a dispatch record's is `<entry key>/<map|tool>/<idempotency
+  key>#<index on that carrier>`, a model call's is `<entry key>/model/<index>`,
+  and the root's is the execution id. The position is load-bearing rather than
+  decorative — §8's derivation deliberately gives two attempts of a retried
+  `flow:` node the same instance path, and two spans of one id would be one span
+  to a collector — and it is **inherited** for the same reason: two same-path
+  siblings whose keys differed only at their own step would still hand identical
+  keys to everything beneath them.
+* The instance path itself is reported rather than hashed: it is the
+  `agentcompose.instance_path` attribute of §12.5, carried exactly as the
+  envelope wrote it.
 * Neither id is ever **all zero**, which the W3C trace context forbids.
 
 A **link** is how a flow-as-tool call reaches the instance that answered it. Its
@@ -1408,10 +1417,24 @@ rather than beside it.
 
 Version `00` is read as the specification writes it, and a later version is read
 for its first four fields — the forward compatibility the specification asks of a
-parser. A header that is **not** valid — a reserved `ff` version, an id that is
-not hex or is all zero, too few fields — is **ignored silently**, which is the
-W3C behaviour: the execution costs nothing for a caller's malformed header, and
-the export gets a trace id of its own.
+parser. A header that is **not** valid is **ignored silently**, which is the W3C
+behaviour: the execution costs nothing for a caller's malformed header, and the
+export gets a trace id of its own. A header is refused when
+
+* there is none;
+* it has fewer than four `-`-separated fields;
+* its version is not two lowercase hex digits, or is the reserved `ff`;
+* its version is `00` and it does not have exactly four fields;
+* its `trace-id` is not 32 lowercase hex characters, or is all zero;
+* its `parent-id` is not 16 lowercase hex characters, or is all zero;
+* its `trace-flags` is not two lowercase hex digits.
+
+Surrounding whitespace is trimmed rather than refused, and `trace-flags` is
+carried as written rather than interpreted: an unsampled caller still names the
+trace this export joins. Each of these arms has a case in
+`crates/compose-core/tests/fixtures/traceparent-conformance.json`, run through the
+emitted parser — an ignored header and a refused one produce the same export, so
+nothing downstream could tell a lapsed guard from a working one.
 
 The header is **not a field of this format.** It is a property of the request
 that started the execution rather than of the run the envelope records, so it

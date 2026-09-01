@@ -48,6 +48,43 @@ pub const RESOURCE_ATTRIBUTES: &[&str] = &[
     "telemetry.sdk.version",
 ];
 
+/// Every reason `parseTraceparent` refuses an inbound header
+/// (`docs/trace.md` §12.3).
+///
+/// A compiler constant for [`RESOURCE_ATTRIBUTES`]'s reason, aimed at a different
+/// silence. An ignored header and a refused one produce the *same* well-formed
+/// export — the run gets a trace id of its own either way — so a guard that
+/// stopped guarding would be invisible from the export side, and a header a
+/// collector would have dropped would start being adopted. So each arm is named
+/// here, and `tests/fixtures/traceparent-conformance.json` must carry a case for
+/// every one of them: this is the discipline `parse::deploy`'s
+/// `every_refusal_arm_answers_some_url` holds the URL rules to, applied to the
+/// one wire contract this module reads rather than writes.
+pub const TRACEPARENT_REFUSALS: &[&str] = &[
+    "absent",
+    "too-few-fields",
+    "version-not-hex",
+    "version-reserved",
+    "version-00-extra-fields",
+    "trace-id-not-hex",
+    "trace-id-wrong-width",
+    "trace-id-all-zero",
+    "span-id-not-hex",
+    "span-id-wrong-width",
+    "span-id-all-zero",
+    "flags-not-hex",
+];
+
+/// How many `return undefined;` statements `parseTraceparent` has.
+///
+/// The other direction of [`TRACEPARENT_REFUSALS`]: that list says every named
+/// arm is exercised, and this says no *unnamed* one was added. A guard is one
+/// statement, several of them refuse for two reasons at once (a width and an
+/// all-zero id share a line), and the corpus names the reasons — so a new
+/// statement here without a new case there is a refusal nothing has ever
+/// reached.
+pub const TRACEPARENT_GUARDS: usize = 7;
+
 /// `src/otlp.ts`.
 #[must_use]
 pub fn module(ir: &Ir) -> super::GeneratedFile {
@@ -123,6 +160,32 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
             RESOURCE_ATTRIBUTES.len(),
             "`resourceAttributes` sets {set} attributes and `docs/trace.md` §12.6 documents {}",
             RESOURCE_ATTRIBUTES.len()
+        );
+    }
+
+    /// **Every guard in the header parser is one the corpus has a case for.**
+    ///
+    /// [`TRACEPARENT_GUARDS`] is the count this reads back out of the emitted
+    /// source. A guard added here is a refusal `docs/trace.md` §12.3 has to
+    /// describe and `tests/fixtures/traceparent-conformance.json` has to reach,
+    /// and the two are what this failing sends a reader to.
+    #[test]
+    fn the_header_parser_has_the_guards_the_corpus_answers() {
+        let body = SOURCE
+            .split_once("export function parseTraceparent(")
+            .expect("`src/otlp.ts` reads an inbound `traceparent` in one place")
+            .1
+            .split_once("\n}\n")
+            .expect("…in a function with a closing brace")
+            .0;
+        let guards = body.matches("return undefined;").count();
+        assert_eq!(
+            guards, TRACEPARENT_GUARDS,
+            "`parseTraceparent` refuses a header in {guards} places and \
+             `TRACEPARENT_GUARDS` says {TRACEPARENT_GUARDS}; name the new arm in \
+             `TRACEPARENT_REFUSALS`, give it a case in \
+             `tests/fixtures/traceparent-conformance.json`, and say what it refuses in \
+             `docs/trace.md` §12.3"
         );
     }
 

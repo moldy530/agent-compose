@@ -274,7 +274,7 @@
               },
               {
                 "traceId": "5647ea8a07ab44e202f07b9a6612172a",
-                "spanId": "62efa17f93e672ad",
+                "spanId": "641889b42e02ed96",
                 "parentSpanId": "b344e72a797047a9",
                 "name": "flow.handle",
                 "kind": 1,
@@ -338,8 +338,8 @@
               },
               {
                 "traceId": "5647ea8a07ab44e202f07b9a6612172a",
-                "spanId": "b1d6bbc00bd2f450",
-                "parentSpanId": "62efa17f93e672ad",
+                "spanId": "1dffcbacb26a840a",
+                "parentSpanId": "641889b42e02ed96",
                 "name": "act",
                 "kind": 1,
                 "startTimeUnixNano": "1788264000000000000",
@@ -408,7 +408,7 @@
               },
               {
                 "traceId": "5647ea8a07ab44e202f07b9a6612172a",
-                "spanId": "5142f39ded4102ed",
+                "spanId": "cb7b0f5aceae5cd3",
                 "parentSpanId": "b344e72a797047a9",
                 "name": "flow.handle",
                 "kind": 1,
@@ -478,7 +478,7 @@
               },
               {
                 "traceId": "5647ea8a07ab44e202f07b9a6612172a",
-                "spanId": "775366b5cc248c56",
+                "spanId": "c71530ac105146c1",
                 "parentSpanId": "b344e72a797047a9",
                 "name": "tool.notify",
                 "kind": 1,
@@ -537,7 +537,7 @@
               },
               {
                 "traceId": "5647ea8a07ab44e202f07b9a6612172a",
-                "spanId": "fc25a7ccf596492c",
+                "spanId": "e44306f9f35b7a10",
                 "parentSpanId": "b344e72a797047a9",
                 "name": "tool.notify",
                 "kind": 1,

@@ -572,7 +572,7 @@
               },
               {
                 "traceId": "45ef450ba2908a1a0dc6289ad2fa1f1c",
-                "spanId": "b33d6c04c865a61d",
+                "spanId": "75ce3b7babf09e91",
                 "parentSpanId": "8b0372a2cbee27e1",
                 "name": "store",
                 "kind": 1,
@@ -637,7 +637,7 @@
               },
               {
                 "traceId": "45ef450ba2908a1a0dc6289ad2fa1f1c",
-                "spanId": "0d59c5d621329965",
+                "spanId": "22c3f23def0f41df",
                 "parentSpanId": "8b0372a2cbee27e1",
                 "name": "store",
                 "kind": 1,

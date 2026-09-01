@@ -368,7 +368,7 @@
                 "links": [
                   {
                     "traceId": "96fc6322ce160081d6420744000860af",
-                    "spanId": "65492dc4e0bf6814",
+                    "spanId": "5e089058ea4fc222",
                     "attributes": [
                       {
                         "key": "agentcompose.instance_path",
@@ -482,7 +482,7 @@
                 "links": [
                   {
                     "traceId": "96fc6322ce160081d6420744000860af",
-                    "spanId": "dcce4b00ffcb217e",
+                    "spanId": "820366a320bb8be9",
                     "attributes": [
                       {
                         "key": "agentcompose.instance_path",
@@ -499,7 +499,7 @@
               },
               {
                 "traceId": "96fc6322ce160081d6420744000860af",
-                "spanId": "65492dc4e0bf6814",
+                "spanId": "5e089058ea4fc222",
                 "parentSpanId": "25dc6bab41b01a72",
                 "name": "flow.condense",
                 "kind": 1,
@@ -551,8 +551,8 @@
               },
               {
                 "traceId": "96fc6322ce160081d6420744000860af",
-                "spanId": "70e2f5b5f638de16",
-                "parentSpanId": "65492dc4e0bf6814",
+                "spanId": "031f2e3788dd146a",
+                "parentSpanId": "5e089058ea4fc222",
                 "name": "shorten",
                 "kind": 1,
                 "startTimeUnixNano": "1788260400000000000",
@@ -621,7 +621,7 @@
               },
               {
                 "traceId": "96fc6322ce160081d6420744000860af",
-                "spanId": "dcce4b00ffcb217e",
+                "spanId": "820366a320bb8be9",
                 "parentSpanId": "25dc6bab41b01a72",
                 "name": "flow.condense",
                 "kind": 1,
@@ -680,8 +680,8 @@
               },
               {
                 "traceId": "96fc6322ce160081d6420744000860af",
-                "spanId": "a04b5dcf59182d33",
-                "parentSpanId": "dcce4b00ffcb217e",
+                "spanId": "1c12fb34820e5147",
+                "parentSpanId": "820366a320bb8be9",
                 "name": "shorten",
                 "kind": 1,
                 "startTimeUnixNano": "1788260400000000000",
