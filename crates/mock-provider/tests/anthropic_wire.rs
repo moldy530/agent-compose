@@ -289,6 +289,118 @@ fn an_assistant_turn_with_no_content_is_refused() {
     );
 }
 
+/// The conversation a tool loop hands its pinned call, as it reaches a socket:
+/// ending on the assistant it is **refused**, and ending on the closing user
+/// turn it is served (PRD §9 resolved q52).
+///
+/// A trailing assistant message is prefill, and prefill under
+/// `tool_choice: {type: "tool", …}` is a contradiction. `api.anthropic.com`
+/// tolerates it; the strict Anthropic-compatible gateways an enterprise
+/// deployment runs behind answer 400, which is how the shape reached a live
+/// 0.6.0 field report at all — every test passed against a mock as lenient as
+/// the vendor. So this server is the strict one, and the pair of runs below is
+/// the whole rule: the same history, the same forced tool, and the closing user
+/// turn as the only difference.
+#[test]
+fn a_forced_tool_choice_needs_the_conversation_to_end_on_the_user() {
+    let loop_turns = [
+        json!({ "role": "user", "content": "{\"goal\":\"ship it\"}" }),
+        json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "query": "it" } },
+        ]}),
+        json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a looked-up snippet" },
+        ]}),
+        json!({ "role": "assistant", "content": [{ "type": "text", "text": "found it" }] }),
+    ];
+    let tools = json!([
+        { "name": "lookup", "description": "Look one fact up.", "input_schema": { "type": "object" } },
+        {
+            "name": "reviewer_output",
+            "description": "The structured output agent.reviewer must produce.",
+            "input_schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+        },
+    ]);
+    let pinned = |messages: Value| {
+        json!({
+            "model": MODEL,
+            "max_tokens": 4096,
+            "system": "You are a meticulous technical reviewer.",
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": { "type": "tool", "name": "reviewer_output" },
+        })
+    };
+
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+
+    let refused = send(
+        &provider.client(),
+        &pinned(Value::Array(loop_turns.to_vec())),
+    );
+    assert_eq!(refused.status, 400);
+    assert_eq!(refused.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    let body = refused.json();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "messages.3: This model does not support assistant message prefill. \
+         The conversation must end with a user message when `tool_choice` \
+         forces a tool.",
+        "{body}"
+    );
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "a refused request consumes nothing"
+    );
+
+    // The same request with the turn the runtime appends: served, and the pinned
+    // tool is still what the answer comes back as.
+    let mut closed = loop_turns.to_vec();
+    closed.push(json!({ "role": "user", "content": "Now produce the structured result." }));
+    let served = send(&provider.client(), &pinned(Value::Array(closed)));
+    assert_eq!(served.status, 200);
+    let body = served.json();
+    assert_eq!(body["content"][0]["type"], "tool_use");
+    assert_eq!(body["content"][0]["name"], "reviewer_output");
+    assert_eq!(body["content"][0]["input"]["verdict"], "approve");
+    let snapshot = provider.snapshot();
+    assert!(snapshot.queues.is_empty(), "the one script was consumed");
+    assert_eq!(snapshot.invalid, 1, "by the second request, not the first");
+}
+
+/// Prefill on its own is **not** refused: it is the Messages API's own feature,
+/// and only a forced `tool_choice` beside it makes the pair a contradiction.
+///
+/// Without this the rule above would be indistinguishable from "assistant turns
+/// may not end a conversation", which is a different and wrong server.
+#[test]
+fn prefill_without_a_forced_tool_choice_is_served() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(MODEL, Outcome::text(" rest of the sentence")));
+
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "max_tokens": 1024,
+            "messages": [
+                { "role": "user", "content": "finish this sentence" },
+                { "role": "assistant", "content": "Here is the" },
+            ],
+        }),
+    );
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json()["content"][0]["type"], "text");
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A call with **no `x-api-key`** is served, because a composition is entitled
 /// to send none.
 ///
