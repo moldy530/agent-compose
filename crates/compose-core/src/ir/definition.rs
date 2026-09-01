@@ -121,7 +121,7 @@ pub struct Tool {
     pub input: FieldMap,
     /// `output:` — the result schema; `{}` for a tool with no result.
     pub output: FieldMap,
-    /// Exactly one of `exec:`, `http:`, `function:`.
+    /// Exactly one of `exec:`, `http:`, `function:`, `module:`.
     #[serde(flatten)]
     pub implementation: ToolImplementation,
 }

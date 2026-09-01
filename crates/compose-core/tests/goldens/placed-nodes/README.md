@@ -101,14 +101,18 @@ about — so the two sentences are one rule: what a build writes is the table
 above plus the authored files the composition references, and it is the only
 thing it writes.
 
-`src/tools/` is where your own code goes. A `tool.*` in the composition may bind
-`module: ./src/tools/<name>.ts`, and `build` writes that file **once** — the
-typed signature, the contract as a doc comment, a body that throws — then never
-writes it again and never reads it to re-emit it. Fill it in and commit it: the
-tool's declared `input:` and `output:` are its contract, `src/modules.ts` is
-where that contract is written down, and `bun run typecheck` is what holds the
-file to it. The directory is a convention rather than a rule; the file list is
-the rule.
+`src/tools/` **in the project** — beside `main.yml`, where a `module:` path is
+resolved — is where your own code goes. A `tool.*` in the composition may bind
+`module: ./src/tools/<name>.ts`, and `build` writes that file **once**, there —
+the typed signature, the contract as a doc comment, a body that throws — then
+never writes it again and never reads it to re-emit it. Fill it in and commit it
+*there* as well: what a build leaves at that path in an output directory —
+including this one — is a copy (the section below), replaced with whatever the
+project holds on every build, so the project's file is the one an edit survives
+in. The tool's declared `input:` and `output:` are its contract,
+`src/modules.ts` is where that contract is written down, and `bun run typecheck`
+is what holds the file to it. The directory is a convention rather than a rule;
+the file list is the rule.
 
 What such a file reads out of the environment is its binding's `env:`, and it
 arrives as the **third argument** rather than through `process.env`: the values
@@ -127,15 +131,14 @@ dedupe. It is absent everywhere else, where a repeated call is what the
 composition asked for — and that same call is the one whose `signal` is not the
 map node's, because a detached delivery is off that node's clock.
 
-You edit those files **in the project** — beside `main.yml`, where the `module:`
-path is resolved. A build copies each one it references into this directory at
-the same relative path, because the composition references it and the artifact a
-worker fetches has to carry it: `src/artifact.ts` lists it and hashes it like
-every other entry, so editing an implementation is a new artifact hash and
-reaches every worker through the join handshake. `agent-compose build --check`
-compares those copies too — a copy that no longer matches what you wrote is a
-build to re-run, exactly like a generated file that drifted. Files under `src/`
-that the composition does not reference ship nowhere.
+A build copies each implementation the composition references into this
+directory at the same relative path, because the artifact a worker fetches has
+to carry it: `src/artifact.ts` lists it and hashes it like every other entry, so
+editing an implementation is a new artifact hash and reaches every worker
+through the join handshake. `agent-compose build --check` compares those copies
+too — a copy that no longer matches what you wrote is a build to re-run, exactly
+like a generated file that drifted. Files under `src/` that the composition does
+not reference ship nowhere.
 
 ## Running it
 
