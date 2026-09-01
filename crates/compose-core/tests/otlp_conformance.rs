@@ -571,6 +571,100 @@ fn the_corpus_holds_a_pause_whose_two_events_carry_the_waits_own_instants() {
     );
 }
 
+/// **The instant guard is asked of an instant that needs it.**
+///
+/// The exporter reads its instants with `Date.parse` and writes a fallback for
+/// one it cannot read, because a clock that became the string `"NaN"` in a field
+/// a collector parses as a number is worse than a clock that is merely
+/// approximate. Every other fixture's instants are this runtime's own
+/// `toISOString()`, so nothing reaches that fallback and whatever it degraded to
+/// would round-trip through the corpus unnoticed — including `"0"`, the epoch,
+/// which [`stamp`] refuses precisely because a wait rendered in 1970 is not an
+/// instant anything happened at.
+///
+/// So the corpus keeps one document whose pause clocks cannot be read, and this
+/// says what its export has to look like: the wait lands on the execution's own
+/// start. `every_expectation_is_a_well_formed_export` then holds the other half
+/// — a span's edges degrade to the same instants as the events stamped on them,
+/// so §12.4's placement survives the degradation rather than being suspended by
+/// it.
+#[test]
+fn the_corpus_holds_a_pause_whose_clock_cannot_be_read() {
+    let mut reached: Vec<String> = Vec::new();
+    for (file, fixture) in fixtures() {
+        if !carries_an_unreadable_pause(&fixture["document"]) {
+            continue;
+        }
+        let spans = fixture["expected"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let began = spans
+            .first()
+            .map(|root| root["startTimeUnixNano"].clone())
+            .unwrap_or(Value::Null);
+        let landed = spans.iter().any(|span| {
+            span["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|event| event["name"] == "human.paused" && event["timeUnixNano"] == began)
+        });
+        assert!(
+            landed,
+            "{file}: a pause carries a `pausedAt` this exporter cannot read and no \
+             `human.paused` event is stamped at the execution's start ({began}); an unreadable \
+             instant falls back to a point inside the execution's window, never to the epoch \
+             (`docs/trace.md` §12.4)"
+        );
+        reached.push(file);
+    }
+    assert!(
+        !reached.is_empty(),
+        "no fixture carries a `human` pause whose instants this exporter cannot parse, so its \
+         instant fallback is reached by nothing in the corpus and a regression that degraded an \
+         unreadable clock to the epoch would ship green"
+    );
+}
+
+/// Whether some `human` pause under this envelope carries an instant the
+/// exporter's `Date.parse` would refuse.
+///
+/// Read as the shape the runtime's own `toISOString()` writes, which is the only
+/// shape it ever writes — a date, a `T`, and a clock. Recursive because an entry
+/// nests: a pause may sit under `inner` or under a dispatch record's own entries.
+fn carries_an_unreadable_pause(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            if let Some(Value::Object(pause)) = fields.get("human")
+                && ["pausedAt", "settledAt"].iter().any(|key| {
+                    pause
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|held| !is_iso_instant(held))
+                })
+            {
+                return true;
+            }
+            fields.values().any(carries_an_unreadable_pause)
+        }
+        Value::Array(held) => held.iter().any(carries_an_unreadable_pause),
+        _ => false,
+    }
+}
+
+/// `YYYY-MM-DDT…`, the leading shape of an ISO 8601 instant.
+fn is_iso_instant(held: &str) -> bool {
+    let bytes = held.as_bytes();
+    bytes.len() >= 20
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'T'
+}
+
 /// **The caller's trace is adopted, not merely noted** (`docs/trace.md` §12.3).
 ///
 /// The fixture that carries a `traceparent` and the one that does not are the

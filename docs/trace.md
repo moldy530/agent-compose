@@ -1463,6 +1463,15 @@ document says so rather than papering over it: a collector rendering invented
 durations as measurements is worse than one rendering honest structure. Adding
 per-entry timing to this format is a change to §3, not to this section.
 
+Every instant above is written as nanoseconds since the epoch, in a JSON string,
+because proto3's JSON mapping writes every 64-bit integer as one. An instant the
+exporter **cannot read** — one this runtime never writes, since the envelope's
+instants are its own `toISOString()` — falls back to a point of the execution's
+window already in hand rather than to the epoch: a span whose edge is
+approximate is still a reading, and a wait rendered in 1970 is not. A pause's two
+events fall back with the edges they sit on, so the placement above holds either
+way.
+
 `status.code` is `1` (ok), `2` (error) or `0` (unset):
 
 | span | ok | error | unset |

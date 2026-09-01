@@ -213,10 +213,11 @@ export function exportRequest(
   context: ExportContext,
 ): ExportTraceServiceRequest {
   const traceId = context.parent?.traceId ?? traceIdOf(document.execution_id);
-  const window = {
-    start: unixNano(context.startedAt, context.startedAt),
-    end: unixNano(context.endedAt, context.startedAt),
-  };
+  // The window's own start is the one instant with nothing earlier to fall back
+  // to, so an unreadable one falls back to the epoch; every other instant in
+  // this file falls back to a point inside the window instead.
+  const start = unixNano(context.startedAt, EPOCH_UNIX_NANO);
+  const window = { start, end: unixNano(context.endedAt, start) };
   const emitted: OtlpSpan[] = [];
   const state: Emission = { document, context, traceId, window, spans: emitted };
 
@@ -622,8 +623,14 @@ function entryEvents(state: Emission, entry: TraceEntry): readonly OtlpEvent[] {
   }
   const pause = entry.human;
   if (pause !== undefined) {
+    // The two instants fall back exactly as `entryWindow` falls back — the wait
+    // to the execution's start, the settling to the wait's own start — because
+    // §12.4 stamps these two events at their span's ends, and a guard that
+    // degraded an event to one instant while degrading its span's edge to
+    // another would move the event off the edge it is documented to sit on.
+    const paused = unixNano(pause.pausedAt, state.window.start);
     events.push({
-      timeUnixNano: unixNano(pause.pausedAt, state.window.start),
+      timeUnixNano: paused,
       name: "human.paused",
       attributes: [
         ...(pause.expiresAt === undefined
@@ -633,7 +640,7 @@ function entryEvents(state: Emission, entry: TraceEntry): readonly OtlpEvent[] {
     });
     if (pause.settledAt !== undefined) {
       events.push({
-        timeUnixNano: unixNano(pause.settledAt, state.window.start),
+        timeUnixNano: unixNano(pause.settledAt, paused),
         name: "human.settled",
         attributes: [
           ...(pause.settled === undefined
@@ -757,6 +764,9 @@ function nonZero(hex: string): string {
   return /^0+$/.test(hex) ? `${hex.slice(0, -1)}1` : hex;
 }
 
+/** The instant nothing happened at — what an unreadable clock degrades to. */
+const EPOCH_UNIX_NANO = "0";
+
 /**
  * One ISO 8601 instant as OTLP's `fixed64` nanoseconds, written as a string.
  *
@@ -768,13 +778,17 @@ function nonZero(hex: string): string {
  * envelope's instants are this runtime's own `toISOString()` and a bad one is
  * unreachable, but an unreadable clock must not become the string `"NaN"` in a
  * field a collector parses as a number.
+ *
+ * **`fallback` is already nanoseconds**, not a second instant to parse — every
+ * caller but the window's own start has a converted point of the execution's
+ * window in hand (`state.window.start`, the pause's own start), and asking those
+ * callers for an instant would have them hand a nanosecond string to
+ * `Date.parse`, which reads it as `NaN` and degrades the guard to the epoch: the
+ * exact value the guard exists to avoid.
  */
 function unixNano(instant: string, fallback: string): string {
   const milliseconds = Date.parse(instant);
-  if (Number.isNaN(milliseconds)) {
-    const spare = Date.parse(fallback);
-    return Number.isNaN(spare) ? "0" : String(BigInt(spare) * 1_000_000n);
-  }
+  if (Number.isNaN(milliseconds)) return fallback;
   return String(BigInt(milliseconds) * 1_000_000n);
 }
 
