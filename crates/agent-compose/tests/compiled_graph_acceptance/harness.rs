@@ -148,6 +148,14 @@ pub const FIXTURES: &[&str] = &[
     "provider-kinds",
     "server-tools",
     "stores",
+    // The one fixture whose subject is the deploy layer's `trace_sink:`
+    // (grammar §14.5). Under `local` — which is what
+    // `the_acceptance_fixtures_validate_clean` resolves it as — it declares no
+    // sink and is an ordinary two-node composition; every test that drives it
+    // writes the target it needs into a copy of the directory, because a sink's
+    // address is a literal and a receiver's port is the operating system's (see
+    // [`staged_with_deploy`]).
+    "trace-sink",
 ];
 
 /// The `${MOCK_BASE_URL}` every fixture's providers resolve at process start.
@@ -373,6 +381,84 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A **copy** of one acceptance fixture, with a `deploy/<target>.yml` written
+/// into it.
+///
+/// What the trace sink needs and no other surface does. A sink's `url:` is a
+/// literal — grammar §4.3 class 3, so no `${ENV}` reaches it — and every receiver
+/// this suite binds takes a port the operating system chose, so the address a
+/// test wants cannot be committed in a fixture's deploy directory. Copying the
+/// composition and writing the target beside it is the honest way round: what is
+/// under test is a *target*, and a target is a file.
+///
+/// The whole directory is copied, `deploy/` included, so a fixture that already
+/// has targets keeps them and gains one — which is what the mesh export needs,
+/// since `placed-nodes` is served under a deploy file of its own.
+///
+/// The [`Scratch`] is returned rather than dropped: it removes the copy when the
+/// test ends, and the entrypoint beside it is only valid while it lives.
+pub fn staged_with_deploy(
+    purpose: &str,
+    name: &str,
+    target: &str,
+    deploy: &str,
+) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(purpose);
+    let source = projects().join(name);
+    copy_tree(&source, scratch.path());
+    let directory = scratch.path().join("deploy");
+    std::fs::create_dir_all(&directory).expect("the scratch area is writable");
+    std::fs::write(directory.join(format!("{target}.yml")), deploy)
+        .expect("the scratch area is writable");
+    let entrypoint = scratch.path().join("main.yml");
+    assert!(
+        entrypoint.is_file(),
+        "the fixture `{name}` has no entrypoint to copy: {}",
+        entrypoint.display()
+    );
+    (scratch, entrypoint)
+}
+
+/// Copy one directory into another, recursively.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("the scratch area is writable");
+    for entry in std::fs::read_dir(from).expect("a readable fixture directory") {
+        let entry = entry.expect("a readable directory entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("a readable file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("a fixture file is copyable");
+        }
+    }
+}
+
+/// `agent-compose run <entrypoint> <flow> --target <name>`, into a directory the
+/// caller owns.
+///
+/// The one thing [`run_into`] cannot do, and the trace sink is what needs it:
+/// PRD resolved q50 puts the sink "wherever executions settle under a target
+/// that declares it — `run` included", so the command that proves it has to be a
+/// `run` under a **named** target.
+pub fn run_target(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    environment: &[(String, String)],
+) -> Run {
+    let mut command = agent_compose();
+    command.arg("run").arg(entrypoint).arg(flow);
+    for (field, value) in inputs {
+        command.arg("--input").arg(format!("{field}={value}"));
+    }
+    command.args(["--target", target]).arg("--out").arg(out);
+    seal(&mut command, environment);
+    let output = command.output().expect("the command runs");
+    Run { output }
 }
 
 /// What `validate` said about a project.

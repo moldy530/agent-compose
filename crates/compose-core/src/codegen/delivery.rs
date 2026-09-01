@@ -78,6 +78,11 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
              sink's: there is no list a sink's address could miss (grammar §14.5)"
         );
         assert!(
+            SOURCE.contains("record.kind === \"trace_sink\""),
+            "the once-per-execution guard no longer asks the ledger which kind a row is, so a \
+             callback webhook would stand in for an export nobody made"
+        );
+        assert!(
             SOURCE.contains("kind: \"trace_sink\""),
             "a trace export is journaled under its own delivery kind, or the ledger cannot tell \
              one from a webhook"
@@ -101,7 +106,7 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
             .expect("…in a function with a closing brace")
             .0;
         let guarded = ship
-            .find("record.kind === \"trace_sink\"")
+            .find("exportedAlready(")
             .expect("a settle is once per execution, and the ledger is what says so");
         let journaled = ship
             .find("intendDelivery(")

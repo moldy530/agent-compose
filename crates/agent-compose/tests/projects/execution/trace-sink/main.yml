@@ -1,0 +1,120 @@
+# Acceptance fixture: the deploy layer's `trace_sink:` (grammar §14.5, PRD
+# resolved q50, q51).
+#
+# What this fixture is *for* is the target it is served under rather than the
+# composition itself, which is why the graph is as small as a graph gets: the
+# sink applies to every execution that settles, so a flow with one node and no
+# model in it exercises the delivery exactly as a fan-out with four would, and
+# costs no scripted provider to run. `placed-nodes` is the fixture whose deploy
+# layer is a mesh; this is the one whose deploy layer is a collector.
+#
+# The deploy files are **not** committed beside it. A sink's `url:` is a literal
+# (grammar §4.3 class 3, so no `${ENV}` reaches it) and every receiver this suite
+# binds takes a port the operating system chose, so each test writes the target
+# it needs into a copy of this directory — see the harness's `staged_with_deploy`.
+#
+# Two flows, because two things settle differently:
+#
+#   * `flow.greet` completes, and is what a `run`, a served request and a mesh
+#     execution all export;
+#   * `flow.refusing` fails, so the export a failed run ships — `status: failed`,
+#     the envelope's `error`, and the aborting node's entry — has a case.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+  on_error: fail
+
+state:
+  greeting:
+    type: string
+    default: ""
+  noted:
+    type: string
+    default: ""
+
+triggers:
+  # `respond: async` so the request is answered with an execution id and the run
+  # settles behind it — which is where the export happens.
+  on_greet_request:
+    type: http
+    flow: flow.greet
+    path: /greetings
+    method: POST
+    input:
+      subject: "payload.body.subject"
+    respond: async
+
+  # The same flow behind a trigger that also subscribes a `callback:`, so a test
+  # can watch a webhook and an export land on one execution's ledger and see
+  # that the two are told apart by kind rather than by event.
+  on_watched_request:
+    type: http
+    flow: flow.greet
+    path: /watched-greetings
+    method: POST
+    input:
+      subject: "payload.body.subject"
+    respond: async
+    callback: "payload.body.callback_url"
+
+  on_refusing_request:
+    type: http
+    flow: flow.refusing
+    path: /refusals
+    method: POST
+    input:
+      subject: "payload.body.subject"
+    respond: async
+
+flow.greet:
+  description: Greet one subject, with no model and no network in the way.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs:
+    greeting:
+      type: string
+    noted:
+      type: string
+  nodes:
+    say:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"greeting":"hello"}']
+        output:
+          greeting: { type: string }
+
+    # A second node so the export carries more than one entry span, and so a
+    # routing decision with a guard on it reaches the export's attributes.
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"seen"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: say }
+    - from: say
+      to: note
+      when: "say.output.greeting == 'hello'"
+    - { from: say, to: end, else: true }
+    - { from: note, to: end }
+
+flow.refusing:
+  description: A run that produces no answer, for the export a failure ships.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs:
+    greeting:
+      type: string
+  nodes:
+    fail:
+      exec:
+        command: "${OPS_BIN}/false"
+  edges:
+    - { from: start, to: fail }
+    - { from: fail, to: end }

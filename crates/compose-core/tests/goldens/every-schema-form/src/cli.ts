@@ -140,6 +140,7 @@ import process from "node:process";
 
 import {
   CallbackRetryError,
+  insisting,
   shipTrace,
   sinkAuth,
   sinkConfigured,
@@ -594,14 +595,31 @@ async function settled(
     produced === undefined
       ? (error as { trace?: readonly runtime.TraceEntry[] } | null)?.trace
       : produced.trace;
-  exported.record = await shipTrace({
-    execution: job.execution,
-    flow: job.address,
-    // Two of the envelope's three: this hook is reached only where the
-    // lifecycle row closes, and a run holding a pause leaves it open.
-    status: produced === undefined ? "failed" : "completed",
-    ...(produced === undefined ? { error: describe(error) } : {}),
-    entries: trace ?? [],
+  // **Insisted on rather than tried once**, for the reason `src/serve.ts` insists
+  // on the same write: the lifecycle row closes as this hook returns, so an
+  // intent the journal would not take here is a trace nothing will ever ship —
+  // no start would find an open execution for it and no `pending` row would be
+  // there to pick up. Bounded like every other ladder on this ledger
+  // (`docs/durability.md` §3.7): its end is a sentence on stderr and a trace file
+  // that still holds the run.
+  await insisting(async () => {
+    try {
+      exported.record = await shipTrace({
+        execution: job.execution,
+        flow: job.address,
+        // Two of the envelope's three: this hook is reached only where the
+        // lifecycle row closes, and a run holding a pause leaves it open.
+        status: produced === undefined ? "failed" : "completed",
+        ...(produced === undefined ? { error: describe(error) } : {}),
+        entries: trace ?? [],
+      });
+      return true;
+    } catch (failure) {
+      process.stderr.write(
+        `\`${job.execution}\`'s trace could not be journaled: ${describe(failure)}\n`,
+      );
+      return false;
+    }
   });
 }
 

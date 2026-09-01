@@ -120,6 +120,13 @@ One export per settled execution and no more. An execution the journal already
 holds an export for is not exported again — which is what a `serve` that died
 between journaling the row and closing the lifecycle row leaves behind.
 
+**Settled** means the journal's lifecycle row closed, which is the moment the
+export is journaled in. Two runs therefore export nothing, and both are runs with
+nothing to export: one that ends holding a `human` pause leaves its row *open* on
+purpose (`docs/durability.md` §3.6) and has not settled yet, and one that failed
+before it was journaled at all — a payload the flow's `inputs:` refused, a
+journal that could not be opened — never had a row or a trace.
+
 ### 1.1 `run --format json`
 
 `agent-compose run <flow> --format json` — grammar §13.2's invocation, plus the

@@ -1242,9 +1242,12 @@ real journal — the file a build before this one wrote — and restarts `serve`
 over it, which is the only way to find out that a compatible change stayed
 compatible. A column added to an existing table is the case that is *not*
 covered by `CREATE TABLE IF NOT EXISTS`, and needs the `PRAGMA table_info` probe
-the migrations beside it use — the delivery's own `trigger` is one such column,
-added to the ledger after it and nullable because no file written before it says
-what trigger a delivery it holds was for.
+the migrations beside it use. Three columns have arrived that way and each is
+nullable for the same reason — no file written before one says what it would have
+held: the delivery's own `trigger`, the delivery's `kind` (a row written before
+it is a `callback`, which was the only kind there was), and the lifecycle row's
+`traceparent` (an execution started before it carried no header this file could
+hold, and one started without one carries none either).
 
 **The dispatch board (§3.8) arrived under the same clause and owes the same
 test**, and it has one: `a_journal_written_before_the_dispatch_board_opens_and_serves_under_this_build`

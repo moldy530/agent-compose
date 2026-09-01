@@ -717,13 +717,19 @@ fn gunzip(bytes: &[u8]) -> Vec<u8> {
         .stderr(Stdio::null())
         .spawn()
         .expect("gzip is on the path");
-    child
-        .stdin
-        .take()
-        .expect("stdin is piped")
-        .write_all(bytes)
-        .expect("the stream is written");
+    // **The stream is written on a thread of its own**, and it has to be: an
+    // artifact is bigger than a pipe. Writing it here and reading afterwards
+    // deadlocks the moment the tarball's *decompressed* size passes the stdout
+    // pipe's buffer — `gzip` blocks writing what nothing is reading, stops
+    // reading stdin, and this thread blocks writing what nothing is consuming.
+    // Neither side ever moves again, and it looks exactly like a slow test.
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let written = bytes.to_vec();
+    let feeding = std::thread::spawn(move || {
+        stdin.write_all(&written).expect("the stream is written");
+    });
     let output = child.wait_with_output().expect("gzip runs");
+    feeding.join().expect("the writer finished");
     assert!(output.status.success(), "the served body is not a gzip");
     output.stdout
 }

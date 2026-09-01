@@ -100,71 +100,85 @@ export interface SettledTrace {
  *
  * Called from the hook that closes the lifecycle row and awaited there, so a
  * process killed a millisecond later leaves a `pending` row the next `serve`
- * start finishes. It answers rather than raising: a trace that could not be
- * journaled is not the run's outcome.
+ * start finishes.
+ *
+ * **It raises rather than answering** where the journal would not take the
+ * intent, and that is what makes the caller's ladder mean something: the row
+ * closes as this returns, so a write refused once — a second process holding the
+ * file past the lock wait, a disk momentarily full, both states
+ * `docs/durability.md` §2 says a healthy deployment reaches — is a trace nothing
+ * will ever ship. Both callers wrap it in [`insisting`] and say what happened on
+ * stderr when the ladder ends, which is §3.7's posture for a delivery: a
+ * courtesy the trace file backstops, never the run's outcome.
  */
 export async function shipTrace(
   settled: SettledTrace,
 ): Promise<runtime.DeliveryRecord | undefined> {
   const sink = traceSink;
   if (sink === undefined) return undefined;
-  try {
-    const held = await deliveriesOf(settled.execution);
-    if (held.some((record) => record.kind === "trace_sink")) return undefined;
-    const document: runtime.TraceDocument = {
-      trace_version: TRACE_VERSION,
-      flow: settled.flow,
-      execution_id: settled.execution,
-      status: settled.status,
-      ...(settled.error === undefined ? {} : { error: settled.error }),
-      entries: settled.entries,
-    };
-    // The lifecycle row is what the export's clock window and its caller's trace
-    // come off. It is read here rather than passed in because the process that
-    // settles an execution need not be the one that started it: a recovered
-    // execution's `traceparent` reached a `serve` that has since died
-    // (`docs/durability.md` §6.1), and the row is where it survived.
-    const row = await journaledExecution(settled.execution);
-    const startedAt = row?.startedAt ?? new Date().toISOString();
-    const parent = parseTraceparent(row?.traceparent);
-    const body =
-      sink.format === "otlp"
-        ? JSON.stringify(
-            exportRequest(document, {
-              target: deployTarget,
-              artifact: ARTIFACT_HASH,
-              compiler: COMPILER_VERSION,
-              startedAt,
-              endedAt: new Date().toISOString(),
-              ...(parent === undefined ? {} : { parent }),
-            }),
-          )
-        : JSON.stringify(document);
-    return await intendDelivery({
-      execution: settled.execution,
-      kind: "trace_sink",
-      event: "settled",
-      url: sink.url,
-      body,
-      // A trace export reports no pauses: it is the record of a run that has
-      // stopped.
-      pauses: [],
-    });
-  } catch (error) {
-    // Not the run's failure — it produced whatever it produced and the trace
-    // file still holds it — but not something to swallow either: what failed is
-    // the record, and a reader has no other way to learn that a trace was never
-    // shipped.
-    process.stderr.write(
-      `\`${settled.execution}\`'s trace could not be journaled for \`${sink.url}\`: ${message(error)}\n`,
-    );
-    return undefined;
-  }
+  if (await exportedAlready(settled.execution)) return undefined;
+  const document: runtime.TraceDocument = {
+    trace_version: TRACE_VERSION,
+    flow: settled.flow,
+    execution_id: settled.execution,
+    status: settled.status,
+    ...(settled.error === undefined ? {} : { error: settled.error }),
+    entries: settled.entries,
+  };
+  // The lifecycle row is what the export's clock window and its caller's trace
+  // come off. It is read here rather than passed in because the process that
+  // settles an execution need not be the one that started it: a recovered
+  // execution's `traceparent` reached a `serve` that has since died
+  // (`docs/durability.md` §6.1), and the row is where it survived.
+  const row = await journaledExecution(settled.execution);
+  const startedAt = row?.startedAt ?? new Date().toISOString();
+  const parent = parseTraceparent(row?.traceparent);
+  const body =
+    sink.format === "otlp"
+      ? JSON.stringify(
+          exportRequest(document, {
+            target: deployTarget,
+            artifact: ARTIFACT_HASH,
+            compiler: COMPILER_VERSION,
+            startedAt,
+            endedAt: new Date().toISOString(),
+            ...(parent === undefined ? {} : { parent }),
+          }),
+        )
+      : JSON.stringify(document);
+  return await intendDelivery({
+    execution: settled.execution,
+    kind: "trace_sink",
+    event: "settled",
+    url: sink.url,
+    body,
+    // A trace export reports no pauses: it is the record of a run that has
+    // stopped.
+    pauses: [],
+  });
 }
 
 // ---------------------------------------------------------------------------
 // The schedule
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether this execution's trace export is already in the journal.
+ *
+ * A journal this process cannot read answers `false`, and the direction matters:
+ * this is the **last** moment anything comes back to the export — the lifecycle
+ * row closes as [`shipTrace`]'s caller returns — so "I cannot tell" has to
+ * resolve toward the recoverable half. Delivery is at-least-once and receivers
+ * dedupe on the delivery id, so a trace exported twice is a collector's
+ * duplicate; a trace exported never is a run nothing will ever describe.
+ */
+async function exportedAlready(execution: string): Promise<boolean> {
+  try {
+    return (await deliveriesOf(execution)).some((record) => record.kind === "trace_sink");
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Work one delivery's remaining schedule (resolved q35).

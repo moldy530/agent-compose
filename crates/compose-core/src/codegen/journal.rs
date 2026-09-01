@@ -331,13 +331,33 @@ mod tests {
             "the three ways a delivery row moves are a refusal, an exhaustion and an attempt: \
              {moved:?}"
         );
+        let mut refusals = 0;
         for statement in moved {
             assert!(
                 statement.contains("AND status = 'pending'"),
                 "a delivery has one outcome, so a row that already reached one is left as it is: \
                  {statement}"
             );
+            // …and the refusal carries one predicate more. `refused` is a
+            // **callback** row's outcome: a trace sink's address is the
+            // operator's and no list admits it, so there is nothing for one to
+            // fail to match (grammar 14.5, PRD resolved q50). The type of
+            // `refuseDelivery` says that for a row being opened; this is what
+            // says it for a row already on the ledger, which is addressed by
+            // execution and ordinal and carries no type to hold.
+            if statement.contains("status = 'refused'") {
+                refusals += 1;
+                assert!(
+                    statement.contains("AND (kind IS NULL OR kind = 'callback')"),
+                    "a statement that refuses a delivery would refuse a trace export too: \
+                     {statement}"
+                );
+            }
         }
+        assert_eq!(
+            refusals, 1,
+            "the ledger refuses a delivery in one statement, and this checked {refusals}"
+        );
     }
 
     /// **A journal write that fails loses neither the event nor the row's end**
@@ -464,6 +484,39 @@ mod tests {
             "the ladder a refused write is retried on is unbounded, which is a queue rather \
              than the courtesy §3.7 calls a webhook"
         );
+    }
+
+    /// **Every column added to a table after it existed has a probe.**
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` leaves a table that exists exactly as it is,
+    /// so a column the schema grew is a column an older file does not have — and
+    /// an `INSERT` naming it fails every new execution in that file.
+    /// `docs/durability.md` §11.2 makes a physical schema change compatible only
+    /// where it still reads older files, and the `PRAGMA table_info` probe is
+    /// what makes it one. This is the list of them, so a fourth column added
+    /// without a probe fails here rather than in somebody's journal.
+    #[test]
+    fn every_column_added_after_its_table_is_migrated_into_an_older_file() {
+        let journal = include_str!("js/journal.ts");
+        let migrated = function_body(journal, "migrated");
+        for (table, column, kind) in [
+            ("executions", "callback", "TEXT"),
+            ("executions", "traceparent", "TEXT"),
+            ("effects", "refused", "INTEGER NOT NULL DEFAULT 0"),
+            ("deliveries", "trigger_kind", "TEXT"),
+            ("deliveries", "kind", "TEXT"),
+        ] {
+            assert!(
+                migrated.contains(&format!("column[\"name\"] === \"{column}\"")),
+                "`{table}.{column}` is in the schema and nothing probes for it, so a journal \
+                 written before it would refuse every write that names it \
+                 (`docs/durability.md` §11.2)"
+            );
+            assert!(
+                migrated.contains(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};")),
+                "`{table}.{column}` is probed for and not added, or added under another type"
+            );
+        }
     }
 
     /// The seven journaled seams, by the name each is declared under.

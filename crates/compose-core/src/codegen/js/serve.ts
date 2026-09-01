@@ -1739,7 +1739,7 @@ async function resumeDeliveries(): Promise<void> {
     pending = await undeliveredDeliveries();
   } catch (error) {
     process.stderr.write(
-      `this project's undelivered callbacks could not be read: ${message(error)}\n`,
+      `this project's undelivered deliveries could not be read: ${message(error)}\n`,
     );
     return;
   }

@@ -4771,6 +4771,15 @@ nothing else — the journal's payloads are private recovery data and stay home
 (`docs/durability.md` §8), and `docs/trace.md` §11's exclusions therefore hold
 for the sink by construction.
 
+**A caller's trace is joined rather than replaced.** Under `format: otlp`, an
+execution an `http` trigger started from a request carrying a valid W3C
+`traceparent` header exports **into** that caller's trace: the root span takes
+the caller's trace id and hangs off the caller's span, so a graph embedded in
+somebody else's system appears inside their trace rather than beside it
+(`docs/trace.md` §12.3, PRD resolved q51). A header that is not valid is ignored
+silently, which is the W3C behaviour — a caller's malformed header costs the
+execution nothing.
+
 The credential is a **deploy-layer** variable and belongs to the hub's
 environment manifest (PRD resolved q41): the hub owns the trace and is the
 process that ships it, so a worker is never asked for a token it would never
