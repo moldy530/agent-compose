@@ -227,6 +227,44 @@ fn every_traceparent_refusal_arm_has_a_case() {
     );
 }
 
+/// **Every root-span status arm is reached by some fixture** (`docs/trace.md`
+/// §12.4).
+///
+/// The sibling of `every_traceparent_refusal_arm_has_a_case`, aimed at the other
+/// place this corpus stands in for an SDK. §12.4's first row publishes three
+/// mappings, and a reader may rely on any of them; the exporter's own callers
+/// reach only two — `shipTrace` is handed *settled* executions, and a run holding
+/// a pause is not one — so the `interrupted` arm has no path into these bytes
+/// except a fixture that names it. Without this the row could be published,
+/// exported wrongly, and never noticed: `agent-compose run` writes exactly that
+/// document (`docs/trace.md` §2), and a later change that made a parked
+/// execution exportable would ship whatever the arm had drifted into.
+///
+/// `codegen::otlp::ENVELOPE_STATUSES` is the list, and its
+/// `the_root_status_arms_are_the_formats` is what stops a status being added to
+/// the format without one.
+#[test]
+fn every_root_status_arm_has_a_fixture() {
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    for (file, fixture) in fixtures() {
+        let status = fixture["document"]["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{file}: an envelope declares a `status`"));
+        reached.insert(status.to_string());
+    }
+    let wanted: BTreeSet<String> = compose_core::codegen::otlp::ENVELOPE_STATUSES
+        .iter()
+        .map(|held| (*held).to_string())
+        .collect();
+    assert_eq!(
+        reached, wanted,
+        "the corpus reaches a different set of envelope statuses than \
+         `codegen::otlp::ENVELOPE_STATUSES` names; `docs/trace.md` §12.4's first row maps each \
+         of them to a root-span status, and an arm no fixture reaches is a published mapping \
+         nothing holds honest"
+    );
+}
+
 /// Every fixture carries an input **and** the bytes it expects.
 ///
 /// A fixture with no expectation is one the runner would answer with a

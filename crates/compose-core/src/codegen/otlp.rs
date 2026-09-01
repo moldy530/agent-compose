@@ -48,6 +48,24 @@ pub const RESOURCE_ATTRIBUTES: &[&str] = &[
     "telemetry.sdk.version",
 ];
 
+/// Every envelope status the root span's mapping has an arm for
+/// (`docs/trace.md` §12.4's first row).
+///
+/// A compiler constant for [`RESOURCE_ATTRIBUTES`]'s reason, aimed at the
+/// silence a *ternary* leaves. The mapping's three arms — OK, ERROR, and the
+/// UNSET one a run holding a question gets — are reachable from the trace
+/// **format** rather than from today's callers: `shipTrace` settles executions,
+/// and `agent-compose run` parks one instead, writing a `status: "interrupted"`
+/// document that a reader may hand this exporter later. So the arms are named
+/// here, the corpus must reach every one of them
+/// (`tests/otlp_conformance.rs`'s `every_root_status_arm_has_a_fixture`), and
+/// [`the_root_status_arms_are_the_formats`] holds the list to the union
+/// `runtime.ts` publishes — a fourth status added to the format without a
+/// mapping would otherwise fall silently into the `else`.
+///
+/// [`the_root_status_arms_are_the_formats`]: tests::the_root_status_arms_are_the_formats
+pub const ENVELOPE_STATUSES: &[&str] = &["completed", "failed", "interrupted"];
+
 /// Every reason `parseTraceparent` refuses an inbound header
 /// (`docs/trace.md` §12.3).
 ///
@@ -161,6 +179,40 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
             "`resourceAttributes` sets {set} attributes and `docs/trace.md` §12.6 documents {}",
             RESOURCE_ATTRIBUTES.len()
         );
+    }
+
+    /// **The root's status arms are the trace format's statuses, all of them.**
+    ///
+    /// [`ENVELOPE_STATUSES`] is what `tests/otlp_conformance.rs` makes the corpus
+    /// reach, and this is what stops that list from being a list of its own: it
+    /// is read back out of `src/runtime.ts`'s `TraceDocument.status`, which is
+    /// the format `docs/trace.md` §2 publishes and the exporter's whole input. A
+    /// fourth status added there lands in the mapping's `else` — exported as
+    /// UNSET with no arm of its own and no fixture — and the failure here is
+    /// what sends its author to §12.4's table instead.
+    #[test]
+    fn the_root_status_arms_are_the_formats() {
+        let runtime = include_str!("js/runtime.ts");
+        let union = ENVELOPE_STATUSES
+            .iter()
+            .map(|status| format!("\"{status}\""))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            runtime.contains(&format!("readonly status: {union};")),
+            "`src/runtime.ts`'s `TraceDocument.status` is no longer `{union}`, so \
+             `ENVELOPE_STATUSES` names a different set of root-span arms than the format \
+             admits (`docs/trace.md` §2, §12.4)"
+        );
+        // …and the two the mapping names outright are named in it, so a renamed
+        // arm is a failure rather than a run silently exported as UNSET.
+        for status in ["completed", "failed"] {
+            assert!(
+                SOURCE.contains(&format!("document.status === \"{status}\"")),
+                "`src/otlp.ts` no longer maps the envelope status `{status}` \
+                 (`docs/trace.md` §12.4)"
+            );
+        }
     }
 
     /// **Every guard in the header parser is one the corpus has a case for.**
