@@ -181,6 +181,7 @@ pub mod artifact;
 pub mod authored;
 pub mod cel;
 pub mod cli;
+pub mod delivery;
 pub mod deployment;
 pub mod env;
 pub mod graph;
@@ -188,6 +189,7 @@ pub mod journal;
 pub mod mesh;
 pub mod modules;
 pub mod names;
+pub mod otlp;
 pub mod pattern;
 pub mod policy;
 pub mod project;
@@ -229,6 +231,7 @@ pub const EMITTED_PATHS: &[&str] = &[
     "src/artifact.ts",
     "src/cel.ts",
     "src/cli.ts",
+    "src/delivery.ts",
     "src/deployment.ts",
     "src/env.ts",
     "src/graph.ts",
@@ -236,6 +239,7 @@ pub const EMITTED_PATHS: &[&str] = &[
     "src/journal.ts",
     "src/mesh.ts",
     "src/modules.ts",
+    "src/otlp.ts",
     "src/runtime.ts",
     "src/schemas.ts",
     "src/serve.ts",
@@ -416,11 +420,13 @@ pub fn emit(ir: &Ir, authored: &authored::Authored) -> GeneratedProject {
         project::readme(ir, &partition),
         project::gitignore(ir),
         cel::module(ir),
+        delivery::module(ir),
         deployment::module(ir, &partition),
         env::module(ir, &environment),
         journal::module(ir),
         mesh::module(ir),
         modules::module(ir, &names),
+        otlp::module(ir),
         runtime::module(ir),
         stores::module(ir),
         schema::module(ir, &names),

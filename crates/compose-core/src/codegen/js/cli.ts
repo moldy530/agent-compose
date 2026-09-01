@@ -132,6 +132,13 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import {
+  CallbackRetryError,
+  shipTrace,
+  sinkAuth,
+  sinkConfigured,
+  workDelivery,
+} from "./delivery.ts";
 import { type CompiledFlow, type FlowRun, flows, runFlow, sessionRefusal } from "./graph.ts";
 import {
   TRACE_VERSION,
@@ -368,6 +375,45 @@ interface Job {
  * construction rather than by two implementations agreeing.
  */
 async function execute(job: Job): Promise<number> {
+  // The trace export this run journals, if it journals one. Held in a box rather
+  // than returned, because it is written by a hook **inside** the run and read
+  // after the run has reported: PRD resolved q50 puts the sink "wherever
+  // executions settle, `run` included", and never in front of the answer.
+  const exported: { record?: runtime.DeliveryRecord } = {};
+  const code = await executing(job, exported);
+  await shipped(exported.record);
+  return code;
+}
+
+/**
+ * Send the trace this run journaled, as far as a command can.
+ *
+ * `false` — the command posture of `workDelivery`: every offset already due is
+ * attempted, which with `docs/durability.md` §3.7's schedule is the first one,
+ * and the rest is left on the row for a `serve` start to pick up. A command that
+ * waited out fifteen minutes of retries would hold a terminal open over a
+ * courtesy; one that sent nothing would make resolved q50's `run` clause false.
+ *
+ * After the answer is on stdout and never before it, and its own failure is its
+ * own: a collector that is down is not this run's outcome and does not touch its
+ * exit code.
+ */
+async function shipped(record: runtime.DeliveryRecord | undefined): Promise<void> {
+  if (record === undefined) return;
+  try {
+    await workDelivery(record, sinkAuth(), false);
+  } catch (error) {
+    process.stderr.write(
+      `\`${record.id}\` could not be delivered and stays in the journal: ${describe(error)}\n`,
+    );
+  }
+}
+
+/** [`execute`]'s body: everything up to and including the run's report. */
+async function executing(
+  job: Job,
+  exported: { record?: runtime.DeliveryRecord },
+): Promise<number> {
   const { address, format, execution } = job;
   const asking = interactively();
 
@@ -395,11 +441,17 @@ async function execute(job: Job): Promise<number> {
     resumable: asking,
     ...(job.trigger === undefined ? {} : { trigger: job.trigger }),
     ...(job.resuming ? { resume: true } : {}),
-    // The webhook a `serve`-started execution finished here still owes, journaled
-    // **before** the lifecycle row closes — see [`owed`].
-    ...(job.callback === undefined
+    // What this run owes at the moment its lifecycle row closes: the webhook a
+    // `serve`-started execution finished here still owes ([`owed`]), and the
+    // trace every settled execution ships under a target that declares a
+    // `trace_sink:` (grammar 14.5). The hook is attached only where there is
+    // something to owe, so a run under neither pays for neither.
+    ...(job.callback === undefined && !sinkConfigured()
       ? {}
-      : { closing: (produced: FlowRun | undefined, error: unknown) => owed(job, produced, error) }),
+      : {
+          closing: (produced: FlowRun | undefined, error: unknown) =>
+            settled(job, exported, produced, error),
+        }),
   });
   const prompting = asking
     ? answerPauses(execution, settling(running), {
@@ -507,6 +559,47 @@ async function execute(job: Job): Promise<number> {
 }
 
 /**
+ * What this run owes the outside world, journaled while its lifecycle row is
+ * still open.
+ *
+ * `runFlow`'s `closing` hook for this command, and it has two things on it: a
+ * `resume` closes an execution somebody subscribed to with a `callback:`
+ * ([`owed`]), and **every** settled execution ships its trace where the deploy
+ * layer names a sink (grammar 14.5, PRD resolved q50). The order is the ordinal's
+ * — a receiver orders on it — and it is the order a `serve` settle uses too.
+ *
+ * Only the **intents** are recorded here. The attempts wait until the run has
+ * reported ([`shipped`]), which is what keeps the sink off the path between a
+ * run and its answer.
+ */
+async function settled(
+  job: Job,
+  exported: { record?: runtime.DeliveryRecord },
+  produced: FlowRun | undefined,
+  error: unknown,
+): Promise<void> {
+  if (job.callback !== undefined) await owed(job, produced, error);
+  if (!sinkConfigured()) return;
+  // A failure carries its trace on the chain and a completion carries it on the
+  // answer; a failure raised before the graph ran carries none, and ships an
+  // envelope with no entries in it — which `docs/trace.md` §2 makes a statement
+  // about the run rather than a way of being absent.
+  const trace =
+    produced === undefined
+      ? (error as { trace?: readonly runtime.TraceEntry[] } | null)?.trace
+      : produced.trace;
+  exported.record = await shipTrace({
+    execution: job.execution,
+    flow: job.address,
+    // Two of the envelope's three: this hook is reached only where the
+    // lifecycle row closes, and a run holding a pause leaves it open.
+    status: produced === undefined ? "failed" : "completed",
+    ...(produced === undefined ? { error: describe(error) } : {}),
+    entries: trace ?? [],
+  });
+}
+
+/**
  * Journal the `settled` webhook a resumed execution owes, **while its lifecycle
  * row is still open** (`docs/durability.md` §3.7, §6.2, PRD resolved q35).
  *
@@ -539,7 +632,10 @@ async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Pr
   if (url === undefined) return;
   try {
     const held = await deliveriesOf(job.execution);
-    if (held.some((record) => record.event === "settled")) return;
+    // The **kind** as well as the event: a target that declares a `trace_sink:`
+    // puts two `settled` rows on the ledger, and the trace export is not the
+    // webhook this caller is waiting for (grammar 14.5).
+    if (held.some((record) => record.kind === "callback" && record.event === "settled")) return;
     // A failure carries its trace on the chain and a completion carries it on
     // the answer; a failure raised before the graph ran carries none, which is
     // the report that goes without the version beside it.
@@ -549,6 +645,7 @@ async function owed(job: Job, produced: FlowRun | undefined, error: unknown): Pr
         : produced.trace;
     await intendDelivery({
       execution: job.execution,
+      kind: "callback",
       // Which trigger's identity the app that finally sends this row is to sign
       // it with, written beside the row for the reason `src/serve.ts` writes it:
       // a delivery names its own trigger rather than depending on a lifecycle
@@ -1061,7 +1158,7 @@ async function serveVerb(argv: readonly string[]): Promise<number> {
   // HTTP framework and a project used as a library never loads it at all. Only
   // the app: `./triggers.ts` is the composition's own table and is imported
   // above, because `run` reads it too.
-  const { BlankCredentialError, CallbackRetryError, serve } = await import("./serve.ts");
+  const { BlankCredentialError, serve } = await import("./serve.ts");
   if (httpTriggers.length === 0) {
     throw new UsageError(
       "this composition declares no `http` triggers, so the generated app exposes no routes: declare one in `triggers:` (grammar 13.3)",

@@ -1,0 +1,378 @@
+{
+  "name": "failed-run",
+  "about": "A run that produced no answer: the root span is ERROR with the envelope's `error` as its message, the aborting entry is ERROR with its own, and the entry a `fallback:` carried away is on the trace beside it. A model call no member answered is the ERROR case of §12.4's last row.",
+  "context": {
+    "target": "production",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000d5",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T13:00:00.000Z",
+    "endedAt": "2026-09-01T13:00:04.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.publish",
+    "execution_id": "exec_failed",
+    "status": "failed",
+    "error": "NodeFailure: `flow.publish` node `sign`: every member of `model.smart` refused",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.publish",
+        "node": "prepare",
+        "traversal": 0,
+        "outcome": "failed",
+        "attempts": 2,
+        "error": "NodeFailure: `prepare` exited 3",
+        "fallback": "recover"
+      },
+      {
+        "step": 2,
+        "flow": "flow.publish",
+        "node": "sign",
+        "traversal": 0,
+        "outcome": "failed",
+        "attempts": 1,
+        "error": "NodeFailure: `flow.publish` node `sign`: every member of `model.smart` refused",
+        "models": [
+          {
+            "model": "model.smart",
+            "failovers": [
+              {
+                "model": "model.smart",
+                "condition": "overloaded",
+                "detail": "the provider answered 529"
+              }
+            ],
+            "refused": {
+              "model": "model.fast",
+              "condition": "rate_limit",
+              "detail": "the provider answered 429"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.publish"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "production"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000d5"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "production"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "0d6208790d50f791e7e82e5605f97f34",
+                "spanId": "1b4cd0b3215ef898",
+                "name": "flow.publish",
+                "kind": 1,
+                "startTimeUnixNano": "1788267600000000000",
+                "endTimeUnixNano": "1788267604000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.publish"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: `flow.publish` node `sign`: every member of `model.smart` refused"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: `flow.publish` node `sign`: every member of `model.smart` refused"
+                }
+              },
+              {
+                "traceId": "0d6208790d50f791e7e82e5605f97f34",
+                "spanId": "fcdb4293d5bc880a",
+                "parentSpanId": "1b4cd0b3215ef898",
+                "name": "prepare",
+                "kind": 1,
+                "startTimeUnixNano": "1788267600000000000",
+                "endTimeUnixNano": "1788267604000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_failed/prepare/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.publish"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "prepare"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.fallback",
+                    "value": {
+                      "stringValue": "recover"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: `prepare` exited 3"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: `prepare` exited 3"
+                }
+              },
+              {
+                "traceId": "0d6208790d50f791e7e82e5605f97f34",
+                "spanId": "73974649cec4f8fa",
+                "parentSpanId": "1b4cd0b3215ef898",
+                "name": "sign",
+                "kind": 1,
+                "startTimeUnixNano": "1788267600000000000",
+                "endTimeUnixNano": "1788267604000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_failed/sign/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.publish"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "sign"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: `flow.publish` node `sign`: every member of `model.smart` refused"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: `flow.publish` node `sign`: every member of `model.smart` refused"
+                }
+              },
+              {
+                "traceId": "0d6208790d50f791e7e82e5605f97f34",
+                "spanId": "24c9e1cf7b3b116d",
+                "parentSpanId": "73974649cec4f8fa",
+                "name": "model.smart",
+                "kind": 3,
+                "startTimeUnixNano": "1788267600000000000",
+                "endTimeUnixNano": "1788267604000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.failovers",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788267600000000000",
+                    "name": "failover",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.model.member",
+                        "value": {
+                          "stringValue": "model.smart"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.model.condition",
+                        "value": {
+                          "stringValue": "overloaded"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.model.detail",
+                        "value": {
+                          "stringValue": "the provider answered 529"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788267600000000000",
+                    "name": "refusal",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.model.member",
+                        "value": {
+                          "stringValue": "model.fast"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.model.condition",
+                        "value": {
+                          "stringValue": "rate_limit"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.model.detail",
+                        "value": {
+                          "stringValue": "the provider answered 429"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "model.fast: the provider answered 429"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -225,9 +225,19 @@ every settled execution's trace envelope is POSTed to.
 `format: envelope` POSTs the trace envelope itself — the exact object the trace
 file holds. `format: otlp` POSTs an OTLP/JSON `ExportTraceServiceRequest` mapped
 from that same envelope, hand-emitted over OTLP/HTTP with no OpenTelemetry SDK in
-the generated project; `agent-compose docs trace` and `docs/trace.md` are where
-the mapping is written down, and a backend that speaks only protobuf is served by
-pointing an OTel Collector at the sink.
+the generated project: the execution as the root span, every entry a span under
+whatever ran it, model calls and dispatches as child spans with their tool calls
+and failovers as events, routing decisions as attributes, and a flow-as-tool join
+as a span link. `agent-compose docs trace` and `docs/trace.md` §12 are where the
+mapping is written down — the span tree, the id derivation, the status table and
+the resource attributes a later metrics exporter can correlate on — and a backend
+that speaks only protobuf is served by pointing an OTel Collector at the sink.
+
+A request that arrives with a W3C `traceparent` header carries its caller's trace
+into the export: the root span adopts the caller's trace id and hangs off the
+caller's span, so a graph embedded in somebody else's system appears inside their
+trace rather than beside it. A malformed header is ignored, which is the W3C
+behaviour and costs the execution nothing.
 
 Four things worth knowing:
 

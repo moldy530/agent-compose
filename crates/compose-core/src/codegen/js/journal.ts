@@ -237,6 +237,23 @@ export interface JournalRecord {
 export type DeliveryEvent = "parked" | "settled";
 
 /**
+ * Who asked for one delivery (grammar 13.3, 14.5, PRD resolved q35, q50).
+ *
+ *  * `callback` — a lifecycle webhook an `http` trigger's `callback:` subscribed
+ *    to. The URL came out of a request payload, so it is attacker-controlled by
+ *    construction and is held to that trigger's `callback_allow:` every time it
+ *    is read.
+ *  * `trace_sink` — the settled execution's trace, shipped to the address the
+ *    deploy layer names. The URL is the operator's, written in the deploy file
+ *    beside the database credentials, so no list gates it — which is why
+ *    [`DeliveryStatus`]'s `refused` cannot apply to one.
+ *
+ * A row written before the ledger recorded this reads as `callback`, which is
+ * what every row written before this field existed was.
+ */
+export type DeliveryKind = "callback" | "trace_sink";
+
+/**
  * Where one delivery stands.
  *
  *  * `pending` — the intent is recorded and the schedule has attempts left.
@@ -244,9 +261,16 @@ export type DeliveryEvent = "parked" | "settled";
  *  * `refused` — the callback URL matched no `callback_allow` entry, so nothing
  *    was ever sent. Recorded rather than raised: resolved q33 makes it "a
  *    refused delivery rather than anybody's failure", so it is never retried
- *    and never the execution's outcome (grammar 13.3, Decision D127).
+ *    and never the execution's outcome (grammar 13.3, Decision D127). It is a
+ *    `callback` row's status and **only** a `callback` row's: a `trace_sink`
+ *    address is the operator's and is admitted by nothing, so there is no list
+ *    for it to miss (grammar 14.5, PRD resolved q50). The type of
+ *    [`Journal.refuseDelivery`] and the predicate of
+ *    [`Journal.refuseRecorded`] are where that is written down rather than
+ *    merely avoided.
  *  * `exhausted` — the bounded schedule ran out. Recorded for the same reason:
- *    a webhook is a courtesy the status route backstops (resolved q35).
+ *    a delivery is a courtesy the status route and the trace file backstop
+ *    (resolved q35).
  */
 export type DeliveryStatus = "pending" | "delivered" | "refused" | "exhausted";
 
@@ -269,9 +293,15 @@ export interface DeliveryAttempt {
  */
 export interface DeliveryIntent {
   readonly execution: string;
+  /** Who asked for it — see [`DeliveryKind`]. */
+  readonly kind: DeliveryKind;
   /**
    * The trigger whose `callback_auth:` signs this delivery and whose
    * `callback_allow:` admits its URL (grammar 13.3).
+   *
+   * A `trace_sink` delivery has none: the identity it carries is the deploy
+   * layer's own, so there is no trigger for a later start to look up
+   * (grammar 14.5).
    *
    * Recorded **on the delivery** rather than read off the execution's lifecycle
    * row, because there is one delivery whose execution has no lifecycle row: a
@@ -301,7 +331,16 @@ export interface DeliveryIntent {
   readonly pauses: readonly string[];
 }
 
-/** One callback delivery, as the journal holds it (`docs/durability.md` §3.7). */
+/**
+ * The one kind of delivery an allowlist can refuse.
+ *
+ * A nominal narrowing of [`DeliveryIntent`] rather than a second shape: it is
+ * the ledger's way of saying that [`Journal.refuseDelivery`] is about a URL that
+ * came out of a request, and that a `trace_sink` row has no such gate.
+ */
+export type CallbackIntent = DeliveryIntent & { readonly kind: "callback" };
+
+/** One delivery, as the journal holds it (`docs/durability.md` §3.7). */
 export interface DeliveryRecord extends DeliveryIntent {
   /**
    * The event ordinal, monotonically increasing per execution across both
@@ -471,6 +510,23 @@ export interface ExecutionRow {
    * the journal and the least of it used (§8).
    */
   readonly callback?: string;
+  /**
+   * The W3C `traceparent` the request that started this execution carried, where
+   * it carried a valid one (PRD resolved q51).
+   *
+   * On the lifecycle row for [`callback`][`ExecutionRow.callback`]'s reason: the
+   * process that **settles** an execution need not be the one that started it,
+   * and the trace this deployment exports adopts its caller's trace id
+   * (`docs/trace.md` §12.3). A recovered execution whose caller's header lived
+   * only in the process that died would export a trace of its own beside the one
+   * it belongs to — two traces for one operation, on the backend the sink exists
+   * to fill.
+   *
+   * The header **as it arrived**, not parsed: what a later start needs is the
+   * bytes the caller sent, and re-validating them where they are read is one
+   * reading rather than two.
+   */
+  readonly traceparent?: string;
   readonly status: ExecutionStatus;
   readonly journalVersion: number;
   readonly startedAt: string;
@@ -528,8 +584,14 @@ export interface Journal {
    * It takes an ordinal like any other delivery: the ordinal counts an
    * execution's lifecycle *events*, and this event happened — the receiver
    * simply was not one this deployment may deliver to.
+   *
+   * It takes a **callback** intent and no other, which is how the ledger states
+   * that a trace sink cannot be refused: there is no list its address could miss
+   * (grammar 14.5, PRD resolved q50), so a caller that reached here with one has
+   * a type error rather than a row nobody will ever send and nothing will ever
+   * explain.
    */
-  refuseDelivery(intent: DeliveryIntent, reason: string): DeliveryRecord;
+  refuseDelivery(intent: CallbackIntent, reason: string): DeliveryRecord;
   /**
    * Refuse a delivery this journal already holds **pending**, without an
    * attempt.
@@ -539,6 +601,10 @@ export interface Journal {
    * that trigger, so the URL is held against it by the first build that has it
    * (`docs/durability.md` §3.7). A row already delivered, refused or exhausted
    * is left as it is — an outcome is not overwritten by a later reading of it.
+   *
+   * A row this addresses by execution and ordinal carries no type to hold, so
+   * the **statement** carries the rule instead: it matches a `callback` row and
+   * no other, and a `trace_sink` row handed to it is left exactly as it was.
    */
   refuseRecorded(execution: string, ordinal: number, reason: string): void;
   /**
@@ -683,6 +749,7 @@ CREATE TABLE IF NOT EXISTS executions (
   inputs          TEXT NOT NULL,
   session_key     TEXT NOT NULL,
   callback        TEXT,
+  traceparent     TEXT,
   status          TEXT NOT NULL,
   journal_version INTEGER NOT NULL,
   started_at      TEXT NOT NULL,
@@ -705,6 +772,7 @@ CREATE TABLE IF NOT EXISTS effects (
 CREATE TABLE IF NOT EXISTS deliveries (
   execution    TEXT NOT NULL,
   ordinal      INTEGER NOT NULL,
+  kind         TEXT,
   trigger_kind TEXT,
   event        TEXT NOT NULL,
   url          TEXT NOT NULL,
@@ -778,8 +846,8 @@ class SqliteJournal implements Journal {
   begin(row: ExecutionRow): void {
     this.#database.run(
       `INSERT INTO executions
-         (id, flow, trigger_kind, inputs, session_key, callback, status, journal_version, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         (id, flow, trigger_kind, inputs, session_key, callback, traceparent, status, journal_version, started_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO NOTHING`,
       [
         row.id,
@@ -788,6 +856,7 @@ class SqliteJournal implements Journal {
         JSON.stringify(row.inputs),
         row.sessionKey,
         row.callback ?? null,
+        row.traceparent ?? null,
         row.status,
         row.journalVersion,
         row.startedAt,
@@ -862,7 +931,7 @@ class SqliteJournal implements Journal {
     return this.#openDelivery(intent, "pending", undefined);
   }
 
-  refuseDelivery(intent: DeliveryIntent, reason: string): DeliveryRecord {
+  refuseDelivery(intent: CallbackIntent, reason: string): DeliveryRecord {
     return this.#openDelivery(intent, "refused", reason);
   }
 
@@ -899,11 +968,12 @@ class SqliteJournal implements Journal {
     };
     this.#database.run(
       `INSERT INTO deliveries
-         (execution, ordinal, trigger_kind, event, url, body, pauses, status, attempts, intended_at, settled_at, detail)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (execution, ordinal, kind, trigger_kind, event, url, body, pauses, status, attempts, intended_at, settled_at, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         record.execution,
         record.ordinal,
+        record.kind,
         record.trigger ?? null,
         record.event,
         record.url,
@@ -923,8 +993,13 @@ class SqliteJournal implements Journal {
     // `status = 'pending'` in the predicate rather than read first: a row that
     // has already been delivered, refused or exhausted has an outcome, and one
     // statement that will not touch it is better than two that could race.
+    //
+    // …and `kind` beside it, because `refused` is a **callback** row's outcome:
+    // a trace sink's address is admitted by no list, so there is nothing for it
+    // to fail to match (grammar 14.5, PRD resolved q50). A row written before
+    // the ledger recorded a kind is a callback, which is what `IS NULL` says.
     this.#database.run(
-      "UPDATE deliveries SET status = 'refused', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
+      "UPDATE deliveries SET status = 'refused', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending' AND (kind IS NULL OR kind = 'callback')",
       [new Date().toISOString(), reason, execution, ordinal],
     );
   }
@@ -1187,11 +1262,15 @@ function deliveryOf(row: Row): DeliveryRecord {
   const settledAt = row["settled_at"];
   const detail = row["detail"];
   const trigger = row["trigger_kind"];
+  const kind = row["kind"];
   const execution = String(row["execution"]);
   const ordinal = Number(row["ordinal"]);
   return {
     execution,
     ordinal,
+    // A row written before the ledger recorded a kind is a callback: it is the
+    // only kind that existed then (see [`DeliveryKind`]).
+    kind: kind === null || kind === undefined ? "callback" : (String(kind) as DeliveryKind),
     id: `${execution}:${ordinal}`,
     // A row written before the ledger recorded it answers nothing here, and the
     // lifecycle row is what names such a delivery's trigger (see
@@ -1225,6 +1304,7 @@ function executionOf(row: Row): ExecutionRow {
   const endedAt = held["ended_at"];
   const error = held["error"];
   const callback = held["callback"];
+  const traceparent = held["traceparent"];
   return {
     id: String(held["id"]),
     flow: String(held["flow"]),
@@ -1232,6 +1312,9 @@ function executionOf(row: Row): ExecutionRow {
     inputs: JSON.parse(String(held["inputs"])) as Record<string, unknown>,
     sessionKey: String(held["session_key"]),
     ...(callback === null || callback === undefined ? {} : { callback: String(callback) }),
+    ...(traceparent === null || traceparent === undefined
+      ? {}
+      : { traceparent: String(traceparent) }),
     status: String(held["status"]) as ExecutionStatus,
     journalVersion: Number(held["journal_version"]),
     startedAt: String(held["started_at"]),
@@ -1344,6 +1427,13 @@ async function migrated(
       if (!columns.some((column) => column["name"] === "callback")) {
         database.exec("ALTER TABLE executions ADD COLUMN callback TEXT;");
       }
+      // The caller's `traceparent`, added to the lifecycle row after it, and
+      // nullable for the same reason `callback` is: an execution started before
+      // this column existed carried no header this file could hold, and one
+      // started without one carries none either (PRD resolved q51).
+      if (!columns.some((column) => column["name"] === "traceparent")) {
+        database.exec("ALTER TABLE executions ADD COLUMN traceparent TEXT;");
+      }
       const effects = database.all("PRAGMA table_info(effects)") as Row[];
       if (!effects.some((column) => column["name"] === "refused")) {
         database.exec("ALTER TABLE effects ADD COLUMN refused INTEGER NOT NULL DEFAULT 0;");
@@ -1356,6 +1446,13 @@ async function migrated(
       const deliveries = database.all("PRAGMA table_info(deliveries)") as Row[];
       if (!deliveries.some((column) => column["name"] === "trigger_kind")) {
         database.exec("ALTER TABLE deliveries ADD COLUMN trigger_kind TEXT;");
+      }
+      // Which of `docs/durability.md` §3.7's two kinds a row is, added to the
+      // ledger after the first of them. Nullable because a row written before it
+      // needs no backfill: `callback` is the only kind that existed then, and
+      // [`deliveryOf`] reads a null as one.
+      if (!deliveries.some((column) => column["name"] === "kind")) {
+        database.exec("ALTER TABLE deliveries ADD COLUMN kind TEXT;");
       }
       // A whole *table* the schema grew needs no probe of its own: `CREATE
       // TABLE IF NOT EXISTS` above created `deliveries` in a file written

@@ -65,30 +65,60 @@ an empty value is never spelled as absence.
 9. [Failed runs](#9-failed-runs)
 10. [Stability](#10-stability)
 11. [What is not part of this format](#11-what-is-not-part-of-this-format)
+12. [The OTLP export](#12-the-otlp-export)
 
 ---
 
 ## 1. Delivery surfaces
 
-A compiled project delivers a trace on three surfaces. All three carry the same
-entries; they differ in what surrounds them.
+A compiled project delivers a trace on four surfaces. All four carry the same
+entries; they differ in what surrounds them, and one of them may re-encode them.
 
 | surface | what carries the trace | version key |
 |---|---|---|
 | `run --format json` | one JSON object on **stdout**, whose `trace` is the array of entries | `trace_version`, beside `trace` |
 | the trace **file** | one JSON object — the whole [envelope](#2-the-envelope) — under the project's data directory | `trace_version`, at the head of the envelope |
 | `serve` status | `GET /executions/:id` and the `callback:` webhook body, whose `trace` is the array of entries | `trace_version`, beside `trace` |
+| the **trace sink** | one POST per settled execution to the address `trace_sink:` names (grammar §14.5): the whole envelope, or the OTLP/JSON §12 maps it to | `trace_version`, at the head of the envelope — and, under `format: otlp`, as the `agentcompose.trace_version` attribute of the root span |
 
-The rule that spans them: **on all three surfaces above, wherever a `trace`
-appears, the `trace_version` that describes it appears beside it — and wherever
-one is absent, so is the other.** Both halves are load-bearing, because one of
-the three carries reports with no trace on them: a `serve` report for a run that
-is still going carries neither, and so does one for a run whose failure carried
-no trace at all — a request the graph refused before it ran (§1.3). `run
+The rule that spans them: **on the first three surfaces above, wherever a
+`trace` appears, the `trace_version` that describes it appears beside it — and
+wherever one is absent, so is the other.** Both halves are load-bearing, because
+one of the three carries reports with no trace on them: a `serve` report for a
+run that is still going carries neither, and so does one for a run whose failure
+carried no trace at all — a request the graph refused before it ran (§1.3). `run
 --format json` always carries both, `trace` empty where the run recorded
 nothing. In process there is no document to put a version in, so the constant
 `TRACE_VERSION` is where an in-process caller of `runFlow` reads the same number
 (§11).
+
+The sink is the one surface that does not always carry a `trace` key, and only
+because under `format: otlp` it carries no envelope at all — §12 is what it
+carries instead, and the version travels as an attribute so that a reader on a
+collector can still pin it. Under the default `format: envelope` it is an
+envelope like the file's, version included.
+
+### 1.4 The trace sink
+
+`trace_sink:` in a deploy file names one address, and **every execution that
+settles under that target** ships its trace there — a `serve` request's, a
+recovered execution's, and an `agent-compose run` alike (grammar §14.5, PRD
+resolved q50). It is the surface a collector can rely on: the other three are
+somebody asking for one trace.
+
+The POST is a **delivery** on the journal's ledger, which is what the guarantees
+are: journaled before it is attempted, retried on a bounded schedule, ordered
+per execution by `X-AgentCompose-Ordinal`, deduped by `X-AgentCompose-Delivery`,
+and signed with the outbound headers grammar §13.3 defines when the sink
+declares `auth:` (`docs/durability.md` §3.7). Two consequences a receiver is
+entitled to: **an export can arrive twice**, and it is one export — the bytes are
+serialized once, at the intent, so a retry is the same delivery rather than a
+second view of one run. And a sink that is down costs deliveries a retry and
+never an execution: nothing about the export can fail, delay or change a run.
+
+One export per settled execution and no more. An execution the journal already
+holds an export for is not exported again — which is what a `serve` that died
+between journaling the row and closing the lifecycle row leaves behind.
 
 ### 1.1 `run --format json`
 
@@ -1281,3 +1311,203 @@ public surface is worth no more than what checks it:
   asked one of them would be evidence for whichever half it happened to run;
 * `crates/agent-compose/tests/trace_format_stability.rs` reads the promise off a
   real run's trace.
+
+---
+
+## 12. The OTLP export
+
+`trace_sink: { url: …, format: otlp }` ships the same settled trace as
+OTLP/JSON spans instead of as the envelope (grammar §14.5, PRD resolved q51).
+This section is normative for that mapping.
+
+**No SDK.** The exporter is hand-written — `src/otlp.ts` in the emitted project,
+whose only import is `node:crypto` — and held by a conformance corpus rather than
+by a vendored dependency: `crates/compose-core/tests/fixtures/otlp-conformance/`
+pairs an envelope and an export context with the exact bytes this mapping must
+produce, and `crates/compose-core/tests/otlp_conformance.rs` runs every fixture
+through the emitted module itself.
+
+**Protobuf.** The wire is OTLP/HTTP with `Content-Type: application/json`, which
+is the encoding this project emits and the only one it emits. A backend that
+speaks protobuf and not JSON is served by **pointing an OpenTelemetry Collector
+at this endpoint**: it accepts OTLP/JSON on its `otlphttp` receiver and re-encodes
+to whatever the backend wants. That is the answer, and it is deliberate — the
+alternative is a protobuf encoder in a project whose whole point is that it has
+no telemetry dependency.
+
+**Encoding.** Proto3's JSON mapping, as the OTLP specification applies it. Two
+consequences a reader will notice: every 64-bit integer — a timestamp, an
+`intValue` attribute — travels as a **string**, and `traceId`/`spanId` travel as
+lowercase **hex** rather than base64. Enum fields (`kind`, `status.code`) travel
+as numbers.
+
+The body is one `ExportTraceServiceRequest`: a single `resourceSpans` entry, a
+single `scopeSpans` entry inside it, and every span of the execution in that one
+array, in the walk order §12.1 fixes.
+
+### 12.1 The span tree
+
+| trace record | span |
+|---|---|
+| the **execution** | the root span. Named for the flow (`flow.review_loop`), and parented by the caller's span where §12.3 gives it one |
+| each **entry**, at every depth | a span under whatever ran it: the root for a top-level entry, the enclosing entry's span for one under `inner`, the dispatch's span for one under a dispatch record. Named for the node id |
+| each **dispatch record**, on `dispatches` and on `toolDispatches` alike | a span under its entry's, named for the record's `target` |
+| each **model call** | a span under its entry's, named for the `model.*` the agent asked for. `kind` is `3` (client) — the one thing a node does that leaves the process — and every other span is `1` (internal) |
+| each **store record**, and a `human` node's **pause** | a span **event** on the entry's span, not a span |
+| each **tool call** on a model call, and each **failover** or **refusal** | a span event on the model call's span |
+| a **flow-as-tool** join | a span **link** from the model-call span to the dispatch span that answered it (§12.2) |
+
+Nothing else becomes a span. `attempts` is a **count** in this format rather than
+a record per attempt (§3), so it travels as the `agentcompose.attempts` attribute
+on the span whose record carries it; there is no per-attempt span, because there
+is no per-attempt record to make one from.
+
+### 12.2 Identity: trace ids, span ids and links
+
+Ids are derived, never random and never clocked, so **two exports of one trace
+are the same bytes** — which is what makes an at-least-once delivery safe to
+retry and what lets the conformance corpus pin exact output.
+
+* **`traceId`** — 16 bytes, 32 lowercase hex: SHA-256 over `agent-compose/trace/v1`,
+  a newline, and the execution id, truncated to the first 16 bytes. Replaced
+  outright by the caller's trace id where §12.3 applies.
+* **`spanId`** — 8 bytes, 16 lowercase hex: SHA-256 over `agent-compose/span/v1`,
+  the execution id, the span's **kind word** (`execution`, `entry`, `dispatch`,
+  `model`) and its **key**, newline-separated, truncated to the first 8 bytes.
+  The kind word is in the hash so that an entry and a dispatch at one instance
+  path cannot collide.
+* The **key** is the instance path of §8 wherever there is one, plus a positional
+  discriminator: `<instance path>#<index in the array that holds the record>` for
+  an entry and for a dispatch record, and `<entry key>/model/<index>` for a model
+  call. The position is load-bearing rather than decorative — §8's derivation
+  deliberately gives two attempts of a retried `flow:` node the same path, and
+  two spans of one id would be one span to a collector.
+* Neither id is ever **all zero**, which the W3C trace context forbids.
+
+A **link** is how a flow-as-tool call reaches the instance that answered it. Its
+`ToolCallRecord.instance` is a dispatch record's `idempotencyKey` (§7.3), so the
+link points at the span of the **first** record on that entry's `toolDispatches`
+carrying that key — first, because §8's map-item retry can file one key twice —
+and carries `agentcompose.instance_path` as its own attribute. A call whose
+record is not on the entry contributes no link.
+
+### 12.3 An inbound `traceparent`
+
+An `http` trigger's request may carry a W3C `traceparent` header. Where it is
+**syntactically valid**, the export adopts it: the root span takes the caller's
+`trace-id` as its own `traceId`, and the caller's `parent-id` as its
+`parentSpanId`. An embedded graph therefore appears inside its caller's trace
+rather than beside it.
+
+Version `00` is read as the specification writes it, and a later version is read
+for its first four fields — the forward compatibility the specification asks of a
+parser. A header that is **not** valid — a reserved `ff` version, an id that is
+not hex or is all zero, too few fields — is **ignored silently**, which is the
+W3C behaviour: the execution costs nothing for a caller's malformed header, and
+the export gets a trace id of its own.
+
+The header is **not a field of this format.** It is a property of the request
+that started the execution rather than of the run the envelope records, so it
+travels on the journal's lifecycle row beside the `callback:` URL that came from
+the same place (`docs/durability.md` §3.5) and reaches the exporter as part of
+its context. That is deliberate: putting it in the envelope would publish it on
+three surfaces this feature says nothing about and put every later release under
+§10.3's presence discipline for it. `trace_version` is untouched by this
+section, and §10.2's compatible-change list is untouched with it.
+
+### 12.4 Timestamps and status
+
+**This format records no per-node timing**, and the export does not invent any. A
+trace entry carries a superstep number and a traversal ordinal, not a clock. So:
+
+* the **root span** covers the execution's window — its journaled `startedAt`
+  (`docs/durability.md` §3.5) to the instant the export was journaled;
+* **every other span** covers the same window, except an entry whose `human`
+  pause gives it one of its own: that span runs from `pausedAt` to `settledAt`,
+  or to the execution's end where nothing settled it (§3.4);
+* a span **event** is stamped at its span's start, except the two a pause
+  contributes, which carry the pause's own instants.
+
+The tree is therefore a **structure, not a latency waterfall**, and this
+document says so rather than papering over it: a collector rendering invented
+durations as measurements is worse than one rendering honest structure. Adding
+per-entry timing to this format is a change to §3, not to this section.
+
+`status.code` is `1` (ok), `2` (error) or `0` (unset):
+
+| span | ok | error | unset |
+|---|---|---|---|
+| root | `status: "completed"` | `"failed"`, with the envelope's `error` as the status message | `"interrupted"` — a run holding a question is not an outcome, and `agentcompose.status` is where it is said |
+| entry | `outcome: "completed"` | `"failed"`, with the entry's `error` as the message | `"skipped"` — its `error` says what was absorbed, and it is on the attributes |
+| dispatch | `outcome: "completed"` | `"failed"`, with the record's `error` as the message | `"skipped"` and `"detached"` |
+| model call | any call a member answered | a call `refused` ended, with `<member>: <detail>` as the message | — |
+
+### 12.5 Attributes
+
+Every attribute this export sets is under the `agentcompose.` prefix, except the
+resource attributes of §12.6. The values come from the fields §2 to §7 specify
+and add nothing to them.
+
+| attribute | on | from |
+|---|---|---|
+| `agentcompose.execution.id` | root | the envelope's `execution_id` |
+| `agentcompose.flow` | root, entry | the envelope's `flow`; an entry's own `flow` |
+| `agentcompose.status` | root | the envelope's `status` |
+| `agentcompose.trace_version` | root | `TRACE_VERSION` — how a reader on a collector pins the format (§1) |
+| `agentcompose.error` | root, entry, dispatch, tool-call event | that record's `error` |
+| `agentcompose.instance_path` | entry, dispatch, store event, tool-call event, link | §8's path — an entry's derived, a dispatch's read off its `idempotencyKey` |
+| `agentcompose.node`, `agentcompose.step`, `agentcompose.traversal`, `agentcompose.outcome`, `agentcompose.attempts` | entry | the entry's own fields |
+| `agentcompose.writes` | entry | the entry's `writes`, as a string array |
+| `agentcompose.fallback` | entry | the entry's `fallback` |
+| `agentcompose.routing` | entry | the **whole** routing decision (§4), serialized as one JSON string. An OTLP attribute is a scalar or an array of scalars and a routing decision is neither, and PRD 5.3 makes routing data — so it travels losslessly rather than partially |
+| `agentcompose.routing.targets` | entry | the same decision's `targets`, repeated as a string array, because "which way did it go" is the question a collector filters on |
+| `agentcompose.dispatch.carrier` | dispatch | `map` for a record on `dispatches`, `tool` for one on `toolDispatches` |
+| `agentcompose.dispatch.index`, `.target`, `.outcome`, `.route`, `.variant`, and `agentcompose.attempts` | dispatch | the record's own fields |
+| `agentcompose.model` | model call | the `model.*` the agent asked for |
+| `agentcompose.model.served_by`, `.fallback`, `.failovers` | model call | which member answered, its ordinal in the route, and how many refused on the way |
+| `agentcompose.model.member`, `.condition`, `.detail` | failover and refusal events | the refusing member, the `route_on:` condition, and what it said |
+| `agentcompose.tool.name`, `.target`, `.outcome` | tool-call event | the call's own fields |
+| `agentcompose.store`, `.op`, `.effect`, `.via`, `.scope`, `.key`, `.deduped` | store event | the store record's own fields |
+| `agentcompose.human.expires_at`, `.settled` | the two pause events | the pause's budget and how it ended |
+
+**What is deliberately not exported.** §11's exclusions hold automatically —
+the mapping's input is the envelope, which never held them — and the mapping adds
+no attribute that reaches around it. Two fields the envelope *does* carry are
+still left out, and the reason is the same one §11 gives: `StoreRecord.answer`
+and `ToolCallRecord.result` are payloads, and shipping them to a third-party
+collector is a wider disclosure than a trace file read by the deployment's own
+operator. A reader who wants them reads the trace.
+
+### 12.6 Resource attributes
+
+Stable, and this table is the promise. PRD resolved q51's second amendment holds
+the metrics door open by requiring them: a later, standalone metrics exporter
+that resources itself this way correlates with these spans on any collector
+without touching this one. `crates/compose-core/src/codegen/otlp.rs`'s
+`the_resource_attributes_are_the_documented_ones` reads the list out of the
+emitted module and out of this table, so a rename that touched one and not the
+other fails the build.
+
+| attribute | value |
+|---|---|
+| `service.name` | the flow's typed address (`flow.review_loop`). The flow rather than the project: it is the identity every trace carries, and an operator watching one graph wants one service |
+| `service.namespace` | the deploy target the artifact was built for; `local` under the built-in target |
+| `service.version` | the artifact hash (`sha256:…`). PRD 5.12 makes the generated tree the deployable and `docs/distributed.md` §4.1 makes its hash the thing two processes agree on, so it is the version of the *service*; the compiler's version is the SDK's, below |
+| `deployment.environment.name` | the deploy target, again — under the OpenTelemetry semantic convention a backend groups environments by |
+| `telemetry.sdk.name` | `agent-compose` |
+| `telemetry.sdk.language` | `nodejs` |
+| `telemetry.sdk.version` | the agent-compose release that emitted the exporter |
+
+The instrumentation **scope** is `{ name: "agent-compose", version: <the same
+release> }`, on the single `scopeSpans` entry.
+
+### 12.7 What a reader may rely on
+
+Everything §10 says about the trace format, read through this mapping: the export
+is a function of the envelope and the context, so a field §10.3 would need a
+version bump to move is a field this mapping would need one to move too. Beyond
+that, at a given `trace_version` a reader of the export MAY rely on the span
+tree of §12.1, the id derivation of §12.2, the status table of §12.4, the
+attribute names of §12.5, and the resource attributes of §12.6 — and MUST NOT
+rely on the *order* of attributes within a span, or on the absence of an
+attribute this document does not name.

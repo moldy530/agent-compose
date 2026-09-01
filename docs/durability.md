@@ -475,27 +475,37 @@ be resumed:
   with nobody to answer it (`docs/grammar.md` §8.7) and ended `3`. The second is
   the reason an interrupt does not close the row.
 
-### 3.7 A callback delivery
+### 3.7 A delivery
 
-**Not an effect, and that is the whole shape of it.** An `http` trigger's
-`callback:` subscribes a receiver to the execution's lifecycle — every
-quiescence that opened new pauses, and settle — and each such event is delivered
-as one POST (`docs/grammar.md` §13.3, PRD resolved q34). Nothing in the
-composition dispatches one: the graph does not know the webhook exists, no
-instance path addresses it, and no replay ever consumes it. So a delivery is
-**not** an `EffectKind`, gets no §4 key, and never appears in the frontier §5
-defines. It is a second ledger beside the effects, and what it owes is
-durability rather than replay.
+**Not an effect, and that is the whole shape of it.** A **delivery** is
+something the execution's lifecycle owes somebody outside it, delivered as one
+POST. There are two kinds, and they differ in who asked rather than in how they
+are worked:
 
-What is recorded, and in this order (PRD resolved q35):
+* a **callback**, which an `http` trigger's `callback:` subscribed to — every
+  quiescence that opened new pauses, and settle (`docs/grammar.md` §13.3, PRD
+  resolved q34);
+* a **trace sink** export, which the deploy layer's `trace_sink:` subscribed to
+  for every execution the deployment settles (`docs/grammar.md` §14.5, PRD
+  resolved q50). One per settled execution, carrying the trace envelope
+  `docs/trace.md` §2 specifies or the OTLP/JSON §12 maps it to.
+
+Nothing in the composition dispatches either: the graph does not know the
+subscription exists, no instance path addresses it, and no replay ever consumes
+it. So a delivery is **not** an `EffectKind`, gets no §4 key, and never appears
+in the frontier §5 defines. It is a second ledger beside the effects, and what
+it owes is durability rather than replay.
+
+What is recorded, and in this order (PRD resolved q35, q50):
 
 | field | meaning |
 |---|---|
-| `execution`, `ordinal` | who it is about, and which of that execution's lifecycle events it is. The ordinal is **monotonically increasing per execution across both kinds** and is allocated in the journal, so a restart cannot reuse one |
+| `execution`, `ordinal` | who it is about, and which of that execution's lifecycle events it is. The ordinal is **monotonically increasing per execution across every kind and event** and is allocated in the journal, so a restart cannot reuse one |
 | `id` | `<execution_id>:<ordinal>` — the `X-AgentCompose-Delivery` header, and what a receiver dedupes on. The same on every attempt |
-| `event` | `parked` or `settled` |
-| `trigger` | the trigger whose `callback_auth:` signs this delivery and whose `callback_allow:` admits its URL (`docs/grammar.md` §13.3). On the delivery rather than read off the execution's lifecycle row when it is picked up, because one delivery has no lifecycle row to read: the `settled` journaled for a run that failed **before** it was journaled at all. A start that could not name that row's trigger could neither send it nor end it, and `pending` is neither of the two ends below |
-| `url` | the callback URL the request payload named, resolved when the request arrived (§3.5) |
+| `kind` | `callback` or `trace_sink` — who asked. A row written before the ledger recorded this is a `callback`, which is the only kind that existed then |
+| `event` | `parked` or `settled`. A `trace_sink` row is always `settled`: it is the record of a run that has stopped |
+| `trigger` | the trigger whose `callback_auth:` signs this delivery and whose `callback_allow:` admits its URL (`docs/grammar.md` §13.3). On the delivery rather than read off the execution's lifecycle row when it is picked up, because one delivery has no lifecycle row to read: the `settled` journaled for a run that failed **before** it was journaled at all. A start that could not name that row's trigger could neither send it nor end it, and `pending` is neither of the two ends below. A `trace_sink` row carries none — the identity it signs with is the deploy layer's own, so there is nothing for a later start to look up |
+| `url` | the callback URL the request payload named, resolved when the request arrived (§3.5); or, on a `trace_sink` row, the address the deploy file wrote |
 | `body` | the exact bytes every attempt POSTs. Bytes rather than a value, because a signature is over what is sent: a body re-serialized on a later attempt, or in a later process, would be a second delivery wearing the first one's id |
 | `pauses` | which pauses a `parked` delivery reported, by wait id; empty on a `settled` one. What keeps a **recovered** execution from re-announcing a question already asked — it re-parks under the same wait ids (§6.1), so a parking fires only where a quiescence opened a pause this set does not hold |
 | `status` | `pending`, `delivered`, `refused` or `exhausted` — below |
@@ -547,7 +557,13 @@ nobody read (`docs/grammar.md` Decision D50).
   comes out of the request payload and is attacker-controlled by construction,
   so it is matched **when it is read**, at the delivery rather than at the start
   (`docs/grammar.md` §13.3, Decision D110, D127). Nothing is sent, nothing is
-  retried, and the refusal is on the status route.
+  retried, and the refusal is on the status route. It is a `callback` row's
+  outcome and **only** a `callback` row's: a sink's address is the operator's,
+  written in the deploy file and admitted by no list, so there is nothing for it
+  to fail to match (`docs/grammar.md` §14.5). The ledger says so twice — the
+  journal call that opens a refused row takes a callback intent and no other,
+  and the statement that refuses a recorded row matches a callback row and no
+  other.
 * **`exhausted`** — the schedule ran out. A webhook is a courtesy the status
   route backstops, not a contract worth an unbounded queue. A row is exhausted
   the moment the schedule holds no offset it has not already had an attempt at,
@@ -605,13 +621,27 @@ matching `callback_allow:` and signing with the trigger's `callback_auth:` are
 the app's. So the row goes down and the next `serve` start delivers it, exactly
 as it does for the row a build that no longer declares the trigger left behind.
 
-**Where it is implemented.** `deliver`, `opening`, `attempts` and
-`attemptDelivery` in the emitted `src/serve.ts`, over the delivery interface of
-`src/journal.ts`, with `owed` in `src/cli.ts` for the `resume` above and
-`runtime.executionReport` writing the report body both surfaces publish.
-`attemptDelivery` is the one declaration in the emitted app
-that reaches the network for a delivery, which is why §3's primitive walk names
-it as an exemption and
+**And a trace sink is delivered from a command too.** PRD resolved q50 puts the
+sink "wherever executions settle under a target that declares it — `run`
+included, not just `serve`", and unlike a callback there is nothing about a sink
+delivery that only an app can do: no allowlist to match, and an identity that is
+the deployment's rather than a trigger's. So `agent-compose run` journals the
+intent from the same closing hook and then works **every offset already due** —
+with the schedule above, the first one — before it exits, leaving the rest on the
+row for whichever `serve` start picks it up. It sends after the run has reported
+and never before it: a sink that is unreachable costs the delivery a retry and
+the command nothing, which is resolved q50's "never blocks or fails the run it
+describes".
+
+**Where it is implemented.** `workDelivery`, `journaling`, `shipTrace` and
+`attemptDelivery` in the emitted `src/delivery.ts`, over the delivery interface
+of `src/journal.ts`; `deliver` and `opening` in `src/serve.ts` for the half that
+is a trigger's — resolving a callback URL and holding it to `callback_allow:` —
+and `shipping` there for the trace; `owed` and `settled` in `src/cli.ts` for the
+`resume` and `run` above; and `runtime.executionReport` writing the report body a
+callback and the status route both publish. `attemptDelivery` is the one
+declaration in the emitted app that reaches the network for a delivery, which is
+why §3's primitive walk names it as an exemption and
 `crates/compose-core/src/codegen/journal.rs`'s
 `a_delivery_is_journaled_before_it_is_attempted` binds the order this section
 states. What the deliveries *report* — one webhook per parking, listing every

@@ -149,6 +149,19 @@ import process from "node:process";
 import Fastify from "fastify";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import {
+  JOURNAL_RETRY_MS,
+  beingWorked,
+  insisting,
+  message,
+  pause,
+  retrySchedule,
+  secret,
+  shipTrace,
+  sinkAuth,
+  sinkConfigured,
+  workDelivery,
+} from "./delivery.ts";
 import { type CompiledFlow, type FlowRun, flows, runFlow } from "./graph.ts";
 import { mountWorkerRoutes, placementWaits, watchPlacementWaits } from "./mesh.ts";
 import {
@@ -672,25 +685,6 @@ function headerValues(request: FastifyRequest, name: string): readonly string[] 
 }
 
 /**
- * The resolved value of one credential's `${ENV}` reference.
- *
- * Present by construction: `src/env.ts` lists every credential this
- * composition's triggers name and `src/index.ts` resolves the whole list at
- * module scope, so a deployment missing one never reaches a route (grammar 4.3,
- * PRD resolved q15). The fallback is what keeps a comparison constant-time
- * rather than a `TypeError` that would answer `500` on the one request that
- * mattered.
- *
- * What that presence check does **not** cover is a variable set to the empty
- * string, which it counts as set — so the empty string this answers is a real
- * answer rather than only the unreachable one, and it is refused wherever it is
- * read (see [`blankCredentials`], [`verified`]).
- */
-function secret(variable: string): string {
-  return process.env[variable] ?? "";
-}
-
-/**
  * Whether two credentials are equal, compared in **constant time**
  * (grammar 13.3).
  *
@@ -1078,6 +1072,12 @@ function register(
 ): Execution {
   const id = `exec_${globalThis.crypto.randomUUID()}`;
   const callback = callbackOf(trigger, payload);
+  // The caller's own trace, where the caller named one (PRD resolved q51). Read
+  // here for [`callbackOf`]'s reason and journaled for the same: the export that
+  // adopts it happens at settle, which may be in another process. Header names
+  // are case-insensitive and this framework lowercases them, so the lookup is
+  // the lowercase spelling W3C writes anyway.
+  const traceparent = (payload.headers["traceparent"] ?? "").trim();
   const execution: Execution = {
     id,
     flow: flow.address,
@@ -1118,6 +1118,11 @@ function register(
       // reason [`resumeInto`] reads it back: the process that finishes this
       // execution may not be this one.
       ...(callback === undefined ? {} : { callback }),
+      // …and the caller's trace, on the row for the same reason. Carried as it
+      // arrived and validated where it is read (`./otlp.ts`'s
+      // `parseTraceparent`), so a malformed header costs the execution nothing
+      // — which is the W3C trace-context behaviour and PRD resolved q51's.
+      ...(traceparent === "" ? {} : { traceparent }),
       // The `settled` webhook, journaled before the row closes — see [`closed`].
       closing: (produced, error) => closed(execution, produced, error),
     }),
@@ -1282,6 +1287,61 @@ async function closed(
   // again. Bounded like every other ladder here (§3.7): its end is a sentence on
   // stderr and a status route that still holds the answer.
   await insisting(() => deliver(execution, "settled", []));
+  await insisting(() =>
+    // The outcome is derived from what the run answered rather than read back
+    // off the execution, for the reason [`recorded`] derives it there: the two
+    // must agree, and one derivation cannot disagree with itself. The third
+    // envelope status is unreachable here — a run holding a pause leaves its row
+    // open and never reaches this hook (`./graph.ts`'s `closing`).
+    shipping(execution, produced === undefined ? "failed" : "completed"),
+  );
+}
+
+/**
+ * Journal this execution's trace export, on the same chain and in the same
+ * moment (grammar 14.5, PRD resolved q50).
+ *
+ * The **second** thing [`closed`] owes, and it is owed by every settled
+ * execution rather than only by one somebody subscribed to: `callback:` is a
+ * request's subscription and `trace_sink:` is the deployment's standing one, so
+ * a run nobody asked about still ships its trace.
+ *
+ * On [`Execution.deliveries`] for the ordinal's sake: the chain is what
+ * serializes ordinal allocation per execution, and a parking still journaling
+ * when the run stopped would otherwise be racing this for the next number.
+ *
+ * The attempts are set going **after** the intent lands and are not awaited,
+ * which is the whole of resolved q50's "never blocks or fails the run it
+ * describes": what the lifecycle row waits for is a row in the journal, not a
+ * collector.
+ */
+function shipping(
+  execution: Execution,
+  status: "completed" | "failed",
+): Promise<boolean> {
+  if (!sinkConfigured()) return Promise.resolve(true);
+  const journaled = execution.deliveries
+    .then(() =>
+      shipTrace({
+        execution: execution.id,
+        flow: execution.flow,
+        status,
+        ...(execution.error === undefined ? {} : { error: execution.error }),
+        entries: execution.trace ?? [],
+      }),
+    )
+    .then((record) => {
+      if (record !== undefined) void workDelivery(record, sinkAuth(), true);
+      return true;
+    })
+    .catch((error: unknown) => {
+      process.stderr.write(
+        `\`${execution.id}\`'s trace could not be journaled: ${message(error)}\n`,
+      );
+      return false;
+    });
+  execution.deliveries = journaled.then(() => undefined);
+  return journaled;
 }
 
 /**
@@ -1293,7 +1353,13 @@ async function closed(
  */
 async function settledAlready(execution: string): Promise<boolean> {
   try {
-    return (await deliveriesOf(execution)).some((record) => record.event === "settled");
+    return (await deliveriesOf(execution)).some(
+      // **The kind as well as the event**: a settle puts two rows on the ledger
+      // where a target declares a sink, and both are `settled` events. Asking
+      // about the event alone would let the trace export a first generation
+      // journaled stand in for the webhook a second one still owes.
+      (record) => record.kind === "callback" && record.event === "settled",
+    );
   } catch {
     return false;
   }
@@ -1537,6 +1603,7 @@ async function opening(
   const trigger = httpTriggers.find((one) => one.name === execution.trigger);
   const intent = {
     execution: execution.id,
+    kind: "callback" as const,
     // On the row itself, because the one delivery whose execution has **no**
     // lifecycle row to read it off is journaled here: [`settling`] fires a
     // `settled` for a run that failed before it was journaled at all, and a
@@ -1571,7 +1638,10 @@ async function opening(
     return;
   }
   const record = await intendDelivery(intent);
-  void attempts(record, trigger);
+  // Set going and not awaited: a run must not stay `running` to a reader for as
+  // long as a receiver takes to answer. `true` because this is the process that
+  // waits out a schedule — see `workDelivery`.
+  void workDelivery(record, trigger.callbackAuth, true);
 }
 
 /**
@@ -1643,291 +1713,6 @@ function credentialed(url: string): boolean {
 }
 
 /**
- * Work one delivery's remaining schedule (resolved q35).
- *
- * The offsets are measured from the **recorded intent**, not from now, which is
- * what makes a restart pick a delivery up where it left it rather than start
- * its schedule again: a row with two attempts on it resumes at the third
- * offset, due at `intendedAt + schedule[2]`, which may already be in the past.
- *
- * Exhaustion is recorded and is **never the execution's failure**: a webhook is
- * a courtesy the status route backstops, not a contract worth an unbounded
- * queue.
- *
- * A row whose recorded attempts already number as many as this schedule has
- * offsets is exhausted **here**, without an attempt. It is the row a restart
- * under a shorter `AGENT_COMPOSE_CALLBACK_RETRY` than the one that wrote it
- * meets, and the loop below has nothing to do with it: there is no offset left
- * to wait for and so no attempt to record. `docs/durability.md` §3.7 gives a
- * delivery two ends and staying `pending` is neither, so the row is ended rather
- * than left for the status route to keep reporting as owed at every start for
- * the rest of the journal's life.
- *
- * **One loop per delivery in one process**, which is what [`working`] says. Two
- * of them over one row would POST it twice and then disagree in the journal
- * about what the receiver did with it.
- *
- * **An attempt the journal would not take is carried, never dropped.** `attempts`
- * on the row is the one thing a later start reads to decide how much of the
- * schedule is left, so a row that under-counts them is a delivery that makes
- * more POSTs than §3.7 bounds it to — and one still `pending` when its schedule
- * is spent is a webhook the status route reports as owed for the life of the
- * journal. See [`journaling`] for what carries them and [`insisting`] for the
- * write nothing else comes back to.
- */
-async function attempts(record: runtime.DeliveryRecord, trigger: HttpTrigger): Promise<void> {
-  if (working.has(record.id)) return;
-  working.add(record.id);
-  try {
-    const schedule = retrySchedule();
-    const intended = Date.parse(record.intendedAt);
-    if (record.attempts.length >= schedule.length) {
-      const spent = `the schedule this process runs under names ${schedule.length} attempt${
-        schedule.length === 1 ? "" : "s"
-      } and ${record.attempts.length} were already made`;
-      await insisting(async () => {
-        try {
-          await exhaustRecordedDelivery(record.execution, record.ordinal, spent);
-          return true;
-        } catch (error) {
-          process.stderr.write(
-            `\`${record.id}\`'s exhaustion could not be journaled: ${message(error)}\n`,
-          );
-          return false;
-        }
-      });
-      return;
-    }
-    const owed: runtime.DeliveryAttempt[] = [];
-    for (let index = record.attempts.length; index < schedule.length; index += 1) {
-      await pause(intended + (schedule[index] ?? 0) - Date.now());
-      const outcome = await attemptDelivery(record, trigger);
-      owed.push({
-        at: new Date().toISOString(),
-        outcome: outcome.ok ? "delivered" : "failed",
-        detail: outcome.detail,
-      });
-      if (!outcome.ok && index < schedule.length - 1) {
-        // Mid-schedule the next attempt's write is what carries whatever this
-        // one could not put down, and it is due at the next offset anyway — so
-        // this is tried once and no more.
-        await journaling(record, owed, "pending");
-        continue;
-      }
-      // The schedule stops here, delivered or exhausted, and nothing in this
-      // process comes back to the row afterwards. So this write is insisted on
-      // rather than tried: it is the one that gives the row one of §3.7's two
-      // ends, and the one that tells a later start how many attempts this
-      // delivery really made.
-      await insisting(() => journaling(record, owed, outcome.ok ? "delivered" : "exhausted"));
-      return;
-    }
-  } finally {
-    working.delete(record.id);
-  }
-}
-
-/**
- * Put the attempts this delivery has made and the journal has not taken onto its
- * row, ending it where the schedule ends, and say whether the journal took them
- * all.
- *
- * Every attempt but the last is written `pending`, because that is what the row
- * was after it: `status` states where the delivery stands after its **latest**
- * attempt, and the latest is the one this call ends on. What lands is dropped
- * from `owed` and what does not is left there for the next call, which is how a
- * journal that is briefly not there costs a row nothing but the moment.
- */
-async function journaling(
-  record: runtime.DeliveryRecord,
-  owed: runtime.DeliveryAttempt[],
-  status: runtime.DeliveryStatus,
-): Promise<boolean> {
-  // The oldest first, and read afresh each round because the round before it
-  // took one off: the condition is "there is one still owed" written as the one
-  // thing that answers it.
-  for (let attempt = owed[0]; attempt !== undefined; attempt = owed[0]) {
-    try {
-      await recordDeliveryAttempt(
-        record.execution,
-        record.ordinal,
-        attempt,
-        owed.length === 1 ? status : "pending",
-      );
-    } catch (error) {
-      process.stderr.write(
-        `\`${record.id}\`'s attempt could not be journaled: ${message(error)}\n`,
-      );
-      return false;
-    }
-    owed.shift();
-  }
-  return true;
-}
-
-/**
- * Make one journal write, waiting out a journal that is briefly not there.
- *
- * The writes this is for are the ones **nothing comes back to**: the end of a
- * delivery's schedule, and the intent of a settle whose lifecycle row closes the
- * moment it returns ([`closed`]). A parking's intent is the third and runs its
- * own ladder ([`announcing`]) because it has more to do at the end of one than
- * give up — the marks it left on the execution have to come back off, and a
- * round is worth taking only while the run is still going. Every other write in
- * this file is followed by another that would carry it.
- *
- * The `write` says whether it landed rather than raising, because each of them
- * has its own sentence for a reader and says it itself.
- */
-async function insisting(write: () => Promise<boolean>): Promise<boolean> {
-  for (let index = 0; ; index += 1) {
-    if (await write()) return true;
-    const wait = JOURNAL_RETRY_MS[index];
-    if (wait === undefined) return false;
-    await pause(wait);
-  }
-}
-
-/**
- * The waits between one journal write's rounds, in milliseconds.
- *
- * Short and few, and what they are for is a journal held for a moment by a
- * second process on the same project or a disk momentarily full
- * (`docs/durability.md` §2) — not a journal that is gone. Bounded like every
- * other ladder here: a webhook is a courtesy the status route backstops (§3.7),
- * so the end of this one is a sentence on stderr rather than a retry that never
- * stops.
- */
-const JOURNAL_RETRY_MS: readonly number[] = [250, 1_000, 5_000];
-
-/**
- * The deliveries this process is working, by delivery id.
- *
- * **A row can reach [`attempts`] from two directions in one start.** `recover`
- * walks the open executions first and does not wait for the replays it starts
- * (`docs/durability.md` §6.1), so an execution that re-parks with a pause
- * nothing announced journals a `parked` intent and sets its schedule going while
- * that walk is still going on — and [`resumeDeliveries`], which reads every
- * `pending` row after it, then reads the row that was written a moment ago.
- *
- * Two loops over one delivery would POST it twice under one id, which a receiver
- * dedupes, and would each record their attempts against one row, which nothing
- * dedupes: the journal would hold a delivery that made more attempts than the
- * schedule §3.7 bounds, and the two would disagree about where it ended. The set
- * is this process's only — one process at a time writes a project's journal
- * (§2), and a row's own `status` is what a later start reads.
- */
-const working = new Set<string>();
-
-/**
- * POST one delivery, and say what the receiver did with it.
- *
- * Every attempt sends the **same bytes** under the same delivery id: the body
- * was serialized once, at the intent, so a signature computed here is a
- * signature over what a receiver will verify and a retry is the same delivery
- * rather than a second one wearing its id.
- *
- * The headers are grammar 13.3's table, and the two `callback_auth:` halves may
- * both apply — a receiver that checks a token and a receiver that verifies a
- * signature are two receivers, and one trigger may deliver to one that does
- * both.
- */
-async function attemptDelivery(
-  record: runtime.DeliveryRecord,
-  trigger: HttpTrigger,
-): Promise<{ readonly ok: boolean; readonly detail: string }> {
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    "X-AgentCompose-Event": record.event,
-    "X-AgentCompose-Delivery": record.id,
-    "X-AgentCompose-Ordinal": String(record.ordinal),
-    // The **intent's** instant, so every attempt of one delivery agrees about
-    // when the event happened. A per-attempt stamp would make two copies of one
-    // delivery disagree about the thing they report.
-    "X-AgentCompose-Timestamp": record.intendedAt,
-  };
-  const auth = trigger.callbackAuth;
-  if (auth?.hmac !== undefined) {
-    // Fixed at HMAC-SHA256 written in hex, with no keys of its own, so one
-    // receiver-side recipe verifies every agent-compose deployment (D127).
-    headers["X-AgentCompose-Signature"] = `sha256=${createHmac(
-      "sha256",
-      secret(auth.hmac.secretEnv),
-    )
-      .update(record.body)
-      .digest("hex")}`;
-  }
-  if (auth?.bearer !== undefined) {
-    // Written as authored: capitalisation is the receiver's to read, never to
-    // match, and the compiler has already refused a name the delivery writes
-    // itself (grammar 13.3, D127).
-    headers[auth.bearer.header] = `${auth.bearer.prefix}${secret(auth.bearer.tokenEnv)}`;
-  }
-  try {
-    const answered = await fetch(record.url, {
-      method: "POST",
-      headers,
-      body: record.body,
-      // **A bounded schedule has to be bounded in wall-clock time too**
-      // (resolved q35). A receiver that completes the handshake and never
-      // answers is the ordinary shape of an unreachable one, and the runtime
-      // this app is pinned to gives `fetch` no timeout of its own — so without
-      // this an attempt never returns, the row stays `pending` for the life of
-      // the process, and the delivery is neither retried nor exhausted while the
-      // status route reports an execution that finished minutes ago as owing a
-      // webhook. An attempt that runs out is a failed attempt like any other and
-      // the schedule carries on to the next offset.
-      signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS),
-      // **A redirect is not followed**, which `fetch`'s default of `follow`
-      // would do (grammar 13.3, Decision D127). `callback_allow:` is the whole
-      // of where a signed delivery may go, and it is matched against the URL the
-      // trigger produced — so following a `Location:` would carry this report,
-      // its `X-AgentCompose-Signature` and a `callback_auth: bearer` under its
-      // author's own header name to a host the list admits nowhere. What a
-      // cross-origin redirect strips is a fixed list of standard credential
-      // headers — never a name a composition chose, and never the body's
-      // signature. The second half is quieter and worse: a `301`, `302` or
-      // `303` rewrites the request to a bodyless `GET`, so an allowlisted
-      // receiver that redirects to itself would answer `2xx` to a request
-      // carrying no report and the row would be journaled `delivered`.
-      redirect: "manual",
-    });
-    const ok = answered.status >= 200 && answered.status < 300;
-    const moved = answered.status >= 300 && answered.status < 400;
-    return {
-      ok,
-      detail: moved
-        ? `the receiver answered ${answered.status} and a delivery follows no redirect: it goes where \`callback_allow:\` admits it or nowhere`
-        : `the receiver answered ${answered.status}`,
-    };
-  } catch (error) {
-    // Named rather than left as the runtime's own wording, which differs
-    // between them: what a reader of the journal needs to know is that the
-    // receiver was reached and said nothing, not which class the abort arrived
-    // in.
-    const out = (error as { name?: unknown } | null)?.name === "TimeoutError";
-    return {
-      ok: false,
-      detail: out
-        ? `the receiver did not answer within ${DELIVERY_TIMEOUT_MS / 1000}s`
-        : message(error),
-    };
-  }
-}
-
-/**
- * How long one attempt waits for a receiver, in milliseconds
- * (`docs/durability.md` §3.7).
- *
- * Normative and not configurable: a webhook is a courtesy the status route
- * backstops, and ten seconds is what the receivers of the world are written
- * against. `AGENT_COMPOSE_CALLBACK_RETRY` shortens the *schedule* for a
- * diagnostic run; nothing shortens this, because a deployment that needed to
- * would be a deployment whose receiver is the thing to fix.
- */
-const DELIVERY_TIMEOUT_MS = 10_000;
-
-/**
  * Pick up every delivery the journal still holds pending
  * (`docs/durability.md` §6.1).
  *
@@ -1975,8 +1760,26 @@ async function resumeDeliveries(): Promise<void> {
 /** One owed delivery, put back on its schedule. See [`resumeDeliveries`]. */
 async function resumeDelivery(record: runtime.DeliveryRecord): Promise<void> {
   // A row this start has already put on its schedule is not put on a second one.
-  // See [`working`] for how one delivery reaches this from two directions.
-  if (working.has(record.id)) return;
+  // See `./delivery.ts`'s `working` for how one row is reached from two
+  // directions in one start.
+  if (beingWorked(record.id)) return;
+  if (record.kind === "trace_sink") {
+    // **A sink row needs no trigger and meets no list** (grammar 14.5, PRD
+    // resolved q50). Its identity is the deploy layer's own, so a build that
+    // still declares a sink signs it and picks it up; one whose target no longer
+    // declares one leaves it, the posture below takes for a trigger this build
+    // has lost. There is nothing to refuse it against: the address was the
+    // operator's, not a caller's.
+    if (!sinkConfigured()) {
+      process.stderr.write(
+        `\`${record.id}\` is a trace export and this target declares no \`trace_sink:\`: it stays undelivered in the journal\n`,
+      );
+      return;
+    }
+    void workDelivery(record, sinkAuth(), true);
+    process.stderr.write(`resumed delivery ${record.id} (trace)\n`);
+    return;
+  }
   // **Off the delivery row**, which is what lets a delivery be finished without
   // its execution: a `settled` journaled for a run that failed before it was
   // journaled at all has no lifecycle row, and reading the trigger there would
@@ -2009,19 +1812,8 @@ async function resumeDelivery(record: runtime.DeliveryRecord): Promise<void> {
     process.stderr.write(`refused delivery ${record.id} (${record.event})\n`);
     return;
   }
-  void attempts(record, trigger);
+  void workDelivery(record, trigger.callbackAuth, true);
   process.stderr.write(`resumed delivery ${record.id} (${record.event})\n`);
-}
-
-/** Wait out one retry offset, without holding the process open for it. */
-function pause(milliseconds: number): Promise<void> {
-  if (milliseconds <= 0) return Promise.resolve();
-  return new Promise<void>((resolve) => {
-    const timer: unknown = setTimeout(resolve, milliseconds);
-    if (typeof (timer as { unref?: () => void }).unref === "function") {
-      (timer as { unref: () => void }).unref();
-    }
-  });
 }
 
 /**
@@ -2089,73 +1881,6 @@ function entryAdmits(pattern: string, url: string): boolean {
   }
   return true;
 }
-
-/**
- * The retry schedule a delivery is worked on, in milliseconds from its intent.
- *
- * The default is `docs/durability.md`'s normative one — five attempts across
- * fifteen minutes — and `AGENT_COMPOSE_CALLBACK_RETRY` overrides it with a
- * comma-separated list of grammar 4.4 durations, which is what a test or a
- * diagnostic run shortens it with. A value that is not one is a **usage error**
- * refused at launch rather than a setting nobody read, which is D50's posture
- * applied to an environment variable: a schedule silently ignored is a
- * deployment that believes its callbacks retry in seconds and finds out
- * otherwise ten minutes later.
- */
-function retrySchedule(): readonly number[] {
-  const written = process.env[CALLBACK_RETRY];
-  if (written === undefined) return CALLBACK_SCHEDULE;
-  // **Set to nothing is set**, and it is the empty list `docs/durability.md`
-  // §3.7 refuses by name. Read as unset it would be the quietest form of the
-  // failure D50 is about: `AGENT_COMPOSE_CALLBACK_RETRY=$SHORT_SCHEDULE` with
-  // the variable unset in the wrapper starts clean on the fifteen-minute
-  // schedule, and the diagnostic run somebody wrote it for waits ten minutes for
-  // a retry they believed was a second away.
-  if (written.trim() === "") {
-    throw new CallbackRetryError(
-      `\`${CALLBACK_RETRY}\` is set to an empty list, which names no attempt at all: give it at least one offset, such as \`0s\`, or unset it for the schedule \`docs/durability.md\` states`,
-    );
-  }
-  const offsets: number[] = [];
-  for (const entry of written.split(",")) {
-    const matched = /^([0-9]+)(ms|s|m|h)$/.exec(entry.trim());
-    const unit = matched === null ? undefined : UNITS[matched[2] ?? ""];
-    if (matched === null || unit === undefined) {
-      throw new CallbackRetryError(
-        `\`${CALLBACK_RETRY}=${written}\` is not a comma-separated list of durations: \`${entry.trim()}\` is not one of \`<integer>ms\`, \`<integer>s\`, \`<integer>m\` or \`<integer>h\` (grammar 4.4)`,
-      );
-    }
-    offsets.push(Number(matched[1]) * unit);
-  }
-  // No empty-list case below: `split(",")` answers at least one entry for every
-  // string, and the one string whose entry is empty was refused above.
-  return offsets;
-}
-
-/** What `AGENT_COMPOSE_CALLBACK_RETRY` was set to and could not mean. */
-export class CallbackRetryError extends Error {
-  constructor(detail: string) {
-    super(detail);
-    this.name = "CallbackRetryError";
-  }
-}
-
-/** The variable that shortens the schedule, for a test or a diagnostic run. */
-const CALLBACK_RETRY = "AGENT_COMPOSE_CALLBACK_RETRY";
-
-/**
- * The normative schedule of `docs/durability.md` §3.7: five attempts at `+0s`,
- * `+15s`, `+60s`, `+240s` and `+600s` from the intent.
- */
-const CALLBACK_SCHEDULE: readonly number[] = [0, 15_000, 60_000, 240_000, 600_000];
-
-/** Grammar 4.4's units, in milliseconds. */
-const UNITS: Readonly<Record<string, number>> = {
-  ms: 1,
-  s: 1_000,
-  m: 60_000,
-  h: 3_600_000,
-};
 
 /**
  * What both the status route and the callback report about an execution.
@@ -2251,10 +1976,6 @@ function strings(held: unknown): Record<string, string> {
     flattened[name] = Array.isArray(value) ? value.map(String).join(", ") : String(value);
   }
   return flattened;
-}
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 /**

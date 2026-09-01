@@ -747,6 +747,12 @@ fn every_delivery_surface_emits_the_version() {
              the trace keys itself, so a second writer appearing here is a second document \
              to keep in step",
         ),
+        (
+            "delivery.ts",
+            1,
+            "`shipTrace`, the one writer of the envelope §1's fourth surface — the trace \
+             sink — POSTs, and the document `./otlp.ts` maps when the sink asks for OTLP",
+        ),
     ] {
         let source = fs::read_to_string(
             repository().join(format!("crates/compose-core/src/codegen/js/{module}")),

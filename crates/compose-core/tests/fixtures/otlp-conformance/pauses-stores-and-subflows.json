@@ -1,0 +1,714 @@
+{
+  "name": "pauses-stores-and-subflows",
+  "about": "The three record kinds that are events or nesting rather than spans of their own: a `human` node's pause — the one timing this format records, and so the one span with a window of its own (§12.4) — store ops as events, and a `flow:` node's instance as entry spans under the node that ran it. The retried `flow:` node is what the positional discriminator of §12.2 exists for: two attempts of one instance derive the same instance path.",
+  "context": {
+    "target": "staging",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000e6",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T14:00:00.000Z",
+    "endedAt": "2026-09-01T14:30:00.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.approve",
+    "execution_id": "exec_pause",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.approve",
+        "node": "load",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "record"
+        ],
+        "stores": [
+          {
+            "store": "store.cases",
+            "op": "get",
+            "effect": "read",
+            "via": "node",
+            "scope": "session",
+            "key": "case-17",
+            "answer": {
+              "title": "a payload the export does not carry"
+            }
+          },
+          {
+            "store": "store.cases",
+            "op": "put",
+            "effect": "write",
+            "via": "node",
+            "scope": "global",
+            "key": "case-17",
+            "idempotencyKey": "exec_pause/load/0",
+            "deduped": false
+          },
+          {
+            "store": "store.notes",
+            "op": "search",
+            "effect": "read",
+            "via": "tool",
+            "scope": "execution"
+          }
+        ]
+      },
+      {
+        "step": 2,
+        "flow": "flow.approve",
+        "node": "sign_off",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "decision"
+        ],
+        "human": {
+          "pausedAt": "2026-09-01T14:00:05.000Z",
+          "expiresAt": "2026-09-02T14:00:05.000Z",
+          "settledAt": "2026-09-01T14:20:00.000Z",
+          "settled": "resumed"
+        }
+      },
+      {
+        "step": 3,
+        "flow": "flow.approve",
+        "node": "archive",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 2,
+        "writes": [
+          "archived"
+        ],
+        "inner": [
+          {
+            "step": 1,
+            "flow": "flow.archive",
+            "node": "store",
+            "traversal": 0,
+            "outcome": "failed",
+            "attempts": 1,
+            "error": "NodeFailure: the archive rejected it"
+          },
+          {
+            "step": 1,
+            "flow": "flow.archive",
+            "node": "store",
+            "traversal": 0,
+            "outcome": "completed",
+            "attempts": 1,
+            "writes": [
+              "archived"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.approve"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000e6"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "45ef450ba2908a1a0dc6289ad2fa1f1c",
+                "spanId": "dbb4dc704bec68c9",
+                "name": "flow.approve",
+                "kind": 1,
+                "startTimeUnixNano": "1788271200000000000",
+                "endTimeUnixNano": "1788273000000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_pause"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.approve"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "45ef450ba2908a1a0dc6289ad2fa1f1c",
+                "spanId": "38f936e750284625",
+                "parentSpanId": "dbb4dc704bec68c9",
+                "name": "load",
+                "kind": 1,
+                "startTimeUnixNano": "1788271200000000000",
+                "endTimeUnixNano": "1788273000000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_pause/load/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.approve"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "load"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "record"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788271200000000000",
+                    "name": "store",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.store",
+                        "value": {
+                          "stringValue": "store.cases"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.op",
+                        "value": {
+                          "stringValue": "get"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.effect",
+                        "value": {
+                          "stringValue": "read"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.via",
+                        "value": {
+                          "stringValue": "node"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.scope",
+                        "value": {
+                          "stringValue": "session"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.key",
+                        "value": {
+                          "stringValue": "case-17"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788271200000000000",
+                    "name": "store",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.store",
+                        "value": {
+                          "stringValue": "store.cases"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.op",
+                        "value": {
+                          "stringValue": "put"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.effect",
+                        "value": {
+                          "stringValue": "write"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.via",
+                        "value": {
+                          "stringValue": "node"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.scope",
+                        "value": {
+                          "stringValue": "global"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.key",
+                        "value": {
+                          "stringValue": "case-17"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_pause/load/0"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.deduped",
+                        "value": {
+                          "boolValue": false
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788271200000000000",
+                    "name": "store",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.store",
+                        "value": {
+                          "stringValue": "store.notes"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.op",
+                        "value": {
+                          "stringValue": "search"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.effect",
+                        "value": {
+                          "stringValue": "read"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.via",
+                        "value": {
+                          "stringValue": "tool"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.store.scope",
+                        "value": {
+                          "stringValue": "execution"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "45ef450ba2908a1a0dc6289ad2fa1f1c",
+                "spanId": "1cf9e8074ac14dd8",
+                "parentSpanId": "dbb4dc704bec68c9",
+                "name": "sign_off",
+                "kind": 1,
+                "startTimeUnixNano": "1788271205000000000",
+                "endTimeUnixNano": "1788272400000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_pause/sign_off/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.approve"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "sign_off"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "decision"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788271205000000000",
+                    "name": "human.paused",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.human.expires_at",
+                        "value": {
+                          "stringValue": "2026-09-02T14:00:05.000Z"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788272400000000000",
+                    "name": "human.settled",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.human.settled",
+                        "value": {
+                          "stringValue": "resumed"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "45ef450ba2908a1a0dc6289ad2fa1f1c",
+                "spanId": "8b0372a2cbee27e1",
+                "parentSpanId": "dbb4dc704bec68c9",
+                "name": "archive",
+                "kind": 1,
+                "startTimeUnixNano": "1788271200000000000",
+                "endTimeUnixNano": "1788273000000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_pause/archive/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.approve"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "archive"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "archived"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "45ef450ba2908a1a0dc6289ad2fa1f1c",
+                "spanId": "b33d6c04c865a61d",
+                "parentSpanId": "8b0372a2cbee27e1",
+                "name": "store",
+                "kind": 1,
+                "startTimeUnixNano": "1788271200000000000",
+                "endTimeUnixNano": "1788273000000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_pause/archive/0/store/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.archive"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "store"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: the archive rejected it"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: the archive rejected it"
+                }
+              },
+              {
+                "traceId": "45ef450ba2908a1a0dc6289ad2fa1f1c",
+                "spanId": "0d59c5d621329965",
+                "parentSpanId": "8b0372a2cbee27e1",
+                "name": "store",
+                "kind": 1,
+                "startTimeUnixNano": "1788271200000000000",
+                "endTimeUnixNano": "1788273000000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_pause/archive/0/store/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.archive"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "store"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "archived"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,752 @@
+{
+  "name": "models-and-flow-tools",
+  "about": "An agent node whose route failed over once and whose loop called a flow-as-tool twice: two model-call spans with failover and tool_call events, two dispatch spans carrying the instances they ran, and the span links resolved q51 asks for — model call to the dispatch it filed, by instance path.",
+  "context": {
+    "target": "staging",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000b3",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T11:00:00.000Z",
+    "endedAt": "2026-09-01T11:00:12.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.triage",
+    "execution_id": "exec_tools",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.triage",
+        "node": "ask",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "verdict"
+        ],
+        "models": [
+          {
+            "model": "model.smart",
+            "servedBy": "model.fast",
+            "fallback": 1,
+            "failovers": [
+              {
+                "model": "model.smart",
+                "condition": "rate_limit",
+                "detail": "the provider answered 429"
+              }
+            ],
+            "toolCalls": [
+              {
+                "name": "condense",
+                "target": "flow.condense",
+                "outcome": "completed",
+                "instance": "exec_tools/ask/0/condense/0"
+              }
+            ]
+          },
+          {
+            "model": "model.smart",
+            "servedBy": "model.smart",
+            "fallback": 0,
+            "failovers": [],
+            "toolCalls": [
+              {
+                "name": "condense",
+                "target": "flow.condense",
+                "outcome": "failed",
+                "instance": "exec_tools/ask/0/condense/1",
+                "error": "SubflowFailure: `flow.condense` produced no answer"
+              },
+              {
+                "name": "unknown_tool",
+                "outcome": "refused",
+                "error": "ToolCallRefused: `unknown_tool` is not a tool this agent offers"
+              }
+            ]
+          }
+        ],
+        "toolDispatches": [
+          {
+            "index": 0,
+            "target": "flow.condense",
+            "outcome": "completed",
+            "attempts": 1,
+            "idempotencyKey": "exec_tools/ask/0/condense/0",
+            "inner": [
+              {
+                "step": 1,
+                "flow": "flow.condense",
+                "node": "shorten",
+                "traversal": 0,
+                "outcome": "completed",
+                "attempts": 1,
+                "writes": [
+                  "summary"
+                ]
+              }
+            ]
+          },
+          {
+            "index": 1,
+            "target": "flow.condense",
+            "outcome": "failed",
+            "attempts": 1,
+            "idempotencyKey": "exec_tools/ask/0/condense/1",
+            "error": "SubflowFailure: `flow.condense` produced no answer",
+            "inner": [
+              {
+                "step": 1,
+                "flow": "flow.condense",
+                "node": "shorten",
+                "traversal": 0,
+                "outcome": "failed",
+                "attempts": 3,
+                "error": "NodeFailure: the model refused every member of `model.smart`"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.triage"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000b3"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "d08fa7c2ff4042e2",
+                "name": "flow.triage",
+                "kind": 1,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_tools"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.triage"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "25dc6bab41b01a72",
+                "parentSpanId": "d08fa7c2ff4042e2",
+                "name": "ask",
+                "kind": 1,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_tools/ask/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.triage"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "ask"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "verdict"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "7a81e37486d52ee2",
+                "parentSpanId": "25dc6bab41b01a72",
+                "name": "model.smart",
+                "kind": 3,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.served_by",
+                    "value": {
+                      "stringValue": "model.fast"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.fallback",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.failovers",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788260400000000000",
+                    "name": "failover",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.model.member",
+                        "value": {
+                          "stringValue": "model.smart"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.model.condition",
+                        "value": {
+                          "stringValue": "rate_limit"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.model.detail",
+                        "value": {
+                          "stringValue": "the provider answered 429"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788260400000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "condense"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.target",
+                        "value": {
+                          "stringValue": "flow.condense"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "completed"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_tools/ask/0/condense/0"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [
+                  {
+                    "traceId": "96fc6322ce160081d6420744000860af",
+                    "spanId": "65492dc4e0bf6814",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_tools/ask/0/condense/0"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "f194733bf3d2ee92",
+                "parentSpanId": "25dc6bab41b01a72",
+                "name": "model.smart",
+                "kind": 3,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.served_by",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.fallback",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.failovers",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788260400000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "condense"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.target",
+                        "value": {
+                          "stringValue": "flow.condense"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "failed"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_tools/ask/0/condense/1"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.error",
+                        "value": {
+                          "stringValue": "SubflowFailure: `flow.condense` produced no answer"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788260400000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "unknown_tool"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "refused"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.error",
+                        "value": {
+                          "stringValue": "ToolCallRefused: `unknown_tool` is not a tool this agent offers"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [
+                  {
+                    "traceId": "96fc6322ce160081d6420744000860af",
+                    "spanId": "dcce4b00ffcb217e",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.instance_path",
+                        "value": {
+                          "stringValue": "exec_tools/ask/0/condense/1"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "65492dc4e0bf6814",
+                "parentSpanId": "25dc6bab41b01a72",
+                "name": "flow.condense",
+                "kind": 1,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_tools/ask/0/condense/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.carrier",
+                    "value": {
+                      "stringValue": "tool"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.index",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.target",
+                    "value": {
+                      "stringValue": "flow.condense"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "70e2f5b5f638de16",
+                "parentSpanId": "65492dc4e0bf6814",
+                "name": "shorten",
+                "kind": 1,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_tools/ask/0/condense/0/shorten/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.condense"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "shorten"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "summary"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "dcce4b00ffcb217e",
+                "parentSpanId": "25dc6bab41b01a72",
+                "name": "flow.condense",
+                "kind": 1,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_tools/ask/0/condense/1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.carrier",
+                    "value": {
+                      "stringValue": "tool"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.index",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.target",
+                    "value": {
+                      "stringValue": "flow.condense"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "SubflowFailure: `flow.condense` produced no answer"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "SubflowFailure: `flow.condense` produced no answer"
+                }
+              },
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "a04b5dcf59182d33",
+                "parentSpanId": "dcce4b00ffcb217e",
+                "name": "shorten",
+                "kind": 1,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_tools/ask/0/condense/1/shorten/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.condense"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "shorten"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: the model refused every member of `model.smart`"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: the model refused every member of `model.smart`"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -88,6 +88,7 @@ import {
   replayedFailure,
 } from "./journal.ts";
 import type {
+  CallbackIntent,
   DeliveryAttempt,
   DeliveryIntent,
   DeliveryRecord,
@@ -107,9 +108,11 @@ export {
   openJournal,
 } from "./journal.ts";
 export type {
+  CallbackIntent,
   DeliveryAttempt,
   DeliveryEvent,
   DeliveryIntent,
+  DeliveryKind,
   DeliveryRecord,
   DeliveryStatus,
   EffectKind,
@@ -8726,6 +8729,17 @@ export interface ExecutionOpening {
    */
   readonly callback?: string;
   /**
+   * The W3C `traceparent` the request that started this invocation carried,
+   * where it carried a valid one (PRD resolved q51).
+   *
+   * `src/serve.ts` is the only caller that passes it, and for
+   * [`callback`][`ExecutionOpening.callback`]'s reason: the export that adopts
+   * the caller's trace happens when the execution **settles**, which may be in a
+   * different process (`docs/durability.md` §6.1), so the header goes on the
+   * lifecycle row rather than staying in the one that read it.
+   */
+  readonly traceparent?: string;
+  /**
    * Whether this generation is **resuming** an execution the journal already
    * holds, rather than starting one.
    *
@@ -8767,6 +8781,7 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
       inputs: opening.inputs,
       sessionKey: opening.sessionKey,
       ...(opening.callback === undefined ? {} : { callback: opening.callback }),
+      ...(opening.traceparent === undefined ? {} : { traceparent: opening.traceparent }),
       status: "open",
       journalVersion: JOURNAL_VERSION,
       startedAt: new Date().toISOString(),
@@ -8903,7 +8918,7 @@ export async function intendDelivery(intent: DeliveryIntent): Promise<DeliveryRe
  * for (grammar 13.3, Decision D127).
  */
 export async function refuseDelivery(
-  intent: DeliveryIntent,
+  intent: CallbackIntent,
   reason: string,
 ): Promise<DeliveryRecord> {
   return (await openJournal()).refuseDelivery(intent, reason);
