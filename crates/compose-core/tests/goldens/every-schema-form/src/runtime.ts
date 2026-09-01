@@ -2141,8 +2141,11 @@ async function callMessages(
   delete settings["max_tokens"];
 
   const messages: Record<string, unknown>[] = [];
-  // One user message, **folded into the one before it** where the turn between
-  // them was dropped.
+  // Whether the turn this loop just **dropped** is the one the next message
+  // follows. Set at the single drop below, and spent by the very next `user`
+  // whether it folded or not — nothing else can widen it.
+  let dropped = false;
+  // One user message, **folded into the one before it** across a dropped turn.
   //
   // Roles alternate on this wire (`WIRE-NOTES`, "Certain"), and there is exactly
   // one way this runtime composes two user turns in a row: the assistant turn
@@ -2151,11 +2154,26 @@ async function callMessages(
   // ending on the user turn before; since resolved q52 the pinned call carries a
   // closing user turn *after* it, and the two would arrive as consecutive `user`
   // messages the API refuses. Folding is what two adjacent user turns mean — one
-  // turn, its parts in the order they were written — and it is unreachable
-  // wherever nothing was dropped.
+  // turn, its parts in the order they were written.
+  //
+  // It is `dropped` that the fold is conditioned on, and not merely "the last
+  // message is a `user` one", because those are the same condition **only for as
+  // long as the claim above holds**. A fold that ran on any two adjacent user
+  // messages would also repair the ones that are mistakes — a closing turn
+  // composed where no loop ran, a history channel that stopped alternating, a
+  // subflow seam that doubled a turn — and repair them *silently*, on the way to
+  // a wire whose alternation check (the mock's, `WIRE-NOTES` (18)) is the one
+  // thing in this project that would have caught them. The conformance oracle is
+  // only as strict as the requests that reach it, and resolved q52 exists
+  // because a lenient wire hid a bad request once already.
   const user = (content: unknown): void => {
+    const exposed = dropped;
+    dropped = false;
     const last = messages[messages.length - 1];
-    if (last === undefined || last["role"] !== "user") {
+    // An assistant message between the drop and here would leave nothing to fold
+    // into — unreachable today (a dropped turn asked for no tool, so the loop
+    // ended on it) and harmless if it ever is not.
+    if (!exposed || last === undefined || last["role"] !== "user") {
       messages.push({ role: "user", content });
       return;
     }
@@ -2222,6 +2240,10 @@ async function callMessages(
       // and it is the last turn the *loop* wrote. What can follow it is
       // [`CLOSING_TURN`] and nothing else, and `user` above folds that into the
       // user turn this drop exposed rather than leaving two of them in a row.
+      // This assignment is the whole of the fold's reach: every other pair of
+      // adjacent user turns still arrives at the wire as the two messages it
+      // composed, to be refused there.
+      dropped = true;
       continue;
     }
     messages.push({ role: "assistant", content });

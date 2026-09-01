@@ -1394,6 +1394,11 @@ fn a_failover_off_the_responses_wire_rewrites_the_turn_for_the_messages_one() {
 /// two are folded into a single user message, in the order they were written.
 /// Left as two messages they would break the alternation this wire requires, and
 /// the node would die on the 400 the drop exists to avoid.
+///
+/// The fold is conditioned on that drop and on nothing else, which this run is
+/// the only witness to: every *other* way two user turns could meet is a bug, and
+/// a fold that repaired them all would spend this server's alternation check —
+/// the one thing that can still see them — to hide it.
 #[test]
 fn a_responses_turn_with_nothing_the_messages_wire_can_spell_is_not_replayed_empty() {
     let provider = MockProvider::start().expect("a loopback port");
