@@ -2175,11 +2175,6 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
     );
 
     let exported = collector.wait_for_event("settled", 1, Duration::from_secs(60));
-    assert_eq!(
-        exported.len(),
-        1,
-        "one export per settled execution, from the hub and from nowhere else"
-    );
     let body = &exported[0].body;
     assert_eq!(body["execution_id"], execution, "{body:#}");
     assert_eq!(body["status"], "completed", "{body:#}");
@@ -2216,5 +2211,46 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
             .as_array()
             .is_some_and(|calls| !calls.is_empty()),
         "the worker's model calls did not reach the hub's export: {signed:#}"
+    );
+
+    // **…and from nowhere else**, which is the half resolved q51's "export is
+    // hub-side only" turns on and the half the wait above cannot give: it
+    // returns on the *first* arrival, so a second exporter's POST would land
+    // milliseconds later and leave this test green. A worker that exported would
+    // be reaching this same collector — it runs the same artifact under the same
+    // target — so the claim is made after a window wide enough for its request
+    // to have arrived, and from both ends:
+    //
+    //  * the collector holds **one** `settled` delivery id. Counted as ids
+    //    rather than as requests for [`harness::Receiver::distinct`]'s reason:
+    //    delivery is at-least-once, so a repeat under one id is the contract and
+    //    a second id is a second export;
+    //  * and the hub's journal — the mesh's only delivery ledger, since a worker
+    //    refuses the table outright (`src/worker-node.ts`'s
+    //    `WorkerJournalReach`) — holds **one** `trace_sink` row, which is the
+    //    half a collector cannot show: an intent journaled and not yet sent is
+    //    an export still owed.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        collector.distinct("settled"),
+        [format!("{execution}:0")],
+        "a second export reached the collector, so this mesh exports from somewhere besides \
+         the hub: {:?}",
+        collector.delivered()
+    );
+    let rows = harness::journal_rows(
+        &mesh.project,
+        "SELECT kind, status FROM deliveries WHERE kind = 'trace_sink' ORDER BY ordinal ASC",
+    );
+    let held = rows.as_array().expect("the query answers rows");
+    assert_eq!(
+        held.len(),
+        1,
+        "one export intent per settled execution: {rows:#}"
+    );
+    assert_eq!(
+        held[0]["status"], "delivered",
+        "the hub's one export is still owed, so the collector's delivery came from somewhere \
+         else: {rows:#}"
     );
 }
