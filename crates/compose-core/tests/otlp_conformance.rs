@@ -25,10 +25,11 @@
 //! **The shape.** This file reads the corpus in Rust and asserts the invariants
 //! §12 states as properties rather than as literals: ids are lowercase hex of the
 //! right width and never all zero, every span but the root names a parent that is
-//! a span of the same export, no two spans share an id, every timestamp is an
-//! integer written as a string, every link resolves, and the resource attributes
-//! are exactly the documented seven. A regenerated expectation that broke any of
-//! those fails here, whatever the runner said.
+//! a span of the same export, no two spans share an id, every timestamp — a
+//! span's window and every event's instant alike — is an integer written as a
+//! string and sits where §12.4 says it sits, every link resolves, and the
+//! resource attributes are exactly the documented seven. A regenerated
+//! expectation that broke any of those fails here, whatever the runner said.
 //!
 //! Together they are the CEL corpus's two directions: one implementation answering
 //! a fixed corpus, and the corpus itself held to a specification.
@@ -356,13 +357,36 @@ fn every_expectation_is_a_well_formed_export() {
                 trace,
                 "{file}: one execution is one trace"
             );
-            for key in ["startTimeUnixNano", "endTimeUnixNano"] {
-                let stamp = span[key]
+            let opened = stamp(&file, &span["startTimeUnixNano"], "startTimeUnixNano");
+            let closed = stamp(&file, &span["endTimeUnixNano"], "endTimeUnixNano");
+
+            // §12.4's third clause, over the instants only the events carry. The
+            // runner cannot ask this: a regenerated expectation agrees with
+            // whatever the mapper produced, so a stamp in milliseconds, or the
+            // `"0"` its instant parser falls back to, would round-trip through
+            // the corpus and reach a collector as an event in 1970. What the
+            // document publishes is a placement, so a placement is what this
+            // reads: an event sits at its span's start, and the one exception —
+            // the second instant a pause contributes — sits at its span's end,
+            // which is `settledAt` (§12.4's second clause).
+            for event in span["events"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{file}: a span carries an event array"))
+            {
+                let name = event["name"]
                     .as_str()
-                    .unwrap_or_else(|| panic!("{file}: `{key}` is a string (proto3 JSON int64)"));
-                assert!(
-                    stamp.chars().all(|held| held.is_ascii_digit()) && !stamp.is_empty(),
-                    "{file}: `{key}` is `{stamp}`, which is not an integer"
+                    .unwrap_or_else(|| panic!("{file}: an event has a string name"));
+                let at = stamp(&file, &event["timeUnixNano"], "an event's `timeUnixNano`");
+                let (wanted, which) = if name == "human.settled" {
+                    (&closed, "its span's end, which is the pause's `settledAt`")
+                } else {
+                    (&opened, "its span's start")
+                };
+                assert_eq!(
+                    &at, wanted,
+                    "{file}: the event `{name}` on `{}` is stamped `{at}`; `docs/trace.md` §12.4 \
+                     stamps it at {which} (`{wanted}`)",
+                    span["name"]
                 );
             }
             let kind = span["kind"].as_u64().unwrap_or_else(|| {
@@ -495,6 +519,58 @@ fn the_corpus_holds_two_spans_at_one_instance_path_with_children() {
     );
 }
 
+/// **The event placement above is asked of data that could break it.**
+///
+/// `every_expectation_is_a_well_formed_export` reads every event's instant, which
+/// is worth little while every one of them is the execution's own start: a mapper
+/// that stamped the whole export at `window.start` would satisfy it. The instants
+/// that can tell the difference are the two `docs/trace.md` §12.4 exempts — a
+/// pause's `pausedAt` and `settledAt`, the only clock this format really records
+/// (§3.4) — so this insists the corpus carries both, each away from the
+/// execution's start, and that the pair straddles the wait rather than collapsing
+/// onto one instant.
+///
+/// Without it a pause fixture retired in good faith would leave the placement
+/// rule true of nothing, and a regression that stamped a wait of a day at the
+/// instant the run began would ship.
+#[test]
+fn the_corpus_holds_a_pause_whose_two_events_carry_the_waits_own_instants() {
+    let mut straddled: Vec<String> = Vec::new();
+    for (file, fixture) in fixtures() {
+        let spans = fixture["expected"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let Some(root) = spans.first() else { continue };
+        let began = root["startTimeUnixNano"].clone();
+        for span in &spans {
+            let mut paused: Option<Value> = None;
+            let mut settled: Option<Value> = None;
+            for event in span["events"].as_array().into_iter().flatten() {
+                match event["name"].as_str() {
+                    Some("human.paused") => paused = Some(event["timeUnixNano"].clone()),
+                    Some("human.settled") => settled = Some(event["timeUnixNano"].clone()),
+                    _ => {}
+                }
+            }
+            let (Some(paused), Some(settled)) = (paused, settled) else {
+                continue;
+            };
+            if paused != began && settled != paused {
+                straddled.push(format!("{file}: {}", span["name"]));
+            }
+        }
+    }
+    assert!(
+        !straddled.is_empty(),
+        "no fixture carries a settled `human` pause whose `human.paused` and `human.settled` \
+         events fall away from the execution's start and away from each other, so \
+         `every_expectation_is_a_well_formed_export`'s event placement is asserted over instants \
+         that are all the same number. `docs/trace.md` §12.4 exempts exactly these two from being \
+         stamped at their span's start, and §3.4 is the wait they measure."
+    );
+}
+
 /// **The caller's trace is adopted, not merely noted** (`docs/trace.md` §12.3).
 ///
 /// The fixture that carries a `traceparent` and the one that does not are the
@@ -545,6 +621,24 @@ fn an_inbound_traceparent_moves_the_trace_id_and_the_roots_parent_and_nothing_el
         assert_eq!(unparented["name"], parented["name"]);
         assert_eq!(unparented["attributes"], parented["attributes"]);
     }
+}
+
+/// One OTLP instant: nanoseconds since the epoch, written as a string because
+/// proto3's JSON mapping writes every 64-bit integer as one.
+fn stamp(file: &str, value: &Value, what: &str) -> String {
+    let held = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{file}: {what} is a string (proto3 JSON int64), not {value}"));
+    assert!(
+        !held.is_empty() && held.chars().all(|character| character.is_ascii_digit()),
+        "{file}: {what} is `{held}`, which is not an integer"
+    );
+    assert!(
+        held.chars().any(|character| character != '0'),
+        "{file}: {what} is `{held}` — the epoch, which is what an unreadable instant falls back \
+         to rather than an instant anything really happened at"
+    );
+    held.to_string()
 }
 
 /// A hex id of the documented width, never all zero.
