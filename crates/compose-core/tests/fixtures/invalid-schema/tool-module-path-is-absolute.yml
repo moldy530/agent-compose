@@ -1,0 +1,10 @@
+# rule: a `module:` path is project-relative and names a `.ts` file (grammar 6.1 / Decision D132)
+# at: /tool.sign/module
+# via: /$defs/moduleImpl/oneOf
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: /opt/tools/sign.ts

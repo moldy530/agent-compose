@@ -957,6 +957,19 @@ The artifact is a **tarball of the generated project** — the same tree
 authentication, on the route §3.5 fixes. Its hash is over the tree's content, so
 two hubs built from one composition serve one artifact.
 
+**The tree is what `build` wrote plus the authored files the composition
+references** (PRD resolved q49). A `tool.*` may bind a hand-written TypeScript
+file inside the project (`docs/grammar.md` §6.1), and such a tool executes
+wherever its tool executes — on a worker, when placed or reached through
+attachment — so the file has to be in the tarball or the node has nothing to run.
+It is: `ARTIFACT_FILES` lists it and `ARTIFACT_HASH` covers it like every other
+entry, at the same relative path it is edited at, which means **editing a tool
+implementation is a new artifact** and reaches every worker through this
+handshake with no new machinery. A file under `src/` the composition does not
+reference is not part of the tree and ships nowhere. `manifest.json` names the
+carried ones under `authored`, so a reader of an unpacked tree can tell the
+compiler's files from an author's without a JavaScript runtime.
+
 A worker:
 
 1. compares the hash the join returned with what it holds;
@@ -1464,6 +1477,21 @@ Which gives, concretely:
 - a variable reachable in two processes belongs to both. Two placed agents
   attaching one unplaced tool is the ordinary case, and the tool's secrets go to
   both placements.
+
+**One of a tool's `${ENV}` references is declared rather than walked, and the
+closure does not care.** A `module:` binding names hand-written TypeScript
+(`docs/grammar.md` §6.1), and a variable read inside it is not something the
+walk above can see — so the binding declares its environment in the YAML, in the
+same shape an `exec:` block's `env:` takes, and those names enter this closure at
+the tool's own address like every other tool surface's (PRD resolved q49). The
+declaration is also the implementation's only way to the values, which reach it
+as a typed argument rather than through `process.env` — so a variable this
+closure did not carry to a process is one that tool's code cannot read there,
+rather than one it silently reads from whatever else that machine was started
+with. What follows is the property that matters and it is unchanged: a module
+tool's variables reach exactly the processes that can execute it. Everything else in
+this section — the executes-in rule, the two worked cases, §9.2's `env_ok` — is
+written over the closure and not over how a name got into it.
 
 **This closure has a second reader, and it is one walk rather than two.** Grammar
 §14.1 rule 5 refuses a store on a process-local backend wherever a component that

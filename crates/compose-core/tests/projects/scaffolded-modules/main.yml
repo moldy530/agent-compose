@@ -1,0 +1,170 @@
+# A composition whose authored half does not exist: every `module:` binding here
+# names a file that is deliberately **not committed**, so the only implementation
+# a build can find is the stub it writes itself.
+#
+# That is the whole point of the fixture. Every other module tool in this
+# repository — the `placed-nodes` golden's `tool.stamp`, the `module-tools`
+# acceptance project's four — is hand-authored, so the corpus type-checks code a
+# person wrote and never the code `agent-compose build` writes for a person who
+# has not. PRD resolved q48's ergonomic half is "you never type the signature":
+# `build` scaffolds the contract import, the doc comment and the throwing body
+# once, and never writes that file again — so a stub that stopped compiling would
+# be a file the author already has and the compiler will not replace. This is the
+# project `generated_code_gates.rs` builds from nothing and hands to `tsc`.
+#
+# The three tools are three stub *shapes*:
+#
+#   * `tool.sign` is the plain one — the scalar `module:` form, scalar schemas,
+#     no declared environment, so its `…ModuleEnv` admits no property and the
+#     doc comment says nothing about a third argument.
+#   * `tool.shape` is the schema language: an enum, a bounded integer, an array,
+#     a nested object and a constrained string, on both surfaces. The stub's
+#     signature is written in terms of `z.infer` over the emitted schemas, so a
+#     lowering that produced a type the contract could not name fails here.
+#   * `tool.sealed` is the mapping form with `env:` and `dependencies:`, so its
+#     stub takes a typed third argument and its pin is folded into the emitted
+#     `package.json`. Its description carries a `*/` on purpose: a doc comment
+#     that did not escape it would end the comment early and the file would not
+#     parse.
+#
+# Both call sites are reached, because the seam types them the same way and only
+# one of them would be enough to miss it: `tool.sign` hangs off an agent's tool
+# loop and the other two are `function:` nodes.
+version: "0.1"
+
+provider.mock:
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+
+model.smart:
+  provider: provider.mock
+  id: claude-sonnet-4-6
+
+state:
+  signed:
+    description: What the agent reported after calling the plain tool.
+    type: string
+    default: ""
+  verdict:
+    description: What the shaped tool answered.
+    type: string
+    default: ""
+  seal:
+    description: What the sealed tool answered.
+    type: string
+    default: ""
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+
+tool.shape:
+  description: Answer a decision over every shape the schema language has.
+  input:
+    mode: { enum: [strict, lenient] }
+    attempts: { type: integer, minimum: 1, maximum: 8 }
+    tags:
+      type: array
+      max_items: 4
+      items: { type: string }
+    author:
+      type: object
+      properties:
+        name: { type: string }
+        contact: { type: string, format: email }
+  output:
+    verdict: { enum: [ok, retry] }
+    detail: { type: string, min_length: 1 }
+    scores:
+      type: array
+      max_items: 4
+      items: { type: number }
+  module: ./src/tools/shape.ts
+
+tool.sealed:
+  description: Seal a payload with the key this process was given (and a `*/` a doc comment must escape).
+  input:
+    payload: { type: string }
+  output:
+    seal: { type: string }
+  module:
+    path: ./src/tools/sealed.ts
+    env:
+      SIGNING_KEY: ${SIGNING_KEY}
+    dependencies:
+      "@noble/hashes": "1.4.0"
+
+agent.reviewer:
+  description: Decide whether a payload is worth sealing.
+  model: model.smart
+  prompt: |
+    Sign what you are given, then say whether it is worth sealing.
+  tools: [tool.sign]
+  input:
+    payload:
+      type: string
+  output:
+    signed:
+      type: string
+      min_length: 1
+
+flow.seal:
+  description: Reach every module binding from the two surfaces a tool has.
+  inputs:
+    payload:
+      type: string
+      min_length: 1
+    mode:
+      enum: [strict, lenient]
+    attempts:
+      type: integer
+      minimum: 1
+      maximum: 8
+    tags:
+      type: array
+      max_items: 4
+      items: { type: string }
+    author:
+      type: object
+      properties:
+        name: { type: string }
+        contact: { type: string, format: email }
+  outputs:
+    signed: { type: string }
+    verdict: { type: string }
+    seal: { type: string }
+  nodes:
+    # A module tool inside an agent's tool loop.
+    review:
+      agent: agent.reviewer
+      input:
+        payload: "input.payload"
+      writes:
+        signed: signed
+
+    # …and at a `function:` node, which is the other call site.
+    decide:
+      function: tool.shape
+      input:
+        mode: "input.mode"
+        attempts: "input.attempts"
+        tags: "input.tags"
+        author: "input.author"
+      writes:
+        verdict: verdict
+
+    seal:
+      function: tool.sealed
+      input:
+        payload: "input.payload"
+      writes:
+        seal: seal
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: decide }
+    - { from: decide, to: seal }
+    - { from: seal, to: end }

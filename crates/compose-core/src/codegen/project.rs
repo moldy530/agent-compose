@@ -143,6 +143,75 @@ pub const NODE_ENGINE: &str = ">=22.18.0";
 /// PRD 5.12's determinism rule forbids.
 pub const PACKAGE_NAME: &str = "agent-compose-generated";
 
+/// Every package the generated `package.json` declares under `dependencies`:
+/// [`PINS`], plus what the composition's `module:` bindings pin (PRD resolved
+/// q49, D133).
+///
+/// One entry per package: [`PINS`] first, in the order this module declares
+/// them — which is the order the emitted `README.md` prints and the order they
+/// are argued in above — and then the module bindings' own, **sorted by name**.
+///
+/// Two orders rather than one because they answer to different things. The
+/// runtime's own set is a curated list a reader of this module walks top to
+/// bottom, and reordering it would put the substrate under the store driver for
+/// no reason a diff could explain. The declared set is the composition's, and it
+/// has to be a function of *what* was declared rather than of which tool
+/// declared it first — a package that moved between two `module:` bindings would
+/// otherwise rewrite `package.json` without changing what it means.
+///
+/// The declared set cannot disagree with itself or with the generated project's
+/// own — `parse::binding` refuses a pin that contradicts one of these, and
+/// `check::modules` refuses two tools pinning one package at two versions — so
+/// this is a merge with nothing to reconcile, and the assertion says so rather
+/// than choosing.
+///
+/// **Both blocks are the project's own.** A package already held is dropped from
+/// the declared set whether it is in [`PINS`] or in [`DEV_PINS`], because the
+/// two checks have to answer one question: `parse::binding` accepts a pin that
+/// agrees with either list, so looking only at [`PINS`] here would emit a
+/// `typescript: "7.0.2"` under `dependencies` *and* under `devDependencies` —
+/// one package in two blocks of one manifest, which the neutrality claim above
+/// ([`super`]'s *Package-manager neutrality*) does not survive: npm warns and
+/// drops one, and which one it drops is not this compiler's decision to leave
+/// open.
+///
+/// # Panics
+///
+/// Panics on a package pinned at two versions, which the validator refuses with
+/// a span to point at. Reaching here with one is a front-end bug, and a silent
+/// last-one-wins would emit a manifest whose resolution is not the one either
+/// tool asked for.
+#[must_use]
+pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
+    let mut declared: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (address, module) in crate::check::modules::bindings(ir) {
+        for dependency in &module.dependencies {
+            let package = dependency.package.value.as_str();
+            let version = dependency.version.value.as_str();
+            let held: Option<String> = PINS
+                .iter()
+                .chain(DEV_PINS)
+                .find(|(pinned, _)| *pinned == package)
+                .map(|(_, version)| (*version).to_string())
+                .or_else(|| declared.get(package).cloned());
+            if let Some(held) = held {
+                assert!(
+                    held == version,
+                    "`{address}` pins `{package}` to `{version}`, which this project already \
+                     holds at `{held}` — the validator refuses that (grammar 6.1)"
+                );
+                continue;
+            }
+            declared.insert(package.to_string(), version.to_string());
+        }
+    }
+    PINS.iter()
+        .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+        .chain(declared)
+        .collect()
+}
+
 /// `package.json`.
 #[must_use]
 pub fn package_json(ir: &Ir) -> super::GeneratedFile {
@@ -162,8 +231,12 @@ pub fn package_json(ir: &Ir) -> super::GeneratedFile {
         names::string(NODE_ENGINE)
     ));
     contents.push_str("  \"scripts\": {\n    \"typecheck\": \"tsc --noEmit\"\n  },\n");
-    contents.push_str(&dependency_block("dependencies", PINS, true));
-    contents.push_str(&dependency_block("devDependencies", DEV_PINS, false));
+    contents.push_str(&dependency_block("dependencies", &dependencies(ir), true));
+    let development: Vec<(String, String)> = DEV_PINS
+        .iter()
+        .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+        .collect();
+    contents.push_str(&dependency_block("devDependencies", &development, false));
     contents.push_str("}\n");
 
     super::GeneratedFile {
@@ -172,7 +245,7 @@ pub fn package_json(ir: &Ir) -> super::GeneratedFile {
     }
 }
 
-fn dependency_block(key: &str, pins: &[(&str, &str)], trailing_comma: bool) -> String {
+fn dependency_block(key: &str, pins: &[(String, String)], trailing_comma: bool) -> String {
     let mut text = format!("  \"{key}\": {{\n");
     for (index, (package, version)) in pins.iter().enumerate() {
         let comma = if index + 1 == pins.len() { "" } else { "," };
@@ -275,13 +348,18 @@ const README_BODY: &str = r#"
 
 | path | what it holds |
 |---|---|
-| `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
-| `src/artifact.ts` | what this tree **is**: a content hash over its own files, the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
+| `.gitignore` | the three things a checkout of this directory leaves out: the install artifact, the `.env` the spec deliberately never contains, and the data this project's own stores keep |
+| `README.md` | this file |
+| `package.json` | the dependency set, each package pinned to the version this compiler release was built against — plus whatever a `module:` binding declared under `dependencies:` — the `typecheck` script, and the Node floor |
+| `tsconfig.json` | the type checker's settings: strict, `noEmit`, and the `.ts` import extensions both supported runtimes resolve |
+| `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, which files here the compiler did not write, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
+| `src/artifact.ts` | what this tree **is**: a content hash over its own files — the emitted ones and the authored ones the composition references — the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
 | `src/deployment.ts` | what the deploy layer declares: the placements a worker may claim, and the per-process environment partition the hub and a worker both read out of it (`docs/distributed.md` §9.1) |
 | `src/env.ts` | every `${ENV}` reference **this process** needs — the hub's own list, which is the whole composition's unless a placement takes something off it — and `readEnvironment()`, the presence check over them |
 | `src/journal.ts` | the execution journal: every effect a run issues, written as it happens, and what a resumed execution consumes instead of re-issuing it (`docs/durability.md`) |
 | `src/mesh.ts` | the hub half of the worker protocol: the `/workers/*` routes a serve mounts where the target declares `placements:`, the journaled dispatch board behind them, and the seam a placed node reaches a worker through (`docs/distributed.md`) |
+| `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, the type of the `env:` that binding declared, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
 | `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
@@ -340,16 +418,62 @@ naming every variable that is missing rather than the first (PRD 5.9, grammar
 compile time, which is what keeps this directory committable and free of
 credentials.
 
-`src/` is owned by the compiler: `agent-compose build` replaces the modules it
-emits, removes the ones it no longer emits, and `agent-compose build --check`
-reports either as drift. `package.json`, `tsconfig.json`, `.gitignore` and this
-README are generated too, and a rebuild replaces them. Everything else in this
-directory — `node_modules/`, a lockfile, a `.env` — is yours and is never
-removed.
+**The file list above is the boundary.** `agent-compose build` replaces exactly
+the files in that table — every one of them, `package.json` and this README
+included — plus a copy of each implementation the composition references, which
+is the section below. Nothing else in this directory is written, removed, or
+reported. A `node_modules/`, a lockfile, a `.env` — and any TypeScript you wrote
+that the composition does not reference — are yours, wherever they sit. `src/` is
+not a compiler-only directory, and the root is not a yours-only one: what makes a
+file the compiler's is being on that list.
 
-Every file the compiler replaces or removes carries the header above, which is
-how it tells its own work from yours: a `build` into a directory holding none of
-its files refuses rather than overwriting what is there.
+Every file the compiler **generates** carries the header above, which is how it
+tells its own work from yours: a `build` into a directory holding none of its
+files refuses rather than overwriting what is there, naming the ones it would
+have replaced. A build writes one other kind of file here and it carries no
+header — a copy of an implementation you wrote, which the section below is
+about — so the two sentences are one rule: what a build writes is the table
+above plus the authored files the composition references, and it is the only
+thing it writes.
+
+`src/tools/` **in the project** — beside `main.yml`, where a `module:` path is
+resolved — is where your own code goes. A `tool.*` in the composition may bind
+`module: ./src/tools/<name>.ts`, and `build` writes that file **once**, there —
+the typed signature, the contract as a doc comment, a body that throws — then
+never writes it again and never reads it to re-emit it. Fill it in and commit it
+*there* as well: what a build leaves at that path in an output directory —
+including this one — is a copy (the section below), replaced with whatever the
+project holds on every build, so the project's file is the one an edit survives
+in. The tool's declared `input:` and `output:` are its contract,
+`src/modules.ts` is where that contract is written down, and `bun run typecheck`
+is what holds the file to it. The directory is a convention rather than a rule;
+the file list is the rule.
+
+What such a file reads out of the environment is its binding's `env:`, and it
+arrives as the **third argument** rather than through `process.env`: the values
+belong to the call, so nothing they hold reaches a later `exec:` child or a
+module running beside it, and `src/modules.ts` types the argument from the names
+the composition declared — a variable the YAML does not list does not compile.
+
+The **second** is the invocation context, and it carries what a host function's
+does. `context.signal` aborts when the node's `timeout:` budget runs out — the
+runtime races that deadline whether or not the implementation looks, so one that
+ignores it keeps running after the node it belonged to has failed, and whatever
+it returns is discarded. `context.idempotency_key` is set on exactly one call: a
+**detached** `map` dispatch that reached this tool as its sink, which is
+delivered at-least-once (grammar 9.4) and is the one delivery a sink has to
+dedupe. It is absent everywhere else, where a repeated call is what the
+composition asked for — and that same call is the one whose `signal` is not the
+map node's, because a detached delivery is off that node's clock.
+
+A build copies each implementation the composition references into this
+directory at the same relative path, because the artifact a worker fetches has
+to carry it: `src/artifact.ts` lists it and hashes it like every other entry, so
+editing an implementation is a new artifact hash and reaches every worker
+through the join handshake. `agent-compose build --check` compares those copies
+too — a copy that no longer matches what you wrote is a build to re-run, exactly
+like a generated file that drifted. Files under `src/` that the composition does
+not reference ship nowhere.
 
 ## Running it
 
@@ -1087,6 +1211,132 @@ mod tests {
         readme(ir, &crate::codegen::env::Partition::of(ir))
     }
 
+    /// A `module:` binding's `dependencies:` are folded into the generated
+    /// manifest, which stays pure-generated (PRD resolved q49, D133).
+    ///
+    /// Three claims in one composition, because each is a different way the
+    /// fold can be wrong: the runtime's own pins keep their curated order and
+    /// their versions; two tools naming one package at one version fold into
+    /// **one** entry rather than two; and the declared set is sorted by package
+    /// name, so a package that moved between two bindings does not rewrite the
+    /// file.
+    #[test]
+    fn a_module_bindings_dependencies_are_folded_into_the_generated_manifest() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+tool.verify:
+  description: Verify a signature.
+  input: {}
+  output: {}
+  module:
+    path: ./src/tools/verify.ts
+    dependencies:
+      "@noble/hashes": "1.4.0"
+
+tool.sign:
+  description: Sign a payload.
+  input: {}
+  output: {}
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      "@noble/hashes": "1.4.0"
+      tweetnacl: "1.0.3"
+"#,
+        );
+        assert_eq!(
+            dependencies(&ir),
+            PINS.iter()
+                .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+                .chain([
+                    ("@noble/hashes".to_string(), "1.4.0".to_string()),
+                    ("tweetnacl".to_string(), "1.0.3".to_string()),
+                ])
+                .collect::<Vec<_>>(),
+            "the pins keep their order, the declared set is sorted after them, \
+             and one package agreed on twice is one entry"
+        );
+
+        let contents = package_json(&ir).contents;
+        let parsed: serde_json::Value = serde_json::from_str(&contents).expect("strict JSON");
+        let block = parsed["dependencies"]
+            .as_object()
+            .expect("a dependency block");
+        assert_eq!(block["@noble/hashes"], "1.4.0", "{contents}");
+        assert_eq!(block["tweetnacl"], "1.0.3", "{contents}");
+        assert_eq!(block.len(), PINS.len() + 2, "{contents}");
+        assert!(
+            contents.contains("generated by agent-compose"),
+            "the manifest is still wholly the compiler's: {contents}"
+        );
+    }
+
+    /// A package the generated project already holds is folded away whichever
+    /// block holds it — `dependencies` or `devDependencies`.
+    ///
+    /// The parser accepts a pin that **agrees** with the generated project's own
+    /// (`parse::binding`, which chains both lists), so a module may perfectly
+    /// well declare `typescript` at the version this release pins. What must not
+    /// follow is the same package under two keys of one manifest: `npm` warns
+    /// and drops one of them, and a manifest whose two blocks disagree about a
+    /// package is exactly what the exact-pin rule exists to prevent.
+    #[test]
+    fn a_package_the_generated_project_already_holds_is_not_declared_twice() {
+        let ir = ir_of(
+            r#"version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input: {}
+  output: {}
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      typescript: "7.0.2"
+      zod: "4.4.3"
+"#,
+        );
+        assert_eq!(
+            dependencies(&ir),
+            PINS.iter()
+                .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+                .collect::<Vec<_>>(),
+            "a dev pin and a runtime pin agreed with are both already held"
+        );
+
+        let contents = package_json(&ir).contents;
+        let parsed: serde_json::Value = serde_json::from_str(&contents).expect("strict JSON");
+        assert!(
+            parsed["dependencies"]["typescript"].is_null(),
+            "`typescript` is a devDependency of the generated project: {contents}"
+        );
+        assert_eq!(
+            parsed["devDependencies"]["typescript"], "7.0.2",
+            "{contents}"
+        );
+        assert_eq!(
+            parsed["dependencies"]
+                .as_object()
+                .expect("a dependency block")
+                .len(),
+            PINS.len(),
+            "{contents}"
+        );
+    }
+
+    /// A composition binding no module emits the pins and nothing else, which is
+    /// what makes the fold above a *fold* rather than a rewrite.
+    #[test]
+    fn a_composition_with_no_module_binding_pins_exactly_the_runtimes_own_set() {
+        assert_eq!(
+            dependencies(&ir_of("version: \"0.1\"\n")),
+            PINS.iter()
+                .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn the_manifest_is_json_and_carries_the_header_in_a_comment_key() {
         let contents = manifest();
@@ -1431,6 +1681,40 @@ model.default:
                 "the section sits with the rest of what the project does"
             );
         }
+    }
+
+    /// The README's Layout table and [`crate::codegen::EMITTED_PATHS`] are one
+    /// list, in both directions.
+    ///
+    /// That table is **normative** in the emitted project rather than a summary
+    /// of it: the paragraph under it says "the file list above is the boundary",
+    /// so a reader decides whether a file is theirs by looking for its name
+    /// there. A row missing for a name the build replaces tells the owner of a
+    /// `package.json` they edited that it is theirs, right up until the next
+    /// build overwrites it; a row with nothing behind it promises a file the
+    /// project does not have. Neither is visible to a golden diff, which shows
+    /// what the README says and never what the emitter does — which is why this
+    /// reads the table back rather than trusting a reviewer to.
+    #[test]
+    fn the_readme_documents_every_emitted_file() {
+        let contents = readme_of(&ir_of("version: \"0.1\"\n")).contents;
+        let below = contents
+            .split_once("## Layout")
+            .expect("the layout table has a heading")
+            .1;
+        let table = below.split_once("\n## ").map_or(below, |(above, _)| above);
+        let listed: std::collections::BTreeSet<&str> = table
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `"))
+            .filter_map(|row| row.split_once('`'))
+            .map(|(path, _)| path)
+            .collect();
+        let emitted: std::collections::BTreeSet<&str> =
+            crate::codegen::EMITTED_PATHS.iter().copied().collect();
+        assert_eq!(
+            listed, emitted,
+            "the README's layout table and the file list `build` replaces disagree"
+        );
     }
 
     /// The two pin tables and the README's table are one list. A dependency

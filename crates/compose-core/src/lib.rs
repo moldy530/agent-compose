@@ -31,6 +31,14 @@
 //! installable agent skill, all embedded so that a released binary needs no
 //! checkout beside it (PRD §7 M2, 5.12).
 //!
+//! One pass reads the **filesystem** rather than the artifact alone:
+//! [`check_modules`] answers whether every `module:` binding's authored file is
+//! on disk (grammar 6.1, PRD resolved q48). It is not part of
+//! [`check`](check()) because it must not run everywhere [`check`](check())
+//! does — a plain `build` *scaffolds* a missing module rather than refusing over
+//! it, so only the verbs whose answer is a verdict ask this question:
+//! `agent-compose validate`, and `agent-compose build --check`.
+//!
 //! One pass reads two artifacts rather than one: [`plan`](plan()) diffs a
 //! composition against another, which is what makes a change to a graph
 //! reviewable as a change rather than as a rewritten router (PRD §2, §7 M2).
@@ -69,6 +77,9 @@ pub mod resolve;
 pub mod yaml;
 
 pub use check::check;
+pub use check::modules::missing as check_modules;
+pub use check::modules::present as module_is_present;
+pub use codegen::authored::Authored;
 pub use codegen::diagnostics as target_diagnostics;
 pub use codegen::{COMPILER_VERSION, GeneratedFile, GeneratedProject, emit};
 pub use diag::{Diagnostic, DiagnosticCode, Diagnostics, Severity, Span, Spanned};

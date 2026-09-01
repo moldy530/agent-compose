@@ -136,6 +136,7 @@ pub const FIXTURES: &[&str] = &[
     "http-trigger",
     "keyless-gateway",
     "model-failover",
+    "module-tools",
     // The one fixture whose subject is a *target* rather than a composition:
     // `deploy/mesh.yml` places two of its components, and every test that drives
     // it is in `tests/distributed_hub_wire.rs`, served under that target
@@ -202,6 +203,21 @@ pub const DELIVERY_SECRET: &str = "DELIVERY_SECRET";
 /// The variable that shortens the callback retry schedule
 /// (`docs/durability.md` §3.7).
 pub const CALLBACK_RETRY: &str = "AGENT_COMPOSE_CALLBACK_RETRY";
+
+/// What the `module-tools` fixture's `tool.stamp` declares it reads
+/// (grammar 6.1's `module:` `env:`, PRD resolved q49).
+///
+/// Supplied to every run for [`TALLY_BIN`]'s reason, and its *value* is what an
+/// assertion reads back: a module tool's answer carries the marker, so a result
+/// holding it is evidence that the declared environment reached the code rather
+/// than that the call merely completed. `tool.sealed` maps the same value to a
+/// name this process does **not** have, which is what makes the other half —
+/// that nothing outside the call can see it — an assertion about absence with a
+/// working positive control beside it.
+pub const STAMP_MARKER: &str = "STAMP_MARKER";
+/// The value it carries. Distinctive enough that finding it in a result is
+/// evidence rather than coincidence.
+pub const STAMP_MARKER_VALUE: &str = "marker-6b2d";
 
 /// What the four credential variables above are set to for every run.
 ///
@@ -272,6 +288,7 @@ pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
         (OPS_URL.to_string(), provider.base_url()),
         (TALLY_BIN.to_string(), "/bin".to_string()),
         (RECEIPT_BIN.to_string(), "/bin".to_string()),
+        (STAMP_MARKER.to_string(), STAMP_MARKER_VALUE.to_string()),
     ]
     .into_iter()
     // The `http-events` fixture's four credentials, supplied to **every** run

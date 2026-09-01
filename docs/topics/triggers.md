@@ -389,8 +389,9 @@ attempt at one effect reuses its key** — a node retry, an item retry, and a
 
 How the key reaches a sink is fixed per binding kind: an `http:` target gets the
 `Idempotency-Key` header, an `exec:` target the `IDEMPOTENCY_KEY` environment
-variable, a `function:` target an `idempotency_key` field on its invocation
-context. It is delivery metadata, never part of the target's input schema, and
+variable, and a `function:` or `module:` target — the two that run in this
+process — an `idempotency_key` field on the invocation context it is called
+with. It is delivery metadata, never part of the target's input schema, and
 never authored — there is nothing here for `validate` to reject.
 
 ## What `reserved` means

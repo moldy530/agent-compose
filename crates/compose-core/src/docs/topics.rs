@@ -62,7 +62,7 @@ pub const TOPICS: &[Topic] = &[
     },
     Topic {
         name: "tools",
-        summary: "`exec`/`http`/`function` implementations, and the def/use split",
+        summary: "`exec`/`http`/`function`/`module` implementations, and the def/use split",
         body: include_str!("../../../../docs/topics/tools.md"),
     },
     Topic {
@@ -200,6 +200,28 @@ mod tests {
         assert!(index.contains("explain"), "the loop names `explain`");
         assert!(index.contains("plan"), "the loop names `plan`");
         assert!(index.contains("run"), "the loop names `run`");
+    }
+
+    /// The index is where an agent with no context decides what to read, so the
+    /// `tools` summary names every implementation binding a tool can carry.
+    ///
+    /// The summaries are free-form prose and this is the one of them with a
+    /// **closed set** behind it (`parse::definition::TOOL_IMPLEMENTATIONS`). A
+    /// binding added to the language and not to this line is a surface the
+    /// discovery path never mentions: the agent scanning the index for where
+    /// hand-written tool code goes reads three names, finds no fourth, and never
+    /// opens the topic that has it. Pinned here rather than in the topic body's
+    /// own tests because the body is what a reader gets *after* choosing, and
+    /// this is the sentence the choice is made on.
+    #[test]
+    fn the_tools_summary_names_every_implementation_binding() {
+        let summary = topic("tools").expect("a `tools` topic").summary;
+        for binding in crate::parse::definition::TOOL_IMPLEMENTATIONS {
+            assert!(
+                summary.contains(&format!("`{binding}`")),
+                "the `tools` summary does not name `{binding}`: {summary}"
+            );
+        }
     }
 
     /// The registry is a lookup table and a suggestion source; both have to

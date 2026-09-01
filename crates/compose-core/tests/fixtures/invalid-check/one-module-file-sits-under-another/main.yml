@@ -1,0 +1,35 @@
+# rule: two authored modules are two files in one tree (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `tool.verify` is implemented by `src/tools/sign.ts/verify.ts`, which is inside `src/tools/sign.ts` — `tool.sign`'s
+# at: main.yml:35:11
+# label: main.yml:27:11 first bound here
+# help: an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract — and no checkout holds two paths that are one file on macOS, or a name that is a file for one tool and a directory for another: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)
+# count: 3
+#
+# `src/tools/sign.ts` would have to be a file for one tool and a directory for
+# the other. No filesystem offers that and no tar archive carries it, so `build`
+# would write the first scaffold and then fail to make a directory for the
+# second — an IO error partway through a write into the author's own tree, for a
+# composition the validator had accepted.
+#
+# Neither file is committed, for the reason
+# `two-module-files-differ-only-in-case` gives: the missing-file rule runs over
+# every fixture here, so the count is the same on every host only when the
+# answer to "is it there" is.
+version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+
+tool.verify:
+  description: Verify a signature.
+  input:
+    signature: { type: string }
+  output:
+    ok: { type: boolean }
+  module: ./src/tools/sign.ts/verify.ts

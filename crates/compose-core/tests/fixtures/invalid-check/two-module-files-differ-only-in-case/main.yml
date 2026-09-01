@@ -1,0 +1,37 @@
+# rule: case is not what tells two authored files apart (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `tool.verify` is implemented by `src/tools/Sign.ts`, which differs only in case from `src/tools/sign.ts` — `tool.sign`'s
+# at: main.yml:37:11
+# label: main.yml:29:11 first bound here
+# help: an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract — and no checkout holds two paths that are one file on macOS, or a name that is a file for one tool and a directory for another: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)
+# count: 3
+#
+# Two files on Linux, one on macOS. `build` scaffolds the first and then finds
+# `Sign.ts` already there, so the second tool's contract would be bound to the
+# first tool's implementation — on some machines and not others, which is the one
+# outcome a composition may never have.
+#
+# **Neither file is committed**, and that is what makes the fixture read the same
+# on every host. The corpus runs the missing-file rule over every project
+# (`check::modules::missing`), which asks the filesystem; a checkout carrying
+# `sign.ts` would answer "there" for `Sign.ts` too on APFS and NTFS and not on
+# ext4, so the count would be two diagnostics on the reviewer's machine and three
+# on CI. With both absent the answer is the same everywhere: this rule, and one
+# missing-file diagnostic per binding.
+version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+
+tool.verify:
+  description: Verify a signature.
+  input:
+    signature: { type: string }
+  output:
+    ok: { type: boolean }
+  module: ./src/tools/Sign.ts

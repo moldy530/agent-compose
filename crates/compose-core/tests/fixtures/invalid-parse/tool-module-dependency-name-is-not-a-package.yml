@@ -1,0 +1,15 @@
+# rule: a `module:` dependency key is an npm package name (grammar 6.1, Decision D133)
+# code: invalid-dependency
+# message: `../vendor/hashes` is not an npm package name
+# at: 15:7
+# help: a package name is at most 214 characters of lowercase letters, digits, `-`, `_` and `.`, optionally scoped as `@scope/name`, and starts with none of `.`, `_` or `-`
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      "../vendor/hashes": "1.4.0"

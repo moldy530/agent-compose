@@ -22,5 +22,7 @@ placements:
     members:
       - agent.signer
       - tool.sign
+      - tool.stamp
+      - agent.stamper
       - agent.escalator
     description: The machine holding the signing keys.

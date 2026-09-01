@@ -1,0 +1,12 @@
+# rule: a `module:` path is project-relative (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `/opt/tools/sign.ts` is not a project-relative path to a TypeScript file
+# at: 12:11
+# help: a `module:` path is `/`-separated, each segment `.`, `..`, or a name matching `[A-Za-z0-9_][A-Za-z0-9_.-]*`, and the last segment ends in `.ts`: no leading `/`, no backslashes, no whitespace, no URLs (grammar 6.1)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: /opt/tools/sign.ts

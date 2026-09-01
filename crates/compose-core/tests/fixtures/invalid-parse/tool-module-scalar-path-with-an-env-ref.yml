@@ -1,0 +1,16 @@
+# rule: the scalar `module:` form is the same class-3 surface its `path:` is (grammar 4.3 class 3, 6.1)
+# code: unexpected-env-ref
+# message: `module` never interpolates environment references, but it contains `${TOOLS}`
+# at: 16:11
+# help: write `$${TOOLS}` for a literal `${TOOLS}`
+# count: 2
+#
+# Two diagnostics, and both are the point: the reference is refused, and the
+# text left standing is not a path either.
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: "${TOOLS}/sign.ts"

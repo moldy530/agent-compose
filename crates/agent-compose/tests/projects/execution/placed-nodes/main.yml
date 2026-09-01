@@ -61,6 +61,11 @@
 # belongs to `mac`'s manifest and not to the hub's, because the hub never runs
 # the tool.
 #
+# `agent.stamper` and `tool.stamp` are that pair again over a `module:` binding
+# rather than an `exec:` one, and they are here because the authored file has to
+# reach the worker both ways a graph can ask for it: `flow.stamped`'s `function:`
+# node, and this agent's own tool loop.
+#
 # Nothing here scripts a model call for the placed agent, and that is the point:
 # a placed node's answer arrives over `/workers/result`, so the hub calls no
 # provider for it at all. `tool.notarize` is the hub's own work, and it is an
@@ -126,6 +131,26 @@ triggers:
     type: http
     flow: flow.direct
     path: /direct-signings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  on_stamped:
+    type: http
+    flow: flow.stamped
+    path: /stampings
+    method: POST
+    input:
+      path: "payload.body.path"
+    respond: async
+
+  # The same authored code, reached the other way a graph can reach a tool — see
+  # `flow.attested`.
+  on_attested:
+    type: http
+    flow: flow.attested
+    path: /attestations
     method: POST
     input:
       path: "payload.body.path"
@@ -229,6 +254,28 @@ tool.sign:
     env:
       KEYCHAIN_PASSWORD: ${KEYCHAIN_PASSWORD}
 
+# The placed **module** tool (grammar §6.1, PRD resolved q48, q49). Authored
+# TypeScript, committed beside this file at `src/tools/stamp.ts`, and carried
+# into the artifact because the composition references it — which is the whole of
+# how it reaches a worker: the worker holds nothing but the artifact, fetches it
+# by hash and runs the node out of it.
+#
+# `${STAMP_MARKER}` is the other half. A `process.env` read inside TypeScript is
+# not something `References::of` can walk, so the binding declares it and the
+# per-placement partition carries it to `mac` and to nowhere else — the same
+# `docs/distributed.md` §9.1 answer `tool.sign`'s `${KEYCHAIN_PASSWORD}` gets,
+# reached through a different binding.
+tool.stamp:
+  description: Stamp a release with the marker the signing machine holds.
+  input:
+    path: { type: string }
+  output:
+    stamped: { type: string }
+  module:
+    path: ./src/tools/stamp.ts
+    env:
+      STAMP_MARKER: ${STAMP_MARKER}
+
 # The hub's own: unplaced, and reached from a `function:` node, where a tool's
 # own placement would be the whole answer if it had one (grammar §14.1).
 tool.notarize:
@@ -263,6 +310,28 @@ agent.signer:
   prompt: |
     Sign the path you are given and report what the signature is.
   tools: [tool.sign]
+  input:
+    path:
+      type: string
+  output:
+    signature:
+      type: string
+      min_length: 1
+
+# Placed, and what it attaches is the **module** tool. `agent.signer` above is
+# the same shape over an `exec:` binding, which is the comparison: grammar §14.1
+# rule 4 runs an attached tool inside its agent's loop wherever that agent runs,
+# and PRD resolved q49 puts a module-bound tool where its tool executes — "on a
+# worker, when placed **or reached through attachment**". This agent is the
+# attachment half: its loop calls authored TypeScript out of the artifact the
+# worker fetched, with no `function:` node and no hub in the way — the surface
+# `flow.stamped` cannot reach.
+agent.stamper:
+  description: Stamp a release from the machine that holds the marker.
+  model: model.smart
+  prompt: |
+    Stamp the path you are given and report what the stamp says.
+  tools: [tool.stamp]
   input:
     path:
       type: string
@@ -513,6 +582,64 @@ flow.direct:
   edges:
     - { from: start, to: sign }
     - { from: sign, to: end }
+
+# The module binding's mesh consequence, made observable (PRD resolved q49). A
+# `function:` node over a **placed module tool**: the tool's own placement is the
+# whole of the answer (grammar §14.1), so the node is dispatched, and what runs
+# it is authored TypeScript the worker only ever saw inside the artifact it
+# fetched. The marker in the answer is the evidence that the binding's `env:`
+# declaration became the argument the authored file reads — `src/tools/stamp.ts`
+# spells `undefined` without it. Where that variable is *delivered* is a separate
+# question, and the test asserts it separately: `STAMP_MARKER` is on `mac`'s
+# environment manifest and off the hub's own `src/env.ts`.
+flow.stamped:
+  description: Stamp a release with authored code, on the machine that holds it.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    stamp:
+      function: tool.stamp
+      input:
+        path: "input.path"
+      writes:
+        stamped: signature
+  edges:
+    - { from: start, to: stamp }
+    - { from: stamp, to: end }
+
+# The other way a graph reaches that same authored file, and the one a
+# `function:` node cannot stand in for: a **placed agent's tool loop**. The node
+# is `agent.stamper`, dispatched to `mac` like any other placed agent, and the
+# module call happens *inside* the loop the worker is running — so what is
+# observable is the loop's own transcript (the tool result the model is handed
+# back carries the marker) and the effect record the worker streams home under
+# `attest/0#tool/0`, whose request names the `module` surface. A seam that only
+# worked from the hub, or only outside a loop, passes `flow.stamped` and fails
+# here.
+flow.attested:
+  description: Stamp a release inside a placed agent's own tool loop.
+  inputs:
+    path:
+      type: string
+      min_length: 1
+  outputs:
+    signature:
+      type: string
+  nodes:
+    attest:
+      agent: agent.stamper
+      input:
+        path: "input.path"
+      writes:
+        signature: signature
+  edges:
+    - { from: start, to: attest }
+    - { from: attest, to: end }
 
 flow.retried:
   description: The same sign-off, under a retry the hub can spend on it.

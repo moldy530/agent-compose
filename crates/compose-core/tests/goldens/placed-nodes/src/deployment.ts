@@ -60,6 +60,8 @@ export const placements: readonly PlacementManifest[] = [
     members: [
       "agent.signer",
       "tool.sign",
+      "tool.stamp",
+      "agent.stamper",
       "agent.escalator",
     ],
     environment: [
@@ -67,6 +69,7 @@ export const placements: readonly PlacementManifest[] = [
       "MOCK_API_KEY",
       "MOCK_BASE_URL",
       "OPS_BIN",
+      "STAMP_MARKER",
     ],
   },
 ];

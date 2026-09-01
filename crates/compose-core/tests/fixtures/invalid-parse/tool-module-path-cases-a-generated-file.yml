@@ -1,0 +1,12 @@
+# rule: a `module:` path is not a name `build` emits, whatever its case (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `src/Modules.ts` differs only in case from `src/modules.ts`, a file `agent-compose build` generates
+# at: 12:11
+# help: macOS and Windows hold those two spellings in one file, so on such a host the build would write `src/modules.ts` over the implementation the `module` binding of tool definition `tool.sign` names — and a composition that works on one machine and destroys code on another is not one this compiler emits: put it somewhere `build` does not emit — `src/tools/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/Modules.ts

@@ -1,0 +1,27 @@
+# rule: one authored file implements one tool (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `tool.verify` and `tool.sign` are both implemented by `src/tools/sign.ts`
+# at: main.yml:27:11
+# label: main.yml:19:11 first bound here
+# help: an authored module is typed against the tool it implements and scaffolded from that tool's schemas, so one file answers to one contract — and no checkout holds two paths that are one file on macOS, or a name that is a file for one tool and a directory for another: give each tool its own `.ts`, and share what they have in common through a module both import (grammar 6.1)
+#
+# One file, two contracts: the scaffold is written from one tool's schemas and
+# the registry seam imports it under that tool's interface, so only one of the
+# two could ever be the file on disk.
+version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+
+tool.verify:
+  description: Verify a signature.
+  input:
+    signature: { type: string }
+  output:
+    ok: { type: boolean }
+  module: ./src/tools/sign.ts

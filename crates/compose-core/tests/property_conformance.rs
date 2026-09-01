@@ -431,7 +431,7 @@ fn project(root: &Path, purpose: &str, seed: u64, source: &str) -> (PathBuf, com
         .join("projects")
         .join(format!("property-{purpose}-{seed}"));
     let _ = fs::remove_dir_all(&out);
-    for file in compose_core::emit(&ir).files() {
+    for file in compose_core::emit(&ir, &compose_core::Authored::none()).files() {
         let path = out.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
         fs::create_dir_all(path.parent().expect("a generated path has a parent"))
             .expect("the scratch area is writable");

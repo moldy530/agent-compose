@@ -694,11 +694,14 @@ export interface RunContext {
    * key a receiver dedupes on for effects that are *meant* to repeat.
    *
    * **The name is normative.** Grammar 9.4's delivery surface says a
-   * `function:`-bound target "receives it as the `idempotency_key` field of its
-   * invocation context", and the invocation context of a host function is this
-   * object ([`HostFunction`]) — so this field *is* that surface and is spelled
-   * the way the spec spells it rather than the way the rest of this file spells
-   * a name. The other two carriers are named there too, and see [`runHttp`] and
+   * `function:`-bound and a `module:`-bound target each "receive it as the
+   * `idempotency_key` field of the invocation context they are called with",
+   * and that context is this object ([`HostFunction`],
+   * [`ModuleImplementation`]) — so this field *is* that surface for both, and is
+   * spelled the way the spec spells it rather than the way the rest of this file
+   * spells a name. One field for the two bindings that run in this process: a
+   * call made here has a context to put a key on and needs no wire to carry it.
+   * The other two carriers are named there too, and see [`runHttp`] and
    * [`runExec`] for the slot each puts it in.
    */
   readonly idempotency_key?: string;
@@ -4606,6 +4609,132 @@ export async function callFunction(
 }
 
 // ---------------------------------------------------------------------------
+// Authored module implementations (grammar 6.1's `module:` binding)
+// ---------------------------------------------------------------------------
+
+/**
+ * One `module:` binding, as the composition wrote it (grammar 6.1, PRD resolved
+ * q48, q49).
+ *
+ * The *identity* of the call and nothing else: which tool, which file, and the
+ * environment the binding declared. The implementation is not here — it reaches
+ * [`callModule`] as an argument, through `./modules.ts`, because that is the one
+ * seam generated code is allowed to reach authored code across.
+ */
+export interface ModuleBinding {
+  /** The tool's address, as the composition spells it (grammar 2.2). */
+  readonly address: string;
+  /** The authored file, project-relative — the path it takes in the artifact. */
+  readonly path: string;
+  /** `env:` — what this implementation declared it reads (grammar 4.3 class 2). */
+  readonly env: readonly { readonly name: string; readonly value: readonly Interpolation[] }[];
+}
+
+/**
+ * The environment one `module:` binding declared, resolved for one call
+ * (grammar 4.3 class 2, 6.1).
+ *
+ * **A map of its own, never `process.env`.** An `exec:` binding's `env:` reaches
+ * its implementation as the *child's* environment, which no other call in this
+ * process shares; a module runs here, so its declaration is handed to it the
+ * same way — as an argument. Written into the ambient environment instead it
+ * would outlive the call it belongs to and reach every later `exec:` child,
+ * every other module, and whatever ran concurrently beside it, which is the one
+ * thing "these names hold these values **when this implementation runs**" does
+ * not say. It would also differ under replay, which never enters the
+ * implementation at all.
+ *
+ * `./modules.ts` states this per tool, over the names that binding declared, so
+ * a read of a variable the YAML does not list is a type error rather than an
+ * `undefined` at three in the morning. This is the erased version the runtime
+ * builds and passes.
+ */
+export type ModuleEnv = Readonly<Record<string, string>>;
+
+/**
+ * What an authored module is, from this side: the tool's parsed input in, its
+ * declared result out.
+ *
+ * `./modules.ts` states the same shape *per tool*, over the tool's own schemas,
+ * and that is the one `tsc` holds an authored file to. This is the erased
+ * version the runtime dispatches through, and it takes `context` for
+ * [`HostFunction`]'s reason: a module tool reached as the sink of a **detached**
+ * dispatch finds that dispatch's key in `context.idempotency_key`, and finds it
+ * absent on every other call. `E` is the binding's own [`ModuleEnv`], which the
+ * generated contract narrows to the names it declared.
+ */
+export type ModuleImplementation<I, O, E extends ModuleEnv = ModuleEnv> = (
+  input: I,
+  context: RunContext,
+  env: E,
+) => O | Promise<O>;
+
+/**
+ * Call an authored module implementation, in this process (grammar 6.1).
+ *
+ * **Parity is the point.** A module tool is a tool: its arguments are parsed
+ * against its declared `input:` before this is reached, its answer against its
+ * `output:` after, its node's `retry:`/`timeout:`/`on_error:` wrap the whole of
+ * it, and a model that called it wrongly gets the refusal back rather than the
+ * node failing (Decision D119). Only the binding differs, so only the journal's
+ * `surface` differs.
+ *
+ * **What identifies the call.** The address, the file the binding names, the
+ * declared environment **as written**, and the input. Whole, for [`runExec`]'s
+ * reason: a binding that moved in any of those is a call this run does not make,
+ * and the recorded answer is not its. The authored file's *contents* are not in
+ * it, exactly as a host function's registration is not in that surface's key —
+ * an implementation that changed is a new artifact hash rather than a new effect
+ * identity, and `docs/durability.md` §3.2's subject is the composition.
+ *
+ * **The environment is resolved into an argument.** `env:` is the same
+ * declaration an `exec:` binding makes and it means the same thing — these names
+ * hold these values when the implementation runs — so it is delivered the way an
+ * `exec:`'s is: as the call's own environment, which nothing outside the call
+ * shares. An `exec:` builds a child's environment; this builds the third
+ * argument, and [`ModuleEnv`] says why it is not `process.env`. A binding that
+ * maps a name to itself (`SIGNING_KEY: "${SIGNING_KEY}"`, the ordinary spelling)
+ * hands on the value already there, resolved at the moment of the call like
+ * every other class-2 reference.
+ */
+export async function callModule<I, O, E extends ModuleEnv>(
+  binding: ModuleBinding,
+  implementation: ModuleImplementation<I, O, E>,
+  input: I,
+  context: RunContext,
+): Promise<O> {
+  return await journaled(
+    context.effects,
+    "tool",
+    {
+      surface: "module",
+      address: binding.address,
+      path: binding.path,
+      env: binding.env.map((entry) => ({ name: entry.name, value: asWritten(entry.value) })),
+      input,
+    },
+    async () => {
+      // `Object.fromEntries` rather than assignment into an object literal,
+      // because a declared name is data and one of them is a *setter* on
+      // `Object.prototype`: `environment["__proto__"] = "…"` is a silent no-op,
+      // so a binding declaring `__proto__` — which the validator's environment
+      // variable form accepts — would hand the implementation an `env.__proto__`
+      // holding `Object.prototype` where `./modules.ts` typed it `string`. This
+      // defines own properties, so every name the composition declared arrives
+      // as the value it declared.
+      const environment = Object.fromEntries(
+        binding.env.map((entry) => [entry.name, interpolate(entry.value)] as const),
+      );
+      // The cast is the compiler's own guarantee rather than a claim about
+      // arbitrary data: `E` is the type `./modules.ts` wrote from this binding's
+      // `env:`, and the map above filled exactly those names from the same
+      // declaration. One emitter wrote both.
+      return await implementation(input, context, environment as E);
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // The router (grammar 7.3, 7.4, 7.6)
 // ---------------------------------------------------------------------------
 
@@ -5033,12 +5162,12 @@ export interface DispatchRecord {
    * A **detached** delivery carries it to its sink on the surface grammar 9.4
    * fixes per binding kind — the `Idempotency-Key` header of an `http:`
    * binding, the `IDEMPOTENCY_KEY` variable in an `exec:` binding's
-   * environment, the `idempotency_key` field of the context a `function:`
-   * binding is invoked with — which is what makes at-least-once delivery a
-   * defensible trade rather than a lost message (PRD 5.6). It is recorded for
-   * every dispatch because it is the same derivation either way, and because it
-   * is the one place the flattened instance path of a nested fan-out is
-   * observable at all.
+   * environment, the `idempotency_key` field of the context a `function:` or a
+   * `module:` binding is invoked with — which is what makes at-least-once
+   * delivery a defensible trade rather than a lost message (PRD 5.6). It is
+   * recorded for every dispatch because it is the same derivation either way,
+   * and because it is the one place the flattened instance path of a nested
+   * fan-out is observable at all.
    */
   readonly idempotencyKey: string;
   /**

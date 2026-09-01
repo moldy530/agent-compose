@@ -149,3 +149,36 @@ pub struct FunctionBinding {
     /// The block's own span.
     pub span: Span,
 }
+
+/// A `module:` implementation binding: a hand-authored TypeScript file inside
+/// the project (grammar 6.1, PRD resolved q48, q49).
+///
+/// The path is the **normalized** project-relative spelling, which is the name
+/// the artifact's file list, the manifest and every diagnostic downstream use —
+/// one portable spelling, as grammar 1.4 asks of every path in this DSL.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Module {
+    /// `path:` — the authored file, project-relative and `/`-separated.
+    pub path: Spanned<String>,
+    /// `env:` — the environment this module's code may read. Declared rather
+    /// than walked: `References::of` cannot follow a `process.env` read inside
+    /// arbitrary TypeScript, so the YAML is where the partition learns of it
+    /// (PRD resolved q49, `docs/distributed.md` §9.1).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<InterpolatedEntry>,
+    /// `dependencies:` — the npm packages the module imports, each at an exact
+    /// version, in declaration order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<Dependency>,
+    /// The block's own span.
+    pub span: Span,
+}
+
+/// One `dependencies:` entry of a [`Module`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Dependency {
+    /// The package name.
+    pub package: Spanned<String>,
+    /// The exact version it is pinned to.
+    pub version: Spanned<String>,
+}

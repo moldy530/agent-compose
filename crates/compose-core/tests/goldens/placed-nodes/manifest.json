@@ -8,6 +8,9 @@
     "the whole directory out and stop regenerating it."
   ],
   "node_runner": "src/worker-node.ts",
+  "authored": [
+    "src/tools/stamp.ts"
+  ],
   "placements": [
     {
       "name": "mac",
@@ -15,7 +18,8 @@
         "KEYCHAIN_PASSWORD",
         "MOCK_API_KEY",
         "MOCK_BASE_URL",
-        "OPS_BIN"
+        "OPS_BIN",
+        "STAMP_MARKER"
       ]
     }
   ]

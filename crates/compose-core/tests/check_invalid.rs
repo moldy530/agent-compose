@@ -90,6 +90,9 @@ const CHECK_CODES: &[&str] = &[
     "duplicate-route",
     "conflicting-placement",
     "process-local-store",
+    "invalid-module-path",
+    "invalid-dependency",
+    "io-error",
 ];
 
 struct Anchor {
@@ -286,7 +289,17 @@ fn every_fixture_produces_exactly_the_diagnostic_it_declares() {
             name(&case)
         );
 
-        let diagnostics = compose_core::check(&ir);
+        // The validator, plus the one rule that needs the filesystem: a
+        // `module:` binding's authored file being on disk (grammar 6.1, PRD
+        // resolved q48). It is a pass of its own because a plain `build`
+        // scaffolds rather than refusing — see `check::modules` — but a fixture
+        // for it is a project like any other, and running it here is what puts
+        // it in the corpus every other rule is pinned by.
+        let mut collected = compose_core::Diagnostics::new();
+        collected.extend(compose_core::check(&ir));
+        collected.extend(compose_core::check_modules(&ir, &case));
+        collected.sort();
+        let diagnostics = collected.into_vec();
         if diagnostics.len() != expected.count {
             problems.push(format!(
                 "expected {} diagnostic(s), got {}",

@@ -185,6 +185,21 @@ fn tool(source: &ast_def::ToolDef) -> Option<ir::definition::Tool> {
                 span: binding.span.clone(),
             },
         },
+        ast_def::ToolImplementation::Module(block) => ir::flow::ToolImplementation::Module {
+            module: ir::binding::Module {
+                path: block.path.clone()?,
+                env: block.env.iter().map(interpolated_entry).collect(),
+                dependencies: block
+                    .dependencies
+                    .iter()
+                    .map(|entry| ir::binding::Dependency {
+                        package: entry.package.clone(),
+                        version: entry.version.clone(),
+                    })
+                    .collect(),
+                span: block.span.clone(),
+            },
+        },
     };
     Some(ir::definition::Tool {
         description: source.description.clone()?,

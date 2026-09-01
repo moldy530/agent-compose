@@ -1,0 +1,13 @@
+# rule: a tool carries exactly one implementation binding (grammar 6.1)
+# code: conflicting-keys
+# message: tool definition `tool.sign` declares both `exec` and `module`; a tool carries exactly one implementation
+# at: 13:3
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  exec:
+    command: sign
+  module: ./src/tools/sign.ts

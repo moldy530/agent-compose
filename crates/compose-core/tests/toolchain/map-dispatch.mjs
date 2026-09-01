@@ -16,9 +16,10 @@
 // real `StateGraph` the way `codegen::state` builds one, because a reduce policy
 // is half reducer and half channel and the half that swallowed a fan-out's batch
 // was the channel. The delivery section intercepts `fetch`, runs a real
-// subprocess, and registers a real host function — one per binding kind grammar
-// 9.4 fixes a surface for — because a key that is derived and recorded but never
-// sent is indistinguishable from a delivered one anywhere else.
+// subprocess, registers a real host function and calls a real module
+// implementation — one per binding kind grammar 9.4 fixes a surface for —
+// because a key that is derived and recorded but never sent is
+// indistinguishable from a delivered one anywhere else.
 //
 // Four sections drive a map through **`runtime.runNode`** rather than calling
 // `runMap` directly, because a compiled map node is always inside one: grammar
@@ -458,8 +459,10 @@ const observed = {};
 // --- What a detached delivery carries to its sink (grammar 9.4, PRD 5.6) ----
 //
 // The key is derived for every dispatch and recorded in the trace either way, so
-// nothing about a run says whether it was ever *delivered*. These are the three
-// surfaces grammar 9.4 fixes, one per binding kind a `tool.*` can be bound by.
+// nothing about a run says whether it was ever *delivered*. These are the
+// surfaces grammar 9.4 fixes, one per binding kind a `tool.*` can be bound by —
+// a header, a variable, and the invocation context the two in-process bindings
+// share.
 {
   const site = { execution: { id: "exec_gate", session_key: "" }, path: ["fan/0/1"], idempotencyKey: "exec_gate/fan/0/1" };
   const keyed = runtime.delivering(context, site);
@@ -547,6 +550,43 @@ const observed = {};
   await runtime.callFunction("sink", { text: "a1" }, keyed);
   await runtime.callFunction("sink", { text: "a1" }, context);
   observed.deliveredContext = seen;
+
+  // The module form: the same field, on the context a `module:` binding's
+  // implementation is called with. It is the fourth binding kind grammar 9.4
+  // fixes a surface for and the second to reach it through the invocation
+  // context rather than over a wire — so a change that stopped passing
+  // `context` through `callModule` would take at-least-once delivery away from
+  // every module sink, which nothing else here would notice.
+  //
+  // The binding's `env:` rides along because the third argument is delivered by
+  // the same call, and one of the two names it declares is a **setter on
+  // `Object.prototype`**: assigned into an object literal, `__proto__` is
+  // silently dropped while `src/modules.ts` still types it `string`.
+  const delivered = [];
+  const binding = {
+    address: "tool.sink",
+    path: "src/tools/sink.ts",
+    env: [
+      { name: "SIGNING_KEY", value: ["a literal"] },
+      { name: "__proto__", value: ["a value, not the prototype"] },
+    ],
+  };
+  const implementation = async (input, invocation, env) => {
+    delivered.push({
+      key: invocation.idempotency_key ?? null,
+      declared: env.SIGNING_KEY,
+      // Read into a differently-named field on purpose: `{ __proto__: … }` in
+      // an object literal is the setter again, and would throw this
+      // observation away on its way to the report.
+      proto:
+        typeof env.__proto__ === "string" ? env.__proto__ : `not a string: ${typeof env.__proto__}`,
+      text: input.text,
+    });
+    return { receipt: "ok" };
+  };
+  await runtime.callModule(binding, implementation, { text: "a1" }, keyed);
+  await runtime.callModule(binding, implementation, { text: "a1" }, context);
+  observed.deliveredModule = delivered;
 }
 
 // --- The node-wide bound covers a detached delivery too ---------------------

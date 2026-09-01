@@ -1,0 +1,13 @@
+# rule: a `module:` block declares the file it binds (grammar 6.1, Decision D132)
+# code: missing-key
+# message: missing required key `path` in the `module` binding of tool definition `tool.sign`
+# at: 12:5
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    dependencies:
+      "@noble/hashes": "1.4.0"

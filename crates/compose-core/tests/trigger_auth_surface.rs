@@ -153,7 +153,9 @@ fn the_whole_auth_surface_parses_and_resolves_clean() {
     // indexed one wrongly would arrive here as a panic rather than as a
     // diagnostic.
     assert!(
-        !compose_core::emit(&ir).files().is_empty(),
+        !compose_core::emit(&ir, &compose_core::Authored::none())
+            .files()
+            .is_empty(),
         "the auth surface validates, so `build` owes it a project"
     );
 }
@@ -573,7 +575,7 @@ fn both_inbound_schemes_require_a_constant_time_comparison() {
 #[test]
 fn both_inbound_schemes_compare_in_constant_time_in_the_generated_app() {
     let ir = resolve_clean("constant-time", &source());
-    let generated = compose_core::emit(&ir);
+    let generated = compose_core::emit(&ir, &compose_core::Authored::none());
     let app = generated
         .files()
         .iter()
@@ -667,7 +669,7 @@ fn function_body(source: &str, header: &str) -> String {
 #[test]
 fn the_auth_surface_reaches_the_generated_app_and_every_document_says_so() {
     let ir = resolve_clean("enforced", &source());
-    let generated = compose_core::emit(&ir);
+    let generated = compose_core::emit(&ir, &compose_core::Authored::none());
     let triggers_module = generated
         .files()
         .iter()

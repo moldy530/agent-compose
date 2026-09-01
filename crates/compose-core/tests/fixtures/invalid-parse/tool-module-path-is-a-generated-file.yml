@@ -1,0 +1,12 @@
+# rule: a `module:` path is not a name `build` emits (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `src/graph.ts` is a file `agent-compose build` generates
+# at: 12:11
+# help: the compiler writes that file itself, so the implementation the `module` binding of tool definition `tool.sign` names would be overwritten by every build: put it somewhere `build` does not emit — `src/tools/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/graph.ts

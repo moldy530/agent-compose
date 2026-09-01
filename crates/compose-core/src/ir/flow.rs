@@ -351,4 +351,11 @@ pub enum ToolImplementation {
         /// The registry lookup.
         function: super::binding::FunctionBinding,
     },
+    /// A hand-authored TypeScript module inside the project — the first
+    /// authored code the compiler holds to a contract (grammar 6.1, PRD
+    /// resolved q48).
+    Module {
+        /// The file, the environment it may read, and what it imports.
+        module: super::binding::Module,
+    },
 }

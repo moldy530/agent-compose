@@ -2,7 +2,7 @@
 
 use crate::diag::{Span, Spanned};
 
-use super::binding::{ExecBlock, FunctionBinding, HttpBlock, InterpolatedEntry};
+use super::binding::{ExecBlock, FunctionBinding, HttpBlock, InterpolatedEntry, ModuleBlock};
 use super::common::{Address, Duration, Ident, Interpolated, LiteralEntry};
 use super::flow::FlowDef;
 use super::schema::FieldMap;
@@ -173,7 +173,7 @@ pub struct ToolDef {
     pub input: Option<FieldMap>,
     /// `output:` — required; `{}` for a tool with no result.
     pub output: Option<FieldMap>,
-    /// Exactly one of `exec:`, `http:`, `function:`.
+    /// Exactly one of `exec:`, `http:`, `function:`, `module:`.
     pub implementation: Option<ToolImplementation>,
 }
 
@@ -186,6 +186,8 @@ pub enum ToolImplementation {
     Http(HttpBlock),
     /// A host-registered function (the escape hatch).
     Function(FunctionBinding),
+    /// A hand-authored TypeScript module inside the project.
+    Module(ModuleBlock),
 }
 
 /// The store kinds (grammar 11.1).

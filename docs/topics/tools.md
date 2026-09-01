@@ -82,7 +82,7 @@ flow.search:
 | `description` | **yes** | LLM-facing; it is the selection signal |
 | `input` | **yes** | parameters; `{}` for a no-argument tool |
 | `output` | **yes** | result schema; `{}` for a tool with no result |
-| `exec` \| `http` \| `function` | **exactly one** | the implementation binding |
+| `exec` \| `http` \| `function` \| `module` | **exactly one** | the implementation binding |
 
 Tool definitions carry **no** `retry`/`timeout`/`on_error`. Policy is a property
 of a use site — the node — and resolves through the chain in
@@ -152,6 +152,101 @@ function:
 A host-registered function: the escape hatch. The registry entry's signature is
 checked against `input`/`output` at build, a missing registration is a build
 error, and any composition using one is flagged as non-portable.
+
+## `module`
+
+The one binding whose implementation lives **inside** the project: a TypeScript
+file you write, in the same tree `build` emits.
+
+```yaml
+module: ./src/tools/sign.ts     # the scalar form: a path and nothing else
+```
+
+```yaml
+module:
+  path: ./src/tools/sign.ts
+  env:
+    SIGNING_KEY: "${SIGNING_KEY}"   # what this code may read
+  dependencies:
+    "@noble/hashes": "1.4.0"        # what it imports, pinned exactly
+```
+
+What an `exec:` or an `http:` reaches is nobody's contract. A module is held to
+the tool's declared `input:`/`output:` by the **type checker**: codegen emits a
+typed interface into `src/modules.ts` from those schemas, and the authored file
+has to satisfy it — so a schema change is a type error naming the field that
+moved, in the file that has to change. Your file imports that type; `bun run
+typecheck` is the gate.
+
+```ts
+// src/tools/sign.ts
+import type { ToolSignModule } from "../modules.ts";
+
+const toolSign: ToolSignModule = async (input, _context, env) => ({
+  signature: await sign(input.payload, env.SIGNING_KEY),
+});
+
+export default toolSign;
+```
+
+The third argument is the `env:` the binding declared, typed from those names:
+`env.SIGNING_KEY` compiles because the YAML lists it, and a variable it does not
+list is a type error rather than an `undefined` at run time. It is a value of
+this call rather than the process's own environment, so nothing it holds leaks
+into a later `exec:` child or into a module running beside it.
+
+**It is a tool, and nothing about running it is special.** The call happens in
+the graph's own process, and everything around it is what every other binding
+gets: the arguments are parsed against the declared `input:` before your code
+sees them, the result against `output:` after; the node's
+`retry:`/`timeout:`/`on_error:` chain governs it, so a module that throws is
+retried and one that never answers is bounded; the call is journaled, so a
+resumed execution does not run it a second time; it appears in the trace as the
+tool call it is; and when a **model** called it with arguments the schema
+refuses, the refusal goes back to the model rather than ending the node. Only
+the binding differs.
+
+Generated code reaches your file in exactly one place — `src/modules.ts`, which
+imports it and holds it to that type. Your file may import anything the project
+generates.
+
+**Where the file goes, and who owns it.** `build` overwrites exactly the files
+it emits and touches nothing else in the output directory, so your
+implementation lives in the same tree without a marker comment or a manual
+section anywhere. The path is project-relative, ends in `.ts` and not in `.d.ts`
+— a declaration file states types and holds no code, and the seam imports your
+module for its value — stays inside the project root, is at most 100 bytes long
+— the artifact is served as a tar and that is what a header holds — and may
+neither be a name `build` writes (`src/graph.ts`, `package.json`, …) nor sit
+inside one. Two bindings may not name one file, two spellings of one file, or a
+path inside another's: `src/tools/<name>.ts` is the conventional place, and one
+file answers to one tool.
+
+**You never type the signature.** `validate` refuses a binding whose file is
+missing and names the repair; `agent-compose build <spec>` **scaffolds** it —
+typed signature, the contract as a doc comment, a body that throws — writes it
+**once**, and never writes that file again. Fill it in, commit it, rebuild: your
+bytes are left exactly alone.
+
+**It travels with the artifact.** You edit the file in the project, beside
+`main.yml`; a build copies each one the composition references into the output
+directory at the same relative path, because that directory is what a worker
+fetches and runs (`agent-compose docs targets`). So the file is in
+`src/artifact.ts`'s list and inside its content hash: editing an implementation
+is a new artifact, and every worker is handed it through the join handshake.
+`build --check` compares those copies too — a copy that no longer matches what
+you wrote is a build to re-run. A file under `src/` the composition does not
+reference ships nowhere.
+
+**Say what it reads and what it imports.** The compiler cannot walk a variable
+read inside your TypeScript, and it ships no lockfile beside the
+artifact, so `env:` and `dependencies:` are declarations rather than discoveries.
+Declared variables reach exactly the processes that can execute the tool — the
+same per-placement partition every other tool's do — and dependencies are folded
+into the generated `package.json`, which is why they must be **exact** versions:
+no `^`, `~`, `>`, `<`, `*` or `x`, no dist-tags, and no `git`/`file`/`npm`/
+`workspace` specifiers. Two tools may share a package at one version; two
+versions of one package is a compile error naming both.
 
 ## Empty result schema
 

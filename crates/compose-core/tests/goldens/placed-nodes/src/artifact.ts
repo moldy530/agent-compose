@@ -7,11 +7,13 @@
 //
 // This artifact's identity on the worker wire (`docs/distributed.md` §3.5, §4).
 //
-// `ARTIFACT_HASH` is a hash over the tree's content — every emitted file's path
-// and the digest of its bytes, sorted, hashed — and is what a join agrees on and
-// what `/workers/artifact/{hash}` is addressed by. `ARTIFACT_FILES` is the set
-// the hub tars for that route: what `agent-compose build` wrote, and nothing an
-// install, a run or an operator put beside it.
+// `ARTIFACT_HASH` is a hash over the tree's content — every file's path and the
+// digest of its bytes, sorted, hashed — and is what a join agrees on and what
+// `/workers/artifact/{hash}` is addressed by. `ARTIFACT_FILES` is the set the
+// hub tars for that route: what `agent-compose build` wrote **plus** the
+// authored files the composition references through a `module:` binding, and
+// nothing an install, a run or an operator put beside them. An edit to a tool
+// implementation is a new hash, and so a new artifact every worker fetches.
 //
 // This file is the one entry the hash does not cover, because a file carrying
 // the hash of a tree containing it has no fixed point. Everything else is
@@ -23,7 +25,7 @@
 // agent-compose release that generated this tree, which a join carries and a
 // mismatch is refused on, naming both sides.
 
-export const ARTIFACT_HASH = "sha256:0566cc0e30c33ee7b507f1c10fbdb8c8f52e71318c034b03eed5dc7b40285756";
+export const ARTIFACT_HASH = "sha256:a635b25a6ba2004fa5eb5d8e2265004fa23383811329c8a2c05126e12ad79fdd";
 
 export const COMPILER_VERSION = "0.0.0-dev";
 
@@ -41,11 +43,13 @@ export const ARTIFACT_FILES: readonly string[] = [
   "src/index.ts",
   "src/journal.ts",
   "src/mesh.ts",
+  "src/modules.ts",
   "src/runtime.ts",
   "src/schemas.ts",
   "src/serve.ts",
   "src/state.ts",
   "src/stores.ts",
+  "src/tools/stamp.ts",
   "src/triggers.ts",
   "src/worker-node.ts",
   "tsconfig.json",

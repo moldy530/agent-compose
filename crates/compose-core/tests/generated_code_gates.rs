@@ -24,6 +24,19 @@
 //!    `compose_core::codegen::project::PINS` names, downloaded and resolved. The
 //!    command is the emitted `README.md`'s own, run through the emitted
 //!    `scripts.typecheck`, so a manifest that stopped declaring it fails here.
+//!    It has a **negative** half, numbered `1b` because it is the same command
+//!    read the other way: a staged golden whose emitted schema is moved under an
+//!    authored `module:` implementation must **fail** to compile, naming the
+//!    field and the file. Everything else here is positive, and a contract that
+//!    stopped constraining would pass all of it — which is the one way PRD
+//!    resolved q48's "`tsc` is the merge tool" could quietly stop being true.
+//!    And a third half, `1c`, over the authored code **nobody wrote**: every
+//!    `module:` implementation in the corpus is hand-authored, so the stub
+//!    `build` scaffolds for an absent one is checked by nothing — and it is
+//!    written once and never rewritten, so a stub that stopped compiling is a
+//!    file the author already has and the compiler declines to replace. It
+//!    builds `tests/projects/scaffolded-modules` the way the command does —
+//!    scaffold, read back, emit — and type-checks the result.
 //! 2. **Construction** — Bun runs the emitted TypeScript and builds a
 //!    `StateGraph` over the state model. A channel spec LangGraph refuses is a
 //!    green `tsc` and a runtime failure, so type-checking alone would not catch
@@ -273,7 +286,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root};
+use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root, repository};
 use serde_json::{Value, json};
 use toolchain::{bun, installed, required, runner, runs};
 
@@ -529,6 +542,185 @@ fn every_generated_project_type_checks_under_the_pinned_toolchain() {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+}
+
+/// Gate 1b: the contract a `module:` binding is held to **bites**.
+///
+/// Every other type gate here is positive — the committed golden compiles — and
+/// a contract that stopped constraining would pass all of them. That is the one
+/// direction worth testing on purpose, because the whole of PRD resolved q48's
+/// answer to marker comments is "`tsc` is the merge tool": a `z.infer` that
+/// widened to `any`, an emitted signature that took `input: unknown`, or a
+/// schema form that lowered to a Zod object accepting anything would all leave
+/// `src/tools/stamp.ts` compiling against a schema it no longer matches, and the
+/// promise in four documents and a PRD entry would be untrue with nothing
+/// failing.
+///
+/// So: a staged golden whose **emitted schema** is moved under an authored file
+/// that was not, and the type gate is required to *fail*, naming the field and
+/// the file. The mutation is the smallest one a real schema change makes — a
+/// renamed field — and it is made in the emitted tree rather than in the
+/// composition, because what is under test is the contract's grip on the
+/// authored half rather than the emitter's own output.
+#[test]
+fn a_schema_the_authored_module_no_longer_matches_fails_the_type_gate() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let golden = GOLDENS
+        .iter()
+        .find(|golden| golden.directory == "placed-nodes")
+        .expect("the mesh golden is the one with a `module:` binding");
+    let project = staged(golden, root, "typecheck-stale");
+
+    let schemas = project.join("src/schemas.ts");
+    let before = fs::read_to_string(&schemas).expect("the emitted schemas are readable");
+    let declared = "export const toolStampInput = z.object({\n  path: z.string(),\n}).strict();";
+    assert!(
+        before.contains(declared),
+        "the fixture's premise moved; `toolStampInput` is not what this gate mutates:\n{before}"
+    );
+    let after = before.replace(
+        declared,
+        "export const toolStampInput = z.object({\n  target: z.string(),\n}).strict();",
+    );
+    fs::write(&schemas, &after).expect("the staged copy is writable");
+
+    let output = bun()
+        .args(["run", "typecheck"])
+        .current_dir(&project)
+        .output()
+        .expect("bun runs");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a renamed schema field left the authored module compiling, so the contract does not \
+         hold it to anything:\n{report}"
+    );
+    assert!(
+        report.contains("src/tools/stamp.ts"),
+        "the failure is in the file that has to change, and says so:\n{report}"
+    );
+    assert!(
+        report.contains("'path'"),
+        "…naming the field that moved:\n{report}"
+    );
+}
+
+/// The composition whose whole authored half is scaffolded, and the modules it
+/// binds.
+///
+/// Committed with **no** `src/` beside it, which is the fixture's premise: the
+/// only implementations that exist are the ones `build` writes.
+const SCAFFOLDED: &str = "crates/compose-core/tests/projects/scaffolded-modules";
+const SCAFFOLDED_MODULES: &[&str] = &[
+    "src/tools/sealed.ts",
+    "src/tools/shape.ts",
+    "src/tools/sign.ts",
+];
+
+/// Gate 1c: the stub `build` writes for an absent `module:` binding compiles.
+///
+/// Gate 1 type-checks five golden projects and gate 1b proves the contract
+/// constrains them — and every authored file in both is one a **person** wrote.
+/// The other half of PRD resolved q48 is the half nobody types: `build`
+/// scaffolds an absent implementation once — the contract import, the doc
+/// comment, the throwing body — and then never writes that file again, so a stub
+/// that stopped compiling is a file the author already has and the compiler
+/// declines to replace. It would pass every gate here and fail in a terminal.
+///
+/// So this one runs the command's own order over a composition with **no**
+/// authored half at all: scaffold what is missing into the project, read it
+/// back, emit, and hand the result to the same `bun run typecheck` gate 1 uses.
+/// Three tools, because a stub's shape varies with its binding — an `env:` that
+/// is declared and one that is not, a description carrying a `*/`, and schemas
+/// reaching past the scalars — and the emitted contract has to name a type for
+/// each of them.
+#[test]
+fn a_scaffolded_module_implementation_type_checks_under_the_pinned_toolchain() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let source = repository().join(SCAFFOLDED);
+    assert_eq!(
+        files_under(&source),
+        ["main.yml"],
+        "the fixture's premise is that nothing authored is committed beside it"
+    );
+
+    // The project the author edits, and the output directory beside it — the two
+    // trees `agent-compose build` writes into, in the same relation.
+    let project = root.join("projects/typecheck-scaffold/scaffolded-modules");
+    let _ = fs::remove_dir_all(&project);
+    fs::create_dir_all(&project).expect("the scratch area is writable");
+    fs::copy(source.join("main.yml"), project.join("main.yml")).expect("the entrypoint copies");
+
+    let resolution = compose_core::resolve_with_target(project.join("main.yml"), "local");
+    assert!(
+        resolution.diagnostics.is_empty(),
+        "the fixture does not resolve: {:#?}",
+        resolution.diagnostics
+    );
+    let ir = resolution.ir.expect("a clean resolution has an artifact");
+    assert!(
+        compose_core::check(&ir).is_empty(),
+        "the fixture does not validate: {:#?}",
+        compose_core::check(&ir)
+    );
+    // The premise, asserted rather than assumed: `validate` refuses this project
+    // right now, once per binding, and names `build` as the repair.
+    let missing = compose_core::check_modules(&ir, &project);
+    assert_eq!(
+        missing.len(),
+        SCAFFOLDED_MODULES.len(),
+        "every binding's file is absent before the scaffold: {missing:#?}"
+    );
+
+    let scaffolds = compose_core::codegen::authored::scaffolds(&ir);
+    assert_eq!(
+        scaffolds
+            .iter()
+            .map(|scaffold| scaffold.path.as_str())
+            .collect::<Vec<_>>(),
+        SCAFFOLDED_MODULES,
+        "the fixture binds exactly the modules this gate is written for"
+    );
+    for scaffold in &scaffolds {
+        write_into(&project, &scaffold.path, &scaffold.contents);
+    }
+
+    let authored = compose_core::Authored::read(&ir, &project)
+        .expect("the scaffolds are there to be read back");
+    let built = compose_core::emit(&ir, &authored);
+    let out = project.join("build/local");
+    for file in built.artifact() {
+        write_into(&out, &file.path, &file.contents);
+    }
+
+    let output = bun()
+        .args(["run", "typecheck"])
+        .current_dir(&out)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "a scaffolded implementation does not type-check, so `build` writes a file its author \
+         cannot compile and will never rewrite:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Write one `/`-separated relative path under `root`, making its directories.
+fn write_into(root: &Path, relative: &str, contents: &str) {
+    let path = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    fs::create_dir_all(path.parent().expect("a relative path has a parent"))
+        .expect("the scratch area is writable");
+    fs::write(&path, contents).expect("the scratch area is writable");
 }
 
 /// Gate 2: every golden project constructs its graph, and its state model holds
@@ -1172,6 +1364,35 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     assert_eq!(
         observed["deliveredContext"],
         serde_json::json!(["exec_gate/fan/0/1", null])
+    );
+    // …and the fourth binding kind, on the same field: a `module:` sink reads
+    // the key off the context it is called with, exactly as a `function:` one
+    // does, so `callModule` forwarding the caller's context is what makes
+    // at-least-once delivery to authored code a promise rather than a hope.
+    //
+    // The third argument rides along, because one call delivers both. Its
+    // second name is `__proto__` — a name grammar 4.3's environment-variable
+    // form accepts and `Object.prototype` answers to — and the value the
+    // implementation reads is the declared string rather than a prototype,
+    // which is the difference between an environment built by assignment and
+    // one built out of own properties. `src/modules.ts` types that name
+    // `string`; this is what makes the type true.
+    assert_eq!(
+        observed["deliveredModule"],
+        serde_json::json!([
+            {
+                "key": "exec_gate/fan/0/1",
+                "declared": "a literal",
+                "proto": "a value, not the prototype",
+                "text": "a1",
+            },
+            {
+                "key": null,
+                "declared": "a literal",
+                "proto": "a value, not the prototype",
+                "text": "a1",
+            },
+        ])
     );
 
     // Grammar 8.6's key table: `max_concurrency` is a node-wide **admission**
@@ -2607,10 +2828,21 @@ fn the_artifact_hash_is_the_same_in_both_languages() {
         serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
 
     let emitted = goldens::emitted(golden);
+    // The **whole tree**, generated and carried alike: PRD resolved q49 widened
+    // the artifact to "what `build` wrote plus the authored files the spec
+    // references", and this golden binds one. A hash taken over half of it would
+    // agree with nothing — not with the constant the emitter wrote, and not with
+    // what a worker computes from the entries it unpacked.
+    let tree: Vec<compose_core::GeneratedFile> = emitted.artifact().cloned().collect();
+    assert!(
+        !emitted.carried().is_empty(),
+        "`{}` carries no authored file, so this says nothing about the widened list",
+        golden.directory
+    );
     let declared = answer["declared"].as_str().expect("the declared hash");
     assert_eq!(
         declared,
-        compose_core::codegen::artifact::hash(emitted.files()),
+        compose_core::codegen::artifact::hash(&tree),
         "the constant the emitter wrote is not the hash it computes"
     );
     assert_eq!(

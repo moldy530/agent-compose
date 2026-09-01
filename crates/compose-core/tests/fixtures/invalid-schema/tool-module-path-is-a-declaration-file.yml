@@ -1,0 +1,10 @@
+# rule: a `module:` path names an implementation, and a `.d.ts` holds none (grammar 6.1 / Decision D132)
+# at: /tool.sign/module
+# via: /$defs/moduleImpl/oneOf
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.d.ts

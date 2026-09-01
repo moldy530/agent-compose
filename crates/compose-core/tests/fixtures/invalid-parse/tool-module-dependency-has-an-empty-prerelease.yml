@@ -1,0 +1,15 @@
+# rule: a `module:` dependency's semver tails are identifiers, not leftovers (grammar 6.1, Decision D133)
+# code: invalid-dependency
+# message: the `module` binding of tool definition `tool.sign` pins `@noble/hashes` to `1.4.0-+`, which is not an exact version
+# at: 15:24
+# help: the artifact carries no lockfile, so a pin is what keeps the hub's install and every worker's resolving one tree: write an exact `MAJOR.MINOR.PATCH` — no `^`, `~`, `>`, `<`, `*` or `x`, and no `git`, `file`, `npm` or `workspace` specifier (PRD resolved q49)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      "@noble/hashes": "1.4.0-+"

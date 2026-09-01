@@ -673,6 +673,17 @@ impl References {
                     ToolImplementation::Http { http } => {
                         references.http(http, &format!("{address}.http"));
                     }
+                    // Declared rather than walked, which is the whole reason
+                    // grammar 6.1 puts an `env:` on the binding: the references
+                    // an authored module makes are `process.env` reads inside
+                    // TypeScript this compiler does not parse, so the YAML is
+                    // the only place the partition can learn of them (PRD
+                    // resolved q49). Filed under the tool's own address like
+                    // every other tool surface, so §9.1's executes-in closure
+                    // carries them to exactly the processes that can run it.
+                    ToolImplementation::Module { module } => {
+                        references.entries_of(&module.env, &format!("{address}.module.env"));
+                    }
                     ToolImplementation::Function { .. } => {}
                 },
                 DefinitionBody::Flow(flow) => {

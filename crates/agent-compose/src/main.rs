@@ -600,25 +600,27 @@ fn launch(
     // the one thing `--format json` promises never to do.
     warned(entrypoint, target, &diagnostics);
 
-    let project = compose_core::emit(&ir);
+    let (project, scaffolded) = match emitted(entrypoint, &ir) {
+        Ok(built) => built,
+        Err(reason) => return fail(&reason),
+    };
+    // The build these two verbs do on the way is silent, and this is the one
+    // thing about it that may not be: a scaffold is a write into the **author's
+    // tree**, made once and never again (PRD resolved q48), so `run` and `serve`
+    // say it in the same words `build` does rather than leaving a later
+    // `git status` to be where it is discovered. On stderr, for the reason
+    // `warned` is: the answer on this side is the child's stdout.
+    let _ = write(
+        &mut io::stderr().lock(),
+        &report::scaffold_notice(&scaffolded, report::color_enabled()),
+    );
     match build::write(&project, out) {
         Ok(_) => {}
         Err(build::Refusal::Io(error)) => {
             return fail(&format!("cannot write `{}`: {error}", out.display()));
         }
         Err(build::Refusal::NotOurs(paths)) => {
-            return fail(&format!(
-                "`{}` holds {} this compiler did not write ({}): point `--out` at a directory \
-                 of its own, or move {} aside",
-                out.display(),
-                if paths.len() == 1 { "a file" } else { "files" },
-                paths
-                    .iter()
-                    .map(|path| format!("`{path}`"))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if paths.len() == 1 { "it" } else { "them" },
-            ));
+            return fail(&occupied(out, &paths));
         }
     }
 
@@ -680,12 +682,63 @@ fn analyse(entrypoint: &Path, target: &str) -> (Vec<compose_core::Diagnostic>, O
     (report.into_vec(), resolution.ir)
 }
 
+/// The one question that needs the filesystem: is every `module:` binding's
+/// authored file there (grammar 6.1, PRD resolved q48)?
+///
+/// Deliberately **not** part of [`analyse`], because the verbs differ on it. A
+/// plain `build`, and the `run`/`serve` that build before they launch, *scaffold*
+/// an absent module — so a refusal here would stop the very command that repairs
+/// it. `validate` and `build --check` answer with a verdict instead, and this is
+/// the sentence they answer with: the same diagnostic, naming `build` as the
+/// repair.
+fn authored(
+    entrypoint: &Path,
+    ir: Option<&Ir>,
+    diagnostics: Vec<compose_core::Diagnostic>,
+) -> Vec<compose_core::Diagnostic> {
+    let Some(ir) = ir else {
+        return diagnostics;
+    };
+    let mut report = Diagnostics::new();
+    report.extend(diagnostics);
+    report.extend(compose_core::check_modules(ir, root(entrypoint)));
+    report.sort();
+    report.into_vec()
+}
+
+/// Scaffold what is missing, read what is there, and emit.
+///
+/// The three steps a `build` — and the `run`/`serve` that build before they
+/// launch — take between a clean report and a directory, in the one order they
+/// can be taken in. The scaffold is a write into the **project** (PRD resolved
+/// q48); the read is what PRD resolved q49's widened artifact needs, because
+/// `compose_core::emit` is a pure function and the tree it describes now holds
+/// files it did not write; and a file that was absent a moment ago is there by
+/// the time it is read, which is why the scaffold cannot come second.
+///
+/// Answers the project and what was scaffolded, or the sentence a failed write
+/// or read is reported with — there is no span to point at for either, so both
+/// are the command's own precondition failing (exit `2`).
+fn emitted(
+    entrypoint: &Path,
+    ir: &Ir,
+) -> Result<(compose_core::GeneratedProject, Vec<(String, String)>), String> {
+    let root = root(entrypoint);
+    let scaffolds = compose_core::codegen::authored::scaffolds(ir);
+    let scaffolded = build::scaffold(&scaffolds, root)
+        .map_err(|error| format!("cannot write `{}`: {error}", root.display()))?;
+    let authored = compose_core::codegen::authored::Authored::read(ir, root)
+        .map_err(|error| format!("{error}"))?;
+    Ok((compose_core::emit(ir, &authored), scaffolded))
+}
+
 fn validate(entrypoint: &Path, target: &str, format: Format) -> ExitCode {
     if let Err(reason) = usable(entrypoint, "validate") {
         return fail(&reason);
     }
 
-    let (diagnostics, _) = analyse(entrypoint, target);
+    let (diagnostics, ir) = analyse(entrypoint, target);
+    let diagnostics = authored(entrypoint, ir.as_ref(), diagnostics);
     // The exit code is the **verdict**, and a warning is not one: a composition
     // reported with nothing but warnings is one this compiler accepts, builds
     // and runs, so `validate` exits `0` and the report says what it noticed.
@@ -906,6 +959,15 @@ fn build_project(
     }
 
     let (validation, ir) = analyse(entrypoint, target);
+    // `--check` is a verdict about a committed project, so it asks the one
+    // question a plain `build` answers by writing instead: is every authored
+    // implementation there? A `build` that refused over an absent module could
+    // never scaffold the one it was refusing over (PRD resolved q48).
+    let validation = if checking {
+        authored(entrypoint, ir.as_ref(), validation)
+    } else {
+        validation
+    };
     // What the *target* cannot express, over a composition the validator
     // accepted: `pattern:` is RE2 and RE2 is not a subset of ECMAScript, so a
     // legal pattern can be one no JavaScript regular expression holds
@@ -928,8 +990,24 @@ fn build_project(
     // this is asked of the errors rather than of the report.
     let target_only = validated && refused;
 
+    // Emitting is what scaffolds, so `--check` takes the other road: it reads
+    // the authored files and writes nothing at all, which it can do because the
+    // pass above already refused a binding whose file is missing.
+    let mut scaffolded: Vec<(String, String)> = Vec::new();
     let project = match (&ir, refused) {
-        (Some(ir), false) => Some(compose_core::emit(ir)),
+        (Some(ir), false) if checking => {
+            match compose_core::codegen::authored::Authored::read(ir, root(entrypoint)) {
+                Ok(authored) => Some(compose_core::emit(ir, &authored)),
+                Err(error) => return fail(&format!("{error}")),
+            }
+        }
+        (Some(ir), false) => match emitted(entrypoint, ir) {
+            Ok((project, written)) => {
+                scaffolded = written;
+                Some(project)
+            }
+            Err(reason) => return fail(&reason),
+        },
         _ => None,
     };
 
@@ -961,23 +1039,7 @@ fn build_project(
             Err(build::Refusal::Io(error)) => {
                 return fail(&format!("cannot write `{}`: {error}", out.display()));
             }
-            Err(build::Refusal::NotOurs(paths)) => {
-                return fail(&format!(
-                    "`{}` holds {} this compiler did not write ({}), and this build would have \
-                     replaced or removed {}: it touches only files carrying its own \
-                     generated-file header. Point `--out` at a directory of its own, or move \
-                     {} aside",
-                    out.display(),
-                    if paths.len() == 1 { "a file" } else { "files" },
-                    paths
-                        .iter()
-                        .map(|path| format!("`{path}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if paths.len() == 1 { "it" } else { "them" },
-                    if paths.len() == 1 { "it" } else { "them" },
-                ));
-            }
+            Err(build::Refusal::NotOurs(paths)) => return fail(&occupied(out, &paths)),
         },
         _ => None,
     };
@@ -992,10 +1054,11 @@ fn build_project(
         drift: &drift,
         not_ours: &not_ours,
         wrote: wrote.as_ref(),
+        scaffolded: &scaffolded,
         target_only,
     };
     let written = match format {
-        Format::Json => match report::build_json(&diagnostics, &drift) {
+        Format::Json => match report::build_json(&diagnostics, &drift, &scaffolded) {
             Ok(text) => write(&mut io::stdout().lock(), &text),
             Err(error) => return fail(&format!("cannot write the report as JSON: {error}")),
         },
@@ -1019,6 +1082,40 @@ fn build_project(
         Err(error) if departed(&error) => ExitCode::from(verdict),
         Err(error) => fail(&format!("cannot write the report: {error}")),
     }
+}
+
+/// The refusal a build writes when a file that is not this compiler's already
+/// holds a name the build would put down (PRD resolved q47, q49).
+///
+/// **Both sides, named.** What a build writes into `--out` is the file list it
+/// emits plus the authored files the composition references, so the only way it
+/// can collide with somebody's work is a name it has to write that their file is
+/// at — and a message saying only "refused" leaves the reader to guess which
+/// name it was. So it names the directory, the paths, and what the compiler was
+/// going to do to them.
+///
+/// "A file it emits" would be the wrong sentence for half of them: a carried
+/// implementation is a name the compiler **writes** and deliberately does not
+/// emit, which is the distinction PRD resolved q47 exists to draw.
+fn occupied(out: &Path, paths: &[String]) -> String {
+    let (noun, pronoun) = if paths.len() == 1 {
+        ("a file", "it")
+    } else {
+        ("files", "them")
+    };
+    format!(
+        "`{}` holds {noun} this compiler did not write at {noun} this build writes ({}), and this \
+         build would have replaced {pronoun}: what a build writes is the file list it emits plus \
+         the authored files the composition references, and in a directory holding none of its \
+         own files it claims none of those names — the generated-file header is how it tells its \
+         work from yours. Point `--out` at a directory of its own, or move {pronoun} aside",
+        out.display(),
+        paths
+            .iter()
+            .map(|path| format!("`{path}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// `agent-compose docs [<topic>]`: the index, or one topic.

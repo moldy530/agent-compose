@@ -1,8 +1,8 @@
 //! Bindings and implementation blocks (grammar 6.1, 8.0, 8.2, 8.3).
 
 use crate::ast::binding::{
-    Binding, Bindings, ExecBlock, FunctionBinding, HttpBlock, HttpMethod, InterpolatedEntry,
-    NodeInput, WriteEntry, Writes,
+    Binding, Bindings, DependencyEntry, ExecBlock, FunctionBinding, HttpBlock, HttpMethod,
+    InterpolatedEntry, ModuleBlock, NodeInput, WriteEntry, Writes,
 };
 use crate::ast::schema::{ScalarKind, Surface, TypeForm};
 use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
@@ -418,6 +418,399 @@ pub(crate) fn function_binding(node: &Node, subject: &str, cx: &mut Cx) -> Optio
     })
 }
 
+/// The extension a `module:` binding's path takes.
+///
+/// One, and it is `.ts`: the generated project is TypeScript run from source
+/// with no build step (see `codegen`), so a `.js` beside it would be a second
+/// authoring language nothing type-checks.
+///
+/// It is not the whole extension rule, because it cannot be: a `.d.ts` ends in
+/// `.ts` and passes this test while naming no implementation at all, which is
+/// [`MODULE_DECLARATION_ENDING`]'s to refuse.
+const MODULE_EXTENSION: &str = ".ts";
+
+/// The ending that makes a `.ts` file a **declaration** file rather than an
+/// implementation.
+///
+/// [`MODULE_EXTENSION`] alone cannot tell the two apart, because a declaration
+/// file's name ends in `.ts` too — and `./src/tools/sign.d.ts` is a binding
+/// whose project could never type-check whatever it held: `src/modules.ts`
+/// imports a bound implementation for its **value**, and `tsc` refuses a value
+/// import of a declaration file outright (TS2846). A build would scaffold
+/// executable code into a file that may hold none, `--check` would be clean
+/// forever, and the type gate PRD resolved q48 makes the merge tool would be
+/// unreachable for that composition — so the refusal is here, at the path, with
+/// a span on what was written.
+///
+/// Matched **case-insensitively** for the reason the emitted-name comparison
+/// below is: the string is a file name first, and macOS and Windows do not tell
+/// `sign.D.ts` and `sign.d.ts` apart.
+const MODULE_DECLARATION_ENDING: &str = ".d.ts";
+
+const MODULE_PATH_RULE: &str = "a `module:` path is `/`-separated, each segment `.`, `..`, or a name matching `[A-Za-z0-9_][A-Za-z0-9_.-]*`, and the last segment ends in `.ts`: no leading `/`, no backslashes, no whitespace, no URLs (grammar 6.1)";
+
+/// Read a `module:` implementation binding (grammar 6.1, PRD resolved q48).
+///
+/// Two spellings of one block. The **scalar** form,
+/// `module: ./src/tools/sign.ts`, is the block with nothing but its `path:`,
+/// which is what a tool reading no environment and importing no package writes;
+/// the **mapping** form adds `env:` and `dependencies:`. They are one shape
+/// rather than two because everything downstream — the artifact's file list, the
+/// environment partition, the generated `package.json` — reads the same three
+/// values whichever way they were written.
+pub(crate) fn module_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<ModuleBlock> {
+    if let Yaml::String(_) = &node.value {
+        // `lexical::text` rather than `expect_string`, so the scalar form is the
+        // same class-3 surface the block form's `path:` is: a path is compile-
+        // time identity, and an `${ENV}` in one is refused rather than carried
+        // (grammar 4.3, Decision D92).
+        let path = lexical::text(node, "`module`", cx)
+            .and_then(|written| module_path(&written, subject, cx));
+        return Some(ModuleBlock {
+            path,
+            env: Vec::new(),
+            dependencies: Vec::new(),
+            span: node.span.clone(),
+        });
+    }
+
+    let mapping = expect_mapping(node, subject, cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), subject);
+    let path = fields
+        .require("path", cx)
+        .and_then(|node| lexical::text(node, "`path`", cx))
+        .and_then(|written| module_path(&written, subject, cx));
+    // Interpolable, exactly as an `exec:` block's `env:` is (grammar 4.3
+    // class 2): what a machine calls its keychain is a property of the machine.
+    // There is no collision rule against the tool's `input:` here — the D66 one
+    // an `exec:` obeys exists because an `exec:` tool's input *arrives* as
+    // environment variables, and a module's arrives as a typed argument.
+    let env = fields
+        .take("env")
+        .map(|node| interpolated_map(node, "`env`", NameForm::EnvVar, cx))
+        .unwrap_or_default();
+    let dependencies = fields
+        .take("dependencies")
+        .map(|node| dependency_map(node, subject, cx))
+        .unwrap_or_default();
+    fields.finish(cx);
+
+    Some(ModuleBlock {
+        path,
+        env,
+        dependencies,
+        span: node.span.clone(),
+    })
+}
+
+/// The longest a `module:` path may be, in bytes.
+///
+/// A ustar header holds a name in 100 bytes, and the artifact is **served as a
+/// tar**: `docs/distributed.md` §3.5's `/workers/artifact/{hash}` packs every
+/// entry of `ARTIFACT_FILES`, which PRD resolved q49 widened to carry the
+/// authored files a composition references. Every emitted name is a compiler
+/// constant well under the limit, so before the module binding the bound could
+/// not be reached; an authored path is the composition's to write, and one byte
+/// over it would be a spec the validator accepted and no worker could ever fetch
+/// the artifact of. Refused here, with a span, rather than thrown inside a hub's
+/// route.
+const MODULE_PATH_BYTES: usize = 100;
+
+/// Check a `module:` path against grammar 6.1's rules, and hand back the
+/// **normalized** spelling — which is the name the artifact, the manifest and
+/// every diagnostic downstream use.
+fn module_path(written: &Spanned<String>, subject: &str, cx: &mut Cx) -> Option<Spanned<String>> {
+    let text = written.value.as_str();
+    if !lexical::is_relative_path(text, &[MODULE_EXTENSION]) {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!("`{text}` is not a project-relative path to a TypeScript file"),
+            )
+            .with_help(MODULE_PATH_RULE),
+        );
+        return None;
+    }
+    if text
+        .rsplit('/')
+        .next()
+        .unwrap_or(text)
+        .to_ascii_lowercase()
+        .ends_with(MODULE_DECLARATION_ENDING)
+    {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!("`{text}` is a TypeScript declaration file, which holds no implementation"),
+            )
+            .with_help(format!(
+                "a `.d.ts` states types and never code, and `src/modules.ts` imports a bound implementation for its value — which `tsc` refuses of a declaration file — so the project this emits could not type-check whatever the file held: name the implementation itself, `{}/<name>.ts` being the conventional place (grammar 6.1, PRD resolved q48)",
+                crate::codegen::AUTHORED_ZONE
+            )),
+        );
+        return None;
+    }
+    let Some(normalized) = lexical::normalize_relative(text) else {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!("`{text}` climbs out of the project root"),
+            )
+            .with_help(
+                "a module implementation is part of the composition and ships inside the artifact every worker fetches, so every prefix of its path stays inside the project root — the entrypoint's own directory (grammar 6.1, `docs/distributed.md` §4)",
+            ),
+        );
+        return None;
+    };
+    if normalized.len() > MODULE_PATH_BYTES {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                format!(
+                    "`{normalized}` is {} bytes long, and a path inside the artifact holds {MODULE_PATH_BYTES}",
+                    normalized.len()
+                ),
+            )
+            .with_help(format!(
+                "the artifact is served to every worker as a tar and a ustar header holds a name in {MODULE_PATH_BYTES} bytes (`docs/distributed.md` §3.5), so a longer path is an artifact no worker could fetch: shorten it — `{}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q49)",
+                crate::codegen::AUTHORED_ZONE
+            )),
+        );
+        return None;
+    }
+    // Case-insensitively, because the string is a **file name** before it is
+    // anything else and macOS and Windows hold `src/Graph.ts` and `src/graph.ts`
+    // in one place. A comparison that distinguished them would accept a
+    // composition here and then, on such a host, write the emitted file over the
+    // author's implementation — a build that destroys code and a `--check` that
+    // can never converge, on the machines a validator cannot see. One portable
+    // spelling is the rule grammar 1.4 already applies to a path (D80).
+    //
+    // **Naming one is not the only way to collide with one.** A path *under* an
+    // emitted name — `src/graph.ts/impl.ts` — is a directory where the emitter
+    // writes a file, so one tree cannot hold both: the build scaffolds into the
+    // author's checkout, writes most of the emission set, and then fails on a
+    // `create_dir_all` with an IO error rather than a diagnostic. Equality alone
+    // would let it through, so the comparison is over the path *and its
+    // directories* (`lexical::path_conflict`).
+    if let Some((emitted, conflict)) = crate::codegen::EMITTED_PATHS
+        .iter()
+        .find_map(|path| lexical::path_conflict(path, &normalized).map(|kind| (*path, kind)))
+    {
+        let zone = crate::codegen::AUTHORED_ZONE;
+        let (message, help) = match conflict {
+            lexical::PathConflict::Same => (
+                format!("`{normalized}` is a file `agent-compose build` generates"),
+                format!(
+                    "the compiler writes that file itself, so the implementation {subject} names would be overwritten by every build: put it somewhere `build` does not emit — `{zone}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)"
+                ),
+            ),
+            lexical::PathConflict::Cased => (
+                format!(
+                    "`{normalized}` differs only in case from `{emitted}`, a file `agent-compose build` generates"
+                ),
+                format!(
+                    "macOS and Windows hold those two spellings in one file, so on such a host the build would write `{emitted}` over the implementation {subject} names — and a composition that works on one machine and destroys code on another is not one this compiler emits: put it somewhere `build` does not emit — `{zone}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)"
+                ),
+            ),
+            lexical::PathConflict::Nested => (
+                format!(
+                    "`{normalized}` is inside `{emitted}`, a file `agent-compose build` generates"
+                ),
+                format!(
+                    "the compiler writes `{emitted}` as a file, so no directory of that name can sit beside it: one tree cannot hold both, and the build would refuse partway through the emission rather than at the spec: put the implementation {subject} names somewhere `build` does not emit — `{zone}/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)"
+                ),
+            ),
+        };
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidModulePath,
+                written.span.clone(),
+                message,
+            )
+            .with_help(help),
+        );
+        return None;
+    }
+    Some(Spanned::new(normalized, written.span.clone()))
+}
+
+/// Read a `module:` binding's `dependencies:` map (grammar 6.1, PRD resolved
+/// q49).
+fn dependency_map(node: &Node, subject: &str, cx: &mut Cx) -> Vec<DependencyEntry> {
+    let Some(mapping) = expect_mapping(node, "`dependencies`", cx) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for entry in mapping.entries() {
+        let package = entry.key.clone();
+        if !is_package_name(&package.value) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidDependency,
+                    package.span.clone(),
+                    format!("`{}` is not an npm package name", package.value),
+                )
+                .with_help(
+                    "a package name is at most 214 characters of lowercase letters, digits, `-`, `_` and `.`, optionally scoped as `@scope/name`, and starts with none of `.`, `_` or `-`",
+                ),
+            );
+            continue;
+        }
+        let Some(version) = lexical::text(&entry.value, "a dependency version", cx) else {
+            continue;
+        };
+        if !is_exact_version(&version.value) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidDependency,
+                    version.span.clone(),
+                    format!(
+                        "{subject} pins `{}` to `{}`, which is not an exact version",
+                        package.value, version.value
+                    ),
+                )
+                .with_help(
+                    "the artifact carries no lockfile, so a pin is what keeps the hub's install and every worker's resolving one tree: write an exact `MAJOR.MINOR.PATCH` — no `^`, `~`, `>`, `<`, `*` or `x`, and no `git`, `file`, `npm` or `workspace` specifier (PRD resolved q49)",
+                ),
+            );
+            continue;
+        }
+        // One `package.json` holds one version of a package, and the generated
+        // half of it is fixed per compiler release (`codegen::project::PINS`),
+        // so a module pinning a runtime dependency at another version is a
+        // conflict decidable right here — in one file, against a constant.
+        if let Some((_, pinned)) = crate::codegen::project::PINS
+            .iter()
+            .chain(crate::codegen::project::DEV_PINS)
+            .find(|(name, _)| *name == package.value)
+            && *pinned != version.value
+        {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidDependency,
+                    version.span.clone(),
+                    format!(
+                        "`{}` is pinned to `{}` here and to `{pinned}` by the generated project",
+                        package.value, version.value
+                    ),
+                )
+                .with_help(format!(
+                    "a generated project's own dependency set is fixed by the compiler release that wrote it, and one `package.json` holds one version of a package: pin `{}` at `{pinned}`, or reach for a package the generated runtime does not (grammar 6.1)",
+                    package.value
+                )),
+            );
+            continue;
+        }
+        entries.push(DependencyEntry { package, version });
+    }
+    entries
+}
+
+/// Whether a string is an npm package name.
+///
+/// The published rule, minus the parts that are advice: at most 214 characters,
+/// lowercase, made of letters, digits, `-`, `_` and `.`, optionally scoped as
+/// `@scope/name`, and starting with none of `.`, `_` or `-`.
+fn is_package_name(text: &str) -> bool {
+    if text.is_empty() || text.len() > 214 {
+        return false;
+    }
+    let bare = match text.strip_prefix('@') {
+        Some(scoped) => {
+            let Some((scope, name)) = scoped.split_once('/') else {
+                return false;
+            };
+            if !is_package_segment(scope) {
+                return false;
+            }
+            name
+        }
+        None => text,
+    };
+    is_package_segment(bare)
+}
+
+fn is_package_segment(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with(['.', '_', '-'])
+        && text.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+/// Whether a version string is an exact semantic version.
+///
+/// `MAJOR.MINOR.PATCH`, each a run of digits with no leading zero past `0`,
+/// with an optional `-prerelease` and `+build`. Everything npm accepts *besides*
+/// one of these — a range operator, a wildcard, a dist-tag, a `git`/`file`/`npm`/
+/// `workspace` specifier, a URL — resolves to a different tree on a different
+/// day or on a different machine, which is the one thing a lockfile-less
+/// artifact cannot have (PRD resolved q49).
+///
+/// The tails are read the way semver.org §9 and §10 write them rather than as a
+/// bag of admitted characters: **build first**, at the first `+`, then the
+/// prerelease at the first `-` of what is left, each a `.`-separated list of
+/// non-empty identifiers. A looser reading admits degenerate spellings — `1.2.3-+`
+/// has an empty prerelease and `1.2.3-01` a numeric identifier with a leading
+/// zero — that `npm install` rejects on the emitted `package.json`, which is the
+/// failure the exactness rule exists to move to `validate`.
+fn is_exact_version(text: &str) -> bool {
+    // Build metadata is everything after the *first* `+`; a second one is not a
+    // separator but an illegal character, and `identifiers` refuses it.
+    let (rest, build) = match text.split_once('+') {
+        Some((rest, build)) => (rest, Some(build)),
+        None => (text, None),
+    };
+    if let Some(build) = build
+        && !identifiers(build, false)
+    {
+        return false;
+    }
+    // The core holds no `-`, so the prerelease starts at the first one.
+    let (core, prerelease) = match rest.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (rest, None),
+    };
+    if let Some(prerelease) = prerelease
+        && !identifiers(prerelease, true)
+    {
+        return false;
+    }
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|part| is_numeric_identifier(part))
+}
+
+/// Whether a semver tail is a `.`-separated list of identifiers.
+///
+/// `numeric` says whether an all-digit identifier is held to semver's
+/// no-leading-zero rule, which applies to a prerelease and not to build
+/// metadata.
+fn identifiers(text: &str, numeric: bool) -> bool {
+    !text.is_empty()
+        && text.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!numeric
+                    || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    || is_numeric_identifier(part))
+        })
+}
+
+/// A run of digits with no leading zero past `0` — semver's numeric identifier,
+/// which each of `MAJOR`, `MINOR` and `PATCH` is.
+fn is_numeric_identifier(part: &str) -> bool {
+    !part.is_empty()
+        && part.bytes().all(|byte| byte.is_ascii_digit())
+        && (part.len() == 1 || !part.starts_with('0'))
+}
+
 /// The fields an inline `exec:` node binds from the child process itself, with
 /// the type each one is fixed to (grammar 8.2, Decision D56).
 const EXEC_ENVELOPE: &[(&str, ScalarKind)] = &[
@@ -549,5 +942,63 @@ pub(crate) fn reject_env_collisions<'a>(
             .with_label(name.span.clone(), "this input field takes the same slot")
             .with_help("an object input is passed to the child as upper-snake-cased environment variables, so one of the two values would be silently discarded"),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dependency pin is exactly what `npm install` would accept as one, so
+    /// the refusal lands on the spec rather than on the emitted `package.json`
+    /// (PRD resolved q49, D133).
+    #[test]
+    fn a_pin_is_a_version_and_not_a_shape_that_resembles_one() {
+        assert!(is_exact_version("1.4.0"));
+        assert!(is_exact_version("0.0.0"));
+        assert!(is_exact_version("10.20.30"));
+        assert!(is_exact_version("1.0.0-alpha"));
+        assert!(is_exact_version("1.0.0-alpha.1"));
+        assert!(is_exact_version("1.0.0-0.3.7"));
+        assert!(is_exact_version("1.0.0-x-y-z.--"));
+        assert!(is_exact_version("1.0.0+20130313144700"));
+        assert!(is_exact_version("1.0.0-beta+exp.sha.5114f85"));
+
+        // A range, a wildcard, a tag, a specifier: what the rule is written for.
+        assert!(!is_exact_version("^1.4.0"));
+        assert!(!is_exact_version("~1.4.0"));
+        assert!(!is_exact_version(">=1.4.0"));
+        assert!(!is_exact_version("1.x"));
+        assert!(!is_exact_version("*"));
+        assert!(!is_exact_version("latest"));
+        assert!(!is_exact_version("npm:other@1.4.0"));
+
+        // The core is three numeric identifiers, no more and no fewer.
+        assert!(!is_exact_version("1.4"));
+        assert!(!is_exact_version("1.4.0.1"));
+        assert!(!is_exact_version("01.4.0"));
+        assert!(!is_exact_version("1.04.0"));
+        assert!(!is_exact_version(""));
+
+        // The degenerate tails: each is a string a looser reading admits and
+        // `npm` does not, so admitting one moves the failure from `validate` to
+        // an install of an emitted manifest.
+        assert!(!is_exact_version("1.2.3-"));
+        assert!(!is_exact_version("1.2.3+"));
+        assert!(!is_exact_version("1.2.3-+"));
+        assert!(!is_exact_version("1.2.3-alpha..1"));
+        assert!(!is_exact_version("1.2.3+build..1"));
+        assert!(!is_exact_version("1.2.3-01"));
+        assert!(!is_exact_version("1.2.3-alpha+"));
+        assert!(!is_exact_version("1.2.3-al pha"));
+        assert!(!is_exact_version("1.2.3+build+more"));
+
+        // Build metadata keeps no leading-zero rule — semver §10 says so, and a
+        // build number is not an ordering — and `-` is an identifier there, so
+        // `1.2.3+-` is a version rather than a degenerate tail. Asserted because
+        // it *looks* like one: the rule is semver's alphabet and not a guess at
+        // which spellings seem meaningful.
+        assert!(is_exact_version("1.2.3+001"));
+        assert!(is_exact_version("1.2.3+-"));
     }
 }

@@ -1,0 +1,12 @@
+# rule: a `module:` path is not inside a name `build` emits either (grammar 6.1, Decision D132)
+# code: invalid-module-path
+# message: `src/graph.ts/impl.ts` is inside `src/graph.ts`, a file `agent-compose build` generates
+# at: 12:11
+# help: the compiler writes `src/graph.ts` as a file, so no directory of that name can sit beside it: one tree cannot hold both, and the build would refuse partway through the emission rather than at the spec: put the implementation the `module` binding of tool definition `tool.sign` names somewhere `build` does not emit — `src/tools/<name>.ts` is the conventional place (grammar 6.1, PRD resolved q47)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/graph.ts/impl.ts

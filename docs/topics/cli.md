@@ -86,15 +86,39 @@ of ECMAScript, so a composition can be valid and have no TypeScript project.
 
 `--out` defaults to `<project>/build/<target>`. `--check` writes nothing and
 reports whether the directory already matches the spec — that is the CI step,
-and it exits `1` on drift. `build` replaces and removes only files carrying its
-own generated-file header, so a directory holding somebody else's TypeScript is
-refused rather than overwritten.
+and it exits `1` on drift.
 
-`build --format json` writes `validate`'s two keys and a third:
-`{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ]}`, where `drift` names
-the files that do not match. All three are always present, so a clean build is
-three empty arrays and a `--check` that found something is the same document
-with the last one populated.
+**The emitted file list is the boundary.** `build` replaces exactly the files it
+emits and `--check` compares exactly them; nothing else under the output
+directory is written, removed, or reported. A directory holding none of the
+compiler's own files is refused rather than overwritten — the generated-file
+header is how it tells its work from yours — and a file the emitter does not
+produce is nobody's business but yours, wherever it sits.
+
+The one exception is a write rather than a removal: a `tool.*` bound to
+`module: ./src/tools/<name>.ts` gets that file **scaffolded once**, in the
+project beside the entrypoint, when it is not there. `validate` and
+`build --check` refuse a binding whose file is missing and name `build` as the
+repair; `build` writes the stub and never writes or reads that file again. It is
+a write into your tree, so whichever verb makes it says so: `build` on its
+verdict line, and `run` and `serve` — which build on the way — on a line of their
+own before the launch. See `agent-compose docs tools`.
+
+A build also **carries** each such file into the output directory, at the same
+relative path — because the composition references it, and the output directory
+is what an artifact is. Those copies are part of what `--check` compares and part
+of the tree's content hash, so an edited implementation is a build to re-run and
+a new artifact. How many a build carried is on its verdict line, beside the count
+of what it emitted.
+
+`build --format json` writes `validate`'s two keys and two more:
+`{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ], "scaffolded": [ … ]}`,
+where `drift` names the files that do not match and `scaffolded` names the
+implementations this build wrote into your tree — `{"path": …, "tool": …}` each,
+the same write the verdict line reports, because it is the one write a build
+makes outside `--out` and it is made only once. All four are always present, so
+a clean build is four empty arrays and a `--check` that found something is the
+same document with `drift` populated.
 
 ## `run`
 

@@ -530,6 +530,27 @@ fn signing(signature: &str) -> Vec<Script> {
     ]
 }
 
+/// The same three calls for `agent.stamper`, whose loop calls the **module**
+/// tool rather than the `exec:` one.
+///
+/// Every one of them is made on the worker for the same reason `signing`'s are,
+/// and so is the tool call between them: an attached tool runs inside its
+/// agent's own loop (grammar §14.1 rule 4), which for a placed agent is a loop
+/// the worker is running.
+fn stamping(stamp: &str) -> Vec<Script> {
+    vec![
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "stamp",
+                json!({ "path": "release.dmg" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("stamped, and here is what it says")),
+        Script::new(SONNET, Outcome::structured(json!({ "signature": stamp }))),
+    ]
+}
+
 /// Wait until `wanted` answers `true`, or fail with what `said` describes.
 fn until(what: &str, said: impl Fn() -> String, wanted: impl Fn() -> bool) {
     let deadline = Instant::now() + PATIENCE;
@@ -585,6 +606,153 @@ fn a_placed_node_runs_on_a_worker_and_its_answer_reaches_the_graph() {
         "the worker's effects reached the hub's journal",
         || format!("the run produced {outputs:#}"),
         || harness::journal_holds(&mesh.project, &["sign/0#model/0", "sign/0#model/2"]),
+    );
+
+    let snapshot = mesh.provider.snapshot();
+    assert!(
+        snapshot.is_drained(),
+        "the placed agent did not make the three calls it was scripted: {snapshot:#?}"
+    );
+}
+
+/// A placed **module** tool runs on the worker, out of the artifact it fetched
+/// (grammar §6.1, PRD resolved q48, q49).
+///
+/// This is the mesh consequence of putting authored code inside the emitted
+/// project, executed rather than asserted. The worker holds no checkout and no
+/// YAML — it is served a tarball of `ARTIFACT_FILES` and runs
+/// `src/worker-node.ts` out of it (§4) — so a `function:` node over a placed
+/// module tool can only work if the file the binding names is *in* that
+/// tarball. It is, because the artifact's file list widened to "what `build`
+/// wrote plus the authored files the spec references".
+///
+/// Two things are checked and each fails differently:
+///
+///   * the **answer**, which says the authored file crossed the wire and ran.
+///     No model is called for this flow at all: a `function:` node names the
+///     tool directly, so what runs on the worker is `src/tools/stamp.ts` and
+///     nothing else.
+///   * the **marker in it**, which says the binding's `env:` declaration became
+///     the argument the authored file reads: `src/tools/stamp.ts` spells
+///     `undefined` into its answer when nothing was handed to it, so a codegen
+///     that dropped the declaration on the way to `callModule` comes back saying
+///     so.
+///
+/// It says nothing about the **partition**, and the distinction is worth
+/// keeping: this harness seals its whole environment into every process it
+/// starts (`harness::environment`), so `STAMP_MARKER` is on the worker either
+/// way and an answer carrying the marker would survive a partition that had
+/// contributed nothing for the binding. What the partition did is asserted
+/// directly below instead — the variable on `mac`'s manifest and off the hub's
+/// own `src/env.ts` — which is where §9.1's "exactly the processes that can
+/// execute it" is decided.
+#[test]
+fn a_placed_module_tool_runs_on_the_worker_out_of_the_artifact_it_fetched() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    let _worker = mesh.worker("module");
+
+    let execution = mesh.start_execution("/stampings", &json!({ "path": "release.dmg" }));
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"],
+        json!(format!("release.dmg {}", harness::STAMP_MARKER_VALUE)),
+        "the authored module did not run on the worker with the environment its \
+         binding declared: {outputs:#}"
+    );
+    assert_eq!(
+        mesh.provider.requests().len(),
+        0,
+        "a `function:` node over a placed tool calls no model on either side"
+    );
+
+    // The partition, from both ends. The variable is on the placement's list…
+    assert!(
+        manifest_of(PLACEMENT).contains(&"STAMP_MARKER".to_string()),
+        "a module binding's declared environment is not on its placement's \
+         manifest: {:?}",
+        manifest_of(PLACEMENT)
+    );
+    // …and off the hub's own, which is what "reaches exactly the processes that
+    // can execute it" means (§9.1).
+    let hub_environment = std::fs::read_to_string(mesh.project.join("src/env.ts"))
+        .expect("the hub's own environment module is readable");
+    assert!(
+        !hub_environment.contains("STAMP_MARKER"),
+        "the hub demands a variable only the worker's tool reads: {hub_environment}"
+    );
+    // …and the artifact says which of its files the compiler did not write, so a
+    // reader of the tree can tell the two halves apart without a JavaScript
+    // runtime (PRD resolved q47).
+    let manifest = std::fs::read_to_string(mesh.project.join("manifest.json"))
+        .expect("the artifact's manifest is readable");
+    assert!(manifest.contains("\"src/tools/stamp.ts\""), "{manifest}");
+}
+
+/// The same authored file, called from inside a **placed agent's tool loop**
+/// (grammar §6.1, §14.1 rule 4, PRD resolved q48, q49).
+///
+/// PRD resolved q49 puts a module-bound tool where its tool executes, "on a
+/// worker, when placed **or reached through attachment**", and those are two
+/// different lowerings rather than one. The test above is the first: a
+/// `function:` node, where the tool's own placement is the whole of the answer
+/// and the dispatched node *is* the tool call. This is the second:
+/// `agent.stamper` is dispatched to `mac`, the worker spawns
+/// `src/worker-node.ts`, and the loop running there decides to call the module —
+/// so the registry seam is exercised inside a dispatched agent node rather than
+/// beside one. A seam wired up only on the hub's entrypoint, or only on the
+/// `function:` lowering, passes the test above and fails this one.
+///
+/// Three things carry it, and none of them is the flow's output — that is the
+/// model's scripted answer and would be the same if the tool had never run:
+///
+///   * the **transcript**, where the loop hands the tool's result back to the
+///     model. It is read off the provider rather than the graph because the
+///     provider is on the other side of the dispatch from the hub: a body
+///     carrying `release.dmg <marker>` is the module's own return value, and it
+///     was produced in whichever process made that call.
+///   * the **effect record** in the **hub's** journal: `attest/0#tool/0`, the
+///     ordinary tool key under the placed node's own site, holding a request
+///     whose `"surface"` is `"module"`. A worker streams its effects home
+///     (§3.3), so this is the journaling parity PRD resolved q48 asks for
+///     — same identity, same shape, only the binding differs — stated on the
+///     mesh's own surface.
+///   * the **provider's transcript being drained**, which says the loop made its
+///     three calls rather than short-circuiting after the tool call failed.
+#[test]
+fn a_module_tool_attached_to_a_placed_agent_runs_in_its_loop_on_the_worker() {
+    let Some(mesh) = Mesh::start() else {
+        return;
+    };
+    mesh.provider.enqueue_all(stamping("stamped-in-the-loop"));
+    let _worker = mesh.worker("attached-module");
+
+    let execution = mesh.start_execution("/attestations", &json!({ "path": "release.dmg" }));
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"], "stamped-in-the-loop",
+        "the placed agent's answer is what the graph wrote: {outputs:#}"
+    );
+
+    // The loop handed the module's return value back to the model, so the module
+    // ran — in the process that made the call, which is the worker's.
+    let requests = mesh.provider.requests();
+    let stamped = format!("release.dmg {}", harness::STAMP_MARKER_VALUE);
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.body_text.contains(&stamped)),
+        "no model call carries the authored module's result, so the loop never called it \
+         or called it and dropped the answer: {requests:#?}"
+    );
+
+    // And the record of that call came home over `/workers/effects`, keyed under
+    // the placed node — the same key an unplaced loop would have written.
+    until(
+        "the module tool's effect record reached the hub's journal",
+        || format!("the run produced {outputs:#}"),
+        || harness::journal_holds(&mesh.project, &["attest/0#tool/0", r#""surface":"module""#]),
     );
 
     let snapshot = mesh.provider.snapshot();

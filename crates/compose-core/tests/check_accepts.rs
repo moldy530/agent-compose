@@ -62,7 +62,21 @@ fn accepts(name: &str, body: &str) {
     // a diagnostic. The emitted bytes are the goldens' subject and not this
     // file's; that the emitter *answers at all* is this one's, because the
     // corpus of legal-but-unusual compositions is here rather than there.
-    let project = compose_core::emit(&ir);
+    //
+    // A case binding a `module:` implementation is emitted the way `build`
+    // emits one: the stub is scaffolded into the project first and then read
+    // back, because the artifact carries the authored file (PRD resolved q49)
+    // and `emit` is a pure function that is handed those bytes. Scaffolding
+    // rather than inventing content is what keeps this the command's own order.
+    for scaffold in compose_core::codegen::authored::scaffolds(&ir) {
+        let path = dir.join(scaffold.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        fs::create_dir_all(path.parent().expect("a project-relative path has a parent"))
+            .expect("can write the scaffold");
+        fs::write(&path, &scaffold.contents).expect("can write the scaffold");
+    }
+    let authored = compose_core::Authored::read(&ir, &dir)
+        .unwrap_or_else(|error| panic!("{name} references a module that cannot be read: {error}"));
+    let project = compose_core::emit(&ir, &authored);
     assert!(
         !project.files().is_empty(),
         "{name} validates, so `build` owes it a project, and it emitted no files"
@@ -2058,6 +2072,75 @@ flow.f:
   edges:
     - { from: start, to: n }
     - { from: n, to: end }
+"#,
+    );
+}
+
+/// The `module:` binding in both of its spellings, and the shapes around it
+/// whose rejecting half the negative corpus pins (grammar 6.1, Decisions D132,
+/// D133).
+///
+/// The scalar form and the block form are one binding, so both are here; two
+/// tools sharing a dependency **at the same version** is the accepting half of
+/// D133's conflict rule, and a package the generated project pins, **at the
+/// version it pins**, is the accepting half of the collision rule.
+/// Over-rejecting either would make a legal composition unwritable and nothing
+/// else in the suite would notice.
+///
+/// Nothing here needs the files to exist: whether an authored module is on disk
+/// is `check_modules`'s question, and it is a pass of its own for a reason —
+/// `build` scaffolds an absent one, and the refusal is pinned by
+/// `tests/fixtures/invalid-check/module-binding-names-a-file-that-is-not-there`.
+#[test]
+fn module_bindings_in_both_forms_sharing_a_pinned_dependency() {
+    accepts(
+        "module-bindings",
+        r#"
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module: ./src/tools/sign.ts
+tool.verify:
+  description: Verify a signature.
+  input:
+    signature: { type: string }
+  output:
+    ok: { type: boolean }
+  module:
+    path: ./src/tools/verify.ts
+    env:
+      SIGNING_KEY: "${SIGNING_KEY}"
+    dependencies:
+      "@noble/hashes": "1.4.0"
+      zod: "4.4.3"
+tool.reseal:
+  description: Re-sign an envelope.
+  input:
+    envelope: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    path: ./src/tools/reseal.ts
+    dependencies:
+      "@noble/hashes": "1.4.0"
+agent.a:
+  model: model.m
+  prompt: Sign it.
+  tools: [tool.sign]
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+    check: { function: tool.verify, input: { signature: "'sig'" } }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: check }
+    - { from: check, to: end }
 "#,
     );
 }

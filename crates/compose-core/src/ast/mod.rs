@@ -28,8 +28,8 @@ pub mod server_tools;
 pub mod trigger;
 
 pub use binding::{
-    Binding, Bindings, ExecBlock, FunctionBinding, HttpBlock, HttpMethod, InterpolatedEntry,
-    NodeInput, WriteEntry, Writes,
+    Binding, Bindings, DependencyEntry, ExecBlock, FunctionBinding, HttpBlock, HttpMethod,
+    InterpolatedEntry, ModuleBlock, NodeInput, WriteEntry, Writes,
 };
 pub use common::{
     Address, Cel, ControlTarget, Duration, DurationUnit, EdgeSource, EdgeTarget, EnvRef, Ident,

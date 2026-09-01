@@ -1,0 +1,15 @@
+# rule: a `module:` dependency may not contradict the generated project's own pin (grammar 6.1, Decision D133)
+# code: invalid-dependency
+# message: `zod` is pinned to `3.23.8` here and to `4.4.3` by the generated project
+# at: 15:12
+# help: a generated project's own dependency set is fixed by the compiler release that wrote it, and one `package.json` holds one version of a package: pin `zod` at `4.4.3`, or reach for a package the generated runtime does not (grammar 6.1)
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      zod: "3.23.8"

@@ -118,15 +118,28 @@ pub(crate) fn refuses(diagnostics: &[Diagnostic]) -> bool {
 }
 
 /// `build`'s JSON report:
-/// `{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ]}`.
+/// `{"diagnostics": [ … ], "warnings": [ … ], "drift": [ … ], "scaffolded": [ … ]}`.
 ///
-/// One shape for every outcome, the way [`json`] is: a clean build writes three
+/// One shape for every outcome, the way [`json`] is: a clean build writes four
 /// empty arrays rather than nothing, and a `--check` that found drift writes the
-/// same three keys with the last populated. A consumer parses one document and
+/// same four keys with `drift` populated. A consumer parses one document and
 /// branches on its contents instead of on which command produced it.
+///
+/// **`scaffolded` is here because it is a write outside `--out`.** Every other
+/// key describes the output directory, which a caller can re-derive by running
+/// the build again; a scaffold is a file put into the *source* tree once and
+/// never written again, so a report that left it out would have a job discard an
+/// unreviewed file and then never hear about it a second time. It is
+/// [`scaffold_phrase`]'s claim as data — one object per implementation, `path`
+/// project-relative and `tool` the address that asked for it — because "said out
+/// loud rather than left for a later `git status`" is not a promise one output
+/// format gets to keep and the other does not. Empty under `--check`, which
+/// never scaffolds, and on a build that found every implementation already
+/// there.
 pub(crate) fn build_json(
     diagnostics: &[Diagnostic],
     drift: &[crate::build::Drift],
+    scaffolded: &[(String, String)],
 ) -> Result<String, serde_json::Error> {
     let mut report = serde_json::Map::new();
     report.insert("diagnostics".to_string(), errors_of(diagnostics)?);
@@ -151,6 +164,20 @@ pub(crate) fn build_json(
                 .collect(),
         ),
     );
+    report.insert(
+        "scaffolded".to_string(),
+        serde_json::Value::Array(
+            scaffolded
+                .iter()
+                .map(|(path, tool)| {
+                    let mut object = serde_json::Map::new();
+                    object.insert("path".to_string(), serde_json::Value::String(path.clone()));
+                    object.insert("tool".to_string(), serde_json::Value::String(tool.clone()));
+                    serde_json::Value::Object(object)
+                })
+                .collect(),
+        ),
+    );
     let mut text = serde_json::to_string_pretty(&serde_json::Value::Object(report))?;
     text.push('\n');
     Ok(text)
@@ -163,12 +190,16 @@ pub(crate) struct Built<'a> {
     /// How the output directory disagrees, under `--check`.
     pub(crate) drift: &'a [crate::build::Drift],
     /// What a rebuild would refuse over, under `--check`
-    /// (`crate::build::not_ours`): the files in the output directory this
-    /// compiler did not write and would have replaced or removed. Empty when a
-    /// rebuild would go through, which is what makes it the remedy.
+    /// (`crate::build::not_ours`): the emitted names in the output directory
+    /// that this compiler did not write and the build would have replaced.
+    /// Empty when a rebuild would go through, which is what makes it the remedy.
     pub(crate) not_ours: &'a [String],
     /// What was written, when anything was.
     pub(crate) wrote: Option<&'a crate::build::Written>,
+    /// The authored implementations this build scaffolded because they were
+    /// absent, as `(path, tool)`, sorted by path (PRD resolved q48). Empty on a
+    /// `--check`, which never scaffolds, and on a build that found them all.
+    pub(crate) scaffolded: &'a [(String, String)],
     /// Whether the diagnostics are codegen's rather than the validator's.
     ///
     /// The two refuse for different reasons and a reader who has just seen
@@ -196,6 +227,7 @@ pub(crate) fn build_verdict(
         drift,
         not_ours,
         wrote,
+        scaffolded,
         target_only,
     } = *built;
     let renderer = if color {
@@ -245,24 +277,27 @@ pub(crate) fn build_verdict(
                 Level::WARNING
             },
             format!(
-                "wrote {} to `{out}` (target `{target}`){noted}{}",
+                "wrote {} to `{out}` (target `{target}`){}{noted}{}",
                 plural(written.files, "file"),
-                // A removal is the one thing a build does that the caller did not
-                // ask for by name, so it is said out loud rather than left for a
-                // later `git status`.
-                if written.removed.is_empty() {
+                // The authored half of the tree, counted separately because it
+                // is a different claim: those bytes are the author's, carried
+                // in because the composition references them and the artifact
+                // has to hold them (PRD resolved q49).
+                if written.carried == 0 {
                     String::new()
                 } else {
                     format!(
-                        ", and removed {} it no longer emits: {}",
-                        plural(written.removed.len(), "generated file"),
-                        written
-                            .removed
-                            .iter()
-                            .map(|path| format!("`{path}`"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        ", carrying {} with them",
+                        plural(written.carried, "authored file")
                     )
+                },
+                // A scaffold is the one thing a build writes that it does not
+                // own, and the one it will never write again, so it is said out
+                // loud rather than left for a later `git status` (PRD resolved
+                // q48).
+                match scaffold_phrase(scaffolded) {
+                    Some(phrase) => format!(", and {phrase}"),
+                    None => String::new(),
                 }
             ),
         ),
@@ -298,6 +333,57 @@ pub(crate) fn build_verdict(
     report
 }
 
+/// What a build wrote into the **author's** tree, as one clause, or `None` when
+/// it wrote nothing there.
+///
+/// One sentence with two readers, which is why it is a function rather than two
+/// `format!`s. `build` folds it onto the end of its own verdict; `run` and
+/// `serve` have no verdict to fold it onto and print it on a line of its own
+/// ([`scaffold_notice`]). A scaffold is the only write any of the three makes
+/// outside `--out`, and the only one they will never make again (PRD resolved
+/// q48) — so whichever verb made it says so, in the same words, rather than
+/// leaving a later `git status` to break the news.
+fn scaffold_phrase(scaffolded: &[(String, String)]) -> Option<String> {
+    if scaffolded.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "scaffolded {} for you to write: {}",
+        plural(scaffolded.len(), "tool implementation"),
+        scaffolded
+            .iter()
+            .map(|(path, tool)| format!("`{path}` (`{tool}`)"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// The line `run` and `serve` print when the build they did on the way wrote a
+/// stub into the project.
+///
+/// Empty when nothing was scaffolded, which is every launch after the first —
+/// these two verbs answer with the flow's own output and a line about the spec
+/// being fine is noise in front of it (see [`crate::warned`]). It goes through
+/// the same renderer `build`'s verdict does, at the same level, because it is
+/// the same claim.
+pub(crate) fn scaffold_notice(scaffolded: &[(String, String)], color: bool) -> String {
+    let Some(phrase) = scaffold_phrase(scaffolded) else {
+        return String::new();
+    };
+    let renderer = if color {
+        Renderer::styled()
+    } else {
+        Renderer::plain()
+    }
+    .decor_style(DecorStyle::Ascii);
+    format!(
+        "{}\n",
+        renderer.render(&[Group::with_title(
+            Level::NOTE.no_name().primary_title(phrase.as_str())
+        )])
+    )
+}
+
 /// What to do about the drift just reported.
 ///
 /// Ordinarily that is `agent-compose build`, which is the whole point of
@@ -306,14 +392,14 @@ pub(crate) fn build_verdict(
 ///
 /// It is not the answer for every directory that drifts, though, and a help line
 /// that said so anyway would send a reader from an exit `1` they can act on to an
-/// exit `2` they cannot. `build` replaces and removes only files carrying its own
-/// generated-file header (see [`crate::build::write`]), so a `src/` holding
-/// somebody's own TypeScript, or a `package.json` in a directory this compiler
-/// has never built into, is drift a rebuild **refuses** rather than fixes — and
-/// a [`Drift`](crate::build::Drift) line cannot tell that case from the stale
-/// module beside it, because both are the same state. `crate::build::not_ours`
-/// answers it off the same scan the write makes, so the remedy printed here is
-/// the one the next command actually performs.
+/// exit `2` they cannot. A `build` into a directory holding none of its own
+/// files refuses rather than replacing what is there (see
+/// [`crate::build::write`]), so a `package.json` naming somebody's application,
+/// or a `src/graph.ts` of their own, is drift a rebuild **refuses** rather than
+/// fixes — and a [`Drift`](crate::build::Drift) line cannot tell that case from a
+/// generated file somebody edited, because both are `differs`.
+/// `crate::build::not_ours` answers it off the same scan the write makes, so the
+/// remedy printed here is the one the next command actually performs.
 fn drift_help(not_ours: &[String]) -> String {
     if not_ours.is_empty() {
         return "help: run `agent-compose build` to regenerate\n".to_string();
@@ -325,8 +411,8 @@ fn drift_help(not_ours: &[String]) -> String {
     };
     format!(
         "help: `agent-compose build` will not regenerate this directory: it holds {noun} this \
-         compiler did not write ({}), and the build would have replaced or removed {pronoun}. \
-         Point `--out` at a directory of its own, or move {pronoun} aside\n",
+         compiler did not write at {noun} this build writes ({}), and the build would have \
+         replaced {pronoun}. Point `--out` at a directory of its own, or move {pronoun} aside\n",
         not_ours
             .iter()
             .map(|path| format!("`{path}`"))
@@ -666,17 +752,20 @@ mod tests {
             "help: run `agent-compose build` to regenerate\n"
         );
         assert_eq!(
-            drift_help(&["src/mine.ts".to_string()]),
+            drift_help(&["src/graph.ts".to_string()]),
             "help: `agent-compose build` will not regenerate this directory: it holds a file this \
-             compiler did not write (`src/mine.ts`), and the build would have replaced or removed \
-             it. Point `--out` at a directory of its own, or move it aside\n"
+             compiler did not write at a file this build writes (`src/graph.ts`), and the build \
+             would have replaced it. Point `--out` at a directory of its own, or move it aside\n"
         );
+        // The plural form, and a **carried** path in it: what the build writes
+        // is wider than what it emits (PRD resolved q49), so the sentence says
+        // "writes" — `src/tools/sign.ts` is a name this compiler never emits.
         assert_eq!(
-            drift_help(&["package.json".to_string(), "src/mine.ts".to_string()]),
+            drift_help(&["src/graph.ts".to_string(), "src/tools/sign.ts".to_string()]),
             "help: `agent-compose build` will not regenerate this directory: it holds files this \
-             compiler did not write (`package.json`, `src/mine.ts`), and the build would have \
-             replaced or removed them. Point `--out` at a directory of its own, or move them \
-             aside\n"
+             compiler did not write at files this build writes (`src/graph.ts`, \
+             `src/tools/sign.ts`), and the build would have replaced them. Point `--out` at a \
+             directory of its own, or move them aside\n"
         );
     }
 

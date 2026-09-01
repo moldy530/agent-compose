@@ -195,6 +195,20 @@ export const httpTriggers: readonly HttpTrigger[] = [
     },
   },
   {
+    name: "on_attested",
+    flow: "flow.attested",
+    path: "/attestations",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
     name: "on_batch",
     flow: "flow.batch",
     path: "/batches",
@@ -285,6 +299,20 @@ export const httpTriggers: readonly HttpTrigger[] = [
     name: "on_retried_release",
     flow: "flow.retried",
     path: "/retried-releases",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
+    name: "on_stamped",
+    flow: "flow.stamped",
+    path: "/stampings",
     method: "POST",
     respond: "async",
     readsBody: true,

@@ -37,12 +37,21 @@
 //!
 //! # The file list
 //!
-//! `ARTIFACT_FILES` is every path this build emitted, sorted — what the hub tars
-//! when a worker fetches (§3.5). It is the emitter's list rather than a directory
-//! walk so that what is served is what `build` wrote: a `node_modules/` an
-//! install left beside it, a `.env`, and the `.agent-compose/` a run filled are
-//! not the artifact, and a walk would have to enumerate exclusions the emitter
-//! already knows the complement of.
+//! `ARTIFACT_FILES` is every path of this build's tree, sorted — what the hub
+//! tars when a worker fetches (§3.5). It is the emitter's list rather than a
+//! directory walk so that what is served is what `build` produced: a
+//! `node_modules/` an install left beside it, a `.env`, and the
+//! `.agent-compose/` a run filled are not the artifact, and a walk would have to
+//! enumerate exclusions the emitter already knows the complement of.
+//!
+//! **The list is wider than the emission set** (PRD resolved q49): "what `build`
+//! wrote plus the authored files the spec references". A `module:` binding's
+//! file is on it, hashed like every other entry — so editing a tool
+//! implementation is a new artifact and reaches every worker through the join
+//! handshake with no new machinery — while a file under `src/` that nothing
+//! references ships nowhere. That is why [`module`] takes the two lists
+//! separately and hashes their union: the *tree* is the subject, and which half
+//! of it a file came from is the build's business rather than the wire's.
 
 use sha2::{Digest, Sha256};
 
@@ -105,21 +114,26 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// `src/artifact.ts`, over the rest of the project.
+/// `src/artifact.ts`, over the rest of the project — the files this build
+/// emitted, and the authored ones it carries (PRD resolved q49).
 #[must_use]
-pub fn module(ir: &Ir, files: &[GeneratedFile]) -> GeneratedFile {
+pub fn module(ir: &Ir, files: &[GeneratedFile], carried: &[GeneratedFile]) -> GeneratedFile {
+    let tree: Vec<&GeneratedFile> = files.iter().chain(carried).collect();
     let mut contents = super::header(ir, "// ");
     contents.push_str(MODULE_DOC);
     contents.push_str(&format!(
         "\nexport const ARTIFACT_HASH = {};\n",
-        names::string(&hash(files))
+        names::string(&hash_of(
+            tree.iter()
+                .map(|file| (file.path.as_str(), file.contents.as_bytes()))
+        ))
     ));
     contents.push_str(&format!(
         "\nexport const COMPILER_VERSION = {};\n",
         names::string(super::COMPILER_VERSION)
     ));
     contents.push_str("\nexport const ARTIFACT_FILES: readonly string[] = [\n");
-    let mut paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+    let mut paths: Vec<&str> = tree.iter().map(|file| file.path.as_str()).collect();
     paths.push(SELF);
     paths.sort_unstable();
     paths.dedup();
@@ -138,11 +152,13 @@ const MODULE_DOC: &str = "\
 //
 // This artifact's identity on the worker wire (`docs/distributed.md` §3.5, §4).
 //
-// `ARTIFACT_HASH` is a hash over the tree's content — every emitted file's path
-// and the digest of its bytes, sorted, hashed — and is what a join agrees on and
-// what `/workers/artifact/{hash}` is addressed by. `ARTIFACT_FILES` is the set
-// the hub tars for that route: what `agent-compose build` wrote, and nothing an
-// install, a run or an operator put beside it.
+// `ARTIFACT_HASH` is a hash over the tree's content — every file's path and the
+// digest of its bytes, sorted, hashed — and is what a join agrees on and what
+// `/workers/artifact/{hash}` is addressed by. `ARTIFACT_FILES` is the set the
+// hub tars for that route: what `agent-compose build` wrote **plus** the
+// authored files the composition references through a `module:` binding, and
+// nothing an install, a run or an operator put beside them. An edit to a tool
+// implementation is a new hash, and so a new artifact every worker fetches.
 //
 // This file is the one entry the hash does not cover, because a file carrying
 // the hash of a tree containing it has no fixed point. Everything else is
@@ -205,6 +221,55 @@ mod tests {
         let mut with_self = tree.to_vec();
         with_self.push(file(SELF, "export const ARTIFACT_HASH = \"anything\";\n"));
         assert_eq!(hash(&tree), hash(&with_self));
+    }
+
+    /// The authored half of the tree is inside the hash and on the file list
+    /// (PRD resolved q49).
+    ///
+    /// Both, and they fail differently: a hash that skipped it would leave a
+    /// worker executing yesterday's implementation under today's name, and a
+    /// file list that skipped it would serve a tarball whose `src/modules.ts`
+    /// imports a file that is not in it.
+    #[test]
+    fn an_authored_file_is_in_the_file_list_and_moves_the_hash() {
+        let ir = crate::codegen::test_support::ir_of(
+            r#"version: "0.1"
+
+tool.sign:
+  description: Sign a payload.
+  input: {}
+  output: {}
+  module: ./src/tools/sign.ts
+"#,
+        );
+        let generated = [file("src/graph.ts", "// the graph\n")];
+        let before = module(&ir, &generated, &[file("src/tools/sign.ts", "// yours\n")]);
+        let after = module(&ir, &generated, &[file("src/tools/sign.ts", "// edited\n")]);
+
+        assert!(
+            before.contents.contains("  \"src/tools/sign.ts\",\n"),
+            "{}",
+            before.contents
+        );
+        assert_ne!(
+            before.contents, after.contents,
+            "editing an implementation is a new artifact, which is what reaches \
+             every worker through the join handshake"
+        );
+        assert_eq!(
+            hash_of(
+                [
+                    ("src/graph.ts", &b"// the graph\n"[..]),
+                    ("src/tools/sign.ts", &b"// yours\n"[..]),
+                ]
+                .into_iter()
+            ),
+            hash(&[
+                file("src/graph.ts", "// the graph\n"),
+                file("src/tools/sign.ts", "// yours\n"),
+            ]),
+            "one rule over the tree, whichever half a file came from"
+        );
     }
 
     /// The known-answer test that says this is SHA-256 rather than some other

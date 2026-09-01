@@ -231,7 +231,8 @@ pub fn expressions(ir: &Ir) -> Vec<Expression<'_>> {
                     http_block(http, &format!("`{address}`'s `http:` binding"), &mut found);
                 }
                 crate::ir::flow::ToolImplementation::Exec { .. }
-                | crate::ir::flow::ToolImplementation::Function { .. } => {}
+                | crate::ir::flow::ToolImplementation::Function { .. }
+                | crate::ir::flow::ToolImplementation::Module { .. } => {}
             },
             crate::ir::definition::DefinitionBody::Flow(flow) => {
                 for node in &flow.nodes {
