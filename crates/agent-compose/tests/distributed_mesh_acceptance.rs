@@ -106,6 +106,16 @@ struct Mesh {
     project: PathBuf,
     /// Removed when the test ends.
     _scratch: harness::Scratch,
+    /// The composition this hub is served from.
+    ///
+    /// Ordinarily the fixture where it is committed. One test serves a **copy**
+    /// with a deploy file of its own — the trace-sink export, whose collector
+    /// takes a port the operating system chose and so cannot be named in a
+    /// committed target — and a restart has to reach the same composition the
+    /// first start did, so the path is held here rather than re-derived.
+    entrypoint: PathBuf,
+    /// The copy above, removed when the test ends; absent for the fixture.
+    _composition: Option<harness::Scratch>,
     client: Client,
     base_url: String,
     /// What every process in this mesh is given.
@@ -119,11 +129,23 @@ impl Mesh {
     /// `None` when the toolchain is not installed, which is the skip every
     /// suite here takes.
     fn start() -> Option<Self> {
-        let project = harness::scratch_project("mesh-acceptance")?;
+        Self::start_from("mesh-acceptance", harness::fixture(FIXTURE), None)
+    }
+
+    /// The same, from a composition the caller supplies.
+    ///
+    /// The one caller that needs it serves a copy of the fixture with an extra
+    /// deploy-layer key in its target; everything else serves the fixture where
+    /// it is committed, which is what [`Mesh::start`] passes.
+    fn start_from(
+        purpose: &str,
+        entrypoint: PathBuf,
+        composition: Option<harness::Scratch>,
+    ) -> Option<Self> {
+        let project = harness::scratch_project(purpose)?;
         let provider = MockProvider::start().expect("a loopback port");
         let environment = environment(&provider);
-        let served =
-            harness::serve_target_into(&project, &harness::fixture(FIXTURE), TARGET, &environment)?;
+        let served = harness::serve_target_into(&project, &entrypoint, TARGET, &environment)?;
         let client = Client::new(&served.base_url)
             .expect("the hub's address parses")
             .with_timeout(Duration::from_secs(30));
@@ -133,6 +155,8 @@ impl Mesh {
             provider,
             _scratch: harness::Scratch::at(project.clone()),
             project,
+            entrypoint,
+            _composition: composition,
             client,
             base_url,
             environment,
@@ -155,7 +179,7 @@ impl Mesh {
         self.served.stop();
         self.served = harness::serve_target_on(
             &self.project,
-            &harness::fixture(FIXTURE),
+            &self.entrypoint,
             TARGET,
             port,
             &self.environment,
@@ -2102,4 +2126,131 @@ fn a_journal_written_before_the_dispatch_board_opens_and_serves_under_this_build
     );
     assert_eq!(settled[0]["placement"], PLACEMENT, "{board:#}");
     assert_eq!(settled[0]["node"], "flow.release.sign", "{board:#}");
+}
+
+/// **The hub exports a mesh execution's whole trace, the placed node's entries
+/// included** (grammar §14.5, PRD resolved q50, q51).
+///
+/// Resolved q51 makes the export **hub-side only**, and says why: "the hub owns
+/// the trace, workers stream collectors home already, so a mesh needs no
+/// per-worker OTel story". This is that claim executed rather than asserted — a
+/// real worker runs the placed node in a process of its own, and what the
+/// collector receives is one export from one address, carrying the entries the
+/// worker produced beside the ones the hub did.
+///
+/// The trace sink reaches this fixture through a **copy** of it: the collector's
+/// port is the operating system's, so the target is written beside the
+/// composition rather than committed in it (see [`harness::staged_with_deploy`]).
+/// The rest of `deploy/mesh.yml` is the fixture's own, read and re-written
+/// verbatim, so what this serves is the mesh every other test here serves plus
+/// one key.
+#[test]
+fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let target = format!(
+        "{}\ntrace_sink:\n  url: \"{}/v1/traces\"\n",
+        std::fs::read_to_string(
+            harness::fixture(FIXTURE)
+                .parent()
+                .expect("a fixture has a directory")
+                .join(format!("deploy/{TARGET}.yml")),
+        )
+        .expect("the fixture's mesh target is readable"),
+        collector.base_url,
+    );
+    let (composition, entrypoint) =
+        harness::staged_with_deploy("mesh-trace-sink", FIXTURE, TARGET, &target);
+    let Some(mesh) = Mesh::start_from("mesh-trace-sink", entrypoint, Some(composition)) else {
+        return;
+    };
+    mesh.provider
+        .enqueue_all(signing("signed-for-the-collector"));
+    let _worker = mesh.worker("exporting");
+
+    let execution = mesh.start_execution("/releases", &json!({ "path": "release.dmg" }));
+    let outputs = mesh.completed(&execution);
+    assert_eq!(
+        outputs["signature"], "signed-for-the-collector",
+        "{outputs:#}"
+    );
+
+    let exported = collector.wait_for_event("settled", 1, Duration::from_secs(60));
+    let body = &exported[0].body;
+    assert_eq!(body["execution_id"], execution, "{body:#}");
+    assert_eq!(body["status"], "completed", "{body:#}");
+    assert_eq!(body["trace_version"], 4, "{body:#}");
+
+    // The placed node's entry is in the hub's export, which is the whole of
+    // "the hub owns the trace": `sign` ran in the worker's process, and its
+    // record came home on the result the worker posted (§3.4).
+    let nodes: Vec<&str> = body["entries"]
+        .as_array()
+        .expect("an envelope carries entries")
+        .iter()
+        .filter_map(|entry| entry["node"].as_str())
+        .collect();
+    assert!(
+        nodes.contains(&"sign"),
+        "the placed node's entry is missing from the hub's export: {body:#}"
+    );
+    assert!(
+        nodes.contains(&"stamp"),
+        "the hub's own node is missing from its export: {body:#}"
+    );
+
+    // …and the model calls the **worker** made are on that entry, which is what
+    // says the export carries the trace rather than a summary of it.
+    let signed = body["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["node"] == "sign")
+        .expect("the placed node's entry");
+    assert!(
+        signed["models"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty()),
+        "the worker's model calls did not reach the hub's export: {signed:#}"
+    );
+
+    // **…and from nowhere else**, which is the half resolved q51's "export is
+    // hub-side only" turns on and the half the wait above cannot give: it
+    // returns on the *first* arrival, so a second exporter's POST would land
+    // milliseconds later and leave this test green. A worker that exported would
+    // be reaching this same collector — it runs the same artifact under the same
+    // target — so the claim is made after a window wide enough for its request
+    // to have arrived, and from both ends:
+    //
+    //  * the collector holds **one** `settled` delivery id. Counted as ids
+    //    rather than as requests for [`harness::Receiver::distinct`]'s reason:
+    //    delivery is at-least-once, so a repeat under one id is the contract and
+    //    a second id is a second export;
+    //  * and the hub's journal — the mesh's only delivery ledger, since a worker
+    //    refuses the table outright (`src/worker-node.ts`'s
+    //    `WorkerJournalReach`) — holds **one** `trace_sink` row, which is the
+    //    half a collector cannot show: an intent journaled and not yet sent is
+    //    an export still owed.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        collector.distinct("settled"),
+        [format!("{execution}:0")],
+        "a second export reached the collector, so this mesh exports from somewhere besides \
+         the hub: {:?}",
+        collector.delivered()
+    );
+    let rows = harness::journal_rows(
+        &mesh.project,
+        "SELECT kind, status FROM deliveries WHERE kind = 'trace_sink' ORDER BY ordinal ASC",
+    );
+    let held = rows.as_array().expect("the query answers rows");
+    assert_eq!(
+        held.len(),
+        1,
+        "one export intent per settled execution: {rows:#}"
+    );
+    assert_eq!(
+        held[0]["status"], "delivered",
+        "the hub's one export is still owed, so the collector's delivery came from somewhere \
+         else: {rows:#}"
+    );
 }

@@ -10,16 +10,35 @@ pins on.
 
 ## Where a trace is delivered
 
-Three surfaces carry the same entries and differ in what surrounds them:
+Four surfaces carry the same entries and differ in what surrounds them:
 
 | surface | what carries it |
 |---|---|
 | `agent-compose run --format json` | one JSON object on **stdout**, whose `trace` is the array of entries |
 | the trace **file** | one JSON object — the whole envelope — under the project's data directory |
 | `agent-compose serve` status | `GET /executions/:id`, and the `callback:` webhook body |
+| the **trace sink** | one POST per settled execution to the address a deploy file's `trace_sink:` names |
 
-Wherever a `trace` appears, the `trace_version` describing it appears beside it,
-and wherever one is absent so is the other.
+On the first three, wherever a `trace` appears the `trace_version` describing it
+appears beside it, and wherever one is absent so is the other.
+
+The first three are somebody asking for **one** trace. The fourth is the
+deployment saying once where all of them go: `trace_sink:` in a deploy file
+(`agent-compose docs targets`), and every execution that settles under that
+target ships its trace there — a served request's, a recovered execution's and a
+one-shot `run` alike. It is a journaled delivery like a `callback:` webhook:
+bounded retry, ordered per execution, signed with the same headers when the sink
+declares `auth:`, and **never** able to block or fail the run it describes.
+
+Its body is the envelope, or — under `format: otlp` — an OTLP/JSON
+`ExportTraceServiceRequest` mapped from that same envelope: the execution as the
+root span, every entry a span under whatever ran it, model calls and dispatches
+as child spans, routing decisions as attributes, and a flow-as-tool join as a
+span link. It is hand-emitted, with no OpenTelemetry dependency in the generated
+project, and a backend that speaks only protobuf is served by pointing an
+OpenTelemetry Collector at the sink. An inbound W3C `traceparent` on an `http`
+trigger's request is honored, so an embedded graph exports into its caller's
+trace. `docs/trace.md` §12 is the normative mapping.
 
 Every `run` also writes `.agent-compose/traces/<flow>-<execution id>.json` under
 the project's data directory, and names the path on stderr under

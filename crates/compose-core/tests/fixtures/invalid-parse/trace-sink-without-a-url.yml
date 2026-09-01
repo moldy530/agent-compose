@@ -1,0 +1,10 @@
+# rule: a `trace_sink:` declares `url:` (grammar 14.5)
+# code: missing-key
+# message: missing required key `url` in `trace_sink`
+# at: 10:3
+version: "0.1"
+
+# A sink with no address names nowhere for a trace to go, so the section is a
+# key that could only have been meant to have one.
+trace_sink:
+  format: otlp

@@ -1,0 +1,378 @@
+{
+  "name": "interrupted-run",
+  "about": "A run that ended holding a question, which is what `agent-compose run` does with every pause it reaches (grammar 8.7). It is §12.4's one UNSET root: `interrupted` is not an outcome, so the root span's status is `{ code: 0 }` and `agentcompose.status` is the only place it is said. It is also the one pause with no settlement (§3.4), so the parked entry's span runs from `pausedAt` to the execution's end rather than to an answer, and carries a `human.paused` event with no `human.settled` beside it. The document is the one `trace_format_stability`'s `an_interrupted_runs_trace_document_keeps_its_shape` pins, with its instants filled in.",
+  "context": {
+    "target": "staging",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000c7",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T15:00:00.000Z",
+    "endedAt": "2026-09-01T15:10:00.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.assisted",
+    "execution_id": "exec_parked",
+    "status": "interrupted",
+    "error": "HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: an answer reaches a pause through `agent-compose serve`'s `POST /executions/:id/resume`, or at the terminal of an `agent-compose run` whose standard input is one (grammar 8.7, PRD 5.11)",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.assisted",
+        "node": "ask",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "answer"
+        ],
+        "models": [
+          {
+            "model": "model.smart",
+            "servedBy": "model.smart",
+            "fallback": 0,
+            "failovers": []
+          }
+        ],
+        "routing": {
+          "targets": [
+            "approve"
+          ],
+          "edges": [
+            {
+              "to": "approve",
+              "taken": true,
+              "reason": "unconditional"
+            }
+          ],
+          "counters": {}
+        }
+      },
+      {
+        "step": 2,
+        "flow": "flow.assisted",
+        "node": "approve",
+        "traversal": 0,
+        "outcome": "failed",
+        "attempts": 1,
+        "human": {
+          "pausedAt": "2026-09-01T15:00:02.000Z",
+          "expiresAt": "2026-09-02T15:00:02.000Z"
+        },
+        "error": "NodeFailure: flow.assisted node `approve` failed: HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: an answer reaches a pause through `agent-compose serve`'s `POST /executions/:id/resume`, or at the terminal of an `agent-compose run` whose standard input is one (grammar 8.7, PRD 5.11)"
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.assisted"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000c7"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "c9fcbe5e5aaba6fe6c730edd615eb4b2",
+                "spanId": "2d43c09f4eefc7a6",
+                "name": "flow.assisted",
+                "kind": 1,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275400000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_parked"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.assisted"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "interrupted"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: an answer reaches a pause through `agent-compose serve`'s `POST /executions/:id/resume`, or at the terminal of an `agent-compose run` whose standard input is one (grammar 8.7, PRD 5.11)"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 0
+                }
+              },
+              {
+                "traceId": "c9fcbe5e5aaba6fe6c730edd615eb4b2",
+                "spanId": "d84a10afdf15a9b3",
+                "parentSpanId": "2d43c09f4eefc7a6",
+                "name": "ask",
+                "kind": 1,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275400000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_parked/ask/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.assisted"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "ask"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "answer"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing",
+                    "value": {
+                      "stringValue": "{\"targets\":[\"approve\"],\"edges\":[{\"to\":\"approve\",\"taken\":true,\"reason\":\"unconditional\"}],\"counters\":{}}"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing.targets",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "approve"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "c9fcbe5e5aaba6fe6c730edd615eb4b2",
+                "spanId": "f745ca2b9a1de9a5",
+                "parentSpanId": "d84a10afdf15a9b3",
+                "name": "model.smart",
+                "kind": 3,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275400000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.served_by",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.fallback",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.failovers",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "c9fcbe5e5aaba6fe6c730edd615eb4b2",
+                "spanId": "ee9eeb5b2c5ace76",
+                "parentSpanId": "2d43c09f4eefc7a6",
+                "name": "approve",
+                "kind": 1,
+                "startTimeUnixNano": "1788274802000000000",
+                "endTimeUnixNano": "1788275400000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_parked/approve/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.assisted"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "approve"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: flow.assisted node `approve` failed: HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: an answer reaches a pause through `agent-compose serve`'s `POST /executions/:id/resume`, or at the terminal of an `agent-compose run` whose standard input is one (grammar 8.7, PRD 5.11)"
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788274802000000000",
+                    "name": "human.paused",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.human.expires_at",
+                        "value": {
+                          "stringValue": "2026-09-02T15:00:02.000Z"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "NodeFailure: flow.assisted node `approve` failed: HumanInterrupt: flow.assisted node `approve` is waiting for a human and this run has no way to answer: an answer reaches a pause through `agent-compose serve`'s `POST /executions/:id/resume`, or at the terminal of an `agent-compose run` whose standard input is one (grammar 8.7, PRD 5.11)"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

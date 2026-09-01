@@ -1,0 +1,12 @@
+# rule: a `trace_sink.auth:` credential takes the env-ref value form (grammar 14.5, 4.3)
+# code: invalid-env-ref
+# message: `token` takes an environment reference, found the literal `s3cret`
+# at: 12:14
+# help: the spec never contains credentials or connection strings: write `${NAME}`
+version: "0.1"
+
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  auth:
+    bearer:
+      token: "s3cret"

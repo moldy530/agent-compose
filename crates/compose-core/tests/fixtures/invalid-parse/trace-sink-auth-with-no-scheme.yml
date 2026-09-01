@@ -1,0 +1,10 @@
+# rule: a `trace_sink.auth:` block declares at least one scheme (grammar 14.5, 13.3)
+# code: missing-key
+# message: the `auth` of `trace_sink` declares no scheme: an `auth` carries `bearer`, `hmac`, or both
+# at: 10:3
+# help: `hmac` signs the delivered body and `bearer` sends a static token; a delivery that carries neither is what leaving `auth:` out already means, which is the posture a collector on a private network takes (grammar 14.5, PRD resolved q50)
+version: "0.1"
+
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  auth: {}

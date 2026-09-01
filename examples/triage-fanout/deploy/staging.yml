@@ -39,6 +39,20 @@ storage_backends:
       url: ${CHROMA_URL}
       index: project-docs
 
+# Where every settled execution's trace ships (grammar 14.5, PRD resolved q50).
+# One address for the whole target, delivered on the same journal-backed
+# at-least-once machinery a `callback:` uses — a collector that is down costs
+# deliveries a retry and the executions nothing. The credential is a deploy-layer
+# variable and belongs to the hub's env manifest: the hub owns the trace, so no
+# worker is ever asked for this token. No allowlist key here, and none is wanted:
+# this address is written on the line above by whoever deploys, not lifted out of
+# a request payload the way a `callback:` URL is.
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  auth:
+    bearer:
+      token: ${TRACE_SINK_TOKEN}
+
 # RESERVED (PRD 5.11): binds the logical `source: bug_reports` of the `ingest`
 # trigger to infrastructure. Delivery is at-least-once with inbound dedupe.
 event_sources:

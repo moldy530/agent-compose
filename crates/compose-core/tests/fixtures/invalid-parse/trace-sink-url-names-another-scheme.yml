@@ -1,0 +1,12 @@
+# rule: a `trace_sink:` is reached over http or https (grammar 14.5)
+# code: invalid-value
+# message: "grpc://collector.internal.example" is not a `trace_sink.url`: it names the scheme `grpc`, and a trace sink is reached over `http` or `https`
+# at: 11:8
+# help: the sink is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://collector.internal.example/v1/traces`; `http` stays legal, which is what makes a collector on the same host work (grammar 14.5, PRD resolved q50)
+version: "0.1"
+
+# OTLP over gRPC is a real transport and this exporter does not speak it; the
+# repair is an OTel Collector reached over `http`, which is what the docs name.
+trace_sink:
+  url: "grpc://collector.internal.example"
+  format: otlp

@@ -1,0 +1,207 @@
+{
+  "name": "traceparent-parented",
+  "about": "The same shape as `minimal-run`, started by a caller that sent a W3C `traceparent`: the export adopts the caller's trace id outright and hangs the root span off the caller's span (§12.3). Every derived span id is unchanged by that — only the trace id and the root's parent move — which is what makes an embedded graph join a caller's trace rather than replace it.",
+  "context": {
+    "target": "local",
+    "artifact": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T10:00:00.000Z",
+    "endedAt": "2026-09-01T10:00:02.500Z",
+    "parent": {
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "00f067aa0ba902b7",
+      "flags": "01"
+    }
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.greet",
+    "execution_id": "exec_minimal",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.greet",
+        "node": "say",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "greeting"
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.greet"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "local"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "local"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                "spanId": "b9480f3b528f35ff",
+                "parentSpanId": "00f067aa0ba902b7",
+                "name": "flow.greet",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256802500000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_minimal"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.greet"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+                "spanId": "198fdde3adc91a80",
+                "parentSpanId": "b9480f3b528f35ff",
+                "name": "say",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256802500000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_minimal/say/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.greet"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "say"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "greeting"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -177,7 +177,7 @@ fn a_composition_written_differently_is_not_a_composition_changed() {
     assert_eq!(
         document,
         r#"{
-  "plan_version": 1,
+  "plan_version": 2,
   "before": {
     "entrypoint": "reformatted/before/main.yml",
     "target": "local",
@@ -238,7 +238,7 @@ fn a_component_record_carries_its_change_its_kind_its_address_and_its_span() {
     assert_eq!(
         document,
         r#"{
-  "plan_version": 1,
+  "plan_version": 2,
   "before": {
     "entrypoint": "renamed-model/before/main.yml",
     "target": "local",
@@ -529,7 +529,7 @@ topology
     assert_eq!(
         document,
         r#"{
-  "plan_version": 1,
+  "plan_version": 2,
   "before": {
     "entrypoint": "resequenced-edges/before/main.yml",
     "target": "local",
@@ -685,7 +685,7 @@ interfaces
     assert_eq!(
         document,
         r#"{
-  "plan_version": 1,
+  "plan_version": 2,
   "before": {
     "entrypoint": "restated-defaults/before/main.yml",
     "target": "local",
@@ -914,7 +914,7 @@ for more about a code, run: agent-compose explain <code>
     assert_eq!(
         document,
         r#"{
-  "plan_version": 1,
+  "plan_version": 2,
   "failed": [
     {
       "spec": "after",

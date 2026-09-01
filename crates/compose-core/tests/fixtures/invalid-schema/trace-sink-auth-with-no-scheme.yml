@@ -1,0 +1,7 @@
+# rule: a trace_sink.auth declares at least one outbound scheme (grammar 14.5, 13.3)
+# at: /trace_sink/auth
+# via: /$defs/callbackAuth/anyOf
+version: "0.1"
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  auth: {}

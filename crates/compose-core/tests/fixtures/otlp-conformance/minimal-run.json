@@ -1,0 +1,201 @@
+{
+  "name": "minimal-run",
+  "about": "One node, one superstep, nothing else. The floor of the mapping: a root span, one entry span under it, the seven resource attributes, and the scope.",
+  "context": {
+    "target": "local",
+    "artifact": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T10:00:00.000Z",
+    "endedAt": "2026-09-01T10:00:02.500Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.greet",
+    "execution_id": "exec_minimal",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.greet",
+        "node": "say",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "greeting"
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.greet"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "local"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "local"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "7d7a64fbe4d3fe0e251b6cb57247bddb",
+                "spanId": "b9480f3b528f35ff",
+                "name": "flow.greet",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256802500000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_minimal"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.greet"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "7d7a64fbe4d3fe0e251b6cb57247bddb",
+                "spanId": "198fdde3adc91a80",
+                "parentSpanId": "b9480f3b528f35ff",
+                "name": "say",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256802500000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_minimal/say/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.greet"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "say"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "greeting"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

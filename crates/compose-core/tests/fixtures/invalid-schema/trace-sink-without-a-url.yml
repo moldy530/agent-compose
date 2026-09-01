@@ -1,0 +1,6 @@
+# rule: a trace_sink names the address its traces are POSTed to (grammar 14.5)
+# at: /trace_sink
+# via: /$defs/traceSink/required
+version: "0.1"
+trace_sink:
+  format: otlp

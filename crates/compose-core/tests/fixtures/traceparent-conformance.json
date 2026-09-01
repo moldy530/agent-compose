@@ -1,0 +1,143 @@
+[
+  {
+    "name": "version-00",
+    "about": "The header as the W3C trace context writes it. Both ids are carried through unchanged and the flags byte is carried as written.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "refuses": null,
+    "expected": {
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "00f067aa0ba902b7",
+      "flags": "01"
+    }
+  },
+  {
+    "name": "unsampled-flags",
+    "about": "`trace-flags` is carried, not interpreted: a caller that did not sample its own trace still names the trace this export joins.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+    "refuses": null,
+    "expected": {
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "00f067aa0ba902b7",
+      "flags": "00"
+    }
+  },
+  {
+    "name": "later-version-with-extra-fields",
+    "about": "The forward compatibility the specification asks of a parser: a version after `00` may append fields, and the four this parser knows are read out of it anyway.",
+    "header": "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-something-later",
+    "refuses": null,
+    "expected": {
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "00f067aa0ba902b7",
+      "flags": "01"
+    }
+  },
+  {
+    "name": "surrounding-whitespace",
+    "about": "A header value a proxy padded. The framing is not the caller's trace, so it is trimmed rather than refused.",
+    "header": "  00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01  ",
+    "refuses": null,
+    "expected": {
+      "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "spanId": "00f067aa0ba902b7",
+      "flags": "01"
+    }
+  },
+  {
+    "name": "no-header-at-all",
+    "about": "The commonest case by far: nobody traced into this execution, and the export derives a trace id of its own.",
+    "refuses": "absent",
+    "expected": null
+  },
+  {
+    "name": "three-fields",
+    "about": "A header cut short. Four fields are the floor of every version.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+    "refuses": "too-few-fields",
+    "expected": null
+  },
+  {
+    "name": "empty-header",
+    "about": "A header present and blank — what a client that set the name and forgot the value sends.",
+    "header": "",
+    "refuses": "too-few-fields",
+    "expected": null
+  },
+  {
+    "name": "version-not-hex",
+    "about": "A version that is not two hex digits is not a version this or any later specification defines.",
+    "header": "zz-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "refuses": "version-not-hex",
+    "expected": null
+  },
+  {
+    "name": "version-ff-is-reserved",
+    "about": "`ff` is reserved by the specification and must never be accepted — the one version that is refused despite being well formed.",
+    "header": "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    "refuses": "version-reserved",
+    "expected": null
+  },
+  {
+    "name": "version-00-with-a-fifth-field",
+    "about": "Version `00` is exactly four fields. A fifth is a header written against a version its own version byte does not claim.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+    "refuses": "version-00-extra-fields",
+    "expected": null
+  },
+  {
+    "name": "trace-id-uppercase",
+    "about": "The specification's hex is lowercase. An uppercase id is not the same string to a collector, so it is refused rather than folded.",
+    "header": "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+    "refuses": "trace-id-not-hex",
+    "expected": null
+  },
+  {
+    "name": "trace-id-too-short",
+    "about": "Thirty-one hex characters: a trace id of the wrong width is not a trace id.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01",
+    "refuses": "trace-id-wrong-width",
+    "expected": null
+  },
+  {
+    "name": "trace-id-all-zero",
+    "about": "The invalid trace id the specification names outright. Adopting it would publish every span under an id a collector drops.",
+    "header": "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+    "refuses": "trace-id-all-zero",
+    "expected": null
+  },
+  {
+    "name": "span-id-not-hex",
+    "about": "A parent id with a character outside `[0-9a-f]`.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902bz-01",
+    "refuses": "span-id-not-hex",
+    "expected": null
+  },
+  {
+    "name": "span-id-too-short",
+    "about": "Fifteen hex characters, which is a parent id nothing can be parented at.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b-01",
+    "refuses": "span-id-wrong-width",
+    "expected": null
+  },
+  {
+    "name": "span-id-all-zero",
+    "about": "The invalid parent id the specification names. A root parented at it is a root parented at nothing, said the wrong way.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+    "refuses": "span-id-all-zero",
+    "expected": null
+  },
+  {
+    "name": "flags-not-hex",
+    "about": "Two characters that are not two hex digits.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0x",
+    "refuses": "flags-not-hex",
+    "expected": null
+  },
+  {
+    "name": "trailing-dash",
+    "about": "A header that ended on its separator. It has four fields and the last of them is empty, which is a `trace-flags` that is not two hex digits rather than a field that is absent.",
+    "header": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-",
+    "refuses": "flags-not-hex",
+    "expected": null
+  }
+]

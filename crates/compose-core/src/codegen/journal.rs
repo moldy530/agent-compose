@@ -189,6 +189,7 @@ mod tests {
     #[test]
     fn a_delivery_is_journaled_before_it_is_attempted() {
         let serve = include_str!("js/serve.ts");
+        let delivery = include_str!("js/delivery.ts");
         let document = include_str!("../../../../docs/durability.md");
 
         let opening = function_body(serve, "opening");
@@ -196,7 +197,7 @@ mod tests {
             .find("intendDelivery(")
             .expect("a delivery records its intent");
         let sending = opening
-            .find("attempts(")
+            .find("workDelivery(")
             .expect("a delivery is then worked on its schedule");
         assert!(
             intent < sending,
@@ -210,7 +211,7 @@ mod tests {
              silent drop (grammar 13.3, PRD resolved q33)"
         );
 
-        let attempts = function_body(serve, "attempts");
+        let attempts = function_body(delivery, "workDelivery");
         let attempted = attempts
             .find("attemptDelivery(")
             .expect("the schedule makes attempts");
@@ -223,9 +224,24 @@ mod tests {
              can hold one"
         );
         assert!(
-            function_body(serve, "journaling").contains("recordDeliveryAttempt("),
-            "the seam `attempts` hands its outcomes to no longer reaches the journal, so an \
+            function_body(delivery, "journaling").contains("recordDeliveryAttempt("),
+            "the seam `workDelivery` hands its outcomes to no longer reaches the journal, so an \
              attempt is made and recorded nowhere (`docs/durability.md` §3.7)"
+        );
+
+        // The **trace sink's** intent, on the same ledger and in the same order:
+        // recorded where the lifecycle row closes, and never attempted from
+        // there (grammar 14.5, PRD resolved q50).
+        let ship = function_body(delivery, "shipTrace");
+        assert!(
+            ship.contains("intendDelivery("),
+            "a trace export is journaled like every other delivery, or a sink outage is a trace \
+             nothing will ever ship"
+        );
+        assert!(
+            !ship.contains("fetch("),
+            "`shipTrace` sends the trace itself, so the hook that closes a lifecycle row waits \
+             on a collector"
         );
 
         // …and the one place a delivery leaves the process is the declaration
@@ -233,6 +249,7 @@ mod tests {
         // a second `fetch`.
         let sites: Vec<String> = declarations(serve)
             .into_iter()
+            .chain(declarations(delivery))
             .filter(|(_, body)| body.contains("fetch("))
             .map(|(name, _)| name)
             .collect();
@@ -243,7 +260,7 @@ mod tests {
              `NOT_AN_EFFECT` names"
         );
 
-        for named in ["`attemptDelivery`", "`src/serve.ts`", "delivery"] {
+        for named in ["`attemptDelivery`", "`src/delivery.ts`", "delivery"] {
             assert!(
                 document.contains(named),
                 "`docs/durability.md` §3.7 does not name {named}, so the ledger this test binds \
@@ -277,9 +294,10 @@ mod tests {
     #[test]
     fn one_delivery_is_worked_once_and_a_row_that_ended_is_not_reopened() {
         let serve = include_str!("js/serve.ts");
+        let delivery = include_str!("js/delivery.ts");
         let journal = include_str!("js/journal.ts");
 
-        let attempts = function_body(serve, "attempts");
+        let attempts = function_body(delivery, "workDelivery");
         let claimed = attempts
             .find("working.add(")
             .expect("a delivery is claimed by the loop that works it");
@@ -296,7 +314,7 @@ mod tests {
             "a claim that is never released is a delivery this process would not pick up again"
         );
         assert!(
-            function_body(serve, "resumeDelivery").contains("working.has("),
+            function_body(serve, "resumeDelivery").contains("beingWorked("),
             "the start's walk over every `pending` row is the second direction one delivery is \
              reached from, so it is the one that has to ask whether the row is already being \
              worked"
@@ -313,13 +331,33 @@ mod tests {
             "the three ways a delivery row moves are a refusal, an exhaustion and an attempt: \
              {moved:?}"
         );
+        let mut refusals = 0;
         for statement in moved {
             assert!(
                 statement.contains("AND status = 'pending'"),
                 "a delivery has one outcome, so a row that already reached one is left as it is: \
                  {statement}"
             );
+            // …and the refusal carries one predicate more. `refused` is a
+            // **callback** row's outcome: a trace sink's address is the
+            // operator's and no list admits it, so there is nothing for one to
+            // fail to match (grammar 14.5, PRD resolved q50). The type of
+            // `refuseDelivery` says that for a row being opened; this is what
+            // says it for a row already on the ledger, which is addressed by
+            // execution and ordinal and carries no type to hold.
+            if statement.contains("status = 'refused'") {
+                refusals += 1;
+                assert!(
+                    statement.contains("AND (kind IS NULL OR kind = 'callback')"),
+                    "a statement that refuses a delivery would refuse a trace export too: \
+                     {statement}"
+                );
+            }
         }
+        assert_eq!(
+            refusals, 1,
+            "the ledger refuses a delivery in one statement, and this checked {refusals}"
+        );
     }
 
     /// **A journal write that fails loses neither the event nor the row's end**
@@ -361,6 +399,7 @@ mod tests {
     #[test]
     fn a_write_the_journal_refuses_leaves_neither_a_lost_event_nor_a_row_that_never_ends() {
         let serve = include_str!("js/serve.ts");
+        let delivery = include_str!("js/delivery.ts");
 
         let parking = function_body(serve, "parking");
         assert!(
@@ -392,7 +431,7 @@ mod tests {
              cannot tell a parking that was recorded from one that was lost"
         );
 
-        let attempts = function_body(serve, "attempts");
+        let attempts = function_body(delivery, "workDelivery");
         let held = attempts
             .find("owed.push(")
             .expect("an attempt's outcome is held before it is written");
@@ -411,7 +450,7 @@ mod tests {
              §3.7's two ends"
         );
 
-        let journaling = function_body(serve, "journaling");
+        let journaling = function_body(delivery, "journaling");
         let refused = journaling
             .find("return false;")
             .expect("`journaling` says when the journal would not take an attempt");
@@ -433,12 +472,51 @@ mod tests {
              row closes as it returns, so a journal that says no once loses the settle for the \
              life of the journal (`docs/durability.md` §3.7)"
         );
+        assert!(
+            closed[insisted..].contains("shipping(execution"),
+            "…and the trace export beside it, which the same closing row makes unrecoverable: a \
+             sink intent written after the row closed is one no start would ever find \
+             (grammar 14.5, PRD resolved q50)"
+        );
 
         assert!(
-            function_body(serve, "insisting").contains("JOURNAL_RETRY_MS["),
+            function_body(delivery, "insisting").contains("JOURNAL_RETRY_MS["),
             "the ladder a refused write is retried on is unbounded, which is a queue rather \
              than the courtesy §3.7 calls a webhook"
         );
+    }
+
+    /// **Every column added to a table after it existed has a probe.**
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` leaves a table that exists exactly as it is,
+    /// so a column the schema grew is a column an older file does not have — and
+    /// an `INSERT` naming it fails every new execution in that file.
+    /// `docs/durability.md` §11.2 makes a physical schema change compatible only
+    /// where it still reads older files, and the `PRAGMA table_info` probe is
+    /// what makes it one. This is the list of them, so a fourth column added
+    /// without a probe fails here rather than in somebody's journal.
+    #[test]
+    fn every_column_added_after_its_table_is_migrated_into_an_older_file() {
+        let journal = include_str!("js/journal.ts");
+        let migrated = function_body(journal, "migrated");
+        for (table, column, kind) in [
+            ("executions", "callback", "TEXT"),
+            ("executions", "traceparent", "TEXT"),
+            ("effects", "refused", "INTEGER NOT NULL DEFAULT 0"),
+            ("deliveries", "trigger_kind", "TEXT"),
+            ("deliveries", "kind", "TEXT"),
+        ] {
+            assert!(
+                migrated.contains(&format!("column[\"name\"] === \"{column}\"")),
+                "`{table}.{column}` is in the schema and nothing probes for it, so a journal \
+                 written before it would refuse every write that names it \
+                 (`docs/durability.md` §11.2)"
+            );
+            assert!(
+                migrated.contains(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind};")),
+                "`{table}.{column}` is probed for and not added, or added under another type"
+            );
+        }
     }
 
     /// The seven journaled seams, by the name each is declared under.
@@ -578,13 +656,14 @@ mod tests {
         //  * `releaseExecution` — grammar 11.1's `scope: execution` lifetime,
         //    run by `runFlow` when a run ends. It removes what the run owned;
         //    running it twice removes it twice.
-        //  * `attemptDelivery` — one attempt at an `http` trigger's lifecycle
-        //    webhook (grammar 13.3, `docs/durability.md` §3.7). It is a
-        //    journaled effect, and it is **not** one of the seven: a delivery
-        //    is not something the graph dispatches, is not addressed by an
-        //    instance path, and is never consumed by a replay — it is the
-        //    *lifecycle* being reported, so it has a ledger of its own beside
-        //    `effects`. What keeps a replay from making it twice is that
+        //  * `attemptDelivery` — one attempt at a lifecycle delivery: an `http`
+        //    trigger's `callback:` webhook, or the settled trace a
+        //    `trace_sink:` ships (grammar 13.3, 14.5, `docs/durability.md`
+        //    §3.7). It is a journaled effect, and it is **not** one of the
+        //    seven: a delivery is not something the graph dispatches, is not
+        //    addressed by an instance path, and is never consumed by a replay —
+        //    it is the *lifecycle* being reported, so it has a ledger of its own
+        //    beside `effects`. What keeps a replay from making it twice is that
         //    ledger's own at-least-once discipline, which
         //    `a_delivery_is_journaled_before_it_is_attempted` reads off the
         //    same seam rather than leaving it to this exemption.
@@ -598,7 +677,7 @@ mod tests {
         //    journal, which is what a replay *is*.
         const NOT_AN_EFFECT: [(&str, &str); 8] = [
             ("src/stores.ts", "releaseExecution"),
-            ("src/serve.ts", "attemptDelivery"),
+            ("src/delivery.ts", "attemptDelivery"),
             ("src/cli.ts", "writeTrace"),
             ("src/journal.ts", "SqliteJournal"),
             ("src/journal.ts", "openJournal"),
@@ -612,6 +691,8 @@ mod tests {
             ("src/stores.ts", include_str!("js/stores.ts")),
             ("src/journal.ts", include_str!("js/journal.ts")),
             ("src/serve.ts", include_str!("js/serve.ts")),
+            ("src/delivery.ts", include_str!("js/delivery.ts")),
+            ("src/otlp.ts", include_str!("js/otlp.ts")),
             ("src/cli.ts", include_str!("js/cli.ts")),
             ("src/cel.ts", include_str!("js/cel.ts")),
         ];

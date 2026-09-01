@@ -756,6 +756,30 @@ impl References {
             references.record(&token.value.name, "deploy.hub.join_token");
         }
 
+        // The trace sink's own credential, and it is the hub's: the hub owns
+        // the trace and is the process that ships it, so a worker that never
+        // exports one must not be asked for the token (PRD resolved q41, q50,
+        // `docs/distributed.md` §9.1). Unconditional past this gate, unlike
+        // `hub.join_token:` above, because there is no second key deciding
+        // whether the code that reads it exists: a target that declares a sink
+        // exports from every execution it settles, under `run` as under `serve`.
+        if let Some(sink) = &ir.deploy.trace_sink
+            && let Some(auth) = &sink.auth
+        {
+            if let Some(bearer) = &auth.bearer {
+                references.record(
+                    &bearer.token.value.name,
+                    "deploy.trace_sink.auth.bearer.token",
+                );
+            }
+            if let Some(hmac) = &auth.hmac {
+                references.record(
+                    &hmac.secret.value.name,
+                    "deploy.trace_sink.auth.hmac.secret",
+                );
+            }
+        }
+
         if let Some(triggers) = &ir.triggers {
             for (name, trigger) in &triggers.entries {
                 let TriggerKind::Http(http) = &trigger.kind else {
@@ -1342,6 +1366,71 @@ triggers:\n  intake:\n    type: http\n    flow: flow.support\n    callback: \"pa
             references.sites("WEBHOOK_TOKEN"),
             ["triggers.open.auth.bearer.token"]
         );
+    }
+
+    /// The trace sink's credential is a variable the deployment needs, and it is
+    /// the **hub's** (grammar 14.5, PRD resolved q41, q50).
+    ///
+    /// Two halves, and each is a different failure. Omitting it from the hub's
+    /// list is a deployment that starts clean and then ships every trace
+    /// unsigned — the sink answers 401 and the executions never notice, which is
+    /// exactly the silence an at-least-once delivery is designed to keep. Adding
+    /// it to a placement's is the false requirement `docs/distributed.md` §9.1
+    /// is written against: the hub owns the trace and is the only process that
+    /// exports one, so a worker refusing to join over a token it would never
+    /// spend is the compiler inventing a dependency.
+    #[test]
+    fn the_trace_sinks_credential_is_the_hubs_and_no_workers() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai\n  api_key: ${VENDOR_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+agent.signer:\n  model: model.smart\n  prompt: Sign what you are given.\n  input: { path: { type: string } }\n  output: { verdict: { type: string } }\n\
+flow.release:\n  inputs:\n    path: { type: string }\n  outputs: {}\n  nodes:\n    sign:\n      agent: agent.signer\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: sign }\n    - { from: sign, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.signer]\n\
+trace_sink:\n  url: \"https://collector.internal.example/v1/traces\"\n  auth:\n    bearer:\n      token: ${TRACE_SINK_TOKEN}\n    hmac:\n      secret: ${TRACE_SINK_SECRET}\n",
+        );
+
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Hub),
+            ["MESH_TOKEN", "TRACE_SINK_SECRET", "TRACE_SINK_TOKEN"],
+            "the hub owns the trace and is the process that ships it, so both sink credentials \
+             are its own"
+        );
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Placement("mac".to_string())),
+            ["VENDOR_KEY"],
+            "a worker exports no trace, so asking it for the sink's credentials would be the \
+             false requirement §9.1 exists to prevent"
+        );
+
+        let references = References::of(&ir);
+        assert_eq!(
+            references.sites("TRACE_SINK_TOKEN"),
+            ["deploy.trace_sink.auth.bearer.token"]
+        );
+        assert_eq!(
+            references.sites("TRACE_SINK_SECRET"),
+            ["deploy.trace_sink.auth.hmac.secret"]
+        );
+    }
+
+    /// …and a sink that authenticates nothing contributes nothing.
+    ///
+    /// The sibling of [`an_open_trigger_contributes_no_variable`]: an
+    /// unauthenticated collector on a private network is a posture grammar 14.5
+    /// admits, so declaring the section must not by itself put a variable on the
+    /// launch check.
+    #[test]
+    fn an_unauthenticated_trace_sink_contributes_no_variable() {
+        let references = References::of(&ir_of_mesh(
+            "version: \"0.1\"\n",
+            "version: \"0.1\"\n\
+trace_sink:\n  url: \"http://localhost:4318/v1/traces\"\n  format: otlp\n",
+        ));
+        assert!(references.is_empty(), "{references:?}");
     }
 
     /// A trigger declaring no credential contributes none.

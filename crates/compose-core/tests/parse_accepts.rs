@@ -759,6 +759,17 @@ storage_backends:
   aliases:
     docs_db: { provider: chroma, url: "${CHROMA_URL}", index: project-docs }
 
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  format: otlp
+  auth:
+    bearer:
+      token: ${TRACE_SINK_TOKEN}
+      header: X-Collector-Token
+      prefix: "Token "
+    hmac:
+      secret: ${TRACE_SINK_SECRET}
+
 event_sources:
   bug_reports:
     kind: sqs
@@ -802,6 +813,25 @@ event_sources:
 "#,
     );
     assert_eq!(document.kind(), DocumentKind::Deploy);
+}
+
+/// The sink's two smaller shapes, beside the maximal one above (grammar 14.5).
+///
+/// The minimal form is the one an author writes first — an address and nothing
+/// else — and it is what proves `format:` and `auth:` are genuinely optional
+/// rather than keys a reader downstream is expected to supply. The second is the
+/// other half of the `format:` table, which the maximal form spends on `otlp`:
+/// an accepted keyword nothing exercises is one only the negative corpus knows
+/// about.
+#[test]
+fn a_trace_sink_in_its_minimal_and_envelope_forms() {
+    for body in [
+        "trace_sink:\n  url: \"https://collector.internal.example/v1/traces\"\n",
+        "trace_sink:\n  url: \"http://localhost:4318/v1/traces\"\n  format: envelope\n  auth:\n    hmac:\n      secret: ${TRACE_SINK_SECRET}\n",
+    ] {
+        let document = accepts("deploy/staging.yml", &format!("version: \"0.1\"\n\n{body}"));
+        assert_eq!(document.kind(), DocumentKind::Deploy);
+    }
 }
 
 #[test]

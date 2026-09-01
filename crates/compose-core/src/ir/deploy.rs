@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::ast::common::{Address, EnvRef, Ident};
 use crate::ast::definition::StoreKind;
-use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue};
+use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue, TraceSinkFormat};
 use crate::diag::{Span, Spanned};
 
 use super::Section;
@@ -46,10 +46,39 @@ pub struct Deploy {
     /// it holds two maps rather than one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_backends: Option<StorageBackends>,
+    /// `trace_sink:` — where every settled execution's trace ships
+    /// (grammar 14.5, PRD resolved q50).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_sink: Option<TraceSink>,
     /// `event_sources:` — reserved grammar, keyed by the logical name an
     /// `event` trigger's `source:` names (grammar 14.4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_sources: Option<Section<EventSource>>,
+}
+
+/// The `trace_sink:` block, resolved (grammar 14.5, PRD resolved q50, q51).
+///
+/// A struct beside [`Section`] rather than one of them, for the reason [`Hub`]
+/// is: it is the deployment's own singleton rather than a map of named entries.
+///
+/// The grammar's defaults land **here** rather than being left to whoever reads
+/// the artifact: [`Self::format`] decides what a delivery's body is, and a
+/// reader that re-derived it differently would ship a collector something it
+/// cannot parse (the reading `inbound_auth`'s defaults take, one layer up).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TraceSink {
+    /// `url:` — the absolute address every settled execution's trace is POSTed
+    /// to.
+    pub url: Spanned<String>,
+    /// `format:` — what the body is, with grammar 14.5's default applied.
+    pub format: TraceSinkFormat,
+    /// `auth:` — how a delivery identifies itself to the sink, absent where the
+    /// collector wants no credential. The **outbound** shape of grammar 13.3,
+    /// resolved, so a sink delivery is signed by the headers a callback is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::ir::trigger::CallbackAuth>,
+    /// The section's own span.
+    pub span: Span,
 }
 
 /// The `hub:` block (grammar 14.2, Decision D130).

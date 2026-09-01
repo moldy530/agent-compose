@@ -1517,6 +1517,16 @@ export async function runFlow(
      */
     readonly callback?: string;
     /**
+     * The W3C `traceparent` the request that started this execution carried,
+     * where it carried a valid one (PRD resolved q51).
+     *
+     * `src/serve.ts` passes it and nothing else does, for `callback`'s reason:
+     * the trace this deployment exports at settle adopts its caller's trace, and
+     * the process that settles an execution need not be the one that read the
+     * header (`docs/trace.md` §12.3).
+     */
+    readonly traceparent?: string;
+    /**
      * Whether this is a **resumed** generation of an execution the journal
      * already holds (PRD resolved q29).
      *
@@ -1585,6 +1595,7 @@ export async function runFlow(
     inputs: parsed,
     sessionKey,
     ...(options.callback === undefined ? {} : { callback: options.callback }),
+    ...(options.traceparent === undefined ? {} : { traceparent: options.traceparent }),
     ...(options.resume === true ? { resuming: true } : {}),
   });
   try {

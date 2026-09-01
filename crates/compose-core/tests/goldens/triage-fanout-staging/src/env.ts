@@ -102,6 +102,12 @@ export const environmentReferences: readonly EnvironmentReference[] = [
     ],
   },
   {
+    name: "TRACE_SINK_TOKEN",
+    sites: [
+      "deploy.trace_sink.auth.bearer.token",
+    ],
+  },
+  {
     name: "TRIAGE_HOST",
     sites: [
       "flow.enrich.node.fetch.http.url",

@@ -6,8 +6,9 @@
 // the whole directory out and stop regenerating it.
 //
 // What this artifact's deploy layer declares: the placements a worker may claim,
-// the environment partition of `docs/distributed.md` §9.1, and the hub's own two
-// keys (grammar §14.1, §14.2).
+// the environment partition of `docs/distributed.md` §9.1, the hub's own two
+// keys, and the address every settled execution's trace ships to
+// (grammar §14.1, §14.2, §14.5).
 //
 // The partition is emitted here rather than derived at either end because §9.1
 // requires one answer under one artifact hash: the hub checks a join's `env_ok`
@@ -27,6 +28,13 @@
 // Both are narrower than the composition's whole environment exactly when a
 // placement takes something off the hub's — the least-privilege line PRD 5.10
 // draws and §9.1 computes: the hub cannot leak what it never held.
+//
+// `traceSink` is the last of them and the one this process **spends** rather
+// than reports: `./delivery.ts` reads it at every settle (grammar §14.5, PRD
+// resolved q50). It carries the format with its default already applied, so a
+// reader that re-derived it differently could not ship a collector a body it
+// cannot parse; and its `auth` is grammar §13.3's outbound block, which is why a
+// trigger's own `callbackAuth` satisfies the same type.
 
 /** One placement, and the environment a worker claiming it has to satisfy. */
 export interface PlacementManifest {
@@ -54,6 +62,43 @@ export interface PlacementManifest {
   readonly environment: readonly string[];
 }
 
+/**
+ * The identity a delivery this deployment makes carries (grammar §13.3).
+ *
+ * The **outbound** block, and the deploy layer's own copy of it: `trace_sink:`
+ * reuses grammar §13.3's shape rather than inventing one beside it, so a
+ * collector written against a trigger's `callback_auth:` verifies a trace export
+ * unchanged. `./triggers.ts`'s `CallbackAuth` is the same shape under the name
+ * the trigger surface gives it, and satisfies this type structurally — which is
+ * what lets `./delivery.ts` sign both kinds of delivery with one function.
+ *
+ * Never a credential: the **variable name** holding one, resolved by the process
+ * that spends it (grammar §4.3).
+ */
+export interface OutboundAuth {
+  readonly bearer?: {
+    readonly header: string;
+    readonly prefix: string;
+    readonly tokenEnv: string;
+  };
+  readonly hmac?: { readonly secretEnv: string };
+}
+
+/** `trace_sink:` — where every settled execution's trace goes (grammar §14.5). */
+export interface TraceSink {
+  /** The absolute address it is POSTed to. */
+  readonly url: string;
+  /**
+   * What the body is, with grammar §14.5's default already applied.
+   *
+   * `envelope` is the trace document itself (`docs/trace.md` §2); `otlp` is the
+   * OTLP/JSON `ExportTraceServiceRequest` `./otlp.ts` maps it to (§12).
+   */
+  readonly format: "envelope" | "otlp";
+  /** How a delivery identifies itself, absent where the collector wants nothing. */
+  readonly auth?: OutboundAuth;
+}
+
 export const placements: readonly PlacementManifest[] = [];
 
 export const hubEnvironment: readonly string[] = [
@@ -69,3 +114,7 @@ export const hubEnvironment: readonly string[] = [
 export const joinTokenEnv: string | undefined = undefined;
 
 export const publicUrl: string | undefined = undefined;
+
+export const deployTarget: string = "local";
+
+export const traceSink: TraceSink | undefined = undefined;

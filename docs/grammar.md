@@ -78,11 +78,11 @@ other, never both (Decision [D3](#d3-spec-files-and-deploy-files-are-disjoint-do
 | Kind | Selected by | May contain |
 |---|---|---|
 | **Spec file** | reachable from the entrypoint's `imports:`, or being the entrypoint | `version`, `imports` (entrypoint only), `defaults`, `state`, `triggers`, typed-address definition keys |
-| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `event_sources` |
+| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `trace_sink`, `event_sources` |
 
-A spec file that declares `hub`, `placements`, `storage_backends`, or
-`event_sources` is a compile error, and a deploy file that declares definitions,
-`imports`, `state`, `triggers`, or `defaults` is a compile error. This is the
+A spec file that declares `hub`, `placements`, `storage_backends`, `trace_sink`,
+or `event_sources` is a compile error, and a deploy file that declares
+definitions, `imports`, `state`, `triggers`, or `defaults` is a compile error. This is the
 mechanical enforcement of the PRD 5.8 per-target invariant: only the deploy layer
 forks per environment.
 
@@ -156,6 +156,7 @@ imports:
 | `hub` | illegal | illegal | allowed | ≤ 1 per target |
 | `placements` | illegal | illegal | allowed | ≤ 1 per target |
 | `storage_backends` | illegal | illegal | allowed | ≤ 1 per target |
+| `trace_sink` | illegal | illegal | allowed | ≤ 1 per target |
 | `event_sources` | illegal | illegal | allowed | ≤ 1 per target |
 
 "≤ 1 per composition" means the section may appear in **at most one file** of the
@@ -750,7 +751,7 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 |---|---|
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
-| `token`, `secret` | an `http` trigger's `auth:` and `callback_auth:` blocks (§13.3) |
+| `token`, `secret` | an `http` trigger's `auth:` and `callback_auth:` blocks (§13.3), and the deploy layer's `trace_sink.auth:` block (§14.5) |
 | `join_token` | the deploy layer's `hub:` block (§14.2) |
 
 The table classifies these field *names* wherever they occur; it never makes one
@@ -781,8 +782,8 @@ channel names, typed addresses, a store's `backend:` alias, a tool's
 `function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
 a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); the `header:` and
 `prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:` entry
-(§13.3); `hub.public_url:` (§14.2), which is shape-checked here and is part of
-what a deployment *is*; a `blob put`'s `content_type:` (§11.4); and every
+(§13.3); `hub.public_url:` (§14.2) and `trace_sink.url:` (§14.5), which are
+shape-checked here and are part of what a deployment *is*; a `blob put`'s `content_type:` (§11.4); and every
 enum-valued key.
 
 Nothing is interpolated in class 3, so an unescaped token there is an error
@@ -4426,12 +4427,15 @@ well-defined rather than a file the grammar half-recognizes (Decision
 [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)):
 
 - `deploy/local.yml` is OPTIONAL. When present it MAY declare `hub:`,
-  `placements:` and `event_sources:`. The first two are **live** static grammar
-  (§14.1, §14.2) and are checked under every target including `local`, which is
-  what a mesh looks like on one machine: this process is the hub, and an
-  `agent-compose worker` beside it is the spoke. `event_sources:` is reserved
-  grammar (§15), parsed, type-checked, and carried into the IR under every
-  target, so it is not inert there either.
+  `placements:`, `trace_sink:` and `event_sources:`. The first two are **live**
+  static grammar (§14.1, §14.2) and are checked under every target including
+  `local`, which is what a mesh looks like on one machine: this process is the
+  hub, and an `agent-compose worker` beside it is the spoke. `trace_sink:` is
+  live under `local` too, and deliberately: an `agent-compose run` on a laptop
+  settles executions like any other target, and §14.5 ships the trace of every
+  execution that settles. `event_sources:` is reserved grammar (§15), parsed,
+  type-checked, and carried into the IR under every target, so it is not inert
+  there either.
 - It MUST NOT declare `storage_backends:`. That section is *active* grammar which
   `local` overrides unconditionally: no alias and no per-kind default is ever
   consulted, so the block could only be an inert key whose author expected a
@@ -4472,6 +4476,13 @@ storage_backends:
     kv: { provider: redis, url: "${REDIS_URL}" }
   aliases:
     docs_db: { provider: chroma, url: "${CHROMA_URL}" }
+
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  format: otlp
+  auth:
+    bearer:
+      token: ${TRACE_SINK_TOKEN}
 
 event_sources:
   bug_reports:
@@ -4688,6 +4699,95 @@ Maps the logical `source:` names used by `event` triggers to infrastructure.
 |---|---|---|---|
 | `kind` | `redis_streams` \| `sqs` \| `nats` | yes | consumer plugin |
 | kind-specific | per plugin | per plugin | e.g. `url`, `stream`, `consumer_group`, `queue_url`, `subject` |
+
+### 14.5 `trace_sink`
+
+**Where every settled execution's trace goes.** Until this key there was no
+surface a collector could rely on: a trace is readable per execution — `run
+--format json`, the trace file, `GET /executions/:id`, a trigger's `callback:` —
+and every one of those is somebody asking for one trace. `trace_sink:` is the
+deployment saying, once, where all of them go (PRD resolved q50).
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `url` | absolute `http`/`https` URL | yes | the address every trace is POSTed to |
+| `format` | `envelope` \| `otlp` | no | what the body is; defaults to `envelope` |
+| `auth` | outbound signing block (§13.3) | no | how a delivery identifies itself |
+
+```yaml
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  format: otlp
+  auth:
+    bearer:
+      token: ${TRACE_SINK_TOKEN}
+```
+
+The rules (Decision
+[D134](#d134-the-trace-sink-is-operator-written-config-and-ships-on-the-delivery-ledger)):
+
+1. **`url:` is an absolute URL naming a host**, its scheme `http` or `https`
+   written lowercase, with **no wildcard** — the shape rule and the diagnostic
+   voice `hub.public_url:` takes (§14.2 rule 3), because it is the same thing:
+   this deployment's own address, written out, rather than a pattern matched
+   against a URL somebody else supplied. A class-3 string (§4.3): a collector
+   that differs per environment is what a second deploy file is for.
+2. **`format:` chooses what a delivery carries**, and defaults to `envelope`:
+   - `envelope` — the trace envelope itself, the exact object the trace file
+     holds (`docs/trace.md` §2), `Content-Type: application/json`;
+   - `otlp` — an OTLP/JSON `ExportTraceServiceRequest` mapped from that same
+     envelope, hand-emitted rather than produced by an SDK, over OTLP/HTTP with
+     `Content-Type: application/json`. `docs/trace.md` is normative for the
+     mapping — the span tree, the ids, the timestamps and the resource
+     attributes — and for the answer to a protobuf-only backend, which is to
+     point an OTel Collector at the sink (PRD resolved q51).
+3. **`auth:` is the outbound signing block of §13.3**, unchanged: `bearer:`,
+   `hmac:`, or both, with the same keys, the same defaults and the same
+   `X-AgentCompose-` header reservations. A sink delivery *is* a delivery — the
+   same journal-backed at-least-once machinery, the same headers — so a receiver
+   written against a `callback:` verifies one of these without being told
+   anything new. Omitting the block is a posture rather than an oversight: a
+   collector on a private network wants no credential.
+4. **There is no allowlist key, and none is required.** `callback_allow:` exists
+   because a callback URL comes out of a request payload and is
+   attacker-controlled by construction (§13.3, [D126](#d126-callback_auth-makes-callback_allow-mandatory));
+   this address is written by the operator in the deploy file and is trusted
+   exactly as a `storage_backends:` connection string is. An allowlist an
+   operator would write to admit the address they wrote on the line above is
+   ceremony, not a control.
+5. **Unknown keys are errors**, as everywhere outside a plugin-config object
+   ([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
+
+**What a sink costs a run: a retry, never an execution.** Delivery happens at
+settle, on the journal's delivery ledger — bounded retry, ordered per execution,
+and never blocking or failing the run it describes. A collector that is down
+costs deliveries their retries and the executions nothing (PRD resolved q35,
+q50).
+
+**It applies wherever executions settle under a target that declares it**, which
+includes `agent-compose run`, not only `serve`: the sink is a property of the
+target rather than of a serving process. What ships is the trace envelope and
+nothing else — the journal's payloads are private recovery data and stay home
+(`docs/durability.md` §8), and `docs/trace.md` §11's exclusions therefore hold
+for the sink by construction.
+
+**A caller's trace is joined rather than replaced.** Under `format: otlp`, an
+execution an `http` trigger started from a request carrying a valid W3C
+`traceparent` header exports **into** that caller's trace: the root span takes
+the caller's trace id and hangs off the caller's span, so a graph embedded in
+somebody else's system appears inside their trace rather than beside it
+(`docs/trace.md` §12.3, PRD resolved q51). A header that is not valid is ignored
+silently, which is the W3C behaviour — a caller's malformed header costs the
+execution nothing.
+
+The credential is a **deploy-layer** variable and belongs to the hub's
+environment manifest (PRD resolved q41): the hub owns the trace and is the
+process that ships it, so a worker is never asked for a token it would never
+spend (`docs/distributed.md` §9.1). It is §13.3's credential in this too: one
+that resolves to the **empty string** refuses `serve` at launch naming the
+variable, and a `run` — which has no launch to refuse at, and settles executions
+under this target all the same — says so on stderr and leaves the export
+`pending` on the ledger rather than signing it with nothing.
 
 ---
 
@@ -7915,6 +8015,61 @@ that a single generated manifest can express, and picking one silently would
 change what the other tool's code runs against. The refusal names both sides
 because either is the one to change. *PRD 5.9, 5.10, resolved q41, q45, q49.*
 
+### D134. The trace sink is operator-written config, and ships on the delivery ledger
+
+`trace_sink:` is a deploy-layer key beside `storage_backends:` (§14.5) taking
+`url:` (required, absolute `http`/`https`, no wildcard), `format:`
+(`envelope` | `otlp`, defaulting to `envelope`) and `auth:` — §13.3's **outbound**
+signing block, unchanged. Every settled execution's trace envelope is delivered
+to that address through the journal-backed at-least-once machinery a `callback:`
+already uses. There is deliberately **no allowlist key**, and `callback_allow:`
+has nothing to do with this surface.
+
+**Rationale.**
+
+*Why a deploy-layer key.* Where traces go is a property of an environment —
+staging's collector is not production's — and only this layer forks per
+environment (PRD 5.8). Putting it in a spec file would fork the half of a
+composition the per-target invariant exists to keep whole.
+
+*Why the existing delivery machinery, and no new one.* An export is a POST that
+must survive a restart, must not arrive twice out of order, and must never be
+able to fail the run it describes. That is exactly the ledger resolved q35 built
+for callbacks: bounded retry, ordered per execution, journaled. A second
+delivery path would be a second thing to make durable and a second thing to get
+wrong; a sink outage would then be able to cost an execution, which is the one
+outcome an observability feature must never buy.
+
+*Why no allowlist.* `callback_allow:` exists for a specific hazard — the callback
+URL comes out of a request payload and is attacker-controlled by construction, so
+a deployment careful enough to sign its deliveries must not send them wherever a
+payload said ([D126](#d126-callback_auth-makes-callback_allow-mandatory), D127).
+None of that is true here: this address is written by the operator, in the deploy
+file, beside the database credentials, and is trusted on exactly the terms a
+`storage_backends:` connection string is. An allowlist over it would be a list an
+operator writes to admit the URL they wrote on the line above — ceremony that
+teaches the wrong lesson about what the allowlist is for.
+
+*Why `auth:` is the outbound block rather than a new shape.* A sink delivery is a
+delivery: same ledger, same `X-AgentCompose-` headers, same fixed HMAC-SHA256
+signature. A receiver written against a `callback:` verifies one of these
+unchanged, and a second spelling of `bearer:`/`hmac:` would be a second set of
+defaults to keep in step for no gain.
+
+*Why `format:` and not two keys.* `envelope` and `otlp` are two renderings of one
+thing — the settled trace — sent to one address by one delivery. A second URL key
+would invite two sinks and the ordering question that comes with them; one key
+with two values keeps "where do the traces go" a question with one answer per
+target. The default is `envelope` because it is the trace this project documents
+and the one a reader can diff against the trace file, so OTLP is opted into
+rather than translated behind an author's back.
+
+*Why the credential is the hub's.* The hub owns the trace: workers stream their
+collectors home already, so no worker ever exports one. Filing the token under
+the hub keeps the per-placement manifest honest — a machine is asked only for
+what it spends (resolved q41, [`docs/distributed.md`](distributed.md) §9.1).
+*PRD resolved q33, q35, q41, q50, q51.*
+
 ---
 
 ## Appendix B — Editor integration
@@ -8007,7 +8162,9 @@ layer's third instance of it — `hub.join_token:` required as soon as
 `placements:` is non-empty, which is one `if`/`then` over two sections of one
 file (§14.2, D130) — and, beside it, a placement's non-empty `members:` list, its
 entries' distinctness, and the `agent.*`/`tool.*` pattern they take (§14.1,
-D129), the map form
+D129) — and, beside both, a `trace_sink:`'s required `url:`, its closed
+`format:`, and the at-least-one-scheme count its `auth:` inherits from
+`callback_auth:` (§14.5, D134), the map form
 rules and the `on_item_error` shape (§8.6) — including the confinement of
 `input:`/`writes:`/`detach:` to the homogeneous form (rule 7, D85) and the
 absence of any `context:` key, which is a `flow:` node's alone because a
@@ -8037,7 +8194,9 @@ map's `as:` (§2.5), and the absence of `${ENV}` tokens on the surfaces where §
 makes them illegal and a single string is the whole surface (`prompt:`, model
 `id:`, `embed.model:`, a trigger's `path:`/`cron:`/`timezone:`, the `header:` and
 `prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:`
-entry (§13.3), and a `blob put`'s `content_type:` — §4.3 class 3, D92). The
+entry (§13.3), a `blob put`'s `content_type:`, and the deploy layer's two
+written-out URLs, `hub.public_url:` and `trace_sink.url:` (§14.2, §14.5) —
+§4.3 class 3, D92). The
 validator owns the rest of class 3: CEL surfaces need the expression grammar,
 and descriptions and schema literals would need the same `not` repeated on
 dozens of properties, which the one-directional invariant does not require — a
@@ -8176,6 +8335,9 @@ version: "0.1"
 hub:              { join_token?: ${VAR}, public_url?: "https://<host>" }
 placements:       { <name>: { members: [agent.*|tool.*, ...], description? } }
 storage_backends: { defaults: { kv|vector|blob: {...} }, aliases: { <alias>: {...} } }
+trace_sink:       { url: "https://<host>/<path>", format?: envelope|otlp,
+                    auth?: { bearer?: {...}, hmac?: {...} } }   # 13.3's outbound
+                                   # block; no allowlist key, and none is wanted
 event_sources:    { <name>: { kind: ..., ... } }
 ```
 

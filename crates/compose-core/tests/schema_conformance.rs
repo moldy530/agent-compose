@@ -722,6 +722,94 @@ fn the_published_schema_accepts_the_whole_trigger_auth_surface() {
     }
 }
 
+/// Grammar 14.5's sink, in the direction the negative corpus cannot reach: the
+/// shapes the schema must **accept**.
+///
+/// Five fixtures under `invalid-schema/` pin the refusals — the missing `url:`,
+/// the wildcard in one, the closed `format:`, the closed key set, and the
+/// at-least-one-scheme count the `auth:` block inherits. Every one of those is a
+/// keyword whose *accepting* direction breaks silently: hoist `format` out of its
+/// `enum` arm into a `const`, close `auth:` the way inbound `auth:` is closed,
+/// or write the URL pattern one character tighter, and the schema refuses a sink
+/// `agent-compose validate` accepts. That leaves this workspace green and puts a
+/// red squiggle on correct YAML in somebody's editor, which is the asymmetry
+/// Appendix B forbids outright.
+///
+/// The example corpus reaches exactly one of these shapes — `deploy/staging.yml`
+/// carries a bearer-signed sink at the default format — so the rest are here.
+/// Each instance is run through the parser too, for the reason
+/// [`the_published_schema_accepts_the_whole_trigger_auth_surface`] does it: a
+/// shape the compiler accepts and the schema refuses is the pair disagreeing
+/// about the language.
+///
+/// The `format:` values are derived from
+/// [`TraceSinkFormat::ALL`](compose_core::ast::TraceSinkFormat) rather than
+/// listed, so a third rendering added to the compiler arrives with the editor
+/// either knowing it or failing here.
+#[test]
+fn the_published_schema_accepts_the_whole_trace_sink_surface() {
+    let validator = compile_schema();
+    let mut legal = vec![
+        // The minimal form: an address and nothing else. `format:` defaults and
+        // a collector on a private network wants no credential.
+        json!({ "url": "https://collector.internal.example/v1/traces" }),
+        // `http` and a port, which is what an OTel Collector on the same host
+        // is reached at — a pattern written one character too tight refuses it.
+        json!({ "url": "http://localhost:4318/v1/traces" }),
+        // Outbound signing, in each of the three shapes grammar 13.3 admits:
+        // either scheme alone, and — the asymmetry with an inbound `auth:` —
+        // both together.
+        json!({
+            "url": "https://collector.internal.example/v1/traces",
+            "auth": { "bearer": { "token": "${TRACE_SINK_TOKEN}", "header": "X-Collector-Token", "prefix": "Token " } },
+        }),
+        json!({
+            "url": "https://collector.internal.example/v1/traces",
+            "auth": { "hmac": { "secret": "${TRACE_SINK_SECRET}" } },
+        }),
+        json!({
+            "url": "https://collector.internal.example/v1/traces",
+            "auth": {
+                "bearer": { "token": "${TRACE_SINK_TOKEN}" },
+                "hmac": { "secret": "${TRACE_SINK_SECRET}" },
+            },
+        }),
+    ];
+    assert!(
+        !compose_core::ast::TraceSinkFormat::ALL.is_empty(),
+        "the format table is what this test quantifies over"
+    );
+    for format in compose_core::ast::TraceSinkFormat::ALL {
+        legal.push(json!({
+            "url": "https://collector.internal.example/v1/traces",
+            "format": format.as_str(),
+        }));
+    }
+
+    for sink in legal {
+        let instance = json!({ "version": "0.1", "trace_sink": sink });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal trace sink:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "deploy/staging.yml");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "the parser must accept what the published schema accepts:\n{source}\n{}",
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
 /// The two closed sets an inbound `hmac:` chooses between are one table each,
 /// written twice: once as the parser's keywords and once as an `enum` in the
 /// published schema (grammar 13.3, PRD resolved q32).

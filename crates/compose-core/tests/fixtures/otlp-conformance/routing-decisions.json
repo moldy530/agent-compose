@@ -1,0 +1,580 @@
+{
+  "name": "routing-decisions",
+  "about": "Four entries across three supersteps, with the whole of docs/trace.md §4 on them: a taken guard, a refused one, a spent `max_iterations` budget, an `else:` a guarded sibling suppressed, and a node its `on_error:` skipped. Routing travels as one JSON attribute plus the targets as an array (§12.5).",
+  "context": {
+    "target": "staging",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000a2",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T10:00:00.000Z",
+    "endedAt": "2026-09-01T10:00:09.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.review_loop",
+    "execution_id": "exec_routing",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.review_loop",
+        "node": "draft",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "draft"
+        ],
+        "routing": {
+          "edges": [
+            {
+              "to": "review",
+              "taken": true,
+              "reason": "unconditional"
+            }
+          ],
+          "targets": [
+            "review"
+          ],
+          "counters": {}
+        }
+      },
+      {
+        "step": 2,
+        "flow": "flow.review_loop",
+        "node": "review",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 2,
+        "writes": [
+          "verdict"
+        ],
+        "routing": {
+          "edges": [
+            {
+              "to": "draft",
+              "when": "review.output.verdict == 'revise'",
+              "value": true,
+              "budget": {
+                "key": "review->draft",
+                "used": 1,
+                "max": 3
+              },
+              "taken": true
+            },
+            {
+              "to": "end",
+              "else": true,
+              "taken": false,
+              "reason": "a guarded sibling was taken"
+            }
+          ],
+          "targets": [
+            "draft"
+          ],
+          "counters": {
+            "review->draft": 1
+          }
+        }
+      },
+      {
+        "step": 3,
+        "flow": "flow.review_loop",
+        "node": "draft",
+        "traversal": 1,
+        "outcome": "skipped",
+        "attempts": 1,
+        "writes": [],
+        "error": "NodeFailure: `draft` answered nothing this pass",
+        "routing": {
+          "edges": [
+            {
+              "to": "review",
+              "taken": true,
+              "reason": "unconditional"
+            }
+          ],
+          "targets": [
+            "review"
+          ],
+          "counters": {}
+        }
+      },
+      {
+        "step": 3,
+        "flow": "flow.review_loop",
+        "node": "review",
+        "traversal": 1,
+        "outcome": "completed",
+        "attempts": 1,
+        "routing": {
+          "edges": [
+            {
+              "to": "draft",
+              "when": "review.output.verdict == 'revise'",
+              "value": true,
+              "budget": {
+                "key": "review->draft",
+                "used": 3,
+                "max": 3
+              },
+              "taken": false,
+              "reason": "the `max_iterations` budget is spent"
+            },
+            {
+              "to": "end",
+              "else": true,
+              "taken": true
+            }
+          ],
+          "targets": [
+            "end"
+          ],
+          "counters": {}
+        }
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.review_loop"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000a2"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "4f9c822a65d1b7b77d6d2de3d2c3382c",
+                "spanId": "d08e1d82aeb89af1",
+                "name": "flow.review_loop",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256809000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_routing"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.review_loop"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "4f9c822a65d1b7b77d6d2de3d2c3382c",
+                "spanId": "da9352afdce5a361",
+                "parentSpanId": "d08e1d82aeb89af1",
+                "name": "draft",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256809000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_routing/draft/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.review_loop"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "draft"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "draft"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing",
+                    "value": {
+                      "stringValue": "{\"edges\":[{\"to\":\"review\",\"taken\":true,\"reason\":\"unconditional\"}],\"targets\":[\"review\"],\"counters\":{}}"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing.targets",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "review"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "4f9c822a65d1b7b77d6d2de3d2c3382c",
+                "spanId": "5c3c809121238805",
+                "parentSpanId": "d08e1d82aeb89af1",
+                "name": "review",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256809000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_routing/review/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.review_loop"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "review"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "verdict"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing",
+                    "value": {
+                      "stringValue": "{\"edges\":[{\"to\":\"draft\",\"when\":\"review.output.verdict == 'revise'\",\"value\":true,\"budget\":{\"key\":\"review->draft\",\"used\":1,\"max\":3},\"taken\":true},{\"to\":\"end\",\"else\":true,\"taken\":false,\"reason\":\"a guarded sibling was taken\"}],\"targets\":[\"draft\"],\"counters\":{\"review->draft\":1}}"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing.targets",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "draft"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "4f9c822a65d1b7b77d6d2de3d2c3382c",
+                "spanId": "33a0093dd026f391",
+                "parentSpanId": "d08e1d82aeb89af1",
+                "name": "draft",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256809000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_routing/draft/1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.review_loop"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "draft"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "skipped"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": []
+                      }
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "NodeFailure: `draft` answered nothing this pass"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing",
+                    "value": {
+                      "stringValue": "{\"edges\":[{\"to\":\"review\",\"taken\":true,\"reason\":\"unconditional\"}],\"targets\":[\"review\"],\"counters\":{}}"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing.targets",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "review"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 0
+                }
+              },
+              {
+                "traceId": "4f9c822a65d1b7b77d6d2de3d2c3382c",
+                "spanId": "78719e55dc21bccd",
+                "parentSpanId": "d08e1d82aeb89af1",
+                "name": "review",
+                "kind": 1,
+                "startTimeUnixNano": "1788256800000000000",
+                "endTimeUnixNano": "1788256809000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_routing/review/1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.review_loop"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "review"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing",
+                    "value": {
+                      "stringValue": "{\"edges\":[{\"to\":\"draft\",\"when\":\"review.output.verdict == 'revise'\",\"value\":true,\"budget\":{\"key\":\"review->draft\",\"used\":3,\"max\":3},\"taken\":false,\"reason\":\"the `max_iterations` budget is spent\"},{\"to\":\"end\",\"else\":true,\"taken\":true}],\"targets\":[\"end\"],\"counters\":{}}"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing.targets",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "end"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+# rule: `trace_sink.url:` is an absolute http/https URL (grammar 14.5)
+# code: invalid-value
+# message: "collector.internal.example/v1/traces" is not a `trace_sink.url`: it names no scheme, and a sink address is absolute
+# at: 9:8
+# help: the sink is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://collector.internal.example/v1/traces`; `http` stays legal, which is what makes a collector on the same host work (grammar 14.5, PRD resolved q50)
+version: "0.1"
+
+trace_sink:
+  url: "collector.internal.example/v1/traces"

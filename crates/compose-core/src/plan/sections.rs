@@ -188,6 +188,25 @@ pub(super) fn components(before: &Ir, after: &Ir) -> Vec<ComponentChange> {
         &[],
     );
 
+    // …and so is `trace_sink:`, for the same reason and by the same shape: one
+    // block of three keys, at one address (grammar 14.5, PRD resolved q50).
+    entry(
+        &mut found,
+        ComponentKind::TraceSink,
+        "trace_sink",
+        before
+            .deploy
+            .trace_sink
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        after
+            .deploy
+            .trace_sink
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        &[],
+    );
+
     let sources: BTreeSet<&str> = names(before.deploy.event_sources.as_ref())
         .chain(names(after.deploy.event_sources.as_ref()))
         .collect();

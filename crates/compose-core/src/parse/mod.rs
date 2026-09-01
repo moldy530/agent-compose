@@ -270,7 +270,13 @@ impl FileRole {
 }
 
 /// Sections that only a deploy file may carry (grammar 1.5).
-const DEPLOY_ONLY: &[&str] = &["hub", "placements", "storage_backends", "event_sources"];
+const DEPLOY_ONLY: &[&str] = &[
+    "hub",
+    "placements",
+    "storage_backends",
+    "trace_sink",
+    "event_sources",
+];
 /// Sections that only a spec file may carry (grammar 1.5).
 const SPEC_ONLY: &[&str] = &["imports", "defaults", "state", "triggers"];
 
@@ -395,6 +401,7 @@ fn deploy_file(
         placements: None,
         hub: None,
         storage_backends: None,
+        trace_sink: None,
         event_sources: None,
         span: root.span.clone(),
     };
@@ -408,6 +415,7 @@ fn deploy_file(
             "storage_backends" => {
                 file.storage_backends = deploy::storage_backends(&entry.value, cx);
             }
+            "trace_sink" => file.trace_sink = deploy::trace_sink(&entry.value, cx),
             "event_sources" => file.event_sources = deploy::event_sources(&entry.value, cx),
             _ if SPEC_ONLY.contains(&key) || is_definition_key(key) => {
                 misplaced(entry, DocumentKind::Spec, None, cx);
@@ -565,7 +573,7 @@ fn version(node: &Node, cx: &mut Cx) -> Option<Spanned<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticCode, FileRole, parse_as};
+    use super::{DEPLOY_ONLY, DiagnosticCode, FileRole, SPEC_ONLY, parse_as};
 
     const IMPORTS_NO_VERSION: &str = "imports:\n  - other.yml\n";
     const DEPLOY_NO_VERSION: &str =
@@ -633,5 +641,106 @@ mod tests {
     fn a_file_in_the_wrong_place_is_not_also_told_the_other_rule() {
         assert!(missing_version(DEPLOY_NO_VERSION, FileRole::Entrypoint).is_empty());
         assert!(missing_version(IMPORTS_NO_VERSION, FileRole::Deploy).is_empty());
+    }
+
+    /// The fragment of `document` between two markers, or a failure naming the
+    /// one that has moved.
+    ///
+    /// The prose is asserted about **where it enumerates**, not anywhere in the
+    /// file: `docs/grammar.md` names `trace_sink` in §14.5 whether or not §1.5's
+    /// table row does, so a whole-file search would pass over exactly the drift
+    /// below is written to catch. A reworded sentence fails here saying which
+    /// marker went missing, which is the same posture
+    /// `codegen::otlp::the_resource_attributes_are_the_documented_ones` takes to
+    /// the emitted source it reads.
+    fn enumeration<'a>(name: &str, document: &'a str, from: &str, to: &str) -> &'a str {
+        let after = document.split_once(from).unwrap_or_else(|| {
+            panic!("`{name}` no longer says `{from}`, so nothing here reads its list of sections")
+        });
+        after
+            .1
+            .split_once(to)
+            .unwrap_or_else(|| panic!("`{name}`'s `{from}` sentence no longer ends at `{to}`"))
+            .0
+    }
+
+    /// **The document-kind split is published in three places, and they must
+    /// agree with the mechanism.**
+    ///
+    /// [`DEPLOY_ONLY`] and [`SPEC_ONLY`] are what actually decides a file's kind
+    /// — the *disjoint* half of [`DEPLOY_SECTIONS`] and [`SPEC_SECTIONS`], since
+    /// `version:` belongs to both kinds and so is never what drifts.
+    /// A reader meets that decision three times: `docs/grammar.md` §1.5's table,
+    /// `agent-compose docs targets`, and — when they have just been refused —
+    /// `agent-compose explain misplaced-section`, which is the document the
+    /// diagnostic's own footer sends them to. A section added to the mechanism
+    /// and written into only two of them leaves that explanation claiming the key
+    /// the author just wrote belongs to neither document kind, which is error UX
+    /// (PRD G3) failing at the one moment it is being read.
+    #[test]
+    fn every_section_of_a_document_kind_is_named_wherever_the_split_is_published() {
+        // The two prose sentences are read with their newlines flattened,
+        // because both wrap and a list broken across lines is the same list. The
+        // grammar's is a table row, which ends *at* a newline, so it is read as
+        // it stands.
+        let grammar = include_str!("../../../../docs/grammar.md");
+        let targets = include_str!("../../../../docs/topics/targets.md").replace('\n', " ");
+        let explain = include_str!("../docs/codes/misplaced-section.md").replace('\n', " ");
+        let published: [(&str, &str, &str); 3] = [
+            (
+                "docs/grammar.md §1.5",
+                enumeration("docs/grammar.md", grammar, "| **Spec file** |", "|\n"),
+                enumeration("docs/grammar.md", grammar, "| **Deploy file** |", "|\n"),
+            ),
+            (
+                "docs/topics/targets.md",
+                enumeration(
+                    "docs/topics/targets.md",
+                    &targets,
+                    "a deploy file declaring",
+                    ".",
+                ),
+                enumeration(
+                    "docs/topics/targets.md",
+                    &targets,
+                    "a spec file declaring",
+                    " is an error",
+                ),
+            ),
+            (
+                "the `misplaced-section` explanation",
+                enumeration(
+                    "src/docs/codes/misplaced-section.md",
+                    &explain,
+                    "A spec file carries",
+                    ".",
+                ),
+                enumeration(
+                    "src/docs/codes/misplaced-section.md",
+                    &explain,
+                    "A deploy file carries",
+                    ".",
+                ),
+            ),
+        ];
+        for (place, spec, deploy) in published {
+            for (kind, sections, sentence) in [
+                ("spec-only", SPEC_ONLY, spec),
+                ("deploy-only", DEPLOY_ONLY, deploy),
+            ] {
+                for section in sections {
+                    assert!(
+                        sentence.contains(&format!("`{section}`"))
+                            || sentence.contains(&format!("`{section}:`")),
+                        "{place} does not name the {kind} section `{section}` where it lists \
+                         them: `{sentence}`. All three of `docs/grammar.md` §1.5, \
+                         `agent-compose docs targets` and `agent-compose explain \
+                         misplaced-section` publish this split, and the last one is what an \
+                         author reads *after* being refused for writing `{section}:` in the \
+                         wrong document."
+                    );
+                }
+            }
+        }
     }
 }

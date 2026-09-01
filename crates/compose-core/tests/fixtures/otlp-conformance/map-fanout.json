@@ -1,0 +1,596 @@
+{
+  "name": "map-fanout",
+  "about": "A `map` node's four dispatch records — completed, skipped, failed and detached — each a span under the map's entry, with the joined instances nested under their own records rather than under the map node. The four outcomes are the four rows of §12.4's dispatch line.",
+  "context": {
+    "target": "staging",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000c4",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T12:00:00.000Z",
+    "endedAt": "2026-09-01T12:00:20.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.batch",
+    "execution_id": "exec_fanout",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.batch",
+        "node": "fan",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "results"
+        ],
+        "dispatches": [
+          {
+            "index": 0,
+            "route": "urgent",
+            "variant": "urgent",
+            "target": "flow.handle",
+            "outcome": "completed",
+            "attempts": 1,
+            "idempotencyKey": "exec_fanout/fan/0/0",
+            "inner": [
+              {
+                "step": 1,
+                "flow": "flow.handle",
+                "node": "act",
+                "traversal": 0,
+                "outcome": "completed",
+                "attempts": 1,
+                "writes": [
+                  "done"
+                ]
+              }
+            ]
+          },
+          {
+            "index": 1,
+            "route": "$default",
+            "variant": "routine",
+            "target": "flow.handle",
+            "outcome": "skipped",
+            "attempts": 2,
+            "idempotencyKey": "exec_fanout/fan/0/1",
+            "error": "ItemFailure: item 1 failed and `on_item_error` dropped it"
+          },
+          {
+            "index": 2,
+            "target": "tool.notify",
+            "outcome": "failed",
+            "attempts": 3,
+            "idempotencyKey": "exec_fanout/fan/0/2",
+            "error": "ToolFailure: `tool.notify` exited 1"
+          },
+          {
+            "index": 3,
+            "target": "tool.notify",
+            "outcome": "detached",
+            "attempts": 0,
+            "idempotencyKey": "exec_fanout/fan/0/3"
+          }
+        ],
+        "routing": {
+          "edges": [
+            {
+              "to": "end",
+              "taken": true,
+              "reason": "unconditional"
+            }
+          ],
+          "targets": [
+            "end"
+          ],
+          "counters": {}
+        }
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.batch"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000c4"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "5647ea8a07ab44e202f07b9a6612172a",
+                "spanId": "262e7204b0da9abe",
+                "name": "flow.batch",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264020000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_fanout"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.batch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "5647ea8a07ab44e202f07b9a6612172a",
+                "spanId": "b344e72a797047a9",
+                "parentSpanId": "262e7204b0da9abe",
+                "name": "fan",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264020000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_fanout/fan/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.batch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "fan"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "results"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing",
+                    "value": {
+                      "stringValue": "{\"edges\":[{\"to\":\"end\",\"taken\":true,\"reason\":\"unconditional\"}],\"targets\":[\"end\"],\"counters\":{}}"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing.targets",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "end"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "5647ea8a07ab44e202f07b9a6612172a",
+                "spanId": "641889b42e02ed96",
+                "parentSpanId": "b344e72a797047a9",
+                "name": "flow.handle",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264020000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_fanout/fan/0/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.carrier",
+                    "value": {
+                      "stringValue": "map"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.index",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.target",
+                    "value": {
+                      "stringValue": "flow.handle"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.route",
+                    "value": {
+                      "stringValue": "urgent"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.variant",
+                    "value": {
+                      "stringValue": "urgent"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "5647ea8a07ab44e202f07b9a6612172a",
+                "spanId": "1dffcbacb26a840a",
+                "parentSpanId": "641889b42e02ed96",
+                "name": "act",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264020000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_fanout/fan/0/0/act/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.handle"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "act"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "done"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "5647ea8a07ab44e202f07b9a6612172a",
+                "spanId": "cb7b0f5aceae5cd3",
+                "parentSpanId": "b344e72a797047a9",
+                "name": "flow.handle",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264020000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_fanout/fan/0/1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.carrier",
+                    "value": {
+                      "stringValue": "map"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.index",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.target",
+                    "value": {
+                      "stringValue": "flow.handle"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.outcome",
+                    "value": {
+                      "stringValue": "skipped"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.route",
+                    "value": {
+                      "stringValue": "$default"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.variant",
+                    "value": {
+                      "stringValue": "routine"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "ItemFailure: item 1 failed and `on_item_error` dropped it"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 0
+                }
+              },
+              {
+                "traceId": "5647ea8a07ab44e202f07b9a6612172a",
+                "spanId": "c71530ac105146c1",
+                "parentSpanId": "b344e72a797047a9",
+                "name": "tool.notify",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264020000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_fanout/fan/0/2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.carrier",
+                    "value": {
+                      "stringValue": "map"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.index",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.target",
+                    "value": {
+                      "stringValue": "tool.notify"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "ToolFailure: `tool.notify` exited 1"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "ToolFailure: `tool.notify` exited 1"
+                }
+              },
+              {
+                "traceId": "5647ea8a07ab44e202f07b9a6612172a",
+                "spanId": "e44306f9f35b7a10",
+                "parentSpanId": "b344e72a797047a9",
+                "name": "tool.notify",
+                "kind": 1,
+                "startTimeUnixNano": "1788264000000000000",
+                "endTimeUnixNano": "1788264020000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_fanout/fan/0/3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.carrier",
+                    "value": {
+                      "stringValue": "map"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.index",
+                    "value": {
+                      "intValue": "3"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.target",
+                    "value": {
+                      "stringValue": "tool.notify"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.dispatch.outcome",
+                    "value": {
+                      "stringValue": "detached"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 0
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

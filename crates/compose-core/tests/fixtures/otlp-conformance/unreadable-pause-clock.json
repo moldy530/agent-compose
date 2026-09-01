@@ -1,0 +1,328 @@
+{
+  "name": "unreadable-pause-clock",
+  "about": "The one input that reaches the exporter's instant guard: a `human` pause whose clock cannot be parsed. The envelope's instants are the runtime's own `toISOString()`, so nothing writes this document today — which is exactly why the guard needs a fixture, because a guard no input reaches is a guard nothing holds honest. An instant this exporter cannot read degrades to a point inside the execution's window rather than to the epoch, where a collector would render the wait in 1970 (§12.4). The first pause loses its `pausedAt` and keeps its `settledAt`; the second keeps its `pausedAt` and loses its `settledAt`. That pairing is the point: a span's edges and the events stamped on them degrade to the same instants, so the placement §12.4 publishes — `human.paused` at its span's start, `human.settled` at its span's end — survives a clock nobody can read.",
+  "context": {
+    "target": "staging",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000c1",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T09:00:00.000Z",
+    "endedAt": "2026-09-01T09:30:00.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.approve",
+    "execution_id": "exec_unreadable_clock",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.approve",
+        "node": "sign_off",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "decision"
+        ],
+        "human": {
+          "pausedAt": "not an instant",
+          "settledAt": "2026-09-01T09:20:00.000Z",
+          "settled": "resumed"
+        }
+      },
+      {
+        "step": 2,
+        "flow": "flow.approve",
+        "node": "counter_sign",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "counter_signature"
+        ],
+        "human": {
+          "pausedAt": "2026-09-01T09:25:00.000Z",
+          "settledAt": "not an instant",
+          "settled": "resumed"
+        }
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.approve"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000c1"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "staging"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "6c3bc209e072923abcfcd597ab2bf2eb",
+                "spanId": "d2c9955e9c691651",
+                "name": "flow.approve",
+                "kind": 1,
+                "startTimeUnixNano": "1788253200000000000",
+                "endTimeUnixNano": "1788255000000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_unreadable_clock"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.approve"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "6c3bc209e072923abcfcd597ab2bf2eb",
+                "spanId": "b6a6316addd66fc0",
+                "parentSpanId": "d2c9955e9c691651",
+                "name": "sign_off",
+                "kind": 1,
+                "startTimeUnixNano": "1788253200000000000",
+                "endTimeUnixNano": "1788254400000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_unreadable_clock/sign_off/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.approve"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "sign_off"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "decision"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788253200000000000",
+                    "name": "human.paused",
+                    "attributes": []
+                  },
+                  {
+                    "timeUnixNano": "1788254400000000000",
+                    "name": "human.settled",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.human.settled",
+                        "value": {
+                          "stringValue": "resumed"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "6c3bc209e072923abcfcd597ab2bf2eb",
+                "spanId": "573b16cb61a5a3b5",
+                "parentSpanId": "d2c9955e9c691651",
+                "name": "counter_sign",
+                "kind": 1,
+                "startTimeUnixNano": "1788254700000000000",
+                "endTimeUnixNano": "1788254700000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_unreadable_clock/counter_sign/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.approve"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "counter_sign"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "counter_signature"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788254700000000000",
+                    "name": "human.paused",
+                    "attributes": []
+                  },
+                  {
+                    "timeUnixNano": "1788254700000000000",
+                    "name": "human.settled",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.human.settled",
+                        "value": {
+                          "stringValue": "resumed"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
