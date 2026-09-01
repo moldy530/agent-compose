@@ -195,6 +195,20 @@ export const httpTriggers: readonly HttpTrigger[] = [
     },
   },
   {
+    name: "on_attested",
+    flow: "flow.attested",
+    path: "/attestations",
+    method: "POST",
+    respond: "async",
+    readsBody: true,
+    input: (payload) => {
+      const bound = roots(payload);
+      return {
+        "path": runtime.toJson(runtime.evaluate("payload.body.path", bound)),
+      };
+    },
+  },
+  {
     name: "on_batch",
     flow: "flow.batch",
     path: "/batches",

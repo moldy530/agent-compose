@@ -61,6 +61,7 @@ export const placements: readonly PlacementManifest[] = [
       "agent.signer",
       "tool.sign",
       "tool.stamp",
+      "agent.stamper",
       "agent.escalator",
     ],
     environment: [
