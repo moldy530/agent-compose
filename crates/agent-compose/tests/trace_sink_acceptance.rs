@@ -346,16 +346,17 @@ fn a_collector_that_refuses_once_is_retried_under_one_delivery_id() {
 
 /// **A collector that is not there costs the run nothing** (PRD resolved q50).
 ///
-/// The other half of "never blocks or fails the run it describes", and it is
-/// asserted on a `run` rather than on a served request because a command is where
-/// blocking would be visible: `serve` answers `202` before the run settles, so an
-/// export that hung would hide behind the response, while `agent-compose run`
-/// prints its answer and exits and a hang there is the command not returning.
+/// The *fails* half of "never blocks or fails the run it describes": a refused
+/// connection is not a failed execution, the exit code is `0`, the outputs are
+/// the flow's own and the trace file is still written.
 ///
-/// The exit code is `0` and the outputs are the flow's own: an unreachable
-/// collector is not a failed execution, and the trace file is still written.
+/// It is deliberately **not** the *blocks* half, and cannot be: a closed port
+/// answers `ECONNREFUSED` at once, so a command that waited on the export before
+/// answering would answer just as fast and this test would pass either way. That
+/// claim needs a collector that takes the connection and holds it, and it is
+/// [`a_collector_that_never_answers_does_not_hold_up_a_runs_report`] below.
 #[test]
-fn a_collector_that_is_not_there_neither_fails_nor_holds_up_a_run() {
+fn a_collector_that_is_not_there_does_not_fail_a_run() {
     let provider = MockProvider::start().expect("a loopback port");
     let (_composition, entrypoint) = harness::staged_with_deploy(
         "sink-absent",
@@ -377,6 +378,119 @@ fn a_collector_that_is_not_there_neither_fails_nor_holds_up_a_run() {
     let outputs = run.succeeded().outputs();
     assert_eq!(outputs["greeting"], "hello", "{outputs:#}");
     assert_eq!(outputs["noted"], "seen", "{outputs:#}");
+}
+
+/// **The run's answer comes out while its export is still in flight** (PRD
+/// resolved q50: the sink "never blocks … the run it describes").
+///
+/// The *blocks* half, and the only test in this suite that can make it: the
+/// collector here takes the connection and never answers, so the one attempt a
+/// command makes sits there for the delivery client's whole per-attempt budget —
+/// ten seconds, `src/delivery.ts`'s `DELIVERY_TIMEOUT_MS`. Against that budget
+/// the ordering in `src/cli.ts` becomes observable rather than merely written
+/// down: the report is printed by `executing` and only then is `shipped`
+/// awaited, so the answer is on stdout while the POST is outstanding.
+///
+/// What is asserted is exactly that interleaving, in the order it has to happen:
+///
+///  1. the complete answer parses off stdout;
+///  2. the collector has taken a connection — so the export really is under way,
+///     rather than the run having exported nothing at all;
+///  3. **two seconds later the command is still going** — it is waiting out the
+///     attempt it started after answering.
+///
+/// Reverse the two lines in `execute` and every step fails at once: the answer
+/// would not appear until the attempt timed out, and the process would exit on
+/// its heels rather than linger. Two seconds is the slack — a fifth of the
+/// budget — that keeps the third step a statement about ordering rather than
+/// about how fast a machine is.
+///
+/// And the run is unharmed: exit `0`, the flow's own outputs, and a ledger row
+/// that records the attempt this command really waited out.
+///
+/// The schedule is **one** attempt rather than [`FAST_RETRY`]'s three, which is
+/// this test's own arithmetic rather than a preference: a command attempts every
+/// offset already due, so three would be thirty seconds of black hole for a claim
+/// ten seconds already makes.
+#[test]
+fn a_collector_that_never_answers_does_not_hold_up_a_runs_report() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let hole = harness::Blackhole::start().expect("a loopback socket");
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-unanswered",
+        FIXTURE,
+        TARGET,
+        &sink_target(&format!("{}/v1/traces", hole.base_url), None, false),
+    );
+    let Some(project) = harness::scratch_project("sink-unanswered") else {
+        return;
+    };
+    let mut once = environment(&provider);
+    once.push((harness::CALLBACK_RETRY.to_string(), "0s".to_string()));
+    let mut running = harness::run_target_spawned(
+        &project,
+        &entrypoint,
+        TARGET,
+        "flow.greet",
+        &[("subject", "nobody")],
+        &once,
+    );
+
+    // 1. The answer, off the pipe of a process that has not exited. The budget is
+    //    the command's whole life — it validates, builds and installs before it
+    //    runs anything — rather than a claim about how long any of that takes.
+    let outputs = running.report(Duration::from_secs(600));
+    assert_eq!(outputs["greeting"], "hello", "{outputs:#}");
+    assert_eq!(outputs["noted"], "seen", "{outputs:#}");
+
+    // 2. …and the export is under way, which is what makes step 3 about the sink
+    //    rather than about a command that happened to be slow to exit.
+    harness::until(PATIENCE, || (hole.reached() >= 1).then_some(()));
+
+    // 3. The command is still there, waiting out the attempt it began *after* it
+    //    answered.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        running.still_running(),
+        "the run exited while the export it had just started was still unanswered, so the \
+         answer above was printed after the delivery rather than before it:\n{}",
+        running.said()
+    );
+
+    let run = running.finish();
+    let outputs = run.succeeded().outputs();
+    assert_eq!(outputs["greeting"], "hello", "{outputs:#}");
+
+    // The ledger's account of the attempt the command waited out: one row, of the
+    // export's kind, ended by the schedule rather than by an answer — and the
+    // detail is the per-attempt budget, which is what the two seconds above were
+    // borrowed from.
+    let rows = harness::journal_rows(
+        &project,
+        "SELECT kind, status, attempts FROM deliveries ORDER BY ordinal ASC",
+    );
+    let held = rows.as_array().expect("the query answers rows");
+    assert_eq!(held.len(), 1, "one delivery on this execution: {rows:#}");
+    assert_eq!(held[0]["kind"], "trace_sink", "{rows:#}");
+    assert_eq!(held[0]["status"], "exhausted", "{rows:#}");
+    let attempts: Value = serde_json::from_str(
+        held[0]["attempts"]
+            .as_str()
+            .expect("the attempts column is JSON text"),
+    )
+    .expect("the attempts column parses");
+    assert_eq!(
+        attempts.as_array().map(Vec::len),
+        Some(1),
+        "the one attempt the schedule allowed, and it ended: {attempts:#}"
+    );
+    assert!(
+        attempts[0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not answer"),
+        "the attempt ended on its own budget rather than on a refusal: {attempts:#}"
+    );
 }
 
 /// **A `run` under a target that declares a sink exports too** (PRD resolved

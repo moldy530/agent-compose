@@ -461,6 +461,156 @@ pub fn run_target(
     Run { output }
 }
 
+/// The same command as [`run_target`], **spawned** rather than waited on.
+///
+/// [`run_target`] can only say what a finished run produced, and there is one
+/// claim that is not about the finished run: PRD resolved q50's "never blocks the
+/// run it describes". A trace export that a command waited on before answering
+/// would still answer, so an assertion over the collected output cannot tell the
+/// two orders apart — what tells them apart is *when* the answer appeared
+/// relative to the export still being in flight. So this hands the command back
+/// while it is still going, and [`Running`] is where that is asked.
+pub fn run_target_spawned(
+    out: &Path,
+    entrypoint: &Path,
+    target: &str,
+    flow: &str,
+    inputs: &[(&str, &str)],
+    environment: &[(String, String)],
+) -> Running {
+    let mut command = agent_compose();
+    command.arg("run").arg(entrypoint).arg(flow);
+    for (field, value) in inputs {
+        command.arg("--input").arg(format!("{field}={value}"));
+    }
+    command.args(["--target", target]).arg("--out").arg(out);
+    seal(&mut command, environment);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    Running::of(command.spawn().expect("the command runs"))
+}
+
+/// A command that has not finished, and what it has said so far.
+///
+/// Both pipes are drained by threads of their own rather than read on demand,
+/// for two reasons that are really one: a pipe nobody reads fills and blocks the
+/// process writing it — which would make this harness the thing holding the run
+/// up — and a caller polling for a *complete* answer has to be able to look at
+/// the bytes so far without committing to a blocking read that may never return.
+pub struct Running {
+    child: Child,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Running {
+    fn of(mut child: Child) -> Self {
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let mut readers = Vec::new();
+        let out = child.stdout.take().expect("stdout was piped");
+        readers.push(drain(out, Arc::clone(&stdout)));
+        let err = child.stderr.take().expect("stderr was piped");
+        readers.push(drain(err, Arc::clone(&stderr)));
+        Self {
+            child,
+            stdout,
+            stderr,
+            readers,
+        }
+    }
+
+    /// The flow's outputs, as soon as the whole JSON object is on stdout.
+    ///
+    /// Polled rather than read to end-of-file, which is the whole point: the
+    /// answer is complete long before the process exits, and waiting for the pipe
+    /// to close would be waiting for exactly the thing under test.
+    pub fn report(&self, budget: Duration) -> Value {
+        let deadline = Instant::now() + budget;
+        loop {
+            let held = self.stdout.lock().expect("the stdout buffer").clone();
+            if let Ok(answer) = serde_json::from_slice::<Value>(&held) {
+                return answer;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the run printed no complete answer inside {budget:?}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&held),
+                self.said(),
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Whether the command is still going.
+    pub fn still_running(&mut self) -> bool {
+        self.child
+            .try_wait()
+            .expect("the command is waited on")
+            .is_none()
+    }
+
+    /// Everything on stderr so far.
+    pub fn said(&self) -> String {
+        String::from_utf8_lossy(&self.stderr.lock().expect("the stderr buffer").clone())
+            .into_owned()
+    }
+
+    /// Wait for the command and answer with the whole run, as [`run_target`] would.
+    pub fn finish(mut self) -> Run {
+        let status = self.child.wait().expect("the command is waited on");
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        Run {
+            output: Output {
+                status,
+                stdout: self.stdout.lock().expect("the stdout buffer").clone(),
+                stderr: self.stderr.lock().expect("the stderr buffer").clone(),
+            },
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let group = self.child.id();
+        #[cfg(unix)]
+        if let Ok(pid) = libc::pid_t::try_from(group) {
+            // SAFETY: this process's own child, unreaped until the `wait` below.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+        gone(group);
+    }
+}
+
+/// Read one pipe to its end, into a buffer the test can look at meanwhile.
+fn drain(
+    mut pipe: impl Read + Send + 'static,
+    into: Arc<Mutex<Vec<u8>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => into
+                    .lock()
+                    .expect("the buffer")
+                    .extend_from_slice(&chunk[..read]),
+            }
+        }
+    })
+}
+
 /// What `validate` said about a project.
 pub fn validate(name: &str, target: &str) -> Output {
     validate_entrypoint(&fixture(name), target)
@@ -1520,8 +1670,9 @@ impl Served {
         if self.reaped {
             return;
         }
+        let group = self.child.id();
         #[cfg(unix)]
-        if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+        if let Ok(pid) = libc::pid_t::try_from(group) {
             // SAFETY: this process's own child, unreaped until the `wait`
             // below, so its group is still its own.
             unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -1529,6 +1680,7 @@ impl Served {
         let _ = self.child.kill();
         let _ = self.child.wait();
         self.reaped = true;
+        gone(group);
     }
 
     /// Wait for the command to exit and answer with its status.
@@ -1544,13 +1696,14 @@ impl Drop for Served {
         if self.reaped {
             return;
         }
+        let group = self.child.id();
         #[cfg(unix)]
         {
             // The negated pid is the group [`serve`] spawned the command into,
             // so this reaches the emitted app as well as the command that
             // launched it. `ESRCH` — a group whose members are already gone — is
             // an expected answer and is ignored like every other.
-            if let Ok(pid) = libc::pid_t::try_from(self.child.id()) {
+            if let Ok(pid) = libc::pid_t::try_from(group) {
                 // SAFETY: `pid` is this process's own child, unreaped until the
                 // `wait` below, so its group is still its own.
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -1558,7 +1711,47 @@ impl Drop for Served {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        gone(group);
     }
+}
+
+/// Wait until nothing is left of a stopped [`Served`]'s **process group**.
+///
+/// A signal is delivered, not completed. `wait` reaps the `agent-compose serve`
+/// command and nothing else — the emitted app it launched is a *grandchild*,
+/// signalled with the group and reaped by init — so a `SIGKILL` returning is not
+/// the app being gone, and what the app was holding when it was killed is still
+/// held for as long as the kernel takes to tear it down. That gap is a real one:
+/// the app holds the SQLite journal, and a test that dropped a [`Served`] and
+/// opened that journal on the very next line met `database is locked` under
+/// load.
+///
+/// So the group is polled until it is empty. `kill(-pgid, 0)` is a liveness
+/// question rather than a signal, and it can only be asked *after* the leader
+/// has been reaped — an unreaped zombie is still a member of its own group and
+/// would answer "alive" for ever.
+///
+/// Bounded, and silent when the budget runs out: this runs in a `Drop` at the
+/// end of a test that has already made its assertions, and a harness that
+/// panicked here would replace a real failure with its own.
+fn gone(group: u32) {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(group) else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            // SAFETY: signal `0` performs the permission and existence checks
+            // and delivers nothing.
+            if unsafe { libc::kill(-pid, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = group;
 }
 
 /// `agent-compose serve <fixture> --port 0`, pointed at the mock.
@@ -1804,23 +1997,46 @@ fn journal_driver(project: &Path, sql: &str, query: bool) -> Output {
     .expect("the driver is copied into the project");
     let script = project.join("journal-sql.sql");
     std::fs::write(&script, sql).expect("the project directory is writable");
-    let mut command = bun();
-    command
-        .arg(&driver)
-        .arg(project.join(".agent-compose").join("journal.sqlite"))
-        .arg(&script);
-    if query {
-        command.arg("--query");
+    // **A lock is waited out rather than failed on**, which is the last of three
+    // guards against a `database is locked` that is really about timing:
+    //
+    //  * [`gone`] waits for the killed app's process group to be empty, so a lock
+    //    still there afterwards has no living owner;
+    //  * the driver then waits out `LOCK_WAIT_MS` and breaks that lock exactly as
+    //    the emitted `src/journal.ts` does — a `mkdir` lock does not die with the
+    //    process holding it, so waiting alone can never clear one;
+    //  * and this covers what neither does: a *live* writer, since `journal_rows`
+    //    is asked of journals a running `serve` is still writing.
+    //
+    // Without all three, a suite running at full parallelism turns "the surgery
+    // ran a heartbeat too early" into a failed assertion about durability.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut command = bun();
+        command
+            .arg(&driver)
+            .arg(project.join(".agent-compose").join("journal.sqlite"))
+            .arg(&script);
+        if query {
+            command.arg("--query");
+        }
+        seal(&mut command, &[]);
+        let output = command.output().expect("bun runs");
+        if output.status.success() {
+            return output;
+        }
+        let said = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let locked = said.contains("database is locked") || said.contains("SQLITE_BUSY");
+        assert!(
+            locked && Instant::now() < deadline,
+            "the journal script did not run:\n{said}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
-    seal(&mut command, &[]);
-    let output = command.output().expect("bun runs");
-    assert!(
-        output.status.success(),
-        "the journal script did not run:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    output
 }
 
 /// The states a status report can be asserted about: an execution has either
