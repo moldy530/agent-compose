@@ -777,22 +777,60 @@ fn callback_auth(
         return None;
     }
     let context = format!("the `callback_auth` of {subject}");
-    let mapping = expect_mapping(&entry.value, &context, cx)?;
-    let mut block = Fields::new(mapping, entry.value.span.clone(), &context);
+    let scheme = outbound_auth(
+        &entry.key.span,
+        &entry.value,
+        &context,
+        "a `callback_auth`",
+        CALLBACK_AUTH_WITHOUT_A_SCHEME,
+        cx,
+    )?;
+    Some(Spanned::new(scheme, entry.value.span.clone()))
+}
+
+/// What a `callback_auth:` declaring neither scheme is told.
+const CALLBACK_AUTH_WITHOUT_A_SCHEME: &str = "`hmac` signs the delivered body and `bearer` sends a static token; a delivery that carries neither is what leaving `callback_auth:` out already means, and that posture needs no allowlist (grammar 13.3, PRD resolved q33)";
+
+/// Read an **outbound** signing block: how a delivery this deployment sends
+/// identifies itself to whoever receives it (grammar 13.3, PRD resolved q33).
+///
+/// Shared by the two surfaces that send one — an `http` trigger's
+/// `callback_auth:` and the deploy layer's `trace_sink.auth:` (grammar 14.5,
+/// PRD resolved q50) — because they are one wire contract and not two: both are
+/// deliveries on the journal's delivery ledger, both write the
+/// `X-AgentCompose-` headers, and a receiver written against one verifies the
+/// other. A second reader would be a second set of defaults to keep in step.
+///
+/// **At least** one scheme, unlike inbound `auth:`: a delivery is this
+/// deployment's own request, so signing it and carrying a token are two things
+/// one receiver may both want, and the resolved question says "and/or".
+///
+/// `anchor` is the key that introduces the block — a missing scheme is about
+/// the key rather than about anything inside it — `what` names it in the
+/// message ("a `callback_auth`"), and `help` is what that surface tells an
+/// author who declared neither.
+pub(crate) fn outbound_auth(
+    anchor: &Span,
+    value: &Node,
+    context: &str,
+    what: &str,
+    help: &'static str,
+    cx: &mut Cx,
+) -> Option<CallbackAuth> {
+    let mapping = expect_mapping(value, context, cx)?;
+    let mut block = Fields::new(mapping, value.span.clone(), context);
     block.note_known(CallbackAuth::KEYS);
     if !CallbackAuth::KEYS.iter().any(|key| block.contains(key)) {
         cx.push(
             Diagnostic::error(
                 DiagnosticCode::MissingKey,
-                entry.key.span.clone(),
+                anchor.clone(),
                 format!(
-                    "{context} declares no scheme: a `callback_auth` carries {}, or both",
+                    "{context} declares no scheme: {what} carries {}, or both",
                     list(CallbackAuth::KEYS)
                 ),
             )
-            .with_help(
-                "`hmac` signs the delivered body and `bearer` sends a static token; a delivery that carries neither is what leaving `callback_auth:` out already means, and that posture needs no allowlist (grammar 13.3, PRD resolved q33)",
-            ),
+            .with_help(help),
         );
         block.finish(cx);
         return None;
@@ -801,7 +839,7 @@ fn callback_auth(
     // it is about the *other* headers on the same request rather than about
     // this key's shape — so it is applied here, where the direction is known,
     // rather than inside the shared reader.
-    let bearer = bearer(&mut block, "bearer", &context, cx).map(|mut scheme| {
+    let bearer = bearer(&mut block, "bearer", context, cx).map(|mut scheme| {
         if scheme
             .header
             .as_ref()
@@ -825,10 +863,7 @@ fn callback_auth(
         Some(CallbackHmac { secret })
     });
     block.finish(cx);
-    Some(Spanned::new(
-        CallbackAuth { bearer, hmac },
-        entry.value.span.clone(),
-    ))
+    Some(CallbackAuth { bearer, hmac })
 }
 
 /// Read `callback_allow:` — the URL patterns a callback may point at

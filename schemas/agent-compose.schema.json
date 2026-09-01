@@ -68,6 +68,10 @@
       },
       "additionalProperties": false
     },
+    "trace_sink": {
+      "description": "DEPLOY FILE ONLY. Where every settled execution's trace ships, on the same journal-backed at-least-once delivery a callback: uses. Grammar 14.5 / PRD resolved q50, q51.",
+      "$ref": "#/$defs/traceSink"
+    },
     "event_sources": {
       "description": "DEPLOY FILE ONLY. Binds the logical `source:` names used by event triggers to infrastructure. RESERVED: parsed and validated in v0, executed in M3. Grammar 14.4 / PRD 5.11.",
       "type": "object",
@@ -89,6 +93,7 @@
     "hub": ["version"],
     "placements": ["version"],
     "storage_backends": ["version"],
+    "trace_sink": ["version"],
     "event_sources": ["version"]
   },
   "allOf": [
@@ -112,6 +117,7 @@
     "hub": { "$ref": "#/$defs/deployFileOnly" },
     "placements": { "$ref": "#/$defs/deployFileOnly" },
     "storage_backends": { "$ref": "#/$defs/deployFileOnly" },
+    "trace_sink": { "$ref": "#/$defs/deployFileOnly" },
     "event_sources": { "$ref": "#/$defs/deployFileOnly" }
   },
 
@@ -123,12 +129,13 @@
           { "required": ["hub"] },
           { "required": ["placements"] },
           { "required": ["storage_backends"] },
+          { "required": ["trace_sink"] },
           { "required": ["event_sources"] }
         ]
       }
     },
     "deployFileOnly": {
-      "description": "A deploy file carries only version + hub/placements/storage_backends/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
+      "description": "A deploy file carries only version + hub/placements/storage_backends/trace_sink/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
       "not": {
         "anyOf": [
           { "required": ["imports"] },
@@ -2754,6 +2761,29 @@
           ]
         }
       },
+      "additionalProperties": false
+    },
+    "traceSink": {
+      "description": "Where every settled execution's trace ships. Delivered on the journal-backed at-least-once machinery a callback: already uses: bounded retry, ordered per execution, and never blocking or failing the run it describes. There is deliberately no allowlist key: this address is operator-written config trusted like a storage backend, which is the distinction callback_allow exists for (grammar 14.5 / PRD resolved q50, q51).",
+      "type": "object",
+      "properties": {
+        "url": {
+          "description": "The address every trace is POSTed to: an absolute http or https URL naming a host, its scheme spelled lowercase. This deployment's own collector rather than a pattern, so it carries no wildcard.",
+          "allOf": [
+            { "$ref": "#/$defs/noEnvRefString" },
+            { "pattern": "^https?://[^\\s/?#*]+([/?#][^\\s*]*)?$" }
+          ]
+        },
+        "format": {
+          "description": "What a delivery's body is: the trace envelope itself (docs/trace.md section 2), or an OTLP/JSON ExportTraceServiceRequest hand-emitted from it. Defaults to envelope.",
+          "enum": ["envelope", "otlp"]
+        },
+        "auth": {
+          "description": "How a delivery identifies itself to the sink: the outbound signing shape of grammar 13.3, because a sink delivery is a delivery and carries the same X-AgentCompose- headers. At least one scheme, and both together are legal.",
+          "$ref": "#/$defs/callbackAuth"
+        }
+      },
+      "required": ["url"],
       "additionalProperties": false
     },
     "backendCommon": {

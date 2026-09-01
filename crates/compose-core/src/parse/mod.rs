@@ -270,7 +270,13 @@ impl FileRole {
 }
 
 /// Sections that only a deploy file may carry (grammar 1.5).
-const DEPLOY_ONLY: &[&str] = &["hub", "placements", "storage_backends", "event_sources"];
+const DEPLOY_ONLY: &[&str] = &[
+    "hub",
+    "placements",
+    "storage_backends",
+    "trace_sink",
+    "event_sources",
+];
 /// Sections that only a spec file may carry (grammar 1.5).
 const SPEC_ONLY: &[&str] = &["imports", "defaults", "state", "triggers"];
 
@@ -395,6 +401,7 @@ fn deploy_file(
         placements: None,
         hub: None,
         storage_backends: None,
+        trace_sink: None,
         event_sources: None,
         span: root.span.clone(),
     };
@@ -408,6 +415,7 @@ fn deploy_file(
             "storage_backends" => {
                 file.storage_backends = deploy::storage_backends(&entry.value, cx);
             }
+            "trace_sink" => file.trace_sink = deploy::trace_sink(&entry.value, cx),
             "event_sources" => file.event_sources = deploy::event_sources(&entry.value, cx),
             _ if SPEC_ONLY.contains(&key) || is_definition_key(key) => {
                 misplaced(entry, DocumentKind::Spec, None, cx);

@@ -17,6 +17,7 @@ use crate::diag::{Span, Spanned};
 
 use super::common::{Address, EnvRef, Ident, Interpolated};
 use super::definition::StoreKind;
+use super::trigger::CallbackAuth;
 
 /// The `placements:` section (grammar 14.1).
 #[derive(Clone, Debug, PartialEq)]
@@ -73,6 +74,63 @@ pub struct HubSection {
     pub declares_join_token: bool,
     /// The section's own span.
     pub span: Span,
+}
+
+/// The `trace_sink:` section (grammar 14.5, PRD resolved q50, q51).
+///
+/// One address every settled execution's trace is shipped to, on the delivery
+/// machinery a `callback:` already uses. A deploy-layer key rather than a spec
+/// one because *where the traces go* is a property of an environment, which is
+/// the whole of what this layer forks for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceSinkSection {
+    /// `url:` — required; an absolute `http`/`https` address, shape-checked the
+    /// way [`HubSection::public_url`] is and a class-3 string for the same
+    /// reason (grammar 4.3, Decision D92).
+    pub url: Option<Spanned<String>>,
+    /// `format:` — what is POSTed. Absent means
+    /// [`TraceSinkFormat::DEFAULT`].
+    pub format: Option<Spanned<TraceSinkFormat>>,
+    /// `auth:` — how a delivery identifies itself to the sink. The **outbound**
+    /// signing shape of grammar 13.3, reused rather than re-invented: a sink
+    /// delivery is a delivery, signed by the same headers a callback is
+    /// (PRD resolved q50).
+    pub auth: Option<Spanned<CallbackAuth>>,
+    /// The section's own span.
+    pub span: Span,
+}
+
+/// What a sink delivery carries (grammar 14.5, PRD resolved q51).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceSinkFormat {
+    /// `envelope` — the trace envelope itself, the object the trace file holds
+    /// (`docs/trace.md` §2). The default.
+    Envelope,
+    /// `otlp` — an OTLP/JSON `ExportTraceServiceRequest`, hand-emitted from the
+    /// same envelope (PRD resolved q51).
+    Otlp,
+}
+
+impl TraceSinkFormat {
+    /// Every format, in the order grammar 14.5 lists them.
+    pub const ALL: &'static [Self] = &[Self::Envelope, Self::Otlp];
+
+    /// What a sink ships when it declares no `format:`.
+    ///
+    /// The envelope, deliberately: it is the trace this project already
+    /// documents and the one a reader can diff against the trace file, so the
+    /// OTLP mapping is a choice an author makes rather than a translation they
+    /// are opted into.
+    pub const DEFAULT: Self = Self::Envelope;
+
+    /// The keyword that names this format.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Envelope => "envelope",
+            Self::Otlp => "otlp",
+        }
+    }
 }
 
 /// The `storage_backends:` section (grammar 14.3).

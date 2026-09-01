@@ -81,6 +81,7 @@ export const hubEnvironment: readonly string[] = [
   "QUEUE_TOKEN",
   "REDIS_URL",
   "REPO_ROOT",
+  "TRACE_SINK_TOKEN",
   "TRIAGE_HOST",
   "TRIAGE_TOKEN",
 ];

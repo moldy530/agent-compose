@@ -7,7 +7,7 @@ use crate::ast::definition::StoreKind;
 use crate::ast::deploy::{
     BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
     EventSourceKind, EventSourcesSection, HubSection, Placement, PlacementsSection, PluginEntry,
-    PluginValue, SECRET_FIELDS, StorageBackendsSection,
+    PluginValue, SECRET_FIELDS, StorageBackendsSection, TraceSinkFormat, TraceSinkSection,
 };
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::yaml::{Mapping, Node, Yaml};
@@ -15,6 +15,7 @@ use crate::yaml::{Mapping, Node, Yaml};
 use super::definition::description;
 use super::lexical;
 use super::reader::{Cx, Fields, expect_finite, expect_mapping, expect_sequence, list};
+use super::section;
 
 /// Namespaces a `members:` entry may name (grammar 14.1, Decision D129).
 ///
@@ -230,6 +231,53 @@ pub(crate) fn hub(node: &Node, cx: &mut Cx) -> Option<HubSection> {
     })
 }
 
+/// One absolute-URL key of the deploy layer, and how its refusals name it.
+///
+/// Two keys take an absolute URL written out — `hub.public_url:` (grammar 14.2)
+/// and `trace_sink.url:` (grammar 14.5) — and they are held to **one** shape
+/// rule with one arm inventory, because an author meeting both surfaces should
+/// meet one set of URL rules. What differs is only the noun each refusal uses
+/// for the thing being written, which is what these fields carry.
+struct UrlSubject {
+    /// The key, as a diagnostic spells it.
+    key: &'static str,
+    /// Completes "contains `*`, and … is this deployment's own URL rather than
+    /// a pattern".
+    own: &'static str,
+    /// Completes "names no scheme, and … is absolute".
+    absolute: &'static str,
+    /// Completes "names the scheme `X`, and … — write `x://`", for a scheme
+    /// written in the wrong case.
+    cased: &'static str,
+    /// Completes "names the scheme `x`, and … is reached over `http` or
+    /// `https`".
+    reached: &'static str,
+    /// The help every refusal of this key carries.
+    help: &'static str,
+}
+
+/// `hub.public_url:` — the ingress base every URL this deployment hands out
+/// derives from (grammar 14.2, PRD resolved q44 invariant 4).
+const PUBLIC_URL: UrlSubject = UrlSubject {
+    key: "hub.public_url",
+    own: "a public base",
+    absolute: "an ingress base",
+    cased: "a URL derived from it is written out as text",
+    reached: "a hub",
+    help: "the base is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://hub.example`; `http` stays legal, which is what makes localhost development work (grammar 14.2, PRD resolved q44)",
+};
+
+/// `trace_sink.url:` — where every settled execution's trace is POSTed
+/// (grammar 14.5, PRD resolved q50).
+const TRACE_SINK_URL: UrlSubject = UrlSubject {
+    key: "trace_sink.url",
+    own: "a sink address",
+    absolute: "a sink address",
+    cased: "the address is written onto the request as text",
+    reached: "a trace sink",
+    help: "the sink is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://collector.internal.example/v1/traces`; `http` stays legal, which is what makes a collector on the same host work (grammar 14.5, PRD resolved q50)",
+};
+
 /// Read `hub.public_url:` — the ingress base every URL this deployment hands
 /// out derives from (grammar 14.2, PRD resolved q44 invariant 4).
 ///
@@ -238,37 +286,43 @@ pub(crate) fn hub(node: &Node, cx: &mut Cx) -> Option<HubSection> {
 /// is our own base, written out. So a `*` here is a character in a hostname
 /// rather than a match against anything, and a base carrying one is a URL that
 /// resolves nowhere.
-///
-/// A class-3 string (grammar 4.3, Decision D92): the base is part of what the
-/// composition *is* and is shape-checked here, so a `${NAME}` token in it would
-/// be a value this pass could not read. A deployment whose ingress differs per
-/// environment writes a different deploy file, which is the layer's whole point.
 fn public_url(node: &Node, cx: &mut Cx) -> Option<Spanned<String>> {
-    let text = lexical::text(node, "`hub.public_url`", cx)?;
-    if let Some(problem) = url_problem(&text.value) {
+    absolute_url(node, &PUBLIC_URL, cx)
+}
+
+/// Read one absolute-URL key, refusing what its [`UrlSubject`] describes.
+///
+/// A class-3 string (grammar 4.3, Decision D92): the value is part of what the
+/// composition *is* and is shape-checked here, so a `${NAME}` token in it would
+/// be a value this pass could not read. A deployment whose ingress — or whose
+/// collector — differs per environment writes a different deploy file, which is
+/// the layer's whole point.
+fn absolute_url(node: &Node, subject: &UrlSubject, cx: &mut Cx) -> Option<Spanned<String>> {
+    let text = lexical::text(node, &format!("`{}`", subject.key), cx)?;
+    if let Some(problem) = url_problem(&text.value, subject) {
         cx.push(
             Diagnostic::error(
                 DiagnosticCode::InvalidValue,
                 text.span.clone(),
-                format!("{:?} is not a `hub.public_url`: it {problem}", text.value),
+                format!("{:?} is not a `{}`: it {problem}", text.value, subject.key),
             )
-            .with_help(PUBLIC_URL_HELP),
+            .with_help(subject.help),
         );
         return None;
     }
     Some(text)
 }
 
-/// Why a `hub.public_url:` is not a legal ingress base, if it is not.
+/// Why a value is not a legal absolute URL for `subject`, if it is not.
 ///
-/// Completes ``` "<value>" is not a `hub.public_url`: it … ```. The arms are
-/// ordered so each is the only answer to some value, and every one of them is
-/// reached by [`tests::every_refusal_arm_answers_some_base`] — an arm no value
-/// reaches is a message no reader has read, and the negative fixture corpus
-/// pins one rule per file rather than one arm. The wording follows
-/// `callback_allow:`'s (PRD resolved q33), because an author meeting both
-/// surfaces should meet one set of URL rules.
-fn url_problem(url: &str) -> Option<String> {
+/// Completes ``` "<value>" is not a `<key>`: it … ```. The arms are ordered so
+/// each is the only answer to some value, and every one of them is reached by
+/// [`tests::every_refusal_arm_answers_some_url`] — an arm no value reaches is a
+/// message no reader has read, and the negative fixture corpus pins one rule per
+/// file rather than one arm. The wording follows `callback_allow:`'s (PRD
+/// resolved q33), because an author meeting these surfaces should meet one set
+/// of URL rules.
+fn url_problem(url: &str, subject: &UrlSubject) -> Option<String> {
     if url.is_empty() {
         return Some("is empty".to_string());
     }
@@ -276,13 +330,16 @@ fn url_problem(url: &str) -> Option<String> {
         return Some("contains whitespace".to_string());
     }
     if url.contains('*') {
-        return Some(
-            "contains `*`, and a public base is this deployment's own URL rather than a pattern"
-                .to_string(),
-        );
+        return Some(format!(
+            "contains `*`, and {} is this deployment's own URL rather than a pattern",
+            subject.own
+        ));
     }
     let Some((scheme, rest)) = url.split_once("://") else {
-        return Some("names no scheme, and an ingress base is absolute".to_string());
+        return Some(format!(
+            "names no scheme, and {} is absolute",
+            subject.absolute
+        ));
     };
     if !matches!(scheme, "http" | "https") {
         if let Some(spelling) = ["http", "https"]
@@ -290,11 +347,13 @@ fn url_problem(url: &str) -> Option<String> {
             .find(|known| known.eq_ignore_ascii_case(scheme))
         {
             return Some(format!(
-                "names the scheme `{scheme}`, and a URL derived from it is written out as text — write `{spelling}://`"
+                "names the scheme `{scheme}`, and {} — write `{spelling}://`",
+                subject.cased
             ));
         }
         return Some(format!(
-            "names the scheme `{scheme}`, and a hub is reached over `http` or `https`"
+            "names the scheme `{scheme}`, and {} is reached over `http` or `https`",
+            subject.reached
         ));
     }
     if rest.is_empty() {
@@ -315,9 +374,6 @@ fn url_problem(url: &str) -> Option<String> {
     }
     None
 }
-
-/// What a `hub.public_url:` is, for every refusal.
-const PUBLIC_URL_HELP: &str = "the base is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://hub.example`; `http` stays legal, which is what makes localhost development work (grammar 14.2, PRD resolved q44)";
 
 /// `join_token:` is required exactly where placements are (grammar 14.2,
 /// Decision D130).
@@ -378,6 +434,62 @@ pub(crate) fn require_join_token(
         ),
     );
 }
+
+/// The `format:` keywords a `trace_sink:` chooses between (grammar 14.5).
+const TRACE_SINK_FORMATS: &[(&str, TraceSinkFormat)] = &[
+    ("envelope", TraceSinkFormat::Envelope),
+    ("otlp", TraceSinkFormat::Otlp),
+];
+
+/// Read the `trace_sink:` section (grammar 14.5, PRD resolved q50, q51).
+///
+/// A closed construct like `hub:` and unlike a backend config: all three keys
+/// are this compiler's own, and an unknown one is a mistake rather than a
+/// plugin's business (Decision D50).
+///
+/// **There is deliberately no allowlist key here, and none is required.**
+/// `callback_allow:` exists because a callback URL comes out of a request
+/// payload and is attacker-controlled by construction (grammar 13.3, Decision
+/// D126); this address is written by the operator in the deploy file, and is
+/// trusted exactly as a `storage_backends:` connection string is. Requiring a
+/// list an operator would write to admit the address they just wrote on the line
+/// above would be ceremony rather than a control (PRD resolved q50).
+pub(crate) fn trace_sink(node: &Node, cx: &mut Cx) -> Option<TraceSinkSection> {
+    let mapping = expect_mapping(node, "`trace_sink`", cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), "`trace_sink`");
+    let url = fields
+        .require("url", cx)
+        .and_then(|node| absolute_url(node, &TRACE_SINK_URL, cx));
+    let format = fields
+        .take("format")
+        .and_then(|node| lexical::keyword(node, "`trace_sink.format`", TRACE_SINK_FORMATS, cx));
+    let auth = fields.take_entry("auth").and_then(|entry| {
+        let scheme = section::outbound_auth(
+            &entry.key.span,
+            &entry.value,
+            "the `auth` of `trace_sink`",
+            "an `auth`",
+            TRACE_SINK_AUTH_WITHOUT_A_SCHEME,
+            cx,
+        )?;
+        Some(Spanned::new(scheme, entry.value.span.clone()))
+    });
+    fields.finish(cx);
+    Some(TraceSinkSection {
+        url,
+        format,
+        auth,
+        span: node.span.clone(),
+    })
+}
+
+/// What a `trace_sink.auth:` declaring neither scheme is told.
+///
+/// The sibling of `callback_auth:`'s, and it ends differently for the reason the
+/// section header gives: leaving the block out is a legitimate posture here —
+/// an unauthenticated collector on a private network — and it buys no allowlist
+/// obligation, because there is none to buy.
+const TRACE_SINK_AUTH_WITHOUT_A_SCHEME: &str = "`hmac` signs the delivered body and `bearer` sends a static token; a delivery that carries neither is what leaving `auth:` out already means, which is the posture a collector on a private network takes (grammar 14.5, PRD resolved q50)";
 
 const STORE_KINDS: &[(&str, StoreKind)] = &[
     ("kv", StoreKind::Kv),
@@ -629,7 +741,7 @@ pub(crate) fn plugin_value(node: &Node, subject: &str, cx: &mut Cx) -> Spanned<P
 
 #[cfg(test)]
 mod tests {
-    use super::url_problem;
+    use super::{PUBLIC_URL, TRACE_SINK_URL, UrlSubject, url_problem};
     use crate::diag::{Diagnostic, DiagnosticCode};
     use crate::parse::parse_str;
 
@@ -763,61 +875,111 @@ mod tests {
     /// eight rules in a corpus that asserts they are distinct. The two arms an
     /// author is likeliest to hit — a relative base and a wildcard — carry
     /// fixtures there as well.
+    ///
+    /// Run over **both** subjects, because one shape rule serving two keys is
+    /// exactly the arrangement where a clause added for one of them reads as
+    /// nonsense on the other: every arm has to be a sentence about whichever key
+    /// reached it.
     #[test]
-    fn every_refusal_arm_answers_some_base() {
-        for (base, expected) in [
-            ("", "is empty"),
-            ("https://hub example", "contains whitespace"),
+    fn every_refusal_arm_answers_some_url() {
+        for (subject, expected) in [
             (
-                "https://*.hub.example",
-                "contains `*`, and a public base is this deployment's own URL rather than a pattern",
+                &PUBLIC_URL,
+                [
+                    "contains `*`, and a public base is this deployment's own URL rather than a pattern",
+                    "names no scheme, and an ingress base is absolute",
+                    "names the scheme `HTTPS`, and a URL derived from it is written out as text — write `https://`",
+                    "names the scheme `ftp`, and a hub is reached over `http` or `https`",
+                ],
             ),
             (
-                "hub.example/ingress",
-                "names no scheme, and an ingress base is absolute",
-            ),
-            (
-                "HTTPS://hub.example",
-                "names the scheme `HTTPS`, and a URL derived from it is written out as text — write `https://`",
-            ),
-            (
-                "ftp://hub.example",
-                "names the scheme `ftp`, and a hub is reached over `http` or `https`",
-            ),
-            ("https://", "names a scheme and nothing else"),
-            (
-                "https:///ingress",
-                "names no host between `https://` and the `/` that follows it",
+                &TRACE_SINK_URL,
+                [
+                    "contains `*`, and a sink address is this deployment's own URL rather than a pattern",
+                    "names no scheme, and a sink address is absolute",
+                    "names the scheme `HTTPS`, and the address is written onto the request as text — write `https://`",
+                    "names the scheme `ftp`, and a trace sink is reached over `http` or `https`",
+                ],
             ),
         ] {
-            assert_eq!(
-                url_problem(base).as_deref(),
-                Some(expected),
-                "`{base}` no longer reaches the arm written for it"
-            );
+            let [wildcard, relative, cased, scheme] = expected;
+            for (url, expected) in [
+                ("", "is empty"),
+                ("https://hub example", "contains whitespace"),
+                ("https://*.hub.example", wildcard),
+                ("hub.example/ingress", relative),
+                ("HTTPS://hub.example", cased),
+                ("ftp://hub.example", scheme),
+                ("https://", "names a scheme and nothing else"),
+                (
+                    "https:///ingress",
+                    "names no host between `https://` and the `/` that follows it",
+                ),
+            ] {
+                assert_eq!(
+                    url_problem(url, subject).as_deref(),
+                    Some(expected),
+                    "`{url}` no longer reaches the arm written for it under `{}`",
+                    subject.key
+                );
+            }
         }
     }
 
-    /// …and the bases an author writes are accepted.
+    /// …and the URLs an author writes are accepted, under either key.
     ///
     /// The other direction, which no negative corpus can catch: a rule written
-    /// one character too tight makes a working ingress base unwritable, and
-    /// nothing else would notice. A port, a path prefix, and `http` for
-    /// localhost are all bases somebody deploys.
+    /// one character too tight makes a working ingress base — or a working
+    /// collector address — unwritable, and nothing else would notice. A port, a
+    /// path prefix, and `http` for localhost are all URLs somebody deploys.
     #[test]
-    fn a_base_an_author_writes_is_accepted() {
-        for base in [
-            "https://hub.example",
-            "https://hub.example/",
-            "http://localhost:8080",
-            "https://hub.example:8443/agent-compose",
-            "https://hub.internal.example/ingress/v1",
-        ] {
-            assert_eq!(
-                url_problem(base),
-                None,
-                "`{base}` is a base somebody deploys and this pass refuses it"
-            );
+    fn a_url_an_author_writes_is_accepted() {
+        for subject in [&PUBLIC_URL, &TRACE_SINK_URL] {
+            for url in [
+                "https://hub.example",
+                "https://hub.example/",
+                "http://localhost:8080",
+                "https://hub.example:8443/agent-compose",
+                "https://hub.internal.example/ingress/v1",
+                "http://localhost:4318/v1/traces",
+            ] {
+                assert_eq!(
+                    url_problem(url, subject),
+                    None,
+                    "`{url}` is a URL somebody deploys and this pass refuses it under `{}`",
+                    subject.key
+                );
+            }
+        }
+    }
+
+    /// The two subjects really are two: no clause is shared between them, so no
+    /// refusal reads as a sentence about the other key.
+    ///
+    /// Cheap, and it is the failure the parameterization invites — a fifth
+    /// subject copied from a fourth and half-edited, whose messages then name
+    /// the wrong construct in the two arms nobody re-read.
+    #[test]
+    fn each_url_subject_names_itself() {
+        let subjects: [&UrlSubject; 2] = [&PUBLIC_URL, &TRACE_SINK_URL];
+        for (index, subject) in subjects.iter().enumerate() {
+            for other in &subjects[index + 1..] {
+                for (left, right, clause) in [
+                    (subject.key, other.key, "key"),
+                    (subject.own, other.own, "own"),
+                    (subject.absolute, other.absolute, "absolute"),
+                    (subject.cased, other.cased, "cased"),
+                    (subject.reached, other.reached, "reached"),
+                    (subject.help, other.help, "help"),
+                ] {
+                    assert_ne!(
+                        left, right,
+                        "`{}` and `{}` share the `{clause}` clause, so one of them names the \
+                         other's construct",
+                        subject.key, other.key
+                    );
+                }
+            }
         }
     }
 }

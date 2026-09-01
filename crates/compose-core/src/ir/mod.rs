@@ -81,8 +81,8 @@
 //!
 //! **A section is a construct too**, and every one of them is written the same
 //! way: `defaults:`, `state:`, `triggers:`, and the deploy layer's `hub:`,
-//! `placements:`, `storage_backends:`, and `event_sources:` each carry the
-//! region the section itself was written in alongside what it declares
+//! `placements:`, `storage_backends:`, `trace_sink:`, and `event_sources:` each
+//! carry the region the section itself was written in alongside what it declares
 //! ([`Section`]). A rule whose subject is a whole section — a channel set that
 //! declares nothing a flow writes, a target that binds no backend for a kind a
 //! store needs — then has a place to point that is neither one arbitrary entry
@@ -204,11 +204,12 @@ impl Ir {
 /// keyed by name, and the region the section itself was written in.
 ///
 /// Sections that are a map of named entries — `state:`, `triggers:`,
-/// `placements:`, `event_sources:` — are all this one shape. The three that are
+/// `placements:`, `event_sources:` — are all this one shape. The four that are
 /// not still carry their span the same way: `defaults:` is a single policy
 /// block, so it is a [`Spanned<Policy>`](Spanned), `hub:` is a single block of
-/// two keys, so it is [its own struct](deploy::Hub), and `storage_backends:`
-/// has two maps rather than one, so it is [its own
+/// two keys, so it is [its own struct](deploy::Hub), `trace_sink:` is a single
+/// block of three, so it is [its own struct](deploy::TraceSink), and
+/// `storage_backends:` has two maps rather than one, so it is [its own
 /// struct](deploy::StorageBackends). See the module docs on spans.
 ///
 /// An `Option<Section<_>>` that is `None` means the section was **not

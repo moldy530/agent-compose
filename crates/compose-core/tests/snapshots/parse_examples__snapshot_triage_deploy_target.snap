@@ -86,40 +86,63 @@ Deploy(
                 span: 30:3..40:26,
             },
         ),
+        trace_sink: Some(
+            TraceSinkSection {
+                url: Some(
+                    "https://collector.internal.example/v1/traces" @ 51:8..51:54,
+                ),
+                format: None,
+                auth: Some(
+                    CallbackAuth {
+                        bearer: Some(
+                            BearerAuth {
+                                token: Some(
+                                    env("${TRACE_SINK_TOKEN}") @ 54:14..54:33,
+                                ),
+                                header: None,
+                                prefix: None,
+                            },
+                        ),
+                        hmac: None,
+                    } @ 53:5..54:33,
+                ),
+                span: 51:3..54:33,
+            },
+        ),
         event_sources: Some(
             EventSourcesSection {
                 sources: [
                     EventSource {
-                        name: "bug_reports" @ 45:3..45:14,
+                        name: "bug_reports" @ 59:3..59:14,
                         kind: Some(
-                            RedisStreams @ 46:11..46:24,
+                            RedisStreams @ 60:11..60:24,
                         ),
                         connection: [
                             ConnectionField {
-                                name: "url" @ 47:5..47:8,
-                                value: env("${REDIS_URL}") @ 47:10..47:22,
+                                name: "url" @ 61:5..61:8,
+                                value: env("${REDIS_URL}") @ 61:10..61:22,
                             },
                         ],
                         extra: [
                             PluginEntry {
-                                key: "stream" @ 48:5..48:11,
+                                key: "stream" @ 62:5..62:11,
                                 value: Text(
                                     "bug-reports",
-                                ) @ 48:13..48:24,
+                                ) @ 62:13..62:24,
                             },
                             PluginEntry {
-                                key: "consumer_group" @ 49:5..49:19,
+                                key: "consumer_group" @ 63:5..63:19,
                                 value: Text(
                                     "agent-compose",
-                                ) @ 49:21..49:34,
+                                ) @ 63:21..63:34,
                             },
                         ],
-                        span: 45:3..49:34,
+                        span: 59:3..63:34,
                     },
                 ],
-                span: 45:3..49:34,
+                span: 59:3..63:34,
             },
         ),
-        span: 4:1..49:34,
+        span: 4:1..63:34,
     },
 )

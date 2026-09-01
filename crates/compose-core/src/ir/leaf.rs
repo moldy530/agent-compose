@@ -69,7 +69,7 @@ use crate::ast::common::{
 use crate::ast::definition::{
     AgentAccess, Builtin, ProviderKind, RouteCondition, StoreKind, StoreScope,
 };
-use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue};
+use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue, TraceSinkFormat};
 use crate::ast::document::Reduce;
 use crate::ast::flow::{FlowContext, StoreOp};
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
@@ -159,6 +159,7 @@ serialize_as_keyword!(
     StoreScope,
     StringFormat,
     Surface,
+    TraceSinkFormat,
     TriggerMethod,
 );
 

@@ -1,0 +1,10 @@
+# rule: `trace_sink.format:` is `envelope` or `otlp` (grammar 14.5)
+# code: unknown-variant
+# message: `jaeger` is not a valid `trace_sink.format`
+# at: 10:11
+# help: `trace_sink.format` takes one of `envelope`, `otlp`
+version: "0.1"
+
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  format: jaeger

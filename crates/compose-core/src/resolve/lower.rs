@@ -762,6 +762,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
             hub: None,
             placements: None,
             storage_backends: None,
+            trace_sink: None,
             event_sources: None,
         });
     };
@@ -827,6 +828,22 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         })
     })?;
 
+    // The grammar's defaults land here rather than in whoever reads the
+    // artifact: `format:` decides what a delivery's body is, and a reader that
+    // re-derived it differently would ship a collector something it cannot
+    // parse (grammar 14.5, PRD resolved q51).
+    let trace_sink = optional(file.file.trace_sink.as_ref(), |section| {
+        Some(ir::deploy::TraceSink {
+            url: section.url.clone()?,
+            format: section
+                .format
+                .as_ref()
+                .map_or(ast_deploy::TraceSinkFormat::DEFAULT, |format| format.value),
+            auth: optional(section.auth.as_ref(), callback_auth)?,
+            span: section.span.clone(),
+        })
+    })?;
+
     let event_sources = optional(file.file.event_sources.as_ref(), |section| {
         let mut entries = BTreeMap::new();
         for entry in &section.sources {
@@ -853,6 +870,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         hub,
         placements,
         storage_backends,
+        trace_sink,
         event_sources,
     })
 }

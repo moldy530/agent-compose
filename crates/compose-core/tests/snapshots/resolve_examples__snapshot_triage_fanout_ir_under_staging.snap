@@ -2725,12 +2725,32 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
       },
       "span": "deploy/staging.yml:30:3..40:26"
     },
+    "trace_sink": {
+      "url": {
+        "value": "https://collector.internal.example/v1/traces",
+        "span": "deploy/staging.yml:51:8..51:54"
+      },
+      "format": "envelope",
+      "auth": {
+        "bearer": {
+          "token": {
+            "value": {
+              "env_ref": "TRACE_SINK_TOKEN"
+            },
+            "span": "deploy/staging.yml:54:14..54:33"
+          },
+          "header": "Authorization",
+          "prefix": "Bearer "
+        }
+      },
+      "span": "deploy/staging.yml:51:3..54:33"
+    },
     "event_sources": {
       "entries": {
         "bug_reports": {
           "name": {
             "value": "bug_reports",
-            "span": "deploy/staging.yml:45:3..45:14"
+            "span": "deploy/staging.yml:59:3..59:14"
           },
           "kind": "redis_streams",
           "connection": {
@@ -2738,7 +2758,7 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "env_ref": "REDIS_URL"
               },
-              "span": "deploy/staging.yml:47:5..47:22"
+              "span": "deploy/staging.yml:61:5..61:22"
             }
           },
           "extra": {
@@ -2746,19 +2766,19 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "text": "agent-compose"
               },
-              "span": "deploy/staging.yml:49:5..49:34"
+              "span": "deploy/staging.yml:63:5..63:34"
             },
             "stream": {
               "value": {
                 "text": "bug-reports"
               },
-              "span": "deploy/staging.yml:48:5..48:24"
+              "span": "deploy/staging.yml:62:5..62:24"
             }
           },
-          "span": "deploy/staging.yml:45:3..49:34"
+          "span": "deploy/staging.yml:59:3..63:34"
         }
       },
-      "span": "deploy/staging.yml:45:3..49:34"
+      "span": "deploy/staging.yml:59:3..63:34"
     }
   }
 }

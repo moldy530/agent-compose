@@ -1,0 +1,13 @@
+# rule: a `trace_sink:` takes `url`, `format` and `auth`, and no other key (grammar 14.5, D50)
+# code: unknown-key
+# message: unknown key `allow` in `trace_sink`
+# at: 12:3
+version: "0.1"
+
+# There is deliberately no allowlist here: the sink address is operator-written
+# config, trusted like a storage backend, and `callback_allow:` exists for the
+# payload-derived URLs this is not (D134).
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  allow:
+    - "https://collector.internal.example/*"

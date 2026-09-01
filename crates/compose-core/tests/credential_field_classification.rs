@@ -99,6 +99,65 @@ fn the_hub_join_token_is_tabulated_as_class_one() {
     );
 }
 
+/// …and so is the `trace_sink.auth:` credential, which the class-1 table has to
+/// name **where it lives** rather than only by spelling.
+///
+/// `token` and `secret` were already class-1 names, so a table row that stopped
+/// at the spelling would look complete while saying nothing about the deploy
+/// layer's second credential-bearing block: §4.3's own sentence is that the
+/// table "classifies these field *names* wherever they occur; it never makes one
+/// legal where its section's own key rules do not admit it", which cuts both
+/// ways — a reader asking "may `trace_sink.auth.bearer.token:` be a literal?"
+/// is entitled to find the answer by looking up the section, not by inferring
+/// that a name borrowed from §13.3 carries §13.3's rule with it.
+#[test]
+fn the_trace_sink_credential_is_tabulated_as_class_one() {
+    let grammar =
+        fs::read_to_string(repository().join("docs/grammar.md")).expect("the grammar is readable");
+    let table = class_one_table(&grammar);
+    let row = table
+        .lines()
+        .find(|line| line.contains("`token`, `secret`"))
+        .expect("grammar 4.3's class-1 table carries the outbound-signing row");
+    assert!(
+        row.contains("§14.5"),
+        "grammar 4.3's `token`/`secret` row does not name §14.5, so the deploy layer's trace-sink \
+         credential is classified by nothing: the row reads as §13.3's alone, and §4.3's totality \
+         rule (D92) then puts `trace_sink.auth.bearer.token:` in class 3 — a literal required \
+         exactly where the compiler refuses one"
+    );
+}
+
+/// …and the class the table names is the class `validate` enforces, on that
+/// block's two credentials.
+#[test]
+fn validate_enforces_the_trace_sink_credentials_class() {
+    const SINK: &str =
+        "version: \"0.1\"\ntrace_sink:\n  url: \"https://collector.internal.example/v1/traces\"\n";
+    for (scheme, key) in [("bearer", "token"), ("hmac", "secret")] {
+        let literal = format!("{SINK}  auth:\n    {scheme}:\n      {key}: \"s3cret\"\n");
+        assert_eq!(
+            parse_str(&literal, "deploy/staging.yml")
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["invalid-env-ref"],
+            "a literal `trace_sink.auth.{scheme}.{key}:` must be refused as class 1 requires"
+        );
+
+        let reference =
+            format!("{SINK}  auth:\n    {scheme}:\n      {key}: ${{SINK_CREDENTIAL}}\n");
+        assert!(
+            parse_str(&reference, "deploy/staging.yml")
+                .diagnostics
+                .is_empty(),
+            "the value form is the form class 1 asks for and it must be accepted for \
+             `trace_sink.auth.{scheme}.{key}:`"
+        );
+    }
+}
+
 /// The other end of the bind: the class the table names is the class `validate`
 /// enforces.
 ///

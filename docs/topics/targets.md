@@ -8,8 +8,9 @@ compositions.
 
 A deploy file is never imported. It is a document kind of its own, and the two
 kinds are disjoint — a spec file declaring `hub:`, `placements:`,
-`storage_backends:` or `event_sources:` is an error, and so is a deploy file
-declaring definitions, `imports:`, `state:`, `triggers:` or `defaults:`.
+`storage_backends:`, `trace_sink:` or `event_sources:` is an error, and so is a
+deploy file declaring definitions, `imports:`, `state:`, `triggers:` or
+`defaults:`.
 
 ```yaml deploy staging
 # deploy/staging.yml
@@ -29,6 +30,13 @@ storage_backends:
     kv: { provider: redis, url: "${REDIS_URL}" }
   aliases:
     docs_db: { provider: chroma, url: "${CHROMA_URL}" }
+
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  format: otlp
+  auth:
+    bearer:
+      token: ${TRACE_SINK_TOKEN}
 
 event_sources:
   bug_reports:
@@ -95,10 +103,12 @@ unconditionally. Four consequences:
 
 - `deploy/local.yml` is **optional**, and `--target local` with no file is the
   zero-config path, not an error.
-- When present it may declare `hub:`, `placements:` and `event_sources:`. The
-  first two are live grammar checked under every target — a `local` mesh is the
-  hub and its workers on one machine, which is how you develop one — and
-  `event_sources:` is reserved grammar carried into the IR.
+- When present it may declare `hub:`, `placements:`, `trace_sink:` and
+  `event_sources:`. The first two are live grammar checked under every target — a
+  `local` mesh is the hub and its workers on one machine, which is how you
+  develop one — `trace_sink:` is live here too, because a laptop's `run` settles
+  executions like any other target, and `event_sources:` is reserved grammar
+  carried into the IR.
 - It **must not** declare `storage_backends:`. That section is *active* grammar
   which `local` overrides unconditionally, so the block could only be an inert
   key whose author expected a substitution. A store that wants a real backend
@@ -198,6 +208,46 @@ env-ref values only.
 
 Capability checks apply at the alias definition: a `vector` store bound to a
 non-vector-capable provider is a compile error.
+
+## `trace_sink` — where every trace goes
+
+Every other way of reading a trace is somebody asking for **one**: `run --format
+json`, the trace file, `GET /executions/:id`, a trigger's `callback:`.
+`trace_sink:` is the deployment saying, once, where all of them go — one address
+every settled execution's trace envelope is POSTed to.
+
+| Key | Shape |
+|---|---|
+| `url` | required; an absolute `http`/`https` URL naming a host, no wildcard — your collector, not a pattern |
+| `format` | `envelope` (default) or `otlp` |
+| `auth` | the outbound signing block an `http` trigger's `callback_auth:` takes: `bearer`, `hmac`, or both |
+
+`format: envelope` POSTs the trace envelope itself — the exact object the trace
+file holds. `format: otlp` POSTs an OTLP/JSON `ExportTraceServiceRequest` mapped
+from that same envelope, hand-emitted over OTLP/HTTP with no OpenTelemetry SDK in
+the generated project; `agent-compose docs trace` and `docs/trace.md` are where
+the mapping is written down, and a backend that speaks only protobuf is served by
+pointing an OTel Collector at the sink.
+
+Four things worth knowing:
+
+- **A sink outage costs deliveries a retry, never an execution.** Delivery is at
+  settle, on the journal's delivery ledger — bounded retry, ordered per
+  execution, and never blocking or failing the run it describes.
+- **It applies wherever executions settle under this target**, which includes a
+  one-shot `agent-compose run main.yml flow.triage` and not only a served
+  process. The sink is a property of the target, not of a `serve`.
+- **Only the envelope ships.** The journal's payloads — completions, tool
+  results, a person's answer — are private recovery data and stay home, so the
+  trace format's exclusions hold for the sink by construction.
+- **There is no allowlist, and none is wanted.** `callback_allow:` exists because
+  a callback URL comes out of a request payload and is attacker-controlled by
+  construction. This one you wrote yourself, in this file, beside the database
+  credentials — it is trusted on the same terms a connection string is.
+
+The `auth:` credential is a deploy-layer variable, so it belongs to the hub's
+environment manifest: the hub owns the trace and is the process that ships it, so
+no worker is ever asked for a token it would never spend.
 
 ## `hub` and `placements` — the distributed surface
 
@@ -319,4 +369,4 @@ outside the list — see `agent-compose docs triggers`. What that adds to a
 the manifest a built project checks at process start, so a deployment receiving
 only the secrets its own surfaces name receives these too.
 
-Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/grammar.md` §14, §14.1–14.4, §15
+Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/trace.md`, `docs/grammar.md` §14, §14.1–14.5, §15

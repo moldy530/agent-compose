@@ -1,0 +1,7 @@
+# rule: trace_sink.format is envelope or otlp, and nothing else (grammar 14.5)
+# at: /trace_sink/format
+# via: /$defs/traceSink/properties/format/enum
+version: "0.1"
+trace_sink:
+  url: "https://collector.internal.example/v1/traces"
+  format: jaeger

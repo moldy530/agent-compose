@@ -44,7 +44,7 @@ pub use definition::{
 pub use deploy::{
     BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
     EventSourceKind, EventSourcesSection, HubSection, Placement, PlacementsSection, SECRET_FIELDS,
-    StorageBackendsSection,
+    StorageBackendsSection, TraceSinkFormat, TraceSinkSection,
 };
 pub use document::{
     Channel, DEPLOY_SECTIONS, DeployFile, Document, DocumentKind, ImportPath, ImportsSection,

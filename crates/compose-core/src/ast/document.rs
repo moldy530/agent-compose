@@ -4,7 +4,9 @@ use crate::diag::{SourceName, Span, Spanned};
 
 use super::common::Ident;
 use super::definition::Definition;
-use super::deploy::{EventSourcesSection, HubSection, PlacementsSection, StorageBackendsSection};
+use super::deploy::{
+    EventSourcesSection, HubSection, PlacementsSection, StorageBackendsSection, TraceSinkSection,
+};
 use super::policy::PolicyBlock;
 use super::schema::TypeNode;
 use super::trigger::TriggersSection;
@@ -17,7 +19,7 @@ pub enum DocumentKind {
     /// `state`, `triggers`.
     Spec,
     /// A deploy file: `version` plus `hub`, `placements`, `storage_backends`,
-    /// `event_sources`.
+    /// `trace_sink`, `event_sources`.
     Deploy,
 }
 
@@ -131,6 +133,9 @@ pub struct DeployFile {
     pub hub: Option<HubSection>,
     /// `storage_backends:`
     pub storage_backends: Option<StorageBackendsSection>,
+    /// `trace_sink:` — where every settled execution's trace ships
+    /// (grammar 14.5).
+    pub trace_sink: Option<TraceSinkSection>,
     /// `event_sources:` — reserved grammar.
     pub event_sources: Option<EventSourcesSection>,
     /// The document root's span.
@@ -249,5 +254,6 @@ pub const DEPLOY_SECTIONS: &[&str] = &[
     "hub",
     "placements",
     "storage_backends",
+    "trace_sink",
     "event_sources",
 ];
