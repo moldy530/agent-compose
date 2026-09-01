@@ -1385,8 +1385,15 @@ fn a_failover_off_the_responses_wire_rewrites_the_turn_for_the_messages_one() {
 /// turn anyway would send, and the Messages API refuses it (`content: List
 /// should have at least 1 item`) — so the node would die on a 400 about the
 /// *request*, one call after the model's empty answer, and `rate_limit` is not a
-/// status a `route_on:` catches. Dropping the turn keeps the conversation legal
-/// and leaves it opening on the user turn it already opened on.
+/// status a `route_on:` catches. Dropping the turn keeps the conversation legal.
+///
+/// It is also the one place two user turns can meet, which is why the assertion
+/// is on blocks rather than on a message count. Resolved q52 closes the tool
+/// exchange with a fixed user turn before the pinned call, and here the assistant
+/// turn between it and the opening user turn is the one being dropped — so the
+/// two are folded into a single user message, in the order they were written.
+/// Left as two messages they would break the alternation this wire requires, and
+/// the node would die on the 400 the drop exists to avoid.
 #[test]
 fn a_responses_turn_with_nothing_the_messages_wire_can_spell_is_not_replayed_empty() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -1442,14 +1449,25 @@ fn a_responses_turn_with_nothing_the_messages_wire_can_spell_is_not_replayed_emp
         replayed.failures(),
         replayed.body_text
     );
+    let messages = replayed.body()["messages"]
+        .as_array()
+        .expect("a message list")
+        .clone();
     assert_eq!(
-        block_types(
-            replayed.body()["messages"]
-                .as_array()
-                .expect("a message list")
-        ),
-        [vec!["<user>".to_string()]],
+        block_types(&messages),
+        [vec!["text".to_string(), "text".to_string()]],
         "the unspellable turn was dropped, not padded and not emptied: {}",
+        replayed.body_text
+    );
+    assert_eq!(
+        messages[0]["content"][0]["text"], "{\"question\":\"what?\"}",
+        "the node's own input still opens the conversation: {}",
+        replayed.body_text
+    );
+    assert_eq!(
+        messages[0]["content"][1]["text"], "Now produce the structured result.",
+        "…and q52's closing turn was folded into it rather than left to break the \
+         alternation the drop exposed: {}",
         replayed.body_text
     );
     assert!(provider.snapshot().is_drained());
@@ -2525,6 +2543,184 @@ fn an_agent_nodes_exchange_reaches_the_next_agent_nodes_request() {
     );
     assert_eq!(run.outputs()["verdict"], "approve");
     assert!(provider.snapshot().is_drained());
+}
+
+/// The pinned structured-output call after a tool loop **ends on a user turn**,
+/// on both wires, and the turn that closes it never becomes conversation
+/// (PRD §9 resolved q52).
+///
+/// The loop exits on the model's own answer, so before q52 the pinned request
+/// carried a history ending on an *assistant* turn — which on the Messages wire
+/// is the prefill feature, and prefill under `tool_choice: {type: "tool", …}` is
+/// a contradiction: "carry on from here" against "your answer must be this call".
+/// `api.anthropic.com` tolerates it and strict Anthropic-compatible gateways
+/// answer 400, which is how the shape reached a live 0.6.0 deployment with every
+/// test green. `crates/mock-provider` now refuses it as the gateway does, so
+/// `is_valid()` below is the regression's tripwire; what this test adds is the
+/// *positive* half, which no refusal can state — the exact turn that closes the
+/// exchange, and where it does and does not appear.
+///
+/// The second node is why the flow has two: the synthetic turn belongs to one
+/// request, and the only place the conversation itself is visible is the request
+/// the **next** agent node makes (grammar 10.4, and see
+/// `an_agent_nodes_exchange_reaches_the_next_agent_nodes_request`). A runtime
+/// that pushed the turn into `turns` instead of composing over a copy would pass
+/// every assertion about the pinned call and fail here.
+#[test]
+fn the_pinned_call_after_a_tool_loop_ends_on_the_turn_that_closes_it() {
+    const CLOSING: &str = "Now produce the structured result.";
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The loop: one tool call, then the answer in prose that ends it.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+        ),
+        Script::new(SONNET, Outcome::text("found it")),
+        // The pinned call, and then the second node, which has no tools of its
+        // own and so makes exactly one call.
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "feedback": "a looked-up snippet" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "verdict": "approve", "feedback": "tightened" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research_pair",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["verdict"],
+        "approve",
+        "the run answered with the structured verdict: {}",
+        run.outputs()
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        4,
+        "two loop calls, the pinned one, then the second node"
+    );
+    assert!(
+        recorded.iter().all(RecordedRequest::is_valid),
+        "every request is one a strict gateway would accept: {:?}",
+        recorded
+            .iter()
+            .map(RecordedRequest::failures)
+            .collect::<Vec<_>>()
+    );
+
+    // The loop's own calls pin nothing and are left exactly as they were: the
+    // closing turn is composed for the request that forces the output tool, not
+    // for every call the node makes.
+    for (ordinal, request) in recorded[..2].iter().enumerate() {
+        assert_eq!(
+            request.structured_output, None,
+            "loop call {ordinal} pins no tool: {}",
+            request.body_text
+        );
+        assert!(
+            !request.body_text.contains(CLOSING),
+            "…and carries no closing turn: {}",
+            request.body_text
+        );
+    }
+
+    let pinned = recorded[2].body();
+    assert_eq!(
+        pinned["tool_choice"]["type"], "tool",
+        "the third call is the pinned one: {pinned}"
+    );
+    let messages = pinned["messages"].as_array().expect("a message list");
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        ["user", "assistant", "user", "assistant", "user"],
+        "the input, the call, its result, the answer that ended the loop, and \
+         the turn that closes it: {pinned}"
+    );
+    let last = messages.last().expect("a last message");
+    assert_eq!(
+        last["content"], CLOSING,
+        "the forced call is asked for by a user turn, verbatim: {pinned}"
+    );
+
+    // …and the conversation the next node inherits is the exchange alone.
+    let next = recorded[3].body();
+    let inherited = next["messages"].as_array().expect("a message list");
+    assert_eq!(
+        inherited.len(),
+        3,
+        "the first node's exchange and the second node's own turn, and nothing \
+         else: {next}"
+    );
+    assert_eq!(
+        inherited[0]["content"], "{\"goal\":\"ship it\"}",
+        "what the looping node was asked: {next}"
+    );
+    assert_eq!(
+        inherited[1]["content"][0]["text"], "{\"feedback\":\"a looked-up snippet\"}",
+        "…and what it answered — not a turn of its loop: {next}"
+    );
+    assert!(
+        !recorded[3].body_text.contains(CLOSING),
+        "the closing turn is one request's shape and never the conversation's: {next}"
+    );
+    assert!(provider.snapshot().is_drained());
+
+    // The same close on the Chat Completions wire, where the pinned call asks
+    // for its shape with `response_format` rather than a forced tool: the turn
+    // is appended above the wire, so both surfaces carry it.
+    let other = MockProvider::start().expect("a loopback port");
+    other.enqueue_all([
+        Script::new(
+            LOCAL,
+            Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+        ),
+        Script::new(LOCAL, Outcome::text("found it")),
+        Script::new(
+            LOCAL,
+            Outcome::structured(json!({ "feedback": "a looked-up snippet" })),
+        ),
+    ]);
+    let across = harness::invoke(
+        "agent-openai",
+        "flow.research",
+        &[("goal", "ship it")],
+        &other,
+    )
+    .expect("the toolchain was there a moment ago");
+    across.succeeded();
+
+    let asked = other.requests();
+    assert_eq!(asked.len(), 3, "two loop calls, then the pinned one");
+    assert!(asked.iter().all(RecordedRequest::is_valid));
+    let pinned = asked[2].body();
+    assert!(
+        pinned["response_format"].is_object(),
+        "the third call is the pinned one on this wire: {pinned}"
+    );
+    let last = pinned["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .expect("a last message")
+        .clone();
+    assert_eq!(last["role"], "user", "and it ends on the user: {pinned}");
+    assert_eq!(last["content"], CLOSING, "with the same text: {pinned}");
+    assert!(other.snapshot().is_drained());
 }
 
 /// A loop answer is replayed as the model sent it, and an answer that carried
