@@ -2563,9 +2563,19 @@ fn an_agent_nodes_exchange_reaches_the_next_agent_nodes_request() {
 /// The second node is why the flow has two: the synthetic turn belongs to one
 /// request, and the only place the conversation itself is visible is the request
 /// the **next** agent node makes (grammar 10.4, and see
-/// `an_agent_nodes_exchange_reaches_the_next_agent_nodes_request`). A runtime
-/// that pushed the turn into `turns` instead of composing over a copy would pass
-/// every assertion about the pinned call and fail here.
+/// `an_agent_nodes_exchange_reaches_the_next_agent_nodes_request`). What that
+/// half pins is the *channel*: the conversation an agent node contributes is
+/// composed from its rendered input and its structured answer (`MessageLike`),
+/// so this asserts that the exchange the closing turn was composed onto is not
+/// among what crosses.
+///
+/// It does **not** pin the composition — a runtime that appended the turn to the
+/// loop's own list instead of to a copy would send the identical request and
+/// hand the next node the identical history, because nothing downstream reads
+/// that list. That is guarded one layer down and by a different gate: `turns` is
+/// `readonly Turn[]` in `callAgent`, so appending to it is a type error, and
+/// `generated_code_gates::every_generated_project_type_checks_under_the_pinned_toolchain`
+/// is what fails on it.
 #[test]
 fn the_pinned_call_after_a_tool_loop_ends_on_the_turn_that_closes_it() {
     const CLOSING: &str = "Now produce the structured result.";

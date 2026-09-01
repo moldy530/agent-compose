@@ -3026,7 +3026,11 @@ export async function callSubflowTool(
  *
  * It belongs to **one request** and not to the conversation: it is composed onto
  * a copy of the loop's turns, so it never reaches the agent's durable history
- * ([`MessageLike`], grammar 10.4) and never appears in the trace.
+ * ([`MessageLike`], grammar 10.4) and never appears in the trace. That the copy
+ * is a copy is held by the type rather than by a test — [`callAgent`]'s `turns`
+ * is `readonly`, because nothing downstream reads it and appending here would
+ * therefore change no observable behaviour until some later refactor made the
+ * conversation and the loop's turns the same list again.
  *
  * It *is* part of the pinned call's request identity, because that identity is
  * the request ([`callModel`]). A journal whose pinned call was recorded before
@@ -3108,7 +3112,16 @@ export async function callAgent(
 }> {
   const rendered = typeof input === "string" ? input : JSON.stringify(input);
   const turn: Turn = { role: "user", text: rendered };
-  const turns: Turn[] = [...history, turn];
+  // The conversation this node holds, and `readonly` is load-bearing: it is what
+  // keeps [`CLOSING_TURN`] out of it (resolved q52). Nothing downstream reads
+  // this array — the history the node contributes is composed from `rendered`
+  // and the structured answer ([`MessageLike`]) — so a `turns.push(CLOSING_TURN)`
+  // before the pinned call would send the right request and be caught by no test
+  // at all. Typed this way it is caught by `tsc`, which every emitted project
+  // runs over its own copy of this file. The loop below rebinds rather than
+  // pushes: one copy per turn it adds, bounded by `max_tool_iterations` and
+  // dwarfed by the model call that earned each one.
+  let turns: readonly Turn[] = [...history, turn];
   // Every call this node makes, in the order it made them (PRD 5.9). A tool
   // loop makes several, and which member of a route served each one is a
   // separate fact about each.
@@ -3157,7 +3170,7 @@ export async function callAgent(
         context,
       );
       models.push(by);
-      turns.push(replayed(agent, answer));
+      turns = [...turns, replayed(agent, answer)];
       if (answer.toolCalls.length === 0) break;
 
       // The record of this call's tool calls, on the record of the call that
@@ -3297,7 +3310,7 @@ export async function callAgent(
         refusal = undefined;
         results.push({ id: call.id, name: call.name, content: JSON.stringify(result) });
       }
-      turns.push({ role: "tool", results });
+      turns = [...turns, { role: "tool", results }];
     }
   }
 
@@ -3307,8 +3320,10 @@ export async function callAgent(
       system: agent.prompt,
       // Over a **copy**, and only where a loop ran: `turns` is the conversation
       // this node held, and [`CLOSING_TURN`] is the shape of one request made
-      // over it (resolved q52). Pushing it would put a turn no model ever saw an
-      // answer to into the history a later turn is composed from.
+      // over it (resolved q52). Appending it to the conversation instead would
+      // send this very request and, today, differ in nothing else at all — which
+      // is why `turns` is `readonly` above and that way of writing this line
+      // does not compile, rather than a test standing where no run can see.
       turns: agent.tools.length > 0 ? [...turns, CLOSING_TURN] : turns,
       tools: agent.tools,
       pinned: agent.output,
