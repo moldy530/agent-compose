@@ -375,20 +375,63 @@ rather than of the composition; written empty it is a compile error, because an
 empty path is the runtime's own working directory and a bound nobody wrote is
 not a bound.
 
+**Written, the directory is yours; omitted, it is the run's.** A binding with no
+`workspace:` works in one fresh directory per execution, under the project's data
+directory (`.agent-compose/workspaces/<execution id>/`), shared by every built-in
+of that execution that took the default — so an agent that writes a file with
+`builtin.files` and compiles it with `builtin.bash` finds one directory. It is
+removed when the execution settles, and kept while its journal row stays open,
+because the generation that resumes a parked run reads what this one wrote. A
+`workspace:` you named is never removed.
+
 `timeout:`, `env:` and `inherit_env:` are `builtin.bash`'s alone — `builtin.files`
 reads and writes through the runtime and forks nothing, so a command bound and a
 child environment there would configure nobody, and each is a compile error.
 `env:` takes exactly the `exec:` shape (`agent-compose docs cel` for `${ENV}`
 refs), and `inherit_env: false` is the default: a built-in's children see the
-variables the binding declared and nothing else.
+variables the binding declared and nothing else — not a credential this process
+holds, and not a `PATH` unless you wrote one (`bash` falls back to its own
+compiled-in default when it finds none, which is why the shorthand works at all).
+`inherit_env: true` is the opt-in, and a declared `env:` still layers over it.
 
 `bash`'s `timeout:` bounds one command; a node's own `timeout:` bounds the whole
 agent node, tool loop included, and the two compose.
 
-**What fails and what bounces.** Arguments the tool's schema refuses go back to
-the model, which can call again — a missing `command`, a `path` that resolves
-outside the workspace. Everything else fails the agent node under its
-`retry:`/`on_error:`, exactly as a failing `exec:` tool does.
+### What the model gets back
+
+`builtin.bash` answers with `stdout`, `stderr` and `exit_code`, and a `notice`
+where something happened to the *session*. `builtin.files` answers with the path
+and what the operation did: a `view` comes back with the file's lines numbered
+(or a directory's entries), a `create` with the bytes written, an edit with the
+line it changed and a few lines around it. Both are capped — a `cat` of a large
+file is cut with the cut said, rather than spending a context window.
+
+**A shell is a session.** One `bash` child per agent node execution, with its
+standard input open: the working directory, the variables and the shell options
+carry from one call to the next, so `cd build` and then `make` is one thought
+rather than two unrelated commands. A node `retry:` opens a fresh one, exactly as
+it restarts the ordinals of grammar §9.4. The model can restart it itself —
+`restart: true` with no command — which is what the provider-defined tool's own
+parameter is for.
+
+**What fails and what bounces.** The split of `agent-compose docs agents` reads
+one way here that is worth stating, because a built-in has no contract of the
+composition's to fail:
+
+- **the model's mistakes come back to the model** — a call with neither a
+  `command` nor a `restart`, a `path` that resolves outside the workspace, a file
+  that is not there, a `str_replace` whose `old_str` matched nothing or matched
+  twice. Each is a statement about arguments the model chose, and it can choose
+  again;
+- **a command's own outcome is an answer, not a failure** — a nonzero exit comes
+  back with the status, and a command that outran the `timeout:` is killed and
+  comes back saying so, with what it printed by then and a notice that the
+  session went with it. The model decides what to do about both, which is what it
+  is there for;
+- **the tool being unusable fails the node** — a `workspace:` that names no
+  directory, a `${WORKSPACE}` that resolved empty, a host with no `bash` on
+  `PATH`. No call can fix those, so `retry:`/`on_error:` decide the run, exactly
+  as they do for a failing `exec:` tool.
 
 **Containment is the workspace and the timeout, and nothing more.** The tools run
 with the privileges of the process running the graph. Container and syscall
@@ -403,7 +446,12 @@ dispatch — which is what "the machine with the capability" placements are for
 
 A built-in call is recorded in the trace like any other tool call, under the
 address it was attached by — `builtin.bash` for a shorthand, `tool.sandbox` for a
-configured one.
+configured one — **and it carries the program the model wrote**: the command and
+its exit status, or the file operation and its path, with a sentence about what
+an edit changed. That is the one thing the trace format carries for these tools
+and for no other, because for every other binding the program is in the spec a
+reader already has (`docs/trace.md` §7.4). What stays out is what stays out
+everywhere else: the command's output, and what a file holds.
 
 ## `function:` nodes
 

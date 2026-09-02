@@ -326,6 +326,7 @@ pub fn readme(ir: &Ir, partition: &super::env::Partition) -> super::GeneratedFil
     contents.push_str(README_BODY);
     contents.push_str(&human_waits(ir, partition));
     contents.push_str(&store_data(ir));
+    contents.push_str(&builtin_workspaces(ir));
     contents.push_str(&route_timeouts(ir));
     contents.push_str(&host_functions(ir));
     contents.push_str(README_PINS);
@@ -851,6 +852,59 @@ the two is the budget you wrote, whichever machine reached the node. The worker'
 own clock does not reach the status route — a deadline shown to a person has to be
 the deadline this process will fire, and two machines' clocks disagree.
 "##;
+
+/// The section a composition holding a **built-in tool** gets
+/// (grammar §5.5, §6.1, PRD resolved q54).
+///
+/// Two things a reader of the generated project has to be told and cannot read
+/// off the spec: where a workspace nobody named lives — because a run writes
+/// there and something has to say what is safe to delete — and what these tools
+/// are, which is the one binding whose program the *model* writes. Emitted
+/// exactly when the composition holds one, in either spelling, for the reason
+/// [`store_data`] is emitted exactly when there is a store.
+fn builtin_workspaces(ir: &Ir) -> String {
+    let held = ir
+        .definitions
+        .values()
+        .any(|definition| match &definition.body {
+            crate::ir::definition::DefinitionBody::Agent(agent) => !agent.builtins.is_empty(),
+            crate::ir::definition::DefinitionBody::Tool(tool) => matches!(
+                tool.implementation,
+                crate::ir::flow::ToolImplementation::Builtin { .. }
+            ),
+            _ => false,
+        });
+    if !held {
+        return String::new();
+    }
+    String::from(BUILTIN_WORKSPACES)
+}
+
+const BUILTIN_WORKSPACES: &str = r#"
+## Where a built-in tool works, and what it may run
+
+This composition holds `builtin.bash` or `builtin.files` — the one binding whose
+program the **model** writes rather than the author. Every other tool fixes what
+runs at build time and lets the model fill parameters a schema constrains; these
+two run the command or the edit a model composes at the moment it composes it.
+That is the trust level an `exec:` tool already extends to author-chosen
+binaries, extended to the model: an agent holding `builtin.bash` can run anything
+the process running this graph can run. There is no container and no syscall
+filter in this release; what bounds a call is the workspace, the command
+`timeout:`, and the environment the binding declared.
+
+A binding that names a `workspace:` works there. One that does not works here:
+
+```text
+.agent-compose/workspaces/<execution id>/     one directory per execution
+```
+
+It is made fresh when the execution's first built-in call runs, shared by every
+built-in of that execution that took the default, and **removed when the run
+settles** — kept only while the execution's journal row stays open, so that a
+`resume` finds the files the run had written. A `workspace:` you named is never
+removed by this project.
+"#;
 
 /// The section a composition declaring a `store.*` gets.
 ///
@@ -1620,6 +1674,79 @@ store.prefs:
         assert!(
             section > contents.find("### On Node instead").expect("the fallback"),
             "…and after the launch instructions it is about"
+        );
+    }
+
+    /// A composition holding a built-in is told where it works and what it may
+    /// run (grammar §5.5, §6.1, PRD resolved q54).
+    ///
+    /// Two things the spec cannot tell the reader of a *project*: where a
+    /// workspace nobody named lives, which is a directory a run writes into and
+    /// something has to say is safe to delete; and the trust level, which is the
+    /// one thing about these tools that is not a key. Both spellings reach it —
+    /// the shorthand on an agent and a `tool.*` with a `builtin:` binding — and
+    /// a composition holding neither is not told about a directory it has no
+    /// tool to fill.
+    #[test]
+    fn a_composition_with_a_built_in_is_told_where_it_works() {
+        let plain = readme_of(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            !plain.contains("## Where a built-in tool works"),
+            "a composition with no built-in has no workspace to describe"
+        );
+
+        let agent = r#"version: "0.1"
+
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-6
+
+agent.worker:
+  description: Works in a directory.
+  model: model.smart
+  prompt: Do the thing.
+  tools: [builtin.bash]
+  output:
+    summary: { type: string }
+"#;
+        let shorthand = readme_of(&ir_of(agent)).contents;
+        assert!(
+            shorthand.contains(".agent-compose/workspaces/<execution id>/"),
+            "the directory a defaulted workspace is: {shorthand}"
+        );
+        assert!(
+            shorthand.contains(
+                "removed when the run
+settles"
+            ),
+            "…and its lifetime, which is what makes it safe to delete: {shorthand}"
+        );
+        assert!(
+            shorthand.contains(
+                "can run anything
+the process running this graph can run"
+            ),
+            "…and the trust level, said rather than implied (D135): {shorthand}"
+        );
+
+        // The other spelling reaches the same section: a `tool.*` carrying a
+        // `builtin:` binding, attached by nothing at all.
+        let configured = readme_of(&ir_of(
+            r#"version: "0.1"
+
+tool.sandbox:
+  builtin: files
+  workspace: "${WORK_DIR}"
+"#,
+        ))
+        .contents;
+        assert!(
+            configured.contains("## Where a built-in tool works"),
+            "{configured}"
         );
     }
 

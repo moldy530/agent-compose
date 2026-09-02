@@ -147,6 +147,38 @@ The line is what the model could do about it: a schema refusal is a statement
 about the *call*, which the model chose and can choose differently; an execution
 failure is a statement about the world.
 
+## Built-in tools, at run time
+
+`builtin.bash` and `builtin.files` (`agent-compose docs tools`) are the two tools
+whose program the **model** writes, and the line above is where that shows. Four
+things are worth knowing at the node:
+
+- **a shell is a session, and the session is the node execution's.** One `bash`
+  child per agent node execution: the working directory and the shell state carry
+  from one call to the next, and a node `retry:` starts a fresh one — the same
+  restart the ordinals of a retried attempt get. It ends when the node does,
+  whichever way the node ends.
+- **what a command *said* is an answer, not a failure.** A nonzero exit comes
+  back with its status; a command that outruns the binding's `timeout:` is killed
+  and comes back saying so, with what it printed by then. Both leave the loop
+  running, and the model decides. What fails the node is the tool being unusable
+  — a workspace that is not a directory, a host with no `bash`.
+- **the workspace is the bound, and it is per execution unless you name one.**
+  Every `builtin.files` path resolves inside it and one that does not is refused
+  to the model; `bash` starts there. A binding that writes no `workspace:` gets a
+  fresh directory per execution, shared with that execution's other built-ins and
+  removed when the run settles.
+- **the child environment is scrubbed.** A built-in's children see the variables
+  its binding declared and nothing else, unless it wrote `inherit_env: true`.
+
+The trust framing is the same one the tools page states and is worth repeating
+where the node is: every other binding fixes *what runs* at build time and lets
+the model fill schema-validated parameters, while these two have the model author
+the program at run time. That is the trust level `exec:` already extends to
+author-arbitrary binaries, extended to the model — an agent holding
+`builtin.bash` can run anything the process running the graph can run, and the
+trace records what it ran (`docs/trace.md` §7.4).
+
 ## The loop is bounded
 
 `max_tool_iterations` (default 8) bounds *turns* of the intra-agent tool loop. A
