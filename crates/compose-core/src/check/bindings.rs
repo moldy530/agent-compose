@@ -20,14 +20,14 @@
 //! a declared object — is decided here (grammar 5.3, 8.6 rule 12, Decisions
 //! D14, D75).
 
-use crate::ast::common::Namespace;
+use crate::ast::common::{Address, Namespace};
 use crate::ast::definition::{AgentAccess, ProviderKind, StoreKind};
 use crate::cel::Scope;
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::ir::binding::{Bindings, Http, NodeInput};
 use crate::ir::definition::{Agent, Store, Tool};
-use crate::ir::flow::{Node, NodeKind};
+use crate::ir::flow::{Node, NodeKind, ToolImplementation};
 use crate::ir::schema::{Field, FieldMap};
 
 use super::model::{default_of, satisfies};
@@ -366,40 +366,58 @@ pub(crate) fn agent_tools(ctx: &mut Ctx, address: &str, agent: &Agent) {
     server_tool_collisions(ctx, address, agent);
 }
 
+/// The name an attached `tool.*`/`flow.*` is offered to the model under.
+///
+/// Its address's local name, except where the tool's implementation is a
+/// `builtin:` binding: those go out as the provider-defined tool types, each of
+/// which carries a name the provider dictates, so `tool.sandbox` with
+/// `builtin: bash` is `bash` on the wire whatever its definition key says
+/// (grammar 5.4, 6.1, Decision D135). Every collision rule below compares this
+/// name, because it is the only one the model ever sees.
+pub(crate) fn wire_name(ctx: &Ctx, address: &Address) -> String {
+    if let Some(tool) = ctx.tool(address)
+        && let ToolImplementation::Builtin { builtin } = &tool.implementation
+    {
+        return builtin.builtin.value.as_str().to_string();
+    }
+    address.name.as_str().to_string()
+}
+
 /// A built-in's name is on the wire beside the agent's other tools, so a
-/// `tool.*` or `flow.*` whose local name is `bash`, `read_file`, `write_file` or
-/// `list` collides with the built-in of that name (grammar 5.5, 11.5,
-/// Decision D123).
+/// `tool.*` or `flow.*` offered under `bash` or `str_replace_based_edit_tool`
+/// collides with the shorthand of that name (grammar 5.5, 11.5,
+/// Decision D135).
 ///
 /// The same rule as [`attached_tool_collisions`], reached from the entry that
 /// carries no address to compare: a built-in's name is fixed by this compiler
 /// rather than by an author's definition key, so the repair is on the *other*
 /// side — rename the definition, or drop one of the two attachments. Which entry
-/// the report underlines is the built-in's, because that is the entry a reader
+/// the report underlines is the shorthand's, because that is the entry a reader
 /// can see the name in without opening another file.
 fn builtin_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
     for builtin in &agent.builtins {
-        let local = builtin.tool.value.as_str();
+        let local = builtin.value.as_str();
         let Some(attached) = agent
             .tools
             .iter()
-            .find(|tool| tool.value.name.as_str() == local)
+            .find(|tool| wire_name(ctx, &tool.value) == local)
         else {
             continue;
         };
+        let attached_span = attached.span.clone();
+        let attached_address = attached.value.to_string();
         ctx.push(
             Diagnostic::error(
                 DiagnosticCode::ToolNameCollision,
-                builtin.tool.span.clone(),
+                builtin.span.clone(),
                 format!(
-                    "`{address}` attaches `{}` and `{}`, which are one `{local}` tool on the model's side",
-                    builtin.tool.value.address(),
-                    attached.value
+                    "`{address}` attaches `{}` and `{attached_address}`, which are one `{local}` tool on the model's side",
+                    builtin.value.address(),
                 ),
             )
-            .with_label(attached.span.clone(), "the other is attached here")
+            .with_label(attached_span, "the other is attached here")
             .with_help(
-                "an attached tool's name is its address's local name and a built-in's is fixed by the compiler (grammar 5.4, 5.5): rename the definition, or drop one of the two attachments",
+                "an attached tool's name is its address's local name — or, for a `builtin:` tool, the name the provider fixes — and a shorthand built-in's is the compiler's (grammar 5.4, 5.5, 6.1): rename the definition, change what it binds, or drop one of the two attachments",
             ),
         );
     }
@@ -424,25 +442,26 @@ fn builtin_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
 /// model would be given a contract the composition did not attach.
 fn attached_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
     for (position, attached) in agent.tools.iter().enumerate() {
-        let local = attached.value.name.as_str();
+        let local = wire_name(ctx, &attached.value);
         let Some(first) = agent.tools[..position]
             .iter()
-            .find(|earlier| earlier.value.name.as_str() == local)
+            .find(|earlier| wire_name(ctx, &earlier.value) == local)
         else {
             continue;
         };
+        let (first_address, first_span) = (first.value.to_string(), first.span.clone());
         ctx.push(
             Diagnostic::error(
                 DiagnosticCode::ToolNameCollision,
                 attached.span.clone(),
                 format!(
-                    "`{address}` attaches `{}` and `{}`, which are one `{local}` tool on the model's side",
-                    first.value, attached.value
+                    "`{address}` attaches `{first_address}` and `{}`, which are one `{local}` tool on the model's side",
+                    attached.value
                 ),
             )
-            .with_label(first.span.clone(), "the first is attached here")
+            .with_label(first_span, "the first is attached here")
             .with_help(
-                "an attached tool's name is its address's local name — the only name it has on the model's side (grammar 5.4, 11.5): rename one of the two definitions, or drop one of the attachments",
+                "an attached tool's name is its address's local name — or, for a `builtin:` tool, the name the provider fixes — and it is the only name it has on the model's side (grammar 5.4, 6.1, 11.5): rename one of the two definitions, or drop one of the attachments",
             ),
         );
     }
@@ -476,7 +495,7 @@ fn store_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
             let Some(tool) = agent
                 .tools
                 .iter()
-                .find(|tool| tool.value.name.as_str() == synthesized)
+                .find(|tool| wire_name(ctx, &tool.value) == synthesized)
             else {
                 continue;
             };
@@ -557,7 +576,7 @@ fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
         .tools
         .iter()
         .map(|tool| Offered {
-            local: tool.value.name.as_str().to_string(),
+            local: wire_name(ctx, &tool.value),
             at: tool.span.clone(),
             subject: format!("attaches `{}`, whose name collides with", tool.value),
             repair: "rename the attachment",
@@ -565,14 +584,14 @@ fn server_tool_collisions(ctx: &mut Ctx, address: &str, agent: &Agent) {
         .collect();
     // A built-in reaches the same `tools` array under the same key, so a suite
     // declaring `bash` and an agent holding `builtin.bash` is the same 400 as
-    // any other pair (grammar 5.5, Decision D123).
+    // any other pair (grammar 5.5, Decision D135).
     for builtin in &agent.builtins {
         offered.push(Offered {
-            local: builtin.tool.value.as_str().to_string(),
-            at: builtin.tool.span.clone(),
+            local: builtin.value.as_str().to_string(),
+            at: builtin.span.clone(),
             subject: format!(
                 "attaches `{}`, whose name collides with",
-                builtin.tool.value.address()
+                builtin.value.address()
             ),
             repair: "drop the built-in, whose name is not an author's to change",
         });
@@ -880,9 +899,9 @@ flow.f:
         );
     }
 
-    /// No store can synthesize a tool called `bash`, `read_file`, `write_file`
-    /// or `list`, which is why [`super::store_tool_collisions`] does not compare
-    /// the built-ins.
+    /// No store can synthesize a tool called `bash` or
+    /// `str_replace_based_edit_tool`, which is why
+    /// [`super::store_tool_collisions`] does not compare the built-ins.
     ///
     /// The premise is about two closed lists — the built-in names and grammar
     /// 11.4's ops — so it is held here rather than asserted in a comment: a

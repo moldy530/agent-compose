@@ -1,16 +1,14 @@
-# M3 acceptance fixture: the four runtime built-ins (grammar 5.5, Decision D123,
-# PRD resolved q31).
+# Acceptance fixture: the built-in shell (grammar 5.5, 6.1, Decision D135,
+# PRD resolved q54).
 #
-# A **built-in** is a tool this runtime implements and an agent opts into one
-# name at a time, bounded by a `root:` it may not leave and — for the shell — a
-# `timeout:` it may not outrun. So what this fixture is written to make
-# assertable is what a transcript and a file system can *see*:
+# A **built-in** is a tool this runtime implements and an agent opts into by
+# name, bounded by a workspace it may not leave and — for the shell — a
+# `timeout:` it may not outrun. It is the one binding whose program the *model*
+# writes, so what this fixture is written to make assertable is what a
+# transcript and a file system can see:
 #
-#   * each of the four really runs — a file read back, a file written, a
-#     directory listed, a command's stdout returned;
-#   * a path that resolves outside the root is refused, by `..` and by a
-#     symlink alike, and refusing it **fails the node** rather than going back
-#     to the model;
+#   * the shell really runs — a command's stdout comes back, and a file it
+#     wrote is on disk afterwards;
 #   * a command that outruns its `timeout:` is killed, and one that exits
 #     nonzero fails the node under the node's own `on_error:`;
 #   * arguments the built-in's own schema refuses **bounce back to the model**
@@ -19,7 +17,7 @@
 #     property the journal buys and the reason a built-in beats a hand-rolled
 #     `exec:` tool.
 #
-# Every `root:` is `${BUILTIN_ROOT}`, which each test points at a scratch
+# Every workspace is `${BUILTIN_ROOT}`, which each test points at a scratch
 # directory of its own: the bound is a property of the machine running the graph
 # (grammar 4.3 class 2), and a fixture that hard-coded one could not be run twice
 # in parallel.
@@ -50,25 +48,36 @@ model.claude:
   settings:
     max_tokens: 4096
 
+# The configured form: a built-in with its bounds written on a `tool.*`, which
+# is what makes one configuration attachable from more than one agent. The 30s
+# here is long enough that no test reaches it by accident — `tool.impatient`
+# below is the one written to reach its own.
+tool.shell:
+  builtin: bash
+  workspace: "${BUILTIN_ROOT}"
+  timeout: 30s
+
+# The same built-in under a deadline a test can reach. The bound is the
+# *binding's*, so two tools in one composition holding the same built-in under
+# different bounds is the shape that proves it (grammar 6.1).
+tool.impatient:
+  builtin: bash
+  workspace: "${BUILTIN_ROOT}"
+  timeout: 1s
+
 agent.worker:
-  description: Reads, writes, lists and runs commands inside one root.
+  description: Runs commands inside one workspace.
   model: model.claude
   prompt: |
     You work inside one directory and may not leave it.
 
     Use your tools to do what the goal asks, then say what you did.
-  # All four, one name per entry, each carrying its own bounds. The 30s here is
-  # long enough that no test reaches it by accident — `agent.impatient` below is
-  # the one written to reach its own.
   tools:
-    - builtin.read_file: { root: "${BUILTIN_ROOT}" }
-    - builtin.write_file: { root: "${BUILTIN_ROOT}" }
-    - builtin.list: { root: "${BUILTIN_ROOT}" }
-    - builtin.bash: { root: "${BUILTIN_ROOT}", timeout: 30s }
+    - tool.shell
   max_tool_iterations: 6
   input:
     goal:
-      description: What to do inside the root.
+      description: What to do inside the workspace.
       type: string
   output:
     summary:
@@ -76,16 +85,12 @@ agent.worker:
       type: string
 
 agent.impatient:
-  # One built-in and a deadline a test can reach: the same `bash`, bounded at a
-  # second instead of thirty. The bound is the *attachment's*, so two agents in
-  # one composition holding the same built-in under different bounds is the
-  # shape that proves it (grammar 5.5).
   description: Runs one command under a deadline short enough to hit.
   model: model.claude
   prompt: |
     Run the command you are asked for and report what it printed.
   tools:
-    - builtin.bash: { root: "${BUILTIN_ROOT}", timeout: 1s }
+    - tool.impatient
   max_tool_iterations: 4
   input:
     goal:
@@ -97,7 +102,7 @@ agent.impatient:
       type: string
 
 flow.work:
-  description: One agent with every built-in on it.
+  description: One agent with the built-in shell on it.
   inputs:
     goal:
       type: string

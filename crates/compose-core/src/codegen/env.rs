@@ -684,6 +684,21 @@ impl References {
                     ToolImplementation::Module { module } => {
                         references.entries_of(&module.env, &format!("{address}.module.env"));
                     }
+                    // A built-in's `workspace:` is grammar 4.3 class 2 like an
+                    // `exec:`'s `cwd:`, and its `env:` is that block's `env:`
+                    // exactly, for the same reason: where a graph may work and
+                    // what its children may read are properties of the machine
+                    // running it, not of the composition (Decision D135). Filed
+                    // under the tool's own address, so §9.1's executes-in
+                    // closure carries them to exactly the processes that can run
+                    // it — which, for a placed agent, is the worker that took
+                    // its dispatch (PRD resolved q41, q45).
+                    ToolImplementation::Builtin { builtin } => {
+                        if let Some(workspace) = &builtin.workspace {
+                            references.text(&workspace.value, &format!("{address}.workspace"));
+                        }
+                        references.entries_of(&builtin.env, &format!("{address}.env"));
+                    }
                     ToolImplementation::Function { .. } => {}
                 },
                 DefinitionBody::Flow(flow) => {
@@ -705,18 +720,12 @@ impl References {
                         }
                     }
                 }
-                DefinitionBody::Agent(agent) => {
-                    // A built-in's `root:` is grammar 4.3 class 2 like an
-                    // `exec:`'s `cwd:`, and for the same reason: where a graph
-                    // is allowed to read and write is a property of the machine
-                    // running it, not of the composition (Decision D123).
-                    for builtin in &agent.builtins {
-                        references.text(
-                            &builtin.root.value,
-                            &format!("{address}.tools.{}.root", builtin.tool.value.address()),
-                        );
-                    }
-                }
+                // A shorthand built-in carries no bounds, so it names no
+                // environment: a built-in with a `workspace:` or an `env:` is a
+                // `tool.*` with a `builtin:` binding, whose references are
+                // collected under that tool's own address above (grammar 5.5,
+                // 6.1, Decision D135).
+                DefinitionBody::Agent(_) => {}
                 DefinitionBody::Store(_) | DefinitionBody::Model(_) => {}
             }
         }

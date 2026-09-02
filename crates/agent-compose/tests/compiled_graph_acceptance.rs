@@ -7795,7 +7795,8 @@ fn the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order
         // which is the only arrangement under which the join means anything.
         //
         // Two calls per dispatched instance, for `agent.triage`'s reason one
-        // level down: `agent.fixer` holds `builtin.read_file` (grammar 5.5), so
+        // level down: `agent.fixer` holds `tool.checkout`, a `builtin: files`
+        // binding (grammar 5.5, 6.1), so
         // each instance makes a loop call before its pinned one. The pair is
         // told apart by which item the request carries rather than by position,
         // since two instances run concurrently and either may ask first.
@@ -12387,33 +12388,29 @@ fn root_of(scratch: &harness::Scratch) -> std::path::PathBuf {
     scratch.path().join("root")
 }
 
-/// All four built-ins, called by a real model loop, doing real work
-/// (grammar 5.5, Decision D123, PRD resolved q31).
+/// The built-in shell, called by a real model loop, doing real work
+/// (grammar 5.5, 6.1, Decision D135, PRD resolved q54).
 ///
-/// One answer carries four calls, so the whole set is exercised in one turn and
-/// the results come back in one tool-result message the transcript can be read
-/// off. What each one is asserted on is the thing only a real call could
-/// produce: the bytes of a file that was on disk before the run, the entries of
-/// a directory the harness made, the stdout of a command, and — the only one
-/// visible outside the transcript — a file that exists on disk afterwards.
+/// A built-in is the one binding whose program the **model** writes, so what it
+/// is asserted on is the thing only a real call could produce: the stdout of a
+/// command the model composed, and — the only one visible outside the transcript
+/// — a file that exists on disk afterwards because that command wrote it.
 #[test]
-fn every_builtin_runs_inside_its_root_and_answers_the_model() {
+fn the_builtin_shell_runs_inside_its_workspace_and_answers_the_model() {
     let provider = MockProvider::start().expect("a loopback port");
     let (scratch, environment) = bounded_root(&provider, "builtins-run");
     let root = root_of(&scratch);
     std::fs::write(root.join("notes.txt"), "the note this file held")
         .expect("the root is writable");
-    std::fs::create_dir_all(root.join("sub")).expect("the root is writable");
 
     provider.enqueue_all([
         Script::new(
             SONNET,
             Outcome::tool_calls(vec![
-                ToolCall::new("read_file", json!({ "path": "notes.txt" })),
-                ToolCall::new("list", json!({ "path": ".", "glob": "" })),
+                ToolCall::new("bash", json!({ "command": "cat notes.txt" })),
                 ToolCall::new(
-                    "write_file",
-                    json!({ "path": "written.txt", "content": "what the graph wrote" }),
+                    "bash",
+                    json!({ "command": "printf 'what the graph wrote' > written.txt" }),
                 ),
                 ToolCall::new(
                     "bash",
@@ -12424,42 +12421,37 @@ fn every_builtin_runs_inside_its_root_and_answers_the_model() {
         Script::new(SONNET, Outcome::text("I have what I need.")),
         Script::new(
             SONNET,
-            Outcome::structured(json!({ "summary": "read, listed, wrote and ran" })),
+            Outcome::structured(json!({ "summary": "read, wrote and ran" })),
         ),
     ]);
 
     let Some(run) = harness::invoke_with(
         "builtin-tools",
         "flow.work",
-        &json!({ "goal": "do the four things" }),
+        &json!({ "goal": "do the three things" }),
         &environment,
     ) else {
         return;
     };
     run.succeeded();
-    assert_eq!(run.outputs()["summary"], "read, listed, wrote and ran");
+    assert_eq!(run.outputs()["summary"], "read, wrote and ran");
 
-    // The one effect that outlives the process: `write_file` really wrote.
+    // The one effect that outlives the process: the command really wrote.
     assert_eq!(
         std::fs::read_to_string(root.join("written.txt")).expect("the file was written"),
         "what the graph wrote"
     );
 
-    // …and the three that are only visible in what the model was handed back,
+    // …and the two that are only visible in what the model was handed back,
     // which is the request that replays this turn's results.
     let asked = provider.requests();
     assert_eq!(asked.len(), 3, "the loop turned twice and then pinned");
     let handed = asked[1].body().to_string();
     for expected in [
-        // `read_file` answered with the bytes that were on disk.
+        // The first command read a file that was on disk before the run.
         "the note this file held",
-        // `list` answered with the directory's entries, a directory marked.
-        "notes.txt",
-        "sub/",
-        // `write_file` answered with the byte count.
-        "bytes_written",
-        // …and `bash` ran with the root as its working directory, which is what
-        // the command printed the basename of.
+        // …and the last ran with the workspace as its working directory, which
+        // is what the command printed the basename of.
         "ran in root",
     ] {
         assert!(
@@ -12468,9 +12460,9 @@ fn every_builtin_runs_inside_its_root_and_answers_the_model() {
         );
     }
 
-    // The trace records each call as a `ToolCallRecord` and nothing more:
-    // `docs/trace.md` §11 keeps a tool's answer out of the format, and a
-    // built-in is a tool (PRD resolved q31 — "traces are unchanged").
+    // The trace records each call as a `ToolCallRecord`, under the **tool's**
+    // address rather than the built-in's, because a configured built-in is a
+    // `tool.*` like any other (grammar 6.1).
     let calls = tool_calls_of(&run, "do");
     assert_eq!(
         calls
@@ -12484,370 +12476,25 @@ fn every_builtin_runs_inside_its_root_and_answers_the_model() {
             .collect::<Vec<_>>(),
         vec![
             (
-                "read_file".to_string(),
-                "builtin.read_file".to_string(),
-                "completed".to_string(),
-                false
-            ),
-            (
-                "list".to_string(),
-                "builtin.list".to_string(),
-                "completed".to_string(),
-                false
-            ),
-            (
-                "write_file".to_string(),
-                "builtin.write_file".to_string(),
+                "bash".to_string(),
+                "tool.shell".to_string(),
                 "completed".to_string(),
                 false
             ),
             (
                 "bash".to_string(),
-                "builtin.bash".to_string(),
+                "tool.shell".to_string(),
+                "completed".to_string(),
+                false
+            ),
+            (
+                "bash".to_string(),
+                "tool.shell".to_string(),
                 "completed".to_string(),
                 false
             ),
         ],
-        "each call is recorded under the built-in's address, with no result beside it"
-    );
-    assert!(provider.snapshot().is_drained());
-}
-
-/// What a `list` answers: the entries in order, a glob matched within and across
-/// path segments, and a flag when it stopped short (grammar 5.5).
-///
-/// The glob matcher is this runtime's own — one fewer pinned dependency, which
-/// is the posture the whole emitted runtime is written in — so its two rules
-/// need exercising rather than asserting: `*` and `?` stay inside one segment
-/// and `**` spans them. The cap is here for the same reason: a bound nothing
-/// reaches is a bound nobody knows the shape of, and `truncated` is what tells a
-/// model its listing is a prefix rather than an answer.
-#[test]
-fn a_listing_matches_globs_in_order_and_says_when_it_stopped_short() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-glob");
-    let root = root_of(&scratch);
-    // A tree deep enough that `*` and `**` disagree about it.
-    std::fs::create_dir_all(root.join("docs/deep")).expect("the root is writable");
-    for path in [
-        "docs/one.md",
-        "docs/two.txt",
-        "docs/deep/three.md",
-        "top.md",
-    ] {
-        std::fs::write(root.join(path), "x").expect("the root is writable");
-    }
-    // …and a directory with more entries than one answer carries.
-    let crowd = root.join("crowd");
-    std::fs::create_dir_all(&crowd).expect("the root is writable");
-    for index in 0..1001 {
-        std::fs::write(crowd.join(format!("{index:04}.txt")), "x").expect("the root is writable");
-    }
-
-    provider.enqueue_all([
-        Script::new(
-            SONNET,
-            Outcome::tool_calls(vec![
-                // `*` does not cross a `/`, so `docs/deep/three.md` is not a match.
-                ToolCall::new("list", json!({ "path": ".", "glob": "docs/*.md" })),
-                // `**` does, and reaches the file the one above cannot.
-                ToolCall::new("list", json!({ "path": ".", "glob": "**/*.md" })),
-                // …and the listing that has to stop.
-                ToolCall::new("list", json!({ "path": "crowd", "glob": "" })),
-            ]),
-        ),
-        Script::new(SONNET, Outcome::text("I have the listings.")),
-        Script::new(SONNET, Outcome::structured(json!({ "summary": "listed" }))),
-    ]);
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "list the tree" }),
-        &environment,
-    ) else {
-        return;
-    };
-    run.succeeded();
-
-    let handed = provider.requests()[1].body().to_string();
-    // Segment-bounded: the two files directly under `docs/`, in order, and not
-    // the one a level down.
-    assert!(
-        handed.contains(r#"[\"docs/one.md\"]"#),
-        "`docs/*.md` matches inside one segment only: {handed}"
-    );
-    // Segment-spanning: everything with that suffix, wherever it sits.
-    assert!(
-        handed.contains(r#"[\"docs/deep/three.md\",\"docs/one.md\",\"top.md\"]"#),
-        "`**/*.md` crosses segments, and the entries are in order: {handed}"
-    );
-    // …and the listing that ran out says so rather than looking complete.
-    assert!(
-        handed.contains(r#"\"truncated\":true"#) && handed.contains(r#"\"0000.txt\""#),
-        "a listing past the cap answers a prefix and reports that it is one: {handed}"
-    );
-    assert!(provider.snapshot().is_drained());
-}
-
-/// A path that climbs out of the root with `..` is **refused**, and refusing it
-/// fails the node rather than going back to the model (PRD resolved q31).
-///
-/// The file it climbs to really exists, which is what makes the assertion about
-/// the *rule* rather than about a missing file: a runtime comparing strings, or
-/// one resolving the path and then opening the raw one, would read it.
-#[test]
-fn a_path_that_climbs_out_of_the_root_is_refused_and_fails_the_node() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-escape");
-    std::fs::write(scratch.path().join("secret.txt"), "not for the model")
-        .expect("the scratch area is writable");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "read_file",
-            json!({ "path": "../secret.txt" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "read the secret" }),
-        &environment,
-    ) else {
-        return;
-    };
-    let said = run.failed();
-    assert!(
-        said.contains("resolves outside `root:`") && said.contains("../secret.txt"),
-        "the refusal names the path and the bound it left: {said}"
-    );
-
-    // …and it is a *failure*, not a refusal handed back: the model saw nothing,
-    // the node ended, and the trace says so (Decision D119).
-    let calls = tool_calls_of(&run, "do");
-    assert_eq!(
-        calls.len(),
-        1,
-        "the loop ended at the first call: {calls:?}"
-    );
-    assert_eq!(calls[0]["outcome"], "failed");
-    assert_eq!(
-        provider.requests().len(),
-        1,
-        "a failed call ends the node, so the loop does not turn again"
-    );
-}
-
-/// A **symlink** that points out of the root is refused too, which is the half a
-/// string comparison passes and a resolution does not (PRD resolved q31:
-/// "resolution, not string prefix — symlinks and `..` count").
-#[cfg(unix)]
-#[test]
-fn a_symlink_that_points_out_of_the_root_is_refused() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-symlink");
-    let outside = scratch.path().join("secret.txt");
-    std::fs::write(&outside, "not for the model").expect("the scratch area is writable");
-    // The link's own path is inside the root and stays inside it under every
-    // string rule there is; only resolving it says otherwise.
-    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("inside.txt"))
-        .expect("the root is writable");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "read_file",
-            json!({ "path": "inside.txt" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "read through the link" }),
-        &environment,
-    ) else {
-        return;
-    };
-    let said = run.failed();
-    assert!(
-        said.contains("resolves outside `root:`") && said.contains("inside.txt"),
-        "a link out of the root is refused where it points, not where it sits: {said}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&outside).expect("the file is still there"),
-        "not for the model",
-        "nothing outside the root was touched"
-    );
-}
-
-/// A **write** through a symlink whose target does not exist yet is refused
-/// rather than creating the file the link points at (PRD resolved q31).
-///
-/// This is the escape a resolution check can pass *by resolving nothing*.
-/// Resolving the whole path fails — there is nothing at the other end of the
-/// link — so what is left is the not-yet-existing case, where the **parent** is
-/// resolved and the last component appended: the parent is the root itself, the
-/// result sits under it, and every check says yes. `writeFile` then follows the
-/// link and creates a file outside the bound. Refusing the dangling link is what
-/// closes that, and the target being a path that does not exist yet is exactly
-/// what makes it a file this call would have created.
-#[cfg(unix)]
-#[test]
-fn a_write_through_a_dangling_symlink_is_refused() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-dangling");
-    let outside = scratch.path().join("not-yet.txt");
-    assert!(
-        !outside.exists(),
-        "the link points at nothing to begin with"
-    );
-    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("dangling.txt"))
-        .expect("the root is writable");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "write_file",
-            json!({ "path": "dangling.txt", "content": "written out of the root" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "write through the link" }),
-        &environment,
-    ) else {
-        return;
-    };
-    let said = run.failed();
-    assert!(
-        said.contains("will not follow `dangling.txt`")
-            && said.contains("symbolic link whose target does not exist"),
-        "a link with nothing to resolve is refused rather than written through: {said}"
-    );
-    assert!(
-        !outside.exists(),
-        "the write reached `{}`, outside the root",
-        outside.display()
-    );
-    let calls = tool_calls_of(&run, "do");
-    assert_eq!(calls[0]["outcome"], "failed");
-}
-
-/// A write to a file that does not exist yet, under a directory that is a
-/// **symlink out of the root**, is refused — which is the case resolved q31
-/// names in as many words ("a write to a not-yet-existing path resolves its
-/// parent").
-///
-/// Nothing at the requested path exists, so there is nothing to resolve whole;
-/// where the *parent* really is decides the call. A runtime that checked the
-/// lexically-resolved path instead would find no `..` in `linkdir/new.txt`,
-/// agree it sits under the root, and write into a directory the composition
-/// never granted.
-#[cfg(unix)]
-#[test]
-fn a_write_to_a_new_file_under_a_symlinked_directory_is_refused() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-linked-parent");
-    let outside = scratch.path().join("elsewhere");
-    std::fs::create_dir_all(&outside).expect("the scratch area is writable");
-    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("linkdir"))
-        .expect("the root is writable");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "write_file",
-            json!({ "path": "linkdir/new.txt", "content": "written out of the root" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "write through the linked directory" }),
-        &environment,
-    ) else {
-        return;
-    };
-    let said = run.failed();
-    assert!(
-        said.contains("resolves outside `root:`") && said.contains("linkdir/new.txt"),
-        "a new file is checked against where its parent really is: {said}"
-    );
-    assert!(
-        !outside.join("new.txt").exists(),
-        "the write reached `{}`, outside the root",
-        outside.join("new.txt").display()
-    );
-    let calls = tool_calls_of(&run, "do");
-    assert_eq!(calls[0]["outcome"], "failed");
-}
-
-/// A listing **does not descend into** a symlinked directory, so no path outside
-/// the root reaches the model through a walk nobody asked a path check of
-/// (grammar 5.5, PRD resolved q31).
-///
-/// `list` is the one built-in that answers with paths the model never named: a
-/// glob walk goes wherever the tree goes, and every entry it finds is reported
-/// without going back through the root check the *listed* path went through. Not
-/// following links is what keeps that sound. The link itself is still an entry —
-/// reported as a link, without the trailing `/` a directory gets — and reading
-/// it is a `read_file` call, where the check is asked and refused.
-#[cfg(unix)]
-#[test]
-fn a_listing_does_not_descend_into_a_symlinked_directory() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-linked-listing");
-    let root = root_of(&scratch);
-    let outside = scratch.path().join("elsewhere");
-    std::fs::create_dir_all(&outside).expect("the scratch area is writable");
-    std::fs::write(outside.join("not-for-the-model.txt"), "x")
-        .expect("the scratch area is writable");
-    // …and a real subdirectory beside the link, so what the walk *does* descend
-    // into is asserted in the same answer as what it does not.
-    std::fs::create_dir_all(root.join("sub")).expect("the root is writable");
-    std::fs::write(root.join("a.txt"), "x").expect("the root is writable");
-    std::fs::write(root.join("sub/b.txt"), "x").expect("the root is writable");
-    std::os::unix::fs::symlink(&outside, root.join("linkdir")).expect("the root is writable");
-
-    provider.enqueue_all([
-        // `**` spans segments, so this asks for everything the walk can reach.
-        Script::new(
-            SONNET,
-            Outcome::tool_calls(vec![ToolCall::new(
-                "list",
-                json!({ "path": ".", "glob": "**" }),
-            )]),
-        ),
-        Script::new(SONNET, Outcome::text("I have the listing.")),
-        Script::new(SONNET, Outcome::structured(json!({ "summary": "listed" }))),
-    ]);
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "list everything" }),
-        &environment,
-    ) else {
-        return;
-    };
-    run.succeeded();
-
-    let handed = provider.requests()[1].body().to_string();
-    assert!(
-        handed.contains(r#"[\"a.txt\",\"linkdir\",\"sub/\",\"sub/b.txt\"]"#),
-        "the walk descended the real directory and stopped at the link, which is \
-         reported as an entry rather than as a directory: {handed}"
-    );
-    assert!(
-        !handed.contains("not-for-the-model.txt"),
-        "a name from outside the root reached the model through the listing: {handed}"
+        "each call is recorded under the tool's address, with no result beside it"
     );
     assert!(provider.snapshot().is_drained());
 }
@@ -12941,12 +12588,12 @@ fn a_command_that_exits_nonzero_fails_the_node_under_its_on_error() {
 }
 
 /// Arguments a built-in's own schema refuses go **back to the model**, which is
-/// the other side of the split (Decision D119, PRD resolved q22 and q31).
+/// the other side of the split (Decision D119, PRD resolved q22 and q54).
 ///
-/// The first answer calls `read_file` with no `path` at all; the loop hands the
+/// The first answer calls `bash` with no `command` at all; the loop hands the
 /// refusal back, the model corrects itself, and the run completes. A runtime
 /// that failed the node on a schema refusal would end the run here, and one that
-/// answered the bad call would read a file nobody named.
+/// answered the bad call would run a command nobody wrote.
 #[test]
 fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -12960,13 +12607,13 @@ fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
     provider.enqueue_all([
         Script::new(
             SONNET,
-            Outcome::tool_calls(vec![ToolCall::new("read_file", json!({}))]),
+            Outcome::tool_calls(vec![ToolCall::new("bash", json!({}))]),
         ),
         Script::new(
             SONNET,
             Outcome::tool_calls(vec![ToolCall::new(
-                "read_file",
-                json!({ "path": "notes.txt" }),
+                "bash",
+                json!({ "command": "cat notes.txt" }),
             )]),
         ),
         Script::new(SONNET, Outcome::text("Now I have it.")),
@@ -12998,13 +12645,13 @@ fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
     );
     let refusal = calls[0]["error"].as_str().unwrap_or_default();
     assert!(
-        refusal.starts_with("ToolCallRefused: ") && refusal.contains("read_file"),
+        refusal.starts_with("ToolCallRefused: ") && refusal.contains("bash"),
         "the refusal is recorded in the shape `docs/trace.md` §3 gives one: {refusal}"
     );
     // …and the model was handed the same sentence, which is what it corrects on.
     let handed = provider.requests()[1].body().to_string();
     assert!(
-        handed.contains("read_file"),
+        handed.contains("bash"),
         "the refusal reached the model: {handed}"
     );
     assert!(provider.snapshot().is_drained());
@@ -13385,8 +13032,8 @@ fn a_root_that_resolves_to_nothing_fails_the_call() {
     provider.enqueue(Script::new(
         SONNET,
         Outcome::tool_calls(vec![ToolCall::new(
-            "read_file",
-            json!({ "path": "Cargo.toml" }),
+            "bash",
+            json!({ "command": "cat Cargo.toml" }),
         )]),
     ));
 
@@ -13404,8 +13051,8 @@ fn a_root_that_resolves_to_nothing_fails_the_call() {
         "the failure names the bound that came back empty: {said}"
     );
     assert!(
-        !said.contains("could not read"),
-        "the call failed on the root rather than reaching the file system at all: {said}"
+        !said.contains("exited"),
+        "the call failed on the workspace rather than reaching the shell at all: {said}"
     );
 }
 
@@ -13429,8 +13076,8 @@ fn a_root_that_names_no_directory_fails_the_call() {
     provider.enqueue(Script::new(
         SONNET,
         Outcome::tool_calls(vec![ToolCall::new(
-            "read_file",
-            json!({ "path": "notes.txt" }),
+            "bash",
+            json!({ "command": "cat notes.txt" }),
         )]),
     ));
 

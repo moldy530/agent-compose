@@ -1384,32 +1384,30 @@ const DURABILITY: &[Criterion] = &[
     },
 ];
 
-/// PRD §7 M3's second bullet, its runtime half: the four built-ins, what bounds
+/// PRD §7 M3's second bullet, its runtime half: the built-ins, what bounds
 /// them, and what a bound being crossed does.
 ///
 /// One sentence rather than an enumeration, so — like `HARNESS` and
 /// `DURABILITY` — its phrases are held to it by containment. Three claims: that
-/// the tools exist and run, that the root bounds them, and that the timeout
+/// the tools exist and run, that the workspace bounds them, and that the timeout
 /// does. The failure and refusal rules are not separate phrases of the bullet —
 /// resolved q31 states them as "the standing rules" — so they hang off the two
 /// bounds they are reached through.
+///
+/// PRD resolved q54 replaced the four-tool set this bullet was written against
+/// with `builtin.bash` and `builtin.files`, and the shell is the half whose
+/// runtime landed first: what the file tool does under a workspace — the path
+/// crossings a resolution catches and a string comparison does not — is named by
+/// no row yet and lands with its handlers.
 const BUILTINS: &[Criterion] = &[
     Criterion {
         bullet: Bullet::BuiltinTools,
         phrase: "runtime bash/file tools",
         tests: &[
-            // All four, in one turn, each asserted on something only a real call
-            // could produce — including the one whose effect outlives the
-            // process.
+            // The shell, in one turn, asserted on things only real calls could
+            // produce — including the one whose effect outlives the process.
             (
-                "every_builtin_runs_inside_its_root_and_answers_the_model",
-                Status::Live,
-            ),
-            // …and the one of the four whose answer is a shape rather than a
-            // value: a listing's ordering, its glob, and the flag that says it
-            // stopped short.
-            (
-                "a_listing_matches_globs_in_order_and_says_when_it_stopped_short",
+                "the_builtin_shell_runs_inside_its_workspace_and_answers_the_model",
                 Status::Live,
             ),
             // …and the half of the loop that is not the tool running: a call the
@@ -1440,41 +1438,10 @@ const BUILTINS: &[Criterion] = &[
         bullet: Bullet::BuiltinTools,
         phrase: "opted into per agent node, bounded by root",
         tests: &[
-            // The bound, crossed the way a string comparison would catch…
-            (
-                "a_path_that_climbs_out_of_the_root_is_refused_and_fails_the_node",
-                Status::Live,
-            ),
-            // …and the way only resolution does, which is what resolved q31
-            // spells out ("symlinks and `..` count").
-            (
-                "a_symlink_that_points_out_of_the_root_is_refused",
-                Status::Live,
-            ),
-            // …and the two shapes of that same crossing where there is nothing
-            // at the path to resolve, which is where q31 says the *parent* is
-            // resolved instead: a link pointing at a file that does not exist
-            // yet, and a new file under a linked directory. Both are writes, and
-            // a write is the one built-in whose escape leaves something behind.
-            (
-                "a_write_through_a_dangling_symlink_is_refused",
-                Status::Live,
-            ),
-            (
-                "a_write_to_a_new_file_under_a_symlinked_directory_is_refused",
-                Status::Live,
-            ),
-            // …and the crossing that asks no path at all: a listing walks where
-            // the tree goes, so it is the root check's other half — the walk
-            // stops at a link rather than reporting what is behind it.
-            (
-                "a_listing_does_not_descend_into_a_symlinked_directory",
-                Status::Live,
-            ),
-            // …and the two ways a bound can fail to be a bound at all: a root
+            // The two ways a bound can fail to be a bound at all: a workspace
             // that names no directory, and one the environment answered with
             // nothing — which would leave the tool bounded to wherever the
-            // runtime was started, the ambient capability D123 refuses.
+            // runtime was started, the ambient capability D135 refuses.
             (
                 "a_root_that_names_no_directory_fails_the_call",
                 Status::Live,

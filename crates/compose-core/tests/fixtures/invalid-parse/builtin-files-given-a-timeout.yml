@@ -1,0 +1,16 @@
+# rule: `timeout:` bounds a child process, so it is not a key `builtin: files`
+# rule: takes (grammar 6.1, D50, D135)
+# code: unknown-key
+# message: unknown key `timeout` in a `builtin: files` binding
+# at: 9:12
+# help: `timeout:`, `env:` and `inherit_env:` bound the child processes `builtin.bash` forks; `builtin.files` reads and writes through the runtime itself and forks none, so it has no child to bound (grammar 6.1)
+tool.sandbox:
+  builtin: files
+  timeout: 30s
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

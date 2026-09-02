@@ -1,0 +1,12 @@
+# rule: the built-in set is closed and grows by resolution, not by drift (grammar 6.1 / D135)
+# at: /tool.sandbox/builtin
+# via: /$defs/toolDef/properties/builtin/enum
+tool.sandbox:
+  builtin: grep
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

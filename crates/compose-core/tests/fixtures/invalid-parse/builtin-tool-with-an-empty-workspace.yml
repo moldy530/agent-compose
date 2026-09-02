@@ -1,0 +1,16 @@
+# rule: a `workspace:` that is written must name a directory; omitting it is how
+# rule: a built-in takes the execution's own (grammar 6.1, D135)
+# code: invalid-value
+# message: `workspace` in tool definition `tool.sandbox` must not be empty
+# at: 9:14
+# help: name the directory this tool works inside, or omit `workspace:` to take the execution's own built-in workspace; an empty one would bound the tool to wherever the runtime was started instead (grammar 6.1)
+tool.sandbox:
+  builtin: bash
+  workspace: ""
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

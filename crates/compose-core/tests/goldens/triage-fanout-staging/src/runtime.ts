@@ -3734,16 +3734,22 @@ async function runExecLive(
 // The runtime built-ins (grammar 5.5, Decision D123, PRD resolved q31)
 // ---------------------------------------------------------------------------
 
-/** Which of the four built-ins one attachment offers (grammar 5.5). */
-export type BuiltinName = "bash" | "read_file" | "write_file" | "list";
+/**
+ * The built-in calls this runtime dispatches on (grammar 5.5, 6.1).
+ *
+ * `bash` and `files` are the two the grammar offers, as the shorthand
+ * `builtin.bash`/`builtin.files` or as a `tool.*` with a `builtin:` binding
+ * (PRD resolved q54). The other three are handlers this runtime still carries;
+ * nothing this compiler emits names one, and `files` takes over what they did.
+ */
+export type BuiltinName = "bash" | "files" | "read_file" | "write_file" | "list";
 
 /**
- * One `builtin.*` entry of an agent's `tools:`, with the bounds it declared.
+ * One built-in an agent holds, with the bounds its binding declared.
  *
- * The bounds are the whole of what an attachment configures, and both are
- * mandatory where they apply: PRD resolved q31 makes the curated set "bounded by
- * a mandatory root and a timeout", so there is no shape here in which a built-in
- * runs unbounded.
+ * The bounds are the whole of what a binding configures, and both are optional:
+ * a built-in written with neither is the shorthand, which takes the execution's
+ * own workspace and the default command bound (grammar 5.5, 6.1).
  */
 export interface BuiltinBinding {
   /** Which built-in. */

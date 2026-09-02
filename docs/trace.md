@@ -741,13 +741,14 @@ nowhere". It is carried for the one tool whose result is the composition's own
 declared data; a `tool.*`'s answer and a store tool's stay out, the second of
 them because §6 already carries it in `StoreRecord.answer`.
 
-A **runtime built-in**'s answer stays out with them, and that is the whole of
-what the built-ins changed here: a `bash`'s stdout and a `read_file`'s contents
-are a tool's answer under §11's rule, so what this format records is the call —
-`name`, `target: "builtin.bash"`, the outcome, and the error where there was
-one. The full answer is in the durability journal, which is private recovery
-data rather than a document a run hands out (`docs/durability.md` §3.2, §8, PRD
-resolved q31).
+A **built-in tool**'s answer stays out with them, and that is the whole of what
+the built-ins changed here: a `bash`'s stdout and a file view's contents are a
+tool's answer under §11's rule, so what this format records is the call —
+`name`, the address it was attached by as the `target` (`builtin.bash` for a
+shorthand, `tool.sandbox` for a configured one), the outcome, and the error where
+there was one. The full answer is in the durability journal, which is private
+recovery data rather than a document a run hands out
+(`docs/durability.md` §3.2, §8, PRD resolved q31, q54).
 
 A `"refused"` call's `error` is where an excerpt of those arguments can appear,
 and it is not an exception to the rule above but the same one read where the

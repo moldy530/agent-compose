@@ -3,7 +3,8 @@
 
 use crate::diag::{Span, Spanned};
 
-use super::common::{Cel, Ident, Interpolated};
+use super::common::{Cel, Duration, Ident, Interpolated};
+use super::definition::Builtin;
 use super::schema::FieldMap;
 
 /// A node's input bindings (grammar 8.0).
@@ -214,6 +215,39 @@ pub struct ModuleBlock {
     /// exact version (PRD resolved q49).
     pub dependencies: Vec<DependencyEntry>,
     /// The block's own span. For the scalar form this is the path's own span,
+    /// which is the only region the binding occupies.
+    pub span: Span,
+}
+
+/// A `builtin:` implementation binding: one of the built-in tools, configured
+/// (grammar 6.1, Decision D135, PRD resolved q54).
+///
+/// The scalar form — `builtin: bash` — is the same block with nothing but its
+/// name, which is what a built-in taking every default writes. The mapping form
+/// adds the bounds: where it works, how long one command may run, and what
+/// environment its children see.
+///
+/// What the block does **not** carry is a contract: `input:` and `output:` are
+/// the built-in's own, fixed by this compiler, because the model authors the
+/// program rather than filling parameters an author declared.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuiltinBlock {
+    /// `builtin:` — which built-in this tool is.
+    pub builtin: Option<Spanned<Builtin>>,
+    /// `workspace:` — the directory the tool works inside. Absent means the
+    /// execution's shared built-in workspace; interpolable exactly as an
+    /// `exec:` block's `cwd:` is (grammar 4.3 class 2).
+    pub workspace: Option<Spanned<Interpolated>>,
+    /// `timeout:` — how long one command may run. `builtin.bash` only.
+    pub timeout: Option<Spanned<Duration>>,
+    /// `env:` — the environment the children run with; exactly the `exec:`
+    /// shape (grammar 4.3). `builtin.bash` only.
+    pub env: Vec<InterpolatedEntry>,
+    /// `inherit_env:` — whether children also see this process's environment.
+    /// Absent means `false`: a built-in's children run scrubbed.
+    /// `builtin.bash` only.
+    pub inherit_env: Option<Spanned<bool>>,
+    /// The block's own span. For the scalar form this is the name's own span,
     /// which is the only region the binding occupies.
     pub span: Span,
 }

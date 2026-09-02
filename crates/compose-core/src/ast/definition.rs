@@ -2,8 +2,10 @@
 
 use crate::diag::{Span, Spanned};
 
-use super::binding::{ExecBlock, FunctionBinding, HttpBlock, InterpolatedEntry, ModuleBlock};
-use super::common::{Address, Duration, Ident, Interpolated, LiteralEntry};
+use super::binding::{
+    BuiltinBlock, ExecBlock, FunctionBinding, HttpBlock, InterpolatedEntry, ModuleBlock,
+};
+use super::common::{Address, Ident, Interpolated, LiteralEntry};
 use super::flow::FlowDef;
 use super::schema::FieldMap;
 
@@ -64,16 +66,16 @@ pub struct AgentDef {
     pub input: Option<FieldMap>,
     /// `tools:` — `tool.*` and `flow.*` references.
     pub tools: Vec<Spanned<Address>>,
-    /// `tools:` — the `builtin.*` entries of the same list (grammar 5.5,
-    /// Decision D123).
+    /// `tools:` — the `builtin.*` shorthand entries of the same list
+    /// (grammar 5.5, Decision D135).
     ///
     /// A second field rather than a second variant inside [`Self::tools`],
     /// because the two are different things everywhere downstream: a reference
     /// names a definition the resolver has to find and the reachability walk has
-    /// to cross, and a built-in names nothing — it is the runtime's own tool,
-    /// carrying the bounds the entry wrote. Every reader of `tools:` is asking
-    /// one of those two questions and none is asking both.
-    pub builtins: Vec<BuiltinAttachment>,
+    /// to cross, and a shorthand names nothing — it is the runtime's own tool
+    /// under its default configuration. Every reader of `tools:` is asking one
+    /// of those two questions and none is asking both.
+    pub builtins: Vec<Spanned<Builtin>>,
     /// `stores:` — `store.*` references.
     pub stores: Vec<Spanned<Address>>,
     /// `description:` — documentation only; agents are not tools.
@@ -82,52 +84,62 @@ pub struct AgentDef {
     pub max_tool_iterations: Option<Spanned<i64>>,
 }
 
-/// One of the four runtime built-in tools (grammar 5.5, Decision D123,
-/// PRD resolved q31).
+/// One of the two built-in agent tools (grammar 5.5, 6.1, Decision D135,
+/// PRD resolved q54).
 ///
-/// A curated set rather than an open one, and it grows by resolution rather than
-/// by drift: a model holding `bash` is arbitrary code execution on the host
-/// running the graph, so what the set holds is a decision with a record, not an
-/// implementation detail of whichever release added a name.
+/// A closed set rather than an open one, and it grows by resolution rather than
+/// by drift: every other implementation binding fixes *what runs* at build time
+/// and lets the model fill schema-validated parameters, while a built-in has the
+/// **model author the program at run time**. That is the trust level `exec:`
+/// already extends to author-arbitrary binaries, extended to the model, so what
+/// the set holds is a decision with a record rather than an implementation
+/// detail of whichever release added a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Builtin {
-    /// `builtin.bash` — one shell command, run with `root:` as its working
-    /// directory and bounded by its `timeout:`.
+    /// `builtin.bash` — a shell session the model drives, run inside the
+    /// workspace and bounded by a per-command `timeout:`.
     Bash,
-    /// `builtin.read_file` — read one file inside `root:`.
-    ReadFile,
-    /// `builtin.write_file` — write one file inside `root:`.
-    WriteFile,
-    /// `builtin.list` — list a directory inside `root:`, optionally filtered by
-    /// a glob.
-    List,
+    /// `builtin.files` — view, create and edit files under the workspace root.
+    Files,
 }
 
 impl Builtin {
     /// Every built-in, in the order grammar 5.5 lists them.
-    pub const ALL: &'static [Self] = &[Self::Bash, Self::ReadFile, Self::WriteFile, Self::List];
+    pub const ALL: &'static [Self] = &[Self::Bash, Self::Files];
 
-    /// The name the model calls it by — the entry's local name, exactly as an
-    /// attached `tool.*`'s is (grammar 5.4).
+    /// The name the model calls it by.
+    ///
+    /// Fixed by this compiler rather than by the definition key, because these
+    /// are the **provider-defined** tool types on the Messages wire and each of
+    /// those carries a name the provider dictates: a `bash_*` tool is `bash` and
+    /// a `text_editor_*` tool is `str_replace_based_edit_tool`, whatever the
+    /// `tool.*` that configured it is called (grammar 6.1, PRD resolved q54
+    /// ruling d). So a configured built-in collides on *that* name, which is
+    /// what [`crate::check::bindings`] compares.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bash => "bash",
-            Self::ReadFile => "read_file",
-            Self::WriteFile => "write_file",
-            Self::List => "list",
+            Self::Files => "str_replace_based_edit_tool",
         }
     }
 
-    /// The address the entry is written under, and the one
-    /// `docs/trace.md` §7.3's `target` records.
+    /// The word the `builtin:` binding is written with (grammar 6.1).
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Files => "files",
+        }
+    }
+
+    /// The address the shorthand is written under, and the one
+    /// `docs/trace.md` §7.3's `target` records for it.
     #[must_use]
     pub const fn address(self) -> &'static str {
         match self {
             Self::Bash => "builtin.bash",
-            Self::ReadFile => "builtin.read_file",
-            Self::WriteFile => "builtin.write_file",
-            Self::List => "builtin.list",
+            Self::Files => "builtin.files",
         }
     }
 
@@ -140,28 +152,25 @@ impl Builtin {
             .find(|tool| tool.address() == text)
     }
 
-    /// Whether this built-in runs a command, and so takes `timeout:`.
+    /// The built-in that `builtin:` keyword names, if it names one.
+    #[must_use]
+    pub fn from_keyword(text: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|tool| tool.keyword() == text)
+    }
+
+    /// Whether this built-in runs a child process, and so takes `timeout:`,
+    /// `env:` and `inherit_env:`.
     ///
-    /// Exactly `builtin.bash`: the file tools have no command to bound, so a
-    /// `timeout:` on one would be a key with nothing to do (Decision D50).
+    /// Exactly `builtin.bash`: `builtin.files` reads and writes through the
+    /// runtime itself and forks nothing, so a command bound and a child
+    /// environment there would be keys with nothing to do (Decision D50).
     #[must_use]
     pub const fn runs_a_command(self) -> bool {
         matches!(self, Self::Bash)
     }
-}
-
-/// One `builtin.*` entry of an agent's `tools:` list, with the bounds it wrote
-/// (grammar 5.5, Decision D123).
-#[derive(Clone, Debug, PartialEq)]
-pub struct BuiltinAttachment {
-    /// Which built-in, and the span of the key that named it.
-    pub tool: Spanned<Builtin>,
-    /// `root:` — required on every built-in; interpolable (grammar 4.3 class 2).
-    pub root: Option<Spanned<Interpolated>>,
-    /// `timeout:` — required on `builtin.bash`, illegal on the file tools.
-    pub timeout: Option<Spanned<Duration>>,
-    /// The whole entry, key and bounds together.
-    pub span: Span,
 }
 
 /// A `tool.*` definition: one implementation, two usage surfaces (grammar 6).
@@ -173,7 +182,7 @@ pub struct ToolDef {
     pub input: Option<FieldMap>,
     /// `output:` — required; `{}` for a tool with no result.
     pub output: Option<FieldMap>,
-    /// Exactly one of `exec:`, `http:`, `function:`, `module:`.
+    /// Exactly one of `exec:`, `http:`, `function:`, `module:`, `builtin:`.
     pub implementation: Option<ToolImplementation>,
 }
 
@@ -188,6 +197,8 @@ pub enum ToolImplementation {
     Function(FunctionBinding),
     /// A hand-authored TypeScript module inside the project.
     Module(ModuleBlock),
+    /// One of the built-in tools, configured (grammar 6.1, Decision D135).
+    Builtin(BuiltinBlock),
 }
 
 /// The store kinds (grammar 11.1).

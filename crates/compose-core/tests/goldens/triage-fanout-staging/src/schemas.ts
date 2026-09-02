@@ -248,6 +248,21 @@ export const storeTriageMemoryValueSchema = z.object({
 }).strict();
 export type StoreTriageMemoryValueSchema = z.infer<typeof storeTriageMemoryValueSchema>;
 
+/** `tool.checkout` — its parameters (grammar 6). */
+export const toolCheckoutInput = z.object({
+  command: z.enum(["view", "create", "str_replace", "insert"]).describe("The file operation to perform: `view` reads a file or lists a directory, `create` writes a whole file, `str_replace` swaps one occurrence of a string, `insert` adds text at a line."),
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file or directory, relative to this tool's workspace."),
+  file_text: z.string().describe("The whole contents of the file, for `create`.").default(""),
+  old_str: z.string().describe("The exact text to replace, for `str_replace`. It must appear exactly once.").default(""),
+  new_str: z.string().describe("The text to put in its place, for `str_replace` and `insert`.").default(""),
+  insert_line: z.number().int().min(0).max(1000000).describe("The line to insert after, for `insert`; `0` inserts at the top of the file.").default(0),
+}).strict();
+export type ToolCheckoutInput = z.infer<typeof toolCheckoutInput>;
+
+/** `tool.checkout` — its result (grammar 6). */
+export const toolCheckoutOutput = z.object({}).strict();
+export type ToolCheckoutOutput = z.infer<typeof toolCheckoutOutput>;
+
 /** `tool.dead_letter` — its parameters (grammar 6). */
 export const toolDeadLetterInput = z.object({
   kind: z.string(),
@@ -287,14 +302,6 @@ export const toolReviewQueueOutput = z.object({
   queued: z.boolean(),
 }).strict();
 export type ToolReviewQueueOutput = z.infer<typeof toolReviewQueueOutput>;
-
-/**
- * `builtin.read_file` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
- */
-export const builtinReadFileInput = z.object({
-  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file to read, relative to the tool's root directory."),
-}).strict();
-export type BuiltinReadFileInput = z.infer<typeof builtinReadFileInput>;
 
 /** State channel `human_decision` — its declared type (grammar 10.1). */
 export const stateHumanDecision = z.enum(["approve", "reject"]).describe("What the reviewer decided about the run as a whole.").default("approve");

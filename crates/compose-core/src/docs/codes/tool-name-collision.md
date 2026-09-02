@@ -27,12 +27,14 @@ that array on every request the connection serves (grammar 12.1), so:
 
 Both are reported against the entry written second, with the first labelled.
 
-A **runtime built-in** fills the same array under the same key (grammar 5.5), so
+A **built-in tool** fills the same array under the same key (grammar 5.5), so
 `builtin.bash` on an agent that also attaches a `tool.bash` is the same event
 once more, and so is a built-in whose name a provider's suite takes. The repair
-there is one-sided: a built-in's name — `bash`, `read_file`, `write_file`,
-`list` — is the compiler's rather than an author's, so what moves is the other
-entry, or the built-in attachment goes.
+there is one-sided: a built-in's name — `bash`, `str_replace_based_edit_tool` —
+is fixed by the provider-defined tool type it goes out as rather than by its
+definition key, so what moves is the other entry, or the built-in goes. That
+holds for a *configured* built-in too: `tool.sandbox` with `builtin: bash` is
+`bash` on the model's side, whatever its definition key says.
 
 ## A spec that triggers it
 

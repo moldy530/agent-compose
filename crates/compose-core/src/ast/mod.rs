@@ -28,8 +28,8 @@ pub mod server_tools;
 pub mod trigger;
 
 pub use binding::{
-    Binding, Bindings, DependencyEntry, ExecBlock, FunctionBinding, HttpBlock, HttpMethod,
-    InterpolatedEntry, ModuleBlock, NodeInput, WriteEntry, Writes,
+    Binding, Bindings, BuiltinBlock, DependencyEntry, ExecBlock, FunctionBinding, HttpBlock,
+    HttpMethod, InterpolatedEntry, ModuleBlock, NodeInput, WriteEntry, Writes,
 };
 pub use common::{
     Address, Cel, ControlTarget, Duration, DurationUnit, EdgeSource, EdgeTarget, EnvRef, Ident,
@@ -37,7 +37,7 @@ pub use common::{
     RESERVED_ROOT_NAMES,
 };
 pub use definition::{
-    AgentAccess, AgentDef, Definition, DefinitionBody, DirectModel, EmbedBlock, ModelDef,
+    AgentAccess, AgentDef, Builtin, Definition, DefinitionBody, DirectModel, EmbedBlock, ModelDef,
     ProviderDef, ProviderKind, RouteCondition, RouteModel, ServerToolDef, Settings, StoreDef,
     StoreKind, StoreScope, ToolDef, ToolImplementation,
 };

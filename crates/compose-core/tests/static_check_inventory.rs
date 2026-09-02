@@ -308,22 +308,21 @@ const GRAMMAR: &[Check] = &[
         codes: &["tool-name-collision"],
         evidence: Evidence::Fixture,
     },
-    // The built-ins of resolved q31, split across the two passes for the same
+    // The built-ins of resolved q54, split across the two passes for the same
     // reason the server-tool rows below are. Every **bound** is a key beside
-    // another key in one entry, so the whole of it is the parser's — which name,
-    // whether it takes a `root:`, whether it takes a `timeout:`, whether the
-    // entry attaches one tool or two. What the parser cannot decide is the only
-    // thing that needs another file: whether the *name* the built-in takes on
-    // the wire is one something else on this agent already takes.
+    // `builtin:` on one definition, so the whole of it is the parser's — which
+    // name, which bounds that name takes, and the contract keys a built-in does
+    // not declare. What the parser cannot decide is the only thing that needs
+    // another file: whether the *name* the built-in takes on the wire is one
+    // something else on this agent already takes.
     Check {
-        rule: "a `builtin.*` entry names one of the four and carries the bounds that name requires (5.5, D123)",
+        rule: "a `builtin:` binding names one of the two and carries only the bounds that name takes (6.1, D135)",
         pass: "parse/definition.rs",
         codes: &[
             "unknown-variant",
-            "missing-key",
             "unknown-key",
             "invalid-value",
-            "invalid-reference",
+            "wrong-type",
             "invalid-duration",
         ],
         evidence: Evidence::Fixture,
@@ -333,10 +332,13 @@ const GRAMMAR: &[Check] = &[
         // name meets an attached `tool.*`/`flow.*` in the agent's own list, and
         // meets a provider's suite only once the agent's model reaches that
         // provider. A *store's* synthesized names cannot collide with a built-in
-        // at all — `<local>_<op>` is not a shape any of the four names has — and
+        // at all — `<local>_<op>` is not a shape either name has — and
         // `check/bindings.rs` holds that premise as a test of its own rather
-        // than as a comment.
-        rule: "a built-in's name is one no other tool this agent offers takes (5.5, 11.5, D123)",
+        // than as a comment. The comparison is over the **wire** name, which for
+        // a configured built-in is the provider's rather than the definition
+        // key's, so `tool.sandbox` binding `bash` collides exactly as the
+        // shorthand does.
+        rule: "a built-in's name is one no other tool this agent offers takes (5.5, 6.1, 11.5, D135)",
         pass: "check/bindings.rs",
         codes: &["tool-name-collision"],
         evidence: Evidence::Fixture,

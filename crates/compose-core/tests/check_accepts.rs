@@ -1998,20 +1998,19 @@ flow.f:
     );
 }
 
-/// All four built-ins on one agent, beside a `tool.*` of its own, each with the
-/// bounds it requires (grammar 5.5, Decision D123).
+/// Both built-ins on one agent in both spellings, beside a `tool.*` of its own
+/// (grammar 5.5, 6.1, Decision D135).
 ///
-/// The accepting half of the corpus that pins every rejection: a missing
-/// `root:`, a `builtin.bash` with no `timeout:`, a `timeout:` on a file tool, a
-/// name outside the set, a bare address, two names in one entry. Each of those
-/// is a fixture; this is the shape they are each *nearly*, and a rule written
-/// one notch tighter than §5.5 would make it unwritable with nothing else
-/// noticing.
+/// The accepting half of the corpus that pins every rejection: an `input:` on a
+/// built-in tool, a `timeout:` on `builtin: files`, a name outside the set, a
+/// bounded mapping in a `tools:` list, a built-in listed twice. Each of those is
+/// a fixture; this is the shape they are each *nearly*, and a rule written one
+/// notch tighter than §6.1 would make it unwritable with nothing else noticing.
 ///
 /// It is emitted as well as checked, which is this file's second claim and the
-/// one that matters most for a construct the emitter learned last: the
-/// attachment reaches `codegen::graph` through a list every other agent leaves
-/// empty.
+/// one that matters most for a construct the emitter learned last: a shorthand
+/// reaches `codegen::graph` through a list every other agent leaves empty, and a
+/// configured one through the attachment loop every other tool takes.
 #[test]
 fn every_builtin_attached_to_one_agent_beside_a_tool() {
     accepts(
@@ -2025,15 +2024,20 @@ tool.repo_grep:
     matches: { type: string }
   exec:
     command: rg
+tool.sandbox:
+  builtin: bash
+  workspace: "${WORKSPACE}/build"
+  timeout: 30s
+  env:
+    PATH: "/usr/bin:/bin"
+  inherit_env: false
 agent.a:
   model: model.m
   prompt: Fix it.
   tools:
     - tool.repo_grep
-    - builtin.read_file: { root: "${WORKSPACE}" }
-    - builtin.write_file: { root: "${WORKSPACE}" }
-    - builtin.list: { root: "./relative/to/the/process" }
-    - builtin.bash: { root: "${WORKSPACE}/build", timeout: 30s }
+    - tool.sandbox
+    - builtin.files
   output:
     verdict: { enum: [approve, revise] }
 flow.f:
@@ -2050,9 +2054,9 @@ flow.f:
 /// One built-in, on an agent carrying no `tool.*` and no `stores:` at all.
 ///
 /// The list every other case leaves non-empty: an agent whose whole tool
-/// surface is a built-in is where the emitter's "no tools at all" branch and its
-/// "some tools" branch meet, and where a reader first meets the construct
-/// (grammar 5.5).
+/// surface is a shorthand built-in is where the emitter's "no tools at all"
+/// branch and its "some tools" branch meet, and where a reader first meets the
+/// construct (grammar 5.5).
 #[test]
 fn one_builtin_is_a_whole_tool_surface() {
     accepts(
@@ -2062,7 +2066,44 @@ agent.a:
   model: model.m
   prompt: Read it.
   tools:
-    - builtin.read_file: { root: "${WORKSPACE}" }
+    - builtin.files
+  output:
+    verdict: { enum: [approve, revise] }
+flow.f:
+  outputs: {}
+  nodes:
+    n: { agent: agent.a, input: "'x'" }
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }
+"#,
+    );
+}
+
+/// A built-in configured **without** bounds, and one carrying only a workspace
+/// relative to the process (grammar 6.1).
+///
+/// Every bound is optional, so `tool.plain` below is the shorthand written the
+/// long way — the shape a rule that required a workspace, or a timeout, would
+/// make unwritable. The author's `description:` is the other optional key, and
+/// it is the one key of a built-in tool a composition may sharpen.
+#[test]
+fn a_builtin_binding_takes_every_bound_or_none() {
+    accepts(
+        "builtin-bounds",
+        r#"
+tool.plain:
+  builtin: bash
+tool.described:
+  builtin: files
+  workspace: "./work"
+  description: The scratch tree this run was handed.
+agent.a:
+  model: model.m
+  prompt: Fix it.
+  tools:
+    - tool.plain
+    - tool.described
   output:
     verdict: { enum: [approve, revise] }
 flow.f:

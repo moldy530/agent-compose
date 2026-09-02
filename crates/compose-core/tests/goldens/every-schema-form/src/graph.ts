@@ -22,10 +22,7 @@ import * as stores from "./stores.ts";
 import {
   agentShaperOutput,
   agentSpreaderOutput,
-  builtinBashInput,
-  builtinListInput,
-  builtinReadFileInput,
-  builtinWriteFileInput,
+  builtinFilesInput,
   flowCondenseInputs,
   flowCondenseNodeReduceOutput,
   flowShapeInputs,
@@ -40,6 +37,7 @@ import {
   toolLookupOutput,
   toolPingInput,
   toolPingOutput,
+  toolSandboxInput,
 } from "./schemas.ts";
 import { State } from "./state.ts";
 import type { GraphState } from "./state.ts";
@@ -514,101 +512,9 @@ const agentShaper: runtime.AgentBinding = {
         ),
     },
     {
-      name: "read_file",
-      address: "builtin.read_file",
-      description: "Read one text file and return its contents. The path is relative to this agent's root directory, and a path that resolves outside it is refused.",
-      schema: {
-        "additionalProperties": false,
-        "properties": {
-          "path": {
-            "description": "The file to read, relative to the tool's root directory.",
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      },
-      invoke: (args, context) =>
-        runtime.runBuiltin(
-          {
-            tool: "read_file",
-            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.read_file.root" }],
-          },
-          runtime.parseToolArguments(builtinReadFileInput, args, "the arguments `read_file` was called with"),
-          context,
-        ),
-    },
-    {
-      name: "write_file",
-      address: "builtin.write_file",
-      description: "Write one text file, replacing whatever it held, and return how many bytes were written. The path is relative to this agent's root directory, a path that resolves outside it is refused, and the directory it names must already exist.",
-      schema: {
-        "additionalProperties": false,
-        "properties": {
-          "content": {
-            "description": "The bytes to write, replacing whatever the file held.",
-            "type": "string"
-          },
-          "path": {
-            "description": "The file to write, relative to the tool's root directory.",
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "path",
-          "content"
-        ],
-        "type": "object"
-      },
-      invoke: (args, context) =>
-        runtime.runBuiltin(
-          {
-            tool: "write_file",
-            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.write_file.root" }],
-          },
-          runtime.parseToolArguments(builtinWriteFileInput, args, "the arguments `write_file` was called with"),
-          context,
-        ),
-    },
-    {
-      name: "list",
-      address: "builtin.list",
-      description: "List the entries of one directory, optionally filtered by a glob. Paths are relative to this agent's root directory, a path that resolves outside it is refused, and a directory entry is reported with a trailing `/`.",
-      schema: {
-        "additionalProperties": false,
-        "properties": {
-          "glob": {
-            "default": "",
-            "description": "A glob to match entries against — `*` and `?` within one path segment, `**` across segments. Empty lists the directory's own entries.",
-            "type": "string"
-          },
-          "path": {
-            "default": ".",
-            "description": "The directory to list, relative to the tool's root directory.",
-            "type": "string"
-          }
-        },
-        "required": [],
-        "type": "object"
-      },
-      invoke: (args, context) =>
-        runtime.runBuiltin(
-          {
-            tool: "list",
-            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.list.root" }],
-          },
-          runtime.parseToolArguments(builtinListInput, args, "the arguments `list` was called with"),
-          context,
-        ),
-    },
-    {
       name: "bash",
-      address: "builtin.bash",
-      description: "Run one `bash` command in this agent's root directory and return what it printed. The command runs under a deadline, and a command that exits nonzero or outruns it fails the node rather than answering.",
+      address: "tool.sandbox",
+      description: "Run a `bash` command in a persistent shell session and return what it printed, with its exit status. The working directory and any shell state carry over from one call to the next, and each command runs under a deadline.",
       schema: {
         "additionalProperties": false,
         "properties": {
@@ -627,10 +533,71 @@ const agentShaper: runtime.AgentBinding = {
         runtime.runBuiltin(
           {
             tool: "bash",
-            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.bash.root" }, "/build"],
+            root: [{ env: "WORKSPACE", site: "tool.sandbox.workspace" }, "/build"],
             timeout: { millis: 30000, written: "30s" },
           },
-          runtime.parseToolArguments(builtinBashInput, args, "the arguments `bash` was called with"),
+          runtime.parseToolArguments(toolSandboxInput, args, "the arguments `bash` was called with"),
+          context,
+        ),
+    },
+    {
+      name: "str_replace_based_edit_tool",
+      address: "builtin.files",
+      description: "View, create and edit files inside this agent's workspace. Every path is relative to that workspace, and a path that resolves outside it is refused.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "description": "The file operation to perform: `view` reads a file or lists a directory, `create` writes a whole file, `str_replace` swaps one occurrence of a string, `insert` adds text at a line.",
+            "enum": [
+              "view",
+              "create",
+              "str_replace",
+              "insert"
+            ],
+            "type": "string"
+          },
+          "file_text": {
+            "default": "",
+            "description": "The whole contents of the file, for `create`.",
+            "type": "string"
+          },
+          "insert_line": {
+            "default": 0,
+            "description": "The line to insert after, for `insert`; `0` inserts at the top of the file.",
+            "maximum": 1000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "new_str": {
+            "default": "",
+            "description": "The text to put in its place, for `str_replace` and `insert`.",
+            "type": "string"
+          },
+          "old_str": {
+            "default": "",
+            "description": "The exact text to replace, for `str_replace`. It must appear exactly once.",
+            "type": "string"
+          },
+          "path": {
+            "description": "The file or directory, relative to this tool's workspace.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "path"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context) =>
+        runtime.runBuiltin(
+          {
+            tool: "files",
+            root: [],
+          },
+          runtime.parseToolArguments(builtinFilesInput, args, "the arguments `str_replace_based_edit_tool` was called with"),
           context,
         ),
     },

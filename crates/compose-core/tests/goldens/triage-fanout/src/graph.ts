@@ -23,7 +23,6 @@ import {
   agentFixerOutput,
   agentSummarizerOutput,
   agentTriageOutput,
-  builtinReadFileInput,
   flowEnrichInputs,
   flowEnrichNodeFetchOutput,
   flowEnrichOutputs,
@@ -34,6 +33,7 @@ import {
   flowTriageNodeEscalateOutput,
   flowTriageNodeVerifyOutput,
   storeDocsToolSearchInput,
+  toolCheckoutInput,
   toolDeadLetterInput,
   toolDeadLetterOutput,
   toolRepoGrepInput,
@@ -397,19 +397,52 @@ const agentFixer: runtime.AgentBinding = {
   },
   tools: [
     {
-      name: "read_file",
-      address: "builtin.read_file",
-      description: "Read one text file and return its contents. The path is relative to this agent's root directory, and a path that resolves outside it is refused.",
+      name: "str_replace_based_edit_tool",
+      address: "tool.checkout",
+      description: "View and edit files in the repository checkout under review. Paths are relative to the checkout root, and a path that resolves outside it is refused.",
       schema: {
         "additionalProperties": false,
         "properties": {
+          "command": {
+            "description": "The file operation to perform: `view` reads a file or lists a directory, `create` writes a whole file, `str_replace` swaps one occurrence of a string, `insert` adds text at a line.",
+            "enum": [
+              "view",
+              "create",
+              "str_replace",
+              "insert"
+            ],
+            "type": "string"
+          },
+          "file_text": {
+            "default": "",
+            "description": "The whole contents of the file, for `create`.",
+            "type": "string"
+          },
+          "insert_line": {
+            "default": 0,
+            "description": "The line to insert after, for `insert`; `0` inserts at the top of the file.",
+            "maximum": 1000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "new_str": {
+            "default": "",
+            "description": "The text to put in its place, for `str_replace` and `insert`.",
+            "type": "string"
+          },
+          "old_str": {
+            "default": "",
+            "description": "The exact text to replace, for `str_replace`. It must appear exactly once.",
+            "type": "string"
+          },
           "path": {
-            "description": "The file to read, relative to the tool's root directory.",
+            "description": "The file or directory, relative to this tool's workspace.",
             "minLength": 1,
             "type": "string"
           }
         },
         "required": [
+          "command",
           "path"
         ],
         "type": "object"
@@ -417,10 +450,10 @@ const agentFixer: runtime.AgentBinding = {
       invoke: (args, context) =>
         runtime.runBuiltin(
           {
-            tool: "read_file",
-            root: [{ env: "REPO_ROOT", site: "agent.fixer.tools.builtin.read_file.root" }],
+            tool: "files",
+            root: [{ env: "REPO_ROOT", site: "tool.checkout.workspace" }],
           },
-          runtime.parseToolArguments(builtinReadFileInput, args, "the arguments `read_file` was called with"),
+          runtime.parseToolArguments(toolCheckoutInput, args, "the arguments `str_replace_based_edit_tool` was called with"),
           context,
         ),
     },

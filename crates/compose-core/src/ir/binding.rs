@@ -174,6 +174,39 @@ pub struct Module {
     pub span: Span,
 }
 
+/// A `builtin:` implementation binding: one of the built-in tools, configured
+/// (grammar 6.1, Decision D135, PRD resolved q54).
+///
+/// Every field but the name is a **bound**, and every bound is optional: a
+/// built-in written with nothing beside its name is the same tool the `tools:`
+/// shorthand attaches, which is why the shorthand needs no definition of its
+/// own.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Builtin {
+    /// `builtin:` — which built-in this tool is.
+    pub builtin: Spanned<crate::ast::definition::Builtin>,
+    /// `workspace:` — the directory this tool works inside. Absent means the
+    /// execution's own built-in workspace, made fresh per execution and shared
+    /// by every built-in that took the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Spanned<Interpolated>>,
+    /// `timeout:` — how long one command may run. `builtin.bash` only; absent
+    /// means the default bound (grammar 6.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Spanned<crate::ast::common::Duration>>,
+    /// `env:` — the environment this tool's children run with, exactly the
+    /// `exec:` shape (grammar 4.3 class 2). `builtin.bash` only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<InterpolatedEntry>,
+    /// `inherit_env:` — whether those children also see this process's own
+    /// environment. Absent means `false`, which is the scrubbed default PRD
+    /// resolved q54 ruling b fixes. `builtin.bash` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherit_env: Option<Spanned<bool>>,
+    /// The definition's own span, which is the region the binding occupies.
+    pub span: Span,
+}
+
 /// One `dependencies:` entry of a [`Module`].
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Dependency {

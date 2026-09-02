@@ -1,0 +1,15 @@
+# rule: `inherit_env:` is the opt-in to an inherited environment, so it is a
+# rule: boolean and nothing else (grammar 6.1, D135)
+# code: wrong-type
+# message: expected a boolean for `inherit_env`, found a string
+# at: 8:16
+tool.sandbox:
+  builtin: bash
+  inherit_env: "yes"
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

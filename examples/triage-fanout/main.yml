@@ -19,6 +19,7 @@ imports:
   - agents/triage.yml
   - agents/fixer.yml
   - agents/summarizer.yml
+  - tools/checkout.yml
   - tools/repo_grep.yml
   - tools/review_queue.yml
   - tools/dead_letter.yml

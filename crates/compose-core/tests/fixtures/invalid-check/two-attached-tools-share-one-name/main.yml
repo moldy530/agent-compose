@@ -3,7 +3,7 @@
 # message: `agent.a` attaches `tool.condense` and `flow.condense`, which are one `condense` tool on the model's side
 # at: main.yml:48:26
 # label: main.yml:48:11 the first is attached here
-# help: an attached tool's name is its address's local name — the only name it has on the model's side (grammar 5.4, 11.5): rename one of the two definitions, or drop one of the attachments
+# help: an attached tool's name is its address's local name — or, for a `builtin:` tool, the name the provider fixes — and it is the only name it has on the model's side (grammar 5.4, 6.1, 11.5): rename one of the two definitions, or drop one of the attachments
 #
 # Grammar 5.4's own duplicate rule is about *entries* — `tools: [tool.x, tool.x]`
 # — and the parser raises that one. This is the other way two attachments

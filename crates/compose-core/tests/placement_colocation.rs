@@ -34,6 +34,9 @@ tool.xcodebuild:
     log: { type: string }
   exec:
     command: xcodebuild
+tool.sandbox:
+  builtin: bash
+  workspace: "${BUILD_ROOT}"
 "#;
 
 /// An agent attaching whatever a case wants attached, and none if it wants none.
@@ -271,6 +274,39 @@ fn a_placed_tool_attached_to_an_unplaced_agent_is_refused() {
         &mesh("  mac:\n    members: [tool.xcodebuild]\n"),
         "`tool.xcodebuild` is a member of placement `mac`, and `agent.builder` that attaches it \
          has no placement, so it runs on the hub",
+    );
+}
+
+/// A **built-in** tool is placed by the same rows: a `builtin:` binding is an
+/// implementation like any other, so the tool it configures is a `members:`
+/// entry that must sit where the agent attaching it does (grammar 6.1, 14.1,
+/// PRD resolved q45, q54).
+///
+/// This is the half of q54's "placement is the feature, not a leak" that a
+/// static check decides: a placed agent runs its model-authored commands on the
+/// worker that took its dispatch, and a composition that put the shell somewhere
+/// else would be one the scheduler could not honour. Written as the accepting
+/// and the refusing case together, because a rule that reached built-ins only in
+/// the refusing direction would make a legal mesh unwritable and nothing else
+/// here would notice.
+#[test]
+fn an_agent_and_its_builtin_tool_may_share_one_placement() {
+    accepts(
+        "builtin-row-2",
+        &format!("{BACKEND}{}", agent("builder", "tool.sandbox")),
+        &mesh("  mac:\n    members: [agent.builder, tool.sandbox]\n"),
+    );
+}
+
+/// …and the refusing direction of the same row.
+#[test]
+fn a_builtin_tool_placed_away_from_its_agent_is_refused() {
+    refuses(
+        "builtin-row-3",
+        &format!("{BACKEND}{}", agent("builder", "tool.sandbox")),
+        &mesh("  mac:\n    members: [tool.sandbox]\n  gpu:\n    members: [agent.builder]\n"),
+        "`tool.sandbox` is a member of placement `mac`, and `agent.builder` that attaches it \
+         has placement `gpu`",
     );
 }
 

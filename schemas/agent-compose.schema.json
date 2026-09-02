@@ -215,60 +215,16 @@
       "description": "An LLM-facing tool: a tool. definition, or a flow. definition used as a tool (flow-as-tool equivalence, PRD 5.1).",
       "anyOf": [{ "$ref": "#/$defs/toolRef" }, { "$ref": "#/$defs/flowRef" }]
     },
-    "builtinFileTool": {
-      "description": "The bounds a built-in file tool takes. Grammar 5.5.",
-      "type": "object",
-      "required": ["root"],
-      "properties": {
-        "root": {
-          "description": "REQUIRED, and non-empty. The directory this tool is bounded to. Every path the model supplies resolves inside it - resolution, not string prefix, so symlinks and .. count - and one that lands outside is refused. An empty root would bound the tool to whatever directory the runtime was started in, which is the ambient capability the per-entry bounds exist to refuse. Interpolable (grammar 4.3 class 2).",
-          "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
-        }
-      },
-      "additionalProperties": false
-    },
-    "builtinTool": {
-      "description": "One runtime built-in, attached under its own name with the bounds that name requires. Exactly one key per entry: the opt-in is one tool name at a time, never a switch that grants the set, so which capabilities an agent holds is readable off the entries that hold them. Grammar 5.5 / PRD resolved q31.",
-      "type": "object",
-      "minProperties": 1,
-      "maxProperties": 1,
-      "properties": {
-        "builtin.bash": {
-          "description": "Run one bash command with root: as its working directory, under timeout:. A model holding this holds arbitrary code execution on the host running the graph, which is why both bounds are required and neither is defaulted.",
-          "type": "object",
-          "required": ["root", "timeout"],
-          "properties": {
-            "root": {
-              "description": "REQUIRED, and non-empty. The working directory the command runs in. An empty root would hand the shell whatever directory the runtime was started in, which is the ambient capability every bound here is written out to refuse. Interpolable (grammar 4.3 class 2).",
-              "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
-            },
-            "timeout": {
-              "description": "REQUIRED. How long the command may run before it is killed and the call fails. This bounds one command; a node-level timeout: bounds the whole agent node (grammar 9.2).",
-              "$ref": "#/$defs/duration"
-            }
-          },
-          "additionalProperties": false
-        },
-        "builtin.read_file": {
-          "description": "Read one file inside root:.",
-          "$ref": "#/$defs/builtinFileTool"
-        },
-        "builtin.write_file": {
-          "description": "Write one file inside root:.",
-          "$ref": "#/$defs/builtinFileTool"
-        },
-        "builtin.list": {
-          "description": "List a directory inside root:, optionally through a glob.",
-          "$ref": "#/$defs/builtinFileTool"
-        }
-      },
-      "additionalProperties": false
+    "builtinShorthand": {
+      "description": "A built-in attached under its defaults: the execution's own workspace, the runtime's command bound, and a scrubbed child environment. The set is closed and grows by resolution rather than by drift - a model holding builtin.bash holds arbitrary code execution on the host running the graph. Bounds are written on a tool. definition carrying a builtin: binding, which is then attached by its address (grammar 5.5, 6.1 / PRD resolved q54).",
+      "enum": ["builtin.bash", "builtin.files"]
     },
     "agentTool": {
-      "description": "One entry of an agent's tools: list - a tool./flow. address, or a runtime built-in attached with its bounds (grammar 5.4, 5.5). The two shapes are told apart by the entry's own type rather than by anyOf, so an editor reports the rule the entry really broke - a missing root:, a timeout: on a file tool - instead of \"not one of two alternatives\".",
-      "if": { "type": "object" },
-      "then": { "$ref": "#/$defs/builtinTool" },
-      "else": { "$ref": "#/$defs/toolOrFlowRef" }
+      "description": "One entry of an agent's tools: list - a tool./flow. address, or a built-in shorthand (grammar 5.4, 5.5). Every entry is an address: a built-in with bounds is a tool. definition with a builtin: binding, attached here like any other tool.",
+      "anyOf": [
+        { "$ref": "#/$defs/toolOrFlowRef" },
+        { "$ref": "#/$defs/builtinShorthand" }
+      ]
     },
     "mapTargetRef": {
       "description": "A map dispatch target: agent., tool., or flow. Map instances are isolated per-item invocations of a component, not nodes of the enclosing flow: they take no policy from `defaults:` (Decision D73) and each runs on a fresh conversation history that is discarded when it completes, never reading or appending to the enclosing flow's `messages` (grammar 8.6 rules 10 and 13, 10.4 / Decisions D29, D105). Grammar 8.6 / PRD 5.6.",
@@ -928,22 +884,62 @@
     "toolDef": {
       "description": "A tool: one definition, two usage surfaces - attached to an agent (LLM-discovered) and invoked as a `function` node (graph-invoked). Grammar 6 / PRD 5.5.",
       "type": "object",
-      "required": ["description", "input", "output"],
       "properties": {
-        "description": { "description": "REQUIRED LLM-facing description: the selection signal when the tool is attached to an agent.", "type": "string", "minLength": 1 },
-        "input": { "description": "Parameter schema; also the checked signature for `function` node use. May be {} for a no-argument tool.", "$ref": "#/$defs/fieldMap" },
-        "output": { "description": "Result schema.", "$ref": "#/$defs/outputFieldMap" },
+        "description": { "description": "The LLM-facing description: the selection signal when the tool is attached to an agent. REQUIRED on every binding but builtin:, where the compiler writes one and this key sharpens it.", "type": "string", "minLength": 1 },
+        "input": { "description": "Parameter schema; also the checked signature for `function` node use. May be {} for a no-argument tool. Illegal on a builtin: tool, whose contract is the compiler's.", "$ref": "#/$defs/fieldMap" },
+        "output": { "description": "Result schema. Illegal on a builtin: tool, whose contract is the compiler's.", "$ref": "#/$defs/outputFieldMap" },
         "exec": { "description": "Subprocess implementation.", "$ref": "#/$defs/execImpl" },
         "http": { "description": "HTTP implementation.", "$ref": "#/$defs/httpImpl" },
         "function": { "description": "Host-registered function implementation (escape hatch; breaks spec portability).", "$ref": "#/$defs/functionImpl" },
-        "module": { "description": "Hand-authored TypeScript inside this project, held to the tool's declared input/output by the type checker (grammar 6.1, Decisions D132, D133).", "$ref": "#/$defs/moduleImpl" }
+        "module": { "description": "Hand-authored TypeScript inside this project, held to the tool's declared input/output by the type checker (grammar 6.1, Decisions D132, D133).", "$ref": "#/$defs/moduleImpl" },
+        "builtin": {
+          "description": "One of the built-in tools, configured. The only binding that does not fix what runs at build time: the model authors the program - a bash command, a file edit - at run time, which is the trust level exec: already extends to author-arbitrary binaries, extended to the model (grammar 6.1 / PRD resolved q54). bash is a shell session; files views, creates and edits files under the workspace.",
+          "enum": ["bash", "files"]
+        },
+        "workspace": {
+          "description": "The directory this built-in works inside: bash runs there, and every files path resolves inside it - resolution, not string prefix, so symlinks and .. count - and one that lands outside is refused. Omitted, the tool takes the execution's own built-in workspace, made fresh per execution and shared by every built-in that took the default. Written, it must name something: an empty workspace would bound the tool to whatever directory the runtime was started in. Interpolable (grammar 4.3 class 2).",
+          "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
+        },
+        "timeout": {
+          "description": "builtin: bash only. How long one command may run before it is killed and a timeout result goes back to the model. This bounds one command; a node-level timeout: bounds the whole agent node (grammar 9.2).",
+          "$ref": "#/$defs/duration"
+        },
+        "env": {
+          "description": "builtin: bash only. The environment its child processes run with - exactly the exec: shape. Children run with these variables and nothing else unless inherit_env is true.",
+          "type": "object",
+          "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
+        },
+        "inherit_env": {
+          "description": "builtin: bash only. Whether its children also see this process's own environment. Defaults to false: a built-in's children run scrubbed, which is what keeps a placement's environment manifest the whole answer (PRD resolved q41, q54).",
+          "type": "boolean"
+        }
       },
       "additionalProperties": false,
       "oneOf": [
         { "description": "exec implementation", "required": ["exec"] },
         { "description": "http implementation", "required": ["http"] },
         { "description": "function implementation", "required": ["function"] },
-        { "description": "module implementation", "required": ["module"] }
+        { "description": "module implementation", "required": ["module"] },
+        { "description": "builtin implementation", "required": ["builtin"] }
+      ],
+      "allOf": [
+        {
+          "description": "A builtin: tool declares no contract of its own; every other binding declares all three.",
+          "if": { "required": ["builtin"] },
+          "then": { "not": { "anyOf": [{ "required": ["input"] }, { "required": ["output"] }] } },
+          "else": { "required": ["description", "input", "output"] }
+        },
+        {
+          "description": "The bounds belong to a built-in.",
+          "if": { "anyOf": [{ "required": ["workspace"] }, { "required": ["timeout"] }, { "required": ["env"] }, { "required": ["inherit_env"] }] },
+          "then": { "required": ["builtin"] }
+        },
+        {
+          "description": "builtin: files reads and writes through the runtime and forks nothing, so it has no child process to bound.",
+          "if": { "properties": { "builtin": { "const": "files" } }, "required": ["builtin"] },
+          "then": { "not": { "anyOf": [{ "required": ["timeout"] }, { "required": ["env"] }, { "required": ["inherit_env"] }] } }
+        }
       ]
     },
     "expectExit": {

@@ -292,14 +292,17 @@ An inline node's `query:`/`body:` CEL is **flow**-scoped (`input`, `state`,
 key that would carry it — `body:` on a body-bearing method, `query:` on
 `GET`/`HEAD` — is a compile error rather than a silently ignored key.
 
-## Runtime built-ins
+## Built-in tools
 
-Four tools the runtime implements — a shell and three file operations — are
-attached from an agent's `tools:` list, **one name per entry**, each carrying the
-bounds it runs under. They are the boilerplate removed from a `tool.*` an author
-could already have hand-rolled with `exec:`, and they move the trust boundary
-nowhere: a model holding `builtin.bash` holds arbitrary code execution on the
-host running the graph.
+Two tools the runtime implements — a shell and a file editor — are the fifth
+implementation binding, and the only one that does not fix *what runs* at build
+time. `exec:`, `http:`, `function:` and `module:` each name a program the author
+chose and let the model fill schema-validated parameters; a built-in has the
+**model author the program at run time**. That is the trust level `exec:` already
+extends to author-arbitrary binaries, extended to the model: an agent holding
+`builtin.bash` can run anything the process running the graph can run.
+
+Two spellings. The **shorthand** attaches a built-in under its defaults:
 
 ```yaml
 agent.fixer:
@@ -307,83 +310,99 @@ agent.fixer:
   prompt: Fix the failing test, then say what you changed.
   tools:
     - tool.repo_grep
-    - builtin.read_file:  { root: "${WORKSPACE}" }
-    - builtin.write_file: { root: "${WORKSPACE}" }
-    - builtin.list:       { root: "${WORKSPACE}" }
-    - builtin.bash:       { root: "${WORKSPACE}", timeout: 30s }
+    - builtin.files
+    - builtin.bash
   output:
     summary: { type: string }
 ```
 
-| Built-in | Arguments | Result |
+The **configured** form is a `tool.*` carrying a `builtin:` binding, attached by
+its address like any other tool — so one configuration serves every agent that
+attaches it:
+
+```yaml
+tool.sandbox:
+  builtin: bash
+  workspace: "${WORK_DIR}"
+  timeout: 120s
+  env:
+    PATH: "/usr/bin:/bin"
+  inherit_env: false
+
+agent.builder:
+  model: model.smart
+  prompt: Build the project and report what broke.
+  tools:
+    - tool.sandbox
+  output:
+    summary: { type: string }
+```
+
+| Built-in | `builtin:` | What the model calls it | Arguments |
+|---|---|---|---|
+| `builtin.bash` | `bash` | `bash` | `command` |
+| `builtin.files` | `files` | `str_replace_based_edit_tool` | `command` (`view`/`create`/`str_replace`/`insert`), `path`, `file_text`, `old_str`, `new_str`, `insert_line` |
+
+The set is closed: any other `builtin:` value is a compile error naming the two.
+
+**The name is the provider's, not the definition key's.** These go out as the
+provider-defined tool types, each of which carries a name the wire dictates — so
+`tool.sandbox` above is `bash` on the model's side, and a `tool.bash` beside it
+would be two tools of one name, which is a `tool-name-collision`.
+
+**A built-in declares no contract.** `input:` and `output:` are compile errors on
+one: the arguments and the result are this compiler's, because the model writes
+the program rather than filling parameters an author declared. `description:`
+stays optional — the compiler writes one, and a composition may sharpen it
+("the repository checkout under review").
+
+### The bounds
+
+| Key | Applies to | Default |
 |---|---|---|
-| `builtin.bash` | `command` | `stdout`, `stderr` |
-| `builtin.read_file` | `path` | `content` |
-| `builtin.write_file` | `path`, `content` | `bytes_written` |
-| `builtin.list` | `path` (default `.`), `glob` (default none) | `entries`, `truncated` |
+| `workspace` | both | a fresh per-execution directory, shared by every built-in that took the default |
+| `timeout` | `bash` | the runtime's per-command bound |
+| `env` | `bash` | nothing — children run scrubbed |
+| `inherit_env` | `bash` | `false` |
 
-The set is closed. There is no key that grants all four, and no ambient default:
-which capabilities an agent holds is meant to be readable off the entries that
-hold them.
+`workspace:` is where the tool works: `builtin.bash` runs there, and every
+`builtin.files` path is relative to it and refused if it resolves outside it —
+resolution, not string comparison, so `../../etc/passwd` and a symlink pointing
+out of the tree are both refused. It is interpolable, so `${WORK_DIR}` is the
+usual spelling and the directory is a property of the machine running the graph
+rather than of the composition; written empty it is a compile error, because an
+empty path is the runtime's own working directory and a bound nobody wrote is
+not a bound.
 
-**`root:` is required on all four.** Every path argument is relative to it, and a
-path that *resolves* outside it is refused — resolution, not string comparison,
-so `../../etc/passwd` and a symlink pointing out of the tree are both refused,
-and a write to a file that does not exist yet is checked through its parent
-directory. `builtin.bash` runs with the root as its working directory. The value
-is interpolable, so `${WORKSPACE}` is the usual spelling and the directory is a
-property of the machine running the graph rather than of the composition.
+`timeout:`, `env:` and `inherit_env:` are `builtin.bash`'s alone — `builtin.files`
+reads and writes through the runtime and forks nothing, so a command bound and a
+child environment there would configure nobody, and each is a compile error.
+`env:` takes exactly the `exec:` shape (`agent-compose docs cel` for `${ENV}`
+refs), and `inherit_env: false` is the default: a built-in's children see the
+variables the binding declared and nothing else.
 
-Two consequences of "resolution" worth knowing before you meet them. A link
-whose target does not exist is **refused rather than followed** — there is
-nothing to resolve, so where it points cannot be checked, and writing through it
-would create the file it names. And a `builtin.list` walk **does not descend into
-a symlinked directory**: the link is reported as an entry, without the trailing
-`/` a directory gets, because a walk that followed it would answer with paths
-outside the root that no path check was ever asked about. Reading through such a
-link is a `read_file` call, where the check is asked.
-
-It has to name something, too: an empty `root:` is a compile error, and a
-`${WORKSPACE}` that comes back empty fails the call rather than resolving. An
-empty path is the runtime's own working directory, so a bound that accepted one
-would be the ambient capability these entries exist to refuse — read off no
-entry, and different on a developer's machine and a deployment's.
-
-`builtin.list`'s `glob` matches `*` and `?` inside one path segment and `**`
-across them — `docs/*.md` is the files directly under `docs/`, `**/*.md` is every
-one of them at any depth. `**` matches zero segments as readily as several, so
-writing several of them says what one says.
-
-**`timeout:` is required on `builtin.bash`** and illegal on the file tools, which
-run no command. What bounds a file tool is the node's own `timeout:`: a listing
-over a large tree stops where it is when the node's deadline runs out or the run
-is cancelled, rather than finishing a walk nothing is waiting for. `bash`'s own
-`timeout:` bounds one command; the node's bounds the whole agent node, tool loop
-included, and the two compose. The deadline kills the command's whole **process
-group** and ends the call — the shell is almost never
-where the work is, and a `npm run build` that outlived its own deadline would go
-on writing inside `root:` after the node had already failed. What survives is
-what left the group on purpose (`setsid`, `set -m`, a daemon that double-forks),
-exactly as it would have from a hand-rolled `exec:` tool; the runtime stops
-reading after such a process rather than waiting for it.
+`bash`'s `timeout:` bounds one command; a node's own `timeout:` bounds the whole
+agent node, tool loop included, and the two compose.
 
 **What fails and what bounces.** Arguments the tool's schema refuses go back to
-the model, which can call again — a missing `path`, an empty `command`.
-Everything else fails the agent node under its `retry:`/`on_error:`, exactly as a
-failing `exec:` tool does: a nonzero exit, a command killed at the timeout, a
-path that resolved outside the root, a `root:` that names no directory, a host
-with no `bash` on `PATH`.
+the model, which can call again — a missing `command`, a `path` that resolves
+outside the workspace. Everything else fails the agent node under its
+`retry:`/`on_error:`, exactly as a failing `exec:` tool does.
 
-**Containment is the root and the timeout, and nothing more.** The tools run with
-the privileges of the process running the graph. Container and syscall isolation,
-and any refusal keyed on where a component is deployed, are not in this release
-and are not implied by anything on this page.
+**Containment is the workspace and the timeout, and nothing more.** The tools run
+with the privileges of the process running the graph. Container and syscall
+isolation, and any refusal keyed on where a component is deployed, are not in
+this release and are not implied by anything on this page.
 
-A built-in call is recorded in the trace like any other tool call — the address
-`builtin.bash` as the target, and no result, because
-`agent-compose docs trace` keeps tool answers out of that format. The durability
-journal keeps the answer in full, which is why a resumed execution consumes a
-recorded `bash` instead of running the command a second time.
+Placement is the feature rather than a leak: an agent holding built-in tools
+joins the executes-in closure exactly as one holding `exec:` tools does, so a
+placed agent runs its model-authored commands on the worker that took its
+dispatch — which is what "the machine with the capability" placements are for
+(`agent-compose docs targets`).
+
+A built-in call is recorded in the trace like any other tool call, under the
+address it was attached by — `builtin.bash` for a shorthand, `tool.sandbox` for a
+configured one.
 
 ## `function:` nodes
 

@@ -1,13 +1,13 @@
 # rule: duplicate entries in an agent's `tools:` are an error, built-ins
 # rule: included (grammar 5.4, 5.5)
 # code: invalid-value
-# message: `tools` lists `builtin.list` twice
+# message: `tools` lists `builtin.files` twice
 # at: 11:7
 agent.reviewer:
   model: model.smart
   prompt: Review the draft.
   tools:
-    - builtin.list: { root: "./one" }
-    - builtin.list: { root: "./two" }
+    - builtin.files
+    - builtin.files
   output:
     verdict: { enum: [approve, revise] }

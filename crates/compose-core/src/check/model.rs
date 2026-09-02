@@ -999,18 +999,25 @@ fn partial_object(properties: FieldMap, span: &Span) -> TypeNode {
     )
 }
 
-/// The **arguments** one runtime built-in takes (grammar 5.5, Decision D123,
-/// PRD resolved q31).
+/// The **arguments** one built-in tool takes (grammar 5.5, 6.1, Decision D135,
+/// PRD resolved q54).
 ///
 /// Written here beside [`store_tool_input`] for the same reason: both are tool
 /// surfaces the composition does not spell out, and both have to be one field
 /// map, so that the JSON the model is constrained by and the Zod the arguments
 /// are parsed with stay one document (PRD §9.16).
 ///
-/// What is **not** here is the bound. `root:` and `timeout:` belong to the
-/// attachment rather than to the call — a model that could name its own root
-/// would hold the capability the attachment exists to bound — so neither is a
-/// parameter, and every path is read relative to the root the entry declared.
+/// The parameter **names** are the ones Anthropic's text-editor and bash tools
+/// carry, because on the Messages wire these go out as those provider-defined
+/// tool types and a trained model fills exactly those names. Every other wire
+/// declares the same names as an ordinary function tool, so one set of handlers
+/// serves all of them.
+///
+/// What is **not** here is the bound. `workspace:`, `timeout:` and the child
+/// environment belong to the binding rather than to the call — a model that
+/// could name its own workspace would hold the capability the binding exists to
+/// bound — so none is a parameter, and every path is read relative to the
+/// workspace the binding declared.
 pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
     let described = |description: &str| {
         let mut ty = scalar_node(ScalarKind::String, span);
@@ -1024,14 +1031,16 @@ pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
         }
         ty
     };
-    let defaulted = |description: &str, value: &str| {
+    let optional = |description: &str| {
         let mut ty = described(description);
         if let TypeForm::Scalar(scalar) = &mut ty.form {
-            scalar.default = Some(Spanned::new(
-                Literal::String(value.to_string()),
-                span.clone(),
-            ));
+            scalar.default = Some(Spanned::new(Literal::String(String::new()), span.clone()));
         }
+        ty
+    };
+    let described_enum = |variants: &[&str], description: &str| {
+        let mut ty = enum_node(variants, span);
+        ty.description = Some(Spanned::new(description.to_string(), span.clone()));
         ty
     };
     let fields: Vec<(&str, TypeNode)> = match builtin {
@@ -1039,36 +1048,49 @@ pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
             "command",
             required("The shell command to run, as one line of `bash`."),
         )],
-        Builtin::ReadFile => vec![(
-            "path",
-            required("The file to read, relative to the tool's root directory."),
-        )],
-        Builtin::WriteFile => vec![
+        Builtin::Files => vec![
             (
-                "path",
-                required("The file to write, relative to the tool's root directory."),
-            ),
-            (
-                "content",
-                described("The bytes to write, replacing whatever the file held."),
-            ),
-        ],
-        Builtin::List => vec![
-            (
-                "path",
-                defaulted(
-                    "The directory to list, relative to the tool's root directory.",
-                    ".",
+                "command",
+                described_enum(
+                    FILE_COMMANDS,
+                    "The file operation to perform: `view` reads a file or lists a directory, \
+                     `create` writes a whole file, `str_replace` swaps one occurrence of a \
+                     string, `insert` adds text at a line.",
                 ),
             ),
             (
-                "glob",
-                defaulted(
-                    "A glob to match entries against — `*` and `?` within one path segment, \
-                     `**` across segments. Empty lists the directory's own entries.",
-                    "",
+                "path",
+                required("The file or directory, relative to this tool's workspace."),
+            ),
+            (
+                "file_text",
+                optional("The whole contents of the file, for `create`."),
+            ),
+            (
+                "old_str",
+                optional(
+                    "The exact text to replace, for `str_replace`. It must appear exactly once.",
                 ),
             ),
+            (
+                "new_str",
+                optional("The text to put in its place, for `str_replace` and `insert`."),
+            ),
+            ("insert_line", {
+                let mut ty = bounded_integer(0, 1_000_000, span);
+                ty.description = Some(Spanned::new(
+                    "The line to insert after, for `insert`; `0` inserts at the top of the file."
+                        .to_string(),
+                    span.clone(),
+                ));
+                // Defaulted, so the three commands that are not `insert` are
+                // callable without it — a required parameter only one operation
+                // reads is one a model has to guess at on every other call.
+                if let TypeForm::Scalar(scalar) = &mut ty.form {
+                    scalar.default = Some(Spanned::new(Literal::Int(0), span.clone()));
+                }
+                ty
+            }),
         ],
     };
     let mut map = field_map(fields, span);
@@ -1076,6 +1098,32 @@ pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
     // on one of them legal (grammar 3.9).
     map.surface = Surface::Input;
     map
+}
+
+/// The `command:` a `builtin.files` call names, in the order grammar 6.1 lists
+/// them — the text-editor operations this runtime implements.
+pub(crate) const FILE_COMMANDS: &[&str] = &["view", "create", "str_replace", "insert"];
+
+/// What a built-in tells the model it does, where the composition wrote no
+/// `description:` of its own.
+///
+/// The compiler's own text, because the contract is the compiler's: a shorthand
+/// entry has nowhere to write one, and a `builtin:` binding declares no
+/// `input:`/`output:` for a description to describe. Each says the thing a model
+/// has to know to call it correctly — that paths are relative to a workspace it
+/// cannot see and cannot leave, and that a command is bounded by a deadline —
+/// because that is the difference between a model correcting itself and a model
+/// spending the loop's budget guessing (PRD G3, Decision D119).
+pub(crate) fn builtin_description(builtin: Builtin) -> String {
+    match builtin {
+        Builtin::Bash => "Run a `bash` command in a persistent shell session and return what it \
+             printed, with its exit status. The working directory and any shell state carry over \
+             from one call to the next, and each command runs under a deadline."
+            .to_string(),
+        Builtin::Files => "View, create and edit files inside this agent's workspace. Every path \
+             is relative to that workspace, and a path that resolves outside it is refused."
+            .to_string(),
+    }
 }
 
 /// `{ type: string, default: "" }` — an optional string parameter.

@@ -1,0 +1,15 @@
+# rule: the built-in set is closed and grows by resolution rather than by drift
+# rule: (grammar 6.1, D135, PRD resolved q54)
+# code: unknown-variant
+# message: `grep` is not a built-in tool
+# at: 8:12
+# help: the built-ins are `bash`, `files`; tool definition `tool.sandbox` names one of those, and every other tool is written with `exec:`, `http:`, `function:` or `module:` (grammar 6.1)
+tool.sandbox:
+  builtin: grep
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

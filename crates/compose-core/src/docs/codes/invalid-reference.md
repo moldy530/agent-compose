@@ -41,18 +41,18 @@ Two positions take a **flow-local node id** rather than an address, and a typed
 address there is this error too: `on_error: { fallback: … }` and a `human`
 node's `on_timeout:`. Control transfer stays inside one flow.
 
-One position takes a reference **or** something that is not one: an agent's
-`tools:` list, whose other entry shape is a runtime built-in
-(`agent-compose docs tools`). `builtin.bash` written there as a bare address is
-this error, and the message says why — a built-in carries the bounds it runs
-under, so the entry is a mapping rather than a name:
+One position takes a reference **or** a name that is not one: an agent's `tools:`
+list, whose other entry shape is a built-in shorthand
+(`agent-compose docs tools`). Those two names are not references and the parser
+does not read them as such, so a misspelled `builtin.*` is `unknown-variant`
+rather than this code:
 
 ```yaml
 tools:
   - tool.repo_grep
-  - builtin.read_file: { root: "${WORKSPACE}" }
-  - builtin.bash:      { root: "${WORKSPACE}", timeout: 30s }
+  - builtin.files
+  - tool.sandbox     # a `builtin: bash` with its bounds (grammar 6.1)
 ```
 
-Grammar: `docs/grammar.md` §2.2, §2.3, §5.5, §14.1, Decision D123. Topics:
+Grammar: `docs/grammar.md` §2.2, §2.3, §5.5, §14.1, Decision D135. Topics:
 `agent-compose docs getting-started`, `agent-compose docs tools`.

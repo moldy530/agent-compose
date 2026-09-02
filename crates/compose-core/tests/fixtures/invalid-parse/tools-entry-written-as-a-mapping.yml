@@ -1,0 +1,12 @@
+# rule: every entry of an agent's `tools:` is an address (grammar 5.4, 5.5)
+# code: wrong-type
+# message: each entry of `tools` is an address, not a mapping
+# at: 10:7
+# help: a `tool.*` or `flow.*` is attached by its address, and so is a built-in: the built-ins are `builtin.bash`, `builtin.files` (grammar 5.4, 5.5)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.repo_grep: { mode: fast }
+  output:
+    verdict: { enum: [approve, revise] }

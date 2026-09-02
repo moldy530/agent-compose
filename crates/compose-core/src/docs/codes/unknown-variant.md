@@ -36,11 +36,12 @@ spelling is close. Above, the four trigger types are `manual`, `http`,
 `schedule` and `event`; an inbound webhook is an `http` trigger.
 
 The **built-in** set is the one closed vocabulary that is closed on purpose
-rather than by what a plugin serves: `builtin.bash`, `builtin.read_file`,
-`builtin.write_file` and `builtin.list` are what this compiler implements, and
-the set grows by a resolved question rather than by a release adding a name
-(`agent-compose docs tools`). A tool of your own goes in a `tool.*` definition
+rather than by what a plugin serves: `bash` and `files` are what a `builtin:`
+binding may name — `builtin.bash` and `builtin.files` as shorthands in an
+agent's `tools:` list — and the set grows by a resolved question rather than by
+a release adding a name (`agent-compose docs tools`). A tool of your own goes in
+a `tool.*` definition with an `exec:`, `http:`, `function:` or `module:` binding
 and is attached by its address.
 
-Grammar: `docs/grammar.md` §5.5, §11.1, §12.1, §13.1, Decision D123. Topics:
-`agent-compose docs triggers`, `agent-compose docs tools`.
+Grammar: `docs/grammar.md` §5.5, §6.1, §11.1, §12.1, §13.1, Decision D135.
+Topics: `agent-compose docs triggers`, `agent-compose docs tools`.
