@@ -16,7 +16,8 @@
 //! that is a published surface rather than a behaviour; the three after that are
 //! about a `human` pause — the board a run holds one on, the terminal it answers
 //! one at, and the process's own standard input that terminal really is; and the
-//! last is about the one built-in tool whose work is this process's own:
+//! last is about the two built-in tools a model drives, read from inside one
+//! call of them:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -226,22 +227,26 @@
 //!     and the runner arms a timer of its own: a run that printed its answer and
 //!     then sat there is the one failure a passing test cannot tell from a slow
 //!     one. Gate 13 asks both cases of Node.
-//! 22. **What a listing costs and what stops it** — `builtin.list`, driven out
-//!     of a golden's own runtime. It is the one built-in whose work happens in
-//!     *this* process — `bash` is a child the runtime kills, the other two file
-//!     tools touch one path each — and both of its inputs are a **model's**: the
-//!     directory it names and the glob it writes. PRD resolved q31 bounds a
-//!     built-in with a root and a timeout, and grammar 5.5 gives a file tool no
-//!     `timeout:`, so what stands between one call and a spent machine is the
-//!     matcher's complexity and the walk's answer to `context.signal` — a search
-//!     exponential in how many `**` a pattern holds, or a walk that finishes a
-//!     tree the graph has already reported as failed, both look exactly like a
-//!     correct listing from outside. Three claims: a run of `**` over a deep
-//!     directory answers correctly and *quickly*, an aborted signal stops the
-//!     walk and is raised as it came rather than restated as a file-system
-//!     fault, and the glob table answers what it has always answered — which is
-//!     what keeps the first two from being bought with a matcher that matches
-//!     less.
+//! 22. **What a built-in call stays inside** — `builtin.bash` and
+//!     `builtin.files`, driven out of a golden's own runtime. The acceptance
+//!     suite drives both through a model loop, which is where the wire, the
+//!     trace records and Decision D119's bounces are settled; what a loop
+//!     cannot show is the inside of a call, and that is where every bound PRD
+//!     resolved q54 puts on these two lives. Eight of them: that a path
+//!     climbing out of the workspace — `..`, an absolute path, or a symlink
+//!     whose own parents do not exist yet — leaves what is outside
+//!     **untouched** rather than merely drawing a complaint, that a file larger
+//!     than the runtime reads is viewed from the front and edited not at all,
+//!     that one shell is held across the calls of a node activity and across no
+//!     more than that, that a `restart` ends that session without swallowing
+//!     the command sent beside it, that a command printing more than a tool
+//!     result can hold still comes back with its status, that a scrubbed child
+//!     sees the declared variables and no others, that a command's deadline
+//!     answers the *model* rather than failing the node, and that a defaulted
+//!     workspace is one directory per execution that goes when the execution
+//!     settles. Break any one of them and the call still answers something that
+//!     reads correctly from outside, which is why they are driven from within
+//!     the runtime rather than read off a transcript.
 //!
 //! # The toolchain fixture
 //!
@@ -386,6 +391,70 @@ fn runners(directory: &Path) -> Vec<String> {
     }
     names.sort();
     names
+}
+
+/// Every runner this file names is a runner the fixture still holds.
+///
+/// The module header above is written as this suite's own index — a numbered
+/// entry per gate, naming the subject it drives and the runner it drives it
+/// out of — and prose is the one part of a test file the compiler never reads.
+/// A gate that changed subject took its runner's name with it once already: the
+/// entry for gate 22 went on describing a `builtin.list` and a listing runner
+/// that the grammar and the fixture had both stopped holding, so a reader
+/// navigating by the index was sent to a test that does not exist, by the name
+/// of a file nothing on disk answers to. Nothing here can check that an entry
+/// still *describes* its gate — but a deleted runner is a **name**, and a name
+/// is checkable: every `*.mjs` this file mentions, in a `runner(…)` call or in a
+/// doc comment or in a prose aside, has to be a file [`runners`] finds in
+/// `tests/toolchain/`. Which makes the deletion of a runner the moment the prose
+/// naming it fails, rather than the moment someone reads it.
+///
+/// One direction only: the fixture also holds runners other suites spawn, and
+/// this file has no business naming those.
+#[test]
+fn this_suite_names_only_runners_the_fixture_holds() {
+    const SOURCE: &str = include_str!("generated_code_gates.rs");
+
+    let held: BTreeSet<String> = runners(&toolchain::root()).into_iter().collect();
+    assert!(
+        held.contains("builtin-tools.mjs"),
+        "the fixture holds none of the runners this file drives, so the scan below asserts \
+         nothing — the fixture moved: {held:?}"
+    );
+
+    let bytes = SOURCE.as_bytes();
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    for (end, _) in SOURCE.match_indices(".mjs") {
+        let start = bytes[..end]
+            .iter()
+            .rposition(
+                |byte| !matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_'),
+            )
+            .map_or(0, |before| before + 1);
+        // `".mjs"` itself, as the extension [`runners`] filters on: an extension
+        // is not a runner, and no file is named for one.
+        if start == end {
+            continue;
+        }
+        named.insert(&SOURCE[start..end + ".mjs".len()]);
+    }
+    assert!(
+        named.len() > 10,
+        "the scan found {} runner names in a file that spawns a dozen — it stopped reading \
+         the shape a runner is named in: {named:?}",
+        named.len()
+    );
+
+    let missing: Vec<&str> = named
+        .iter()
+        .copied()
+        .filter(|name| !held.contains(*name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "this file names {missing:?}, which `tests/toolchain/` does not hold — a runner was \
+         renamed or deleted and the prose that names it was left standing"
+    );
 }
 
 /// Why gate 13 cannot run here, or `None` when it can.

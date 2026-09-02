@@ -1349,9 +1349,13 @@ fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
             })
         })
         .collect();
-    // A built-in is on the wire under its own name too (grammar 5.5), so an
-    // agent attaching `builtin.list` and called `agent.list` does not get to
-    // pin an output tool called `list`.
+    // A built-in is on the wire under a name of its own too (grammar 5.5, and
+    // the provider dictates it: `bash`, `str_replace_based_edit_tool`), so
+    // those names are the pinned output tool's to avoid like any other. No
+    // built-in this release ships can collide — neither name is spelled
+    // `<something>_output` — but the set grows by resolution and the suffix is
+    // this function's, so the one that could is a built-in added here rather
+    // than a rule remembered there.
     attached.extend(
         agent
             .builtins
