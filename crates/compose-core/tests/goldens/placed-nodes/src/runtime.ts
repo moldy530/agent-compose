@@ -4535,10 +4535,12 @@ async function openShell(
   child.stdout.on("data", (chunk: string) => {
     session.stdout += chunk;
     settleShell(session);
+    holdShellOutput(session);
   });
   child.stderr.on("data", (chunk: string) => {
     session.stderr += chunk;
     settleShell(session);
+    holdShellOutput(session);
   });
   // A shell this runtime could not start — no such file, a `bash` that is not
   // executable — arrives here rather than as a throw, and ends the session with
@@ -4664,8 +4666,8 @@ async function runBuiltinBash(
   const answer = await typeIntoShell(session, command, binding.timeout, context);
   const notice = shellNotice(binding, answer, restarted);
   return {
-    stdout: capped(answer.stdout, BUILTIN_OUTPUT_LIMIT),
-    stderr: capped(answer.stderr, BUILTIN_OUTPUT_LIMIT),
+    stdout: trimmedMiddle(answer.stdout),
+    stderr: trimmedMiddle(answer.stderr),
     ...(answer.code === undefined ? {} : { exit_code: answer.code }),
     ...(answer.timedOut === true ? { timed_out: true } : {}),
     ...(notice === undefined ? {} : { notice }),
@@ -4786,6 +4788,43 @@ function settleShell(session: ShellSession): void {
   session.stderr = session.stderr.slice(errored + marked.length);
   session.pending = undefined;
   pending({ stdout, stderr, ...(Number.isNaN(status) ? {} : { code: status }) });
+}
+
+/**
+ * How much of one command's output this runtime will **hold in memory** before
+ * it starts dropping the middle of it.
+ *
+ * [`BUILTIN_OUTPUT_LIMIT`] bounds what a call *answers with*, and that bound is
+ * applied when the call settles — which is too late for the one command that can
+ * hurt this process rather than the model's context window: `cat` of a large
+ * file, a build that prints a megabyte a second, `yes` left running. Those are
+ * bytes this runtime accumulates as they arrive, and a model writes the program.
+ *
+ * So the buffer is held to this, and what is dropped is the **middle**: the head
+ * is what a result answers with, and the tail is where the marker that closes
+ * the command will be ([`settleShell`]) — so trimming has to keep both or it
+ * would either lose the answer or lose the command's own ending. The drop is
+ * said in the text rather than silent, for [`capped`]'s reason.
+ */
+const SHELL_BUFFER_LIMIT = 1_000_000;
+
+/**
+ * How much of the **tail** a trim keeps: comfortably more than one chunk, so a
+ * marker split across two reads is never cut in half by the trim between them.
+ */
+const SHELL_TAIL = 65_536;
+
+/** Hold one session's buffers to [`SHELL_BUFFER_LIMIT`]. */
+function holdShellOutput(session: ShellSession): void {
+  session.stdout = held(session.stdout);
+  session.stderr = held(session.stderr);
+}
+
+/** One buffer, with the middle dropped where it has outgrown the bound. */
+function held(buffered: string): string {
+  if (buffered.length <= SHELL_BUFFER_LIMIT) return buffered;
+  const dropped = buffered.length - BUILTIN_OUTPUT_LIMIT - SHELL_TAIL;
+  return `${buffered.slice(0, BUILTIN_OUTPUT_LIMIT)}\n…[${dropped} characters dropped as they arrived: this command printed more than this runtime holds]\n${buffered.slice(-SHELL_TAIL)}`;
 }
 
 /**
@@ -5173,10 +5212,32 @@ function snippetAround(contents: string, line: number): string {
 }
 
 /**
+ * One command's stream, held to [`BUILTIN_OUTPUT_LIMIT`] by dropping its
+ * **middle**.
+ *
+ * The head and the tail rather than the head alone, which is the difference
+ * between a bound on a *file* and a bound on a *command*: a build that failed
+ * says why in its last lines, and a runtime that answered with the first thirty
+ * thousand characters of a hundred-thousand-character log would hand a model
+ * everything except the part it asked for. What was dropped is said, for
+ * [`capped`]'s reason — and said without a count, because this may be trimming
+ * a buffer [`held`] has already trimmed and a number here would be a number
+ * about the wrong string.
+ */
+function trimmedMiddle(text: string): string {
+  if (text.length <= BUILTIN_OUTPUT_LIMIT) return text;
+  const head = Math.floor((BUILTIN_OUTPUT_LIMIT * 2) / 3);
+  return `${text.slice(0, head)}\n…[the middle of this output was dropped: it printed more than this tool answers with]\n${text.slice(head - BUILTIN_OUTPUT_LIMIT)}`;
+}
+
+/**
  * `text`, cut to `limit` characters with the cut **said**.
  *
  * A model reading a truncated answer has to know it was truncated, or it will
- * reason about a file it has only the first half of. See [`BUILTIN_OUTPUT_LIMIT`].
+ * reason about a file it has only the first half of. The **head** is what is
+ * kept here — a `view` is read from line 1 and a path is read from its root — 
+ * which is the difference from [`trimmedMiddle`], the bound a command's output
+ * gets. See [`BUILTIN_OUTPUT_LIMIT`].
  */
 function capped(text: string, limit: number): string {
   if (text.length <= limit) return text;

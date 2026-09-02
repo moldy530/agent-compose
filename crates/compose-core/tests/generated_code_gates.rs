@@ -3802,6 +3802,34 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
          rather than left to wonder where its state went: {session}"
     );
 
+    // --- A command that prints more than the runtime holds -----------------
+    let bounded = &answer["bounded"];
+    assert_eq!(
+        bounded["exitCode"],
+        json!(0),
+        "a command that printed megabytes still settled with its status: {bounded}"
+    );
+    let length = bounded["length"]
+        .as_u64()
+        .expect("the runner measures what came back");
+    assert!(
+        length < 200_000,
+        "what a call answers with is bounded, and this one came back with {length}          characters: a tool result is text a model reads (PRD resolved q54)"
+    );
+    assert_eq!(
+        (
+            &bounded["keptTheHead"],
+            &bounded["keptTheTail"],
+            &bounded["saidWhatItDropped"]
+        ),
+        (&json!(true), &json!(true), &json!(true)),
+        "the **middle** is what a bound drops: the head is the answer and the tail is          where a command's ending is, and the drop is said rather than silent: {bounded}"
+    );
+    assert_eq!(
+        bounded["after"]["stdout"], "still usable\n",
+        "…and the session survived it, which is what says the trim did not eat the          marker that closes a command: {bounded}"
+    );
+
     // --- The scrubbed environment (PRD resolved q54 ruling b) --------------
     let environment = &answer["environment"];
     assert_eq!(

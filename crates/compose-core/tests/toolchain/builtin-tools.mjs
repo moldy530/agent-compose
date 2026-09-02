@@ -215,6 +215,34 @@ runtime.endShellSessions(first);
 runtime.endShellSessions(second);
 
 // ---------------------------------------------------------------------------
+// A command that prints more than this runtime holds.
+//
+// The bound on a *result* is applied when a call settles; this is the one that
+// has to be applied as the bytes arrive, because the program is the model's and
+// `cat` of a large file is a command it can write. The command below prints a
+// few megabytes, which is over the buffer bound and far over the answer's — so
+// what is asserted is that the call still settles with its status, that what
+// comes back is bounded, and that both ends of the output are in it.
+const loudRoot = workspace("loud");
+const loudContext = contextWith("exec_loud");
+const loud = await call(
+  shell(loudRoot, { timeout: { millis: 60_000, written: "60s" } }),
+  { command: "printf 'the first line\n'; for i in $(seq 1 120000); do printf 'noise %s\n' \"$i\"; done; printf 'the last line\n'" },
+  loudContext,
+);
+const bounded = {
+  exitCode: loud.result?.exit_code ?? null,
+  length: (loud.result?.stdout ?? "").length,
+  keptTheHead: (loud.result?.stdout ?? "").startsWith("the first line"),
+  keptTheTail: (loud.result?.stdout ?? "").includes("the last line"),
+  saidWhatItDropped: (loud.result?.stdout ?? "").includes("dropped"),
+  // …and the session is still usable, which is what says the trim did not eat
+  // the marker that closes a command.
+  after: (await call(shell(loudRoot), { command: "echo still usable" }, loudContext)).result,
+};
+runtime.endShellSessions(loudContext);
+
+// ---------------------------------------------------------------------------
 // The scrubbed environment, both ways round.
 process.env["INHERITED_SECRET"] = "the value this process holds";
 const scrubbedRoot = workspace("scrubbed");
@@ -288,5 +316,5 @@ await runtime.releaseWorkspaces("exec_default_workspace", false);
 workspaces.goneWhenSettled = !fs.existsSync(madeAt);
 
 process.stdout.write(
-  `${JSON.stringify({ containment, editingTool, session, environment, timeout, workspaces })}\n`,
+  `${JSON.stringify({ containment, editingTool, session, bounded, environment, timeout, workspaces })}\n`,
 );
