@@ -1433,6 +1433,15 @@ const BUILTINS: &[Criterion] = &[
                 "arguments_a_builtin_refuses_bounce_back_to_the_model",
                 Status::Live,
             ),
+            // …including the argument the *vendor's* tool carries and this one
+            // does not: the Messages wire declares the provider-defined text
+            // editor, whose `view` takes a `view_range`, so the refusal has to
+            // name the key it refused for the loop to be a cost rather than a
+            // dead end.
+            (
+                "an_argument_outside_a_builtins_schema_is_refused_naming_the_key",
+                Status::Live,
+            ),
             // …and the same rule where a *file* path is what the model got
             // wrong, which is the one refusal that is also a bound.
             (

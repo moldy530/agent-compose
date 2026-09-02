@@ -12821,6 +12821,98 @@ fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// A parameter the **vendor's own tool** carries and this runtime does not:
+/// `view_range` on the text editor (grammar 5.5, Decision D119, PRD resolved
+/// q54).
+///
+/// The live gap in the contract, rather than a forward-compatibility corner. On
+/// the Messages wire `builtin.files` goes out as `text_editor_20250728`, whose
+/// `view` takes an optional `view_range` — so a model trained on that type will
+/// send one, and the closed argument set this compiler declares refuses it.
+/// What has to hold for that to be a *cost* rather than a dead end is the whole
+/// of D119: the refusal names the key it refused, the model corrects, and the
+/// run completes — spending one turn of `max_tool_iterations`, which is what
+/// `agent-compose docs tools` tells an author to budget for.
+///
+/// And the presence rule the other half of the campaign wrote down: this call is
+/// refused **before** it reaches the tool, so its record carries no `program`
+/// (`docs/trace.md` §7.3) — the arguments the model chose are in the `error`,
+/// where a refusal is allowed to quote them, and nowhere else.
+#[test]
+fn an_argument_outside_a_builtins_schema_is_refused_naming_the_key() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-unknown-key");
+    std::fs::write(
+        root_of(&scratch).join("notes.txt"),
+        "one\ntwo\nthree\nfour\n",
+    )
+    .expect("the root is writable");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({ "command": "view", "path": "notes.txt", "view_range": [1, 2] }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({ "command": "view", "path": "notes.txt" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("The whole file will do.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "read the whole file instead" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.edit",
+        &json!({ "goal": "read the first two lines" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "read the whole file instead");
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["outcome"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["refused", "completed"],
+        "the unknown key bounced and the corrected call ran: {calls:?}"
+    );
+    let refusal = calls[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        refusal.starts_with("ToolCallRefused: ")
+            && refusal.contains("Unrecognized key")
+            && refusal.contains("view_range"),
+        "the refusal **names the key it refused**, which is the difference between a model \
+         that corrects itself and one that guesses (PRD G3): {refusal}"
+    );
+    assert!(
+        calls[0].get("program").is_none(),
+        "a call refused before it reached the tool records no program — nothing ran, and \
+         `docs/trace.md` §7.3 says the record carries one only where the built-in was \
+         reached: {calls:?}"
+    );
+    // …and the model was handed the same sentence, which is what it corrects on.
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("view_range"),
+        "the refusal reached the model with the offending key in it: {handed}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// The file tool, round-tripped by a real model loop: create, edit, view
 /// (grammar 5.5, 6.1, PRD resolved q54).
 ///

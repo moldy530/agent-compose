@@ -346,13 +346,17 @@ agent.builder:
 
 The set is closed: any other `builtin:` value is a compile error naming the two.
 
-The **arguments** are the closed set above and nothing else, on every wire. That
-matters most on the Messages wire, where these go out as the provider-defined
-types and a trained model may reach for a parameter a *later* revision of the
-vendor's tool carries — the text editor's `view_range` is the one to expect. Such
-a call is refused with the offending key named, and the model calls again without
-it (`agent-compose docs agents`), which costs one iteration of the loop. A `view`
-answers with the whole file, numbered and capped, so nothing is out of reach.
+The **arguments** are the closed set above and nothing else, on every wire, and
+that set is **narrower than the vendor tool's own** on the Messages wire: these
+go out there as the provider-defined types, and the text editor's `view` takes
+an optional `view_range` this runtime does not implement. So a model trained on
+that type may send one — a slice of a long file is the ordinary thing to reach
+for — and the call is refused with the offending key named, which the model
+corrects by calling again without it. **Budget for it**: the bounce costs one
+turn of the agent's `max_tool_iterations` (default 8), so an agent whose work is
+mostly reading long files wants a turn or two of headroom. Nothing is out of
+reach either way — a `view` answers with the whole file, numbered, up to the cap
+below.
 
 **The name is the provider's, not the definition key's.** These go out as the
 provider-defined tool types, each of which carries a name the wire dictates — so
