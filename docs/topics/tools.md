@@ -411,8 +411,12 @@ agent node, tool loop included, and the two compose.
 where something happened to the *session*. `builtin.files` answers with the path
 and what the operation did: a `view` comes back with the file's lines numbered
 (or a directory's entries), a `create` with the bytes written, an edit with the
-line it changed and a few lines around it. Both are capped — a `cat` of a large
-file is cut with the cut said, rather than spending a context window.
+line it changed and a few lines around it. Both are bounded, and the two bounds differ where it
+matters: a command's output is cut in the **middle** — a build that failed says
+why in its last lines — and a file view is cut at the end, because a file is read
+from line 1. Either way the cut is said rather than silent. A command that prints
+more than the runtime will hold is bounded as it arrives, too, so a `cat` of
+something enormous costs a truncated answer rather than the process.
 
 **A shell is a session.** One `bash` child per agent node execution, with its
 standard input open: the working directory, the variables and the shell options
