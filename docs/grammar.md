@@ -1006,7 +1006,9 @@ wire dictates. So `tool.sandbox` above is `bash` to the model, a `tool.bash`
 beside it is a `tool-name-collision`, and the same holds against a provider's
 server-tool suite (§12.1). Its **address** — `builtin.files` for a shorthand,
 `tool.sandbox` for a configured one — is what
-[`docs/trace.md`](trace.md) §7.3 records as the call's target.
+[`docs/trace.md`](trace.md) §7.3 records as the call's target, beside the one
+thing that format carries for these two tools and for no others: the **program**
+the model wrote, which §7.4 specifies (PRD resolved q54 ruling c).
 
 **Failure and refusal follow §5.4's split unchanged.** Arguments the built-in's
 own schema refuses, and paths that resolve outside the workspace, are handed back
@@ -1015,6 +1017,14 @@ to the model
 An *execution* failure — a host with no `bash` on `PATH`, a workspace that names
 no directory — fails the agent node, where §9's chain decides the run exactly as
 it does for an `exec:` tool.
+
+**What a command *said* is neither.** A nonzero exit status, and a command killed
+at its `timeout:`, come back to the model as the tool's **result**: the model
+wrote the program, so how it ended is a fact it asked for rather than a contract
+of the composition's, and there is no `expect_exit:` here for one to sit on. The
+loop goes on and the node does not end. That is the one place a built-in's split
+reads differently from an `exec:` tool's, and it reads differently because the
+author of the program is different.
 
 **What bounds a built-in is the workspace and the timeout, and nothing else.**
 The tools run with the privileges of the process running the graph, which is what

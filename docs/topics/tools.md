@@ -341,10 +341,18 @@ agent.builder:
 
 | Built-in | `builtin:` | What the model calls it | Arguments |
 |---|---|---|---|
-| `builtin.bash` | `bash` | `bash` | `command` |
+| `builtin.bash` | `bash` | `bash` | `command`, `restart` |
 | `builtin.files` | `files` | `str_replace_based_edit_tool` | `command` (`view`/`create`/`str_replace`/`insert`), `path`, `file_text`, `old_str`, `new_str`, `insert_line` |
 
 The set is closed: any other `builtin:` value is a compile error naming the two.
+
+The **arguments** are the closed set above and nothing else, on every wire. That
+matters most on the Messages wire, where these go out as the provider-defined
+types and a trained model may reach for a parameter a *later* revision of the
+vendor's tool carries — the text editor's `view_range` is the one to expect. Such
+a call is refused with the offending key named, and the model calls again without
+it (`agent-compose docs agents`), which costs one iteration of the loop. A `view`
+answers with the whole file, numbered and capped, so nothing is out of reach.
 
 **The name is the provider's, not the definition key's.** These go out as the
 provider-defined tool types, each of which carries a name the wire dictates — so
