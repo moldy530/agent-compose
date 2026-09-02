@@ -365,6 +365,12 @@ the program rather than filling parameters an author declared. `description:`
 stays optional — the compiler writes one, and a composition may sharpen it
 ("the repository checkout under review").
 
+Which is why an agent's `tools:` list is the only place a built-in is called
+from. A `tool.*` binding one is still a tool by address, so a `function:` node or
+a `map` dispatch can name it — and both are compile errors: those two surfaces
+bind the composition's arguments against a declared `input:` and read a declared
+result, and a built-in has neither. Attach it to an agent instead.
+
 ### The bounds
 
 | Key | Applies to | Default |
@@ -417,6 +423,13 @@ why in its last lines — and a file view is cut at the end, because a file is r
 from line 1. Either way the cut is said rather than silent. A command that prints
 more than the runtime will hold is bounded as it arrives, too, so a `cat` of
 something enormous costs a truncated answer rather than the process.
+
+The path a `files` call names is the model's, so what it *reads* is bounded the
+same way for the same reason. A `view` of a file past that bound answers with the
+front of it and says where it stopped; a `str_replace` or an `insert` on one is
+**refused**, because an edit writes back what it read and a truncated read would
+truncate the file rather than the answer. Work on something that large with
+`bash`, which streams rather than holds.
 
 **A shell is a session.** One `bash` child per agent node execution, with its
 standard input open: the working directory, the variables and the shell options

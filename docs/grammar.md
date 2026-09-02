@@ -1429,6 +1429,14 @@ required of every other binding, is **optional**: the compiler writes one, and a
 composition may sharpen it with the fact only it knows ("the repository checkout
 under review").
 
+**So an agent's `tools:` list is its only call site.** §6's two usage surfaces
+are one surface for this binding: a `function:` node naming a `builtin:` tool,
+and a `map` dispatching to one, are each a compile error naming the repair
+(`invalid-value`). Both of those surfaces pass the **composition's** arguments —
+checked field by field against a declared `input:` (§8.4, §8.6 rule 12) — and
+read a declared result, and a built-in has neither to offer them. There is
+nothing for such a node to bind and nothing for it to write.
+
 **`workspace:` is where the tool works.** `builtin.bash` runs there, and every
 `builtin.files` path is taken relative to it and refused if it **resolves**
 outside it — resolution, not string comparison, so a `..` that climbs out and a
@@ -7388,18 +7396,23 @@ already has rather than invented. *PRD 5.5, 5.12, resolved q31, q54, G3.*
 cancelled run — and so does a stop signal delivered to the process running the
 graph while a command is in flight.
 
-**Rationale**. §5.5 promises that a command which outruns its `timeout:` "is
-killed", and the bound is one of the two things q31 says a built-in *has*: "a
+**Rationale**. §5.5 promises that a command which outruns its `timeout:` is
+killed, and the bound is one of the two things q31 says a built-in *has*: "a
 model holding bash is arbitrary code execution on the host running the graph,
 which is why every bound here is explicit". A kill aimed at the shell's own pid
 does not keep that promise, because the shell is almost never where the work is.
 `bash -c 'npm run build'` forks; so does a pipeline, a subshell, a command list.
 Kill the shell and every one of those children keeps running — and keeps writing
-inside the `root:` the attachment bounded it to — while the graph has already
-reported the call as failed and moved on. With `retry: 2` that is two generations
-of one command writing one root with the composition believing exactly one is
-live; with `on_error: skip` it is a downstream node reading files a "killed"
-command is still producing. The bound would be a message rather than a fact.
+inside the `workspace:` the binding bounded it to — while the model has already
+been told the command was killed.
+
+**And here the loop goes on**, which is what makes the orphan worse rather than
+better: a spent `timeout:` comes back as the call's *result* and the node does
+not end (§5.5), so the model's next command runs in the same workspace beside the
+one the deadline was supposed to have ended, and reads what it is still writing.
+A node `retry:` opens a third shell beside both, and `on_error: skip` leaves a
+downstream node reading files a "killed" command is still producing. The bound
+would be a message rather than a fact.
 
 **What this costs and why it is worth it.** A detached command is out of the
 **terminal's** reach as well as the shell's: its group is no longer the
@@ -7423,15 +7436,20 @@ and syscall isolation §5.5 defers there. The runtime stops **reading** what suc
 process holds rather than waiting on it, so the call is still bounded even when
 the process is not.
 
-**The same rule inside this process.** `builtin.list` is the one built-in whose
-work is the runtime's own — a walk over a directory the model named, matching a
-glob the model wrote — and both of those size it. An abort stops that walk where
-it is, for the reason it kills a process group: an activity the graph has stopped
-*waiting* for is not an activity that may go on working, and a compiled graph is
-embedded code, so a listing left running is a core taken from every other
-execution in the same process. The walk also hands the event loop back as it
-goes, because a deadline is a timer and a timer cannot fire inside work that
-never yields. *PRD resolved q31, §5.5, §9.2.*
+**The other built-in has no group to kill, and is bounded another way.**
+`builtin.files` forks nothing — it reads and writes through the runtime itself,
+which is why §6.1 gives it no `timeout:` at all — so what could run away inside
+this process is not a child but an *allocation*: the path is the model's, and a
+`view` of a very large file would pull it whole into a process that is running
+every other execution too. So the file tool is sized rather than deadlined: a
+directory is listed one level deep rather than walked, and a read stops at a
+bound this runtime sets. A `view` past it answers with the front of the file and
+says so; an edit past it is refused outright, because `str_replace` and `insert`
+write back what they read and a truncated read there would truncate the file
+rather than the answer. Both bounds are the same statement this decision makes
+about a process group, made about memory: a compiled graph is embedded code, and
+work no one is waiting for is a resource taken from every other execution beside
+it. *PRD resolved q31, q54, §5.5, §6.1, §9.2.*
 
 ### D125. Inbound `auth:` is one scheme per trigger, with env-ref secrets
 
@@ -8093,6 +8111,17 @@ refuses, at the widest surface it has. `description:` survives because it is
 prose and not contract: the compiler's text is accurate and an author's can be
 sharper ("the repository checkout under review").
 
+*Why only one of §6's two surfaces takes it.* The same sentence, read one step
+along: a `function:` node and a `map` dispatch are the surfaces where the
+**composition** writes the arguments, and it writes them against a declared
+`input:`. A built-in has none, so a node naming one has nothing to bind, nothing
+to read back, and no model in the loop to have authored the program — which is
+the whole of what this binding is. It is refused by the validator rather than
+left to the emitter, which writes no function for a built-in at all: unchecked,
+the spec compiles to a project calling a function nothing defines, and a
+composition `validate` accepted would fail at `tsc`. This is the rule §6.1 states
+and `check/bindings.rs` decides.
+
 *Why `inherit_env:` defaults to false.* A built-in's children are the one place a
 composition's environment can leak wholesale, and a placement's environment
 manifest (PRD resolved q41) is only the whole answer if the children read nothing
@@ -8130,7 +8159,9 @@ It is necessarily **looser** than `agent-compose validate`, which is the
 authority. The schema cannot see across files, so it does not check:
 
 - reference resolution or reference typing (`model.smart` existing, and being a
-  model);
+  model) — including which *implementation* a referenced tool carries, so a
+  `function:` node or a `map` dispatch naming a `builtin:` tool, which no node
+  may call (§6.1, D135), is the validator's;
 - singleton-section cardinality across files, or duplicate addresses;
 - whether `version:` is present in a file that turns out to be the entrypoint
   (it is required whenever `imports:` or a deploy section is present, which is
@@ -8208,13 +8239,18 @@ absence of any `context:` key, which is a `flow:` node's alone because a
 dispatch's history isolation is unconditional (rule 13, D105) —
 the field-map-only `input:` on the node kinds that name their
 fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
-direct-XOR-route split on model definitions (§12.2), the built-in entries of an
-agent's `tools:` — one name per entry over the closed four, `root:` required on
-every one of them and `timeout:` required on `builtin.bash` and refused on the
-file tools (§5.5, D123), which is an `if`/`then` keyed on the entry's own
-*type* rather than on a sibling literal: a string is an address and a mapping is
-a built-in, so an editor underlines the missing `root:` rather than reporting
-that the entry is neither kind of thing — the `human` timeout/route
+direct-XOR-route split on model definitions (§12.2), the shape of an agent's
+`tools:` entries — every entry a **string**, either a `tool.*`/`flow.*` address
+or one of the two built-in shorthands as a closed enum, so a mapping entry is
+refused outright and a misspelled `builtin.*` is underlined against the two
+names (§5.5, D135) — and, on a tool definition, the `builtin:` binding beside
+the other four in the same `oneOf`, with the three conditionals its bounds carry:
+`input:`/`output:` refused on a built-in and required on every other binding,
+`workspace:`/`timeout:`/`env:`/`inherit_env:` legal only where `builtin:` is
+written, and the last three refused on `builtin: files`, which forks nothing to
+bound (§6.1, D50, D135) — each an `if`/`then` on a sibling literal in the same
+object, so an editor underlines the key that does not belong rather than
+reporting that the definition is no kind of tool — the `human` timeout/route
 pairing (§8.7) and the absence of node-level `timeout:`/`retry:` on a `human`
 node (§8.7, D52 — the other two levels of that exemption are resolution
 semantics, with nothing to reject), the `fail`/`skip`-only `on_error:` in
