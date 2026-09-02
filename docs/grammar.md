@@ -1404,7 +1404,7 @@ tool.sandbox:
 |---|---|---|---|
 | `builtin` | enum `bash files` | yes | which built-in; any other name is `unknown-variant` |
 | `workspace` | string (non-empty, interpolable) | no | the directory this tool works inside; default is the execution's own built-in workspace |
-| `timeout` | duration (§4.4) | no | `bash` only; bounds one command |
+| `timeout` | duration (§4.4) | no | `bash` only; bounds one command. Default **120s** |
 | `env` | map env-var-name (`[A-Za-z_][A-Za-z0-9_]*`) → string (interpolable) | no | `bash` only; exactly the `exec:` shape |
 | `inherit_env` | boolean | no | `bash` only; default `false` |
 
@@ -1431,6 +1431,11 @@ directory the runtime happened to be started in and a bound nobody wrote is not 
 bound. **Omitting** it is the way to take the default — one fresh directory per
 execution, shared by every built-in of that execution that took it, removed when
 the execution settles.
+
+**`timeout:` defaults to 120s**, which is a bound chosen to be longer than a
+build step and shorter than a wedged process: a model that wanted longer says so,
+and a command nobody bounded would hold an agent node until §9.2's own deadline
+took the whole loop with it.
 
 **`timeout:`, `env:` and `inherit_env:` are `builtin.bash`'s alone.**
 `builtin.files` reads and writes through the runtime itself and forks nothing, so

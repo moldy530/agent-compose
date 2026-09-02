@@ -22,6 +22,7 @@ import * as stores from "./stores.ts";
 import {
   agentShaperOutput,
   agentSpreaderOutput,
+  builtinBashInput,
   builtinFilesInput,
   flowCondenseInputs,
   flowCondenseNodeReduceOutput,
@@ -654,6 +655,35 @@ const agentSpreader: runtime.AgentBinding = {
           args,
           context,
           call,
+        ),
+    },
+    {
+      name: "bash",
+      address: "builtin.bash",
+      description: "Run a `bash` command in a persistent shell session and return what it printed, with its exit status. The working directory and any shell state carry over from one call to the next, and each command runs under a deadline.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "description": "The shell command to run, as one line of `bash`.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      invoke: (args, context) =>
+        runtime.runBuiltin(
+          {
+            tool: "bash",
+            root: [],
+            timeout: { millis: 120000, written: "120s" },
+          },
+          runtime.parseToolArguments(builtinBashInput, args, "the arguments `bash` was called with"),
+          context,
         ),
     },
   ],

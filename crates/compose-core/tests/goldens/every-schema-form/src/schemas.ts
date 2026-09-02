@@ -380,6 +380,14 @@ export const toolSandboxOutput = z.object({}).strict();
 export type ToolSandboxOutput = z.infer<typeof toolSandboxOutput>;
 
 /**
+ * `builtin.bash` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
+ */
+export const builtinBashInput = z.object({
+  command: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The shell command to run, as one line of `bash`."),
+}).strict();
+export type BuiltinBashInput = z.infer<typeof builtinBashInput>;
+
+/**
  * `builtin.files` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
  */
 export const builtinFilesInput = z.object({

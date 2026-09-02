@@ -981,6 +981,18 @@ fn agents(
 /// Grammar 5's default for `max_tool_iterations:` (Decision D51, PRD §9.14).
 const DEFAULT_TOOL_ITERATIONS: i64 = 8;
 
+/// Grammar 6.1's default for a `builtin: bash` binding's `timeout:`, as written.
+///
+/// Longer than a build step and shorter than a wedged process: a composition
+/// that wants either says so, and a command nobody bounded would hold an agent
+/// node until §9.2's own deadline took the whole loop with it (Decision D135).
+const DEFAULT_BUILTIN_TIMEOUT: &str = "120s";
+
+/// [`DEFAULT_BUILTIN_TIMEOUT`] in milliseconds, which is what the timer is set
+/// to. The two are one value written twice, for the reason the emitted binding
+/// carries both: the timer reads one and a failure message quotes the other.
+const DEFAULT_BUILTIN_TIMEOUT_MILLIS: u128 = 120_000;
+
 /// One `flow.*` in an agent's `tools:` — flow-as-tool (grammar 5.4, PRD 5.1).
 ///
 /// The tool is emitted with the contract grammar 5.4 gives it — its local name
@@ -1150,15 +1162,24 @@ fn builtin_tool(
             || "[]".to_string(),
             |workspace| interpolation(&workspace.value, &format!("{address}.workspace")),
         );
-    let timeout = binding
-        .and_then(|binding| binding.timeout.as_ref())
-        .map_or_else(String::new, |timeout| {
-            format!(
-                "            timeout: {{ millis: {}, written: {} }},\n",
-                timeout.value.as_millis(),
-                names::string(timeout.value.as_str())
-            )
-        });
+    let timeout = match binding.and_then(|binding| binding.timeout.as_ref()) {
+        Some(timeout) => format!(
+            "            timeout: {{ millis: {}, written: {} }},\n",
+            timeout.value.as_millis(),
+            names::string(timeout.value.as_str())
+        ),
+        // The default is emitted rather than left to the runtime, for the
+        // reason every other class-2 value is written out here: what bounded a
+        // call is a fact of the artifact, and a command bounded by a number
+        // nobody can read off the emitted graph is a bound nobody wrote
+        // (grammar 6.1). `builtin.files` runs no command, so it takes none.
+        None if tool.runs_a_command() => format!(
+            "            timeout: {{ millis: {}, written: {} }},\n",
+            DEFAULT_BUILTIN_TIMEOUT_MILLIS,
+            names::string(DEFAULT_BUILTIN_TIMEOUT)
+        ),
+        None => String::new(),
+    };
     text.push_str(&format!(
         "      invoke: (args, context) =>\n        runtime.runBuiltin(\n          \
          {{\n            tool: {},\n            root: {workspace},\n{timeout}          }},\n          \

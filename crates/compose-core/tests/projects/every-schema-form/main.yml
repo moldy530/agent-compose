@@ -336,7 +336,11 @@ agent.spreader:
   description: Shapes one goal of a batch.
   model: model.m
   prompt: Shape one goal.
-  tools: [flow.condense]
+  # The shell under every default — the shape `agent.shaper` above cannot hold
+  # beside its configured `tool.sandbox`, since both are `bash` on the model's
+  # side. What it pins is the emitted default bound: a shorthand carries no
+  # `timeout:` and the graph is what says what bounded the command (grammar 6.1).
+  tools: [flow.condense, builtin.bash]
   input:
     goal: { type: string }
   output:

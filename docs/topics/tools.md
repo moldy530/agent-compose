@@ -302,7 +302,8 @@ chose and let the model fill schema-validated parameters; a built-in has the
 extends to author-arbitrary binaries, extended to the model: an agent holding
 `builtin.bash` can run anything the process running the graph can run.
 
-Two spellings. The **shorthand** attaches a built-in under its defaults:
+Two spellings. The **shorthand** attaches a built-in under its defaults — a fresh workspace,
+a 120s command bound, a scrubbed environment:
 
 ```yaml
 agent.fixer:
@@ -361,7 +362,7 @@ stays optional — the compiler writes one, and a composition may sharpen it
 | Key | Applies to | Default |
 |---|---|---|
 | `workspace` | both | a fresh per-execution directory, shared by every built-in that took the default |
-| `timeout` | `bash` | the runtime's per-command bound |
+| `timeout` | `bash` | `120s` |
 | `env` | `bash` | nothing — children run scrubbed |
 | `inherit_env` | `bash` | `false` |
 
