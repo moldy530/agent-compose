@@ -672,12 +672,24 @@ fn a_refused_tool_calls_trace_document_keeps_its_shape() {
 /// which tool ran — so a snapshot holding only one would leave the other's
 /// presence rule to prose.
 ///
+/// The **`restart`** is here for the same reason read the other way: it is the
+/// one `bash` call that runs no command, and §7.4 says `exitCode` is absent
+/// where none completed. A record carrying `exitCode: 0` for it would be this
+/// format contradicting its own presence rule, which a snapshot catches and an
+/// assertion about the run's outcome would not.
+///
 /// And the half a snapshot makes visible that an assertion would not: what is
-/// **not** in the document. The command writes, the `view` reads it back and the
-/// `create` writes a file, and none of that content is anywhere in the trace — a
-/// tool's answer stays under §11's rule with every other tool's, and a
-/// regression that started carrying stdout would land here as a diff rather than
-/// as a test nobody wrote.
+/// **not** in the document. The command writes, the `view` reads it back, the
+/// `create` writes a file and the `cat` prints one, and none of that content is
+/// anywhere in the trace — a tool's answer stays under §11's rule with every
+/// other tool's, and a regression that started carrying stdout would land here
+/// as a diff rather than as a test nobody wrote.
+///
+/// The sentinel the loop below looks for is the file the `create` wrote and the
+/// `cat` printed, because that text appears in **no command**: a guard written
+/// against what the `printf` wrote would be looking for a string the recorded
+/// command itself contains, and could only ever be satisfied by a trace missing
+/// the record §7.4 requires.
 ///
 /// The workspace is `${BUILTIN_ROOT}`, pointed at a scratch directory of this
 /// test's own: a resolved path is exactly what §11.1 keeps out of the format, so
@@ -702,9 +714,15 @@ fn a_built_in_tools_trace_document_keeps_its_shape() {
                     json!({
                         "command": "create",
                         "path": "plan.md",
-                        "file_text": "the plan this agent wrote\n",
+                        "file_text": "the plan this agent wrote\nover two lines\n",
                     }),
                 ),
+                // …the one `bash` call that runs nothing, whose record carries no
+                // `exitCode` because no command completed (§7.4).
+                ToolCall::new("bash", json!({ "restart": true })),
+                // …one whose *output* is text no command in this run contains,
+                // which is what makes the absence assertions below say anything.
+                ToolCall::new("bash", json!({ "command": "cat plan.md" })),
                 // …and one that exits nonzero, which is a **completed** call
                 // carrying the status rather than a failure (resolved q54).
                 ToolCall::new("bash", json!({ "command": "test -f nothing-here" })),
@@ -737,12 +755,29 @@ fn a_built_in_tools_trace_document_keeps_its_shape() {
     };
     run.succeeded();
     let held = document(&run);
-    for answered in ["one\ntwo", "the plan this agent wrote"] {
+    // The file's two lines, and the pair of them as a **JSON string** would
+    // carry them: a newline inside one is the two characters `\n`, never the
+    // byte, so a guard written with a real newline asserts the absence of
+    // something this document could not hold whatever regressed.
+    for answered in [
+        "the plan this agent wrote",
+        "over two lines",
+        "the plan this agent wrote\\nover two lines",
+    ] {
         assert!(
             !held.contains(answered),
-            "a built-in's *answer* reached the trace: `{answered}` is a command's output \
-             or a file's contents, which §11 keeps out of this format with every other \
-             tool's"
+            "a built-in's *answer* reached the trace: `{answered}` is a file's contents, \
+             written by a `create` and printed by a `cat`, which §11 keeps out of this \
+             format with every other tool's"
+        );
+    }
+    // …and the same rule read as a shape rather than as a string, which is what
+    // catches an answer this fixture's sentinels happen not to appear in.
+    for key in ["\"stdout\"", "\"stderr\"", "\"content\"", "\"file_text\""] {
+        assert!(
+            !held.contains(key),
+            "a key carrying a tool's answer is in the document: {key} is what a built-in \
+             answers *with*, and §7.4 carries the program the model wrote and no more of it"
         );
     }
     insta::assert_snapshot!(held);

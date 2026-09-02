@@ -20,6 +20,10 @@
 //     `cd` in one call is still in effect in the next, and a second activity
 //     starts in the workspace. Two contexts is the whole of that claim, and it
 //     is invisible from outside the process;
+//   * **the restart the model asks for** — the one way a session ends that the
+//     *model* drives: alone it runs nothing and says so with no status, and a
+//     `command` sent with it runs in the fresh session rather than being
+//     dropped, which is a claim only the file system afterwards can settle;
 //   * **the scrubbed environment** — a variable this process holds is *not* in
 //     the child unless the binding declared it or opted into inheritance. Both
 //     directions, because a runtime that passed everything and one that passed
@@ -268,6 +272,54 @@ runtime.endShellSessions(first);
 runtime.endShellSessions(second);
 
 // ---------------------------------------------------------------------------
+// The restart the *model* asks for.
+//
+// The other way a session ends, and the only one the model drives: `restart` is
+// a parameter of the provider-defined tool, so it is a call this runtime has to
+// answer whatever else it is doing. Three claims, and the third is the one a
+// runtime gets wrong quietly:
+//
+//   * a restart **alone** runs nothing — so it comes back with a notice and no
+//     `exit_code`, because a status invented for a call that ran nothing would
+//     be copied into the trace as a command that completed (`docs/trace.md`
+//     §7.4);
+//   * it really ends the session — the `cd` before it is gone after it;
+//   * a `command` sent **with** a restart *runs*, in the fresh session. A
+//     runtime that dropped it would answer the model `exit_code: 0` for a write
+//     that never happened and record that command in the trace as having run on
+//     this host, which is worse than recording nothing. So what is asserted is
+//     the file system afterwards, not the wording of the answer.
+const restarted = workspace("restarted");
+fs.mkdirSync(path.join(restarted, "inner"));
+const restarting = contextWith("exec_restart");
+await call(shell(restarted), { command: "cd inner; kept=42" }, restarting);
+const restartAlone = await call(shell(restarted), { restart: true }, restarting);
+const afterRestart = await call(shell(restarted), { command: 'pwd; echo "[${kept-unset}]"' }, restarting);
+await call(shell(restarted), { command: "cd inner; kept=42" }, restarting);
+const withCommand = await call(
+  shell(restarted),
+  {
+    command: 'printf "ran\\n" > made-by-restart.txt; pwd; echo "[${kept-unset}]"; (exit 5)',
+    restart: true,
+  },
+  restarting,
+);
+const restart = {
+  alone: restartAlone.result,
+  aloneProgram: restartAlone.program,
+  // The state the restart threw away: back in the workspace, with the variable
+  // it was holding gone.
+  after: (afterRestart.result?.stdout ?? "").trim(),
+  withCommand: withCommand.result,
+  withCommandProgram: withCommand.program,
+  // The proof the command was not discarded — on disk rather than in the answer.
+  commandRan: fs.existsSync(path.join(restarted, "made-by-restart.txt")),
+  // …and that it ran in the *fresh* session: the workspace again, and no `kept`.
+  whereItRan: (withCommand.result?.stdout ?? "").trim(),
+};
+runtime.endShellSessions(restarting);
+
+// ---------------------------------------------------------------------------
 // A command that prints more than this runtime holds.
 //
 // The bound on a *result* is applied when a call settles; this is the one that
@@ -369,5 +421,5 @@ await runtime.releaseWorkspaces("exec_default_workspace", false);
 workspaces.goneWhenSettled = !fs.existsSync(madeAt);
 
 process.stdout.write(
-  `${JSON.stringify({ containment, editingTool, readBound, session, bounded, environment, timeout, workspaces })}\n`,
+  `${JSON.stringify({ containment, editingTool, readBound, session, restart, bounded, environment, timeout, workspaces })}\n`,
 );

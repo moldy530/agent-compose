@@ -3626,10 +3626,12 @@ fn the_local_backends_behaved(answer: &Value) {
 /// resolved q54 makes there: that an escaping path leaves everything outside the
 /// workspace **untouched**, that a file larger than the runtime reads is viewed
 /// from the front and edited not at all, that one shell really is held across
-/// the calls of a node activity and not across two, that a scrubbed child sees
-/// the declared variables and no others, that a command's deadline answers the
-/// model rather than failing the node, and that a defaulted workspace is one
-/// directory per execution that goes when the execution settles.
+/// the calls of a node activity and not across two, that a `restart` the model
+/// asked for ends that session and does not swallow the command sent with it,
+/// that a scrubbed child sees the declared variables and no others, that a
+/// command's deadline answers the model rather than failing the node, and that a
+/// defaulted workspace is one directory per execution that goes when the
+/// execution settles.
 #[test]
 fn the_built_in_tools_are_bounded_by_their_workspace_session_and_deadline() {
     let Some(root) = installed() else {
@@ -3856,6 +3858,67 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
         quit.contains("the shell exited") && quit.contains("fresh shell"),
         "a model that ended its own shell is told so, and told what the next call will find, \
          rather than left to wonder where its state went: {session}"
+    );
+
+    // --- The restart the model asks for (PRD resolved q54) -----------------
+    let restart = &answer["restart"];
+    assert_eq!(
+        restart["alone"],
+        json!({
+            "stdout": "",
+            "stderr": "",
+            "notice": "the shell session was restarted: its working directory is the workspace \
+                       again, and no shell state carried over"
+        }),
+        "a restart on its own answers with what it did and **no** `exit_code`: no command ran, \
+         so there is no status to report: {restart}"
+    );
+    assert_eq!(
+        restart["aloneProgram"],
+        json!({ "tool": "bash", "command": "restart" }),
+        "…and the trace's record of it says the same, which is `docs/trace.md` §7.4's presence \
+         rule for `exitCode` — absent where no command completed: {restart}"
+    );
+    let after = restart["after"].as_str().unwrap_or_default();
+    assert!(
+        after.ends_with("[unset]") && !after.contains("/inner"),
+        "…and the session really ended: the next call is in the workspace with none of the \
+         state the restart threw away: {restart}"
+    );
+    assert_eq!(
+        restart["commandRan"],
+        json!(true),
+        "a `command` sent **with** a restart runs — a runtime that dropped it would answer the \
+         model `exit_code: 0` for a write that never happened: {restart}"
+    );
+    let where_it_ran = restart["whereItRan"].as_str().unwrap_or_default();
+    assert!(
+        where_it_ran.ends_with("[unset]") && !where_it_ran.contains("/inner"),
+        "…in the **fresh** session, which is what the restart beside it asked for: {restart}"
+    );
+    assert_eq!(
+        restart["withCommand"]["exit_code"],
+        json!(5),
+        "…and it comes back with its own status rather than a manufactured one: {restart}"
+    );
+    let restarted_notice = restart["withCommand"]["notice"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        restarted_notice.contains("the model asked for a restart")
+            && restarted_notice.contains("fresh shell"),
+        "…and the model is told which session it ran in: {restart}"
+    );
+    assert_eq!(
+        restart["withCommandProgram"]["command"],
+        json!("printf \"ran\\n\" > made-by-restart.txt; pwd; echo \"[${kept-unset}]\"; (exit 5)"),
+        "…and the trace records the command that ran, with its status, rather than the word \
+         `restart`: {restart}"
+    );
+    assert_eq!(
+        restart["withCommandProgram"]["exitCode"],
+        json!(5),
+        "…with the status it really exited: {restart}"
     );
 
     // --- A command that prints more than the runtime holds -----------------
