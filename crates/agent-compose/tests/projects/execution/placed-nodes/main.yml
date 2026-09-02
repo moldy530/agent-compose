@@ -304,12 +304,20 @@ agent.briefer:
       type: string
       min_length: 1
 
+# …and `builtin.bash`, by the shorthand and under every default, which is PRD
+# resolved q54's placement clause executed: a built-in joins the executes-in
+# closure exactly as an `exec:` tool does, so a placed agent runs the commands
+# its *model* writes on the worker that took its dispatch — which is precisely
+# what "the machine with the capability" placements exist for. It adds no
+# `members:` entry, because the shorthand is not a `tool.*` there is an address
+# to place; it is the agent's, and the agent is already `mac`'s. The workspace is
+# the default one, so it is made on the worker and goes with the dispatch.
 agent.signer:
   description: Sign a release on the machine that holds the keys.
   model: model.smart
   prompt: |
     Sign the path you are given and report what the signature is.
-  tools: [tool.sign]
+  tools: [tool.sign, builtin.bash]
   input:
     path:
       type: string

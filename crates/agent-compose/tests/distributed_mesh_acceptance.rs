@@ -575,6 +575,37 @@ fn stamping(stamp: &str) -> Vec<Script> {
     ]
 }
 
+/// The same, with a **built-in** call ahead of the attached tool's (PRD
+/// resolved q54).
+///
+/// `agent.signer` holds `builtin.bash` by the shorthand, so its loop can run a
+/// command — and, being placed, runs it on the worker that took the dispatch.
+/// The command prints where it ran, which is the only thing that could tell the
+/// two processes apart from inside a transcript.
+fn signing_after_a_command(signature: &str) -> Vec<Script> {
+    vec![
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "printf 'ran where the keys are'" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "sign",
+                json!({ "path": "release.dmg" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("signed, and here is the signature")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": signature })),
+        ),
+    ]
+}
+
 /// Wait until `wanted` answers `true`, or fail with what `said` describes.
 fn until(what: &str, said: impl Fn() -> String, wanted: impl Fn() -> bool) {
     let deadline = Instant::now() + PATIENCE;
@@ -2164,7 +2195,7 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
         return;
     };
     mesh.provider
-        .enqueue_all(signing("signed-for-the-collector"));
+        .enqueue_all(signing_after_a_command("signed-for-the-collector"));
     let _worker = mesh.worker("exporting");
 
     let execution = mesh.start_execution("/releases", &json!({ "path": "release.dmg" }));
@@ -2211,6 +2242,30 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
             .as_array()
             .is_some_and(|calls| !calls.is_empty()),
         "the worker's model calls did not reach the hub's export: {signed:#}"
+    );
+
+    // …and the **program** a built-in ran there, which is the mesh half of PRD
+    // resolved q54: a placed agent runs model-authored commands on the worker
+    // that took its dispatch, and the record of what it ran comes home on the
+    // same result as everything else the node did (`docs/trace.md` §7.4,
+    // `docs/distributed.md` §3.4). A mesh that carried the model calls and lost
+    // this would leave the one machine an operator most wants an account of
+    // with no account of the command it ran.
+    let programs: Vec<&Value> = signed["models"]
+        .as_array()
+        .expect("the placed node's model calls")
+        .iter()
+        .flat_map(|call| call["toolCalls"].as_array().into_iter().flatten())
+        .filter_map(|call| call.get("program"))
+        .collect();
+    assert_eq!(
+        programs,
+        vec![&json!({
+            "tool": "bash",
+            "command": "printf 'ran where the keys are'",
+            "exitCode": 0
+        })],
+        "the placed agent's `builtin.bash` call is missing from the hub's trace, or          carries something other than what the model ran: {signed:#}"
     );
 
     // **…and from nowhere else**, which is the half resolved q51's "export is

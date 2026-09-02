@@ -4398,6 +4398,21 @@ function endShell(session: ShellSession, why: string): void {
     session.ending = why;
     killCommandGroup(session.child);
     releaseCommand(session.child);
+    // …and this runtime's **hold** on what the kill could not reach, which is
+    // the other half of ending a session. A process that left the group
+    // deliberately — `set -m` and a backgrounded job is the portable spelling,
+    // a double-forking daemon the other — survives the group kill and can still
+    // be holding the pipes this session is reading. Left attached, the `data`
+    // handlers go on appending to a buffer nobody will ever read, and the open
+    // handles go on holding the event loop: in `serve`, or any host embedding a
+    // compiled graph, unbounded memory and a process that will not exit,
+    // minutes after the node that opened the shell has finished. So the streams
+    // are dropped rather than merely ignored (grammar 5.5, Decision D124).
+    for (const stream of [session.child.stdin, session.child.stdout, session.child.stderr]) {
+      stream.removeAllListeners("data");
+      stream.destroy();
+    }
+    session.child.unref();
   }
   const pending = session.pending;
   session.pending = undefined;
@@ -4505,6 +4520,12 @@ async function openShell(
   };
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
+  // A write to a shell that died between the check and the write — the model's
+  // own `exit`, a `kill` from outside, the deadline — arrives as an `error` on
+  // this stream, and an `error` nothing listens for ends the process. What
+  // answers such a call is the session ending ([`endShell`], from `close`), so
+  // the write's own failure has nothing left to say.
+  child.stdin.on("error", () => {});
   child.stdout.on("data", (chunk: string) => {
     session.stdout += chunk;
     settleShell(session);

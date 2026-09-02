@@ -1405,17 +1405,38 @@ const BUILTINS: &[Criterion] = &[
         phrase: "runtime bash/file tools",
         tests: &[
             // The shell, in one turn, asserted on things only real calls could
-            // produce — including the one whose effect outlives the process.
+            // produce — including the one whose effect outlives the process, and
+            // the program the trace carries of each (resolved q54 ruling c).
             (
                 "the_builtin_shell_runs_inside_its_workspace_and_answers_the_model",
                 Status::Live,
             ),
+            // …and what makes it a *session* rather than a fork per command: a
+            // `cd` in one call is still in effect in the next, which is the
+            // difference between a tool a model can drive and one it has to
+            // re-explain itself to (resolved q54).
+            (
+                "a_shells_state_carries_across_the_calls_of_one_node_activity",
+                Status::Live,
+            ),
+            // …and the file tool, round-tripped: create, edit, view, with the
+            // provider-defined text editor's own operations and parameter names.
+            (
+                "the_file_tool_creates_edits_and_views_inside_its_workspace",
+                Status::Live,
+            ),
             // …and the half of the loop that is not the tool running: a call the
-            // schema refuses is the model's to make again, which is what keeps a
-            // built-in's contract the same contract every other tool surface has
-            // (Decision D119).
+            // contract refuses is the model's to make again, which is what keeps
+            // a built-in's contract the same contract every other tool surface
+            // has (Decision D119).
             (
                 "arguments_a_builtin_refuses_bounce_back_to_the_model",
+                Status::Live,
+            ),
+            // …and the same rule where a *file* path is what the model got
+            // wrong, which is the one refusal that is also a bound.
+            (
+                "a_file_path_that_leaves_the_workspace_bounces_back_to_the_model",
                 Status::Live,
             ),
             // …and what a built-in buys over the `exec:` tool an author could
@@ -1425,11 +1446,19 @@ const BUILTINS: &[Criterion] = &[
                 "a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again",
                 Status::Live,
             ),
-            // …and the one thing q31 says about *where* the shell comes from:
-            // `PATH`, at the call, with a host that has none failing as an
-            // execution failure that names the requirement.
+            // …and the one thing q54 keeps from q31 about *where* the shell
+            // comes from: `PATH`, at the call, with a host that has none failing
+            // as an execution failure that names the requirement.
             (
                 "a_host_with_no_bash_on_path_fails_the_call_naming_the_requirement",
+                Status::Live,
+            ),
+            // …and the wire the other ruling is about: on Chat Completions the
+            // same two tools are function tools carrying this compiler's own
+            // schemas, because that surface has no provider-defined types
+            // (resolved q54 ruling d).
+            (
+                "the_builtins_go_out_as_function_tools_on_the_openai_wire",
                 Status::Live,
             ),
         ],
@@ -1443,11 +1472,27 @@ const BUILTINS: &[Criterion] = &[
             // nothing — which would leave the tool bounded to wherever the
             // runtime was started, the ambient capability D135 refuses.
             (
-                "a_root_that_names_no_directory_fails_the_call",
+                "a_workspace_that_names_no_directory_fails_the_call",
                 Status::Live,
             ),
             (
-                "a_root_that_resolves_to_nothing_fails_the_call",
+                "a_workspace_that_resolves_to_nothing_fails_the_call",
+                Status::Live,
+            ),
+            // …and the bound a composition did *not* write, which resolved q54
+            // gives a lifetime rather than leaving to the process's own working
+            // directory: one directory per execution, shared by every built-in
+            // of that execution that took the default, gone when the run
+            // settles.
+            (
+                "the_default_workspace_is_the_executions_own_and_goes_when_the_run_settles",
+                Status::Live,
+            ),
+            // …and the bound q54 ruling b adds beside the workspace: the child
+            // environment, scrubbed to what the binding declared, with an
+            // explicit opt-in for the machines where inheriting is the point.
+            (
+                "a_shells_environment_holds_what_its_binding_declared_and_nothing_else",
                 Status::Live,
             ),
         ],
@@ -1456,16 +1501,19 @@ const BUILTINS: &[Criterion] = &[
         bullet: Bullet::BuiltinTools,
         phrase: "bounded by root + timeout",
         tests: &[
-            // The deadline, reached — and reached at the *attachment's* value,
-            // since the fixture binds the same built-in at two.
+            // The deadline, reached — and reached at the *binding's* value,
+            // since the fixture binds the same built-in at two. What it answers
+            // is the **model**: resolved q54 makes a spent deadline a tool
+            // result, so the loop goes on and the run completes.
             (
-                "a_command_that_outruns_its_timeout_is_killed_and_fails_the_node",
+                "a_command_that_outruns_its_timeout_comes_back_as_a_timeout_result",
                 Status::Live,
             ),
-            // …and the other execution failure a shell has, which is where the
-            // node's own `on_error:` gets to decide the run.
+            // …and the other thing a command can do that is not a failure of the
+            // tool: exit nonzero, which for a program the *model* wrote is a
+            // fact it asked for rather than a contract of the composition's.
             (
-                "a_command_that_exits_nonzero_fails_the_node_under_its_on_error",
+                "a_command_that_exits_nonzero_comes_back_to_the_model_with_its_status",
                 Status::Live,
             ),
             // …and what the deadline has to end besides the shell: the work the

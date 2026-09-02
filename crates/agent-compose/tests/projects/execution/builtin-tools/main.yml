@@ -1,26 +1,31 @@
-# Acceptance fixture: the built-in shell (grammar 5.5, 6.1, Decision D135,
+# Acceptance fixture: the two built-in tools (grammar 5.5, 6.1, Decision D135,
 # PRD resolved q54).
 #
 # A **built-in** is a tool this runtime implements and an agent opts into by
-# name, bounded by a workspace it may not leave and — for the shell — a
-# `timeout:` it may not outrun. It is the one binding whose program the *model*
-# writes, so what this fixture is written to make assertable is what a
-# transcript and a file system can see:
+# name, bounded by a workspace it may not leave, a per-command deadline, and a
+# child environment the binding declares. It is the one binding whose program the
+# *model* writes, so what this fixture makes assertable is what a transcript, a
+# file system and a trace can see:
 #
-#   * the shell really runs — a command's stdout comes back, and a file it
-#     wrote is on disk afterwards;
-#   * a command that outruns its `timeout:` is killed, and one that exits
-#     nonzero fails the node under the node's own `on_error:`;
-#   * arguments the built-in's own schema refuses **bounce back to the model**
-#     (Decision D119), which is the other side of the same split;
-#   * a killed run resumes without re-running the recorded `bash`, which is the
-#     property the journal buys and the reason a built-in beats a hand-rolled
-#     `exec:` tool.
+#   * the shell really runs, and it is a **session** — a `cd` in one call is
+#     still in effect in the next, which is the difference between a tool a model
+#     can drive and one it has to re-explain itself to every time;
+#   * a command that exits nonzero and one that outruns its `timeout:` come back
+#     as **tool results**, so the loop goes on and the model decides;
+#   * the file tool round-trips — create, edit, view — and a path that leaves the
+#     workspace bounces back to the model, which corrects itself (D119);
+#   * the child environment is **scrubbed**: a variable this harness holds is
+#     invisible unless the binding declared it or opted into inheriting;
+#   * the trace carries the model's **program** — the command and its exit
+#     status, the file operation and its path (`docs/trace.md` §7.4);
+#   * a killed run resumes without re-running the recorded command, which is the
+#     property the journal buys.
 #
-# Every workspace is `${BUILTIN_ROOT}`, which each test points at a scratch
-# directory of its own: the bound is a property of the machine running the graph
-# (grammar 4.3 class 2), and a fixture that hard-coded one could not be run twice
-# in parallel.
+# `${BUILTIN_ROOT}` is a scratch directory each test points at itself: a
+# workspace is a property of the machine running the graph (grammar 4.3 class 2),
+# and a fixture that hard-coded one could not be run twice in parallel. The
+# agents that take the **default** workspace write no `workspace:` at all, which
+# is the other half of the surface.
 version: "0.1"
 
 state:
@@ -42,28 +47,63 @@ provider.mock:
   api_key: ${MOCK_API_KEY}
   base_url: ${MOCK_BASE_URL}
 
+# The other wire the built-ins go out on: an OpenAI provider speaks Chat
+# Completions, where the same two tools are declared as function tools with this
+# compiler's own schemas rather than as the provider-defined types (PRD resolved
+# q54 ruling d).
+provider.other:
+  kind: openai
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_BASE_URL}
+
 model.claude:
   provider: provider.mock
   id: claude-sonnet-4-6
   settings:
     max_tokens: 4096
 
-# The configured form: a built-in with its bounds written on a `tool.*`, which
-# is what makes one configuration attachable from more than one agent. The 30s
-# here is long enough that no test reaches it by accident — `tool.impatient`
-# below is the one written to reach its own.
+model.gpt:
+  provider: provider.other
+  id: gpt-4.1
+
+# The configured form: a built-in with its bounds written on a `tool.*`, which is
+# what makes one configuration attachable from more than one agent. The 30s here
+# is long enough that no test reaches it by accident — `tool.impatient` below is
+# the one written to reach its own. `env:` is the whole of what the shell's
+# children see: `PATH` because a scrubbed child has none to look a program up on,
+# and `DECLARED` because a test asks the shell to print it.
 tool.shell:
   builtin: bash
   workspace: "${BUILTIN_ROOT}"
   timeout: 30s
+  env:
+    PATH: "${PATH}"
+    DECLARED: the value the binding wrote
 
 # The same built-in under a deadline a test can reach. The bound is the
-# *binding's*, so two tools in one composition holding the same built-in under
+# *binding's*, so two tools in one composition holding one built-in under
 # different bounds is the shape that proves it (grammar 6.1).
 tool.impatient:
   builtin: bash
   workspace: "${BUILTIN_ROOT}"
   timeout: 1s
+  env:
+    PATH: "${PATH}"
+
+# The opt-in that widens the scrubbed child: `inherit_env: true` is for the
+# machines where inheriting is the point (PRD resolved q54 ruling b).
+tool.inheriting:
+  builtin: bash
+  workspace: "${BUILTIN_ROOT}"
+  timeout: 30s
+  inherit_env: true
+
+# The file tool, bounded to the same workspace: the two tools of one execution
+# working in one directory is the shape they are for.
+tool.editor:
+  builtin: files
+  workspace: "${BUILTIN_ROOT}"
+  description: View and edit the files of the scratch checkout.
 
 agent.worker:
   description: Runs commands inside one workspace.
@@ -95,6 +135,62 @@ agent.impatient:
   input:
     goal:
       description: What to run.
+      type: string
+  output:
+    summary:
+      description: What was done, as text.
+      type: string
+
+agent.inheritor:
+  description: Runs commands with this process's environment behind them.
+  model: model.claude
+  prompt: |
+    Run the command you are asked for and report what it printed.
+  tools:
+    - tool.inheriting
+  max_tool_iterations: 4
+  input:
+    goal:
+      description: What to run.
+      type: string
+  output:
+    summary:
+      description: What was done, as text.
+      type: string
+
+agent.editor:
+  description: Edits files inside one workspace.
+  model: model.claude
+  prompt: |
+    You edit files inside one directory and may not leave it.
+
+    Use your tools to do what the goal asks, then say what you did.
+  tools:
+    - tool.editor
+  max_tool_iterations: 8
+  input:
+    goal:
+      description: What to do to the files.
+      type: string
+  output:
+    summary:
+      description: What was done, as text.
+      type: string
+
+# The shorthand, on the other wire: no `tool.*` anywhere, so every bound is the
+# default — including the workspace, which is one fresh directory per execution.
+agent.elsewhere:
+  description: Holds both built-ins under every default, on an OpenAI provider.
+  model: model.gpt
+  prompt: |
+    Work in your workspace. Use your tools, then say what you did.
+  tools:
+    - builtin.bash
+    - builtin.files
+  max_tool_iterations: 6
+  input:
+    goal:
+      description: What to do inside the workspace.
       type: string
   output:
     summary:
@@ -137,12 +233,68 @@ flow.deadline:
     - { from: start, to: do }
     - { from: do, to: end }
 
+flow.inherited:
+  description: One agent whose shell inherits this process's environment.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    do:
+      agent: agent.inheritor
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: do }
+    - { from: do, to: end }
+
+flow.edit:
+  description: One agent with the built-in file tool on it.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    do:
+      agent: agent.editor
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: do }
+    - { from: do, to: end }
+
+flow.elsewhere:
+  description: One agent holding both built-ins under every default, on the OpenAI wire.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    do:
+      agent: agent.elsewhere
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: do }
+    - { from: do, to: end }
+
 flow.tolerant:
   # The node-level half of the failure split: a built-in whose *execution* failed
   # fails the agent node, and the node's own `on_error:` decides the run
-  # (grammar 9.2, Decision D119). `skip` retires this node's own write, so the
-  # channel keeps the value `after` puts in it and the run completes — which is
-  # only observable because the node failed rather than answering.
+  # (grammar 9.2, Decision D119). What reaches it is the tool being unusable —
+  # a workspace that is not there, a host with no `bash` — never what a command
+  # said, which comes back to the model instead. `skip` retires this node's own
+  # write, so the channel keeps the value `after` puts in it and the run
+  # completes, which is only observable because the node failed.
   description: An agent whose built-in fails, absorbed by the node's `on_error:`.
   inputs:
     goal:
@@ -154,47 +306,6 @@ flow.tolerant:
   nodes:
     attempt:
       agent: agent.worker
-      input:
-        goal: "input.goal"
-      on_error: skip
-
-    after:
-      exec:
-        command: printf
-        args: ["%s", "the node was skipped"]
-        output:
-          stdout: { type: string }
-      writes:
-        stdout: summary
-
-  edges:
-    - { from: start, to: attempt }
-    - { from: attempt, to: after }
-    - { from: after, to: end }
-
-flow.outlived:
-  # The deadline again, absorbed rather than raised — the only shape in which a
-  # run that **completed** can be asked what the runtime is still holding on to.
-  #
-  # A killed shell can leave a grandchild holding the output pipes this runtime
-  # reads (`sleep 60 & wait` is the shape). Those pipes and their `data` handlers
-  # are the call's, and a call that has already failed must not keep them: a
-  # handler still appending to a buffer nobody will read is unbounded memory in a
-  # long-lived host, and an open pipe is an event-loop handle that keeps the
-  # process alive for as long as the grandchild does. A run that *ended* at the
-  # failure would hide both behind its own exit, which is why this flow absorbs
-  # the failure and lets the process decide when it is done.
-  description: An agent whose command outruns its deadline, absorbed by the node's `on_error:`.
-  inputs:
-    goal:
-      type: string
-      min_length: 1
-  outputs:
-    summary:
-      type: string
-  nodes:
-    attempt:
-      agent: agent.impatient
       input:
         goal: "input.goal"
       on_error: skip
