@@ -2141,15 +2141,52 @@ async function callMessages(
   delete settings["max_tokens"];
 
   const messages: Record<string, unknown>[] = [];
+  // Whether the turn this loop just **dropped** is the one the next message
+  // follows. Set at the single drop below, and spent by the very next `user`
+  // whether it folded or not — nothing else can widen it.
+  let dropped = false;
+  // One user message, **folded into the one before it** across a dropped turn.
+  //
+  // Roles alternate on this wire (`WIRE-NOTES`, "Certain"), and there is exactly
+  // one way this runtime composes two user turns in a row: the assistant turn
+  // between them had nothing this surface can spell and was dropped below. That
+  // used to be the last turn of the request, so dropping it left the request
+  // ending on the user turn before; since resolved q52 the pinned call carries a
+  // closing user turn *after* it, and the two would arrive as consecutive `user`
+  // messages the API refuses. Folding is what two adjacent user turns mean — one
+  // turn, its parts in the order they were written.
+  //
+  // It is `dropped` that the fold is conditioned on, and not merely "the last
+  // message is a `user` one", because those are the same condition **only for as
+  // long as the claim above holds**. A fold that ran on any two adjacent user
+  // messages would also repair the ones that are mistakes — a closing turn
+  // composed where no loop ran, a history channel that stopped alternating, a
+  // subflow seam that doubled a turn — and repair them *silently*, on the way to
+  // a wire whose alternation check (the mock's, `WIRE-NOTES` (18)) is the one
+  // thing in this project that would have caught them. The conformance oracle is
+  // only as strict as the requests that reach it, and resolved q52 exists
+  // because a lenient wire hid a bad request once already.
+  const user = (content: unknown): void => {
+    const exposed = dropped;
+    dropped = false;
+    const last = messages[messages.length - 1];
+    // An assistant message between the drop and here would leave nothing to fold
+    // into — unreachable today (a dropped turn asked for no tool, so the loop
+    // ended on it) and harmless if it ever is not.
+    if (!exposed || last === undefined || last["role"] !== "user") {
+      messages.push({ role: "user", content });
+      return;
+    }
+    last["content"] = [...textBlocks(last["content"]), ...textBlocks(content)];
+  };
   for (const turn of request.turns) {
     if (turn.role === "user") {
-      messages.push({ role: "user", content: turn.text });
+      user(turn.text);
       continue;
     }
     if (turn.role === "tool") {
-      messages.push({
-        role: "user",
-        content: turn.results.map((result) => ({
+      user(
+        turn.results.map((result) => ({
           type: "tool_result",
           tool_use_id: result.id,
           content: result.content,
@@ -2162,7 +2199,7 @@ async function callMessages(
           // be sending a field no successful call has.
           ...(result.isError === true ? { is_error: true } : {}),
         })),
-      });
+      );
       continue;
     }
     // A turn *this* wire sent goes back exactly as it came — thinking blocks and
@@ -2200,8 +2237,13 @@ async function callMessages(
       //
       // Roles still alternate for the mock and the API alike (`WIRE-NOTES`
       // (18)): a turn this empty carried no tool call, so the loop ended on it
-      // and it is the **last** turn — the request that drops it ends on the
-      // user turn before it.
+      // and it is the last turn the *loop* wrote. What can follow it is
+      // [`CLOSING_TURN`] and nothing else, and `user` above folds that into the
+      // user turn this drop exposed rather than leaving two of them in a row.
+      // This assignment is the whole of the fold's reach: every other pair of
+      // adjacent user turns still arrives at the wire as the two messages it
+      // composed, to be refused there.
+      dropped = true;
       continue;
     }
     messages.push({ role: "assistant", content });
@@ -2275,6 +2317,21 @@ async function callMessages(
     stopReason: (answer["stop_reason"] as string | null) ?? null,
     content: blocks,
   };
+}
+
+/**
+ * One Messages `content` as the block list it is shorthand for, so two turns can
+ * be folded into one (see the `user` helper in [`callMessages`]).
+ *
+ * The string spelling *is* one text block — the API normalises it into one and
+ * addresses its complaints at the normalised block — so this is a rewriting
+ * rather than a wrapping. An empty string is the one that becomes no block at
+ * all: `{"type": "text", "text": ""}` is a block the API refuses, and a fold that
+ * produced one would turn a legal turn into a 400.
+ */
+function textBlocks(content: unknown): unknown[] {
+  if (typeof content !== "string") return content as unknown[];
+  return content === "" ? [] : [{ type: "text", text: content }];
 }
 
 async function callChatCompletions(
@@ -2981,6 +3038,32 @@ export async function callSubflowTool(
 }
 
 /**
+ * The turn that closes a tool exchange, so the pinned call ends on the user
+ * (PRD §9 resolved q52, and see [`callAgent`]).
+ *
+ * Fixed text, and unconditional on every wire: there is no gateway capability to
+ * declare and no key to set. It is harmless where the old shape was tolerated —
+ * the ask to emit the verdict becomes a real user turn instead of a prefill — and
+ * it is what a strict gateway requires.
+ *
+ * It belongs to **one request** and not to the conversation: it is composed onto
+ * a copy of the loop's turns, so it never reaches the agent's durable history
+ * ([`MessageLike`], grammar 10.4) and never appears in the trace. That the copy
+ * is a copy is held by the type rather than by a test — [`callAgent`]'s `turns`
+ * is `readonly`, because nothing downstream reads it and appending here would
+ * therefore change no observable behaviour until some later refactor made the
+ * conversation and the loop's turns the same list again.
+ *
+ * It *is* part of the pinned call's request identity, because that identity is
+ * the request ([`callModel`]). A journal whose pinned call was recorded before
+ * this turn existed therefore **diverges** on resume rather than replaying the
+ * wrong answer, which is the direction `docs/durability.md` §11.3 asks for and
+ * why no `JOURNAL_VERSION` moves: what the identity is composed of has not
+ * changed, only what this runtime sends.
+ */
+const CLOSING_TURN: Turn = { role: "user", text: "Now produce the structured result." };
+
+/**
  * One agent node: the tool loop, then the pinned structured-output call.
  *
  * Two shapes, and which one runs is decided by the agent's own `tools:` list:
@@ -3023,6 +3106,19 @@ export async function callSubflowTool(
  * next request could not legally carry — and where the turn records which wire
  * wrote it, so a ladder that fails over to a member on the *other* wire replays
  * a turn that member can read ([`ContentWire`]).
+ *
+ * **The pinned call always ends on a user turn** ([`CLOSING_TURN`], PRD §9
+ * resolved q52). The loop exits on the model's own answer, so the conversation
+ * it hands the pinned call ends on an *assistant* turn — and on the Messages
+ * wire a trailing assistant turn is the **prefill** feature, which contradicts
+ * the forced `tool_choice` beside it: "continue this turn" against "your answer
+ * must be this tool call". `api.anthropic.com` happens to tolerate the pair;
+ * strict Anthropic-compatible gateways refuse it with a 400 naming the shape
+ * ("the conversation must end with a user message"), and a refusal that is
+ * shape-determined is replayed by every member of the ladder. So the loop's
+ * exchange is closed with one fixed user turn before the output tool is pinned.
+ * The tool-less path composes a request that already ends on the user turn and
+ * is untouched.
  */
 export async function callAgent(
   agent: AgentBinding,
@@ -3038,7 +3134,16 @@ export async function callAgent(
 }> {
   const rendered = typeof input === "string" ? input : JSON.stringify(input);
   const turn: Turn = { role: "user", text: rendered };
-  const turns: Turn[] = [...history, turn];
+  // The conversation this node holds, and `readonly` is load-bearing: it is what
+  // keeps [`CLOSING_TURN`] out of it (resolved q52). Nothing downstream reads
+  // this array — the history the node contributes is composed from `rendered`
+  // and the structured answer ([`MessageLike`]) — so a `turns.push(CLOSING_TURN)`
+  // before the pinned call would send the right request and be caught by no test
+  // at all. Typed this way it is caught by `tsc`, which every emitted project
+  // runs over its own copy of this file. The loop below rebinds rather than
+  // pushes: one copy per turn it adds, bounded by `max_tool_iterations` and
+  // dwarfed by the model call that earned each one.
+  let turns: readonly Turn[] = [...history, turn];
   // Every call this node makes, in the order it made them (PRD 5.9). A tool
   // loop makes several, and which member of a route served each one is a
   // separate fact about each.
@@ -3087,7 +3192,7 @@ export async function callAgent(
         context,
       );
       models.push(by);
-      turns.push(replayed(agent, answer));
+      turns = [...turns, replayed(agent, answer)];
       if (answer.toolCalls.length === 0) break;
 
       // The record of this call's tool calls, on the record of the call that
@@ -3227,13 +3332,24 @@ export async function callAgent(
         refusal = undefined;
         results.push({ id: call.id, name: call.name, content: JSON.stringify(result) });
       }
-      turns.push({ role: "tool", results });
+      turns = [...turns, { role: "tool", results }];
     }
   }
 
   const { answer: final, served: finalServed } = await callModel(
     agent.model,
-    { system: agent.prompt, turns, tools: agent.tools, pinned: agent.output },
+    {
+      system: agent.prompt,
+      // Over a **copy**, and only where a loop ran: `turns` is the conversation
+      // this node held, and [`CLOSING_TURN`] is the shape of one request made
+      // over it (resolved q52). Appending it to the conversation instead would
+      // send this very request and, today, differ in nothing else at all — which
+      // is why `turns` is `readonly` above and that way of writing this line
+      // does not compile, rather than a test standing where no run can see.
+      turns: agent.tools.length > 0 ? [...turns, CLOSING_TURN] : turns,
+      tools: agent.tools,
+      pinned: agent.output,
+    },
     context,
   );
   models.push(finalServed);

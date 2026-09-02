@@ -154,6 +154,17 @@ that ran does — there is no second counter, and several refusals in one answer
 are corrected together for one iteration. A model that never corrects spends the
 bound and fails the node, with the error naming the last refusal it was holding.
 
+## The call that ends it
+
+The structured output is a separate, final model call: the output schema goes on
+the wire as a tool and the answer is pinned to it. The loop before it ends on the
+model's own answer, so the runtime **closes the exchange with one fixed user
+turn** — `Now produce the structured result.` — before pinning. That is a wire
+shape rather than a knob: a conversation ending on an assistant turn is the
+prefill feature, and strict Anthropic-compatible gateways refuse prefill beside a
+forced tool choice. The turn belongs to that one request; it is not part of the
+agent's conversation and does not appear in the trace.
+
 ## As a node
 
 ```yaml

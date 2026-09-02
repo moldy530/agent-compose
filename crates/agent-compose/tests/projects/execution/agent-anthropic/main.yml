@@ -217,3 +217,42 @@ flow.research:
   edges:
     - { from: start, to: research }
     - { from: research, to: end }
+
+flow.research_pair:
+  description: A tool loop, and then a second agent node reading what it left behind.
+  # `flow.pair` above crosses the shared history channel between two agents that
+  # have **no** tools, so what the second node is called with is the whole of the
+  # first node's exchange. This is the same crossing with a tool loop on the
+  # first node, which is what makes resolved q52's synthetic turn decidable: the
+  # runtime closes the loop with a fixed user turn before it pins the output
+  # tool, that turn belongs to one *request*, and the only way to see whether it
+  # leaked into the conversation is to look at what the next node was called
+  # with.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+    draft:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    research:
+      agent: agent.researcher
+      input:
+        goal: "input.goal"
+
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "state.feedback"
+
+  edges:
+    - { from: start, to: research }
+    - { from: research, to: review }
+    - { from: review, to: end }

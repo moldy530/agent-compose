@@ -21,6 +21,10 @@
 //! * the **tool surface** — names unique and well formed, `input_schema` an
 //!   object schema, and `tools` present whenever a tool block appears anywhere
 //!   in the conversation;
+//! * **prefill against a forced tool** — a request that pins
+//!   `tool_choice: {type: "tool", …}` over a conversation ending on an assistant
+//!   turn, which is the shape strict Anthropic-compatible gateways refuse and
+//!   `api.anthropic.com` happens to tolerate (PRD §9 resolved q52);
 //! * the **required envelope** — `model`, `messages`, `max_tokens`, the
 //!   `anthropic-version` header, and a JSON content type. Not the *presence* of
 //!   `x-api-key`: a keyless provider behind a gateway is a legal composition and
@@ -114,6 +118,7 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
     let tools = check_tools(&mut checker, body);
     let forced = check_tool_choice(&mut checker, body, &tools.names);
     let uses_tool_blocks = check_messages(&mut checker, body);
+    check_prefill(&mut checker, body);
     if uses_tool_blocks && !body.contains_key("tools") {
         checker.fail(
             "tools",
@@ -449,6 +454,57 @@ fn check_tool_choice(
         // request. With several it is a genuine choice, and no schema is pinned.
         "any" if tools.len() == 1 => tools.first().cloned(),
         _ => None,
+    }
+}
+
+/// A forced `tool_choice` may not sit on a conversation that ends on the
+/// assistant (PRD §9 resolved q52).
+///
+/// A trailing assistant message *is* the Messages API's prefill feature — "carry
+/// on from here" — and `tool_choice: {type: "tool", name: …}` is "your answer
+/// must be this call". The two contradict each other, and which of them a service
+/// believes is not something a client should have to find out: `api.anthropic.com`
+/// tolerates the pair, and strict Anthropic-compatible gateways (the Bedrock-style
+/// proxies that are the norm in enterprise deployments) refuse it with a 400
+/// naming the shape.
+///
+/// This server refuses it **unconditionally**, and that is what an oracle is for.
+/// The class of bug q52 closes reached a live 0.6.0 deployment precisely because
+/// the suite's provider was as lenient as the vendor's: the compiled graph's
+/// pinned call after a tool loop ended on the model's own answer, every test
+/// passed, and the first strict gateway to see it answered 400 on every member of
+/// the ladder. A conformance oracle earns its keep by being the strictest wire
+/// the runtime must satisfy, so the leniency is not inherited here.
+///
+/// Only `type: "tool"` — an `any` or `auto` choice is not a promise about the
+/// next turn's content, and prefill beside it is the ordinary feature.
+fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
+    let forced = body
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        == Some("tool");
+    if !forced {
+        return;
+    }
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return;
+    };
+    let last = messages.len().saturating_sub(1);
+    let ends_on_assistant = messages
+        .last()
+        .and_then(Value::as_object)
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant");
+    if ends_on_assistant {
+        checker.fail(
+            &at("messages", last),
+            format!(
+                "messages.{last}: This model does not support assistant message prefill. The conversation must end with a user message when `tool_choice` forces a tool."
+            ),
+        );
     }
 }
 
@@ -1761,6 +1817,96 @@ mod tests {
                 .map(|output| output.name().to_string()),
             Some("extract".to_string())
         );
+    }
+
+    /// A forced `tool_choice` over a conversation ending on the assistant is
+    /// prefill against a forced call, and this server refuses it (resolved q52).
+    ///
+    /// The shape a compiled graph produced before q52: the tool loop ends on the
+    /// model's own answer, and the pinned call went out over that history. The
+    /// pointer names the offending message and the text is the strict gateway's,
+    /// because the whole point of refusing here is that a reader who meets it in
+    /// CI meets the sentence the deployment would have sent them.
+    #[test]
+    fn a_forced_tool_choice_over_a_trailing_assistant_turn_is_refused() {
+        let loop_ended = json!([
+            { "role": "user", "content": "{\"goal\":\"ship it\"}" },
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "query": "it" } },
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a snippet" },
+            ]},
+            { "role": "assistant", "content": [{ "type": "text", "text": "found it" }] },
+        ]);
+        let tools = json!([
+            { "name": "lookup", "input_schema": { "type": "object" } },
+            { "name": "extract", "input_schema": { "type": "object" } },
+        ]);
+        let request = messages(json!({
+            "messages": loop_ended,
+            "tools": tools,
+            "tool_choice": { "type": "tool", "name": "extract" },
+        }));
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.3");
+        assert_eq!(
+            failures[0].message,
+            "messages.3: This model does not support assistant message prefill. \
+             The conversation must end with a user message when `tool_choice` \
+             forces a tool."
+        );
+    }
+
+    /// The same conversation with the closing user turn the runtime now appends
+    /// (resolved q52), and an unpinned request over the old shape: prefill is
+    /// only refused where a forced `tool_choice` contradicts it.
+    #[test]
+    fn a_forced_tool_choice_over_a_trailing_user_turn_is_accepted() {
+        let tools = json!([
+            { "name": "lookup", "input_schema": { "type": "object" } },
+            { "name": "extract", "input_schema": { "type": "object" } },
+        ]);
+        let closed = json!([
+            { "role": "user", "content": "{\"goal\":\"ship it\"}" },
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "query": "it" } },
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a snippet" },
+            ]},
+            { "role": "assistant", "content": [{ "type": "text", "text": "found it" }] },
+            { "role": "user", "content": "Now produce the structured result." },
+        ]);
+        let parsed = parse(
+            &headers(),
+            Some(&messages(json!({
+                "messages": closed,
+                "tools": tools,
+                "tool_choice": { "type": "tool", "name": "extract" },
+            }))),
+        );
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        assert_eq!(
+            parsed
+                .structured_output
+                .map(|output| output.name().to_string()),
+            Some("extract".to_string())
+        );
+
+        // Prefill itself is untouched: an assistant turn to carry on from, with
+        // nothing forcing a call, is the API's own feature.
+        let prefill = parse(
+            &headers(),
+            Some(&messages(json!({
+                "messages": [
+                    { "role": "user", "content": "finish this" },
+                    { "role": "assistant", "content": "Here is the" },
+                ],
+            }))),
+        );
+        assert!(prefill.failures.is_empty(), "{:?}", prefill.failures);
     }
 
     /// The sampling knobs are checked for **type and range**, not just for

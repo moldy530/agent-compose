@@ -283,6 +283,15 @@ const CODEGEN: &[Criterion] = &[
                 "a_loop_answer_is_replayed_verbatim_and_an_empty_one_stops_the_node",
                 Status::Live,
             ),
+            // …and how it hands over to the pinned call (PRD §9 resolved q52):
+            // with one fixed user turn, because a forced `tool_choice` over a
+            // history ending on the assistant is prefill against a forced call
+            // and strict gateways refuse it. The turn is one request's shape, so
+            // the second half of the row is that the next node never sees it.
+            (
+                "the_pinned_call_after_a_tool_loop_ends_on_the_turn_that_closes_it",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).

@@ -88,6 +88,13 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   parameter**, and both Azure routes authenticate with an `api-key` header (a
   bearer token is also accepted, for AAD). The newer `/openai/v1/...` route makes
   `api-version` optional — see (7), where the route forms live.
+* **A forced `tool_choice` needs the conversation to end on the user.** A
+  trailing assistant message is the Messages API's *prefill* feature, and prefill
+  under `tool_choice: {type: "tool", …}` contradicts it. `api.anthropic.com`
+  tolerates the pair; strict Anthropic-compatible gateways refuse it with a 400,
+  which is what took a compiled graph down in the field (PRD §9 resolved q52).
+  This server refuses it as they do — see (24) for the sentence, and the runtime
+  closes its tool loop with a fixed user turn so the shape never leaves it.
 * **A pinned tool choice guarantees a call.** Anthropic's `tool_choice: {type:
   "tool", …}` and `{type: "any"}`, OpenAI's forced function and `tool_choice:
   "required"`, and OpenAI's `response_format: {type: "json_schema"}` each make
@@ -190,7 +197,9 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   empty message or padding it with prose the model never wrote — which is what
   it already does with the Chat Completions turn of (18) that reduces to
   nothing. Roles still alternate: a turn that empty carried no tool call, so it
-  is the last one, and the request ends on the user turn before it.
+  is the last turn the loop wrote, and the only thing that can follow it is the
+  closing user turn of resolved q52 — which the runtime folds into the user turn
+  the drop exposed rather than sending two in a row.
 
 ---
 
@@ -794,6 +803,30 @@ one `message` item per scripted answer and so cannot compose the shape.
 shaped answer at all. If it never does, nothing is lost — a single-message turn
 reads identically — and if it does, the alternative is a `JSON.parse` of prose
 thrown inside the journaled model call, which a resume then replays.
+
+### 24. The sentence a forced choice over a prefilled turn is refused with
+
+*What is certain*: that strict Anthropic-compatible gateways refuse the shape
+(PRD §9 resolved q52, from a live 0.6.0 field report), and that
+`api.anthropic.com` does not. This server takes the strict side unconditionally,
+because a conformance oracle as lenient as the vendor is what let the shape ship:
+every test passed and the first gateway to see it answered 400 on every member of
+the ladder.
+
+*What is assumed* is the wording. The gateways answer along the lines of "This
+model does not support assistant message prefill. The conversation must end with
+a user message"; this server says that and names the condition it is refusing
+under, since it accepts prefill wherever no tool is forced:
+
+```
+messages.<n>: This model does not support assistant message prefill. The
+conversation must end with a user message when `tool_choice` forces a tool.
+```
+
+*If wrong*: a message, not a verdict. The rule decides what a compiled graph may
+send, and the runtime satisfies it by appending the closing user turn of
+resolved q52 — `a_forced_tool_choice_needs_the_conversation_to_end_on_the_user`
+in `tests/anthropic_wire.rs` locks both halves.
 
 ---
 
