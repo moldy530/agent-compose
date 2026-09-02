@@ -4,8 +4,9 @@
 
 A value is not one of a closed set. Trigger types, provider kinds, store kinds
 and scopes, reduce policies, `on_error` strategies, `context:`, `agent_access:`,
-`route_on` conditions, `format:` names, the four runtime built-ins — each is a
-fixed vocabulary, and the compiler knows all of them.
+`route_on` conditions, `format:` names, the two runtime built-ins — in a
+`builtin:` binding and in the `builtin.*` shorthand alike — each is a fixed
+vocabulary, and the compiler knows all of them.
 
 Closed vocabularies are what make the rest of the checking possible: routing
 exhaustiveness needs a finite variant set, capability checking needs to know

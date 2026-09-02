@@ -43,9 +43,11 @@ node's `on_timeout:`. Control transfer stays inside one flow.
 
 One position takes a reference **or** a name that is not one: an agent's `tools:`
 list, whose other entry shape is a built-in shorthand
-(`agent-compose docs tools`). Those two names are not references and the parser
-does not read them as such, so a misspelled `builtin.*` is `unknown-variant`
-rather than this code:
+(`agent-compose docs tools`). Those two names are not references, and the parser
+reads a `builtin.*` entry against the closed set before it reads the entry as an
+address — so a misspelled one is `unknown-variant` naming the two, with a "did
+you mean" where the miss is near, rather than this code with a list of namespaces
+that does not contain what the author was reaching for:
 
 ```yaml
 tools:

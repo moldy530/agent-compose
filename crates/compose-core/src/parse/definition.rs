@@ -179,6 +179,41 @@ fn agent_tools(
             builtins.push(Spanned::new(tool, item.span.clone()));
             continue;
         }
+        // A `builtin.*` that is not one of the two. Read here rather than left
+        // to `lexical::reference`, which would report it as an entry in no
+        // namespace at all and offer a list of six that does not contain the
+        // thing the author was reaching for: the shorthand is the first spelling
+        // a reader types, and `builtin.fils` is the likeliest way to get it
+        // wrong (grammar 5.5, PRD G3).
+        if let Yaml::String(text) = &item.value
+            && let Some(name) = text.strip_prefix("builtin.")
+        {
+            // Compared on the **name** rather than on the whole address: every
+            // candidate shares the `builtin.` prefix, so a whole-address
+            // comparison measures eight equal characters and then calls
+            // `builtin.grep` a near miss for `builtin.bash`.
+            let names: Vec<&str> = Builtin::ALL.iter().map(|tool| tool.keyword()).collect();
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::UnknownVariant,
+                    item.span.clone(),
+                    format!("`{text}` is not a built-in tool"),
+                )
+                .with_optional_help(
+                    suggest(name, &names)
+                        .and_then(Builtin::from_keyword)
+                        .map(|tool| format!("did you mean `{}`?", tool.address()))
+                        .or_else(|| {
+                            Some(format!(
+                                "the built-ins are {}, and the set is closed; every other tool is \
+                                 a `tool.*` or `flow.*` address (grammar 5.5)",
+                                builtin_addresses()
+                            ))
+                        }),
+                ),
+            );
+            continue;
+        }
         let Some(reference) = lexical::reference(
             item,
             "each entry of `tools`",
