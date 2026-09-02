@@ -197,6 +197,48 @@ agent.elsewhere:
       description: What was done, as text.
       type: string
 
+# One agent holding **both** built-ins under one workspace, which is the shape
+# `tests/trace_format_stability.rs` pins the trace of: the two programs a
+# `BuiltinProgram` record can carry — a command with an exit status, and a file
+# operation with a path — reached from one run.
+agent.both:
+  description: Runs commands and edits files in one workspace.
+  model: model.claude
+  prompt: |
+    You work inside one directory and may not leave it.
+
+    Use your tools to do what the goal asks, then say what you did.
+  tools:
+    - tool.shell
+    - tool.editor
+  max_tool_iterations: 6
+  input:
+    goal:
+      description: What to do inside the workspace.
+      type: string
+  output:
+    summary:
+      description: What was done, as text.
+      type: string
+
+flow.both:
+  description: One agent holding the shell and the file tool at once.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      type: string
+  nodes:
+    do:
+      agent: agent.both
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: do }
+    - { from: do, to: end }
+
 flow.work:
   description: One agent with the built-in shell on it.
   inputs:

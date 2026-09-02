@@ -4553,6 +4553,12 @@ async function openShell(
   context.signal.addEventListener("abort", () => endShell(session, "the run was stopped"), {
     once: true,
   });
+  // …and the abort that arrived **while this shell was being opened**, which the
+  // listener above would never hear: a listener registered on an already-aborted
+  // signal is never called, so a shell forked in the window between the deadline
+  // firing and this line would be one nothing was left to kill. Ended here
+  // instead, which the caller then reports as the session having gone.
+  if (context.signal.aborted) endShell(session, "the run was stopped");
   return session;
 }
 
@@ -4754,9 +4760,12 @@ async function typeIntoShell(
  * its stdout marker would otherwise be answered with the stderr of a command
  * that had not finished being reported.
  *
- * What follows a marker is **kept**, because it is the next command's: a
- * background job's late output, or the tail of a stream the platform delivered
- * in one chunk with the marker in the middle of it.
+ * What follows a marker is left in the buffer rather than thrown away here —
+ * the platform can deliver a marker and the bytes after it in one chunk — and
+ * the **next command clears it** ([`typeIntoShell`]), which is where that
+ * decision belongs: late output is a background job's, and a job belongs to the
+ * command that started it, so attributing its writing to the next command would
+ * be worse than losing it.
  */
 function settleShell(session: ShellSession): void {
   const pending = session.pending;

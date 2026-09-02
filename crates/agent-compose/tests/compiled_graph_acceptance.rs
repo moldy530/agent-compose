@@ -13120,9 +13120,12 @@ fn a_shells_environment_holds_what_its_binding_declared_and_nothing_else() {
 /// is that the path is where this format says and that nothing is there
 /// afterwards.
 ///
-/// The configured half is the contrast, and it is asserted in the same run's
-/// sibling: `${BUILTIN_ROOT}` is the composition's directory, so what a run wrote
-/// there is still there when the run has gone.
+/// The configured half is the contrast, and it is asserted by every other test
+/// in this section: `${BUILTIN_ROOT}` is the composition's directory rather than
+/// the run's, so what a run wrote there is still there when the run has gone —
+/// which is what
+/// `the_builtin_shell_runs_inside_its_workspace_and_answers_the_model` reads
+/// `written.txt` back out of, after its run has ended.
 #[test]
 fn the_default_workspace_is_the_executions_own_and_goes_when_the_run_settles() {
     let provider = MockProvider::start().expect("a loopback port");

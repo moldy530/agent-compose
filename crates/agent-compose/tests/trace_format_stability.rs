@@ -31,7 +31,7 @@
 //! INSTA_UPDATE=always cargo test -p agent-compose --test trace_format_stability
 //! ```
 //!
-//! # Why these seven runs
+//! # Why these eight runs
 //!
 //! Between them they reach every record **type** the format has, every member of
 //! `TraceDocument.status`, and the entry shapes a reader meets first: a bounded
@@ -44,8 +44,11 @@
 //! whose rules (no writes, routing only where routing failed) exist nowhere
 //! else; a run that ended holding a `human` pause, for the `human` record
 //! and the `"interrupted"` document status version `2` introduced (§10.3.1);
-//! and a flow attached as a tool and called twice, for the tool-call record and
-//! the second dispatch-record carrier version `3` introduced (§10.3.2).
+//! a flow attached as a tool and called twice, for the tool-call record and
+//! the second dispatch-record carrier version `3` introduced (§10.3.2); and an
+//! agent holding both **built-in** tools, for the `BuiltinProgram` record and
+//! the two shapes it takes — a command with an exit status, a file operation
+//! with a path (§7.4, PRD resolved q54).
 //!
 //! A run added here is what keeps that first sentence true: the count is a claim
 //! about coverage, so a record type or a status member added to the format
@@ -656,6 +659,93 @@ fn a_refused_tool_calls_trace_document_keeps_its_shape() {
     };
     run.succeeded();
     insta::assert_snapshot!(document(&run));
+}
+
+/// A built-in tool's calls: the **program** the model wrote, which is the one
+/// thing this format carries of a tool's arguments (`docs/trace.md` §7.4, PRD
+/// resolved q54 ruling c).
+///
+/// Both shapes a `BuiltinProgram` takes, from one run: a `bash` command with the
+/// status it exited, and a file operation with the path it was given and a
+/// sentence about what it changed. They are different halves of one record type
+/// — every field of it is optional, and which ones are present is what says
+/// which tool ran — so a snapshot holding only one would leave the other's
+/// presence rule to prose.
+///
+/// And the half a snapshot makes visible that an assertion would not: what is
+/// **not** in the document. The command writes, the `view` reads it back and the
+/// `create` writes a file, and none of that content is anywhere in the trace — a
+/// tool's answer stays under §11's rule with every other tool's, and a
+/// regression that started carrying stdout would land here as a diff rather than
+/// as a test nobody wrote.
+///
+/// The workspace is `${BUILTIN_ROOT}`, pointed at a scratch directory of this
+/// test's own: a resolved path is exactly what §11.1 keeps out of the format, so
+/// a snapshot that started holding one would fail as an unexplained diff.
+#[test]
+fn a_built_in_tools_trace_document_keeps_its_shape() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new(
+                    "bash",
+                    json!({ "command": "printf 'one\ntwo\n' > notes.txt" }),
+                ),
+                ToolCall::new(
+                    "str_replace_based_edit_tool",
+                    json!({ "command": "view", "path": "notes.txt" }),
+                ),
+                ToolCall::new(
+                    "str_replace_based_edit_tool",
+                    json!({
+                        "command": "create",
+                        "path": "plan.md",
+                        "file_text": "the plan this agent wrote\n",
+                    }),
+                ),
+                // …and one that exits nonzero, which is a **completed** call
+                // carrying the status rather than a failure (resolved q54).
+                ToolCall::new("bash", json!({ "command": "test -f nothing-here" })),
+            ]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "wrote a note and a plan" })),
+        ),
+    ]);
+
+    let scratch = harness::Scratch::new("stability-builtins");
+    let root = scratch.path().join("root");
+    std::fs::create_dir_all(&root).expect("the scratch area is writable");
+    let mut environment = harness::environment(&provider);
+    environment.push(("BUILTIN_ROOT".to_string(), root.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+    ));
+
+    let Some(run) = harness::run_with(
+        "builtin-tools",
+        "flow.both",
+        &[("goal", "write a note and a plan")],
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let held = document(&run);
+    for answered in ["one\ntwo", "the plan this agent wrote"] {
+        assert!(
+            !held.contains(answered),
+            "a built-in's *answer* reached the trace: `{answered}` is a command's output \
+             or a file's contents, which §11 keeps out of this format with every other \
+             tool's"
+        );
+    }
+    insta::assert_snapshot!(held);
 }
 
 /// A store round trip: a read's recorded answer, a write's key and dedupe flag,
