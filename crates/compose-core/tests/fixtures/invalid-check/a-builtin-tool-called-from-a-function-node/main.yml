@@ -1,0 +1,26 @@
+# rule: a built-in is called from an agent's `tools:` list and from nowhere else
+# rule: (grammar 5.5, 6.1, D135)
+# code: invalid-value
+# message: node `shell` invokes `tool.sandbox`, which binds the built-in `bash`
+# at: main.yml:23:17
+# label: main.yml:17:12 the built-in is bound here
+# help: a built-in hands the **model** the program, so an agent's `tools:` list is its only call site: it declares no `input:` for a node to bind and no `output:` for one to read (grammar 5.5, 6.1, Decision D135). Attach `tool.sandbox` to an agent and let the agent call it, or bind this tool with `exec:` to run a command this composition chose
+#
+# Not decidable in one file: what the node names is a `tool.*` address like any
+# other, and which implementation that definition carries is written somewhere
+# else. The emitter writes no function for a built-in — an agent's list is the
+# only call site it has — so a node reaching one would emit a call to a function
+# nothing defines, which is a project that does not type-check from a spec
+# `validate` accepted.
+version: "0.1"
+tool.sandbox:
+  builtin: bash
+  workspace: ./work
+flow.main:
+  outputs: {}
+  nodes:
+    shell:
+      function: tool.sandbox
+  edges:
+    - { from: start, to: shell }
+    - { from: shell, to: end }

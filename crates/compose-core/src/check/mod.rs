@@ -159,6 +159,7 @@ fn flow_definition<'a>(ctx: &mut Ctx<'a>, address: &'a str, flow: &'a Flow) {
     channels::flow_outputs(ctx, &cx);
     for node in &flow.nodes {
         bindings::node(ctx, &cx, node);
+        bindings::builtin_node_targets(ctx, node);
         channels::node_writes(ctx, &cx, node);
         match &node.kind {
             NodeKind::Map { map } => maps::map_node(ctx, &cx, node, map),

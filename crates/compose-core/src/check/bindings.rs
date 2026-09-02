@@ -27,7 +27,7 @@ use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::ir::binding::{Bindings, Http, NodeInput};
 use crate::ir::definition::{Agent, Store, Tool};
-use crate::ir::flow::{Node, NodeKind, ToolImplementation};
+use crate::ir::flow::{MapDispatch, Node, NodeKind, ToolImplementation};
 use crate::ir::schema::{Field, FieldMap};
 
 use super::model::{default_of, satisfies};
@@ -682,6 +682,75 @@ pub(crate) fn tool_implementation(ctx: &mut Ctx, address: &str, tool: &Tool) {
     }
 }
 
+/// The **one** call site a built-in has: an agent's `tools:` list (grammar 5.5,
+/// 6.1, Decision D135).
+///
+/// A `tool.*` binding a built-in is a tool by address like any other, so a
+/// `function:` node and a `map` dispatch can both name one — and neither can
+/// call it. The reason is the same one that makes `input:`/`output:` compile
+/// errors on such a tool: those two surfaces pass a **composition's** arguments
+/// and read a declared result, and a built-in has neither. The model writes the
+/// program, and only a model's loop has one to write.
+///
+/// Without this the mistake reaches the emitter, which skips a built-in when it
+/// writes the project's tool functions and then emits a node calling the
+/// function it did not write — a project that does not type-check, from a spec
+/// `validate` accepted. The invariant `codegen::graph` states is enforced here.
+pub(crate) fn builtin_node_targets<'a>(ctx: &mut Ctx<'a>, node: &'a Node) {
+    let id = text(&node.id).to_string();
+    match &node.kind {
+        NodeKind::Function { function } => {
+            builtin_call_site(ctx, &format!("node `{id}`"), function);
+        }
+        NodeKind::Map { map } => {
+            let subject = format!("the `map` of node `{id}`");
+            match &map.dispatch {
+                MapDispatch::Homogeneous { node: target, .. } => {
+                    builtin_call_site(ctx, &subject, target);
+                }
+                MapDispatch::Routed {
+                    routes, default, ..
+                } => {
+                    for route in routes.iter().chain(default.as_deref()) {
+                        builtin_call_site(ctx, &subject, &route.node);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One node target, refused where the tool it names binds a built-in.
+fn builtin_call_site(ctx: &mut Ctx, subject: &str, target: &Spanned<Address>) {
+    let Some(tool) = ctx.tool(&target.value) else {
+        return;
+    };
+    let ToolImplementation::Builtin { builtin } = &tool.implementation else {
+        return;
+    };
+    let name = builtin.builtin.value;
+    ctx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            target.span.clone(),
+            format!(
+                "{subject} invokes `{}`, which binds the built-in `{}`",
+                target.value,
+                name.keyword()
+            ),
+        )
+        .with_label(builtin.builtin.span.clone(), "the built-in is bound here")
+        .with_help(format!(
+            "a built-in hands the **model** the program, so an agent's `tools:` list is its only \
+             call site: it declares no `input:` for a node to bind and no `output:` for one to \
+             read (grammar 5.5, 6.1, Decision D135). Attach `{}` to an agent and let the agent \
+             call it, or bind this tool with `exec:` to run a command this composition chose",
+            target.value
+        )),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     /// Every code one composition reports, in the order the report is sorted
@@ -924,5 +993,48 @@ flow.f:
                 }
             }
         }
+    }
+
+    /// A `map` dispatch is the other way a node names a tool, and it reaches a
+    /// built-in through the same emitter gap a `function:` node does.
+    ///
+    /// The negative corpus pins the `function:` spelling, where the rule is the
+    /// only thing the composition gets wrong. A dispatch cannot be that clean —
+    /// a target declaring no input fields is also a whole-item mismatch — so the
+    /// second call site is held here, where the extra diagnostic is part of what
+    /// is asserted rather than something a one-rule fixture has to avoid.
+    #[test]
+    fn a_map_dispatching_to_a_builtin_is_refused_at_the_dispatch() {
+        assert_eq!(
+            codes(
+                r#"
+state:
+  jobs:
+    type: array
+    max_items: 5
+    items:
+      type: object
+      properties:
+        summary: { type: string }
+tool.sandbox:
+  builtin: bash
+  workspace: ./work
+flow.f:
+  outputs: {}
+  nodes:
+    work:
+      map:
+        over: "state.jobs"
+        node: tool.sandbox
+        max_concurrency: 2
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#
+            ),
+            ["type-mismatch", "invalid-value"],
+            "the dispatch names a built-in, which no node may call, and passes it an item a \
+             tool declaring no `input:` cannot take"
+        );
     }
 }

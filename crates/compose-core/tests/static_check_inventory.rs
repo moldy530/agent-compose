@@ -344,6 +344,19 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // The third site of the same surface, and the one that is about a
+        // *node* rather than about an agent. A `tool.*` binding a built-in is a
+        // tool by address, so a `function:` node and a `map` dispatch can each
+        // name one — and neither can call it: those two surfaces pass the
+        // composition's arguments and read a declared result, and a built-in
+        // declares neither. Left unchecked the spec reaches the emitter, which
+        // writes no function for a built-in and then emits a node calling it.
+        rule: "a built-in is called from an agent's `tools:` list and from nowhere else (5.5, 6.1, D135)",
+        pass: "check/bindings.rs",
+        codes: &["invalid-value"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "a provider with a default endpoint declares `api_key:` or a `base_url:` (12.1, D120)",
         pass: "parse/definition.rs",
         codes: &["missing-credential"],
