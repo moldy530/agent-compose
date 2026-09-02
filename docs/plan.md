@@ -169,6 +169,16 @@ per node it declares would bury the two edges that moved in the flow beside it.
 For the same reason, §5 and §6 report only on subjects present in both specs —
 what a new component contains is not a diff, it is the spec.
 
+**One exception**, and it is about a capability rather than about contents: a
+`tool.*` that arrived or left carrying a `builtin:` binding reports the field
+`builtin`, holding the name it binds (`"bash"` or `"files"`). Every other
+implementation fixes a program the composition chose; that one hands the program
+to the **model**, which is the widest capability the grammar grants
+(`docs/grammar.md` §5.5, PRD resolved q54), and a plan that printed
+`+ tool.sandbox` and nothing else would read exactly like any other tool
+arriving. It stays one field: what a built-in's own bounds are — its
+`workspace:`, its `timeout:` — is contents, and is not expanded.
+
 `FieldChange` is one field of one subject:
 
 | field | meaning |
@@ -245,7 +255,7 @@ is accounted for.
 | `change` | §3's vocabulary |
 | `component` | which kind of component it is |
 | `address` | its canonical address (§8) |
-| `fields` | §3's field records; empty unless `change` is `"changed"` |
+| `fields` | §3's field records; empty unless `change` is `"changed"`, or the subject is a `tool.*` binding a built-in (§3) |
 | `span` | where it is written (§10) |
 
 `ComponentKind` is the closed vocabulary `component` draws on:
@@ -786,7 +796,9 @@ document is the same thing at the top level.
 
 Comparing something that was not compared before — a field of a definition that
 this version delegates nowhere and therefore never reported — is also compatible.
-It produces records of a shape a reader already parses.
+It produces records of a shape a reader already parses. §3's `builtin` field on
+an arriving or departing `tool.*` is that: no key, no vocabulary and no address
+spelling moved, and a reader that skipped `fields` on an addition still skips it.
 
 Improving a `message`, which is a diagnostic's own text and is free to get
 better; §7 makes the pair `code`/`message` the identity of a finding *within one

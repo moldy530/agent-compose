@@ -2565,15 +2565,16 @@ fn sides(under: &str, at: usize, case: &Case) -> (Ir, Ir) {
     (old, new)
 }
 
-/// A built-in reaching an agent is **named** in the plan, in both spellings
-/// (PRD resolved q54, `docs/plan.md` §3, §4).
+/// A built-in reaching an agent by its **shorthand** is named in the plan (PRD
+/// resolved q54, `docs/plan.md` §3, §4).
 ///
 /// The three cases above move a built-in's bounds, which is enough for the
 /// completeness walk and not enough for the property q54 asks for: what a
 /// built-in grants is the widest capability this grammar hands out, so an author
 /// reading a plan has to *see* one arrive. Asserted on the records' addresses
 /// rather than on the rendered text, because the addresses are the machine
-/// surface `docs/plan.md` fixes and the rendering follows them.
+/// surface `docs/plan.md` fixes and the rendering follows them. The configured
+/// spelling is the test below.
 #[test]
 fn a_builtin_arriving_at_an_agent_is_named_in_the_plan() {
     let case = Case {
@@ -2625,16 +2626,93 @@ fn a_builtin_arriving_at_an_agent_is_named_in_the_plan() {
         "the plan does not say which built-in arrived, which is the whole of what it grants: \
          {said}"
     );
-    // …and the configured spelling, which is a definition arriving rather than a
-    // list growing: `tool.checkout` is in the base composition, so what this
-    // half pins is that the plan names the tool at all when its agent's list
-    // moves — the address a reader opens to find the `builtin:` binding.
+}
+
+/// …and the **configured** spelling, which is a definition arriving rather than
+/// a list growing (PRD resolved q54, `docs/plan.md` §3).
+///
+/// The shorthand says what it grants in the agent's own `builtins` field. A
+/// `tool.*` carrying a `builtin:` binding says it nowhere unless the arrival
+/// carries it: an added definition reports no fields, so `+ tool.sandbox` would
+/// read exactly like `+ tool.repo_grep` — and the configured form is now the
+/// only way to grant a *bounded* shell, so it is the spelling a plan reader most
+/// needs told. One field, `builtin`, holding the name.
+#[test]
+fn a_configured_builtin_arriving_says_what_it_binds() {
+    let case = Case {
+        what: "a tool binding a shell, added and attached",
+        before: &[],
+        after: &[
+            (
+                "tools/checkout.yml",
+                "tool.checkout:",
+                "tool.sandbox:\n  builtin: bash\n  workspace: \"${REPO_ROOT}\"\n  timeout: 90s\ntool.checkout:",
+            ),
+            (
+                "agents/fixer.yml",
+                "    - tool.checkout",
+                "    - tool.checkout\n    - tool.sandbox",
+            ),
+        ],
+        differs: true,
+    };
+    let (old, new) = sides("builtin-definition", 0, &case);
+    let arrived = plan(
+        Composition {
+            entrypoint: "before/main.yml",
+            ir: &old,
+            resolution: &[],
+        },
+        Composition {
+            entrypoint: "after/main.yml",
+            ir: &new,
+            resolution: &[],
+        },
+    );
+    let tool = arrived
+        .components
+        .iter()
+        .find(|change| change.address == "tool.sandbox")
+        .expect("the tool that arrived is a component change");
+    let said: Vec<(&str, String)> = tool
+        .fields
+        .iter()
+        .map(|field| (field.path.as_str(), format!("{:?}", field.after)))
+        .collect();
     assert!(
-        agent
-            .fields
-            .iter()
-            .any(|field| field.path == "tools" || field.path == "builtins"),
-        "the plan reported an agent's tool surface moving without naming the list that moved"
+        said.iter()
+            .any(|(path, after)| *path == "builtin" && after.contains("bash")),
+        "a `tool.*` binding a shell arrived and the plan does not say it binds one, so it reads \
+         like any other tool arriving: {said:?}"
+    );
+    // …and the same tool leaving says the same thing, on the other side: the two
+    // artifacts compared the other way round.
+    let left = plan(
+        Composition {
+            entrypoint: "before/main.yml",
+            ir: &new,
+            resolution: &[],
+        },
+        Composition {
+            entrypoint: "after/main.yml",
+            ir: &old,
+            resolution: &[],
+        },
+    );
+    let tool = left
+        .components
+        .iter()
+        .find(|change| change.address == "tool.sandbox")
+        .expect("the tool that left is a component change");
+    let said: Vec<(&str, String)> = tool
+        .fields
+        .iter()
+        .map(|field| (field.path.as_str(), format!("{:?}", field.before)))
+        .collect();
+    assert!(
+        said.iter()
+            .any(|(path, before)| *path == "builtin" && before.contains("bash")),
+        "a capability leaving is as much of a plan as one arriving: {said:?}"
     );
 }
 

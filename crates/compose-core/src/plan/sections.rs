@@ -36,14 +36,14 @@ use serde_json::Value;
 
 use crate::diag::{Diagnostic, Diagnostics};
 use crate::ir::definition::DefinitionBody;
-use crate::ir::flow::Flow;
+use crate::ir::flow::{Flow, ToolImplementation};
 use crate::ir::{Definition, Ir};
 
 use super::Composition;
 use super::diff::{changes, only, placed, semantic, without};
 use super::document::{
-    ChangeKind, ComponentChange, ComponentKind, Finding, InterfaceChange, InterfaceKind,
-    TopologyChange, TopologyKind, Validation,
+    ChangeKind, ComponentChange, ComponentKind, FieldChange, Finding, InterfaceChange,
+    InterfaceKind, TopologyChange, TopologyKind, Validation,
 };
 
 /// Keys of a definition that another section owns, plus the one key that can
@@ -276,15 +276,51 @@ fn entry(
 }
 
 /// A definition that arrived or left: the component itself is the change, so it
-/// carries no fields.
+/// carries no fields — with **one** exception, [`granted`].
 fn arrival(change: ChangeKind, address: &str, definition: &Definition) -> ComponentChange {
     ComponentChange {
         change,
         component: kind(&definition.body),
         address: address.to_string(),
-        fields: Vec::new(),
+        fields: granted(change, &definition.body),
         span: definition.span.clone(),
     }
+}
+
+/// What a `tool.*` that arrived or left **binds**, where what it binds is a
+/// built-in (`docs/plan.md` §3, §4, PRD resolved q54).
+///
+/// The one field an arrival reports, and it is here because of what a built-in
+/// is: every other binding fixes a program the author chose, and this one hands
+/// the program to the **model** — the widest capability this grammar grants, and
+/// the one place the trust boundary moves off the composition. PRD resolved q54
+/// requires that `plan` say so rather than hide it, and for the *configured*
+/// spelling nothing else in a plan can: the shorthand shows up in the agent's
+/// own `builtins` field, while `tool.sandbox` arriving with a shell inside it
+/// would otherwise read exactly like `tool.repo_grep` arriving with a `ripgrep`
+/// inside it.
+///
+/// It stays one field rather than the whole definition, which is what keeps
+/// §3's rule intact where it means something: an arrival is not expanded into
+/// its contents, and the bounds a built-in carries — its `workspace:`, its
+/// `timeout:` — are contents. What is reported is *which capability arrived*.
+fn granted(change: ChangeKind, body: &DefinitionBody) -> Vec<FieldChange> {
+    let DefinitionBody::Tool(tool) = body else {
+        return Vec::new();
+    };
+    let ToolImplementation::Builtin { builtin } = &tool.implementation else {
+        return Vec::new();
+    };
+    let named = Value::String(builtin.builtin.value.keyword().to_string());
+    let (before, after) = match change {
+        ChangeKind::Added => (None, Some(named)),
+        _ => (Some(named), None),
+    };
+    vec![FieldChange {
+        path: "builtin".to_string(),
+        before,
+        after,
+    }]
 }
 
 const fn kind(body: &DefinitionBody) -> ComponentKind {
