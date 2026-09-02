@@ -1,0 +1,292 @@
+// What the two built-in tools do, run against a generated project's own runtime
+// (grammar 5.5, 6.1, PRD resolved q54).
+//
+// The acceptance suite drives these through a model loop, which is where the
+// wire, the trace and the bounces are decided. What it cannot reach is the
+// inside of one call, and that is what this runner is for:
+//
+//   * **containment** — a `..` that climbs out, an absolute path, a symlink
+//     pointing outside the workspace, and a *dangling* symlink pointing outside
+//     it. Each has to come back as a refusal and, more importantly, has to leave
+//     the file outside the workspace untouched. A test that only read the
+//     message would pass against a runtime that refused *and* wrote;
+//   * **the session** — `builtin.bash` keeps one shell per node activity, so a
+//     `cd` in one call is still in effect in the next, and a second activity
+//     starts in the workspace. Two contexts is the whole of that claim, and it
+//     is invisible from outside the process;
+//   * **the scrubbed environment** — a variable this process holds is *not* in
+//     the child unless the binding declared it or opted into inheritance. Both
+//     directions, because a runtime that passed everything and one that passed
+//     nothing each satisfy half of it;
+//   * **the command deadline** — a command that outruns its bound comes back as
+//     a tool result rather than as a failure, and the session it killed is
+//     replaced by the next call;
+//   * **the default workspace** — one directory per execution under the
+//     project's data directory, shared by two bindings that took the default,
+//     removed when the execution settles and kept when it parks.
+//
+// Usage: node builtin-tools.mjs <generated project directory> <scratch dir>
+// Output: one JSON object, read by `generated_code_gates.rs`.
+
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { pathToFileURL } from "node:url";
+
+const [, , project, scratch] = process.argv;
+if (project === undefined || scratch === undefined) {
+  throw new Error("usage: node builtin-tools.mjs <generated project directory> <scratch dir>");
+}
+
+const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts")).href);
+
+/** A context with a signal nothing aborts, and no journal behind it. */
+function contextWith(execution) {
+  return {
+    execution: { id: execution, session_key: "" },
+    signal: new AbortController().signal,
+    node: "probe",
+  };
+}
+
+/** The call site an agent's loop hands a tool, one per call. */
+function site() {
+  return { path: [], ordinal: 0, dispatches: [], builtin: [] };
+}
+
+/** One built-in call, as the emitted `graph.ts` makes it. */
+async function call(binding, args, context) {
+  const where = site();
+  try {
+    const result = await runtime.runBuiltin(binding, args, context, where);
+    return { result, program: where.builtin[0] };
+  } catch (error) {
+    return {
+      refused: error instanceof runtime.ToolCallRefused,
+      message: error instanceof Error ? error.message : String(error),
+      program: where.builtin[0],
+    };
+  }
+}
+
+/** A workspace of this run's own, emptied. */
+function workspace(name) {
+  const root = path.join(path.resolve(scratch), name);
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.mkdirSync(root, { recursive: true });
+  return root;
+}
+
+const files = (root) => ({ tool: "files", workspace: [root], env: [] });
+const shell = (root, extra = {}) => ({
+  tool: "bash",
+  workspace: [root],
+  timeout: { millis: 5_000, written: "5s" },
+  env: [],
+  ...extra,
+});
+
+// ---------------------------------------------------------------------------
+// Containment.
+//
+// Four ways out of a workspace, and one file outside it that none of them may
+// reach. The file is written with a sentinel and read back at the end: what is
+// being tested is the file system's state, not the wording of a refusal.
+const outside = path.join(path.resolve(scratch), "outside");
+fs.rmSync(outside, { recursive: true, force: true });
+fs.mkdirSync(outside, { recursive: true });
+const secret = path.join(outside, "secret.txt");
+fs.writeFileSync(secret, "the file outside the workspace");
+
+const contained = workspace("contained");
+fs.symlinkSync(secret, path.join(contained, "link.txt"));
+fs.symlinkSync(path.join(outside, "not-there-yet.txt"), path.join(contained, "dangling.txt"));
+
+const escapes = {};
+for (const [name, args] of [
+  ["climb", { command: "create", path: "../outside/secret.txt", file_text: "clobbered" }],
+  ["absolute", { command: "create", path: secret, file_text: "clobbered" }],
+  ["symlink", { command: "create", path: "link.txt", file_text: "clobbered" }],
+  ["dangling", { command: "create", path: "dangling.txt", file_text: "clobbered" }],
+  ["read", { command: "view", path: "../outside/secret.txt" }],
+]) {
+  escapes[name] = await call(files(contained), args, contextWith("exec_contained"));
+}
+const containment = {
+  refused: Object.fromEntries(Object.entries(escapes).map(([name, answer]) => [name, answer.refused === true])),
+  // The whole point: nothing outside the workspace moved.
+  outsideUnchanged: fs.readFileSync(secret, "utf8") === "the file outside the workspace",
+  outsideNotCreated: !fs.existsSync(path.join(outside, "not-there-yet.txt")),
+  // …and the record of a refused call still says what the model asked for
+  // (`docs/trace.md` §7.4).
+  program: escapes.climb.program,
+  message: escapes.climb.message,
+};
+
+// ---------------------------------------------------------------------------
+// The file tool, end to end.
+const editing = workspace("editing");
+const editContext = contextWith("exec_editing");
+const created = await call(
+  files(editing),
+  { command: "create", path: "notes/todo.md", file_text: "one\ntwo\nthree\n" },
+  editContext,
+);
+const viewed = await call(files(editing), { command: "view", path: "notes/todo.md" }, editContext);
+const replaced = await call(
+  files(editing),
+  { command: "str_replace", path: "notes/todo.md", old_str: "two", new_str: "TWO" },
+  editContext,
+);
+const inserted = await call(
+  files(editing),
+  { command: "insert", path: "notes/todo.md", insert_line: 1, new_str: "one and a half" },
+  editContext,
+);
+const listed = await call(files(editing), { command: "view", path: "notes" }, editContext);
+const ambiguous = await call(
+  files(editing),
+  { command: "create", path: "twice.txt", file_text: "same\nsame\n" },
+  editContext,
+).then(() =>
+  call(
+    files(editing),
+    { command: "str_replace", path: "twice.txt", old_str: "same", new_str: "other" },
+    editContext,
+  ),
+);
+const missing = await call(
+  files(editing),
+  { command: "str_replace", path: "notes/todo.md", old_str: "nowhere", new_str: "x" },
+  editContext,
+);
+const absent = await call(files(editing), { command: "view", path: "nothing.txt" }, editContext);
+const editingTool = {
+  created: created.result,
+  createdProgram: created.program,
+  viewed: viewed.result,
+  replaced: replaced.result,
+  replacedProgram: replaced.program,
+  inserted: inserted.result,
+  insertedProgram: inserted.program,
+  listed: listed.result,
+  ambiguousRefused: ambiguous.refused === true,
+  ambiguousMessage: ambiguous.message,
+  missingRefused: missing.refused === true,
+  absentRefused: absent.refused === true,
+  // What is on disk when the four operations have run.
+  onDisk: fs.readFileSync(path.join(editing, "notes/todo.md"), "utf8"),
+};
+
+// ---------------------------------------------------------------------------
+// The shell session.
+//
+// One context is one node activity: the `cd` in the first call is still in
+// effect in the second, and the variable set in the second is still set in the
+// third. A *different* context is a different activity and starts over.
+const shelled = workspace("shelled");
+fs.mkdirSync(path.join(shelled, "inner"));
+const first = contextWith("exec_shell");
+const moved = await call(shell(shelled), { command: "cd inner && pwd" }, first);
+const stayed = await call(shell(shelled), { command: "pwd" }, first);
+const remembered = await call(shell(shelled), { command: "kept=42; echo set" }, first);
+const recalled = await call(shell(shelled), { command: "echo \"[$kept]\"" }, first);
+const second = contextWith("exec_shell");
+const fresh = await call(shell(shelled), { command: "pwd; echo \"[$kept]\"" }, second);
+// `(exit 3)` rather than `exit 3`: the command is typed into a shell that
+// outlives it, so a bare `exit` would end the *session* — which is a thing this
+// runtime handles (the next call opens a fresh one) and not the thing being
+// asked here.
+const failed = await call(shell(shelled), { command: "echo out; echo err >&2; (exit 3)" }, first);
+const quit = await call(shell(shelled), { command: "exit 7" }, first);
+const session = {
+  moved: moved.result,
+  stayedInInner: (stayed.result?.stdout ?? "").trim().endsWith("/inner"),
+  remembered: (recalled.result?.stdout ?? "").trim(),
+  freshActivity: (fresh.result?.stdout ?? "").trim(),
+  // A nonzero exit is an answer, not a node failure.
+  failed: failed.result,
+  failedProgram: failed.program,
+  // …and a model that ends its own shell is told so rather than left to wonder
+  // why its state is gone.
+  quitNotice: quit.result?.notice ?? null,
+};
+runtime.endShellSessions(first);
+runtime.endShellSessions(second);
+
+// ---------------------------------------------------------------------------
+// The scrubbed environment, both ways round.
+process.env["INHERITED_SECRET"] = "the value this process holds";
+const scrubbedRoot = workspace("scrubbed");
+const scrubbedContext = contextWith("exec_env");
+const scrubbed = await call(
+  shell(scrubbedRoot),
+  { command: 'echo "[${INHERITED_SECRET-unset}][${DECLARED-unset}]"' },
+  scrubbedContext,
+);
+const declared = await call(
+  shell(scrubbedRoot, { env: [{ name: "DECLARED", value: ["a value the binding wrote"] }] }),
+  { command: 'echo "[${INHERITED_SECRET-unset}][${DECLARED-unset}]"' },
+  scrubbedContext,
+);
+const inherited = await call(
+  shell(scrubbedRoot, { inheritEnv: true }),
+  { command: 'echo "[${INHERITED_SECRET-unset}][${DECLARED-unset}]"' },
+  scrubbedContext,
+);
+const environment = {
+  scrubbed: (scrubbed.result?.stdout ?? "").trim(),
+  declared: (declared.result?.stdout ?? "").trim(),
+  inherited: (inherited.result?.stdout ?? "").trim(),
+};
+runtime.endShellSessions(scrubbedContext);
+
+// ---------------------------------------------------------------------------
+// The command deadline.
+//
+// A bound short enough to reach, a command far longer than it, and the call
+// after it: the deadline answers the model rather than failing the node, and the
+// session it took with it is replaced.
+const impatientRoot = workspace("impatient");
+const impatientContext = contextWith("exec_timeout");
+const impatient = { tool: "bash", workspace: [impatientRoot], timeout: { millis: 300, written: "300ms" }, env: [] };
+const startedTimeout = Date.now();
+const outran = await call(impatient, { command: "sleep 30" }, impatientContext);
+const timeout = {
+  elapsedMs: Date.now() - startedTimeout,
+  result: outran.result,
+  program: outran.program,
+  after: (await call(impatient, { command: "echo still here" }, impatientContext)).result,
+};
+runtime.endShellSessions(impatientContext);
+
+// ---------------------------------------------------------------------------
+// The default workspace.
+//
+// Two bindings that wrote none, in one execution: one directory, shared, under
+// the project's data directory. Removed when the execution settles; kept when it
+// parks, because the generation that resumes it reads what this one wrote.
+const shared = { tool: "files", workspace: [], env: [] };
+const alsoShared = { tool: "bash", workspace: [], timeout: { millis: 5_000, written: "5s" }, env: [] };
+const defaulted = contextWith("exec_default_workspace");
+await call(shared, { command: "create", path: "made.txt", file_text: "by the file tool\n" }, defaulted);
+const sameDirectory = await call(alsoShared, { command: "cat made.txt; pwd" }, defaulted);
+runtime.endShellSessions(defaulted);
+const madeAt = path.join(project, ".agent-compose", "workspaces", "exec_default_workspace");
+const workspaces = {
+  underTheDataDirectory: fs.existsSync(madeAt),
+  sharedByBothTools: (sameDirectory.result?.stdout ?? "").includes("by the file tool"),
+};
+await runtime.releaseWorkspaces("exec_default_workspace", true);
+workspaces.keptWhenParked = fs.existsSync(madeAt);
+// The parked release dropped this process's handle on it, so the settled one is
+// asked over a workspace it has to find again — which is the case a resumed run
+// makes, and the one a memoized path would answer wrongly.
+const settling = contextWith("exec_default_workspace");
+await call(shared, { command: "view", path: "made.txt" }, settling);
+await runtime.releaseWorkspaces("exec_default_workspace", false);
+workspaces.goneWhenSettled = !fs.existsSync(madeAt);
+
+process.stdout.write(
+  `${JSON.stringify({ containment, editingTool, session, environment, timeout, workspaces })}\n`,
+);

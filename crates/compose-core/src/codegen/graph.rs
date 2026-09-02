@@ -1123,15 +1123,19 @@ fn builtin_tools(
 /// to (`docs/durability.md` §3.2). A binding that wrote none emits none, which
 /// is how the runtime is told to use the execution's own workspace.
 ///
-/// **What is not emitted yet.** `env:` and `inherit_env:` are carried in the IR
-/// and reach the environment manifest through `codegen::env`, so a placement
-/// already demands what a built-in's children read; the runtime is handed them
-/// with the `builtin.files` handlers and the per-execution workspace, which is
-/// the half of PRD resolved q54 that lands after this grammar. Until then a
-/// `builtin.files` call and a defaulted workspace each fail loudly at the call
-/// rather than answering — `runBuiltin` throws on a name it does not implement
-/// and on a workspace that resolved to nothing — which is the one behaviour a
-/// staged landing may have: never a call that quietly did something else.
+/// `env:` is emitted the same way and for the same reason, and `inherit_env:`
+/// only where it is `true`: the scrubbed child is the default (PRD resolved q54
+/// ruling b), so the emitted binding carries the opt-in rather than the state.
+/// The same values reach the environment manifest through `codegen::env`, which
+/// is what makes a placement demand exactly what a built-in's children read
+/// (resolved q41).
+///
+/// The **wire type** is emitted beside the schema rather than instead of it:
+/// the Messages wire declares these as Anthropic's own dated tool types, which
+/// is what engages a model's trained behaviour, and the OpenAI wires declare the
+/// same arguments as a function tool from the schema. One set of runtime
+/// handlers serves both, because the argument names are the same
+/// (`ast::definition::Builtin::provider_type`).
 fn builtin_tool(
     names: &Names,
     surfaces: &[schema::Surface<'_>],
@@ -1155,6 +1159,15 @@ fn builtin_tool(
     text.push_str(&format!(
         "      schema: {},\n",
         json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
+    ));
+    // The dated type the Messages wire declares this tool as, which is what
+    // engages a model's trained behaviour for it (PRD resolved q54 ruling d).
+    // Emitted beside the schema rather than instead of it: the OpenAI wires have
+    // no provider-defined types and declare the same arguments as a function
+    // tool, and the runtime reads whichever its wire has.
+    text.push_str(&format!(
+        "      providerType: {},\n",
+        names::string(tool.provider_type())
     ));
     let workspace = binding
         .and_then(|binding| binding.workspace.as_ref())
@@ -1180,10 +1193,39 @@ fn builtin_tool(
         ),
         None => String::new(),
     };
+    // `env:` as written, exactly as an `exec:` binding carries it (grammar 4.3
+    // class 2): the child's environment is a property of the machine running the
+    // graph, and a resolved credential in the artifact — or in the effect record
+    // the journal keys this call under — is one this project does not write.
+    let environment = binding.map_or_else(Vec::new, |binding| binding.env.clone());
+    let env = if environment.is_empty() {
+        "            env: [],\n".to_string()
+    } else {
+        let mut entries = String::from("            env: [\n");
+        for entry in &environment {
+            entries.push_str(&format!(
+                "              {{ name: {}, value: {} }},\n",
+                names::string(&entry.name.value),
+                interpolation(
+                    &entry.value.value,
+                    &format!("{address}.env.{}", entry.name.value)
+                )
+            ));
+        }
+        entries.push_str("            ],\n");
+        entries
+    };
+    // …and the opt-in that widens it, written only where it is `true`: the
+    // scrubbed child is the default PRD resolved q54 ruling b fixes, and an
+    // `inheritEnv: false` on every other binding would be a key nobody wrote.
+    let inherit = match binding.and_then(|binding| binding.inherit_env.as_ref()) {
+        Some(inherit) if inherit.value => "            inheritEnv: true,\n",
+        _ => "",
+    };
     text.push_str(&format!(
-        "      invoke: (args, context) =>\n        runtime.runBuiltin(\n          \
-         {{\n            tool: {},\n            root: {workspace},\n{timeout}          }},\n          \
-         runtime.parseToolArguments({schema_name}, args, {}),\n          context,\n        ),\n",
+        "      invoke: (args, context, call) =>\n        runtime.runBuiltin(\n          \
+         {{\n            tool: {},\n            workspace: {workspace},\n{timeout}{env}{inherit}          }},\n          \
+         runtime.parseToolArguments({schema_name}, args, {}),\n          context,\n          call,\n        ),\n",
         names::string(tool.keyword()),
         names::string(&format!(
             "the arguments `{}` was called with",
@@ -3921,6 +3963,14 @@ async function quiesceFlow(
     // quiesced.
     const parked = runtime.staysOpen(executionId, outcome);
     stores.releaseExecution(executionId, parked);
+    // …and the directory this run's built-in tools worked in, under the same
+    // rule and for the same reason (grammar 6.1, PRD resolved q54): a workspace
+    // nobody configured belongs to the execution, so it goes when the execution
+    // ends — and stays where the row stays open, because the generation that
+    // resumes it runs past the frontier into files the recorded prefix wrote.
+    // A binding that named its own `workspace:` is the composition's and is
+    // never removed.
+    await runtime.releaseWorkspaces(executionId, parked);
   };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way

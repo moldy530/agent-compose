@@ -130,7 +130,7 @@ import {
 } from "./journal.ts";
 import { type PlacedAnswer, executeLocally } from "./mesh.ts";
 import type * as runtime from "./runtime.ts";
-import { dispatchPausesHome, remotePauseOf } from "./runtime.ts";
+import { dispatchPausesHome, releaseWorkspaces, remotePauseOf } from "./runtime.ts";
 
 /** The dispatch this process was handed, as §3.2 puts it on the wire. */
 interface Dispatch {
@@ -631,6 +631,14 @@ async function main(): Promise<void> {
         : { type: "result", paused };
   }
   closeSession(dispatch.execution_id);
+  // The workspace a built-in tool of this dispatch was given, where it took the
+  // default (grammar 6.1, PRD resolved q54). This process runs one node and
+  // exits, so the directory's lifetime is the dispatch's: there is no later node
+  // of this execution here to share it with, and nothing left to remove it
+  // afterwards. A dispatch that **parked** keeps it, for the reason `runFlow`
+  // keeps one — the generation that answers the pause is dispatched again and
+  // reads past the frontier into what this one wrote.
+  await releaseWorkspaces(dispatch.execution_id, line["paused"] !== undefined);
   // After every effect line this dispatch produced, so a reader that stops at
   // the result has already seen them all.
   await writing;

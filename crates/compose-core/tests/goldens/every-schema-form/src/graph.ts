@@ -520,25 +520,34 @@ const agentShaper: runtime.AgentBinding = {
         "additionalProperties": false,
         "properties": {
           "command": {
+            "default": "",
             "description": "The shell command to run, as one line of `bash`.",
-            "minLength": 1,
             "type": "string"
+          },
+          "restart": {
+            "default": false,
+            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. No `command` is run on a call that restarts.",
+            "type": "boolean"
           }
         },
-        "required": [
-          "command"
-        ],
+        "required": [],
         "type": "object"
       },
-      invoke: (args, context) =>
+      providerType: "bash_20250124",
+      invoke: (args, context, call) =>
         runtime.runBuiltin(
           {
             tool: "bash",
-            root: [{ env: "WORKSPACE", site: "tool.sandbox.workspace" }, "/build"],
+            workspace: [{ env: "WORKSPACE", site: "tool.sandbox.workspace" }, "/build"],
             timeout: { millis: 30000, written: "30s" },
+            env: [
+              { name: "PATH", value: ["/usr/bin:/bin"] },
+              { name: "HOME", value: [{ env: "WORKSPACE", site: "tool.sandbox.env.HOME" }] },
+            ],
           },
           runtime.parseToolArguments(toolSandboxInput, args, "the arguments `bash` was called with"),
           context,
+          call,
         ),
     },
     {
@@ -592,14 +601,17 @@ const agentShaper: runtime.AgentBinding = {
         ],
         "type": "object"
       },
-      invoke: (args, context) =>
+      providerType: "text_editor_20250728",
+      invoke: (args, context, call) =>
         runtime.runBuiltin(
           {
             tool: "files",
-            root: [],
+            workspace: [],
+            env: [],
           },
           runtime.parseToolArguments(builtinFilesInput, args, "the arguments `str_replace_based_edit_tool` was called with"),
           context,
+          call,
         ),
     },
   ],
@@ -665,25 +677,31 @@ const agentSpreader: runtime.AgentBinding = {
         "additionalProperties": false,
         "properties": {
           "command": {
+            "default": "",
             "description": "The shell command to run, as one line of `bash`.",
-            "minLength": 1,
             "type": "string"
+          },
+          "restart": {
+            "default": false,
+            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. No `command` is run on a call that restarts.",
+            "type": "boolean"
           }
         },
-        "required": [
-          "command"
-        ],
+        "required": [],
         "type": "object"
       },
-      invoke: (args, context) =>
+      providerType: "bash_20250124",
+      invoke: (args, context, call) =>
         runtime.runBuiltin(
           {
             tool: "bash",
-            root: [],
+            workspace: [],
             timeout: { millis: 120000, written: "120s" },
+            env: [],
           },
           runtime.parseToolArguments(builtinBashInput, args, "the arguments `bash` was called with"),
           context,
+          call,
         ),
     },
   ],
@@ -1437,6 +1455,14 @@ async function quiesceFlow(
     // quiesced.
     const parked = runtime.staysOpen(executionId, outcome);
     stores.releaseExecution(executionId, parked);
+    // …and the directory this run's built-in tools worked in, under the same
+    // rule and for the same reason (grammar 6.1, PRD resolved q54): a workspace
+    // nobody configured belongs to the execution, so it goes when the execution
+    // ends — and stays where the row stays open, because the generation that
+    // resumes it runs past the frontier into files the recorded prefix wrote.
+    // A binding that named its own `workspace:` is the composition's and is
+    // never removed.
+    await runtime.releaseWorkspaces(executionId, parked);
   };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way

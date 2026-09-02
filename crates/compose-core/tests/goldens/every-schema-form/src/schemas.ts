@@ -371,7 +371,8 @@ export type ToolPingOutput = z.infer<typeof toolPingOutput>;
 
 /** `tool.sandbox` — its parameters (grammar 6). */
 export const toolSandboxInput = z.object({
-  command: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The shell command to run, as one line of `bash`."),
+  command: z.string().describe("The shell command to run, as one line of `bash`.").default(""),
+  restart: z.boolean().describe("Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. No `command` is run on a call that restarts.").default(false),
 }).strict();
 export type ToolSandboxInput = z.infer<typeof toolSandboxInput>;
 
@@ -383,7 +384,8 @@ export type ToolSandboxOutput = z.infer<typeof toolSandboxOutput>;
  * `builtin.bash` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
  */
 export const builtinBashInput = z.object({
-  command: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The shell command to run, as one line of `bash`."),
+  command: z.string().describe("The shell command to run, as one line of `bash`.").default(""),
+  restart: z.boolean().describe("Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. No `command` is run on a call that restarts.").default(false),
 }).strict();
 export type BuiltinBashInput = z.infer<typeof builtinBashInput>;
 

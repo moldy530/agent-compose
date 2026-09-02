@@ -2420,6 +2420,14 @@ async function quiesceFlow(
     // quiesced.
     const parked = runtime.staysOpen(executionId, outcome);
     stores.releaseExecution(executionId, parked);
+    // …and the directory this run's built-in tools worked in, under the same
+    // rule and for the same reason (grammar 6.1, PRD resolved q54): a workspace
+    // nobody configured belongs to the execution, so it goes when the execution
+    // ends — and stays where the row stays open, because the generation that
+    // resumes it runs past the frontier into files the recorded prefix wrote.
+    // A binding that named its own `workspace:` is the composition's and is
+    // never removed.
+    await runtime.releaseWorkspaces(executionId, parked);
   };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way

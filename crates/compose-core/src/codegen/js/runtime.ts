@@ -76,6 +76,7 @@ import {
   JOURNAL_VERSION,
   ReplayDivergence,
   closeSession,
+  dataRoot,
   journalExists,
   journaled,
   latchDivergence,
@@ -1422,6 +1423,19 @@ export interface ToolCallRecord {
    * (Decision D119, [`ToolCallRefused`]).
    */
   readonly error?: string;
+  /**
+   * **What the model ran**, on a call to a built-in tool (`docs/trace.md` §7.4,
+   * PRD resolved q54 ruling c).
+   *
+   * The one carve-out from §11's rule that this format carries no tool's
+   * arguments, and it is the tool whose arguments *are* the program: every other
+   * binding runs what the composition wrote, which a reader already has, while a
+   * built-in runs what the model wrote at run time. Present on every call that
+   * reached a built-in — completed, failed, or refused by the tool itself — and
+   * absent everywhere else, including on a built-in call the loop refused before
+   * it (a schema the arguments failed), which never reached the tool.
+   */
+  readonly program?: BuiltinProgram;
 }
 
 /**
@@ -1462,6 +1476,23 @@ export interface ToolSpec {
   readonly name: string;
   readonly description: string;
   readonly schema: JsonSchema;
+  /**
+   * The **provider-defined tool type** this tool goes out as on the Messages
+   * wire, where it has one (grammar 6.1, PRD resolved q54 ruling d).
+   *
+   * Present on the two built-ins and on nothing else. Anthropic ships `bash` and
+   * the text editor as *its own* tool types — `{"type": "bash_20250124", "name":
+   * "bash"}` — and a model is trained against the type rather than against a
+   * schema somebody wrote, so declaring them that way is what engages the
+   * behaviour the tools exist for. The type is dated because it versions: it is
+   * a fact of the wire, so the compiler writes it here (`codegen::graph`'s
+   * `BUILTIN_WIRE_TYPES`) rather than this runtime pinning a date of its own.
+   *
+   * The other two wires have no such thing and take [`schema`] as an ordinary
+   * function tool, which is why every built-in has one either way: the same
+   * arguments under the same names, so the same handlers serve every wire.
+   */
+  readonly providerType?: string;
 }
 
 /** One turn of the conversation, in a shape both surfaces can render. */
@@ -2260,11 +2291,18 @@ async function callMessages(
   const server = model.provider.serverTools ?? [];
   if (offered.length > 0 || server.length > 0) {
     body["tools"] = [
-      ...offered.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        input_schema: tool.schema,
-      })),
+      // A **provider-defined** tool goes out as its type and its name and
+      // nothing else (grammar 6.1, PRD resolved q54 ruling d): the schema is the
+      // provider's, the model is trained against the type, and an `input_schema`
+      // beside it is a key this surface refuses. That is the whole difference
+      // between the two built-ins here and every other client tool — the
+      // arguments that come back are the same either way, which is what lets one
+      // set of handlers serve every wire ([`ToolSpec.providerType`]).
+      ...offered.map((tool) =>
+        tool.providerType === undefined
+          ? { name: tool.name, description: tool.description, input_schema: tool.schema }
+          : { type: tool.providerType, name: tool.name },
+      ),
       ...server,
     ];
   }
@@ -2412,6 +2450,12 @@ async function callChatCompletions(
   const server = model.provider.serverTools ?? [];
   if (request.tools.length > 0 || server.length > 0) {
     body["tools"] = [
+      // Every client tool is a function tool here, the two built-ins included:
+      // this surface has no provider-defined types, so what the Messages wire
+      // declares as `{"type": "bash_20250124"}` is declared here as an ordinary
+      // function under the same name with the compiler's own schema
+      // ([`ToolSpec.providerType`], PRD resolved q54 ruling d). Same names, same
+      // arguments, same handlers.
       ...request.tools.map((tool) => ({
         type: "function",
         function: { name: tool.name, description: tool.description, parameters: tool.schema },
@@ -2606,6 +2650,10 @@ async function callResponses(
   // Client tools first, then the provider's suite — the same order the Messages
   // wire uses, pinned by the goldens for the same reason.
   const server = model.provider.serverTools ?? [];
+  // The built-ins are function tools here too, for [`callChatCompletions`]'
+  // reason: this surface's provider-defined types are OpenAI's own server tools,
+  // which are the provider's to run, and a client tool the *graph* runs is
+  // declared with the compiler's schema whatever the Messages wire calls it.
   const functions = request.tools.map((tool) => ({
     type: "function",
     name: tool.name,
@@ -2895,6 +2943,17 @@ export interface ToolCallSite {
    * same object in both.
    */
   readonly dispatches: DispatchRecord[];
+  /**
+   * Where a **built-in** files what the model asked it to run
+   * (`docs/trace.md` §7.4).
+   *
+   * One slot rather than a channel: this array is built per call, so what a call
+   * filed is `builtin[0]` and a tool that is not a built-in files nothing. The
+   * shape is [`dispatches`]' — a list the callee appends to and the loop reads
+   * off afterwards — because the reason is the same: only the call knows what it
+   * ran, and only the loop has the record to put it on.
+   */
+  readonly builtin: BuiltinProgram[];
 }
 
 /**
@@ -3126,6 +3185,34 @@ export async function callAgent(
   models: readonly ModelCall[];
   toolDispatches?: readonly DispatchRecord[];
 }> {
+  try {
+    return await agentLoop(agent, input, history, context, where);
+  } finally {
+    // A `builtin.bash` session belongs to this node activity and to nothing
+    // else (PRD resolved q54): the shell holds a working directory inside a
+    // workspace the run may be about to remove, and a `retry:` that reached
+    // the second attempt must start from the workspace rather than from
+    // wherever the first attempt had `cd`ed to. Ended however this loop leaves
+    // — answered, failed, or thrown out of by a deadline that abandoned it —
+    // which is what the wrapper is for: this is the one thing the node owns
+    // that a `return` alone would not release ([`endShellSessions`]).
+    endShellSessions(context);
+  }
+}
+
+/** [`callAgent`]'s loop, with the sessions it opens released around it. */
+async function agentLoop(
+  agent: AgentBinding,
+  input: unknown,
+  history: readonly Turn[],
+  context: RunContext,
+  where: AgentSite,
+): Promise<{
+  output: unknown;
+  history: MessageLike[];
+  models: readonly ModelCall[];
+  toolDispatches?: readonly DispatchRecord[];
+}> {
   const rendered = typeof input === "string" ? input : JSON.stringify(input);
   const turn: Turn = { role: "user", text: rendered };
   // The conversation this node holds, and `readonly` is load-bearing: it is what
@@ -3218,6 +3305,7 @@ export async function callAgent(
         why: ToolCallRefused,
         target?: string,
         instance?: { instance: string } | Record<string, never>,
+        program?: { program: BuiltinProgram } | Record<string, never>,
       ): void => {
         record({
           name: call.name,
@@ -3225,6 +3313,7 @@ export async function callAgent(
           outcome: "refused",
           ...(instance ?? {}),
           error: describe(why),
+          ...(program ?? {}),
         });
         refusal = why.message;
         results.push({ id: call.id, name: call.name, content: why.message, isError: true });
@@ -3263,6 +3352,9 @@ export async function callAgent(
           ordinal,
           ...(where.policy === undefined ? {} : { policy: where.policy }),
           dispatches,
+          // One per call, because what it holds is this call's program rather
+          // than the loop's history (`docs/trace.md` §7.4).
+          builtin: [],
         };
         // Which dispatches this call filed is decided by counting, so the link
         // below is read off the record the call really made rather than derived
@@ -3279,6 +3371,15 @@ export async function callAgent(
         const started = (): { instance: string } | Record<string, never> => {
           const filed = dispatches[before];
           return filed === undefined ? {} : { instance: filed.idempotencyKey };
+        };
+        // …and the same idiom for the other thing a call can file: the program a
+        // **built-in** was handed (`docs/trace.md` §7.4). Read off what the call
+        // filed rather than off the tool's shape, so a record carries one
+        // because a built-in ran rather than because this loop assumed which
+        // tools are built-ins.
+        const ran = (): { program: BuiltinProgram } | Record<string, never> => {
+          const filed = site.builtin[0];
+          return filed === undefined ? {} : { program: filed };
         };
         let result: unknown;
         try {
@@ -3301,7 +3402,7 @@ export async function callAgent(
             // needs no correction re-derives its first attempt's keys instead
             // of firing every child flow's effects again.
             ordinals.set(call.name, ordinal);
-            refuse(call, error, tool.address, started());
+            refuse(call, error, tool.address, started(), ran());
             continue;
           }
           record({
@@ -3310,6 +3411,7 @@ export async function callAgent(
             outcome: "failed",
             ...started(),
             error: describe(error),
+            ...ran(),
           });
           throw error;
         }
@@ -3319,6 +3421,7 @@ export async function callAgent(
           outcome: "completed",
           ...started(),
           ...(dispatches[before] === undefined ? {} : { result }),
+          ...ran(),
         });
         // The call worked, so the loop is holding no refusal: a budget spent
         // after this says the bound stopped a model that was calling correctly
@@ -3725,225 +3828,441 @@ async function runExecLive(
 }
 
 // ---------------------------------------------------------------------------
-// The runtime built-ins (grammar 5.5, Decision D123, PRD resolved q31)
+// The built-in tools (grammar 5.5, 6.1, Decision D135, PRD resolved q54)
 // ---------------------------------------------------------------------------
 
 /**
- * The built-in calls this runtime dispatches on (grammar 5.5, 6.1).
+ * Which built-in a binding holds (grammar 5.5, 6.1).
  *
- * `bash` and `files` are the two the grammar offers, as the shorthand
- * `builtin.bash`/`builtin.files` or as a `tool.*` with a `builtin:` binding
- * (PRD resolved q54). The other three are handlers this runtime still carries;
- * nothing this compiler emits names one, and `files` takes over what they did.
+ * The two PRD resolved q54 ships, written as the shorthand `builtin.bash` /
+ * `builtin.files` in an agent's `tools:` or as a `tool.*` carrying a `builtin:`
+ * binding. The set is closed in the grammar and the emitter writes one of these
+ * two, so a third name reaching this runtime is a build from another release.
  */
-export type BuiltinName = "bash" | "files" | "read_file" | "write_file" | "list";
+export type BuiltinName = "bash" | "files";
 
 /**
  * One built-in an agent holds, with the bounds its binding declared.
  *
- * The bounds are the whole of what a binding configures, and both are optional:
- * a built-in written with neither is the shorthand, which takes the execution's
- * own workspace and the default command bound (grammar 5.5, 6.1).
+ * Every field but `tool` is a **bound**, and every bound is the binding's rather
+ * than the model's: a model that could name its own workspace, its own deadline
+ * or its own environment would hold exactly the capability these exist to hold
+ * still. What the model chooses is the program — the command, or the file
+ * operation and its path — and that is the whole of the trust shift Decision
+ * D135 says out loud.
  */
 export interface BuiltinBinding {
   /** Which built-in. */
   readonly tool: BuiltinName;
   /**
-   * `root:` — the directory every path resolves inside, and `bash`'s working
-   * directory. Interpolation parts rather than a string, because the value
-   * reaches the process at start (grammar 4.3 class 2).
-   */
-  readonly root: readonly Interpolation[];
-  /**
-   * `timeout:` — how long `bash`'s command may run. `millis` is what the timer
-   * is set to and `written` is what a message quotes, so a failure reads in the
-   * author's own units.
+   * `workspace:` — the directory `bash` starts in and every `files` path
+   * resolves inside.
    *
-   * Absent on the file tools, which run no command.
+   * Interpolation parts rather than a string, because the value reaches the
+   * process at start (grammar 4.3 class 2). **Empty** is the binding that wrote
+   * none, which is the execution's own workspace ([`sharedWorkspace`]): one
+   * fresh directory per execution, shared by every built-in of that execution
+   * that took the default, removed when the execution settles.
+   */
+  readonly workspace: readonly Interpolation[];
+  /**
+   * `timeout:` — how long one `bash` command may run. `millis` is what the timer
+   * is set to and `written` is what the model is told, so a command that outran
+   * it reads in the author's own units.
+   *
+   * Absent on `builtin.files`, which runs no command. Present on every emitted
+   * `bash` binding, written or defaulted to grammar 6.1's 120s.
    */
   readonly timeout?: { readonly millis: number; readonly written: string };
+  /**
+   * `env:` — the variables this tool's children run with, as written
+   * (grammar 4.3 class 2), and **the whole of what they run with** unless
+   * [`inheritEnv`] says otherwise.
+   *
+   * Empty on `builtin.files`, which forks nothing.
+   */
+  readonly env: readonly { readonly name: string; readonly value: readonly Interpolation[] }[];
+  /**
+   * `inherit_env:` — whether those children also see this process's own
+   * environment, with [`env`] layered over it.
+   *
+   * Absent is `false`, which is the scrubbed default PRD resolved q54 ruling b
+   * fixes: a placement's environment manifest is the whole answer to what a
+   * machine is asked for (resolved q41), and a child that inherited this
+   * process's environment would read credentials nobody declared to it.
+   */
+  readonly inheritEnv?: boolean;
 }
 
 /**
- * How many entries one `list` answers with before it reports that it stopped.
+ * **The model's program**, as `docs/trace.md` §7.4 records it (PRD resolved q54
+ * ruling c).
  *
- * Not containment — v1's containment is the root and the timeout, and nothing
- * here narrows what the agent may reach: a directory with more entries than this
- * is listed a subdirectory or a glob at a time. It is a bound on one *answer*,
- * because a tool result is text a model reads, and an unbounded one would spend
- * a context window rather than fail. `truncated` says so rather than leaving the
- * model to infer completeness from a round number.
+ * The carve-out, and its whole extent. §11 keeps a tool's *answer* out of this
+ * format at every surface and that rule is untouched here: a command's stdout
+ * and a file's contents are answers, and they stay in the journal. What a
+ * built-in adds is the half no other tool has — for every other binding the
+ * program is the composition's, written in a spec the reader already has, and
+ * for this one the **model wrote it at run time**, so a trace without it would
+ * record that an agent ran something and nothing about what.
+ *
+ * Every field is capped ([`PROGRAM_LIMIT`]) and none of them is a file body: an
+ * edit is recorded as [`change`], a sentence this runtime composes about the
+ * shape of the edit rather than an excerpt of what was written.
  */
-const LISTING_LIMIT = 1000;
+export interface BuiltinProgram {
+  /**
+   * Which built-in ran it.
+   *
+   * The union is written out rather than named ([`BuiltinName`], which is the
+   * same two members): a record type of this format names only types
+   * `docs/trace.md` specifies, and the alias is the *binding's* vocabulary
+   * rather than the trace's.
+   */
+  readonly tool: "bash" | "files";
+  /** `bash`: the command as the model wrote it, capped. */
+  readonly command?: string;
+  /** `files`: which operation it asked for. */
+  readonly operation?: "view" | "create" | "str_replace" | "insert";
+  /** `files`: the path as the model wrote it, capped — never the resolved one. */
+  readonly path?: string;
+  /**
+   * `bash`: the command's exit status, where one completed.
+   *
+   * Mutable for [`ModelCall.toolCalls`]' reason: the record is made from the
+   * call's arguments, before there is an outcome to put in it.
+   */
+  exitCode?: number;
+  /** `bash`: `true` where the command outran its bound and was killed. */
+  timedOut?: boolean;
+  /** `files`: what an edit changed, as a sentence — never file contents. */
+  change?: string;
+}
 
 /**
- * How many entries one `list` matches before it hands the event loop back.
+ * How much of one stream or one file view a call answers with.
  *
- * The walk `await`s a `readdir` per directory, so a turn of the loop already
- * falls between two directories; this is what puts one *inside* a directory too.
- * Both halves of the work in that loop are a model's to size — how many entries
- * the directory it named holds, and how long the glob it wrote is — and an
- * emitted graph is embedded code: a `serve` process runs every other execution
- * and its own listener on this same loop.
- *
- * It is also what lets the node's own `timeout:` (grammar 9.2) fire *during* a
- * listing rather than after it. A deadline is a timer, and a timer cannot run
- * inside a burst that never yields — so a walk that never breathed would
- * overshoot the bound by the length of the burst, and [`walkListing`]'s abort
- * check would not be reached until the burst it is meant to cut short had
- * already finished.
+ * Not containment — containment is the workspace and the command deadline, and
+ * nothing here narrows what an agent may reach. It is a bound on one *answer*,
+ * because a tool result is text a model reads and a `cat` of a large file would
+ * spend a context window rather than fail. What was cut is **said** in the
+ * result rather than left for the model to infer from a round number.
  */
-const LISTING_YIELD = 256;
+const BUILTIN_OUTPUT_LIMIT = 30_000;
+
+/** The same, for the fields `docs/trace.md` §7.4 carries. */
+const PROGRAM_LIMIT = 1_000;
+
+/** How many entries one directory view answers with. [`capped`]'s reason. */
+const LISTING_LIMIT = 1_000;
+
+/** How many lines of context an edit's result shows around what it changed. */
+const SNIPPET_LINES = 4;
 
 /**
- * Run one built-in call (grammar 5.5, Decision D123).
+ * Run one built-in call (grammar 5.5, 6.1, PRD resolved q54).
  *
  * The seam every built-in goes through, journaled like every other tool
  * execution: the record holds what the call answered, and a resumed generation
  * is handed it back rather than running the command again
  * (`docs/durability.md` §3.2). That is the whole of what durability owes a
  * built-in — a `bash` that appended a line to a file appends it once across any
- * number of process generations.
+ * number of process generations — and the one thing it cannot restore is the
+ * shell's own state, because a replayed command is a command that did not run: a
+ * generation that resumes past the frontier opens a fresh session in the
+ * workspace, whatever the recorded prefix had `cd`ed into.
  *
- * The identity is the **attachment as the composition wrote it** plus the
- * arguments the model chose: the tool, the `root:` unresolved, and `bash`'s
- * `timeout:` as written. Unresolved for `runExec`'s reason — one composition
- * derives one identity whatever machine it runs on — and *whole* for the other:
- * a root that moved is a different directory to read, and a timeout that moved
- * is a different bound to have survived, so neither is a call this run makes
- * under the recorded key.
+ * The identity is the **binding as the composition wrote it** plus the arguments
+ * the model chose: the tool, the `workspace:` unresolved, `bash`'s `timeout:`,
+ * and the environment as written. Unresolved for [`runExec`]'s reason — one
+ * composition derives one identity whatever machine it runs on — and *whole* for
+ * the other: a workspace that moved is a different directory to work in, a
+ * timeout that moved is a different bound to have survived, and an environment
+ * that moved is a different program, so none is a call this run makes under the
+ * recorded key.
+ *
+ * **A refusal survives the journal as a refusal.** The two outcomes a tool call
+ * has are different kinds of thing (Decision D119): a path that leaves the
+ * workspace, a `str_replace` that matched nothing, a `create` with nothing to
+ * write are the model's to correct and go back to it, while a workspace that
+ * does not exist is the world's and fails the node. The journal records either
+ * as the effect's outcome, and a replayed failure arrives as a plain `Error`
+ * carrying the recorded class *name* — so the class is restored on the way out
+ * ([`restoredRefusal`]) and a resumed generation bounces what the first
+ * generation bounced instead of failing a node over it.
  */
 export async function runBuiltin(
   binding: BuiltinBinding,
   args: Record<string, unknown>,
   context: RunContext,
+  site: ToolCallSite,
 ): Promise<unknown> {
-  return await journaled(
-    context.effects,
-    "tool",
-    {
-      surface: "builtin",
-      tool: binding.tool,
-      root: asWritten(binding.root),
-      ...(binding.timeout === undefined ? {} : { timeout: binding.timeout.written }),
-      input: args,
-    },
-    () => runBuiltinLive(binding, args, context),
-  );
+  // Filed before the call runs, so the record exists however the call ends: a
+  // command that failed the node is exactly the one a reader opens the trace
+  // for, and what it holds is an argument the *model* chose rather than an
+  // answer this format keeps out (`docs/trace.md` §7.4, §11).
+  const program = programOf(binding, args);
+  site.builtin.push(program);
+  let answered: unknown;
+  try {
+    answered = await journaled(
+      context.effects,
+      "tool",
+      {
+        surface: "builtin",
+        tool: binding.tool,
+        workspace: asWritten(binding.workspace),
+        ...(binding.timeout === undefined ? {} : { timeout: binding.timeout.written }),
+        env: binding.env.map((entry) => ({ name: entry.name, value: asWritten(entry.value) })),
+        ...(binding.inheritEnv === true ? { inheritEnv: true } : {}),
+        input: args,
+      },
+      () => runBuiltinLive(binding, args, context),
+    );
+  } catch (error) {
+    throw restoredRefusal(error);
+  }
+  recordOutcome(program, answered);
+  return answered;
 }
 
-/** [`runBuiltin`] with nothing between it and the file system. */
+/**
+ * A replayed [`ToolCallRefused`], back in its class.
+ *
+ * The journal keeps an error as its `name` and its `message` and hands a resume
+ * a plain `Error` carrying both (`./journal.ts`'s `replayedFailure`), which is
+ * right for every failure this runtime *reports* and wrong for the one it
+ * **classifies**: [`callAgent`] reads the class to decide whether a call goes
+ * back to the model or ends the node, so a refusal that came back as an `Error`
+ * would fail a node the generation that recorded it carried on from — a resume
+ * doing something the run it is resuming did not.
+ *
+ * Read off the recorded name, which is the only thing a record keeps of a class.
+ * Written here rather than in `./journal.ts` because the class is this module's
+ * and the journal is the module beneath it.
+ */
+function restoredRefusal(error: unknown): unknown {
+  if (error instanceof ToolCallRefused) return error;
+  if (error instanceof Error && error.name === "ToolCallRefused") {
+    return new ToolCallRefused(error.message);
+  }
+  return error;
+}
+
+/** The program half of a call's record: what the model asked for. */
+function programOf(binding: BuiltinBinding, args: Record<string, unknown>): BuiltinProgram {
+  if (binding.tool === "bash") {
+    const command = typeof args["command"] === "string" ? args["command"] : "";
+    const written = command.trim() === "" && args["restart"] === true ? "restart" : command;
+    return { tool: "bash", command: capped(written, PROGRAM_LIMIT) };
+  }
+  const operation = String(args["command"] ?? "");
+  return {
+    tool: "files",
+    ...(isFileOperation(operation) ? { operation } : {}),
+    path: capped(String(args["path"] ?? ""), PROGRAM_LIMIT),
+  };
+}
+
+/**
+ * The outcome half, read off the **answer** rather than off the call.
+ *
+ * Which is what makes it survive a resume: a replayed call performs nothing, so
+ * a runtime that filled these in where the command ran would write a trace whose
+ * built-in calls lost their exit status on every generation but the first. The
+ * answer is the journal's, replayed or live.
+ */
+function recordOutcome(program: BuiltinProgram, answered: unknown): void {
+  if (answered === null || typeof answered !== "object") return;
+  const result = answered as Record<string, unknown>;
+  if (typeof result["exit_code"] === "number") program.exitCode = result["exit_code"];
+  if (result["timed_out"] === true) program.timedOut = true;
+  if (typeof result["change"] === "string") {
+    program.change = capped(result["change"], PROGRAM_LIMIT);
+  }
+}
+
+/** [`runBuiltin`] with nothing between it and the machine. */
 async function runBuiltinLive(
   binding: BuiltinBinding,
   args: Record<string, unknown>,
   context: RunContext,
 ): Promise<unknown> {
-  // The root is resolved once per call, before anything is touched: every path
-  // check below is against a directory that really exists, so a `root:` naming
-  // one that does not is reported as itself rather than as every path inside it
-  // failing to resolve.
-  const root = await builtinRoot(binding);
-  switch (binding.tool) {
-    case "bash":
-      return await runBuiltinBash(binding, root, String(args.command), context);
-    case "read_file":
-      return await readWithinRoot(binding, root, String(args.path));
-    case "write_file":
-      return await writeWithinRoot(binding, root, String(args.path), String(args.content));
-    case "list":
-      return await listWithinRoot(binding, root, String(args.path), String(args.glob), context);
-    default:
-      // Unreachable over a project this compiler emitted: the set is closed in
-      // the grammar and the emitter writes one of the four. Said rather than
-      // defaulted to a branch, because a fifth name reaching here should stop
-      // rather than quietly list a directory.
-      throw new Error(`\`builtin.${binding.tool}\` is not a built-in this runtime implements`);
-  }
+  // Resolved once per call, before anything is touched: every path check below
+  // is against a directory that really exists, so a `workspace:` naming one that
+  // does not is reported as itself rather than as every path inside it failing
+  // to resolve.
+  const workspace = await builtinWorkspace(binding, context);
+  if (binding.tool === "bash") return await runBuiltinBash(binding, workspace, args, context);
+  return await runBuiltinFiles(workspace, args);
 }
 
 /**
- * The attachment's `root:`, resolved to a real directory.
+ * The directory this call works in: the binding's `workspace:`, or the
+ * execution's own.
  *
- * `realpath`, not a normalization: the containment rule of PRD resolved q31 is
- * "resolution, not string prefix — symlinks and `..` count", and comparing a
- * resolved target against an unresolved root would answer the question about two
- * different directories. A root that is itself a symlink is perfectly legal; it
- * is the *resolved* one that bounds the calls.
+ * A **written** workspace is resolved with `realpath` rather than normalized,
+ * because the containment rule of PRD resolved q54 is resolution rather than
+ * string prefix — symlinks and `..` count — and comparing a resolved target
+ * against an unresolved root would answer the question about two different
+ * directories. A workspace that is itself a symlink is perfectly legal; it is
+ * the *resolved* one that bounds the calls.
  *
- * A root that does not exist fails the call as an execution failure, so the
- * node's `retry:`/`on_error:` decides it (Decision D119). The message quotes the
- * root **as written**, which is what keeps a resolved `${WORKSPACE}` out of a
- * field the trace carries (`docs/trace.md` §11.1).
+ * One that does not exist fails the call as an execution failure, so the node's
+ * `retry:`/`on_error:` decides it (Decision D119): a model cannot make a
+ * directory exist by calling differently. The message quotes it **as written**,
+ * which is what keeps a resolved `${WORKSPACE}` out of a field the trace carries
+ * (`docs/trace.md` §11.1).
  *
- * A root that resolves to **nothing** fails the same way, and is checked before
+ * One that resolves to **nothing** fails the same way, and is checked before
  * anything else because it is the one empty answer the file system would accept:
- * `path.resolve("")` is this process's working directory, so an attachment whose
+ * `path.resolve("")` is this process's working directory, so a binding whose
  * `${WORKSPACE}` came back empty would silently bound the tool to wherever the
- * runtime happened to be started — the ambient capability grammar 5.5 and D123
- * refuse in their own words. The parser refuses an empty `root:` as written; this
- * is the same rule where only the environment can break it.
+ * runtime happened to be started — the ambient capability grammar 6.1 refuses in
+ * its own words. The parser refuses an empty `workspace:` as written; this is
+ * the same rule where only the environment can break it.
  */
-async function builtinRoot(binding: BuiltinBinding): Promise<string> {
-  const written = asWritten(binding.root);
-  const declared = interpolate(binding.root);
+async function builtinWorkspace(binding: BuiltinBinding, context: RunContext): Promise<string> {
+  if (binding.workspace.length === 0) return await sharedWorkspace(context.execution.id);
+  const written = asWritten(binding.workspace);
+  const declared = interpolate(binding.workspace);
   if (declared.trim() === "") {
     throw new Error(
-      `\`builtin.${binding.tool}\`'s \`root:\` \`${written}\` resolved to nothing, and a tool bounded to nothing would be bounded to whatever directory this process was started in`,
+      `\`builtin.${binding.tool}\`'s \`workspace:\` \`${written}\` resolved to nothing, and a tool bounded to nothing would be bounded to whatever directory this process was started in`,
     );
   }
   const resolved = await realpathOrAbsent(path.resolve(declared));
   const directory =
-    resolved === undefined ? false : await fs.promises.stat(resolved).then(
-      (entry) => entry.isDirectory(),
-      () => false,
-    );
+    resolved === undefined
+      ? false
+      : await fs.promises.stat(resolved).then(
+          (entry) => entry.isDirectory(),
+          () => false,
+        );
   if (resolved === undefined || !directory) {
     throw new Error(
-      `\`builtin.${binding.tool}\`'s \`root:\` \`${written}\` is not a directory that exists, and every path this tool takes resolves inside it`,
+      `\`builtin.${binding.tool}\`'s \`workspace:\` \`${written}\` is not a directory that exists, and every path this tool takes resolves inside it`,
     );
   }
   return resolved;
 }
 
 /**
- * Whether a resolved path is the root or sits beneath it.
+ * The execution's own workspace: one fresh directory, shared by every built-in
+ * of that execution that wrote no `workspace:` (grammar 6.1).
+ *
+ * Under the project's data directory rather than the platform's temporary one,
+ * for the reason everything else a run leaves behind is: a person asking where
+ * an agent's files went finds them beside the journal and the traces, and a
+ * directory the operating system may sweep under a running process is a
+ * workspace that vanishes mid-node. The generated `README.md` names the layout.
+ *
+ * **One per execution, not one per tool**, because a composition whose agent
+ * writes a file with `builtin.files` and then compiles it with `builtin.bash` is
+ * the shape these two tools exist for. The *promise* is memoized rather than the
+ * path, so two calls racing in one superstep make one directory.
+ *
+ * A **worker** running a placed agent reaches this too, and there the execution
+ * ends with the dispatch (`docs/distributed.md` §3.2): that process runs one
+ * node and exits, so the directory is that node's and goes on the way out. What
+ * a placed built-in shares with the rest of its execution is the placement, not
+ * the disk — which is what "the machine with the capability" already means.
+ */
+async function sharedWorkspace(execution: string): Promise<string> {
+  const held = executionWorkspaces.get(execution);
+  if (held !== undefined) return await held;
+  const made = (async (): Promise<string> => {
+    const directory = path.join(dataRoot(), "workspaces", execution);
+    await fs.promises.mkdir(directory, { recursive: true });
+    // `realpath` for [`builtinWorkspace`]'s reason: `AGENT_COMPOSE_DATA_DIR` is
+    // a path a person typed and may reach the directory through a symlink,
+    // and containment compares resolved locations.
+    return await fs.promises.realpath(directory);
+  })();
+  executionWorkspaces.set(execution, made);
+  return await made;
+}
+
+/** The workspaces this process has made, by execution ([`sharedWorkspace`]). */
+const executionWorkspaces = new Map<string, Promise<string>>();
+
+/**
+ * Remove what an execution's built-ins were given, or leave it standing for the
+ * generation that will finish the run.
+ *
+ * `scope: execution` read for a directory: what this run's own workspace held
+ * goes when the run ends, however it ended — a `serve` process runs many
+ * executions, and a workspace that stayed would be both a leak and a lifetime
+ * the composition did not declare.
+ *
+ * **Unless the run has not ended.** An execution whose journal row stays open —
+ * parked at a `human` pause, stopped by a divergence — is one a resume replays,
+ * and what it wrote has to still be there when the resumed generation runs past
+ * the frontier: a file the recorded prefix created is a file the next command
+ * expects to find. It is the rule `./stores.ts` follows for a `scope: execution`
+ * store, decided by the same predicate (`staysOpen`) for the same reason
+ * (`docs/durability.md` §5).
+ *
+ * A binding that wrote its own `workspace:` is untouched: the composition named
+ * that directory, so its lifetime is the composition's rather than this run's.
+ */
+export async function releaseWorkspaces(execution: string, parked: boolean): Promise<void> {
+  const held = executionWorkspaces.get(execution);
+  if (held === undefined) return;
+  executionWorkspaces.delete(execution);
+  if (parked) return;
+  const directory = await held.catch(() => undefined);
+  if (directory === undefined) return;
+  await fs.promises.rm(directory, { recursive: true, force: true }).catch(() => {
+    // A workspace that would not go is not this run's outcome. What is left
+    // behind is a directory under `.agent-compose/`, which the generated
+    // `README.md` says is safe to remove.
+  });
+}
+
+/**
+ * Whether a resolved path is the workspace or sits beneath it.
  *
  * Both sides are already `realpath`ed by the time this is asked, which is what
  * makes a string comparison the right one *here* and the wrong one anywhere
  * else: what is being compared is two real locations, not two spellings.
  */
-function withinRoot(root: string, target: string): boolean {
-  if (target === root) return true;
-  const prefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+function withinWorkspace(workspace: string, target: string): boolean {
+  if (target === workspace) return true;
+  const prefix = workspace.endsWith(path.sep) ? workspace : `${workspace}${path.sep}`;
   return target.startsWith(prefix);
 }
 
 /**
- * The real path one argument names, refused if it lands outside the root.
+ * The real path one `files` argument names, **refused** if it lands outside the
+ * workspace (PRD resolved q54, Decision D119).
  *
  * Three cases, and the middle one is why this is not one `realpath` call:
  *
  *  * the path **exists** — it is resolved whole, symlinks and all, and checked;
- *  * it does **not exist yet**, which is every `write_file` to a new file: its
+ *  * it does **not exist yet**, which is every `create` of a new file: its
  *    *parent* is resolved and the last component appended, so a write through a
  *    symlinked directory is still checked against where that directory really
  *    is;
  *  * its parent does not exist either, where there is nothing left to resolve
  *    and the lexically-resolved path is checked. `path.resolve` has already
- *    collapsed every `..`, so a climb out of the root is refused here as surely
- *    as anywhere else, and the call then fails on the missing directory.
+ *    collapsed every `..`, so a climb out of the workspace is refused here as
+ *    surely as anywhere else, and the call then fails on the missing directory.
  *
  * A **dangling symlink** is refused rather than written through, and that is the
  * case the middle branch would otherwise get wrong: `writeFile` follows a
- * symlink, so a link inside the root pointing at a file outside it that does not
- * exist yet would be a write outside the root with every check passed.
+ * symlink, so a link inside the workspace pointing at a file outside it that
+ * does not exist yet would be a write outside the workspace with every check
+ * passed.
+ *
+ * The refusal goes **back to the model**: it chose the path and can choose
+ * another, which is exactly what Decision D119 divides on.
  */
-async function targetWithinRoot(
-  binding: BuiltinBinding,
-  root: string,
+async function targetWithinWorkspace(
+  workspace: string,
   requested: string,
 ): Promise<string> {
-  const absolute = path.resolve(root, requested);
+  const absolute = path.resolve(workspace, requested);
   const resolved = await realpathOrAbsent(absolute);
   let target = resolved;
   if (target === undefined) {
@@ -3952,16 +4271,16 @@ async function targetWithinRoot(
       () => false,
     );
     if (link) {
-      throw new Error(
-        `\`builtin.${binding.tool}\` will not follow \`${requested}\`: it is a symbolic link whose target does not exist, so where it points cannot be checked against \`root:\` \`${asWritten(binding.root)}\``,
+      throw new ToolCallRefused(
+        `\`${FILE_TOOL}\` will not follow \`${requested}\`: it is a symbolic link whose target does not exist, so where it points cannot be checked against this tool's workspace`,
       );
     }
     const parent = await realpathOrAbsent(path.dirname(absolute));
     target = parent === undefined ? absolute : path.join(parent, path.basename(absolute));
   }
-  if (!withinRoot(root, target)) {
-    throw new Error(
-      `\`builtin.${binding.tool}\` refused \`${requested}\`: it resolves outside \`root:\` \`${asWritten(binding.root)}\`, which is the directory this tool is bounded to`,
+  if (!withinWorkspace(workspace, target)) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` refused \`${requested}\`: it resolves outside this tool's workspace, which every path it takes is relative to. Ask again with a path inside the workspace — one with no leading \`/\`, and no \`..\` that climbs out of it`,
     );
   }
   return target;
@@ -3975,26 +4294,484 @@ async function realpathOrAbsent(target: string): Promise<string | undefined> {
   );
 }
 
+// ---------------------------------------------------------------------------
+// `builtin.bash`: one shell session per node activity
+// ---------------------------------------------------------------------------
+
+/**
+ * One `builtin.bash` shell, held for as long as the agent node activity that
+ * opened it (PRD resolved q54).
+ *
+ * A session rather than a fork per command, because the two are different tools
+ * to a model: `cd build` followed by `make` is one thought, and a runtime that
+ * forked twice would answer the second call from the workspace root with the
+ * model's own account of what it had already done as the only record. So the
+ * shell is a child process with its standard input open, commands are *typed*
+ * into it, and its working directory, its variables, its functions and its shell
+ * options carry from one call to the next.
+ *
+ * **Where a session begins and ends is the node activity**, which is the
+ * ordinal-reset rule read for a shell: an agent-node `retry:` runs the activity
+ * again, and the second attempt opens a shell of its own rather than inheriting
+ * the directory the failed attempt happened to be in — the same statement
+ * grammar 9.4 makes about the keys a retried attempt derives. [`callAgent`] ends
+ * them ([`endShellSessions`]) whichever way its loop leaves.
+ */
+interface ShellSession {
+  /** The shell itself. */
+  readonly child: ReturnType<typeof forkBoundShell>;
+  /** What the marker protocol is keyed on: one random id per session. */
+  readonly marker: string;
+  /** What has been read off each pipe since the last command settled. */
+  stdout: string;
+  stderr: string;
+  /** Where the command in flight is answered, if one is. */
+  pending?: (settled: ShellAnswer) => void;
+  /** Whether this shell is gone — killed, or exited under the model. */
+  ended: boolean;
+  /** How it went, for the notice the next call carries. */
+  ending?: string;
+}
+
+/** What one typed command answered. */
+interface ShellAnswer {
+  readonly stdout: string;
+  readonly stderr: string;
+  /** `$?`, absent where no command completed. */
+  readonly code?: number;
+  /** Whether the command outran the binding's `timeout:` and was killed. */
+  readonly timedOut?: boolean;
+  /** How the *session* ended under the command, where it did. */
+  readonly ended?: string;
+}
+
+/**
+ * The shells one node activity is holding, keyed by the binding that opened
+ * each.
+ *
+ * A `WeakMap` on the **context**, which is what makes "one session per node
+ * activity" a fact of the structure rather than a convention: [`runActivity`]
+ * builds one context per attempt and hands it to the activity, so two attempts
+ * of one node are two keys and a `map`'s dispatched items are one key each.
+ * Nothing enumerates it — [`endShellSessions`] is handed the context it is
+ * closing — so a context that ended without reaching that call is collected with
+ * its sessions rather than held for the life of the process.
+ *
+ * Keyed **within** a context by the binding as written, because two `bash` tools
+ * on one agent are two shells: different workspaces, different environments,
+ * different bounds. One tool attached twice is one shell, which is what an
+ * author means by attaching one tool.
+ */
+const shellSessions = new WeakMap<RunContext, Map<string, ShellSession>>();
+
+/** The key one binding's session is held under ([`shellSessions`]). */
+function sessionKeyOf(binding: BuiltinBinding): string {
+  return JSON.stringify([
+    asWritten(binding.workspace),
+    binding.timeout?.written ?? "",
+    binding.env.map((entry) => [entry.name, asWritten(entry.value)]),
+    binding.inheritEnv === true,
+  ]);
+}
+
+/**
+ * End every shell one node activity opened.
+ *
+ * Called by [`callAgent`] on its way out, however it leaves: the session is the
+ * activity's, and a shell that outlived it would be a process holding the event
+ * loop open with a working directory inside a workspace the run may be about to
+ * remove. A node deadline that abandons the activity mid-call is covered by the
+ * abort listener each session registers instead, which fires where there is no
+ * `finally` left to run.
+ */
+export function endShellSessions(context: RunContext): void {
+  const held = shellSessions.get(context);
+  if (held === undefined) return;
+  shellSessions.delete(context);
+  for (const session of held.values()) endShell(session, "the agent node that opened it ended");
+}
+
+/** End one shell, and the process group it leads. */
+function endShell(session: ShellSession, why: string): void {
+  if (!session.ended) {
+    session.ended = true;
+    session.ending = why;
+    killCommandGroup(session.child);
+    releaseCommand(session.child);
+  }
+  const pending = session.pending;
+  session.pending = undefined;
+  pending?.({ stdout: session.stdout, stderr: session.stderr, ended: why });
+}
+
+/**
+ * The session this call runs in, opened where the activity has none.
+ *
+ * A shell that **ended** — killed at a command deadline, or exited because the
+ * model typed `exit` — is replaced here rather than reported as a failure: the
+ * model asked for a command, and a runtime that answered "your shell is gone"
+ * would spend an iteration of the loop on bookkeeping. What it *is* told is that
+ * the state went with it, which is the part it has to know
+ * ([`shellNotice`]).
+ */
+async function shellFor(
+  binding: BuiltinBinding,
+  workspace: string,
+  context: RunContext,
+): Promise<{ session: ShellSession; restarted?: string }> {
+  let held = shellSessions.get(context);
+  if (held === undefined) {
+    held = new Map<string, ShellSession>();
+    shellSessions.set(context, held);
+  }
+  const key = sessionKeyOf(binding);
+  const existing = held.get(key);
+  if (existing !== undefined && !existing.ended) return { session: existing };
+  const session = await openShell(binding, workspace, context);
+  held.set(key, session);
+  return existing === undefined ? { session } : { session, restarted: existing.ending };
+}
+
+/**
+ * Fork one `builtin.bash` shell into a process group of its own, with the stop
+ * sweep armed **first**.
+ *
+ * The one place a shell is forked, and it exists to make that ordering a fact
+ * rather than a habit: the arming and the fork are two adjacent statements whose
+ * order is the whole of [`armCommandSweep`]'s window argument, and a call site
+ * that reached `spawn` directly would reopen it. `crates/compose-core/src/
+ * codegen/runtime.rs` reads this body and holds the two lines in this order.
+ *
+ * `detached` is what puts the shell in a group of its own (see
+ * [`killCommandGroup`] for why the group is the unit). There is no `signal:`
+ * here, because the shell outlives the call: what ends it is [`endShell`], from
+ * the node's abort listener, from [`callAgent`]'s way out, or from a command's
+ * own deadline.
+ *
+ * The **executable is resolved before the fork** rather than looked up by name,
+ * because the child's environment is scrubbed: `spawn` resolves the program
+ * against the environment it is *giving the child*, so a `bash` looked up by
+ * name would be looked for on a `PATH` the binding may never have declared.
+ * Resolving it here keeps PRD resolved q54's posture — the shell comes off *this
+ * process's* `PATH` at the call, and a host without one fails the call naming
+ * the requirement — while the child still sees only what the binding declared.
+ *
+ * The return type is **inferred** rather than written, which is the one place
+ * this file leaves one off: the overload `spawn` resolves for this `stdio` tuple
+ * types the three pipes as streams, and naming a wider type here would put a
+ * null check on every read of them for a stream this call can never be without.
+ */
+function forkBoundShell(executable: string, workspace: string, environment: NodeJS.ProcessEnv) {
+  armCommandSweep();
+  try {
+    return spawn(executable, SHELL_ARGUMENTS, {
+      cwd: workspace,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+      env: environment,
+    });
+  } catch (error) {
+    if (runningCommands.size === 0) standDown();
+    throw error;
+  }
+}
+
+/**
+ * How the shell is started: no startup files, and commands off standard input.
+ *
+ * `--noprofile --norc` because a session that read a person's shell
+ * configuration would answer differently on two machines running one
+ * composition — and, under the scrubbed environment, would be looking for those
+ * files with no `HOME` to find them under. `-s` is "read commands from standard
+ * input", which is what makes this a session rather than a command.
+ */
+const SHELL_ARGUMENTS = ["--noprofile", "--norc", "-s"];
+
+/** Open one shell for this binding, in this workspace. */
+async function openShell(
+  binding: BuiltinBinding,
+  workspace: string,
+  context: RunContext,
+): Promise<ShellSession> {
+  const executable = await shellExecutable();
+  const child = forkBoundShell(executable, workspace, shellEnvironment(binding));
+  holdCommand(child);
+  const session: ShellSession = {
+    child,
+    marker: `__agent_compose_${globalThis.crypto.randomUUID().replace(/-/g, "")}`,
+    stdout: "",
+    stderr: "",
+    ended: false,
+  };
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    session.stdout += chunk;
+    settleShell(session);
+  });
+  child.stderr.on("data", (chunk: string) => {
+    session.stderr += chunk;
+    settleShell(session);
+  });
+  // A shell this runtime could not start — no such file, a `bash` that is not
+  // executable — arrives here rather than as a throw, and ends the session with
+  // the reason. The call waiting on it is answered by [`endShell`].
+  child.on("error", (error) => endShell(session, `the shell could not be run: ${describe(error)}`));
+  child.on("close", () => endShell(session, "the shell exited"));
+  // A node deadline (grammar 9.2) or a cancelled run aborts the context's
+  // signal, and a shell is the one thing a compiled graph holds that would go on
+  // running afterwards: the node has stopped waiting and the process group is
+  // still inside the workspace. Registered once per session rather than once per
+  // command, because the session is what outlives a call.
+  context.signal.addEventListener("abort", () => endShell(session, "the run was stopped"), {
+    once: true,
+  });
+  return session;
+}
+
+/**
+ * The environment the shell and its children run with (PRD resolved q54
+ * ruling b).
+ *
+ * **Scrubbed by default**: only what the binding declared, so a placement's
+ * environment manifest is the whole answer to what a machine is asked for
+ * (resolved q41) and a model-authored command cannot read a credential nobody
+ * handed it. `inherit_env: true` is the explicit opt-in for the machines where
+ * inheriting is the point, and a declared `env:` still layers over it — the
+ * binding is the author's statement about this process's environment, exactly as
+ * it is for an `exec:` tool.
+ *
+ * A scrubbed environment has no `PATH`, and `bash` supplies its compiled-in
+ * default where it finds none — which is why the shorthand is usable at all on
+ * an ordinary host. A composition that wants a `PATH` it can name declares one,
+ * which is what the `env:` in grammar 6.1's own example is.
+ */
+function shellEnvironment(binding: BuiltinBinding): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv =
+    binding.inheritEnv === true ? { ...process.env } : {};
+  for (const entry of binding.env) environment[entry.name] = interpolate(entry.value);
+  return environment;
+}
+
+/**
+ * Where `bash` is on this host, resolved from **this process's** `PATH` at the
+ * call.
+ *
+ * The posture PRD resolved q54 fixes: a host with no shell fails the call as an
+ * execution failure naming the requirement, rather than the compiler deciding at
+ * build time what a deployment machine has.
+ */
+async function shellExecutable(): Promise<string> {
+  for (const directory of (process.env["PATH"] ?? "").split(path.delimiter)) {
+    if (directory === "") continue;
+    const candidate = path.join(directory, "bash");
+    const usable = await fs.promises.access(candidate, fs.constants.X_OK).then(
+      () => true,
+      () => false,
+    );
+    if (usable) return candidate;
+  }
+  throw new Error(
+    "`builtin.bash` could not be run: this host has no `bash` on `PATH`, which the tool resolves it from at the call",
+  );
+}
+
+/**
+ * Run one command in this activity's shell and answer with what it printed
+ * (grammar 5.5, 6.1, PRD resolved q54).
+ *
+ * **An exit status is an answer, not a failure.** A command that exited nonzero
+ * is a fact the model asked for — a test that failed, a file that was not there
+ * — and the model is what decides what to do about it, so the status comes back
+ * beside the output rather than ending the node. It is the split Decision D119
+ * draws everywhere else, read where the *model* writes the program: what fails
+ * the node is the tool being unusable — no shell on the host, a workspace that
+ * does not exist — and never what a command said.
+ *
+ * **A command that outruns its bound is killed and reported**, for that same
+ * reason. The kill takes the shell's whole process group, because the shell is
+ * almost never where the work is (`npm run build`, `a | b`,
+ * `(cd sub && make)` are all `bash` forking) — so the session goes with it and
+ * the next call opens a fresh one in the workspace. The model is told exactly
+ * that, because the shell state it was relying on is what it lost.
+ */
+async function runBuiltinBash(
+  binding: BuiltinBinding,
+  workspace: string,
+  args: Record<string, unknown>,
+  context: RunContext,
+): Promise<unknown> {
+  const command = typeof args["command"] === "string" ? args["command"] : "";
+  const restart = args["restart"] === true;
+  if (!restart && command.trim() === "") {
+    // The one shape the schema admits and the tool cannot: `restart` is
+    // optional, so `{}` parses, and a call with neither a command nor a restart
+    // has asked for nothing. Back to the model, which can say which it meant
+    // (Decision D119).
+    throw new ToolCallRefused(
+      "`bash` was called with no `command` and no `restart`: send the shell command to run, or `restart: true` to start a fresh shell session",
+    );
+  }
+  if (restart) {
+    const held = shellSessions.get(context)?.get(sessionKeyOf(binding));
+    if (held !== undefined) endShell(held, "the model asked for a restart");
+    // Opened here rather than left to the next call, so a `restart` that cannot
+    // open a shell fails now — with the reason — instead of on whatever command
+    // follows it.
+    await shellFor(binding, workspace, context);
+    return {
+      stdout: "",
+      stderr: "",
+      exit_code: 0,
+      notice:
+        "the shell session was restarted: its working directory is the workspace again, and no shell state carried over",
+    };
+  }
+  const { session, restarted } = await shellFor(binding, workspace, context);
+  const answer = await typeIntoShell(session, command, binding.timeout, context);
+  const notice = shellNotice(binding, answer, restarted);
+  return {
+    stdout: capped(answer.stdout, BUILTIN_OUTPUT_LIMIT),
+    stderr: capped(answer.stderr, BUILTIN_OUTPUT_LIMIT),
+    ...(answer.code === undefined ? {} : { exit_code: answer.code }),
+    ...(answer.timedOut === true ? { timed_out: true } : {}),
+    ...(notice === undefined ? {} : { notice }),
+  };
+}
+
+/** What the model is told about its *session*, beside what the command printed. */
+function shellNotice(
+  binding: BuiltinBinding,
+  answer: ShellAnswer,
+  restarted: string | undefined,
+): string | undefined {
+  const next =
+    "the next call opens a fresh shell in the workspace, with none of this session's state";
+  if (answer.timedOut === true) {
+    return `the command ran longer than \`${binding.timeout?.written ?? ""}\` and was killed, with what it had printed by then returned above; ${next}`;
+  }
+  if (answer.ended !== undefined) return `${answer.ended}; ${next}`;
+  if (restarted !== undefined) {
+    return `${restarted}, so this command ran in a fresh shell in the workspace, with none of the previous session's state`;
+  }
+  return undefined;
+}
+
+/**
+ * Type one command into a live shell and wait for the marker that closes it.
+ *
+ * A session cannot be asked "has the command finished" the way a forked one can
+ * — nothing exits — so the shell is asked to **say so**: the command is followed
+ * by two `printf`s writing a per-session marker, one to each stream, and the
+ * call settles when both have arrived. The exit status rides the stdout marker,
+ * which is the one place `$?` is still the command's.
+ *
+ * The marker is random per session rather than a constant, so text the *model*
+ * writes cannot close a command early by printing one — a `printf` of a fixed
+ * string would be a command able to make its own status up. It is not a boundary
+ * against a command that reads its own environment: the trust level is the one
+ * D135 names, and this is about accidents rather than about containment.
+ *
+ * Three things end the wait besides the marker, and each is answered where it
+ * belongs: the command's own deadline and a shell that exited under it are facts
+ * about the model's program and come back to the model, while a **cancelled
+ * run** is raised as it came, because there is no model left to answer.
+ */
+async function typeIntoShell(
+  session: ShellSession,
+  command: string,
+  bound: BuiltinBinding["timeout"],
+  context: RunContext,
+): Promise<ShellAnswer> {
+  if (context.signal.aborted) throw abortReason(context.signal);
+  // Nothing the last command left is this one's. A background job it started can
+  // still be writing, and that output belongs to the call that started it.
+  session.stdout = "";
+  session.stderr = "";
+  const answer = await new Promise<ShellAnswer>((resolve) => {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settle = (settled: ShellAnswer): void => {
+      if (done) return;
+      done = true;
+      if (timer !== undefined) clearTimeout(timer);
+      session.pending = undefined;
+      resolve(settled);
+    };
+    if (bound !== undefined) {
+      timer = setTimeout(() => {
+        const printed = { stdout: session.stdout, stderr: session.stderr };
+        // Taken away from [`endShell`] first: the kill settles whatever call the
+        // session is holding, and this call is the deadline's to answer.
+        session.pending = undefined;
+        endShell(session, "the command outran its bound");
+        settle({ ...printed, timedOut: true });
+      }, bound.millis);
+    }
+    session.pending = settle;
+    // `$?` is read into a variable first, because the `printf` that reports it
+    // would otherwise be what `$?` is about.
+    session.child.stdin.write(
+      `${command}\n${session.marker}_status=$?\nprintf '\\n%s:%s\\n' '${session.marker}' "$${session.marker}_status"\nprintf '\\n%s\\n' '${session.marker}' >&2\n`,
+    );
+  });
+  if (context.signal.aborted) throw abortReason(context.signal);
+  return answer;
+}
+
+/**
+ * Settle the command in flight where both of its markers have arrived.
+ *
+ * Both, and in the order the shell wrote them rather than the order they were
+ * read: the two pipes are independent, so a command whose stderr arrives after
+ * its stdout marker would otherwise be answered with the stderr of a command
+ * that had not finished being reported.
+ *
+ * What follows a marker is **kept**, because it is the next command's: a
+ * background job's late output, or the tail of a stream the platform delivered
+ * in one chunk with the marker in the middle of it.
+ */
+function settleShell(session: ShellSession): void {
+  const pending = session.pending;
+  if (pending === undefined) return;
+  const closing = `\n${session.marker}:`;
+  const at = session.stdout.indexOf(closing);
+  if (at < 0) return;
+  const rest = session.stdout.slice(at + closing.length);
+  const ends = rest.indexOf("\n");
+  if (ends < 0) return;
+  const marked = `\n${session.marker}\n`;
+  const errored = session.stderr.indexOf(marked);
+  if (errored < 0) return;
+  const status = Number.parseInt(rest.slice(0, ends), 10);
+  const stdout = session.stdout.slice(0, at);
+  const stderr = session.stderr.slice(0, errored);
+  session.stdout = rest.slice(ends + 1);
+  session.stderr = session.stderr.slice(errored + marked.length);
+  session.pending = undefined;
+  pending({ stdout, stderr, ...(Number.isNaN(status) ? {} : { code: status }) });
+}
+
 /**
  * Kill a `builtin.bash` shell **and every process it started**.
  *
  * The shell is spawned `detached`, which on a POSIX host makes it the leader of
  * a process group of its own; a signal sent to the negated pid goes to the whole
- * group, which is where the command's real work lives. That distinction is the
- * whole point of this function: `bash -c 'npm run build'` is a shell that forks,
- * and a `SIGKILL` aimed at the shell's own pid ends the shell while the build
- * keeps compiling — inside the very `root:` the attachment bounded it to, for as
- * long after the node failed as it likes.
+ * group, which is where the commands' real work lives. That distinction is the
+ * whole point of this function: `npm run build` is a shell that forks, and a
+ * `SIGKILL` aimed at the session's own pid ends the session while the build
+ * keeps compiling — inside the very workspace the binding bounded it to, for as
+ * long after the node ended as it likes.
  *
  * What still escapes is what **left the group deliberately**: a command that
- * calls `setsid`, a shell that turned job control on (`set -m`), a daemon that
+ * calls `setsid`, one that turned job control on (`set -m`), a daemon that
  * double-forks away. Those are the same processes a hand-rolled `exec:` tool
- * would have left behind, and containing them is the distribution work's, not
+ * would leave behind, and containing them is the distribution work's rather than
  * this bound's (grammar 5.5, Decision D124).
  *
  * The fallback is for the host where the group kill is not a thing —
  * `process.kill` with a negative pid is a POSIX call, and Windows is a posture
- * q31 defers — where killing the shell alone is still better than killing
+ * q54 defers — where killing the shell alone is still better than killing
  * nothing. Both are guarded: a group that has already gone answers `ESRCH`, and
  * a spawn that never started has no pid to aim at.
  */
@@ -4024,15 +4801,15 @@ const SWEPT_SIGNALS = ["SIGINT", "SIGTERM"] as const;
 const commandSweeps: (() => void)[] = [];
 
 /**
- * Arrange for a stop signal to take a command's process group with it, from
+ * Arrange for a stop signal to take a shell's process group with it, from
  * **before** the shell that group belongs to exists.
  *
- * A detached command is a command the **terminal** can no longer reach: its
- * group is not the foreground one any more, so the `SIGINT` a person types
- * reaches this process and nothing below it. Left there, `Ctrl-C` on a `run`
- * would end the graph and leave the build it was in the middle of still writing
- * into `root:` — a regression against a hand-rolled `exec:` tool, whose child
- * *is* in that group and does die. So the group a call detached is swept here
+ * A detached shell is one the **terminal** can no longer reach: its group is not
+ * the foreground one any more, so the `SIGINT` a person types reaches this
+ * process and nothing below it. Left there, `Ctrl-C` on a `run` would end the
+ * graph and leave the build it was in the middle of still writing into the
+ * workspace — a regression against a hand-rolled `exec:` tool, whose child *is*
+ * in that group and does die. So the group a session detached is swept here
  * instead, and what the terminal used to do the runtime now does.
  *
  * **Armed before the fork rather than after it**, which is an ordering and not a
@@ -4041,21 +4818,21 @@ const commandSweeps: (() => void)[] = [];
  * default ends this process where it stands — nothing runs, this module
  * included. A shell forked before that call is therefore a shell whose group a
  * `Ctrl-C` in the window between the two would leave running, with the graph
- * that started it gone: exactly the escape the sweep exists to close, in the
- * one instant it is easiest to reach. Once the handler is installed the window
+ * that started it gone: exactly the escape the sweep exists to close, in the one
+ * instant it is easiest to reach. Once the handler is installed the window
  * cannot reopen — a listener runs between turns of the loop, and the spawn and
  * the [`holdCommand`] beside it are one turn — so arming first is the whole of
  * the fix. `crates/compose-core/src/codegen/runtime.rs` pins the order.
  *
  * Two properties keep this from being a runtime that seizes an embedder's
- * signals. The handlers exist **only while a command does** — armed for the
- * first, removed with the last, so a process that is not running one has exactly
- * the disposition it had before this module was imported, and a spawn that
- * throws stands them down again on its way out. And the sweep **re-raises**: it
- * kills the groups, stands down, and delivers the same signal again, so whatever
- * would have happened — `serve`'s own handler closing the app
- * (`src/serve.ts`), or the default disposition ending the process — happens,
- * unchanged and with the same exit status (grammar 5.5, Decision D124).
+ * signals. The handlers exist **only while a shell does** — armed for the first,
+ * removed with the last, so a process running none has exactly the disposition
+ * it had before this module was imported, and a spawn that throws stands them
+ * down again on its way out. And the sweep **re-raises**: it kills the groups,
+ * stands down, and delivers the same signal again, so whatever would have
+ * happened — `serve`'s own handler closing the app (`src/serve.ts`), or the
+ * default disposition ending the process — happens, unchanged and with the same
+ * exit status (grammar 5.5, Decision D124).
  */
 function armCommandSweep(): void {
   if (commandSweeps.length > 0) return;
@@ -4071,55 +4848,13 @@ function armCommandSweep(): void {
   }
 }
 
-/** Register a running command with the sweep [`armCommandSweep`] armed. */
+/** Register a running shell with the sweep [`armCommandSweep`] armed. */
 function holdCommand(child: ChildProcess): void {
   armCommandSweep();
   runningCommands.add(child);
 }
 
-/**
- * Fork one `builtin.bash` shell into a process group of its own, with the stop
- * sweep armed **first**.
- *
- * The one place a shell is forked, and it exists to make that ordering a fact
- * rather than a habit: the arming and the fork are two adjacent statements whose
- * order is the whole of [`armCommandSweep`]'s window argument, and a call site
- * that reached `spawn` directly would reopen it. `crates/compose-core/src/
- * codegen/runtime.rs` reads this body and holds the two lines in this order.
- *
- * `detached` is what puts the shell in that group (see [`runBuiltinBash`] for
- * why the group is the unit), and `signal` is the node's, so a cancelled run
- * kills the shell the platform's own way with [`killCommandGroup`] sweeping up
- * behind it.
- *
- * A `spawn` that throws where it stands — a bad argument shape, rather than the
- * `error` event a missing `bash` arrives as — leaves no command running, so the
- * handlers stand down again on the way out: they exist only while a command
- * does, which is the property that keeps this from seizing an embedder's
- * signals.
- *
- * The return type is **inferred** rather than written, which is the one place
- * this file leaves one off: the overload `spawn` resolves for this `stdio` tuple
- * types `stdout` and `stderr` as streams, and naming a wider type here would put
- * a null check on every read of the pipes below for a stream this call can never
- * be without.
- */
-function forkBoundShell(command: string, root: string, signal: AbortSignal) {
-  armCommandSweep();
-  try {
-    return spawn("bash", ["-c", command], {
-      cwd: root,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-      signal,
-    });
-  } catch (error) {
-    if (runningCommands.size === 0) standDown();
-    throw error;
-  }
-}
-
-/** Drop a command that has ended, and the sweep with the last of them. */
+/** Drop a shell that has ended, and the sweep with the last of them. */
 function releaseCommand(child: ChildProcess): void {
   runningCommands.delete(child);
   if (runningCommands.size === 0) standDown();
@@ -4130,389 +4865,286 @@ function standDown(): void {
   for (const remove of commandSweeps.splice(0)) remove();
 }
 
-/**
- * Run one `builtin.bash` command (grammar 5.5, PRD resolved q31).
- *
- * `bash` is resolved from `PATH` at the call, which is the posture q31 fixes: a
- * host with no shell fails the call as an execution failure naming the
- * requirement, rather than the compiler deciding at build time what a deployment
- * machine has.
- *
- * The command runs with the attachment's root as its working directory and
- * under its `timeout:`. Both bounds are the attachment's and neither is the
- * model's to move. A command that exits nonzero, or that outruns the timeout and
- * is killed, **fails the node** — there is no `expect_exit:` here, because a
- * built-in has no per-call configuration surface for one to sit on.
- *
- * There is no standard input: the argument is the command, and a shell reading
- * from a stream nothing writes to would hang until the timeout took it.
- */
-async function runBuiltinBash(
-  binding: BuiltinBinding,
-  root: string,
-  command: string,
-  context: RunContext,
-): Promise<unknown> {
-  const bound = binding.timeout;
-  const spawned = new Promise<{ code: number; stdout: string; stderr: string; expired: boolean }>(
-    (resolve, reject) => {
-      // `detached` is what makes the deadline below bound the **command** rather
-      // than the shell that happens to be typing it. On a POSIX host it puts the
-      // shell in a process group of its own, and the group is what gets killed:
-      // a shell alone is almost never where the work is — `npm run build`,
-      // `a | b`, `(cd sub && make)` are all bash *forking*, and a kill aimed at
-      // the shell's pid leaves every one of those children running, still
-      // writing inside `root:`, for as long as they like after the node they
-      // belonged to has already failed. Under `retry:` that is two generations
-      // of the same command in one root with the graph believing one is live.
-      // See [`killCommandGroup`] for what the kill is and what still escapes it.
-      //
-      // …and detaching is also what puts the command out of the terminal's
-      // reach, which [`forkBoundShell`] is the answer to: it arms the sweep
-      // *before* the fork, so a stop signal this process is sent takes the
-      // group with it from the instant that group exists.
-      const child = forkBoundShell(command, root, context.signal);
-      holdCommand(child);
-      let stdout = "";
-      let stderr = "";
-      let expired = false;
-      // The deadline is enforced here rather than through the platform's own
-      // `timeout` option, which the two supported runtimes do not implement
-      // alike. `SIGKILL` rather than `SIGTERM`: the bound is what an author was
-      // promised, and a command that traps the polite signal would outlive it.
-      //
-      // And the call is settled **here**, rather than left to the `close` event
-      // the ordinary path resolves on. `close` waits for the child's output
-      // pipes to close as well as for the child to exit, and a process that put
-      // itself in a process group of its own — `bash -c 'set -m; sleep 30 &
-      // wait'` is the shape, and a double-forking daemon is the other — is out
-      // of reach of the group kill and can still be holding them, so a deadline
-      // that waited for `close` would be the command's to honour rather than the
-      // composition's. Resolving twice is harmless: the first settlement is the
-      // promise's, and the `close` that may still arrive finds it settled.
-      //
-      // Settling early is only half of ending a call, though, and [`abandon`]
-      // is the other half: the *promise* is settled but such an escapee still
-      // holds the pipes this runtime is still reading, so the `data` handlers
-      // below would go on appending to a buffer nobody will ever read, and the
-      // open handles would go on holding the event loop. In a long-lived host —
-      // `serve`, or anything embedding a compiled graph — that is unbounded
-      // memory growth and a process that will not exit, both of them minutes
-      // after the call they belong to was reported as failed. So the streams are
-      // dropped rather than merely ignored: what the deadline ends is the call
-      // *and* this runtime's hold on what outlived it.
-      const abandon = (): void => {
-        for (const stream of [child.stdout, child.stderr]) {
-          if (stream === null || stream === undefined) continue;
-          stream.removeAllListeners("data");
-          stream.destroy();
-        }
-        child.unref();
-      };
-      const timer =
-        bound === undefined
-          ? undefined
-          : setTimeout(() => {
-              expired = true;
-              killCommandGroup(child);
-              abandon();
-              settle();
-              resolve({ code: -1, stdout, stderr, expired: true });
-            }, bound.millis);
-      // A node deadline (grammar 9.2) or a cancelled run aborts the spawn's
-      // signal, and the platform answers that by killing the **shell** — the
-      // one pid it knows about. The command's own children are this call's to
-      // end for the same reason the timeout's are: a run somebody cancelled
-      // must not leave a build still writing into `root:`. Registered after the
-      // spawn, so the platform's kill lands first and this one sweeps the group
-      // it left behind; `abandon` stays the `error` handler's, which is where
-      // the abort arrives.
-      const swept = (): void => killCommandGroup(child);
-      context.signal.addEventListener("abort", swept, { once: true });
-      const settle = (): void => {
-        if (timer !== undefined) clearTimeout(timer);
-        context.signal.removeEventListener("abort", swept);
-        releaseCommand(child);
-      };
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString();
-      });
-      child.stderr.on("data", (chunk: Buffer) => {
-        stderr += chunk.toString();
-      });
-      child.on("error", (error) => {
-        settle();
-        // The same early settlement, reached the other way: the abort above
-        // rejects here while a process that left the group may still hold the
-        // pipes. A spawn that never started (no `bash` on `PATH`) has nothing to
-        // drop, which is what the guards in `abandon` are for.
-        abandon();
-        reject(error);
-      });
-      child.on("close", (code) => {
-        settle();
-        resolve({ code: code ?? -1, stdout, stderr, expired });
-      });
-    },
-  );
+// ---------------------------------------------------------------------------
+// `builtin.files`: the text editor, under the workspace
+// ---------------------------------------------------------------------------
 
-  let result: { code: number; stdout: string; stderr: string; expired: boolean };
-  try {
-    result = await spawned;
-  } catch (error) {
-    // A deadline on the *node*, or a run somebody cancelled, arrives here as an
-    // abort rather than as this call's failure, and is raised as it came.
-    if (context.signal.aborted) throw error;
-    const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
-    if (code === "ENOENT") {
-      throw new Error(
-        "`builtin.bash` could not be run: this host has no `bash` on `PATH`, which the tool resolves it from at the call",
+/**
+ * The name the model calls the file tool by, which is the provider's rather than
+ * this compiler's (grammar 6.1, PRD resolved q54 ruling d).
+ *
+ * On the Messages wire these go out as the provider-defined tool types, and each
+ * of those carries a name the wire dictates; the other wires declare the same
+ * name as an ordinary function tool, so one set of handlers serves all of them.
+ * Written here because it is what a **message** the model reads has to call it.
+ */
+const FILE_TOOL = "str_replace_based_edit_tool";
+
+/** The operations this file tool implements, in the order grammar 6.1 lists them. */
+const FILE_OPERATIONS = ["view", "create", "str_replace", "insert"] as const;
+
+/** One of them. */
+type FileOperation = (typeof FILE_OPERATIONS)[number];
+
+/** Whether a string the model sent names one. */
+function isFileOperation(value: string): value is FileOperation {
+  return (FILE_OPERATIONS as readonly string[]).includes(value);
+}
+
+/**
+ * Run one `builtin.files` call (grammar 5.5, 6.1, PRD resolved q54).
+ *
+ * The operations and their parameter names are Anthropic's text-editor tool's,
+ * because on the Messages wire this *is* that tool and a trained model fills
+ * exactly those names — so the same handlers serve the OpenAI wires, where the
+ * compiler declares the same shape as a function tool.
+ *
+ * **Every failure of a path is the model's to correct**, and goes back to it as
+ * a refusal (Decision D119): a path outside the workspace, a file that is not
+ * there, a `str_replace` that matched nothing or matched twice, a `create` with
+ * nothing to write. Each is a statement about arguments the model chose, and it
+ * can choose again — failing the agent node because a model guessed a filename
+ * wrong would end a run over something the next call would have fixed. What
+ * fails the node is the **workspace** being unusable, which no call can fix.
+ */
+async function runBuiltinFiles(
+  workspace: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const operation = String(args["command"] ?? "");
+  if (!isFileOperation(operation)) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` was asked for \`command: "${operation}"\`, which is not one of ${FILE_OPERATIONS.map((name) => `\`${name}\``).join(", ")}`,
+    );
+  }
+  const requested = String(args["path"] ?? "");
+  const target = await targetWithinWorkspace(workspace, requested);
+  const text = (name: string): string => (typeof args[name] === "string" ? args[name] : "");
+  switch (operation) {
+    case "view":
+      return await viewPath(requested, target);
+    case "create":
+      return await createFile(requested, target, text("file_text"));
+    case "str_replace":
+      return await replaceInFile(requested, target, text("old_str"), text("new_str"));
+    default:
+      return await insertIntoFile(
+        requested,
+        target,
+        typeof args["insert_line"] === "number" ? args["insert_line"] : 0,
+        text("new_str"),
       );
-    }
-    throw new Error(
-      `\`builtin.bash\` could not be run${code === undefined ? "" : ` (${code})`}`,
-    );
   }
-
-  if (result.expired) {
-    throw new Error(
-      `\`builtin.bash\` ran longer than \`${bound?.written ?? ""}\` and was killed${
-        result.stderr === "" ? "" : `: ${result.stderr.trim()}`
-      }`,
-    );
-  }
-  if (result.code !== 0) {
-    throw new Error(
-      `\`builtin.bash\` exited ${result.code}${result.stderr === "" ? "" : `: ${result.stderr.trim()}`}`,
-    );
-  }
-  return { stdout: result.stdout, stderr: result.stderr };
-}
-
-/** Read one file inside the root (grammar 5.5). */
-async function readWithinRoot(
-  binding: BuiltinBinding,
-  root: string,
-  requested: string,
-): Promise<unknown> {
-  const target = await targetWithinRoot(binding, root, requested);
-  try {
-    return { content: await fs.promises.readFile(target, "utf8") };
-  } catch (error) {
-    throw builtinFailure(binding, "read", requested, error);
-  }
-}
-
-/** Write one file inside the root, replacing it whole (grammar 5.5). */
-async function writeWithinRoot(
-  binding: BuiltinBinding,
-  root: string,
-  requested: string,
-  content: string,
-): Promise<unknown> {
-  const target = await targetWithinRoot(binding, root, requested);
-  try {
-    await fs.promises.writeFile(target, content, "utf8");
-  } catch (error) {
-    throw builtinFailure(binding, "write", requested, error);
-  }
-  return { bytes_written: Buffer.byteLength(content, "utf8") };
 }
 
 /**
- * List a directory inside the root, optionally through a glob (grammar 5.5).
+ * `view`: a file's contents with line numbers, or a directory's entries.
  *
- * With no glob the answer is the directory's own entries; with one it is a walk
- * beneath it, matched segment by segment. Either way the paths are relative to
- * the directory that was listed, a directory is reported with a trailing `/`,
- * and the order is lexicographic — a listing a model reads twice reads the same
- * both times.
+ * Numbered because the two editing operations are addressed by line — `insert`
+ * takes one, and a `str_replace` a model composes from a numbered view is one it
+ * can see is unique — and because it is what the provider-defined tool answers,
+ * so a trained model reads it without being told.
  *
- * **Symlinked directories are not descended into.** A link inside the root may
- * point anywhere, and a walk that followed one would report paths outside the
- * root without any path check having been asked. The link itself is still an
- * entry; reading it is a `read_file` call, where the check *is* asked.
+ * A directory is listed one level deep, its entries sorted, with a `/` on the
+ * ones that are directories. Not walked: a workspace holding a dependency tree
+ * would answer a `view` with a hundred thousand paths, and a model that wants
+ * one asks `bash` for it.
  */
-async function listWithinRoot(
-  binding: BuiltinBinding,
-  root: string,
-  requested: string,
-  glob: string,
-  context: RunContext,
-): Promise<unknown> {
-  const target = await targetWithinRoot(binding, root, requested);
-  const found: string[] = [];
-  // Split once per call rather than once per candidate: the pattern is as long
-  // as the *model* wrote it, and a walk that re-split it for every entry would
-  // multiply one long argument by the size of the tree.
-  const pattern = glob === "" ? undefined : globPattern(glob);
-  try {
-    await walkListing(target, "", pattern, found, context);
-  } catch (error) {
-    // A deadline on the *node*, or a run somebody cancelled, arrives here as an
-    // abort rather than as this call's failure, and is raised as it came —
-    // [`runBuiltinBash`]'s rule, for its reason.
-    if (context.signal.aborted) throw error;
-    throw builtinFailure(binding, "list", requested, error);
+async function viewPath(requested: string, target: string): Promise<unknown> {
+  const entry = await fs.promises.stat(target).catch(() => undefined);
+  if (entry === undefined) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` could not view \`${requested}\`: nothing is there. \`view\` the directory above it to see what is`,
+    );
   }
-  found.sort();
+  if (entry.isDirectory()) {
+    const held = await fs.promises.readdir(target, { withFileTypes: true }).catch((error: unknown) => {
+      throw fileRefusal("view", requested, error);
+    });
+    const listed = held.map((item) => (item.isDirectory() ? `${item.name}/` : item.name)).sort();
+    return {
+      path: requested,
+      entries: listed.slice(0, LISTING_LIMIT),
+      truncated: listed.length > LISTING_LIMIT,
+    };
+  }
+  const held = await readFileText("view", requested, target);
+  return { path: requested, content: capped(numbered(held), BUILTIN_OUTPUT_LIMIT) };
+}
+
+/**
+ * `create`: the whole file, written or replaced.
+ *
+ * Parent directories are made, because a model that wrote `src/lib/a.ts` meant
+ * the directories too and the alternative is an `ENOENT` it corrects with a
+ * `bash mkdir`. They are inside the workspace by construction: the target has
+ * already been checked, and every parent of a contained path is contained.
+ */
+async function createFile(requested: string, target: string, contents: string): Promise<unknown> {
+  if (contents === "") {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` was asked to \`create\` \`${requested}\` with no \`file_text\`: send the whole contents of the file to write`,
+    );
+  }
+  try {
+    await fs.promises.mkdir(path.dirname(target), { recursive: true });
+    await fs.promises.writeFile(target, contents, "utf8");
+  } catch (error) {
+    throw fileRefusal("create", requested, error);
+  }
+  const bytes = Buffer.byteLength(contents, "utf8");
+  return { path: requested, bytes_written: bytes, change: `wrote ${bytes} bytes` };
+}
+
+/**
+ * `str_replace`: one occurrence, swapped.
+ *
+ * **Exactly one**, which is the provider-defined tool's own contract and the
+ * reason it is a good edit primitive: a match that appears twice is an edit the
+ * model cannot have meant unambiguously, so it is refused with the count and
+ * asked for more context rather than applied to the first one.
+ */
+async function replaceInFile(
+  requested: string,
+  target: string,
+  before: string,
+  after: string,
+): Promise<unknown> {
+  if (before === "") {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` was asked to \`str_replace\` in \`${requested}\` with no \`old_str\`: send the exact text to replace`,
+    );
+  }
+  const held = await readFileText("str_replace", requested, target);
+  const at = held.indexOf(before);
+  if (at < 0) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` found no \`old_str\` in \`${requested}\`: it has to match the file character for character, whitespace included. \`view\` the file and copy the text out of it`,
+    );
+  }
+  const occurrences = held.split(before).length - 1;
+  if (occurrences > 1) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` found \`old_str\` ${occurrences} times in \`${requested}\`, and \`str_replace\` edits exactly one: include enough surrounding text to name the one you mean`,
+    );
+  }
+  const updated = `${held.slice(0, at)}${after}${held.slice(at + before.length)}`;
+  await writeFileText("str_replace", requested, target, updated);
+  const line = held.slice(0, at).split("\n").length;
   return {
-    entries: found.slice(0, LISTING_LIMIT),
-    truncated: found.length > LISTING_LIMIT,
+    path: requested,
+    replaced_at_line: line,
+    snippet: snippetAround(updated, line),
+    change: `replaced one occurrence at line ${line}`,
   };
 }
 
 /**
- * One level of a listing, and every level beneath it when a glob asked for one.
+ * `insert`: text put in after a line, `0` for the top of the file.
  *
- * An **absent** `pattern` is the no-glob case rather than a separate function,
- * because the two differ only in whether the walk goes on: the entry shapes, the
- * trailing `/` and the relative spelling are the same answer either way.
- *
- * The walk stops where it is when the node's deadline runs out or the run is
- * cancelled (grammar 9.2). How much work a listing is depends on a directory
- * this runtime did not choose and a glob a *model* wrote, so a walk that only
- * ever ran to completion would keep reading a tree for a node the graph had
- * already reported as failed — the same hold on what outlived a call that
- * [`runBuiltinBash`] refuses to leave behind.
+ * A line outside the file is refused with the length rather than clamped: a
+ * model that meant line 400 of a 40-line file has misread something, and
+ * appending at the end would hide it.
  */
-async function walkListing(
-  directory: string,
-  prefix: string,
-  pattern: readonly string[] | undefined,
-  found: string[],
-  context: RunContext,
-): Promise<void> {
-  const entries = await fs.promises.readdir(directory, { withFileTypes: true });
-  let seen = 0;
-  for (const entry of entries) {
-    if (context.signal.aborted) throw abortReason(context.signal);
-    // `isDirectory` is `lstat`'s answer here, so a symlink to a directory is a
-    // symlink: reported, not descended into.
-    const directoryEntry = entry.isDirectory();
-    const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
-    const listed = directoryEntry ? `${relative}/` : relative;
-    if (pattern === undefined || matchSegments(pattern, relative.split("/"))) found.push(listed);
-    if (pattern !== undefined && directoryEntry) {
-      await walkListing(path.join(directory, entry.name), relative, pattern, found, context);
-    }
-    seen += 1;
-    if (seen % LISTING_YIELD === 0) await sleep(0, context.signal);
-  }
-}
-
-/**
- * A glob split into the segments [`matchSegments`] matches it as, with runs of
- * `**` collapsed to one.
- *
- * `*` and `?` match within a single path segment and `**` matches across them,
- * which is the spelling every tool a model has met uses. Written here rather
- * than taken from a library for the reason this whole runtime is: one fewer
- * pinned dependency, and a matcher whose behaviour is this project's to state
- * (PRD 5.12).
- *
- * `**` is *zero or more* segments, so two of them in a row accept exactly what
- * one of them accepts, and the only difference between the two spellings is what
- * the match costs: each `**` is a place the matcher may have to give a segment
- * back, and a run of them is the shape that makes it do so the most times.
- * Collapsed here — once per call,
- * over an argument a model chose — so the length of that run cannot become the
- * length of the search. See [`matchSegments`].
- */
-function globPattern(glob: string): readonly string[] {
-  return glob.split("/").filter((segment, at, all) => segment !== "**" || all[at - 1] !== "**");
-}
-
-/**
- * [`globPattern`]'s segments against a candidate's, with `**` the one that may
- * span several.
- *
- * Iterative, and for the reason [`matchSegment`] is: the pattern is a **model's**
- * argument. The recursion this replaced tried every split of the target at every
- * `**` and re-tried it under the next one, which is exponential in how many of
- * them a glob holds — a pattern one line long and a directory twelve deep were
- * hours of a core spent inside a call, and `**` is not even the only way to
- * write that pattern. The walk here is the standard two-pointer one, which
- * accepts the same language in `pattern.length × target.length` steps: the last
- * `**` passed is remembered, and a mismatch after it hands that one more segment
- * rather than starting the search again.
- */
-function matchSegments(pattern: readonly string[], target: readonly string[]): boolean {
-  let patternAt = 0;
-  let targetAt = 0;
-  let star = -1;
-  let resume = 0;
-  while (targetAt < target.length) {
-    const head = patternAt < pattern.length ? pattern[patternAt] : undefined;
-    if (head === "**") {
-      star = patternAt;
-      resume = targetAt;
-      patternAt += 1;
-    } else if (head !== undefined && matchSegment(head, target[targetAt] ?? "")) {
-      patternAt += 1;
-      targetAt += 1;
-    } else if (star >= 0) {
-      // Backtrack: the last `**` spans one more segment.
-      patternAt = star + 1;
-      resume += 1;
-      targetAt = resume;
-    } else {
-      return false;
-    }
-  }
-  // A trailing `**` spans nothing, which is a match; anything else left over is
-  // a segment the candidate does not have.
-  while (pattern[patternAt] === "**") patternAt += 1;
-  return patternAt === pattern.length;
-}
-
-/** One segment against one name: `*` any run of characters, `?` exactly one. */
-function matchSegment(pattern: string, name: string): boolean {
-  let patternAt = 0;
-  let nameAt = 0;
-  let star = -1;
-  let resume = 0;
-  while (nameAt < name.length) {
-    const current = pattern[patternAt];
-    if (patternAt < pattern.length && (current === "?" || current === name[nameAt])) {
-      patternAt += 1;
-      nameAt += 1;
-    } else if (patternAt < pattern.length && current === "*") {
-      star = patternAt;
-      resume = nameAt;
-      patternAt += 1;
-    } else if (star >= 0) {
-      // Backtrack: the last `*` takes one more character.
-      patternAt = star + 1;
-      resume += 1;
-      nameAt = resume;
-    } else {
-      return false;
-    }
-  }
-  while (pattern[patternAt] === "*") patternAt += 1;
-  return patternAt === pattern.length;
-}
-
-/**
- * What a file operation that failed says, in one sentence this runtime composes.
- *
- * The platform's own message quotes the **resolved** path — which is the
- * directory a `${WORKSPACE}` resolved to on this machine, and so a value
- * `docs/trace.md` §11.1 keeps out of a trace field. So the failure is restated:
- * the path as the *model* asked for it, and the platform's error **code**, which
- * says what went wrong without saying what it went wrong on.
- */
-function builtinFailure(
-  binding: BuiltinBinding,
-  verb: string,
+async function insertIntoFile(
   requested: string,
-  error: unknown,
-): Error {
+  target: string,
+  at: number,
+  addition: string,
+): Promise<unknown> {
+  if (addition === "") {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` was asked to \`insert\` into \`${requested}\` with no \`new_str\`: send the text to insert`,
+    );
+  }
+  const held = await readFileText("insert", requested, target);
+  const trailing = held === "" || held.endsWith("\n");
+  const lines = held === "" ? [] : held.replace(/\n$/, "").split("\n");
+  if (!Number.isInteger(at) || at < 0 || at > lines.length) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` was asked to \`insert\` after line ${at} of \`${requested}\`, which has ${lines.length} line(s): \`insert_line\` is 0 for the top of the file and at most its length`,
+    );
+  }
+  const added = addition.replace(/\n$/, "").split("\n");
+  const next = [...lines.slice(0, at), ...added, ...lines.slice(at)];
+  const updated = `${next.join("\n")}${trailing ? "\n" : ""}`;
+  await writeFileText("insert", requested, target, updated);
+  return {
+    path: requested,
+    inserted_after_line: at,
+    lines_inserted: added.length,
+    snippet: snippetAround(updated, at + 1),
+    change: `inserted ${added.length} line(s) after line ${at}`,
+  };
+}
+
+/** One file's text, refused to the model where the path would not give it up. */
+async function readFileText(
+  operation: FileOperation,
+  requested: string,
+  target: string,
+): Promise<string> {
+  try {
+    return await fs.promises.readFile(target, "utf8");
+  } catch (error) {
+    throw fileRefusal(operation, requested, error);
+  }
+}
+
+/** The same, writing. */
+async function writeFileText(
+  operation: FileOperation,
+  requested: string,
+  target: string,
+  contents: string,
+): Promise<void> {
+  try {
+    await fs.promises.writeFile(target, contents, "utf8");
+  } catch (error) {
+    throw fileRefusal(operation, requested, error);
+  }
+}
+
+/**
+ * What a file operation that would not work says, in one sentence this runtime
+ * composes.
+ *
+ * The platform's own message quotes the **resolved** path — the directory a
+ * `${WORKSPACE}` resolved to on this machine, and so a value `docs/trace.md`
+ * §11.1 keeps out of a trace field. So the failure is restated: the path as the
+ * *model* asked for it, and the platform's error **code**, which says what went
+ * wrong without saying what it went wrong on.
+ */
+function fileRefusal(operation: FileOperation, requested: string, error: unknown): ToolCallRefused {
   const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
-  return new Error(
-    `\`builtin.${binding.tool}\` could not ${verb} \`${requested}\`${code === undefined ? "" : ` (${code})`}`,
+  return new ToolCallRefused(
+    `\`${FILE_TOOL}\` could not \`${operation}\` \`${requested}\`${code === undefined ? "" : ` (${code})`}`,
   );
+}
+
+/** A file's text with each line numbered, which is what `view` answers with. */
+function numbered(contents: string): string {
+  const lines = contents.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines.map((line, at) => `${String(at + 1).padStart(6, " ")}\t${line}`).join("\n");
+}
+
+/** The lines around an edit, numbered — what an edit answers with. */
+function snippetAround(contents: string, line: number): string {
+  const lines = numbered(contents).split("\n");
+  const from = Math.max(0, line - 1 - SNIPPET_LINES);
+  return capped(lines.slice(from, line + SNIPPET_LINES).join("\n"), BUILTIN_OUTPUT_LIMIT);
+}
+
+/**
+ * `text`, cut to `limit` characters with the cut **said**.
+ *
+ * A model reading a truncated answer has to know it was truncated, or it will
+ * reason about a file it has only the first half of. See [`BUILTIN_OUTPUT_LIMIT`].
+ */
+function capped(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n…[${text.length - limit} more characters, not shown]`;
 }
 
 /** A resolved `http:` block. */

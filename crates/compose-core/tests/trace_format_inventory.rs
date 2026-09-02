@@ -667,6 +667,7 @@ export interface TraceEntry {
 fn the_walk_reaches_every_record_the_envelope_carries() {
     let reached: BTreeSet<String> = reachable(&runtime()).into_keys().collect();
     let expected: BTreeSet<String> = [
+        "BuiltinProgram",
         "DispatchRecord",
         "EdgeDecision",
         "Failover",

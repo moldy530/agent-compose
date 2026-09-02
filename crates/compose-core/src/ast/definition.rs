@@ -124,6 +124,35 @@ impl Builtin {
         }
     }
 
+    /// The **provider-defined tool type** this built-in goes out as on the
+    /// Messages wire (grammar 6.1, PRD resolved q54 ruling d).
+    ///
+    /// Anthropic ships the shell and the text editor as tool types of its own
+    /// rather than as schemas an author writes, and a model is trained against
+    /// the *type*: declared this way a request engages that trained behaviour,
+    /// and declared as an ordinary function tool it does not. So the type is
+    /// what a Messages request carries, and [`Self::as_str`] is the name that
+    /// type dictates.
+    ///
+    /// **These strings are dated because they version.** A new dated type is a
+    /// new tool contract — `text_editor_20250728` dropped `undo_edit` from the
+    /// one before it — so a bump here is a change to what this compiler emits
+    /// and to what its runtime implements, made together. This is the one place
+    /// they are written: the emitter reads them into each tool's descriptor
+    /// (`codegen::graph`), and `crates/mock-provider` holds the wire's own copy
+    /// because there it is the provider's vocabulary rather than the compiler's.
+    ///
+    /// The OpenAI wires have no such thing and take the compiler's schema as an
+    /// ordinary function tool under the same name — one set of runtime handlers
+    /// either way (`codegen::js/runtime.ts`).
+    #[must_use]
+    pub const fn provider_type(self) -> &'static str {
+        match self {
+            Self::Bash => "bash_20250124",
+            Self::Files => "text_editor_20250728",
+        }
+    }
+
     /// The word the `builtin:` binding is written with (grammar 6.1).
     #[must_use]
     pub const fn keyword(self) -> &'static str {

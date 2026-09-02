@@ -313,20 +313,20 @@ mod tests {
             .find("armCommandSweep();")
             .expect("`forkBoundShell` arms the stop sweep");
         let spawned = forked
-            .find("return spawn(\"bash\", [\"-c\", command], {")
+            .find("return spawn(executable, SHELL_ARGUMENTS, {")
             .expect("`forkBoundShell` forks the shell");
         assert!(
             armed < spawned,
             "the sweep is armed after the shell is forked, so a stop signal arriving in between \
-             is met by the kernel's default disposition: the graph ends and the command's process \
-             group is left running inside `root:` (grammar 5.5, Decision D124): {forked}"
+             is met by the kernel's default disposition: the graph ends and the shell's process \
+             group is left running inside the workspace (grammar 5.5, Decision D124): {forked}"
         );
         // …and the fork has **one** call site, which is what makes the ordering
         // above a property of the runtime rather than of one function: a second
         // `spawn` of the shell would carry its own ordering, and the window this
         // closes is reopened by whichever one forgets.
         assert_eq!(
-            SOURCE.matches("spawn(\"bash\"").count(),
+            SOURCE.matches("SHELL_ARGUMENTS, {").count(),
             1,
             "a `builtin.bash` shell is forked somewhere other than `forkBoundShell`, which is the \
              one call site that arms the stop sweep first"

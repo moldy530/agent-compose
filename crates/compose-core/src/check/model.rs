@@ -1043,11 +1043,35 @@ pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
         ty.description = Some(Spanned::new(description.to_string(), span.clone()));
         ty
     };
+    let boolean = |description: &str| {
+        let mut ty = scalar_node(ScalarKind::Boolean, span);
+        ty.description = Some(Spanned::new(description.to_string(), span.clone()));
+        if let TypeForm::Scalar(scalar) = &mut ty.form {
+            scalar.default = Some(Spanned::new(Literal::Bool(false), span.clone()));
+        }
+        ty
+    };
     let fields: Vec<(&str, TypeNode)> = match builtin {
-        Builtin::Bash => vec![(
-            "command",
-            required("The shell command to run, as one line of `bash`."),
-        )],
+        Builtin::Bash => vec![
+            // Optional, because `restart` is the one call that carries no
+            // command — the provider-defined `bash` tool takes exactly this pair
+            // and a trained model sends `{"restart": true}` alone. A call
+            // carrying neither is refused by the tool with a sentence saying
+            // which to send (Decision D119), rather than by a schema that would
+            // have refused the restart too.
+            (
+                "command",
+                optional("The shell command to run, as one line of `bash`."),
+            ),
+            (
+                "restart",
+                boolean(
+                    "Set to `true` to end this shell session and start a fresh one in the \
+                     workspace, which is how a wedged shell is recovered. No `command` is run \
+                     on a call that restarts.",
+                ),
+            ),
+        ],
         Builtin::Files => vec![
             (
                 "command",
