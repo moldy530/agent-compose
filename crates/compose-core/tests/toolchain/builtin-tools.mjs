@@ -6,10 +6,16 @@
 // inside of one call, and that is what this runner is for:
 //
 //   * **containment** — a `..` that climbs out, an absolute path, a symlink
-//     pointing outside the workspace, and a *dangling* symlink pointing outside
-//     it. Each has to come back as a refusal and, more importantly, has to leave
-//     the file outside the workspace untouched. A test that only read the
-//     message would pass against a runtime that refused *and* wrote;
+//     pointing outside the workspace, a *dangling* symlink pointing outside it,
+//     and a symlinked **directory** written through at a path whose own parents
+//     do not exist yet (which `create` would otherwise make, following the link
+//     on the way). Each has to come back as a refusal and, more importantly, has
+//     to leave everything outside the workspace untouched — nothing changed and
+//     nothing new. A test that only read the message would pass against a
+//     runtime that refused *and* wrote;
+//   * **the read bound** — a file larger than the runtime reads is *viewed*
+//     from the front with the stop said, and *edited* not at all: an edit
+//     rewrites what it read, so a truncated read would truncate the file;
 //   * **the session** — `builtin.bash` keeps one shell per node activity, so a
 //     `cd` in one call is still in effect in the next, and a second activity
 //     starts in the workspace. Two contexts is the whole of that claim, and it
@@ -89,9 +95,16 @@ const shell = (root, extra = {}) => ({
 // ---------------------------------------------------------------------------
 // Containment.
 //
-// Four ways out of a workspace, and one file outside it that none of them may
-// reach. The file is written with a sentinel and read back at the end: what is
-// being tested is the file system's state, not the wording of a refusal.
+// Six ways out of a workspace, and one directory outside it that none of them
+// may reach. The file in it is written with a sentinel and read back at the end,
+// and the directory's own entries are listed: what is being tested is the file
+// system's state, not the wording of a refusal.
+//
+// The last two are the ones a parent-only check gets wrong. `create` makes the
+// directories above what it writes, so `out/deep/nested.txt` through a symlinked
+// `out` has *no* parent to resolve — and a check that stopped there would hand
+// back the lexical path, find it inside the workspace, and then let `mkdir -p`
+// follow the link.
 const outside = path.join(path.resolve(scratch), "outside");
 fs.rmSync(outside, { recursive: true, force: true });
 fs.mkdirSync(outside, { recursive: true });
@@ -101,6 +114,7 @@ fs.writeFileSync(secret, "the file outside the workspace");
 const contained = workspace("contained");
 fs.symlinkSync(secret, path.join(contained, "link.txt"));
 fs.symlinkSync(path.join(outside, "not-there-yet.txt"), path.join(contained, "dangling.txt"));
+fs.symlinkSync(outside, path.join(contained, "out"), "dir");
 
 const escapes = {};
 for (const [name, args] of [
@@ -109,18 +123,24 @@ for (const [name, args] of [
   ["symlink", { command: "create", path: "link.txt", file_text: "clobbered" }],
   ["dangling", { command: "create", path: "dangling.txt", file_text: "clobbered" }],
   ["read", { command: "view", path: "../outside/secret.txt" }],
+  ["linkedDirectory", { command: "create", path: "out/secret.txt", file_text: "clobbered" }],
+  ["underLinkedDirectory", { command: "create", path: "out/deep/nested.txt", file_text: "leaked" }],
+  ["farUnderLinkedDirectory", { command: "create", path: "out/a/b/c/file.txt", file_text: "leaked" }],
 ]) {
   escapes[name] = await call(files(contained), args, contextWith("exec_contained"));
 }
 const containment = {
   refused: Object.fromEntries(Object.entries(escapes).map(([name, answer]) => [name, answer.refused === true])),
-  // The whole point: nothing outside the workspace moved.
+  // The whole point: nothing outside the workspace moved, and nothing new is
+  // there either.
   outsideUnchanged: fs.readFileSync(secret, "utf8") === "the file outside the workspace",
   outsideNotCreated: !fs.existsSync(path.join(outside, "not-there-yet.txt")),
+  outsideEntries: fs.readdirSync(outside).sort(),
   // …and the record of a refused call still says what the model asked for
   // (`docs/trace.md` §7.4).
   program: escapes.climb.program,
   message: escapes.climb.message,
+  throughLinkMessage: escapes.underLinkedDirectory.message,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,6 +196,39 @@ const editingTool = {
   absentRefused: absent.refused === true,
   // What is on disk when the four operations have run.
   onDisk: fs.readFileSync(path.join(editing, "notes/todo.md"), "utf8"),
+};
+
+// ---------------------------------------------------------------------------
+// A file larger than this runtime reads.
+//
+// The path is the model's, so the size of what a `files` call pulls into this
+// process is the model's too unless the runtime bounds it. `view` answers with
+// the front and says it stopped; an edit is refused outright, because
+// `str_replace` writes back what it read and a truncated read would truncate the
+// file — which the size on disk afterwards is what actually proves.
+const heavyRoot = workspace("heavy");
+const heavyContext = contextWith("exec_heavy");
+const heavyPath = path.join(heavyRoot, "big.txt");
+{
+  const block = Buffer.from(`${"x".repeat(99)}\n`.repeat(1_000));
+  const handle = fs.openSync(heavyPath, "w");
+  for (let written = 0; written < 45; written += 1) fs.writeSync(handle, block);
+  fs.closeSync(handle);
+}
+const heavyBytes = fs.statSync(heavyPath).size;
+const heavyViewed = await call(files(heavyRoot), { command: "view", path: "big.txt" }, heavyContext);
+const heavyEdited = await call(
+  files(heavyRoot),
+  { command: "str_replace", path: "big.txt", old_str: "xxxxx", new_str: "yyyyy" },
+  heavyContext,
+);
+const readBound = {
+  bytesOnDisk: heavyBytes,
+  viewedLength: (heavyViewed.result?.content ?? "").length,
+  saidItStopped: (heavyViewed.result?.content ?? "").includes("were read"),
+  editRefused: heavyEdited.refused === true,
+  editMessage: heavyEdited.message,
+  stillWholeOnDisk: fs.statSync(heavyPath).size === heavyBytes,
 };
 
 // ---------------------------------------------------------------------------
@@ -316,5 +369,5 @@ await runtime.releaseWorkspaces("exec_default_workspace", false);
 workspaces.goneWhenSettled = !fs.existsSync(madeAt);
 
 process.stdout.write(
-  `${JSON.stringify({ containment, editingTool, session, bounded, environment, timeout, workspaces })}\n`,
+  `${JSON.stringify({ containment, editingTool, readBound, session, bounded, environment, timeout, workspaces })}\n`,
 );

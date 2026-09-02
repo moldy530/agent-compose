@@ -3966,6 +3966,35 @@ const LISTING_LIMIT = 1_000;
 const SNIPPET_LINES = 4;
 
 /**
+ * How many bytes of one file this runtime will **hold in memory**.
+ *
+ * [`BUILTIN_OUTPUT_LIMIT`] bounds what a `files` call answers with, and that
+ * bound is applied to a string the whole file is already inside of — which is
+ * the same gap [`SHELL_BUFFER_LIMIT`] closes on the shell's side, reached from
+ * the other end: there a model writes the program, here a model writes the
+ * **path**. `view` of a multi-gigabyte file in the workspace would allocate it
+ * whole, and then a numbered copy of it, inside a `serve` process that is
+ * running every other execution too, to answer with thirty thousand characters
+ * of it.
+ *
+ * So a read stops here. The two operations then divide, because a truncated read
+ * means different things to them:
+ *
+ *  * `view` answers with the **front** of the file and says the rest was not
+ *    read — the same statement [`capped`] makes one level along, and a model
+ *    that wants the tail of a large file has `bash`;
+ *  * `str_replace` and `insert` are **refused**, because an edit reads the whole
+ *    file and writes the whole file back: an edit built on a truncated read
+ *    would not truncate the answer, it would truncate the file.
+ *
+ * Comfortably above any source file and far below what would hurt this process.
+ */
+const FILE_READ_LIMIT = 4_000_000;
+
+/** How much of a file one read takes, on the way to [`FILE_READ_LIMIT`]. */
+const FILE_READ_CHUNK = 65_536;
+
+/**
  * Run one built-in call (grammar 5.5, 6.1, PRD resolved q54).
  *
  * The seam every built-in goes through, journaled like every other tool
@@ -4243,20 +4272,26 @@ function withinWorkspace(workspace: string, target: string): boolean {
  * The real path one `files` argument names, **refused** if it lands outside the
  * workspace (PRD resolved q54, Decision D119).
  *
- * Three cases, and the middle one is why this is not one `realpath` call:
+ * Two cases, and the second one is why this is not one `realpath` call:
  *
  *  * the path **exists** — it is resolved whole, symlinks and all, and checked;
- *  * it does **not exist yet**, which is every `create` of a new file: its
- *    *parent* is resolved and the last component appended, so a write through a
- *    symlinked directory is still checked against where that directory really
- *    is;
- *  * its parent does not exist either, where there is nothing left to resolve
- *    and the lexically-resolved path is checked. `path.resolve` has already
- *    collapsed every `..`, so a climb out of the workspace is refused here as
- *    surely as anywhere else, and the call then fails on the missing directory.
+ *  * it does **not exist yet**, which is every `create` of a new file. Then the
+ *    **deepest ancestor that does exist** is resolved and the components below
+ *    it are appended lexically, so a write through a symlinked directory is
+ *    checked against where that directory really is.
+ *
+ * That walk climbs rather than stopping at the parent, and the difference is a
+ * hole: `create` makes its parent directories (`createFile`), so a
+ * `link/deep/file.txt` whose `link` is a symlink out of the workspace and whose
+ * `deep` does not exist yet has no parent to resolve — and a check that gave up
+ * there would hand back the lexical path, pass the prefix test, and then let
+ * `mkdir -p` follow the link and write outside. Resolving the deepest existing
+ * ancestor sees `link` for what it is however many missing components sit under
+ * it. What is left below that ancestor cannot be a symlink, because it does not
+ * exist.
  *
  * A **dangling symlink** is refused rather than written through, and that is the
- * case the middle branch would otherwise get wrong: `writeFile` follows a
+ * case the second branch would otherwise get wrong: `writeFile` follows a
  * symlink, so a link inside the workspace pointing at a file outside it that
  * does not exist yet would be a write outside the workspace with every check
  * passed.
@@ -4281,8 +4316,7 @@ async function targetWithinWorkspace(
         `\`${FILE_TOOL}\` will not follow \`${requested}\`: it is a symbolic link whose target does not exist, so where it points cannot be checked against this tool's workspace`,
       );
     }
-    const parent = await realpathOrAbsent(path.dirname(absolute));
-    target = parent === undefined ? absolute : path.join(parent, path.basename(absolute));
+    target = await underDeepestExisting(absolute);
   }
   if (!withinWorkspace(workspace, target)) {
     throw new ToolCallRefused(
@@ -4298,6 +4332,29 @@ async function realpathOrAbsent(target: string): Promise<string | undefined> {
     (resolved) => resolved,
     () => undefined,
   );
+}
+
+/**
+ * A path that does not exist, rebuilt on the real location of the deepest
+ * ancestor that does.
+ *
+ * The climb ends at the filesystem root, where `path.dirname` stops moving —
+ * and a root that will not `realpath` is a host this runtime has nothing to say
+ * about, so the lexical path is what comes back and the caller's own prefix test
+ * decides it. `path.resolve` has already collapsed every `..`, so that fallback
+ * still refuses a climb out of the workspace.
+ */
+async function underDeepestExisting(absolute: string): Promise<string> {
+  const below: string[] = [];
+  let ancestor = absolute;
+  for (;;) {
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) return absolute;
+    below.unshift(path.basename(ancestor));
+    const real = await realpathOrAbsent(parent);
+    if (real !== undefined) return path.join(real, ...below);
+    ancestor = parent;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -5044,7 +5101,13 @@ async function viewPath(requested: string, target: string): Promise<unknown> {
     };
   }
   const held = await readFileText("view", requested, target);
-  return { path: requested, content: capped(numbered(held), BUILTIN_OUTPUT_LIMIT) };
+  const shown = capped(numbered(held.text), BUILTIN_OUTPUT_LIMIT);
+  return {
+    path: requested,
+    content: held.whole
+      ? shown
+      : `${shown}\n…[only the first ${FILE_READ_LIMIT} bytes of this file were read: it is larger than this tool views. Use \`bash\` to reach the rest]`,
+  };
 }
 
 /**
@@ -5090,7 +5153,7 @@ async function replaceInFile(
       `\`${FILE_TOOL}\` was asked to \`str_replace\` in \`${requested}\` with no \`old_str\`: send the exact text to replace`,
     );
   }
-  const held = await readFileText("str_replace", requested, target);
+  const held = await readWholeFileText("str_replace", requested, target);
   const at = held.indexOf(before);
   if (at < 0) {
     throw new ToolCallRefused(
@@ -5132,7 +5195,7 @@ async function insertIntoFile(
       `\`${FILE_TOOL}\` was asked to \`insert\` into \`${requested}\` with no \`new_str\`: send the text to insert`,
     );
   }
-  const held = await readFileText("insert", requested, target);
+  const held = await readWholeFileText("insert", requested, target);
   const trailing = held === "" || held.endsWith("\n");
   const lines = held === "" ? [] : held.replace(/\n$/, "").split("\n");
   if (!Number.isInteger(at) || at < 0 || at > lines.length) {
@@ -5153,17 +5216,72 @@ async function insertIntoFile(
   };
 }
 
-/** One file's text, refused to the model where the path would not give it up. */
+/**
+ * One file's text, refused to the model where the path would not give it up —
+ * and read under [`FILE_READ_LIMIT`] rather than under whatever size the file
+ * happens to be.
+ *
+ * `whole` is false where the file had more than was read, which only a `view`
+ * is allowed to see: [`readWholeFileText`] is what the two editing operations
+ * call, and it refuses that case outright.
+ */
 async function readFileText(
   operation: FileOperation,
   requested: string,
   target: string,
-): Promise<string> {
+): Promise<{ readonly text: string; readonly whole: boolean }> {
+  const handle = await fs.promises.open(target, "r").catch((error: unknown) => {
+    throw fileRefusal(operation, requested, error);
+  });
   try {
-    return await fs.promises.readFile(target, "utf8");
+    // Chunked rather than one `readFile`, so the allocation follows what the
+    // file actually holds and stops at the bound rather than after it: a
+    // `stat` first would be a size this runtime then has to trust.
+    const chunks: Buffer[] = [];
+    let filled = 0;
+    let whole = true;
+    for (;;) {
+      const chunk = Buffer.alloc(FILE_READ_CHUNK);
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length);
+      if (bytesRead === 0) break;
+      chunks.push(chunk.subarray(0, bytesRead));
+      filled += bytesRead;
+      if (filled > FILE_READ_LIMIT) {
+        whole = false;
+        break;
+      }
+    }
+    const held = Buffer.concat(chunks, Math.min(filled, FILE_READ_LIMIT));
+    return { text: held.toString("utf8"), whole };
   } catch (error) {
     throw fileRefusal(operation, requested, error);
+  } finally {
+    await handle.close().catch(() => {
+      // A handle that would not close is not this call's outcome.
+    });
   }
+}
+
+/**
+ * The same, for an operation that will **write the file back**.
+ *
+ * A file larger than [`FILE_READ_LIMIT`] is refused here rather than truncated,
+ * because `str_replace` and `insert` rewrite what they read: the truncation
+ * would land on disk. The refusal names the bound and the tool that has no such
+ * bound, which is the repair a model can act on (Decision D119).
+ */
+async function readWholeFileText(
+  operation: FileOperation,
+  requested: string,
+  target: string,
+): Promise<string> {
+  const held = await readFileText(operation, requested, target);
+  if (!held.whole) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` will not \`${operation}\` \`${requested}\`: it is larger than the ${FILE_READ_LIMIT} bytes this tool reads, and an edit rewrites the whole file. Edit a file this size with \`bash\``,
+    );
+  }
+  return held.text;
 }
 
 /** The same, writing. */

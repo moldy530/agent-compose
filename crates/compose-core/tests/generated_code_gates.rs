@@ -3623,12 +3623,13 @@ fn the_local_backends_behaved(answer: &Value) {
 /// The acceptance suite drives these through a model loop, which is where the
 /// wire, the trace records and Decision D119's bounces are decided. What a loop
 /// cannot show is the inside of a call, and each of these is a claim PRD
-/// resolved q54 makes there: that an escaping path leaves the file outside the
-/// workspace **untouched**, that one shell really is held across the calls of a
-/// node activity and not across two, that a scrubbed child sees the declared
-/// variables and no others, that a command's deadline answers the model rather
-/// than failing the node, and that a defaulted workspace is one directory per
-/// execution that goes when the execution settles.
+/// resolved q54 makes there: that an escaping path leaves everything outside the
+/// workspace **untouched**, that a file larger than the runtime reads is viewed
+/// from the front and edited not at all, that one shell really is held across
+/// the calls of a node activity and not across two, that a scrubbed child sees
+/// the declared variables and no others, that a command's deadline answers the
+/// model rather than failing the node, and that a defaulted workspace is one
+/// directory per execution that goes when the execution settles.
 #[test]
 fn the_built_in_tools_are_bounded_by_their_workspace_session_and_deadline() {
     let Some(root) = installed() else {
@@ -3665,7 +3666,10 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
             "absolute": true,
             "symlink": true,
             "dangling": true,
-            "read": true
+            "read": true,
+            "linkedDirectory": true,
+            "underLinkedDirectory": true,
+            "farUnderLinkedDirectory": true
         }),
         "every way out of the workspace is refused **as a refusal**, which is what goes back to \
          the model rather than failing the node: {containment}"
@@ -3678,6 +3682,27 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
         (&json!(true), &json!(true)),
         "the file outside the workspace was written through anyway, so the refusals above are a \
          message rather than a bound: {containment}"
+    );
+    // The two crossings a *parent-only* resolution lets through leave nothing on
+    // disk to find by name, because they name directories that did not exist
+    // before the call: what says they were refused is that the directory outside
+    // the workspace still holds exactly what it held.
+    assert_eq!(
+        containment["outsideEntries"],
+        json!(["secret.txt"]),
+        "a `create` through a symlinked directory, at a path whose own parents do not exist yet, \
+         made them outside the workspace: `create` makes its parents, so the containment check \
+         has to resolve the deepest ancestor that exists rather than stop at the parent \
+         (grammar 6.1, PRD resolved q54): {containment}"
+    );
+    let through = containment["throughLinkMessage"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        through.contains("resolves outside this tool's workspace")
+            && through.contains("out/deep/nested.txt"),
+        "…and the refusal quotes the path the model chose rather than the link it went through \
+         (PRD G3): {through}"
     );
     assert_eq!(
         containment["program"],
@@ -3759,6 +3784,37 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
         json!({ "tool": "files", "operation": "create", "path": "notes/todo.md", "change": "wrote 14 bytes" }),
         "the trace's record of an edit is the operation, the path and a **sentence** — never the \
          bytes written (`docs/trace.md` §7.4, §11): {editing}"
+    );
+
+    // --- The bound on what one `files` call reads --------------------------
+    //
+    // The path is the model's, so the size of the read is the model's too unless
+    // the runtime bounds it — the same reason the shell's buffer is bounded as
+    // its bytes arrive, reached from the other end. `view` takes the front and
+    // says so; an edit is refused, because it writes back what it read.
+    let heavy = &answer["readBound"];
+    assert!(
+        heavy["bytesOnDisk"].as_u64().unwrap_or_default() > 4_000_000,
+        "the case needs a file past the runtime's read bound to be about anything: {heavy}"
+    );
+    assert!(
+        heavy["viewedLength"].as_u64().unwrap_or_default() < 40_000
+            && heavy["saidItStopped"] == json!(true),
+        "a `view` of a file larger than the runtime reads answers with a bounded head and says \
+         where it stopped, rather than pulling the file into this process: {heavy}"
+    );
+    assert_eq!(
+        (&heavy["editRefused"], &heavy["stillWholeOnDisk"]),
+        (&json!(true), &json!(true)),
+        "an edit of a file past the read bound is refused **and** leaves the file whole: an edit \
+         rewrites what it read, so a truncated read there would truncate the file rather than \
+         the answer: {heavy}"
+    );
+    let heavy_message = heavy["editMessage"].as_str().unwrap_or_default();
+    assert!(
+        heavy_message.contains("an edit rewrites the whole file") && heavy_message.contains("bash"),
+        "…and the refusal says why and names the tool with no such bound (PRD G3, D119): \
+         {heavy_message}"
     );
 
     // --- The shell session (one per node activity) -------------------------
