@@ -4686,6 +4686,17 @@ async function shellExecutable(): Promise<string> {
  * `(cd sub && make)` are all `bash` forking) — so the session goes with it and
  * the next call opens a fresh one in the workspace. The model is told exactly
  * that, because the shell state it was relying on is what it lost.
+ *
+ * **A `restart` ends the session, and a command sent with it runs in the fresh
+ * one.** The provider-defined tool's parameter is written for the restart alone,
+ * and that is the call this answers with a notice and *no* status: nothing ran,
+ * so there is no `exit_code` to report and none in the trace's record of it
+ * (`docs/trace.md` §7.4). A model that sent both asked for a shell it could
+ * trust and a command in it, which is one call rather than two — so the command
+ * runs, after the restart, and comes back with its own status. What it must
+ * never be is dropped: a discarded command answered `exit_code: 0` would tell
+ * the model its write happened and leave the trace claiming a command ran on
+ * this host that never did, which is worse than recording nothing at all.
  */
 async function runBuiltinBash(
   binding: BuiltinBinding,
@@ -4707,18 +4718,26 @@ async function runBuiltinBash(
   if (restart) {
     const held = shellSessions.get(context)?.get(sessionKeyOf(binding));
     if (held !== undefined) endShell(held, "the model asked for a restart");
-    // Opened here rather than left to the next call, so a `restart` that cannot
-    // open a shell fails now — with the reason — instead of on whatever command
-    // follows it.
+  }
+  if (command.trim() === "") {
+    // A restart on its own. The shell is opened here rather than left to the
+    // next call, so a `restart` that cannot open one fails now — with the
+    // reason — instead of on whatever command follows it.
     await shellFor(binding, workspace, context);
     return {
+      // No `exit_code`: no command ran, and a status invented for a call that
+      // ran nothing would say one completed here and be copied into the trace
+      // as such (`docs/trace.md` §7.4's presence rule for the field).
       stdout: "",
       stderr: "",
-      exit_code: 0,
       notice:
         "the shell session was restarted: its working directory is the workspace again, and no shell state carried over",
     };
   }
+  // A command sent *with* a restart lands here too, in the shell the restart
+  // just left ended — so [`shellFor`] opens the fresh one and reports the
+  // restart back through [`shellNotice`], the way it does for a session that
+  // ended any other way.
   const { session, restarted } = await shellFor(binding, workspace, context);
   const answer = await typeIntoShell(session, command, binding.timeout, context);
   const notice = shellNotice(binding, answer, restarted);

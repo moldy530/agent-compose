@@ -366,7 +366,7 @@ export type ToolStampOutput = z.infer<typeof toolStampOutput>;
  */
 export const builtinBashInput = z.object({
   command: z.string().describe("The shell command to run, as one line of `bash`.").default(""),
-  restart: z.boolean().describe("Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. No `command` is run on a call that restarts.").default(false),
+  restart: z.boolean().describe("Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.").default(false),
 }).strict();
 export type BuiltinBashInput = z.infer<typeof builtinBashInput>;
 

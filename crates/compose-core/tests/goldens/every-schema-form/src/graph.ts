@@ -526,7 +526,7 @@ const agentShaper: runtime.AgentBinding = {
           },
           "restart": {
             "default": false,
-            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. No `command` is run on a call that restarts.",
+            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.",
             "type": "boolean"
           }
         },
@@ -683,7 +683,7 @@ const agentSpreader: runtime.AgentBinding = {
           },
           "restart": {
             "default": false,
-            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. No `command` is run on a call that restarts.",
+            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.",
             "type": "boolean"
           }
         },

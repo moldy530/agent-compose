@@ -156,8 +156,10 @@ things are worth knowing at the node:
 - **a shell is a session, and the session is the node execution's.** One `bash`
   child per agent node execution: the working directory and the shell state carry
   from one call to the next, and a node `retry:` starts a fresh one — the same
-  restart the ordinals of a retried attempt get. It ends when the node does,
-  whichever way the node ends.
+  restart the ordinals of a retried attempt get. The model can start a fresh one
+  itself with `restart: true`, and a `command` it sends beside that runs in the
+  new session rather than being dropped. It ends when the node does, whichever
+  way the node ends.
 - **what a command *said* is an answer, not a failure.** A nonzero exit comes
   back with its status; a command that outruns the binding's `timeout:` is killed
   and comes back saying so, with what it printed by then. Both leave the loop

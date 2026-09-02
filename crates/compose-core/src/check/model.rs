@@ -1058,7 +1058,9 @@ pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
             // and a trained model sends `{"restart": true}` alone. A call
             // carrying neither is refused by the tool with a sentence saying
             // which to send (Decision D119), rather than by a schema that would
-            // have refused the restart too.
+            // have refused the restart too; a call carrying **both** runs the
+            // command in the session the restart opened, because a command the
+            // runtime dropped would be one the model was told had run.
             (
                 "command",
                 optional("The shell command to run, as one line of `bash`."),
@@ -1067,8 +1069,8 @@ pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
                 "restart",
                 boolean(
                     "Set to `true` to end this shell session and start a fresh one in the \
-                     workspace, which is how a wedged shell is recovered. No `command` is run \
-                     on a call that restarts.",
+                     workspace, which is how a wedged shell is recovered. Sent alone it runs \
+                     nothing; sent with a `command`, that command runs in the fresh session.",
                 ),
             ),
         ],

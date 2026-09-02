@@ -413,8 +413,10 @@ agent node, tool loop included, and the two compose.
 
 ### What the model gets back
 
-`builtin.bash` answers with `stdout`, `stderr` and `exit_code`, and a `notice`
-where something happened to the *session*. `builtin.files` answers with the path
+`builtin.bash` answers with `stdout`, `stderr` and `exit_code` — the status only
+where a command completed, so a killed one and a bare `restart:` come back
+without it — and a `notice` where something happened to the *session*.
+`builtin.files` answers with the path
 and what the operation did: a `view` comes back with the file's lines numbered
 (or a directory's entries), a `create` with the bytes written, an edit with the
 line it changed and a few lines around it. Both are bounded, and the two bounds differ where it
@@ -436,8 +438,12 @@ standard input open: the working directory, the variables and the shell options
 carry from one call to the next, so `cd build` and then `make` is one thought
 rather than two unrelated commands. A node `retry:` opens a fresh one, exactly as
 it restarts the ordinals of grammar §9.4. The model can restart it itself —
-`restart: true` with no command — which is what the provider-defined tool's own
-parameter is for.
+`restart: true`, which is what the provider-defined tool's own parameter is for.
+Sent alone it runs nothing and answers with a notice and **no** `exit_code`,
+because no command completed; sent beside a `command`, that command runs in the
+fresh session and answers with its own status. It is never dropped: a runtime
+that swallowed it would tell the model a write succeeded that never happened,
+and leave a trace saying that command ran on that host.
 
 **What fails and what bounces.** The split of `agent-compose docs agents` reads
 one way here that is worth stating, because a built-in has no contract of the
