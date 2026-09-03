@@ -1395,10 +1395,21 @@ const DURABILITY: &[Criterion] = &[
 /// bounds they are reached through.
 ///
 /// PRD resolved q54 replaced the four-tool set this bullet was written against
-/// with `builtin.bash` and `builtin.files`, and the shell is the half whose
-/// runtime landed first: what the file tool does under a workspace — the path
-/// crossings a resolution catches and a string comparison does not — is named by
-/// no row yet and lands with its handlers.
+/// with `builtin.bash` and `builtin.files`, and both halves are named below. The
+/// file tool's rows are its round trip — `create`, `str_replace`, `insert` and
+/// `view` under the workspace, in the provider-defined editor's own operations —
+/// and the two crossings that workspace has to refuse: a path that *resolves*
+/// outside it, and a second **name** for a file outside it, which no resolution
+/// can catch because a hard link has no target to follow.
+///
+/// What no row here reaches is the inside of one call, which is a limit of this
+/// corpus rather than a gap in it: an acceptance case drives a model loop, and
+/// what a loop shows is the wire, the trace and the bounce. The rest — every
+/// other way out of a workspace, the read bound, the session held across two
+/// activities, the scrubbed child — is asserted against a generated project's
+/// own runtime by
+/// `the_built_in_tools_are_bounded_by_their_workspace_session_and_deadline` in
+/// `compose-core`'s `generated_code_gates.rs`.
 const BUILTINS: &[Criterion] = &[
     Criterion {
         bullet: Bullet::BuiltinTools,
