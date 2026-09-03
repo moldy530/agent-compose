@@ -4565,6 +4565,37 @@ function forkBoundShell(executable: string, workspace: string, environment: Node
  */
 const SHELL_ARGUMENTS = ["--noprofile", "--norc", "-s"];
 
+/**
+ * The first line every session is given: the shell's own two streams, saved on
+ * descriptors the model's program does not write through.
+ *
+ * The marker protocol ([`typeIntoShell`]) is this runtime *talking to itself*
+ * down the same two pipes the command answers on, and a model may permanently
+ * redirect where those pipes are: `exec > build.log 2>&1` at the top of a
+ * command is an ordinary thing to write, and it changes the shell's own
+ * descriptors 1 and 2 for every command that follows. Markers written to those
+ * would go into the log with the build output — the call in flight waits out its
+ * `timeout:`, and so does the next one, and the one after that, because nothing
+ * the shell prints afterwards can ever close a command again. A session that
+ * answers nothing until it is killed, from a command that did exactly what it
+ * said.
+ *
+ * So the descriptors the markers use are taken **before the model has a session
+ * to redirect**, and the protocol writes to those: a later `exec` moves 1 and 2
+ * and leaves 3 and 4 pointing at the pipes this runtime is reading. The
+ * command's own output still goes wherever the model sent it, which is the
+ * model's business — what is no longer the model's business is whether the
+ * runtime can tell that the command ended.
+ *
+ * What this does *not* survive is a command that reassigns 3 or 4 themselves
+ * (`exec 3< manifest` is the spelling of a `read -u 3` loop). That command's
+ * marker is lost the way every command's was before, and the deadline answers it
+ * — the same bound, on one command rather than on the session, since the kill
+ * takes the shell with it and the next call opens one whose preamble has run
+ * again.
+ */
+const SHELL_PREAMBLE = "exec 3>&1 4>&2\n";
+
 /** Open one shell for this binding, in this workspace. */
 async function openShell(
   binding: BuiltinBinding,
@@ -4589,6 +4620,12 @@ async function openShell(
   // answers such a call is the session ending ([`endShell`], from `close`), so
   // the write's own failure has nothing left to say.
   child.stdin.on("error", () => {});
+  // …and the one line this runtime types that is not a command: the shell's own
+  // streams, saved where a model's `exec` cannot move them ([`SHELL_PREAMBLE`]).
+  // Written at the open rather than in front of each command, because the point
+  // is to hold descriptors the session was born with — a save typed after a
+  // command had redirected them would save the redirection.
+  child.stdin.write(SHELL_PREAMBLE);
   child.stdout.on("data", (chunk: string) => {
     session.stdout += chunk;
     settleShell(session);
@@ -4777,6 +4814,15 @@ function shellNotice(
  * call settles when both have arrived. The exit status rides the stdout marker,
  * which is the one place `$?` is still the command's.
  *
+ * They are written to descriptors **3 and 4** rather than to 1 and 2, and that
+ * is the difference between a protocol the model can break and one it cannot:
+ * the session saved its own two streams there before it ran anything
+ * ([`SHELL_PREAMBLE`]), so a command that redirects the shell's for good —
+ * `exec > build.log 2>&1`, an ordinary line to write — moves where its *output*
+ * goes and not where the marker that closes it goes. The two descriptors are
+ * dups of the same pipes, so the marker still arrives behind the command's own
+ * output, in order, on the stream it belongs to.
+ *
  * The marker is random per session rather than a constant, so text the *model*
  * writes cannot close a command early by printing one — a `printf` of a fixed
  * string would be a command able to make its own status up. It is not a boundary
@@ -4843,10 +4889,11 @@ async function typeIntoShell(
       }, bound.millis);
     }
     session.pending = settle;
-    // The group, its `/dev/null`, and the assignment inside it are all load
-    // bearing — see this function's own note on each.
+    // The group, its `/dev/null`, the assignment inside it and the descriptors
+    // the two `printf`s write to are all load bearing — see this function's own
+    // note on each.
     session.child.stdin.write(
-      `{ ${command}\n${session.marker}_status=$?\n} < /dev/null\nprintf '\\n%s:%s\\n' '${session.marker}' "$${session.marker}_status"\nprintf '\\n%s\\n' '${session.marker}' >&2\n`,
+      `{ ${command}\n${session.marker}_status=$?\n} < /dev/null\nprintf '\\n%s:%s\\n' '${session.marker}' "$${session.marker}_status" >&3\nprintf '\\n%s\\n' '${session.marker}' >&4\n`,
     );
   });
   if (context.signal.aborted) throw abortReason(context.signal);

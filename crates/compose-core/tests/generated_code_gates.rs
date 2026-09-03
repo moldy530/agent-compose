@@ -3702,7 +3702,9 @@ fn the_local_backends_behaved(answer: &Value) {
 /// that cannot be read, that a file larger than
 /// the runtime reads is viewed from the front and edited not at all, that one
 /// shell really is held across
-/// the calls of a node activity and not across two, that a `restart` the model
+/// the calls of a node activity and not across two, that a command redirecting
+/// that shell's own streams (`exec > run.log 2>&1`) still settles and leaves the
+/// session usable, that a `restart` the model
 /// asked for ends that session and does not swallow the command sent with it,
 /// that a scrubbed child sees the declared variables and no others, that a
 /// command's deadline answers the model rather than failing the node, and that a
@@ -4103,6 +4105,48 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
         quit.contains("the shell exited") && quit.contains("fresh shell"),
         "a model that ended its own shell is told so, and told what the next call will find, \
          rather than left to wonder where its state went: {session}"
+    );
+
+    // --- A command that redirects the shell's own streams -------------------
+    //
+    // The completion markers are this runtime talking to itself down the pipes
+    // the command answers on, and `exec > run.log 2>&1` moves where those pipes
+    // are for the rest of the session. Markers that went with them would leave
+    // the call in flight waiting out its `timeout:` — and the next call, and the
+    // one after that — from a command that did exactly what it said.
+    let redirected = &answer["redirectedShell"];
+    assert_eq!(
+        redirected["first"],
+        json!({ "stdout": "", "stderr": "", "exit_code": 0 }),
+        "a command that redirected the shell's own streams **settled**, with its status: what \
+         it printed went to the file it named, and the marker that closes it did not: \
+         {redirected}"
+    );
+    assert_eq!(
+        redirected["after"],
+        json!({ "stdout": "", "stderr": "", "exit_code": 4 }),
+        "…and so did the command after it, with a status of its own: {redirected}"
+    );
+    assert_eq!(
+        redirected["log"], "the redirected line\nsecond line\nto stderr\n",
+        "…in that same shell, which is what the file says rather than the answers: the second \
+         command's output is under the first's in the log the first one opened, so the \
+         redirection is still in force and this is still the session that made it — and no \
+         marker text is in there with them: {redirected}"
+    );
+    let redirect_ms = redirected["elapsedMs"]
+        .as_u64()
+        .expect("the runner times the pair of calls");
+    assert!(
+        redirect_ms < 4_000,
+        "both calls answered well inside one 5s bound, rather than spending it: a session whose \
+         markers followed the redirection answers nothing until the deadline kills it, and this \
+         pair took {redirect_ms}ms"
+    );
+    assert_eq!(
+        redirected["restored"]["stdout"], "captured again\n",
+        "…and the model gets captured output back the way it always could, by restarting the \
+         session it redirected: {redirected}"
     );
 
     // --- The restart the model asks for (PRD resolved q54) -----------------

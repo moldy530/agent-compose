@@ -32,6 +32,11 @@
 //     `cd` in one call is still in effect in the next, and a second activity
 //     starts in the workspace. Two contexts is the whole of that claim, and it
 //     is invisible from outside the process;
+//   * **a command that redirects the shell itself** — `exec > run.log 2>&1` is an
+//     ordinary line for a model to write and it moves the shell's own two
+//     streams for the rest of the session. The runtime's completion markers must
+//     not go with them: the call has to settle, and so does the one after it, in
+//     that same session;
 //   * **the restart the model asks for** — the one way a session ends that the
 //     *model* drives: alone it runs nothing and says so with no status, and a
 //     `command` sent with it runs in the fresh session rather than being
@@ -411,6 +416,55 @@ runtime.endShellSessions(first);
 runtime.endShellSessions(second);
 
 // ---------------------------------------------------------------------------
+// A command that redirects the shell's own streams for good.
+//
+// The one place the runtime's protocol and the model's program share a channel,
+// reached from the other end than the standard-input case above: `exec > run.log
+// 2>&1` at the top of a build command moves the *shell's* descriptors 1 and 2 —
+// not one command's — so every completion marker printed to them afterwards
+// lands in the log instead of on the pipes this runtime reads. The call in
+// flight then waits out its whole `timeout:`, and so does the next one, from a
+// command that did exactly what it said.
+//
+// Three claims, and the middle one is the whole of it:
+//
+//   * the redirecting command **settles**, with the status it exited;
+//   * the command after it settles too, **in that same session** — which is what
+//     the log proves rather than the answer: the second command's output is
+//     under the first's in the file, so fd 1 is still the log and this is still
+//     the shell that redirected it;
+//   * and the model can have its captured output back the way it always could,
+//     by restarting the session it redirected.
+const redirectedRoot = workspace("redirected");
+const redirectingContext = contextWith("exec_redirect");
+const startedRedirect = Date.now();
+const redirecting = await call(
+  shell(redirectedRoot),
+  { command: "exec > run.log 2>&1\nprintf 'the redirected line\\n'" },
+  redirectingContext,
+);
+const afterRedirect = await call(
+  shell(redirectedRoot),
+  { command: "printf 'second line\\n'; printf 'to stderr\\n' >&2; (exit 4)" },
+  redirectingContext,
+);
+const restoredCapture = await call(
+  shell(redirectedRoot),
+  { command: "printf 'captured again\\n'", restart: true },
+  redirectingContext,
+);
+const redirectedShell = {
+  first: redirecting.result,
+  after: afterRedirect.result,
+  // Both calls, against a 5s bound each: a protocol the redirect defeated would
+  // spend that bound rather than answer.
+  elapsedMs: Date.now() - startedRedirect,
+  log: fs.readFileSync(path.join(redirectedRoot, "run.log"), "utf8"),
+  restored: restoredCapture.result,
+};
+runtime.endShellSessions(redirectingContext);
+
+// ---------------------------------------------------------------------------
 // The restart the *model* asks for.
 //
 // The other way a session ends, and the only one the model drives: `restart` is
@@ -560,5 +614,5 @@ await runtime.releaseWorkspaces("exec_default_workspace", false);
 workspaces.goneWhenSettled = !fs.existsSync(madeAt);
 
 process.stdout.write(
-  `${JSON.stringify({ containment, editingTool, viewWindow, readBound, session, restart, bounded, environment, timeout, workspaces })}\n`,
+  `${JSON.stringify({ containment, editingTool, viewWindow, readBound, session, redirectedShell, restart, bounded, environment, timeout, workspaces })}\n`,
 );
