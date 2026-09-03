@@ -397,21 +397,20 @@ flow.build:
 | Built-in | `builtin:` | What the model calls it | Arguments |
 |---|---|---|---|
 | `builtin.bash` | `bash` | `bash` | `command`, `restart` |
-| `builtin.files` | `files` | `str_replace_based_edit_tool` | `command` (`view`/`create`/`str_replace`/`insert`), `path`, `file_text`, `old_str`, `new_str`, `insert_line` |
+| `builtin.files` | `files` | `str_replace_based_edit_tool` | `command` (`view`/`create`/`str_replace`/`insert`), `path`, `view_range`, `file_text`, `old_str`, `new_str`, `insert_line` |
 
 The set is closed: any other `builtin:` value is a compile error naming the two.
 
-The **arguments** are the closed set above and nothing else, on every wire, and
-that set is **narrower than the vendor tool's own** on the Messages wire: these
-go out there as the provider-defined types, and the text editor's `view` takes
-an optional `view_range` this runtime does not implement. So a model trained on
-that type may send one — a slice of a long file is the ordinary thing to reach
-for — and the call is refused with the offending key named, which the model
-corrects by calling again without it. **Budget for it**: the bounce costs one
-turn of the agent's `max_tool_iterations` (default 8), so an agent whose work is
-mostly reading long files wants a turn or two of headroom. Nothing is out of
-reach either way — a `view` answers with the whole file, numbered, up to the cap
-below.
+The **arguments** are the closed set above and nothing else, on every wire —
+the names the provider-defined tools carry, because on the Messages wire these
+*are* those tools and a model trained on the type fills exactly those names.
+`view_range` is there for that reason: the text editor's `view` takes an
+optional `[first, last]`, a model reaches for it on the second read of a long
+file, and this runtime reads that window — the file's own line numbers, both
+ends included, `-1` as the last line for the rest of the file. A key **outside**
+the set is refused with the key named, and the model calls again without it;
+that bounce costs one turn of the agent's `max_tool_iterations` (default 8),
+which is the budget to keep a turn of headroom in.
 
 **The name is the provider's, not the definition key's.** These go out as the
 provider-defined tool types, each of which carries a name the wire dictates — so
@@ -501,9 +500,20 @@ from line 1. Either way the cut is said rather than silent. A command that print
 more than the runtime will hold is bounded as it arrives, too, so a `cat` of
 something enormous costs a truncated answer rather than the process.
 
+**A long file is read in windows.** `view_range: [400, 460]` answers with those
+lines and no others, numbered 400 to 460 — the *file's* numbers, so a
+`str_replace` composed out of one window matches what the next window shows.
+`[400, -1]` reads to the end, and a last line past the end is clamped there
+rather than refused. Without a range the whole file comes back, cut at the
+answer bound counting from line 1, so a window is how the far end of a long file
+is reached at all. A range that cannot be read — one number where two belong, a
+start below line 1 or past the end of the file, an end before its start, a range
+on a directory — comes back as a refusal saying which, and the model asks again.
+
 The path a `files` call names is the model's, so what it *reads* is bounded the
 same way for the same reason. A `view` of a file past that bound answers with the
-front of it and says where it stopped; a `str_replace` or an `insert` on one is
+front of it — or with the window that was asked for, if it falls inside what was
+read — and says where the read stopped; a `str_replace` or an `insert` on one is
 **refused**, because an edit writes back what it read and a truncated read would
 truncate the file rather than the answer. Work on something that large with
 `bash`, which streams rather than holds.
@@ -527,7 +537,8 @@ composition's to fail:
 - **the model's mistakes come back to the model** — a call with neither a
   `command` nor a `restart`, a `path` that resolves outside the workspace, a
   write to a file that carries a second name, a file that is not there, a
-  `str_replace` whose `old_str` matched nothing or matched twice. Each is a
+  `str_replace` whose `old_str` matched nothing or matched twice, a `view_range`
+  that cannot be read. Each is a
   statement about arguments the model chose, and it can choose again;
 - **a command's own outcome is an answer, not a failure** — a nonzero exit comes
   back with the status, and a command that outran the `timeout:` is killed and

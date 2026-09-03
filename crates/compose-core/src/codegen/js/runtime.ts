@@ -5096,7 +5096,7 @@ async function runBuiltinFiles(
   const text = (name: string): string => (typeof args[name] === "string" ? args[name] : "");
   switch (operation) {
     case "view":
-      return await viewPath(requested, target);
+      return await viewPath(requested, target, args["view_range"]);
     case "create":
       return await createFile(requested, target, text("file_text"));
     case "str_replace":
@@ -5123,8 +5123,18 @@ async function runBuiltinFiles(
  * ones that are directories. Not walked: a workspace holding a dependency tree
  * would answer a `view` with a hundred thousand paths, and a model that wants
  * one asks `bash` for it.
+ *
+ * `view_range` reads a **window** of a file rather than its front, which is the
+ * provider-defined tool's own parameter and the ordinary way a long file is
+ * read: the answer bound below cuts a whole-file view at
+ * [`BUILTIN_OUTPUT_LIMIT`] from line 1, so without a window the tail of a long
+ * file is reachable only through `bash` — which an agent holding this tool
+ * alone does not have. The numbers stay the **file's**: a window starting at
+ * line 400 is numbered from 400, so a `str_replace` composed out of it is
+ * composed against lines the next `view` will agree with.
  */
-async function viewPath(requested: string, target: string): Promise<unknown> {
+async function viewPath(requested: string, target: string, range: unknown): Promise<unknown> {
+  const wanted = viewWindow(requested, range);
   const entry = await fs.promises.stat(target).catch(() => undefined);
   if (entry === undefined) {
     throw new ToolCallRefused(
@@ -5132,6 +5142,15 @@ async function viewPath(requested: string, target: string): Promise<unknown> {
     );
   }
   if (entry.isDirectory()) {
+    // A directory has no lines to take a window of. Refused rather than ignored,
+    // for the reason every other argument mistake is (Decision D119): a model
+    // that asked for lines 10–40 of something and was handed an unnumbered
+    // listing would read the listing as the answer to the question it asked.
+    if (wanted !== undefined) {
+      throw new ToolCallRefused(
+        `\`${FILE_TOOL}\` was asked to \`view\` \`${requested}\` with a \`view_range\`, and it is a directory: send the range with a file's path, or drop it to list this directory`,
+      );
+    }
     const held = await fs.promises.readdir(target, { withFileTypes: true }).catch((error: unknown) => {
       throw fileRefusal("view", requested, error);
     });
@@ -5143,13 +5162,80 @@ async function viewPath(requested: string, target: string): Promise<unknown> {
     };
   }
   const held = await readFileText("view", requested, target);
-  const shown = capped(numbered(held.text), BUILTIN_OUTPUT_LIMIT);
+  const all = fileLines(held.text);
+  let from = 1;
+  let selected = all;
+  if (wanted !== undefined) {
+    if (wanted.first > all.length) {
+      throw new ToolCallRefused(
+        `\`${FILE_TOOL}\` was asked to \`view\` \`${requested}\` from line ${wanted.first}, and ${held.whole ? `it has ${all.length} line(s)` : `the ${FILE_READ_LIMIT} bytes of it this tool reads hold ${all.length} line(s)`}: \`view_range\` counts a file's own lines from 1`,
+      );
+    }
+    // The last line is *clamped* rather than refused, because `-1` and "past the
+    // end" are the same request — read what is there — and a model that guessed
+    // a file's length high asked a question this can answer.
+    const last = wanted.last === -1 ? all.length : Math.min(wanted.last, all.length);
+    if (last < wanted.first) {
+      throw new ToolCallRefused(
+        `\`${FILE_TOOL}\` was asked to \`view\` \`${requested}\` from line ${wanted.first} to line ${wanted.last}, which ends before it starts: \`view_range\` is \`[first, last]\`, and \`-1\` as the last line reads to the end of the file`,
+      );
+    }
+    from = wanted.first;
+    selected = all.slice(wanted.first - 1, last);
+  }
+  const shown = capped(numberedLines(selected, from), BUILTIN_OUTPUT_LIMIT);
   return {
     path: requested,
     content: held.whole
       ? shown
       : `${shown}\n…[only the first ${FILE_READ_LIMIT} bytes of this file were read: it is larger than this tool views. Use \`bash\` to reach the rest]`,
   };
+}
+
+/**
+ * The window a `view_range` asks for, or `undefined` for the whole file.
+ *
+ * The parameter carries `default: []` (`builtin_tool_input`), so a model that
+ * sent nothing and one that sent the empty range arrive here identically and
+ * both mean the whole file — which is what makes the default the *file* rather
+ * than a pair of numbers that would have to guess how long it is.
+ *
+ * Everything else it can be is the model's to correct (Decision D119). The
+ * schema bounds the pair to two integers in range; what it cannot say is that
+ * they are two rather than one, or that they are the right way round, so those
+ * are said here in a sentence that names the spelling that works.
+ */
+function viewWindow(
+  requested: string,
+  range: unknown,
+): { readonly first: number; readonly last: number } | undefined {
+  if (range === undefined || range === null) return undefined;
+  const bounds: readonly unknown[] = Array.isArray(range) ? (range as readonly unknown[]) : [range];
+  if (bounds.length === 0) return undefined;
+  const first = bounds[0];
+  const last = bounds[1];
+  if (
+    bounds.length !== 2 ||
+    !Number.isInteger(first) ||
+    !Number.isInteger(last) ||
+    typeof first !== "number" ||
+    typeof last !== "number"
+  ) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` was given a \`view_range\` for \`${requested}\` that is not two line numbers: send \`[first, last]\` — whole numbers counting the file's lines from 1, with \`-1\` as the last line to read to the end of the file`,
+    );
+  }
+  if (first < 1) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` was given a \`view_range\` starting at line ${first} for \`${requested}\`: a file's first line is 1`,
+    );
+  }
+  if (last < 1 && last !== -1) {
+    throw new ToolCallRefused(
+      `\`${FILE_TOOL}\` was given a \`view_range\` ending at line ${last} for \`${requested}\`: the last line is a line number, or \`-1\` to read to the end of the file`,
+    );
+  }
+  return { first, last };
 }
 
 /**
@@ -5415,11 +5501,28 @@ function fileRefusal(operation: FileOperation, requested: string, error: unknown
   );
 }
 
-/** A file's text with each line numbered, which is what `view` answers with. */
-function numbered(contents: string): string {
+/**
+ * A file's text as its lines, without the empty one a trailing newline leaves.
+ *
+ * The lines rather than the text, because a `view_range` slices them and a
+ * re-split of a *slice* would drop a blank line that happened to land last —
+ * the trailing-newline rule is a fact about a whole file, not about a window
+ * cut out of one.
+ */
+function fileLines(contents: string): readonly string[] {
   const lines = contents.split("\n");
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-  return lines.map((line, at) => `${String(at + 1).padStart(6, " ")}\t${line}`).join("\n");
+  return lines;
+}
+
+/** Those lines, numbered from `from` — what a `view` answers with. */
+function numberedLines(lines: readonly string[], from: number): string {
+  return lines.map((line, at) => `${String(at + from).padStart(6, " ")}\t${line}`).join("\n");
+}
+
+/** A file's text with each line numbered from 1. */
+function numbered(contents: string): string {
+  return numberedLines(fileLines(contents), 1);
 }
 
 /** The lines around an edit, numbered — what an edit answers with. */

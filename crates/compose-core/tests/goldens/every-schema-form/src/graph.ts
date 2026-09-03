@@ -593,6 +593,17 @@ const agentShaper: runtime.AgentBinding = {
             "description": "The file or directory, relative to this tool's workspace.",
             "minLength": 1,
             "type": "string"
+          },
+          "view_range": {
+            "default": [],
+            "description": "The first and last line to show, for `view` of a file: `[10, 40]`. Lines count from 1 and both ends are included; `-1` as the last line reads to the end of the file. Omitted, the whole file is shown.",
+            "items": {
+              "maximum": 1000000,
+              "minimum": -1,
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "type": "array"
           }
         },
         "required": [

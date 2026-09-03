@@ -232,10 +232,13 @@
 //!     suite drives both through a model loop, which is where the wire, the
 //!     trace records and Decision D119's bounces are settled; what a loop
 //!     cannot show is the inside of a call, and that is where every bound PRD
-//!     resolved q54 puts on these two lives. Eight of them: that a path
+//!     resolved q54 puts on these two lives. Nine of them: that a path
 //!     climbing out of the workspace — `..`, an absolute path, or a symlink
 //!     whose own parents do not exist yet — leaves what is outside
-//!     **untouched** rather than merely drawing a complaint, that a file larger
+//!     **untouched** rather than merely drawing a complaint, that a
+//!     `view_range` reads a window of a file under the file's own numbering and
+//!     refuses the ranges it cannot read rather than answering with the wrong
+//!     lines, that a file larger
 //!     than the runtime reads is viewed from the front and edited not at all,
 //!     that one shell is held across the calls of a node activity and across no
 //!     more than that, that a `restart` ends that session without swallowing
@@ -3694,7 +3697,9 @@ fn the_local_backends_behaved(answer: &Value) {
 /// cannot show is the inside of a call, and each of these is a claim PRD
 /// resolved q54 makes there: that an escaping path leaves everything outside the
 /// workspace **untouched**, that a `create` with an empty `file_text` writes the
-/// empty file rather than refusing a capability away, that a file larger than
+/// empty file rather than refusing a capability away, that a `view_range` reads
+/// a window of a file under the file's own line numbers and refuses the ranges
+/// that cannot be read, that a file larger than
 /// the runtime reads is viewed from the front and edited not at all, that one
 /// shell really is held across
 /// the calls of a node activity and not across two, that a `restart` the model
@@ -3925,6 +3930,97 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
         "…and that spelling really inserts the blank line: {editing}"
     );
 
+    // --- The window a `view` can be asked for ------------------------------
+    //
+    // `view_range` is the provider-defined text editor's own parameter, and the
+    // only way the far end of a long file is reachable through this tool: a
+    // whole-file view is cut at the answer bound counting from line 1. So the
+    // window has to keep the **file's** numbering — a `str_replace` composed out
+    // of one is composed against lines the next `view` will agree with — and the
+    // ways a range can be wrong have to come back as refusals rather than as a
+    // view of the wrong lines (Decision D119).
+    let ranged = &answer["viewWindow"];
+    assert_eq!(
+        ranged["middle"],
+        json!({ "path": "ranged.txt", "content": "     2\tb\n     3\t\n     4\td" }),
+        "a window is the file's own lines under the file's own numbers, blank line included — \
+         a re-split of the window's joined text would have dropped that blank line, because a \
+         trailing empty line is a fact about a whole file and not about a slice of one: \
+         {ranged}"
+    );
+    assert_eq!(
+        (&ranged["toTheEnd"], &ranged["clamped"]),
+        (
+            &json!({ "path": "ranged.txt", "content": "     4\td\n     5\te" }),
+            &json!({ "path": "ranged.txt", "content": "     4\td\n     5\te" })
+        ),
+        "`-1` and a last line past the end are the same request — read what is there — so the \
+         second is clamped rather than refused: {ranged}"
+    );
+    assert_eq!(
+        ranged["emptyRange"],
+        json!({
+            "path": "ranged.txt",
+            "content": "     1\ta\n     2\tb\n     3\t\n     4\td\n     5\te"
+        }),
+        "…and the empty range is the whole file, which is what the parameter's `default: []` \
+         means: a model that sent nothing and one that sent `[]` are one call here: {ranged}"
+    );
+    assert_eq!(
+        (
+            &ranged["pastTheEndRefused"],
+            &ranged["backwardsRefused"],
+            &ranged["oneNumberRefused"],
+            &ranged["fromZeroRefused"],
+            &ranged["onDirectoryRefused"]
+        ),
+        (
+            &json!(true),
+            &json!(true),
+            &json!(true),
+            &json!(true),
+            &json!(true)
+        ),
+        "a start past the end, a range that ends before it starts, one number where two belong, \
+         a start below line 1, and a range on a directory are each the model's to correct \
+         rather than a view of whatever the runtime made of them: {ranged}"
+    );
+    let past = ranged["pastTheEndMessage"].as_str().unwrap_or_default();
+    assert!(
+        past.contains("5 line(s)") && past.contains("counts a file's own lines from 1"),
+        "…and the refusal says how long the file is, which is the number the model needs to \
+         ask again (PRD G3): {past}"
+    );
+    let backwards = ranged["backwardsMessage"].as_str().unwrap_or_default();
+    assert!(
+        backwards.contains("ends before it starts") && backwards.contains("-1"),
+        "…and the backwards range names the spelling that reads to the end: {backwards}"
+    );
+    let one_number = ranged["oneNumberMessage"].as_str().unwrap_or_default();
+    assert!(
+        one_number.contains("not two line numbers") && one_number.contains("[first, last]"),
+        "…and a range of one number says what a range is: {one_number}"
+    );
+    let from_zero = ranged["fromZeroMessage"].as_str().unwrap_or_default();
+    assert!(
+        from_zero.contains("a file's first line is 1"),
+        "…and a start below 1 says where a file starts, since 0-based is the guess a model \
+         makes: {from_zero}"
+    );
+    let on_directory = ranged["onDirectoryMessage"].as_str().unwrap_or_default();
+    assert!(
+        on_directory.contains("it is a directory"),
+        "…and a directory has no lines to window, so an unnumbered listing is not the answer to \
+         the question that was asked: {on_directory}"
+    );
+    assert_eq!(
+        ranged["program"],
+        json!({ "tool": "files", "operation": "view", "path": "ranged.txt" }),
+        "the trace's record of a windowed read is the operation and the path it already \
+         carried: the window is a bound on the *answer*, and `docs/trace.md` §7.4's fields do \
+         not change because one was asked for: {ranged}"
+    );
+
     // --- The bound on what one `files` call reads --------------------------
     //
     // The path is the model's, so the size of the read is the model's too unless
@@ -3941,6 +4037,18 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
             && heavy["saidItStopped"] == json!(true),
         "a `view` of a file larger than the runtime reads answers with a bounded head and says \
          where it stopped, rather than pulling the file into this process: {heavy}"
+    );
+    assert_eq!(
+        (&heavy["tailFirstNumber"], &heavy["tailSaidItStopped"]),
+        (&json!(39_990), &json!(true)),
+        "…and a `view_range` reaches the part of that file the bounded head cannot: the window \
+         starts at the line it asked for, tens of thousands of lines past where the whole-file \
+         view was cut, and still says the read stopped short of the file's end: {heavy}"
+    );
+    assert!(
+        heavy["tailLength"].as_u64().unwrap_or_default() < 30_000,
+        "…and it is a window rather than the rest of the file: eleven lines, not the answer \
+         bound's worth of them: {heavy}"
     );
     assert_eq!(
         (&heavy["editRefused"], &heavy["stillWholeOnDisk"]),

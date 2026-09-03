@@ -12927,18 +12927,23 @@ fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
     assert!(provider.snapshot().is_drained());
 }
 
-/// A parameter the **vendor's own tool** carries and this runtime does not:
-/// `view_range` on the text editor (grammar 5.5, Decision D119, PRD resolved
-/// q54).
+/// A key the built-in's argument set does not carry (grammar 5.5, Decision
+/// D119, PRD resolved q54).
 ///
-/// The live gap in the contract, rather than a forward-compatibility corner. On
-/// the Messages wire `builtin.files` goes out as `text_editor_20250728`, whose
-/// `view` takes an optional `view_range` — so a model trained on that type will
-/// send one, and the closed argument set this compiler declares refuses it.
+/// The set is **closed**, and it is the compiler's rather than the model's: on
+/// the Messages wire `builtin.files` goes out as `text_editor_20250728` with no
+/// schema at all, so what arrives is whatever the model was trained to fill —
+/// the declared names for the most part, and now and then a key from some other
+/// editor it has seen, or one it invented for the call it had in mind. The
+/// compiler's Zod is `.strict()`, so that call is refused before the tool is
+/// reached.
+///
 /// What has to hold for that to be a *cost* rather than a dead end is the whole
 /// of D119: the refusal names the key it refused, the model corrects, and the
 /// run completes — spending one turn of `max_tool_iterations`, which is what
-/// `agent-compose docs tools` tells an author to budget for.
+/// `agent-compose docs tools` tells an author to budget for. The vendor's own
+/// `view_range` is **not** an example of this any more: it is implemented, and
+/// `the_file_tool_creates_edits_and_views_inside_its_workspace` drives it.
 ///
 /// And the presence rule the other half of the campaign wrote down: this call is
 /// refused **before** it reaches the tool, so its record carries no `program`
@@ -12959,7 +12964,7 @@ fn an_argument_outside_a_builtins_schema_is_refused_naming_the_key() {
             SONNET,
             Outcome::tool_calls(vec![ToolCall::new(
                 "str_replace_based_edit_tool",
-                json!({ "command": "view", "path": "notes.txt", "view_range": [1, 2] }),
+                json!({ "command": "view", "path": "notes.txt", "line_numbers": false }),
             )]),
         ),
         Script::new(
@@ -12979,7 +12984,7 @@ fn an_argument_outside_a_builtins_schema_is_refused_naming_the_key() {
     let Some(run) = harness::invoke_with(
         "builtin-tools",
         "flow.edit",
-        &json!({ "goal": "read the first two lines" }),
+        &json!({ "goal": "read the notes" }),
         &environment,
     ) else {
         return;
@@ -13000,7 +13005,7 @@ fn an_argument_outside_a_builtins_schema_is_refused_naming_the_key() {
     assert!(
         refusal.starts_with("ToolCallRefused: ")
             && refusal.contains("Unrecognized key")
-            && refusal.contains("view_range"),
+            && refusal.contains("line_numbers"),
         "the refusal **names the key it refused**, which is the difference between a model \
          that corrects itself and one that guesses (PRD G3): {refusal}"
     );
@@ -13013,7 +13018,7 @@ fn an_argument_outside_a_builtins_schema_is_refused_naming_the_key() {
     // …and the model was handed the same sentence, which is what it corrects on.
     let handed = provider.requests()[1].body().to_string();
     assert!(
-        handed.contains("view_range"),
+        handed.contains("line_numbers"),
         "the refusal reached the model with the offending key in it: {handed}"
     );
     assert!(provider.snapshot().is_drained());
@@ -13023,10 +13028,11 @@ fn an_argument_outside_a_builtins_schema_is_refused_naming_the_key() {
 /// (grammar 5.5, 6.1, PRD resolved q54).
 ///
 /// The operations and their parameter names are the provider-defined text
-/// editor's, because on the Messages wire this *is* that tool. What is asserted
-/// is the file system afterwards and the view the model was handed, which
-/// together are the only proof the three calls were one file's story rather than
-/// three separate answers.
+/// editor's, because on the Messages wire this *is* that tool — including the
+/// `view_range` a fourth call reads a window with, which is how a file longer
+/// than one answer is read. What is asserted is the file system afterwards and
+/// the two views the model was handed, which together are the only proof the
+/// calls were one file's story rather than four separate answers.
 #[test]
 fn the_file_tool_creates_edits_and_views_inside_its_workspace() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -13061,6 +13067,16 @@ fn the_file_tool_creates_edits_and_views_inside_its_workspace() {
             Outcome::tool_calls(vec![ToolCall::new(
                 "str_replace_based_edit_tool",
                 json!({ "command": "view", "path": "notes/plan.md" }),
+            )]),
+        ),
+        // …and the same file read as a **window**, which is the provider-defined
+        // editor's own `view_range` and the way a file longer than one answer is
+        // read at all. `-1` as the last line reads to the end of the file.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({ "command": "view", "path": "notes/plan.md", "view_range": [2, -1] }),
             )]),
         ),
         Script::new(SONNET, Outcome::text("The file reads the way it should.")),
@@ -13102,6 +13118,25 @@ fn the_file_tool_creates_edits_and_views_inside_its_workspace() {
         viewed.contains(r"     1\\tone") && viewed.contains(r"     2\\tthe second line"),
         "the view came back numbered: {viewed}"
     );
+    // …and what it was handed for the **window**: those lines and no others,
+    // under the file's own numbers, which is what makes a `str_replace`
+    // composed out of one window match what the next one shows.
+    let answering = provider.requests()[4].body()["messages"]
+        .as_array()
+        .and_then(|turns| turns.last())
+        .map(|turn| turn["content"][0]["content"].clone())
+        .unwrap_or_default();
+    let ranged: serde_json::Value = serde_json::from_str(
+        answering
+            .as_str()
+            .expect("the tool result is the JSON the runtime answered with"),
+    )
+    .expect("…and it parses");
+    assert_eq!(
+        ranged["content"], "     2\tthe second line\n     3\tthree",
+        "`view_range: [2, -1]` answered with line 2 to the end of the file, numbered 2 and 3 — \
+         a window, not a re-numbered copy of one: {ranged}"
+    );
 
     let calls = tool_calls_of(&run, "do");
     assert_eq!(
@@ -13123,9 +13158,11 @@ fn the_file_tool_creates_edits_and_views_inside_its_workspace() {
                 "change": "replaced one occurrence at line 2"
             }),
             json!({ "tool": "files", "operation": "view", "path": "notes/plan.md" }),
+            json!({ "tool": "files", "operation": "view", "path": "notes/plan.md" }),
         ],
         "the trace carries the operation, the path and a sentence about the edit — never \
-         the file's contents (`docs/trace.md` §7.4, §11): {calls:?}"
+         the file's contents (`docs/trace.md` §7.4, §11), and a windowed read records the \
+         same two fields as any other, because the window bounds the *answer*: {calls:?}"
     );
     assert!(
         !run.trace()

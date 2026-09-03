@@ -1088,6 +1088,32 @@ pub(crate) fn builtin_tool_input(builtin: Builtin, span: &Span) -> FieldMap {
                 "path",
                 required("The file or directory, relative to this tool's workspace."),
             ),
+            // The one argument that is here because the *provider-defined* tool
+            // has it. `view` of a long file is read in windows, and a model
+            // trained on `text_editor_20250728` reaches for this on the second
+            // read of one; declaring a narrower `view` would spend a turn of
+            // `max_tool_iterations` on a bounce every time it did, and leave the
+            // tail of a file past the runtime's answer bound reachable only
+            // through `bash` — which an agent holding this tool alone does not
+            // have.
+            ("view_range", {
+                let mut ty = array_node(bounded_integer(-1, 1_000_000, span), Some(2), span);
+                ty.description = Some(Spanned::new(
+                    "The first and last line to show, for `view` of a file: `[10, 40]`. \
+                     Lines count from 1 and both ends are included; `-1` as the last line \
+                     reads to the end of the file. Omitted, the whole file is shown."
+                        .to_string(),
+                    span.clone(),
+                ));
+                // Defaulted to the empty range for `insert_line`'s reason — the
+                // three commands that never read it stay callable without it —
+                // and *empty* rather than `[1, -1]` so the default is the whole
+                // file however long the file turns out to be.
+                if let TypeForm::Array(array) = &mut ty.form {
+                    array.default = Some(Spanned::new(Literal::Sequence(Vec::new()), span.clone()));
+                }
+                ty
+            }),
             (
                 "file_text",
                 optional("The whole contents of the file, for `create`."),

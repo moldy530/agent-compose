@@ -20,6 +20,11 @@
 //     writes the empty file for both, because refusing them would leave
 //     `.gitkeep` with no spelling that works; `insert` keeps its refusal for an
 //     empty `new_str`, because a lone newline is that spelling there;
+//   * **the view window** — `view_range`, the provider-defined editor's own
+//     parameter and the way a file longer than one answer is read: the window
+//     keeps the *file's* line numbers, `-1` and a last line past the end both
+//     read to the end, and the four ways a range can be wrong come back as
+//     refusals rather than as a view of the wrong lines;
 //   * **the read bound** — a file larger than the runtime reads is *viewed*
 //     from the front with the stop said, and *edited* not at all: an edit
 //     rewrites what it read, so a truncated read would truncate the file;
@@ -202,6 +207,49 @@ const inserted = await call(
   editContext,
 );
 const listed = await call(files(editing), { command: "view", path: "notes" }, editContext);
+// The window a `view` can be asked for — the provider-defined editor's own
+// `view_range`, and the way a long file is read at all. On a file of its own,
+// with a **blank line inside the window**, because a window re-split out of its
+// own joined text would lose a blank line that landed last.
+await call(
+  files(editing),
+  { command: "create", path: "ranged.txt", file_text: "a\nb\n\nd\ne\n" },
+  editContext,
+);
+const ranged = (view_range) =>
+  call(files(editing), { command: "view", path: "ranged.txt", view_range }, editContext);
+const middle = await ranged([2, 4]);
+const toTheEnd = await ranged([4, -1]);
+const clamped = await ranged([4, 99]);
+const emptyRange = await ranged([]);
+const pastTheEnd = await ranged([9, 10]);
+const backwards = await ranged([4, 2]);
+const oneNumber = await ranged([4]);
+const fromZero = await ranged([0, 2]);
+const onDirectory = await call(
+  files(editing),
+  { command: "view", path: "notes", view_range: [1, 2] },
+  editContext,
+);
+const viewWindow = {
+  middle: middle.result,
+  toTheEnd: toTheEnd.result,
+  clamped: clamped.result,
+  emptyRange: emptyRange.result,
+  pastTheEndRefused: pastTheEnd.refused === true,
+  pastTheEndMessage: pastTheEnd.message,
+  backwardsRefused: backwards.refused === true,
+  backwardsMessage: backwards.message,
+  oneNumberRefused: oneNumber.refused === true,
+  oneNumberMessage: oneNumber.message,
+  fromZeroRefused: fromZero.refused === true,
+  fromZeroMessage: fromZero.message,
+  onDirectoryRefused: onDirectory.refused === true,
+  onDirectoryMessage: onDirectory.message,
+  // What the trace carries of a windowed read: the operation and the path, and
+  // nothing about the window — `docs/trace.md` §7.4's fields, unchanged.
+  program: middle.program,
+};
 const ambiguous = await call(
   files(editing),
   { command: "create", path: "twice.txt", file_text: "same\nsame\n" },
@@ -299,6 +347,14 @@ const heavyPath = path.join(heavyRoot, "big.txt");
 }
 const heavyBytes = fs.statSync(heavyPath).size;
 const heavyViewed = await call(files(heavyRoot), { command: "view", path: "big.txt" }, heavyContext);
+// …and the reason `view_range` exists: a whole-file view is cut at the answer
+// bound *from line 1*, so the far end of a long file is reachable only through a
+// window. This one asks for it directly.
+const heavyTail = await call(
+  files(heavyRoot),
+  { command: "view", path: "big.txt", view_range: [39_990, -1] },
+  heavyContext,
+);
 const heavyEdited = await call(
   files(heavyRoot),
   { command: "str_replace", path: "big.txt", old_str: "xxxxx", new_str: "yyyyy" },
@@ -308,6 +364,11 @@ const readBound = {
   bytesOnDisk: heavyBytes,
   viewedLength: (heavyViewed.result?.content ?? "").length,
   saidItStopped: (heavyViewed.result?.content ?? "").includes("were read"),
+  // The window into the same file: it starts where it was asked to, which is far
+  // past where the whole-file view was cut, and still says the read stopped.
+  tailFirstNumber: Number.parseInt((heavyTail.result?.content ?? "").trimStart(), 10),
+  tailLength: (heavyTail.result?.content ?? "").length,
+  tailSaidItStopped: (heavyTail.result?.content ?? "").includes("were read"),
   editRefused: heavyEdited.refused === true,
   editMessage: heavyEdited.message,
   stillWholeOnDisk: fs.statSync(heavyPath).size === heavyBytes,
@@ -499,5 +560,5 @@ await runtime.releaseWorkspaces("exec_default_workspace", false);
 workspaces.goneWhenSettled = !fs.existsSync(madeAt);
 
 process.stdout.write(
-  `${JSON.stringify({ containment, editingTool, readBound, session, restart, bounded, environment, timeout, workspaces })}\n`,
+  `${JSON.stringify({ containment, editingTool, viewWindow, readBound, session, restart, bounded, environment, timeout, workspaces })}\n`,
 );

@@ -252,6 +252,7 @@ export type StoreTriageMemoryValueSchema = z.infer<typeof storeTriageMemoryValue
 export const toolCheckoutInput = z.object({
   command: z.enum(["view", "create", "str_replace", "insert"]).describe("The file operation to perform: `view` reads a file or lists a directory, `create` writes a whole file, `str_replace` swaps one occurrence of a string, `insert` adds text at a line."),
   path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file or directory, relative to this tool's workspace."),
+  view_range: z.array(z.number().int().min(-1).max(1000000)).max(2).describe("The first and last line to show, for `view` of a file: `[10, 40]`. Lines count from 1 and both ends are included; `-1` as the last line reads to the end of the file. Omitted, the whole file is shown.").default([]),
   file_text: z.string().describe("The whole contents of the file, for `create`.").default(""),
   old_str: z.string().describe("The exact text to replace, for `str_replace`. It must appear exactly once.").default(""),
   new_str: z.string().describe("The text to put in its place, for `str_replace` and `insert`.").default(""),

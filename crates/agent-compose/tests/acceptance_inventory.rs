@@ -1439,8 +1439,9 @@ const BUILTINS: &[Criterion] = &[
                 "a_command_that_reads_standard_input_does_not_eat_the_marker_protocol",
                 Status::Live,
             ),
-            // …and the file tool, round-tripped: create, edit, view, with the
-            // provider-defined text editor's own operations and parameter names.
+            // …and the file tool, round-tripped: create, edit, view, and a
+            // `view_range` window of the same file, with the provider-defined
+            // text editor's own operations and parameter names.
             (
                 "the_file_tool_creates_edits_and_views_inside_its_workspace",
                 Status::Live,
@@ -1453,11 +1454,11 @@ const BUILTINS: &[Criterion] = &[
                 "arguments_a_builtin_refuses_bounce_back_to_the_model",
                 Status::Live,
             ),
-            // …including the argument the *vendor's* tool carries and this one
-            // does not: the Messages wire declares the provider-defined text
-            // editor, whose `view` takes a `view_range`, so the refusal has to
-            // name the key it refused for the loop to be a cost rather than a
-            // dead end.
+            // …including a key the argument set does not carry at all: the
+            // Messages wire declares the provider-defined text editor with no
+            // schema, so what arrives is whatever the model was trained to
+            // fill, and the refusal has to name the key it refused for the loop
+            // to be a cost rather than a dead end.
             (
                 "an_argument_outside_a_builtins_schema_is_refused_naming_the_key",
                 Status::Live,
