@@ -1462,10 +1462,18 @@ const BUILTINS: &[Criterion] = &[
                 "a_host_with_no_bash_on_path_fails_the_call_naming_the_requirement",
                 Status::Live,
             ),
-            // …and the wire the other ruling is about: on Chat Completions the
-            // same two tools are function tools carrying this compiler's own
-            // schemas, because that surface has no provider-defined types
-            // (resolved q54 ruling d).
+            // …and what the *wire* carries, which resolved q54 ruling d makes a
+            // requirement rather than an implementation detail: on the Messages
+            // wire the two go out as the dated provider-defined tool types, so
+            // the behaviour the model was trained into engages.
+            (
+                "the_builtins_go_out_as_provider_defined_tools_on_the_messages_wire",
+                Status::Live,
+            ),
+            // …and the wire the other half of that ruling is about: on Chat
+            // Completions the same two tools are function tools carrying this
+            // compiler's own schemas, because that surface has no
+            // provider-defined types.
             (
                 "the_builtins_go_out_as_function_tools_on_the_openai_wire",
                 Status::Live,

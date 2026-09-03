@@ -13285,6 +13285,77 @@ fn the_default_workspace_is_the_executions_own_and_goes_when_the_run_settles() {
     );
 }
 
+/// Both built-ins are declared on the Messages wire as the **provider-defined
+/// tool types** (PRD resolved q54 ruling d).
+///
+/// The half of that ruling the PRD calls the point rather than the incident: a
+/// model is *trained* against `bash_20250124` and `text_editor_20250728`, and a
+/// request that offered the same two tools as ordinary custom tools carrying
+/// this compiler's own `input_schema` would still work — the arguments come
+/// back the same, which is what lets one set of handlers serve every wire — and
+/// engage none of that training. Nothing about the graph's own behaviour
+/// distinguishes the two, so the assertion is on the **request**, entry for
+/// entry: the dated type, the name that type dictates, and nothing beside them.
+///
+/// The mock is the other half of the check and cannot be skipped past: it holds
+/// a provider-defined entry to `{type, name, cache_control}` and to the name its
+/// dated type requires (`crates/mock-provider` `WIRE-NOTES` (25)), so a request
+/// naming `text_editor_20250728` `files` is a 400 rather than a run.
+#[test]
+fn the_builtins_go_out_as_provider_defined_tools_on_the_messages_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-messages");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "printf 'ran on the trained wire'" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("Done.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the trained wire ran it" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.both",
+        &json!({ "goal": "run one command" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the trained wire ran it");
+
+    let asked = provider.requests();
+    let declared = asked[0].body();
+    assert_eq!(
+        declared["tools"],
+        json!([
+            { "type": "bash_20250124", "name": "bash" },
+            { "type": "text_editor_20250728", "name": "str_replace_based_edit_tool" },
+        ]),
+        "a built-in reaches the Messages wire as its dated provider-defined type and the \
+         name that type dictates — an `input_schema` beside it, or a `description`, is this \
+         compiler declaring an ordinary custom tool and losing the trained behaviour the \
+         ruling is for: {declared}"
+    );
+    assert!(
+        asked[1]
+            .body()
+            .to_string()
+            .contains("ran on the trained wire"),
+        "and the loop really ran it: {}",
+        asked[1].body()
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// Both built-ins drive a loop on a **non-Anthropic wire** (PRD resolved q54
 /// ruling d).
 ///
