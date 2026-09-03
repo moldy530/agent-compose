@@ -79,7 +79,7 @@
 //!
 //! # …and the promises a snapshot cannot make
 //!
-//! Seven claims of `docs/trace.md` are about a *rule* rather than about a shape,
+//! Eight claims of `docs/trace.md` are about a *rule* rather than about a shape,
 //! and each is asserted directly, because a snapshot of a document that happens
 //! to satisfy a rule would go on passing after the rule was dropped: that the
 //! third delivery surface carries the version beside its trace **and only
@@ -100,9 +100,15 @@
 //! that held the wait and on no node above it (§3), which
 //! [`document`] holds every snapshot run to as well and
 //! [`a_pause_is_recorded_on_the_node_that_held_it_and_on_no_node_above_it`]
-//! reaches at the two constructs a pause can be nested under.
+//! reaches at the two constructs a pause can be nested under — and that the
+//! **program a model wrote** is carried capped at the character bound §7.4
+//! states, which
+//! [`a_command_past_the_program_bound_is_recorded_capped_at_the_documented_length`]
+//! reaches with a command longer than that bound, since every command in a
+//! snapshot run here is short enough that a cap no longer applied would leave
+//! each of those documents byte-identical.
 //!
-//! Two of the seven ride on a run this file already makes rather than on a run
+//! Two of the eight ride on a run this file already makes rather than on a run
 //! of their own: the §6 pair on the store run — a presence rule is a claim about
 //! a record the snapshot already holds, and the two are asserted before
 //! `assert_snapshot!` so a change to the rule fails as itself rather than as a
@@ -1306,6 +1312,98 @@ fn a_failure_a_run_survived_carries_its_class_like_one_that_ended_a_run() {
     assert!(
         error.starts_with("NodeFailure: ") && error.contains("timed out"),
         "…and it names the class in front of the budget that ended it: {error:?}"
+    );
+}
+
+/// The model's own program is carried **capped**, at the length §7.4 states in
+/// characters (PRD resolved q54 ruling c).
+///
+/// The bound is the whole reason the carve-out is safe to make. Every other
+/// field of this format is something the compiler or this runtime composed, and
+/// `BuiltinProgram.command` is the one text a **model** wrote at run time
+/// (§11.5) — arbitrary length as well as arbitrary content, since a model may
+/// send a here-doc with a file in it and call it a command. A trace is read by
+/// people and shipped to sinks, so §7.4 answers that with a number, and a number
+/// in a document is a promise until something holds the runtime to it.
+///
+/// The snapshot runs cannot: every command in them is short, and a cap that
+/// stopped being applied would leave each of those documents byte-identical. So
+/// this drives a command past the bound and reads the field back off the trace
+/// on disk — the length that was kept, the sentence that says what was dropped,
+/// and the dropped text itself, which must be nowhere in the document.
+#[test]
+fn a_command_past_the_program_bound_is_recorded_capped_at_the_documented_length() {
+    // `docs/trace.md` §7.4, for `command` and for `path` — one constant in the
+    // emitted runtime (`PROGRAM_LIMIT`), read here as the document states it.
+    const BOUND: usize = 1_000;
+
+    let provider = MockProvider::start().expect("a loopback port");
+    // A command that really runs and is far longer than the trace will carry:
+    // everything past the `#` is a comment, so the shell prints one line
+    // whatever the padding is. `past-the-cap` sits at the very end, which is
+    // what makes the absence assertion below say something.
+    let command = format!("printf 'ran\\n' # {} past-the-cap", "y".repeat(1_200));
+    assert!(
+        command.len() > BOUND,
+        "the fixture's own premise: the command is longer than the bound it is testing"
+    );
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("bash", json!({ "command": command }))]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "ran the long command" })),
+        ),
+    ]);
+
+    let scratch = harness::Scratch::new("stability-program-bound");
+    let root = scratch.path().join("root");
+    std::fs::create_dir_all(&root).expect("the scratch area is writable");
+    let mut environment = harness::environment(&provider);
+    environment.push(("BUILTIN_ROOT".to_string(), root.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+    ));
+
+    let Some(run) = harness::run_with(
+        "builtin-tools",
+        "flow.work",
+        &[("goal", "run the long command")],
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let entries = run.entries("do");
+    let [entry] = entries.as_slice() else {
+        panic!("the flow's one agent node has one entry: {entries:?}");
+    };
+    let program = &entry["models"][0]["toolCalls"][0]["program"];
+    let recorded = program["command"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a `bash` call's record carries the command it ran: {entry}"));
+    assert_eq!(
+        recorded,
+        format!(
+            "{}\n…[{} more characters, not shown]",
+            &command[..BOUND],
+            command.len() - BOUND
+        ),
+        "the recorded command is the model's first {BOUND} characters and a sentence saying how \
+         many were dropped: the bound is exact, and what was cut is **said** rather than left \
+         for a reader to infer from a round number"
+    );
+    let held = run.trace_document().to_string();
+    assert!(
+        !held.contains("past-the-cap"),
+        "the tail of the command is in the document: a cap that kept the text somewhere else in \
+         the trace would be a bound on one field rather than on what the format carries: {held}"
     );
 }
 
