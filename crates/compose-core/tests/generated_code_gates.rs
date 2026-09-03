@@ -3740,7 +3740,8 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
             "read": true,
             "linkedDirectory": true,
             "underLinkedDirectory": true,
-            "farUnderLinkedDirectory": true
+            "farUnderLinkedDirectory": true,
+            "prefixSibling": true
         }),
         "every way out of the workspace is refused **as a refusal**, which is what goes back to \
          the model rather than failing the node: {containment}"
@@ -3765,6 +3766,23 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
          made them outside the workspace: `create` makes its parents, so the containment check \
          has to resolve the deepest ancestor that exists rather than stop at the parent \
          (grammar 6.1, PRD resolved q54): {containment}"
+    );
+    // The crossing every case above is blind to: a *sibling* whose name extends
+    // the workspace's, which a resolution catches and a prefix comparison that
+    // does not count the separator does not. Everything else here resolves under
+    // a different directory outright, so this is the only case that can tell the
+    // two comparisons apart — and the write it would have let through lands in a
+    // directory the composition never offered (`/srv/work-backup` beside
+    // `/srv/work`).
+    assert_eq!(
+        (
+            &containment["siblingUnchanged"],
+            &containment["siblingEntries"]
+        ),
+        (&json!(true), &json!(["secret.txt"])),
+        "a `create` at `../<workspace>-evil/secret.txt` reached the sibling directory: a real \
+         path that merely *starts* with the workspace's is not inside it, so the containment \
+         check has to compare whole path segments (grammar 6.1, PRD resolved q54): {containment}"
     );
     let through = containment["throughLinkMessage"]
         .as_str()

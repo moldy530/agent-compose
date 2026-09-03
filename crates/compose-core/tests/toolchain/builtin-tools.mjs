@@ -7,12 +7,14 @@
 //
 //   * **containment** — a `..` that climbs out, an absolute path, a symlink
 //     pointing outside the workspace, a *dangling* symlink pointing outside it,
-//     and a symlinked **directory** written through at a path whose own parents
+//     a symlinked **directory** written through at a path whose own parents
 //     do not exist yet (which `create` would otherwise make, following the link
-//     on the way). Each has to come back as a refusal and, more importantly, has
-//     to leave everything outside the workspace untouched — nothing changed and
-//     nothing new. A test that only read the message would pass against a
-//     runtime that refused *and* wrote;
+//     on the way), and a **sibling whose name extends the workspace's**, which
+//     a prefix comparison that does not count the separator calls contained.
+//     Each has to come back as a refusal and, more importantly, has to leave
+//     everything outside the workspace untouched — nothing changed and nothing
+//     new. A test that only read the message would pass against a runtime that
+//     refused *and* wrote;
 //   * **the read bound** — a file larger than the runtime reads is *viewed*
 //     from the front with the stop said, and *edited* not at all: an edit
 //     rewrites what it read, so a truncated read would truncate the file;
@@ -99,16 +101,26 @@ const shell = (root, extra = {}) => ({
 // ---------------------------------------------------------------------------
 // Containment.
 //
-// Six ways out of a workspace, and one directory outside it that none of them
-// may reach. The file in it is written with a sentinel and read back at the end,
-// and the directory's own entries are listed: what is being tested is the file
-// system's state, not the wording of a refusal.
+// Nine ways out of a workspace, and two directories outside it that none of
+// them may reach. The file in each is written with a sentinel and read back at
+// the end, and the first directory's own entries are listed: what is being
+// tested is the file system's state, not the wording of a refusal.
 //
-// The last two are the ones a parent-only check gets wrong. `create` makes the
-// directories above what it writes, so `out/deep/nested.txt` through a symlinked
-// `out` has *no* parent to resolve — and a check that stopped there would hand
-// back the lexical path, find it inside the workspace, and then let `mkdir -p`
-// follow the link.
+// `underLinkedDirectory` and `farUnderLinkedDirectory` are the ones a
+// parent-only check gets wrong. `create` makes the directories above what it
+// writes, so `out/deep/nested.txt` through a symlinked `out` has *no* parent to
+// resolve — and a check that stopped there would hand back the lexical path,
+// find it inside the workspace, and then let `mkdir -p` follow the link.
+//
+// `prefixSibling` is the one every *other* case here is blind to, and the only
+// one that lands outside the workspace by a path with nothing wrong with it.
+// Each of the eight above resolves under `outside/`, which fails even a bare
+// `target.startsWith(workspace)` — so none of them can tell a comparison that
+// counts the separator from one that does not. This one is a sibling whose name
+// *extends* the workspace's own (`…/contained-evil` beside `…/contained`, the
+// shape `/srv/work-backup` has beside `/srv/work`): a prefix test alone calls it
+// contained, and a `create` through it overwrites a file the composition never
+// offered.
 const outside = path.join(path.resolve(scratch), "outside");
 fs.rmSync(outside, { recursive: true, force: true });
 fs.mkdirSync(outside, { recursive: true });
@@ -120,6 +132,15 @@ fs.symlinkSync(secret, path.join(contained, "link.txt"));
 fs.symlinkSync(path.join(outside, "not-there-yet.txt"), path.join(contained, "dangling.txt"));
 fs.symlinkSync(outside, path.join(contained, "out"), "dir");
 
+// The sibling, made after the workspace so `workspace()` cannot empty it: its
+// path is the workspace's path with more characters after it and no separator
+// between.
+const sibling = `${contained}-evil`;
+fs.rmSync(sibling, { recursive: true, force: true });
+fs.mkdirSync(sibling, { recursive: true });
+const siblingSecret = path.join(sibling, "secret.txt");
+fs.writeFileSync(siblingSecret, "the file in the sibling directory");
+
 const escapes = {};
 for (const [name, args] of [
   ["climb", { command: "create", path: "../outside/secret.txt", file_text: "clobbered" }],
@@ -130,6 +151,10 @@ for (const [name, args] of [
   ["linkedDirectory", { command: "create", path: "out/secret.txt", file_text: "clobbered" }],
   ["underLinkedDirectory", { command: "create", path: "out/deep/nested.txt", file_text: "leaked" }],
   ["farUnderLinkedDirectory", { command: "create", path: "out/a/b/c/file.txt", file_text: "leaked" }],
+  [
+    "prefixSibling",
+    { command: "create", path: `../${path.basename(sibling)}/secret.txt`, file_text: "clobbered" },
+  ],
 ]) {
   escapes[name] = await call(files(contained), args, contextWith("exec_contained"));
 }
@@ -140,6 +165,10 @@ const containment = {
   outsideUnchanged: fs.readFileSync(secret, "utf8") === "the file outside the workspace",
   outsideNotCreated: !fs.existsSync(path.join(outside, "not-there-yet.txt")),
   outsideEntries: fs.readdirSync(outside).sort(),
+  // …and the sibling the prefix test would have called contained still holds
+  // what it held.
+  siblingUnchanged: fs.readFileSync(siblingSecret, "utf8") === "the file in the sibling directory",
+  siblingEntries: fs.readdirSync(sibling).sort(),
   // …and the record of a refused call still says what the model asked for
   // (`docs/trace.md` §7.4).
   program: escapes.climb.program,
