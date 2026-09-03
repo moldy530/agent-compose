@@ -995,46 +995,87 @@ flow.f:
         }
     }
 
-    /// A `map` dispatch is the other way a node names a tool, and it reaches a
-    /// built-in through the same emitter gap a `function:` node does.
+    /// A **routed** `map` is the third way a node names a tool, and the one the
+    /// negative corpus does not reach.
     ///
-    /// The negative corpus pins the `function:` spelling, where the rule is the
-    /// only thing the composition gets wrong. A dispatch cannot be that clean —
-    /// a target declaring no input fields is also a whole-item mismatch — so the
-    /// second call site is held here, where the extra diagnostic is part of what
-    /// is asserted rather than something a one-rule fixture has to avoid.
+    /// Two fixtures pin the other two spellings against their exact messages —
+    /// `a-builtin-tool-called-from-a-function-node` and
+    /// `a-builtin-tool-dispatched-to-by-a-map` — and both go through one target
+    /// address. A `routes:` ladder is a *list* of them, walked separately
+    /// ([`super::builtin_node_targets`]), so a rule kept at the homogeneous
+    /// dispatch is not thereby kept at a route: this is the arm where a built-in
+    /// sits beside targets that are perfectly legal, which is also the shape an
+    /// author most plausibly writes it in.
+    ///
+    /// Held here rather than as a fixture because what it is evidence for is the
+    /// **arm**, not the wording: the message is the fixtures', and a routed
+    /// composition minimal enough to fail nothing else needs a union, a
+    /// discriminator and a second route to carry it.
     #[test]
-    fn a_map_dispatching_to_a_builtin_is_refused_at_the_dispatch() {
+    fn a_route_of_a_map_dispatching_to_a_builtin_is_refused_at_that_route() {
         assert_eq!(
             codes(
                 r#"
-state:
-  jobs:
-    type: array
-    max_items: 5
-    items:
-      type: object
-      properties:
-        summary: { type: string }
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+agent.triage:
+  model: model.m
+  prompt: Triage.
+  input:
+    text: { type: string }
+  output:
+    jobs:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          shell:
+            command: { type: string }
+          human:
+            summary: { type: string }
+agent.reviewer:
+  model: model.m
+  prompt: Review.
+  input:
+    summary: { type: string }
+  output:
+    ticket: { type: string }
 tool.sandbox:
   builtin: bash
   workspace: ./work
 flow.f:
   outputs: {}
   nodes:
-    work:
+    classify:
+      agent: agent.triage
+      input: { text: "'x'" }
+    dispatch:
       map:
-        over: "state.jobs"
-        node: tool.sandbox
-        max_concurrency: 2
+        over: "classify.output.jobs"
+        as: job
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          shell:
+            node: tool.sandbox
+            input: { command: "job.command" }
+          human:
+            node: agent.reviewer
+            input: { summary: "job.summary" }
   edges:
-    - { from: start, to: work }
-    - { from: work, to: end }
+    - { from: start, to: classify }
+    - { from: classify, to: dispatch }
+    - { from: dispatch, to: end }
 "#
             ),
-            ["type-mismatch", "invalid-value"],
-            "the dispatch names a built-in, which no node may call, and passes it an item a \
-             tool declaring no `input:` cannot take"
+            ["invalid-value"],
+            "the route names a built-in, which no node may call however it names it — and the \
+             route beside it, which names an agent, is refused nothing"
         );
     }
 }
