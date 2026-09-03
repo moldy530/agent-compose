@@ -1100,10 +1100,10 @@ tool.web_search:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `description` | string (non-empty) | **yes** | LLM-facing; the selection signal (PRD 5.5) |
-| `input` | field map (input surface) | **yes** | tool parameters; `{}` for no-arg tools |
-| `output` | field map (result surface, §3.5) | **yes** | result schema; makes edges serializable (PRD 5.7) |
-| `exec` \| `http` \| `function` \| `module` | block | **exactly one** | implementation binding |
+| `description` | string (non-empty) | **yes**, and **optional** under `builtin` | LLM-facing; the selection signal (PRD 5.5). The compiler writes a built-in's own, which a composition may sharpen (§6.1, [D135](#d135-a-builtin-binding-hands-the-model-the-program-and-says-so)) |
+| `input` | field map (input surface) | **yes**, and **refused** under `builtin` | tool parameters; `{}` for no-arg tools. A built-in declares no contract, so writing one is a compile error (§6.1, D135) |
+| `output` | field map (result surface, §3.5) | **yes**, and **refused** under `builtin` | result schema; makes edges serializable (PRD 5.7). Refused under `builtin` for the same reason (§6.1, D135) |
+| `exec` \| `http` \| `function` \| `module` \| `builtin` | block, or — for `builtin` — an enum with its bounds beside it | **exactly one** | implementation binding (§6.1) |
 
 ### 6.1 Implementation bindings
 

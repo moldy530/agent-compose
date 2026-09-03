@@ -1230,3 +1230,79 @@ pub(crate) fn suggest_namespace(prefix: &str) -> Option<&'static str> {
     let names: Vec<&str> = Namespace::ALL.iter().map(|n| n.as_str()).collect();
     suggest(prefix, &names)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TOOL_IMPLEMENTATIONS;
+
+    /// §6's normative key table, which is the summary a reader meets **before**
+    /// §6.1's prose — the table rows between the section heading and its first
+    /// subsection.
+    fn tool_key_table() -> String {
+        let grammar = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .expect("the manifest directory has a grandparent")
+                .join("docs/grammar.md"),
+        )
+        .expect("the grammar is readable");
+        let section = grammar
+            .split_once("\n## 6. Tool definitions\n")
+            .expect("the grammar has a §6")
+            .1;
+        let body = section
+            .split_once("\n### 6.1")
+            .expect("§6 ends where §6.1 begins")
+            .0;
+        body.lines()
+            .filter(|line| line.starts_with("| `"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The table names every implementation binding a tool can carry.
+    ///
+    /// The same closed set the `tools` topic's index summary is held to
+    /// (`crate::docs::topics`), pinned here against the **normative** document
+    /// for the reason that one is pinned against the index: a table is where a
+    /// reader — or an agent — settles what the language admits before reading
+    /// the prose under it, and a binding missing from it reads as a binding
+    /// that does not exist. `builtin:` was added to the language by PRD
+    /// resolved q54, and this row is what a reader checks a composition
+    /// against.
+    #[test]
+    fn the_grammar_tool_table_names_every_implementation_binding() {
+        let table = tool_key_table();
+        for binding in TOOL_IMPLEMENTATIONS {
+            assert!(
+                table.contains(&format!("`{binding}`")),
+                "§6's key table does not name the `{binding}` binding:\n{table}"
+            );
+        }
+    }
+
+    /// …and it says which of the three declared keys a `builtin:` tool reads
+    /// differently.
+    ///
+    /// The half that made the stale table *wrong* rather than merely
+    /// incomplete: `description:` is optional under `builtin:`, and `input:`
+    /// and `output:` are compile errors there (grammar 6.1, Decision D135), so
+    /// a row marking any of the three unconditionally required sends a reader
+    /// to write the one composition the parser refuses.
+    #[test]
+    fn the_grammar_tool_table_qualifies_the_keys_a_builtin_reads_differently() {
+        let table = tool_key_table();
+        for key in ["description", "input", "output"] {
+            let row = table
+                .lines()
+                .find(|line| line.starts_with(&format!("| `{key}` |")))
+                .unwrap_or_else(|| panic!("§6's key table has a `{key}` row:\n{table}"));
+            assert!(
+                row.contains("builtin"),
+                "§6's key table states `{key}`'s requirement without the `builtin:` \
+                 qualification §6.1 puts on it: {row}"
+            );
+        }
+    }
+}
