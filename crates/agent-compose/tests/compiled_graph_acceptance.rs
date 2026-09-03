@@ -12605,6 +12605,112 @@ fn a_shells_state_carries_across_the_calls_of_one_node_activity() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// A command that reads **standard input** gets one of its own, rather than the
+/// pipe this runtime types its commands into (PRD resolved q54).
+///
+/// The one place the runtime's own protocol and the model's program would share
+/// a channel. `builtin.bash` is a session, so the shell reads its script from
+/// standard input and each command is typed into that pipe followed by the marker
+/// lines that close it — which is exactly what a command reading standard input
+/// would read. Both failures are silent, which is why this is asserted rather
+/// than left to the other tests:
+///
+///  * `read` swallows the line carrying `$?`, so the call settles with **no
+///    status** — a completed command recorded as one that did not finish, which
+///    `docs/trace.md` §7.4 says is the difference between "the command failed"
+///    and "the command did not finish";
+///  * `cat` swallows both `printf`s, spends the whole `timeout:` and answers the
+///    model with this runtime's marker text as the command's own output.
+///
+/// So both are run, and what is asserted is a status on each and a session still
+/// usable after them.
+#[test]
+fn a_command_that_reads_standard_input_does_not_eat_the_marker_protocol() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-stdin");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new(
+                    "bash",
+                    json!({
+                        "command":
+                            "read -r line; printf 'read exited %s and the line is [%s]' \"$?\" \"$line\""
+                    }),
+                ),
+                ToolCall::new("bash", json!({ "command": "cat" })),
+                ToolCall::new(
+                    "bash",
+                    json!({ "command": "printf 'still in %s' \"$(basename \"$PWD\")\"" }),
+                ),
+            ]),
+        ),
+        Script::new(SONNET, Outcome::text("The shell answered all three.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "nothing ate the protocol" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "run three commands, two of which read standard input" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "nothing ate the protocol");
+
+    // Each call completed with a status, which is the assertion: a `read` that
+    // had eaten the status line would be recorded with no `exitCode` at all, and
+    // a `cat` that had eaten the markers would be recorded `timedOut`.
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["program"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!({
+                "tool": "bash",
+                "command":
+                    "read -r line; printf 'read exited %s and the line is [%s]' \"$?\" \"$line\"",
+                "exitCode": 0
+            }),
+            json!({ "tool": "bash", "command": "cat", "exitCode": 0 }),
+            json!({
+                "tool": "bash",
+                "command": "printf 'still in %s' \"$(basename \"$PWD\")\"",
+                "exitCode": 0
+            }),
+        ],
+        "a command that reads standard input reads its own, so each of the three completed \
+         with the status `docs/trace.md` §7.4 records where one did: {calls:?}"
+    );
+
+    // …and what the model was handed: the `read` reported the end of an input
+    // with nothing in it rather than a line of this runtime's protocol, and the
+    // third command proves the session survived the two.
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("read exited 1 and the line is []"),
+        "the `read` found the end of an empty input rather than the marker line: {handed}"
+    );
+    assert!(
+        !handed.contains("__agent_compose_"),
+        "no answer carries this runtime's own marker protocol back to the model: {handed}"
+    );
+    assert!(
+        handed.contains("still in root"),
+        "the session outlived both of them, in the workspace it started in: {handed}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A command that exits nonzero **comes back to the model** with its status
 /// (PRD resolved q54, Decision D119).
 ///
@@ -13116,6 +13222,115 @@ fn a_file_path_that_leaves_the_workspace_bounces_back_to_the_model() {
         handed.contains("resolves outside this tool's workspace"),
         "the model was told what was wrong with the path it chose: {handed}"
     );
+}
+
+/// A file inside the workspace that carries a **second name** is refused for
+/// writing (PRD resolved q54, Decision D119).
+///
+/// The one escape the resolution check cannot see, and the reason the refusal
+/// lives at the write instead. `targetWithinWorkspace` answers "where is this
+/// path really", which is the whole answer for a symbolic link — a link has a
+/// target — and no answer at all for a hard one: a second directory entry for one
+/// inode has nothing to resolve, so the path is inside the workspace and the
+/// bytes it names are also outside it. A `str_replace` through the name inside
+/// would rewrite what the name outside reads, with every path check passed.
+///
+/// Reachable through a **configured** `workspace:` that something else populated
+/// — a checkout, a package manager that links rather than copies — which is the
+/// shape `tool.editor` has. What is asserted is the file outside, read back after
+/// the run: a refusal message alone would pass against a runtime that wrote the
+/// file and then said something about it.
+#[test]
+fn a_write_to_a_file_with_a_second_name_is_refused_to_the_model() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-hard-link");
+    let outside = scratch.path().join("outside.txt");
+    std::fs::write(&outside, "the file outside the workspace").expect("the scratch is writable");
+    // The second name, inside the workspace. Not a symlink: there is no target
+    // for a resolution to follow, which is the whole point of the case.
+    std::fs::hard_link(&outside, root_of(&scratch).join("linked.txt"))
+        .expect("the scratch and its root are one filesystem");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({
+                    "command": "str_replace",
+                    "path": "linked.txt",
+                    "old_str": "outside the workspace",
+                    "new_str": "clobbered",
+                }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({
+                    "command": "create",
+                    "path": "copy.txt",
+                    "file_text": "written where it belongs",
+                }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("I worked on a copy instead.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "left the linked file alone" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.edit",
+        &json!({ "goal": "edit the file" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "left the linked file alone");
+
+    // The bound, as the file system saw it: the edit did not land, on either
+    // name.
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("the file outside is still there"),
+        "the file outside the workspace",
+        "a write through a second name is refused rather than made"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_of(&scratch).join("copy.txt"))
+            .expect("the corrected call wrote inside the workspace"),
+        "written where it belongs"
+    );
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["outcome"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["refused", "completed"],
+        "the refusal came back to the model and the corrected call ran: {calls:?}"
+    );
+    assert_eq!(
+        calls[0]["program"],
+        json!({ "tool": "files", "operation": "str_replace", "path": "linked.txt" }),
+        "a refused call still records what the model asked for, and no `change`, because \
+         nothing changed (`docs/trace.md` §7.4): {calls:?}"
+    );
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("names point at that one file"),
+        "the model was told what it was about to write through: {handed}"
+    );
+
+    // …and the read is deliberately left alone: a path inside the workspace is
+    // inside the bound whatever else names it, so refusing the `view` would buy
+    // nothing a `bash` could not undo.
+    assert!(provider.snapshot().is_drained());
 }
 
 /// A built-in's children see **what the binding declared and nothing else**

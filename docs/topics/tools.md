@@ -387,11 +387,21 @@ result, and a built-in has neither. Attach it to an agent instead.
 `workspace:` is where the tool works: `builtin.bash` runs there, and every
 `builtin.files` path is relative to it and refused if it resolves outside it —
 resolution, not string comparison, so `../../etc/passwd` and a symlink pointing
-out of the tree are both refused. It is interpolable, so `${WORK_DIR}` is the
-usual spelling and the directory is a property of the machine running the graph
-rather than of the composition; written empty it is a compile error, because an
-empty path is the runtime's own working directory and a bound nobody wrote is
-not a bound.
+out of the tree are both refused. Resolution is the whole answer for a
+*symbolic* link, which has a target to resolve, and no answer at all for a
+**hard** one: a second name for the same file has no target, so a path inside the
+workspace really is inside it while the bytes it names may have another name
+outside. So the refusal moves to the write — a `create` over a file with more
+than one name, and a `str_replace` or `insert` in one, are refused outright,
+which is where such a file could have carried an edit out of the directory. A
+`view` of one is not, since reading a path inside the workspace is inside the
+bound whatever else names it. It matters only for a `workspace:` you named and
+something else populated (a checkout, a package manager that links rather than
+copies); nothing puts a second name in a fresh per-execution workspace. It is
+interpolable, so `${WORK_DIR}` is the usual spelling and the directory is a
+property of the machine running the graph rather than of the composition;
+written empty it is a compile error, because an empty path is the runtime's own
+working directory and a bound nobody wrote is not a bound.
 
 **Written, the directory is yours; omitted, it is the run's.** A binding with no
 `workspace:` works in one fresh directory per execution, under the project's data
@@ -454,10 +464,10 @@ one way here that is worth stating, because a built-in has no contract of the
 composition's to fail:
 
 - **the model's mistakes come back to the model** — a call with neither a
-  `command` nor a `restart`, a `path` that resolves outside the workspace, a file
-  that is not there, a `str_replace` whose `old_str` matched nothing or matched
-  twice. Each is a statement about arguments the model chose, and it can choose
-  again;
+  `command` nor a `restart`, a `path` that resolves outside the workspace, a
+  write to a file that carries a second name, a file that is not there, a
+  `str_replace` whose `old_str` matched nothing or matched twice. Each is a
+  statement about arguments the model chose, and it can choose again;
 - **a command's own outcome is an answer, not a failure** — a nonzero exit comes
   back with the status, and a command that outran the `timeout:` is killed and
   comes back saying so, with what it printed by then and a notice that the

@@ -1419,6 +1419,15 @@ const BUILTINS: &[Criterion] = &[
                 "a_shells_state_carries_across_the_calls_of_one_node_activity",
                 Status::Live,
             ),
+            // …and the cost that session has: the shell reads its script from
+            // the same standard input the commands are typed into, so a command
+            // that reads standard input would read this runtime's own protocol
+            // — silently, as a command with no exit status or one that spends
+            // its whole bound answering with marker text.
+            (
+                "a_command_that_reads_standard_input_does_not_eat_the_marker_protocol",
+                Status::Live,
+            ),
             // …and the file tool, round-tripped: create, edit, view, with the
             // provider-defined text editor's own operations and parameter names.
             (
@@ -1446,6 +1455,14 @@ const BUILTINS: &[Criterion] = &[
             // wrong, which is the one refusal that is also a bound.
             (
                 "a_file_path_that_leaves_the_workspace_bounces_back_to_the_model",
+                Status::Live,
+            ),
+            // …and the crossing a *resolution* cannot catch either, which is why
+            // it is refused at the write: a hard link has no target, so a second
+            // name for a file outside the workspace resolves to the path inside
+            // it and an edit through that name lands outside.
+            (
+                "a_write_to_a_file_with_a_second_name_is_refused_to_the_model",
                 Status::Live,
             ),
             // …and what a built-in buys over the `exec:` tool an author could

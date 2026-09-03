@@ -1441,8 +1441,14 @@ nothing for such a node to bind and nothing for it to write.
 `builtin.files` path is taken relative to it and refused if it **resolves**
 outside it — resolution, not string comparison, so a `..` that climbs out and a
 symlink that points out are both refused, and a write to a file that does not
-exist yet resolves through its parent. It is interpolable (§4.3 class 2), because
-which directory a graph may work in is a property of the machine running it.
+exist yet resolves through its parent. Resolution is the whole answer for a
+*symbolic* link and no answer at all for a **hard** one, which has no target: a
+second name for a file is inside the workspace while the bytes it names are also
+outside, so a `builtin.files` **write** to a file with more than one name is
+refused instead — a `view` of one is not, since reading a path inside the
+workspace is inside the bound whatever else names it. It is interpolable (§4.3
+class 2), because which directory a graph may work in is a property of the
+machine running it.
 Written, it must name something: `workspace: ""` is a compile error and a
 `${VAR}` that resolves empty fails the call, because an empty path is the
 directory the runtime happened to be started in and a bound nobody wrote is not a

@@ -167,8 +167,10 @@ things are worth knowing at the node:
   — a workspace that is not a directory, a host with no `bash`.
 - **the workspace is the bound, and it is per execution unless you name one.**
   Every `builtin.files` path resolves inside it and one that does not is refused
-  to the model; `bash` starts there. A binding that writes no `workspace:` gets a
-  fresh directory per execution, shared with that execution's other built-ins and
+  to the model; a file inside it that carries a second name — a hard link — is
+  refused for writing, since resolution cannot see where its other name is;
+  `bash` starts there. A binding that writes no `workspace:` gets a fresh
+  directory per execution, shared with that execution's other built-ins and
   removed when the run settles.
 - **the child environment is scrubbed.** A built-in's children see the variables
   its binding declared and nothing else, unless it wrote `inherit_env: true`.

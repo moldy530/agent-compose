@@ -4296,6 +4296,12 @@ function withinWorkspace(workspace: string, target: string): boolean {
  * does not exist yet would be a write outside the workspace with every check
  * passed.
  *
+ * What this cannot see is a **hard** link, and that is a fact about resolution
+ * rather than an oversight: a second name for one inode has no target, so
+ * `realpath` answers with the path inside the workspace and is right to. The
+ * write is the half that reaches out, and it is refused where the write is made
+ * ([`refuseSecondName`]) rather than here.
+ *
  * The refusal goes **back to the model**: it chose the path and can choose
  * another, which is exactly what Decision D119 divides on.
  */
@@ -4783,6 +4789,29 @@ function shellNotice(
  * against a command that reads its own environment: the trust level is the one
  * D135 names, and this is about accidents rather than about containment.
  *
+ * **The command gets a standard input of its own**, and that is not a detail: the
+ * shell reads its *script* from standard input (`-s`, [`SHELL_ARGUMENTS`]), which
+ * is the same pipe these lines are typed into — so a command that reads standard
+ * input reads the protocol. `read -r line` eats the `…_status=$?` line and the
+ * call settles with no status at all; `cat`, `head -n 1`, anything interactive
+ * eats both `printf`s, burns the whole `timeout:` and answers the model with this
+ * runtime's own marker text as the command's output. So the command runs inside a
+ * brace group redirected from `/dev/null`, and a `read` that finds nothing is the
+ * honest answer to a shell with no input to give.
+ *
+ * A brace group rather than a subshell, because a subshell would end the session
+ * the tool is for: `cd build` has to still be true for the next call, and so do
+ * the variables, the functions and the shell options. A group runs in this shell.
+ *
+ * The status is read into a variable **inside** the group, for two reasons: the
+ * `printf` that reports it would otherwise be what `$?` is about, and the
+ * assignment is what keeps the group from ever being empty — a command that is
+ * only a comment would otherwise close as `{ }`, a syntax error that ends the
+ * session. A command with an unterminated construct still ends it, and better
+ * than it did before: the group's `}` closes the parse, so the shell says
+ * `syntax error` and exits at once rather than waiting out the bound for a
+ * command it was never going to run.
+ *
  * Three things end the wait besides the marker, and each is answered where it
  * belongs: the command's own deadline and a shell that exited under it are facts
  * about the model's program and come back to the model, while a **cancelled
@@ -4820,10 +4849,10 @@ async function typeIntoShell(
       }, bound.millis);
     }
     session.pending = settle;
-    // `$?` is read into a variable first, because the `printf` that reports it
-    // would otherwise be what `$?` is about.
+    // The group, its `/dev/null`, and the assignment inside it are all load
+    // bearing — see this function's own note on each.
     session.child.stdin.write(
-      `${command}\n${session.marker}_status=$?\nprintf '\\n%s:%s\\n' '${session.marker}' "$${session.marker}_status"\nprintf '\\n%s\\n' '${session.marker}' >&2\n`,
+      `{ ${command}\n${session.marker}_status=$?\n} < /dev/null\nprintf '\\n%s:%s\\n' '${session.marker}' "$${session.marker}_status"\nprintf '\\n%s\\n' '${session.marker}' >&2\n`,
     );
   });
   if (context.signal.aborted) throw abortReason(context.signal);
@@ -5145,10 +5174,10 @@ async function createFile(requested: string, target: string, contents: string): 
   }
   try {
     await fs.promises.mkdir(path.dirname(target), { recursive: true });
-    await fs.promises.writeFile(target, contents, "utf8");
   } catch (error) {
     throw fileRefusal("create", requested, error);
   }
+  await writeFileText("create", requested, target, contents);
   const bytes = Buffer.byteLength(contents, "utf8");
   return { path: requested, bytes_written: bytes, change: `wrote ${bytes} bytes` };
 }
@@ -5303,18 +5332,63 @@ async function readWholeFileText(
   return held.text;
 }
 
-/** The same, writing. */
+/**
+ * The same, writing — and the one place the workspace bound is asked a question
+ * [`targetWithinWorkspace`] cannot answer.
+ *
+ * Every write of this tool goes through here, `create` included, so the hard-link
+ * refusal below is a property of writing rather than of a caller remembering to
+ * ask for it.
+ */
 async function writeFileText(
   operation: FileOperation,
   requested: string,
   target: string,
   contents: string,
 ): Promise<void> {
+  await refuseSecondName(operation, requested, target);
   try {
     await fs.promises.writeFile(target, contents, "utf8");
   } catch (error) {
     throw fileRefusal(operation, requested, error);
   }
+}
+
+/**
+ * Refuse to **write** a file that has more than one name (PRD resolved q54,
+ * Decision D119).
+ *
+ * The one escape resolution cannot close. [`targetWithinWorkspace`] asks where a
+ * path really is, which is the whole answer for a symbolic link — a link has a
+ * target, and where it points is where the write would land. A **hard** link has
+ * no target: it is a second directory entry for one inode, so `realpath` answers
+ * with the path inside the workspace and a `writeFile` through it rewrites the
+ * bytes every other name reads, one of which may be outside. The file is not
+ * followed anywhere; the workspace is simply not the whole of where it is.
+ *
+ * It cannot be narrowed to "…and the other name is outside", because a
+ * filesystem offers no way to ask where a link's siblings are short of walking
+ * every mount — so a file hard-linked twice *inside* the workspace is refused
+ * too, and the refusal says what it saw so the model can copy the file and edit
+ * the copy. The case is a **configured** `workspace:` that something else
+ * populated (a checkout, a package manager that links rather than copies);
+ * nothing puts a second name in a fresh per-execution workspace.
+ *
+ * A `view` is deliberately left alone: reading a file that is genuinely at a path
+ * inside the workspace is inside the bound whatever else names it, and refusing
+ * the read would buy nothing — the model could read the same bytes with `bash`.
+ * It is the write that reaches out of the directory.
+ */
+async function refuseSecondName(
+  operation: FileOperation,
+  requested: string,
+  target: string,
+): Promise<void> {
+  const entry = await fs.promises.lstat(target).catch(() => undefined);
+  if (entry === undefined || !entry.isFile() || entry.nlink <= 1) return;
+  throw new ToolCallRefused(
+    `\`${FILE_TOOL}\` will not \`${operation}\` \`${requested}\`: ${entry.nlink} names point at that one file, and this tool cannot tell whether the others are inside its workspace — so writing it could change a file outside. \`create\` a copy at a new path and work on that`,
+  );
 }
 
 /**
