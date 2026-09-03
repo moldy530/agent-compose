@@ -305,23 +305,60 @@ extends to author-arbitrary binaries, extended to the model: an agent holding
 Two spellings. The **shorthand** attaches a built-in under its defaults — a fresh workspace,
 a 120s command bound, a scrubbed environment:
 
-```yaml
+```yaml spec
+version: "0.1"
+
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+
 agent.fixer:
   model: model.smart
   prompt: Fix the failing test, then say what you changed.
   tools:
-    - tool.repo_grep
     - builtin.files
     - builtin.bash
+  input:
+    goal: { type: string }
   output:
     summary: { type: string }
+
+state:
+  summary: { type: string, default: "" }
+
+flow.fix:
+  inputs:
+    goal: { type: string, min_length: 1 }
+  outputs:
+    summary: { type: string }
+  nodes:
+    fix:
+      agent: agent.fixer
+      input: { goal: "input.goal" }
+  edges:
+    - { from: start, to: fix }
+    - { from: fix, to: end }
 ```
 
 The **configured** form is a `tool.*` carrying a `builtin:` binding, attached by
 its address like any other tool — so one configuration serves every agent that
-attaches it:
+attaches it. The whole surface, written out:
 
-```yaml
+```yaml spec
+version: "0.1"
+
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+
 tool.sandbox:
   builtin: bash
   workspace: "${WORK_DIR}"
@@ -335,8 +372,26 @@ agent.builder:
   prompt: Build the project and report what broke.
   tools:
     - tool.sandbox
+  input:
+    goal: { type: string }
   output:
     summary: { type: string }
+
+state:
+  summary: { type: string, default: "" }
+
+flow.build:
+  inputs:
+    goal: { type: string, min_length: 1 }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      agent: agent.builder
+      input: { goal: "input.goal" }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
 ```
 
 | Built-in | `builtin:` | What the model calls it | Arguments |
