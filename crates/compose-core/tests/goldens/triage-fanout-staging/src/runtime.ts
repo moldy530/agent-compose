@@ -4018,8 +4018,8 @@ const FILE_READ_CHUNK = 65_536;
  *
  * **A refusal survives the journal as a refusal.** The two outcomes a tool call
  * has are different kinds of thing (Decision D119): a path that leaves the
- * workspace, a `str_replace` that matched nothing, a `create` with nothing to
- * write are the model's to correct and go back to it, while a workspace that
+ * workspace, a `str_replace` that matched nothing, an `insert` past the end of a
+ * file are the model's to correct and go back to it, while a workspace that
  * does not exist is the world's and fails the node. The journal records either
  * as the effect's outcome, and a replayed failure arrives as a plain `Error`
  * carrying the recorded class *name* — so the class is restored on the way out
@@ -5081,8 +5081,8 @@ function isFileOperation(value: string): value is FileOperation {
  *
  * **Every failure of a path is the model's to correct**, and goes back to it as
  * a refusal (Decision D119): a path outside the workspace, a file that is not
- * there, a `str_replace` that matched nothing or matched twice, a `create` with
- * nothing to write. Each is a statement about arguments the model chose, and it
+ * there, a `str_replace` that matched nothing or matched twice, an `insert` past
+ * the end of a file. Each is a statement about arguments the model chose, and it
  * can choose again — failing the agent node because a model guessed a filename
  * wrong would end a run over something the next call would have fixed. What
  * fails the node is the **workspace** being unusable, which no call can fix.
@@ -5165,13 +5165,18 @@ async function viewPath(requested: string, target: string): Promise<unknown> {
  * the directories too and the alternative is an `ENOENT` it corrects with a
  * `bash mkdir`. They are inside the workspace by construction: the target has
  * already been checked, and every parent of a contained path is contained.
+ *
+ * **An empty `file_text` writes an empty file**, which is what the
+ * provider-defined text editor does with one — and here it is the only thing
+ * that can be done with one. `file_text` carries `default: ""` so that the three
+ * operations which never read it are callable without it (`builtin_tool_input`),
+ * and the parse fills that default in, so a model that sent `""` and a model
+ * that sent nothing arrive here identically. Refusing the pair would leave
+ * `.gitkeep` and `__init__.py` with **no spelling that works** for an agent
+ * holding only this tool; writing it costs a model that forgot its contents one
+ * `create` it repeats, with `wrote 0 bytes` in the answer saying why.
  */
 async function createFile(requested: string, target: string, contents: string): Promise<unknown> {
-  if (contents === "") {
-    throw new ToolCallRefused(
-      `\`${FILE_TOOL}\` was asked to \`create\` \`${requested}\` with no \`file_text\`: send the whole contents of the file to write`,
-    );
-  }
   try {
     await fs.promises.mkdir(path.dirname(target), { recursive: true });
   } catch (error) {
@@ -5231,6 +5236,14 @@ async function replaceInFile(
  * A line outside the file is refused with the length rather than clamped: a
  * model that meant line 400 of a 40-line file has misread something, and
  * appending at the end would hide it.
+ *
+ * An empty `new_str` **is** refused here, where an empty `file_text` is written
+ * by [`createFile`], and the difference is whether the refusal closes anything
+ * off: a blank line has a spelling that works — a lone newline, which this
+ * splits into one empty line — and the message names it, while an empty file has
+ * no spelling at all if `create` will not write one. So the defaulted parameter
+ * costs a forgetful model one call here and takes nothing away from a
+ * deliberate one.
  */
 async function insertIntoFile(
   requested: string,
@@ -5240,7 +5253,7 @@ async function insertIntoFile(
 ): Promise<unknown> {
   if (addition === "") {
     throw new ToolCallRefused(
-      `\`${FILE_TOOL}\` was asked to \`insert\` into \`${requested}\` with no \`new_str\`: send the text to insert`,
+      `\`${FILE_TOOL}\` was asked to \`insert\` into \`${requested}\` with no \`new_str\`: send the text to insert, or a lone newline for a blank line`,
     );
   }
   const held = await readWholeFileText("insert", requested, target);

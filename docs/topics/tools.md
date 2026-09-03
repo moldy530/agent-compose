@@ -488,7 +488,13 @@ without it — and a `notice` where something happened to the *session*.
 `builtin.files` answers with the path
 and what the operation did: a `view` comes back with the file's lines numbered
 (or a directory's entries), a `create` with the bytes written, an edit with the
-line it changed and a few lines around it. Both are bounded, and the two bounds differ where it
+line it changed and a few lines around it. **A `create` with no `file_text`
+writes an empty file** and says `wrote 0 bytes` — `file_text` is a defaulted
+parameter, so a model that sends `""` and one that leaves it out arrive
+identically, and a runtime that refused the pair would put `.gitkeep` out of
+reach of an agent holding only this tool. `insert` refuses an empty `new_str`
+instead, and names the spelling that works: a lone newline, which is the blank
+line. Both answers are bounded, and the two bounds differ where it
 matters: a command's output is cut in the **middle** — a build that failed says
 why in its last lines — and a file view is cut at the end, because a file is read
 from line 1. Either way the cut is said rather than silent. A command that prints

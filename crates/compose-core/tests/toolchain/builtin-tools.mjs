@@ -15,6 +15,11 @@
 //     everything outside the workspace untouched — nothing changed and nothing
 //     new. A test that only read the message would pass against a runtime that
 //     refused *and* wrote;
+//   * **the empty file** — `file_text` is a defaulted parameter, so a `""` sent
+//     deliberately and one left out reach the handler the same way. `create`
+//     writes the empty file for both, because refusing them would leave
+//     `.gitkeep` with no spelling that works; `insert` keeps its refusal for an
+//     empty `new_str`, because a lone newline is that spelling there;
 //   * **the read bound** — a file larger than the runtime reads is *viewed*
 //     from the front with the stop said, and *edited* not at all: an edit
 //     rewrites what it read, so a truncated read would truncate the file;
@@ -214,6 +219,40 @@ const missing = await call(
   editContext,
 );
 const absent = await call(files(editing), { command: "view", path: "nothing.txt" }, editContext);
+// The file with nothing in it, both ways a model can ask for one. `file_text`
+// carries `default: ""` so the operations that never read it are callable
+// without it, and the parse fills that default in — so `""` sent deliberately
+// and `file_text` left out arrive at the handler identically. A `create` that
+// refused the pair would leave `.gitkeep` with no spelling that works, so both
+// write the empty file and the answer says `wrote 0 bytes`.
+const emptied = await call(
+  files(editing),
+  { command: "create", path: "keep/.gitkeep", file_text: "" },
+  editContext,
+);
+const omitted = await call(files(editing), { command: "create", path: "keep/.keep" }, editContext);
+// …and the operation that keeps its refusal, because there the empty argument
+// has a spelling that works: a lone newline inserts the blank line. On a file of
+// its own, so what the four operations above left on disk stays theirs.
+await call(
+  files(editing),
+  { command: "create", path: "keep/blank.txt", file_text: "a\n" },
+  editContext,
+);
+const blankLine = await call(
+  files(editing),
+  { command: "insert", path: "keep/blank.txt", insert_line: 0, new_str: "" },
+  editContext,
+);
+await call(
+  files(editing),
+  { command: "insert", path: "keep/blank.txt", insert_line: 0, new_str: "\n" },
+  editContext,
+);
+const emptyOf = (name) => {
+  const at = path.join(editing, "keep", name);
+  return fs.existsSync(at) && fs.readFileSync(at, "utf8") === "";
+};
 const editingTool = {
   created: created.result,
   createdProgram: created.program,
@@ -229,6 +268,16 @@ const editingTool = {
   absentRefused: absent.refused === true,
   // What is on disk when the four operations have run.
   onDisk: fs.readFileSync(path.join(editing, "notes/todo.md"), "utf8"),
+  // The empty file, asked for both ways, and the empty argument that keeps its
+  // refusal because a lone newline says the same thing.
+  emptyCreated: emptied.result,
+  emptyProgram: emptied.program,
+  emptyOnDisk: emptyOf(".gitkeep"),
+  omittedCreated: omitted.result,
+  omittedOnDisk: emptyOf(".keep"),
+  blankLineRefused: blankLine.refused === true,
+  blankLineMessage: blankLine.message,
+  blankLineOnDisk: fs.readFileSync(path.join(editing, "keep/blank.txt"), "utf8"),
 };
 
 // ---------------------------------------------------------------------------

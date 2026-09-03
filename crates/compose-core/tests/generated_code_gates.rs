@@ -3693,8 +3693,10 @@ fn the_local_backends_behaved(answer: &Value) {
 /// wire, the trace records and Decision D119's bounces are decided. What a loop
 /// cannot show is the inside of a call, and each of these is a claim PRD
 /// resolved q54 makes there: that an escaping path leaves everything outside the
-/// workspace **untouched**, that a file larger than the runtime reads is viewed
-/// from the front and edited not at all, that one shell really is held across
+/// workspace **untouched**, that a `create` with an empty `file_text` writes the
+/// empty file rather than refusing a capability away, that a file larger than
+/// the runtime reads is viewed from the front and edited not at all, that one
+/// shell really is held across
 /// the calls of a node activity and not across two, that a `restart` the model
 /// asked for ends that session and does not swallow the command sent with it,
 /// that a scrubbed child sees the declared variables and no others, that a
@@ -3873,6 +3875,54 @@ fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
         json!({ "tool": "files", "operation": "create", "path": "notes/todo.md", "change": "wrote 14 bytes" }),
         "the trace's record of an edit is the operation, the path and a **sentence** — never the \
          bytes written (`docs/trace.md` §7.4, §11): {editing}"
+    );
+
+    // The empty file, asked for both ways a model can ask for one. `file_text`
+    // is defaulted so the operations that never read it are callable without it,
+    // and the parse fills that default in — so a `""` sent deliberately and a
+    // `file_text` left out are one call by the time the handler sees them. Both
+    // write the file: refusing the pair would leave `.gitkeep` and
+    // `__init__.py` with no spelling that works for an agent holding only this
+    // tool, which is a capability lost rather than a mistake bounced.
+    assert_eq!(
+        editing["emptyCreated"],
+        json!({ "path": "keep/.gitkeep", "bytes_written": 0, "change": "wrote 0 bytes" }),
+        "an explicit empty `file_text` writes the empty file, as the provider-defined text \
+         editor does with one: {editing}"
+    );
+    assert_eq!(
+        editing["omittedCreated"],
+        json!({ "path": "keep/.keep", "bytes_written": 0, "change": "wrote 0 bytes" }),
+        "…and so does a `create` that carried no `file_text` at all, because the two are the \
+         same call here — the answer's `wrote 0 bytes` is what tells a model which it made: \
+         {editing}"
+    );
+    assert_eq!(
+        (&editing["emptyOnDisk"], &editing["omittedOnDisk"]),
+        (&json!(true), &json!(true)),
+        "…and both are on disk, empty, rather than answered for and not written: {editing}"
+    );
+    assert_eq!(
+        editing["emptyProgram"],
+        json!({ "tool": "files", "operation": "create", "path": "keep/.gitkeep", "change": "wrote 0 bytes" }),
+        "…and the trace says what it wrote, which is how an empty file is told from a \
+         forgotten one after the fact: {editing}"
+    );
+    assert_eq!(
+        editing["blankLineRefused"],
+        json!(true),
+        "`insert` keeps the refusal an empty argument gets, because there it closes nothing \
+         off: {editing}"
+    );
+    let blank_line = editing["blankLineMessage"].as_str().unwrap_or_default();
+    assert!(
+        blank_line.contains("lone newline"),
+        "…and the refusal names the spelling that works, which is what makes it a cost of one \
+         call rather than a dead end: {blank_line}"
+    );
+    assert_eq!(
+        editing["blankLineOnDisk"], "\na\n",
+        "…and that spelling really inserts the blank line: {editing}"
     );
 
     // --- The bound on what one `files` call reads --------------------------
