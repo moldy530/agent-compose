@@ -1301,7 +1301,8 @@ runs in, so an error is reproducible and a trace snapshot is comparable across
 machines.
 
 What a message *does* quote from outside this process is **what the other side
-answered**, and a reader should treat that text as untrusted:
+answered** — and, for the two built-in tools, what the **model** asked them to
+run. A reader should treat all of it as untrusted:
 
 | field | what it can carry from outside |
 |---|---|
@@ -1310,10 +1311,13 @@ answered**, and a reader should treat that text as untrusted:
 | `ToolCallRecord.error` | the same text, from the tool a model called (§7.3). On a `"failed"` call, the tool's execution failing: a `tool.*`'s refused response or child stderr, a store op's failure, or one raised inside a flow-as-tool call's instance. On a `"refused"` one it is this runtime's own sentence rather than the other side's — the tool, the field and the constraint, with an excerpt of the **arguments** the model sent, at whichever of the three surfaces refused them (grammar D119) |
 | `TraceDocument.error` | the same text, when that failure is what stopped the run |
 | `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
+| `BuiltinProgram.command`, `BuiltinProgram.path` | the **program the model wrote** for a built-in tool, carried verbatim and capped at 1000 characters each: the `bash` command's text, and the `files` path as the model asked for it (§7.4). Not what a system answered but what the model chose, so it is the one text here that is adversarial by construction wherever a model read something it should not have — a `command` is shell source and a `path` is arbitrary bytes, and neither is a name this runtime composed. `BuiltinProgram.change` beside them is this runtime's own sentence about an edit (`replaced one occurrence at line 12`) and carries nothing of the file |
 
 A target that echoes back what it was sent puts that echo in the trace — a 404
 body naming the path it did not route, a command that prints its own arguments
-on stderr. This format records what it was answered; it does not audit it.
+on stderr. This format records what it was answered; it does not audit it. The
+built-in row is the same posture read one step earlier: it records what an agent
+was told to run, and does not vouch for it.
 
 Two fields are the composition's own to fill, and both are carried verbatim:
 `StoreRecord.answer` is what a read answered (§6), and `ToolCallRecord.result`
@@ -1321,7 +1325,10 @@ is the `outputs:` a subflow a model called answered with (§7.3). A run that
 reads a secret out of a store, or writes one into a flow's declared outputs, has
 put it there itself; the trace records both like any other value. Neither is
 derived from a resolved `${ENV}` reference by this runtime, which is what §11.1
-opens by promising.
+opens by promising. `ToolCallRecord.program` is a third field carried verbatim
+and is in the table above rather than here, because the party that fills it is
+the **model** rather than the composition — the reason it is untrusted text and
+these two are not.
 
 ### 11.2 Where a resolved value would otherwise have escaped
 
