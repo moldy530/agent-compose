@@ -386,7 +386,7 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
         "value": "agent.fixer",
         "span": "agents/fixer.yml:4:1..4:12"
       },
-      "span": "agents/fixer.yml:4:1..28:19",
+      "span": "agents/fixer.yml:4:1..34:19",
       "namespace": "agent",
       "model": {
         "value": "model.fast",
@@ -402,14 +402,14 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "patch",
-              "span": "agents/fixer.yml:23:5..23:10"
+              "span": "agents/fixer.yml:29:5..29:10"
             },
             "type": {
               "description": {
                 "value": "A unified diff.",
-                "span": "agents/fixer.yml:24:20..24:35"
+                "span": "agents/fixer.yml:30:20..30:35"
               },
-              "span": "agents/fixer.yml:24:7..25:19",
+              "span": "agents/fixer.yml:30:7..31:19",
               "form": "scalar",
               "type": "string"
             }
@@ -417,20 +417,20 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "explanation",
-              "span": "agents/fixer.yml:26:5..26:16"
+              "span": "agents/fixer.yml:32:5..32:16"
             },
             "type": {
               "description": {
                 "value": "One sentence describing the change.",
-                "span": "agents/fixer.yml:27:20..27:55"
+                "span": "agents/fixer.yml:33:20..33:55"
               },
-              "span": "agents/fixer.yml:27:7..28:19",
+              "span": "agents/fixer.yml:33:7..34:19",
               "form": "scalar",
               "type": "string"
             }
           }
         ],
-        "span": "agents/fixer.yml:23:5..28:19"
+        "span": "agents/fixer.yml:29:5..34:19"
       },
       "input": {
         "surface": "input",
@@ -438,10 +438,10 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "file",
-              "span": "agents/fixer.yml:20:5..20:9"
+              "span": "agents/fixer.yml:26:5..26:9"
             },
             "type": {
-              "span": "agents/fixer.yml:20:11..20:27",
+              "span": "agents/fixer.yml:26:11..26:27",
               "form": "scalar",
               "type": "string"
             }
@@ -449,21 +449,21 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "patch_hint",
-              "span": "agents/fixer.yml:21:5..21:15"
+              "span": "agents/fixer.yml:27:5..27:15"
             },
             "type": {
-              "span": "agents/fixer.yml:21:17..21:33",
+              "span": "agents/fixer.yml:27:17..27:33",
               "form": "scalar",
               "type": "string"
             }
           }
         ],
-        "span": "agents/fixer.yml:20:5..21:33"
+        "span": "agents/fixer.yml:26:5..27:33"
       },
       "tools": [
         {
           "value": "tool.checkout",
-          "span": "agents/fixer.yml:18:7..18:20"
+          "span": "agents/fixer.yml:24:7..24:20"
         }
       ],
       "description": {
