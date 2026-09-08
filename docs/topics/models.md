@@ -431,9 +431,15 @@ route still fails over only on grammar 12.2's infrastructure conditions.
 output object (`agent-compose docs trace`). Two deployments of one composition
 can answer through different mechanisms: a gateway a generation behind the wire
 it proxies takes only the forced tool, the newest model generation takes only the
-native parameter, and the same YAML runs on both. When a trace shows two
-provider-side calls where you expected one, that is the first call of a pairing
-discovering which rung this endpoint is on.
+native parameter, and the same YAML runs on both.
+
+The ladder itself is **inside** one model call, so it does not add a record: a
+first call that discovered its rung is one `models[]` entry naming the mechanism
+that answered, and the rung that was refused leaves none. Where the extra round
+trip shows up is your provider's own request log — two requests against one
+trace record — and in that call's timing. A trace whose `outputMechanism` is
+`"forced_tool"` on a wire whose native parameter this runtime prefers is what
+says the discovery happened at all.
 
 **When both are refused**, the run fails with a diagnostic quoting *both*
 refusals verbatim. That is deliberate and it is not a missing knob: the runtime
