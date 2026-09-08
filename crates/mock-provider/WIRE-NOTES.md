@@ -376,6 +376,17 @@ transcript entry.
 *If wrong* (some client retries 422s): the transcript still shows the refusal,
 and the run fails with the queue empty rather than passing.
 
+The header has a **fifth** value that is none of the above, and it is deliberately
+not a harness refusal at all: `unsupported-mechanism`, on a well-formed request
+asking for a structured-output mechanism the endpoint's `Personality` does not
+carry (27). That one wears the *provider's* own 400 rather than 422, because it
+is emulating a refusal a real endpoint sends and a compiled graph is meant to
+read it as one. What the header buys is the reading of a raw exchange: the
+transcript records such a request as `valid`, so labelling it `invalid-request`
+would have the response and the transcript contradicting each other about whether
+generated code composed the request correctly. Read the header's **value**, never
+its presence.
+
 ### 12. Request-header checks are presence checks, and only where the grammar makes the header unconditional
 
 `content-type: application/json` is required on **every** request, and
@@ -923,6 +934,14 @@ endpoint does not carry is refused **before** anything is taken from a queue,
 exactly as a malformed request is, because what a generated graph does about that
 refusal is send the same call again the other way — a personality that ate an
 outcome per refusal would make the ladder unscriptable.
+
+It is refused in the surface's ordinary 400 envelope, and recorded — and
+labelled — apart from a malformed one: the transcript's `verdict` says `valid`,
+its `unsupported` names the mechanism, and the response's `x-mock-provider-error`
+says `unsupported-mechanism` rather than `invalid-request` (11). The two say
+opposite things about the generated code — a rejection is a codegen bug, and this
+is the endpoint being what a test staged — so a run that laddered exactly as it
+was asked to still reads as one in which every request was composed correctly.
 
 *What is certain*: that the newest Anthropic generation answers a forced
 `tool_choice` of type `tool` or `any` with a 400, and that gateways refuse

@@ -56,7 +56,7 @@ use crate::control::{
     request_id,
 };
 use crate::strict::{Checker, Dialect, Kind, at, listed};
-use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED};
+use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED, UNSUPPORTED};
 
 /// The top-level keys the Messages API accepts.
 ///
@@ -1568,6 +1568,23 @@ fn error(sequence: u64, status: u16, kind: &str, message: &str) -> Response {
 /// the credential and nothing else. Every other failure is the 400 the API sends
 /// for a body it could not accept.
 pub(crate) fn rejected(sequence: u64, failures: &[ValidationFailure]) -> Answer {
+    refused(sequence, failures, INVALID)
+}
+
+/// The answer to a **well-formed** request asking for a structured-output
+/// mechanism this endpoint does not carry (`Personality`, PRD §9 resolved q53).
+///
+/// The same 400 in the same envelope — a service refusing an argument it does
+/// not have answers its ordinary bad-request error, which is the whole point of
+/// staging one — and a different [`HARNESS_HEADER`](crate::control::HARNESS_HEADER)
+/// value, because `invalid-request` would tell a reader the request was
+/// malformed while the transcript beside it records the request as valid.
+pub(crate) fn unsupported(sequence: u64, failures: &[ValidationFailure]) -> Answer {
+    refused(sequence, failures, UNSUPPORTED)
+}
+
+/// The body both refusals above share, under the label that says which it is.
+fn refused(sequence: u64, failures: &[ValidationFailure], label: &str) -> Answer {
     let (status, kind, reported) = classify(failures);
     let message = reported
         .iter()
@@ -1575,7 +1592,7 @@ pub(crate) fn rejected(sequence: u64, failures: &[ValidationFailure]) -> Answer 
         .collect::<Vec<_>>()
         .join("; ");
     error(sequence, status, kind, &message)
-        .harness(INVALID)
+        .harness(label)
         .answer()
 }
 

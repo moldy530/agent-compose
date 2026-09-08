@@ -123,8 +123,8 @@ pub use client::{Client, Request, Response};
 pub use control::{
     CREATED, Delay, Endpoint, Failure, HARNESS_HEADER, HARNESS_STATUS, Outcome, OutputMechanism,
     Personality, REFUSED_INVALID, REFUSED_MISMATCH, REFUSED_UNSCRIPTED, REFUSED_UNSENDABLE,
-    RecordedRequest, Reply, ReplyBody, Script, ServerToolUse, Snapshot, Store, StructuredOutput,
-    Surface, ToolCall, Usage, ValidationFailure, Verdict,
+    REFUSED_UNSUPPORTED, RecordedRequest, Reply, ReplyBody, Script, ServerToolUse, Snapshot, Store,
+    StructuredOutput, Surface, ToolCall, Usage, ValidationFailure, Verdict,
 };
 pub use server::serve;
 

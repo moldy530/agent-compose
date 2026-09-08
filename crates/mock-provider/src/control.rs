@@ -62,13 +62,18 @@ use serde_json::Value;
 /// from itself on every run. 2023-11-14T22:13:20Z, chosen only for being round.
 pub const CREATED: u64 = 1_700_000_000;
 
-/// The header a response carries when the *harness* refused the request rather
-/// than a provider having failed.
+/// The header a response carries when this server decided the answer itself,
+/// rather than a script having asked for one.
 ///
 /// A test that sees it knows the run never reached a scripted outcome: the
-/// request was malformed, unscripted, or asked for something the script could
-/// not render. Generated code classifies provider failures by status (5.9), so
-/// these answers deliberately carry a status no failover condition claims.
+/// request was malformed, unscripted, asked for something the script could not
+/// render, or asked this endpoint for a structured-output mechanism its
+/// [`Personality`] does not carry. The **value** is what says which of those,
+/// and a reader has to look at it rather than at the header's presence — the
+/// four say different things about whose bug it is, and only
+/// [`REFUSED_UNSUPPORTED`] is not a bug at all. Generated code classifies
+/// provider failures by status (5.9), so the three harness refusals deliberately
+/// carry a status no failover condition claims.
 pub const HARNESS_HEADER: &str = "x-mock-provider-error";
 
 /// The status every harness refusal carries.
@@ -103,6 +108,24 @@ pub const REFUSED_MISMATCH: &str = "script-mismatch";
 /// [`HARNESS_HEADER`] on a scripted outcome that could not be put on the wire at
 /// all — a `raw` outcome carrying a header name or value HTTP cannot carry.
 pub const REFUSED_UNSENDABLE: &str = "unsendable-response";
+/// [`HARNESS_HEADER`] on a **well-formed** request asking this endpoint for a
+/// structured-output mechanism its [`Personality`] does not carry (PRD §9
+/// resolved q53).
+///
+/// Apart from [`REFUSED_INVALID`] because the two say opposite things about the
+/// generated code: a malformed request is a codegen bug, and this is the
+/// endpoint being what a test staged — the same request is recorded with
+/// [`Verdict::Valid`] beside `unsupported: Some(_)`, and what the graph does
+/// about it is send the call again the other way. Labelling both `invalid-request`
+/// would put the wire response and the transcript in contradiction, and would
+/// make "no request in this run was malformed" — the natural way to assert that
+/// every request was composed correctly — fail on every correct laddering run.
+///
+/// It rides the *provider's* own 400 rather than [`HARNESS_STATUS`], because
+/// unlike the other three this refusal is one a real endpoint sends; the header
+/// is only how a reader of a transcript tells a staged one from a scripted
+/// `raw` 400.
+pub const REFUSED_UNSUPPORTED: &str = "unsupported-mechanism";
 
 /// The two refusals that happen **after** an outcome has been taken from its
 /// queue, spelled as [`RecordedRequest::served`] records them.

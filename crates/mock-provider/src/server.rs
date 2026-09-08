@@ -338,13 +338,16 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
                 let answer = anthropic::render(sequence, &body, structured.as_ref(), &outcome);
                 recorded(store, sequence, &outcome, answer)
             }
-            // The two refusals that take nothing from a queue, rendered the
-            // same way and recorded apart: a malformed request is a codegen
+            // The two refusals that take nothing from a queue, sharing an
+            // envelope and labelled apart: a malformed request is a codegen
             // bug, and a mechanism this endpoint does not carry is the endpoint
-            // being what a test staged (PRD §9 resolved q53).
-            Decision::Rejected(failures) | Decision::Unsupported(failures) => {
-                anthropic::rejected(sequence, &failures)
-            }
+            // being what a test staged (PRD §9 resolved q53). The label is the
+            // `x-mock-provider-error` value, which is the only thing on the wire
+            // that tells them apart — the status is the provider's own 400
+            // either way, and the transcript's `verdict` says `valid` for the
+            // second, so one label for both would contradict it.
+            Decision::Rejected(failures) => anthropic::rejected(sequence, &failures),
+            Decision::Unsupported(failures) => anthropic::unsupported(sequence, &failures),
             Decision::Unscripted { model, reason } => {
                 anthropic::unscripted(sequence, &model, &reason)
             }
@@ -354,9 +357,8 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
                 let answer = openai::render(sequence, &body, &model, structured.as_ref(), &outcome);
                 recorded(store, sequence, &outcome, answer)
             }
-            Decision::Rejected(failures) | Decision::Unsupported(failures) => {
-                openai::rejected(sequence, &failures)
-            }
+            Decision::Rejected(failures) => openai::rejected(sequence, &failures),
+            Decision::Unsupported(failures) => openai::unsupported(sequence, &failures),
             Decision::Unscripted { model, reason } => openai::unscripted(sequence, &model, &reason),
         },
         // The Responses surface renders its own answers and borrows the two
@@ -369,9 +371,8 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
                     responses::render(sequence, &body, &model, structured.as_ref(), &outcome);
                 recorded(store, sequence, &outcome, answer)
             }
-            Decision::Rejected(failures) | Decision::Unsupported(failures) => {
-                openai::rejected(sequence, &failures)
-            }
+            Decision::Rejected(failures) => openai::rejected(sequence, &failures),
+            Decision::Unsupported(failures) => openai::unsupported(sequence, &failures),
             Decision::Unscripted { model, reason } => openai::unscripted(sequence, &model, &reason),
         },
     }

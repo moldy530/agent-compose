@@ -25,7 +25,8 @@
 //! suite.
 
 use mock_provider::{
-    Client, MockProvider, Outcome, OutputMechanism, Personality, Request, Script, StructuredOutput,
+    Client, HARNESS_HEADER, MockProvider, Outcome, OutputMechanism, Personality, REFUSED_INVALID,
+    REFUSED_UNSUPPORTED, Request, Script, StructuredOutput,
 };
 use serde_json::{Value, json};
 
@@ -385,6 +386,73 @@ fn the_openai_wires_refuse_each_mechanism_in_their_own_words() {
             .iter()
             .all(mock_provider::RecordedRequest::is_valid),
         "…and every one of them was well formed"
+    );
+}
+
+/// What a mechanism refusal says **on the wire** about whose bug it is:
+/// `unsupported-mechanism`, never `invalid-request`.
+///
+/// The status is the provider's own 400 either way and the envelope is the
+/// surface's, so the `x-mock-provider-error` value is the only thing in a raw
+/// exchange that tells a staged endpoint from a request this server could not
+/// parse — and the transcript records this one as **valid** beside
+/// `unsupported: Some(_)`, so the two had to be made to agree. Labelled
+/// `invalid-request`, a laddering run would send a contributor reading its
+/// headers after a codegen bug that does not exist, and would falsify the
+/// natural spelling of "every request in this run was composed correctly".
+#[test]
+fn a_mechanism_refusal_is_labelled_apart_from_a_malformed_request() {
+    let provider = MockProvider::start().expect("a port");
+    provider.personality(SONNET, Personality::BothRejected);
+    provider.personality(GPT, Personality::BothRejected);
+
+    let client = provider.client();
+    let staged = [
+        messages(&client, &messages_native()),
+        messages(&client, &messages_forced()),
+        chat(&client, &chat_forced()),
+        responses(&client, &responses_native()),
+    ];
+    for refused in &staged {
+        assert_eq!(refused.status, 400, "the provider's own bad request");
+        assert_eq!(
+            refused.header(HARNESS_HEADER),
+            Some(REFUSED_UNSUPPORTED),
+            "…and the label that says the endpoint is being what a test staged"
+        );
+    }
+
+    // The contrast, on the same wire and at the same status: a request this
+    // server could not parse at all. `output_format` is q53's *deprecated*
+    // spelling of the very parameter above ((26)), so it is also the nearest
+    // neighbour a mislabelling could hide behind.
+    let malformed = messages(
+        &client,
+        &json!({
+            "model": SONNET,
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "output_format": { "type": "json_schema", "schema": schema() },
+        }),
+    );
+    assert_eq!(malformed.status, 400);
+    assert_eq!(
+        malformed.header(HARNESS_HEADER),
+        Some(REFUSED_INVALID),
+        "a malformed request keeps the label it has always had"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(recorded.len(), 5);
+    let valid = recorded
+        .iter()
+        .map(mock_provider::RecordedRequest::is_valid)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        valid,
+        [true, true, true, true, false],
+        "…which is what the transcript says of each, and the whole reason the \
+         four staged refusals may not wear `invalid-request`"
     );
 }
 
