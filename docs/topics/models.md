@@ -438,10 +438,14 @@ That is a model ignoring a fixed instruction to produce its result, not an
 endpoint that lacks a mechanism — nothing was refused, and nothing laddered.
 
 Nothing else ladders. A 401, a 429, a 5xx, a content refusal, a schema the
-decoder will not compile, and a complaint about the **conversation** rather than
+decoder will not compile, a complaint about the **conversation** rather than
 about a parameter — a strict gateway refusing a history that ends on an assistant
-turn — are refusals about something other than the mechanism, and each behaves
-exactly as it always has. Including for `route_on:`, which is untouched: the
+turn — and a parameter refused because of **another parameter in the same
+request**, such as `output_config` beside a `settings:` key this model will not
+take it with, are refusals about something other than the mechanism, and each
+behaves exactly as it always has. The last of those is the one worth knowing
+about, because it is the only refusal here that *does* name something in your
+composition to change: you get the endpoint's own sentence, and it names the key. Including for `route_on:`, which is untouched: the
 mechanism ladder is *inside* one call to one route member, so a condition the
 working rung answers with is the route's to act on as it always was, and a route
 still fails over only on grammar 12.2's infrastructure conditions — which the

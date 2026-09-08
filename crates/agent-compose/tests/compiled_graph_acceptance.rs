@@ -3428,6 +3428,135 @@ fn a_refusal_that_is_not_about_the_mechanism_does_not_ladder() {
     }
 }
 
+/// Two more families that name the mechanism's own key and are still not about
+/// the mechanism (PRD §9 resolved q53).
+///
+/// Both are the way of being wrong that **hides itself**, for the same reason the
+/// case above about a key one level inside the parameter is: the loss is recorded
+/// before the retry is sent, so a body read as a missing mechanism demotes a rung
+/// that is there for the life of the process, the retry carries the same
+/// offending request to the other rung, and the run dies telling an operator
+/// there is nothing to configure about an endpoint that has both mechanisms.
+///
+///   * the key that is also an **English word**. Responses spells its native
+///     mechanism `text.format` and the top-level parameter that sits inside
+///     `text`, and `text` is a word every other refusal on that surface is free to
+///     use: a model that takes no text input, a media type, a sentence pointing
+///     at "the text output" as the remedy for something else. Each of those
+///     clears a word boundary and each says "not supported", and none of them
+///     says the endpoint lacks `text.format`;
+///   * the mechanism refused **beside another parameter this same request
+///     carried**. `output_config` under `thinking:`, `response_format` under a
+///     second OpenAI key: the conversation-shape family one step out, and a
+///     statement about a request this runtime composed rather than about what the
+///     endpoint carries. What the operator has here is one `settings:` key to
+///     drop, which is the opposite of nothing to configure.
+#[test]
+fn a_refusal_naming_the_key_as_a_word_or_blaming_another_parameter_does_not_ladder() {
+    // As above: one run, and the claim is that the request count did not grow.
+    let unladdered = |project: &str,
+                      flow: &str,
+                      inputs: &[(&str, &str)],
+                      model: &str,
+                      before: &[Outcome],
+                      about: &str,
+                      body: Value| {
+        let provider = MockProvider::start().expect("a loopback port");
+        for outcome in before {
+            provider.enqueue(Script::new(model, outcome.clone()));
+        }
+        provider.enqueue(Script::new(model, Outcome::raw(400, body)));
+
+        let Some(run) = harness::invoke(project, flow, inputs, &provider) else {
+            return;
+        };
+        run.failed();
+        assert_eq!(
+            provider.requests().len(),
+            before.len() + 1,
+            "on `{project}`, a 400 about {about} is not a mechanism this endpoint \
+             lacks, so the call ended where it always did — no retry"
+        );
+    };
+
+    let respond = &[("question", "does it?")][..];
+    // The loop's own turn: prose and no calls, so the next request is the pinned
+    // one each case is about (grammar 5, D51).
+    let loop_turn = &[Outcome::text("I have what I need.")][..];
+    for (about, body) in [
+        (
+            "the word `text` as the input a model does not take",
+            json!({
+                "error": {
+                    "message": "This model does not support text input.",
+                    "type": "invalid_request_error",
+                },
+            }),
+        ),
+        (
+            "the word `text` inside a media type",
+            json!({
+                "error": {
+                    "message": "Invalid value: 'text/plain'. Supported values are: 'application/pdf'. Unsupported parameter: file content type.",
+                    "type": "invalid_request_error",
+                },
+            }),
+        ),
+        (
+            "the word `text` naming the remedy for another parameter",
+            json!({
+                "error": {
+                    "message": "Unsupported parameter: 'reasoning.summary' is not supported with this model. Use the text output instead.",
+                    "type": "invalid_request_error",
+                    "param": "reasoning.summary",
+                },
+            }),
+        ),
+    ] {
+        unladdered(
+            "server-tools",
+            "flow.respond",
+            respond,
+            GPT5,
+            loop_turn,
+            about,
+            body,
+        );
+    }
+
+    let review = &[("goal", "ship it"), ("draft", "a draft")][..];
+    unladdered(
+        "agent-anthropic",
+        "flow.review",
+        review,
+        SONNET,
+        &[],
+        "the mechanism refused beside a `settings:` key",
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "`output_config` is not supported when `thinking` is enabled.",
+            },
+        }),
+    );
+    unladdered(
+        "agent-openai",
+        "flow.review",
+        review,
+        LOCAL,
+        &[],
+        "the mechanism refused beside another request parameter",
+        json!({
+            "error": {
+                "message": "Invalid parameter: 'response_format' is not supported when 'logprobs' is requested.",
+                "type": "invalid_request_error",
+                "param": "response_format",
+            },
+        }),
+    );
+}
+
 /// …and a refusal that **is** about the mechanism ladders however the service
 /// happened to word it (PRD §9 resolved q53).
 ///

@@ -2432,9 +2432,11 @@ function mechanismOrder(
  * `text` is the parameter `text.format` sits inside, and a gateway that has
  * never heard of the wire refuses it under that name.
  *
- * Every entry is matched by [`namesKey`] rather than by a bare `includes`, which
- * is what makes an entry as short as `text` safe to carry: a run of letters
- * inside a longer word is not this key being named.
+ * Every entry is matched by [`namesKey`] rather than by a bare `includes` — a run
+ * of letters inside a longer word is not this key being named — and an entry that
+ * is also an ordinary English word ([`WORD_SHAPED_KEYS`]) has to be *named as a
+ * parameter* on top of that. Those two together are what make an entry as short
+ * as `text` safe to carry beside prose about text input and `text/plain`.
  */
 const MECHANISM_KEYS: Readonly<Record<Wire, Readonly<Record<OutputMechanism, readonly string[]>>>> =
   {
@@ -2568,6 +2570,86 @@ const ABOUT_THE_CONVERSATION: readonly string[] = [
 ];
 
 /**
+ * The words a refusal joins two **parameters** with when it has the one this
+ * ladder asked for and will not take it *beside something else in the same
+ * body* — `` `output_config` is not supported when `thinking` is enabled. ``
+ *
+ * The [`ABOUT_THE_CONVERSATION`] family one step out: a statement about the
+ * request this runtime composed rather than about what the endpoint carries. It
+ * names the rung's own key, it says "not supported", and the thing to change is
+ * neither the mechanism nor the conversation — it is a `settings:` key in the
+ * composition. Laddering on it carries the same offending parameter to the other
+ * rung, is refused there for the same reason, and reports an endpoint that
+ * "carries neither mechanism … there is nothing to configure" when what the
+ * operator has is one setting to drop.
+ *
+ * Read by [`blamesAnotherParameter`] as a **shape** rather than as a phrase,
+ * because the parameter being blamed is the vendor's and cannot be listed: one of
+ * these connectives, then a *quoted* identifier that is not one of this
+ * mechanism's own spellings. Both halves are narrowing, and deliberately, because
+ * being wrong here costs a run that could have laddered rather than a request:
+ *
+ *   * the **quoting** is what separates this from a capability refusal, which
+ *     joins the same words to prose — `json_schema response format is not
+ *     supported with this model.` is "with this model", not with a parameter, and
+ *     an identifier charset that stops at `-` keeps a quoted *model id* out too;
+ *   * the **closed list** leaves a bare `with` alone, so `` Use `tools` with
+ *     `tool_choice` instead. `` — other parameters named as the remedy rather than
+ *     as the conflict — still ladders.
+ *
+ * An endpoint statement outranks it exactly as it outranks
+ * [`NOT_ABOUT_THE_MECHANISM`] ([`ABOUT_THE_ENDPOINT`], [`unsupportedMechanism`]),
+ * and an unquoted `when thinking is enabled` is left to ladder, pay one request,
+ * and be answered by a diagnostic carrying both bodies.
+ */
+const CONFLICT_CONNECTIVES: readonly string[] = [
+  // Conditional: the clause a service opens when the parameter is fine and this
+  // request is not.
+  "whenever",
+  "when",
+  "while",
+  "unless",
+  "if",
+  // …and the ways of saying two parameters may not travel together.
+  "alongside",
+  "combined with",
+  "together with",
+  "used with",
+  "supported with",
+  "allowed with",
+  "in combination with",
+  "incompatible with",
+  "conflicts with",
+  "mutually exclusive with",
+  "at the same time as",
+  "in the same request as",
+];
+
+/** [`CONFLICT_CONNECTIVES`], then the quoted name of the parameter blamed. */
+const BLAMES_ANOTHER_PARAMETER = new RegExp(
+  `(?:^|[^a-z0-9_])(?:${CONFLICT_CONNECTIVES.join("|")})\\s+["'\`]([a-z0-9_]+(?:\\.[a-z0-9_]+)*)["'\`]`,
+  "g",
+);
+
+/**
+ * Whether this refusal blames a parameter that is **not this mechanism's**
+ * ([`CONFLICT_CONNECTIVES`]).
+ *
+ * A body naming the mechanism's own key after a connective is not this: `The
+ * conversation must end with a user message when `output_config` asks for
+ * structured output.` is about the mechanism's request, and is disqualified a
+ * line earlier for what it actually is.
+ */
+function blamesAnotherParameter(body: string, keys: readonly string[]): boolean {
+  for (const match of body.matchAll(BLAMES_ANOTHER_PARAMETER)) {
+    const blamed = match[1];
+    if (keys.some((key) => blamed === key || blamed.startsWith(`${key}.`))) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
  * Whether `body` names `key` as **the key itself**, rather than carrying those
  * letters inside a longer word or a longer path.
  *
@@ -2592,10 +2674,15 @@ const ABOUT_THE_CONVERSATION: readonly string[] = [
  * nothing will look at again. The other direction of being wrong costs a
  * request; this one costs the bug.
  *
+ * And where the key is a **word** as well as a key ([`WORD_SHAPED_KEYS`]), a word
+ * boundary is not enough on its own: the body has to name it the way a service
+ * names a parameter ([`namedAsParameter`]).
+ *
  * `body` arrives lowercased, so the character classes are written that way.
  */
 function namesKey(body: string, key: string): boolean {
   const identifier = /[a-z0-9_]/;
+  const wordShaped = WORD_SHAPED_KEYS.has(key);
   // `charAt` answers `""` off either end, which is not an identifier character —
   // a key at the very start or end of the body is named by it.
   for (let at = body.indexOf(key); at >= 0; at = body.indexOf(key, at + 1)) {
@@ -2604,9 +2691,70 @@ function namesKey(body: string, key: string): boolean {
     // …and not the head of a longer path. Only a `.` followed by a segment is
     // one: a key at the end of a sentence is followed by a full stop.
     if (after === "." && identifier.test(body.charAt(at + key.length + 1))) continue;
+    if (wordShaped && !namedAsParameter(body, at, key)) continue;
     return true;
   }
   return false;
+}
+
+/**
+ * The [`MECHANISM_KEYS`] spellings that are **ordinary English words** as well as
+ * request keys, and so cannot be read as this parameter merely because a refusal
+ * used the word.
+ *
+ * `text` is the only one, and dropping it is not an option: it is the Responses
+ * wire's own name for the parameter `text.format` sits inside, and a gateway that
+ * has never heard of the wire refuses it under that name. But it is also a word
+ * every other refusal on that surface is free to use. `This model does not
+ * support text input.`, `Invalid value: 'text/plain'. … Unsupported parameter:
+ * file content type.` and `Unsupported parameter: 'reasoning.summary' is not
+ * supported with this model. Use the text output instead.` each clear
+ * [`namesKey`]'s word boundary and each carries an [`UNSUPPORTED_PARAMETER`]
+ * phrase, and not one of them says the endpoint lacks `text.format`.
+ *
+ * Reading one of those as a missing mechanism is the direction of being wrong
+ * that **hides itself**: the loss is recorded before the retry is sent
+ * ([`structuredAnswer`]), so `native` is gone for that pairing for the life of
+ * the process, the retry carries the same offending request to the other rung and
+ * fails there for the same reason, and the run dies claiming there is nothing to
+ * configure about an endpoint that has both mechanisms.
+ *
+ * The distinctive spellings — `output_config`, `response_format`, `tool_choice`,
+ * `text.format` — are exempt, because a body carrying one of those is talking
+ * about it however it is punctuated, and holding *them* to a quoting rule would
+ * lose the plain `response_format is not supported for this model.` a service is
+ * free to send.
+ */
+const WORD_SHAPED_KEYS: ReadonlySet<string> = new Set(["text"]);
+
+/**
+ * Whether the run of letters at `at` is `body` naming a **parameter** rather than
+ * using the same letters as a word in a sentence.
+ *
+ * Three ways, and no more than three, because each is a punctuation mark a
+ * service reaches for when it lifts an identifier out of prose:
+ *
+ *   * **quoted on both sides** — `'text'`, `"text"`, `` `text` ``. Both sides is
+ *     the load-bearing half: `'text/plain'` opens with the quote and is a media
+ *     type;
+ *   * **labelled**, `text: …` — the pydantic-shaped address a bare top-level key
+ *     arrives as;
+ *   * **named after a colon**, `Unrecognized request argument supplied: text` —
+ *     OpenAI's way of pointing at the argument it did not know, and so the
+ *     wording of the one refusal this entry exists for.
+ *
+ * Anything else — `text input`, `the text output` — is the word, and a refusal
+ * carrying it is about something this ladder has no business moving on.
+ *
+ * `slice` off the front of the string answers `""` rather than throwing, so a key
+ * at position 0 or 1 is simply not named after a colon.
+ */
+function namedAsParameter(body: string, at: number, key: string): boolean {
+  const quote = /["'`]/;
+  const after = body.charAt(at + key.length);
+  if (quote.test(body.charAt(at - 1)) && quote.test(after)) return true;
+  if (after === ":") return true;
+  return at >= 2 && body.slice(at - 2, at) === ": ";
 }
 
 /**
@@ -2670,16 +2818,18 @@ function addressedElsewhere(body: string, keys: readonly string[]): boolean {
  * is not JSON, a content refusal and a schema the decoder will not compile are
  * all *not* this, and each still reaches [`callModel`]'s route ladder as itself.
  *
- * Five things must hold at once: the status is one a service refuses a request
+ * Six things must hold at once: the status is one a service refuses a request
  * with rather than one it fails under (400, and 422 for the services that use
  * it); the complaint is not about the **conversation** this runtime composed
- * ([`ABOUT_THE_CONVERSATION`]); it is not addressed at some other part of the
- * request ([`addressedElsewhere`]); the body names the key this mechanism is
- * spelled with on this wire — as that key ([`namesKey`]), not as letters inside
- * another word or a segment of a longer path; and the body carries one of the
- * ways of saying "that parameter is not one I have" without carrying one of the
- * ways of saying "that parameter's contents are wrong" that is not also a
- * statement about the endpoint ([`ABOUT_THE_ENDPOINT`]).
+ * ([`ABOUT_THE_CONVERSATION`]); it is not about this parameter's **contents**
+ * ([`NOT_ABOUT_THE_MECHANISM`]) nor about **another parameter** this same request
+ * carried ([`blamesAnotherParameter`]), unless it also says the endpoint is what
+ * lacks the mechanism ([`ABOUT_THE_ENDPOINT`]); it is not addressed at some other
+ * part of the request ([`addressedElsewhere`]); the body names the key this
+ * mechanism is spelled with on this wire — as that key ([`namesKey`]), not as
+ * letters inside another word, a segment of a longer path, or an English word
+ * that happens to be spelled like a request key ([`WORD_SHAPED_KEYS`]); and the
+ * body carries one of the ways of saying "that parameter is not one I have".
  */
 function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unknown): boolean {
   if (!(error instanceof ProviderFailure)) return false;
@@ -2691,7 +2841,12 @@ function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unk
   // First, and with nothing able to re-qualify it: a refusal about the shape of
   // the conversation is a refusal about this runtime's own request.
   if (carries(ABOUT_THE_CONVERSATION)) return false;
-  if (carries(NOT_ABOUT_THE_MECHANISM) && !carries(ABOUT_THE_ENDPOINT)) return false;
+  // …then the two a statement about the endpoint outranks — what is *inside* the
+  // parameter, and what is *beside* it in the same body.
+  if (!carries(ABOUT_THE_ENDPOINT)) {
+    if (carries(NOT_ABOUT_THE_MECHANISM)) return false;
+    if (blamesAnotherParameter(body, keys)) return false;
+  }
   if (addressedElsewhere(body, keys)) return false;
   if (!keys.some((key) => namesKey(body, key))) return false;
   return carries(UNSUPPORTED_PARAMETER);

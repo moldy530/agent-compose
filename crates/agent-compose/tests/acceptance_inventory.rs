@@ -331,6 +331,10 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             (
+                "a_refusal_naming_the_key_as_a_word_or_blaming_another_parameter_does_not_ladder",
+                Status::Live,
+            ),
+            (
                 "a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends",
                 Status::Live,
             ),
