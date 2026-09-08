@@ -4,8 +4,9 @@
 //! what a client on the other end of a connection actually receives — status,
 //! headers, and body — because that is what the Anthropic SDK inside a compiled
 //! graph will parse. A request here is written the way generated code will write
-//! it: the agent's output schema as a forced tool (PRD 5.2), its `tools:` and
-//! `stores:` entries as the tool surface (grammar 5.4, 11.5).
+//! it: the agent's output schema asked for either way this wire has (PRD 5.2,
+//! PRD §9 resolved q53), its `tools:` and `stores:` entries as the tool surface
+//! (grammar 5.4, 11.5).
 
 use std::time::Duration;
 
@@ -87,10 +88,118 @@ fn a_scripted_structured_output_arrives_as_forced_tool_use() {
         recorded[0]
             .structured_output
             .as_ref()
-            .map(|output| output.name()),
+            .and_then(|output| output.name()),
         Some("reviewer_output")
     );
     assert!(provider.snapshot().is_drained(), "the script was consumed");
+}
+
+/// The wire's **other** structured-output mechanism: `output_config`'s format,
+/// answered with a text block that parses (PRD §9 resolved q53,
+/// `WIRE-NOTES` (26)).
+///
+/// The same scripted object as the test above, and the script says nothing about
+/// which mechanism asked — the *request* decides where the object goes, which is
+/// what lets one script drive both rungs of the runtime's ladder.
+#[test]
+fn an_output_config_structured_output_arrives_as_the_assistant_text() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "max_tokens": 4096,
+            "system": "You are a meticulous technical reviewer.",
+            "messages": [{ "role": "user", "content": "{\"goal\":\"ship it\"}" }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "verdict": { "type": "string", "enum": ["approve", "revise"] },
+                            "feedback": { "type": "string" },
+                        },
+                        "required": ["verdict", "feedback"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+        }),
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["stop_reason"], "end_turn", "no call ended this turn");
+    assert_eq!(body["content"][0]["type"], "text");
+    let text = body["content"][0]["text"]
+        .as_str()
+        .expect("the format shaped the assistant's text")
+        .to_string();
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("which parses"),
+        json!({ "verdict": "approve", "feedback": "" })
+    );
+
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert!(
+        recorded[0].tools.is_empty(),
+        "this mechanism declares no tool at all: {:?}",
+        recorded[0].tools
+    );
+    assert_eq!(
+        recorded[0]
+            .structured_output
+            .as_ref()
+            .map(mock_provider::StructuredOutput::mechanism),
+        Some(mock_provider::OutputMechanism::Native)
+    );
+    assert_eq!(
+        recorded[0]
+            .structured_output
+            .as_ref()
+            .and_then(|output| output.name()),
+        None,
+        "…and no name: a format constrains the text and has no call to name"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The **deprecated** spelling is not this wire's parameter, and a request that
+/// sent one is refused as the unknown argument it is (`WIRE-NOTES` (26)).
+///
+/// The failure mode a compiled graph that regressed to `output_format` should
+/// have: refused here, in CI, rather than accepted by a server more forgiving
+/// than the API.
+#[test]
+fn the_deprecated_output_format_spelling_is_an_unknown_argument() {
+    let provider = MockProvider::start().expect("a port");
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "output_format": { "type": "json_schema", "schema": { "type": "object" } },
+        }),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    let recorded = provider.requests();
+    assert!(!recorded[0].is_valid());
+    assert_eq!(
+        recorded[0].failures()[0].message,
+        "output_format: Extra inputs are not permitted"
+    );
+    assert_eq!(
+        recorded[0].unsupported, None,
+        "a malformed request is not an endpoint refusing a mechanism"
+    );
 }
 
 /// The tool surface a request carries is observable, in request order.
@@ -374,8 +483,91 @@ fn a_forced_tool_choice_needs_the_conversation_to_end_on_the_user() {
     assert_eq!(snapshot.invalid, 1, "by the second request, not the first");
 }
 
+/// …and so does the **native** mechanism, whose request pins nothing at all
+/// (PRD §9 resolved q53).
+///
+/// The rung the runtime prefers on this wire asks through `output_config`, so an
+/// oracle that only watched the pin would have stopped watching the request that
+/// is now the common one: a ladder that composed its native shape without q52's
+/// closing turn would meet the strict gateway's 400 in a deployment rather than
+/// here. Same history, same pair of runs, the other parameter.
+#[test]
+fn output_config_needs_the_conversation_to_end_on_the_user() {
+    let loop_turns = [
+        json!({ "role": "user", "content": "{\"goal\":\"ship it\"}" }),
+        json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "query": "it" } },
+        ]}),
+        json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a looked-up snippet" },
+        ]}),
+        json!({ "role": "assistant", "content": [{ "type": "text", "text": "found it" }] }),
+    ];
+    let asked = |messages: Value| {
+        json!({
+            "model": MODEL,
+            "max_tokens": 4096,
+            "system": "You are a meticulous technical reviewer.",
+            "messages": messages,
+            "tools": [
+                { "name": "lookup", "description": "Look one fact up.", "input_schema": { "type": "object" } },
+            ],
+            "output_config": { "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": { "verdict": { "type": "string" } },
+                    "required": ["verdict"],
+                    "additionalProperties": false,
+                },
+            }},
+        })
+    };
+
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+
+    let refused = send(
+        &provider.client(),
+        &asked(Value::Array(loop_turns.to_vec())),
+    );
+    assert_eq!(refused.status, 400);
+    assert_eq!(refused.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    let body = refused.json();
+    assert_eq!(
+        body["error"]["message"],
+        "messages.3: This model does not support assistant message prefill. \
+         The conversation must end with a user message when `output_config` \
+         asks for structured output.",
+        "{body}"
+    );
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "a refused request consumes nothing"
+    );
+
+    let mut closed = loop_turns.to_vec();
+    closed.push(json!({ "role": "user", "content": "Now produce the structured result." }));
+    let served = send(&provider.client(), &asked(Value::Array(closed)));
+    assert_eq!(served.status, 200);
+    let body = served.json();
+    assert_eq!(
+        body["content"][0]["type"], "text",
+        "the native mechanism answers in the assistant's text: {body}"
+    );
+    assert_eq!(body["content"][0]["text"], "{\"verdict\":\"approve\"}");
+    assert!(
+        provider.snapshot().queues.is_empty(),
+        "the script was taken"
+    );
+}
+
 /// Prefill on its own is **not** refused: it is the Messages API's own feature,
-/// and only a forced `tool_choice` beside it makes the pair a contradiction.
+/// and only a structured-output ask beside it makes the pair a contradiction.
 ///
 /// Without this the rule above would be indistinguishable from "assistant turns
 /// may not end a conversation", which is a different and wrong server.

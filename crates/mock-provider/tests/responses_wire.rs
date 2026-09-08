@@ -88,9 +88,126 @@ fn a_text_format_structured_output_arrives_as_the_assistant_text() {
         recorded[0]
             .structured_output
             .as_ref()
-            .map(mock_provider::StructuredOutput::name),
+            .and_then(mock_provider::StructuredOutput::name),
         Some("reviewer_output")
     );
+}
+
+/// This wire's **other** structured-output mechanism: a flat forced function,
+/// answered with the `function_call` item its arguments ride (PRD §9 resolved
+/// q53).
+///
+/// The rung a compiled graph falls to when an endpoint refuses `text.format`.
+/// One script drives either — where the object goes is the *request's* decision.
+#[test]
+fn a_forced_function_structured_output_arrives_as_the_calls_arguments() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "instructions": "You are a meticulous technical reviewer.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "{\"goal\":\"ship it\"}" }],
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "reviewer_output",
+                "description": "The structured output agent.reviewer must produce.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "verdict": { "type": "string", "enum": ["approve", "revise"] },
+                    },
+                    "required": ["verdict"],
+                    "additionalProperties": false,
+                },
+                "strict": true,
+            }],
+            "tool_choice": { "type": "function", "name": "reviewer_output" },
+        }),
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["output"][0]["type"], "function_call");
+    assert_eq!(body["output"][0]["name"], "reviewer_output");
+    let arguments = body["output"][0]["arguments"]
+        .as_str()
+        .expect("arguments travel as a JSON string on this wire")
+        .to_string();
+    assert_eq!(
+        serde_json::from_str::<Value>(&arguments).expect("which parses"),
+        json!({ "verdict": "approve" })
+    );
+
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert_eq!(
+        recorded[0]
+            .structured_output
+            .as_ref()
+            .map(mock_provider::StructuredOutput::mechanism),
+        Some(mock_provider::OutputMechanism::ForcedTool)
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A pin is a promise about **which** function is called, so a script that calls
+/// a sibling is an answer this wire cannot send.
+#[test]
+fn a_scripted_call_to_a_sibling_of_the_pinned_function_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+    ));
+
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "instructions": "You are a researcher.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "{\"goal\":\"ship it\"}" }],
+            }],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look one thing up.",
+                    "parameters": { "type": "object", "properties": {}, "additionalProperties": false },
+                },
+                {
+                    "type": "function",
+                    "name": "reviewer_output",
+                    "description": "The agent's output.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "verdict": { "type": "string" } },
+                        "required": ["verdict"],
+                        "additionalProperties": false,
+                    },
+                },
+            ],
+            "tool_choice": { "type": "function", "name": "reviewer_output" },
+        }),
+    );
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert!(
+        response.text().contains("this request pins `tool_choice"),
+        "the refusal names the pin it contradicts: {}",
+        response.text()
+    );
+    assert!(provider.requests()[0].was_refused());
 }
 
 /// The provider's suite reaches the wire **as written**, and is recorded apart
@@ -152,6 +269,70 @@ fn a_scripted_server_tool_use_is_woven_into_the_turn() {
     assert_eq!(output[0]["status"], "completed");
     assert_eq!(output[0]["results"][0]["url"], "https://docs.example.com/a");
     assert_eq!(output[1]["type"], "message");
+}
+
+/// A use scripted with a **preamble** puts what the model said first in a
+/// `message` item of its own, so the turn carries two — which is the shape
+/// `text.format` shapes only the **last** of (PRD §9 resolved q53).
+///
+/// The two items are distinct answers to distinct questions, and a reader that
+/// flattened them would find `Let me look that up.{"verdict":"approve"}` where
+/// the object was. The ids say the same thing: one response, two items, two ids.
+#[test]
+fn a_preamble_is_a_message_item_of_its_own_ahead_of_the_use() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search",
+                json!({ "type": "search", "query": "agent-compose" }),
+                json!([{ "url": "https://docs.example.com/a", "title": "A" }]),
+            )
+            .preceded_by("Let me look that up."),
+        ]),
+    ));
+
+    let body = send(&provider.client(), &structured_request()).json();
+    let output = body["output"].as_array().expect("an output list");
+    let kinds: Vec<&str> = output
+        .iter()
+        .filter_map(|item| item["type"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["message", "web_search_call", "message"],
+        "prose, the search it announced, then the shaped answer: {output:?}"
+    );
+    assert_eq!(output[0]["content"][0]["text"], "Let me look that up.");
+    assert_eq!(output[2]["content"][0]["text"], "{\"verdict\":\"approve\"}");
+    assert_ne!(
+        output[0]["id"], output[2]["id"],
+        "two items of one turn, two ids: {output:?}"
+    );
+}
+
+/// …and the empty string is not a preamble: a `message` whose only `output_text`
+/// is empty is not a turn this API sends.
+#[test]
+fn an_empty_preamble_is_refused_on_this_wire() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })).with_server_tools(vec![
+            ServerToolUse::new("web_search", json!({}), json!([])).preceded_by(""),
+        ]),
+    ));
+
+    let response = send(&provider.client(), &structured_request());
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("the empty string")),
+        "the refusal names what the script wrote: {}",
+        response.json()
+    );
 }
 
 /// A provider runs only the server tools it was given: a script naming one the

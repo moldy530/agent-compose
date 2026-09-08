@@ -38,7 +38,7 @@ use crate::control::{
     request_id,
 };
 use crate::strict::{Checker, Dialect, Kind, at, listed};
-use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED};
+use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED, UNSUPPORTED};
 
 /// The top-level keys this surface accepts.
 ///
@@ -1534,6 +1534,26 @@ pub(crate) fn error(
 /// is not a request parameter. Every other failure is the 400 the service sends
 /// for a body it could not accept.
 pub(crate) fn rejected(sequence: u64, failures: &[ValidationFailure]) -> Answer {
+    refused(sequence, failures, INVALID)
+}
+
+/// The answer to a **well-formed** request asking for a structured-output
+/// mechanism this endpoint does not carry (`Personality`, PRD §9 resolved q53).
+///
+/// The same 400 in the same envelope — a service refusing an argument it does
+/// not have answers its ordinary bad-request error, which is the whole point of
+/// staging one — and a different [`HARNESS_HEADER`](crate::control::HARNESS_HEADER)
+/// value, because `invalid-request` would tell a reader the request was
+/// malformed while the transcript beside it records the request as valid.
+///
+/// Shared by both OpenAI-shaped surfaces, Responses included: how a connection
+/// reports a bad request belongs to the connection rather than to the wire.
+pub(crate) fn unsupported(sequence: u64, failures: &[ValidationFailure]) -> Answer {
+    refused(sequence, failures, UNSUPPORTED)
+}
+
+/// The body both refusals above share, under the label that says which it is.
+fn refused(sequence: u64, failures: &[ValidationFailure], label: &str) -> Answer {
     let credentials: Vec<&ValidationFailure> = failures
         .iter()
         .filter(|failure| failure.authentication)
@@ -1551,7 +1571,7 @@ pub(crate) fn rejected(sequence: u64, failures: &[ValidationFailure]) -> Answer 
             Some("invalid_api_key"),
             &message,
         )
-        .harness(INVALID)
+        .harness(label)
         .answer();
     }
     let message = failures
@@ -1560,8 +1580,7 @@ pub(crate) fn rejected(sequence: u64, failures: &[ValidationFailure]) -> Answer 
         .collect::<Vec<_>>()
         .join(" ");
     let param = failures.first().map(|failure| failure.pointer.clone());
-    let mut response =
-        error(sequence, 400, "invalid_request_error", None, &message).harness(INVALID);
+    let mut response = error(sequence, 400, "invalid_request_error", None, &message).harness(label);
     if let Some(param) = param {
         response.body["error"]["param"] = json!(param);
     }

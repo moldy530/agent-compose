@@ -97,4 +97,5 @@ pub(crate) fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue
 pub(crate) use crate::control::{
     HARNESS_STATUS, REFUSED_INVALID as INVALID, REFUSED_MISMATCH as MISMATCH,
     REFUSED_UNSCRIPTED as UNSCRIPTED, REFUSED_UNSENDABLE as UNSENDABLE,
+    REFUSED_UNSUPPORTED as UNSUPPORTED,
 };

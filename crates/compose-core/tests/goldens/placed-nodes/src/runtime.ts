@@ -1266,6 +1266,36 @@ export type ModelSelection = ModelBinding | ModelRoute;
 /** Grammar 12.2's `route_on:` vocabulary — infrastructure conditions only. */
 export type RouteCondition = "rate_limit" | "overloaded" | "timeout" | "server_error";
 
+/**
+ * Which of a wire's two ways of asking for an object under a schema answered a
+ * structured-output call (PRD §9 resolved q53).
+ *
+ * **Not a composition surface, and never one**: there is no YAML key, no
+ * capability flag and no shipped model table. Every wire this runtime speaks has
+ * two mechanisms, the composer prefers the wire's own native parameter, and a
+ * refusal that names *the mechanism* rather than the request ladders to the
+ * other one inside the same call ([`structuredAnswer`]). What the operator gets
+ * is a run that works against a gateway a generation behind and against a model
+ * generation ahead, without being asked which.
+ *
+ *  * `"native"` — the wire's structured-output parameter: `output_config`'s
+ *    `format` on the Messages wire, `response_format` on Chat Completions,
+ *    `text.format` on Responses. The object comes back as the assistant's text.
+ *  * `"forced_tool"` — the synthetic output tool, pinned by name: `tool_choice:
+ *    {type: "tool", …}` on the Messages wire and a forced function on the OpenAI
+ *    wires, with `strict` where the wire takes one. The object comes back as
+ *    that call's arguments.
+ *
+ * It reaches the trace ([`ModelCall.outputMechanism`], `docs/trace.md` §7)
+ * because two deployments of one composition may answer through different
+ * mechanisms and nothing else in the record would say so.
+ *
+ * Which rung a given call *starts* on is [`mechanismOrder`]'s: the schema
+ * decides where the native format is even applicable, and what this process has
+ * learned about the endpoint demotes a rung that is not there.
+ */
+export type OutputMechanism = "native" | "forced_tool";
+
 /** Whether this selection is the route form. */
 function isRoute(selection: ModelSelection): selection is ModelRoute {
   return Array.isArray((selection as ModelRoute).route);
@@ -1342,6 +1372,28 @@ export interface ModelCall {
   readonly failovers: readonly Failover[];
   /** What ended the call, when no member answered it. */
   readonly refused?: Refusal;
+  /**
+   * Which mechanism the answer to a **structured-output** call came through
+   * (`docs/trace.md` §7, PRD §9 resolved q53).
+   *
+   * On the calls that asked for an object under a schema — the pinned call that
+   * ends an agent node, which is one call per node — and on nothing else: a
+   * tool-loop call asks for no object, so there is no mechanism to name.
+   *
+   * The one thing about this record that is not decided by the composition: the
+   * runtime discovers what the endpoint accepts ([`OutputMechanism`]), so the
+   * same spec deployed against a lagging gateway and against the newest model
+   * generation answers through different mechanisms. Recorded because the
+   * operator debugging a trace has no other way to tell which, and because a
+   * mechanism that laddered is what explains the extra round trip in the
+   * timings.
+   *
+   * A call **replayed from a journal** carries what that journal recorded, which
+   * for a journal written before this field existed is nothing (`ModelCall` is a
+   * value the journal keeps, and `docs/durability.md` §11.2 makes a field added
+   * to a record type a compatible change rather than a bump).
+   */
+  readonly outputMechanism?: OutputMechanism;
   /**
    * What this call's answer asked the agent's tools to do, one record per tool
    * call the loop ran (`docs/trace.md` §7.3, PRD §9.20).
@@ -1601,6 +1653,22 @@ export interface ModelAnswer {
    * node error say which happened.
    */
   readonly refusal?: string | null;
+  /**
+   * Which mechanism asked for the object this answer carries, on a call that
+   * asked for one (PRD §9 resolved q53, [`OutputMechanism`]).
+   *
+   * Set by the composer that sent the request rather than read back off the
+   * answer, because it is a fact about the **request**: the two mechanisms put
+   * the object in different places, so what the composer asked with is also what
+   * it parsed. Absent on every call that pinned nothing, which is every call of
+   * a tool loop.
+   *
+   * It rides the answer so that [`callModel`] can put it on the trace record
+   * without the mechanism ladder having to reach into record-building — and so
+   * that a **journalled** answer replays carrying the mechanism its generation
+   * really used, rather than one this process would have chosen.
+   */
+  readonly mechanism?: OutputMechanism;
 }
 
 /**
@@ -1987,6 +2055,12 @@ async function callModelLive(
         servedBy: model.address,
         fallback: ordinal,
         failovers: [...failovers],
+        // Which of the wire's two structured-output mechanisms answered, on the
+        // calls that asked for an object (PRD §9 resolved q53,
+        // `docs/trace.md` §7). Read off the answer rather than decided here:
+        // the ladder is inside [`callDirect`], and a call that pinned nothing
+        // carries no mechanism because it asked for none.
+        ...(answer.mechanism === undefined ? {} : { outputMechanism: answer.mechanism }),
       };
       site.modelCalls?.push(served);
       return { answer, served };
@@ -2129,15 +2203,18 @@ function failoverContext(
   );
 }
 
+/** The request a wire composer is handed. */
+interface ModelRequest {
+  readonly system: string;
+  readonly turns: readonly Turn[];
+  readonly tools: readonly ToolSpec[];
+  readonly pinned?: ToolSpec;
+}
+
 /** One call to one direct binding, on whichever surface its kind reaches. */
 async function callDirect(
   model: ModelBinding,
-  request: {
-    readonly system: string;
-    readonly turns: readonly Turn[];
-    readonly tools: readonly ToolSpec[];
-    readonly pinned?: ToolSpec;
-  },
+  request: ModelRequest,
   signal: AbortSignal,
 ): Promise<ModelAnswer> {
   // Grammar 12.1's two SDK-reached kinds. There is no request to compose for
@@ -2149,24 +2226,768 @@ async function callDirect(
       `\`${model.provider.address}\` is \`kind: ${model.provider.kind}\`, which is reached through a cloud SDK rather than an HTTP endpoint (grammar 12.1) and which this compiler release does not call: bind \`${model.address}\` to an \`anthropic\`, \`openai\`, \`openai_compatible\` or \`azure_openai\` provider`,
     );
   }
-  if (model.provider.kind === "anthropic") return await callMessages(model, request, signal);
+  const wire = wireOf(model.provider);
+  // A call that asks for no object has one shape and one attempt: the mechanism
+  // ladder is about the *pinned* call and nothing else, so a tool loop pays
+  // nothing for it and reads `"native"` here only because the parameter has to
+  // hold something the composers will not look at.
+  if (request.pinned === undefined) return await onWire(wire, model, request, "native", signal);
+  return await structuredAnswer(wire, model, request, signal);
+}
+
+// ---------------------------------------------------------------------------
+// Structured output's wire mechanism (PRD §9 resolved q53)
+// ---------------------------------------------------------------------------
+
+/**
+ * Which HTTP surface a provider speaks (grammar 12.1, Decision D122).
+ *
+ * Named as a value rather than left as [`callDirect`]'s three-branch `if`
+ * because the mechanism ladder has to send the *same* request twice, and "the
+ * same" is exactly this choice: a retry that re-derived the wire could not be
+ * the same call.
+ */
+type Wire = "messages" | "chat_completions" | "responses";
+
+/** Which of the three [`Wire`]s this provider is reached on. */
+function wireOf(provider: ProviderBinding): Wire {
+  if (provider.kind === "anthropic") return "messages";
   // The one wire choice that is not the kind's alone: an `openai` provider
   // carrying a server-tool suite speaks Responses for **every** call it makes
   // (Decision D122, [`speaksResponses`]).
-  if (speaksResponses(model.provider)) return await callResponses(model, request, signal);
-  return await callChatCompletions(model, request, signal);
+  if (speaksResponses(provider)) return "responses";
+  return "chat_completions";
+}
+
+/** One request, composed for one wire, asking for its object one way. */
+async function onWire(
+  wire: Wire,
+  model: ModelBinding,
+  request: ModelRequest,
+  mechanism: OutputMechanism,
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  if (wire === "messages") return await callMessages(model, request, mechanism, signal);
+  if (wire === "responses") return await callResponses(model, request, mechanism, signal);
+  return await callChatCompletions(model, request, mechanism, signal);
+}
+
+/**
+ * The mechanisms a (provider, model id) pairing has **refused**, for the
+ * lifetime of **this process** (PRD §9 resolved q53).
+ *
+ * The whole of the memoization, and deliberately as small as it looks: no file,
+ * no config, no expiry, and nothing that survives a restart. What it buys is
+ * that only the *first* structured-output call of a pairing pays the adaptive
+ * round trip — a fan-out of forty agent nodes over one model ladders once — and
+ * what it costs if it is ever wrong is one 400 and one retry, which is the same
+ * thing that first call pays.
+ *
+ * Keyed by the **provider's address and the model id**, not by the `model.*`
+ * alias: what accepts or refuses a mechanism is an endpoint serving a model
+ * generation, so two `model.*` bindings that name one id on one provider are one
+ * pairing, and the same id on a second provider is not — a lagging gateway and
+ * `api.anthropic.com` are different endpoints serving the same names.
+ *
+ * It holds the **losses** rather than the wins, and that is a load-bearing
+ * choice rather than another spelling of the same thing. A loss is a fact about
+ * the *endpoint* — this one does not have that rung — and holds for every call
+ * the pairing will ever make. A win is entangled with the schema the winning
+ * call carried, and one composition's agents do not all carry the same schema
+ * ([`mechanismOrder`]): recording it instead would make a run depend on which
+ * agent happened to go first, starting an agent whose schema cannot ride the
+ * native rung there anyway because an earlier agent's could — and being refused
+ * for a reason this ladder deliberately does not move on.
+ *
+ * It is also written **earlier** than a win could be: the refusal records it
+ * before its own retry is sent, so a second call racing the first skips a rung
+ * already known to be gone rather than repeating the discovery.
+ */
+const refusedMechanisms = new Map<string, Set<OutputMechanism>>();
+
+/** Remember that this pairing does not carry this rung. */
+function rememberRefusal(key: string, mechanism: OutputMechanism): void {
+  const refused = refusedMechanisms.get(key);
+  if (refused === undefined) refusedMechanisms.set(key, new Set([mechanism]));
+  else refused.add(mechanism);
+}
+
+/** The [`refusedMechanisms`] key for one binding. */
+function mechanismKey(model: ModelBinding): string {
+  // NUL rather than a printable separator: a provider address is
+  // `provider.<name>` and a model id is the vendor's, and neither can carry
+  // one, so no two pairings can collide on a key.
+  return `${model.provider.address}\u0000${model.id}`;
+}
+
+/**
+ * One structured-output call: the preferred mechanism, and the other one if the
+ * endpoint says it does not have the first (PRD §9 resolved q53).
+ *
+ * The ladder here is **inside one call** and is orthogonal to the route ladder
+ * around it ([`callModel`]): a route moves to the next *member* on the
+ * infrastructure conditions grammar 12.2 names, and this moves to the other
+ * *mechanism* on a refusal that names the mechanism. A capability-shaped 400 was
+ * never a failover condition ([`classify`] answers `undefined` for every 4xx but
+ * 429), so nothing about `route_on:` changes: what used to fail the node now
+ * gets one more chance on the same member, and a failure that is not
+ * capability-shaped is re-thrown untouched into the ladder that was always
+ * there.
+ *
+ * A **double refusal** is reported as one error naming both, because that is the
+ * only actionable thing left to say: there is no knob to set — the runtime
+ * already tried both of the wire's mechanisms — so what the operator needs is
+ * the two things the endpoint said, verbatim.
+ *
+ * # What the retry is bounded by
+ *
+ * The **same** `signal` the first attempt had, which is this route member's
+ * share of the node's budget ([`callModel`], [`requestBudget`]) — not a fresh
+ * one. That is deliberate: the two attempts are one call to one member, so a
+ * ladder that renewed the budget would let a node with `timeout:` outlive it by
+ * a whole request per pinned call. The cost is that a member whose share is
+ * nearly spent may have its second rung cut short, which is a `timeout` the
+ * route ladder then acts on exactly as it would have acted on the first — a
+ * refusal that arrives as a spent deadline rather than as a mechanism that
+ * works. It is the first call of a pairing that pays it, and only where a
+ * budget is declared this tight.
+ */
+async function structuredAnswer(
+  wire: Wire,
+  model: ModelBinding,
+  request: ModelRequest,
+  signal: AbortSignal,
+): Promise<ModelAnswer> {
+  const key = mechanismKey(model);
+  const [first, second] = mechanismOrder(wire, request.pinned!.schema, key);
+  try {
+    return await onWire(wire, model, request, first, signal);
+  } catch (refused) {
+    if (!unsupportedMechanism(wire, first, refused)) throw refused;
+    // The **loss**, recorded before the retry is sent: from here on, every call
+    // of this pairing skips the rung this one just found is not there.
+    rememberRefusal(key, first);
+    try {
+      return await onWire(wire, model, request, second, signal);
+    } catch (again) {
+      if (!unsupportedMechanism(wire, second, again)) throw again;
+      rememberRefusal(key, second);
+      throw bothMechanismsRefused(wire, model, first, refused, second, again);
+    }
+  }
+}
+
+/**
+ * The two rungs of one call, in the order this call will try them.
+ *
+ * Two independent things decide it, and neither is a preference in the ordinary
+ * sense.
+ *
+ * The **schema** goes first because it is a fact about *this call*. The Messages
+ * wire's native format constrains its decoder against a **closed** schema —
+ * every object `additionalProperties: false`, every property in `required`,
+ * which is exactly what [`strictable`] answers — and a schema that fails it is
+ * refused by the format rather than decoded loosely. Forced tool use asks for no
+ * such thing, and grammar 3.4's `optional:` on an object nested in an agent's
+ * `output:` is a perfectly legal composition, so starting such an agent on the
+ * native rung would trade a working node for a 400 about its **schema** — a
+ * refusal that names the schema rather than the mechanism, and so one this
+ * ladder deliberately does not move on. The OpenAI wires take `strict: false`
+ * and simply constrain nothing, which is the posture they have had since q16, so
+ * nothing there changes.
+ *
+ * What this process has **learned about the endpoint** then demotes a rung that
+ * is not there ([`refusedMechanisms`]). It is a demotion rather than a
+ * preference, which is what lets the two compose without either overruling the
+ * other: a rung nothing has refused keeps whatever order the schema gave it, and
+ * a rung that has been refused goes last however much the schema wanted it —
+ * because "this endpoint does not have it" beats "this schema would rather use
+ * it". A pairing that has refused **both** is left in schema order, which is the
+ * order that produces the clearer of the two double-refusal diagnostics.
+ */
+function mechanismOrder(
+  wire: Wire,
+  schema: JsonSchema,
+  key: string,
+): readonly [OutputMechanism, OutputMechanism] {
+  const preferred: OutputMechanism =
+    wire === "messages" && !strictable(schema) ? "forced_tool" : "native";
+  const other: OutputMechanism = preferred === "native" ? "forced_tool" : "native";
+  const refused = refusedMechanisms.get(key);
+  if (refused !== undefined && refused.has(preferred) && !refused.has(other)) {
+    return [other, preferred];
+  }
+  return [preferred, other];
+}
+
+/**
+ * The request key each wire spells each mechanism with — and what a refusal that
+ * is about the *mechanism* therefore has to name.
+ *
+ * One table, read by [`unsupportedMechanism`] and by the double-refusal
+ * diagnostic, so the recognizer and the sentence an operator reads cannot come
+ * to disagree about what was tried. The first entry of each list is the
+ * mechanism's canonical spelling on that wire; the rest are the shorter forms a
+ * service names when it complains about the *top-level* key — Responses' own
+ * `text` is the parameter `text.format` sits inside, and a gateway that has
+ * never heard of the wire refuses it under that name.
+ *
+ * Every entry is matched by [`namesKey`] rather than by a bare `includes` — a run
+ * of letters inside a longer word is not this key being named — and an entry that
+ * is also an ordinary English word ([`WORD_SHAPED_KEYS`]) has to be *named as a
+ * parameter* on top of that. Those two together are what make an entry as short
+ * as `text` safe to carry beside prose about text input and `text/plain`.
+ */
+const MECHANISM_KEYS: Readonly<Record<Wire, Readonly<Record<OutputMechanism, readonly string[]>>>> =
+  {
+    messages: { native: ["output_config"], forced_tool: ["tool_choice"] },
+    chat_completions: { native: ["response_format"], forced_tool: ["tool_choice"] },
+    responses: { native: ["text.format", "text"], forced_tool: ["tool_choice"] },
+  };
+
+/**
+ * What a service says when a **parameter** is one it does not have.
+ *
+ * The two families the ruling names are here: an unknown key (a gateway a
+ * generation behind the wire it proxies — `output_config: Extra inputs are not
+ * permitted` in the Messages API's pydantic wording, `Unrecognized request
+ * argument supplied: response_format` in OpenAI's) and a key the service knows
+ * and this model does not take (`tool_choice: type "tool" and "any" are not
+ * supported for this model.`, which is how the newest Anthropic generation
+ * refuses forced tool use).
+ *
+ * …and a third the ruling did not have to spell, because it is neither of those
+ * and is refused in neither's words: the service **has** the key and this
+ * deployment will not carry it — gated behind a beta header, an API version or an
+ * account flag, or withdrawn again.
+ * `output_config: This feature requires the beta header anthropic-beta:
+ * structured-outputs-2025-11-13.`, `output_config is not available on this API
+ * version.`, `output_config: not enabled for this organization.` Not one of
+ * those carries a phrase from the two families above, and every one of them is a
+ * plain statement that this endpoint does not have the parameter — the most
+ * likely refusal a *young* parameter draws, which the native rung is, from
+ * exactly the deployment this ladder exists for. The forced tool would have
+ * answered all three.
+ *
+ * Matched case-insensitively as substrings, which is as much as a body written
+ * for a person can be held to. Being wrong in the **permissive** direction costs
+ * one extra request that also fails and a diagnostic quoting both refusals;
+ * being wrong in the strict direction costs a run that could have worked, which
+ * is why the list carries the phrasings rather than one canonical one.
+ *
+ * That cost model holds only because the two families where the *other* rung
+ * would have **worked** are excluded by shape rather than by phrase — a
+ * complaint about something inside the parameter ([`namesKey`]) and a complaint
+ * addressed somewhere else entirely ([`addressedElsewhere`]). Those are the ones
+ * a permissive reading would not merely make expensive but make **silent**: the
+ * retry succeeds, the run passes, and a request this runtime composed wrongly is
+ * remembered as an endpoint that lacks a mechanism.
+ */
+const UNSUPPORTED_PARAMETER: readonly string[] = [
+  // A key the service has never heard of.
+  "extra inputs are not permitted",
+  "unrecognized request argument",
+  "unrecognized key",
+  "unknown parameter",
+  "unsupported parameter",
+  "unexpected parameter",
+  "unexpected keyword argument",
+  "unknown field",
+  "is not a valid parameter",
+  // …a key it has and this model does not take.
+  "not supported",
+  "does not support",
+  // …and a key it has and this deployment does not carry — gated behind a beta,
+  // an API version or an account flag, or gone. The two beta spellings name the
+  // gate rather than carrying the bare word, which a complaint about something
+  // *inside* the parameter is free to use.
+  "beta header",
+  "requires the beta",
+  "not available",
+  "not yet available",
+  "no longer available",
+  "no longer supported",
+  "not enabled",
+];
+
+/**
+ * …and what a service says when the parameter was fine and its **contents** were
+ * not.
+ *
+ * The disqualifier, and the reason the recognizer is more than a phrase list: a
+ * schema OpenAI's decoder will not compile is refused as `Invalid schema for
+ * response_format 'review': … 'minimum' is not supported`, which names the
+ * mechanism's own key *and* one of the phrases above and is not a statement
+ * about the mechanism at all. Laddering on it would send the same schema at the
+ * other rung, be refused for the same reason, and report an endpoint that
+ * carries neither mechanism when what the operator has is a schema this decoder
+ * will not take.
+ */
+const NOT_ABOUT_THE_MECHANISM: readonly string[] = [
+  "invalid schema",
+  "too deep",
+  "nesting depth",
+];
+
+/**
+ * …and what a body says when the thing that does not carry the mechanism is the
+ * **endpoint**, which outranks the disqualifier above.
+ *
+ * The disqualifier reads the whole body, because a service writes one sentence
+ * and does not tell a client which clause is the complaint. That is right for
+ * the schema refusals it is for and wrong for the one shape that carries a
+ * capability statement *inside* the same boilerplate: `Invalid schema for
+ * response_format: json_schema response format is not supported with this
+ * model.` is a gateway saying it does not have the mechanism, in a sentence that
+ * opens with the words a schema complaint opens with. Disqualifying it would
+ * fail a run the forced function would have served — the expensive direction of
+ * being wrong, per [`UNSUPPORTED_PARAMETER`].
+ *
+ * So a phrase here re-qualifies a body the disqualifier caught, and each of them
+ * names the *endpoint* as what lacks it, which is a thing no complaint about a
+ * schema's contents says: `'minimum' is not supported.` is about the schema and
+ * carries none of these. Being wrong here costs one more request that also fails
+ * and a diagnostic quoting both refusals, which is the cheap direction.
+ */
+const ABOUT_THE_ENDPOINT: readonly string[] = [
+  "with this model",
+  "for this model",
+  "on this model",
+  "with this endpoint",
+  "for this endpoint",
+];
+
+/**
+ * …and what a service says when what it will not take is the **conversation**,
+ * which outranks everything above.
+ *
+ * The one refusal family that is a statement about a request *this runtime
+ * composed* rather than about anything the endpoint has or lacks, and therefore
+ * the only one whose disqualification cannot be re-qualified: a strict gateway
+ * holding q52's rule refuses a structured-output ask over a history that ends on
+ * the assistant with `This model does not support assistant message prefill. The
+ * conversation must end with a user message when \`output_config\` asks for
+ * structured output.` — a sentence that names the rung's own key, carries "does
+ * not support", and is about neither.
+ *
+ * [`addressedElsewhere`] catches that sentence when the gateway writes it at the
+ * message it stopped on (`messages.3: …`), which is the wording this project's
+ * mock provider sends and the one its `WIRE-NOTES` (24) records as *assumed*. An
+ * assumed dialect is not a defence: the same gateway wording the same rule as a
+ * bare sentence carries no address, and a runtime whose closing turn had
+ * regressed would then send the **same illegal conversation** at the other rung,
+ * be refused for the same reason, and fail with a diagnostic saying the endpoint
+ * carries neither mechanism and there is nothing to configure — every word of
+ * which would be false, aimed at the one bug this recognizer exists to keep out
+ * of the diagnostic. So the family is spelled here too, where no address and no
+ * "for this model" beside it changes the answer.
+ *
+ * Being wrong here costs a run that could have laddered, and only for an endpoint
+ * that words a *capability* refusal in terms of prefill or of which role the last
+ * turn has — which is not a sentence about a parameter at all.
+ */
+const ABOUT_THE_CONVERSATION: readonly string[] = [
+  // The feature a trailing assistant turn is, named by every dialect that
+  // refuses it.
+  "prefill",
+  // …and the rule itself, cut short of the noun so that "user message" and
+  // "user turn" are both this sentence.
+  "must end with a user",
+];
+
+/**
+ * The words a refusal joins two **parameters** with when it has the one this
+ * ladder asked for and will not take it *beside something else in the same
+ * body* — `` `output_config` is not supported when `thinking` is enabled. ``
+ *
+ * The [`ABOUT_THE_CONVERSATION`] family one step out: a statement about the
+ * request this runtime composed rather than about what the endpoint carries. It
+ * names the rung's own key, it says "not supported", and the thing to change is
+ * neither the mechanism nor the conversation — it is a `settings:` key in the
+ * composition. Laddering on it carries the same offending parameter to the other
+ * rung, is refused there for the same reason, and reports an endpoint that
+ * "carries neither mechanism … there is nothing to configure" when what the
+ * operator has is one setting to drop.
+ *
+ * Read by [`blamesAnotherParameter`] as a **shape** rather than as a phrase,
+ * because the parameter being blamed is the vendor's and cannot be listed: one of
+ * these connectives, then a *quoted* identifier that is not one of this
+ * mechanism's own spellings. Both halves are narrowing, and deliberately, because
+ * being wrong here costs a run that could have laddered rather than a request:
+ *
+ *   * the **quoting** is what separates this from a capability refusal, which
+ *     joins the same words to prose — `json_schema response format is not
+ *     supported with this model.` is "with this model", not with a parameter, and
+ *     an identifier charset that stops at `-` keeps a quoted *model id* out too;
+ *   * the **closed list** leaves a bare `with` alone, so `` Use `tools` with
+ *     `tool_choice` instead. `` — other parameters named as the remedy rather than
+ *     as the conflict — still ladders.
+ *
+ * An endpoint statement outranks it exactly as it outranks
+ * [`NOT_ABOUT_THE_MECHANISM`] ([`ABOUT_THE_ENDPOINT`], [`unsupportedMechanism`]),
+ * and an unquoted `when thinking is enabled` is left to ladder, pay one request,
+ * and be answered by a diagnostic carrying both bodies.
+ */
+const CONFLICT_CONNECTIVES: readonly string[] = [
+  // Conditional: the clause a service opens when the parameter is fine and this
+  // request is not.
+  "whenever",
+  "when",
+  "while",
+  "unless",
+  "if",
+  // …and the ways of saying two parameters may not travel together.
+  "alongside",
+  "combined with",
+  "together with",
+  "used with",
+  "supported with",
+  "allowed with",
+  "in combination with",
+  "incompatible with",
+  "conflicts with",
+  "mutually exclusive with",
+  "at the same time as",
+  "in the same request as",
+];
+
+/** [`CONFLICT_CONNECTIVES`], then the quoted name of the parameter blamed. */
+const BLAMES_ANOTHER_PARAMETER = new RegExp(
+  `(?:^|[^a-z0-9_])(?:${CONFLICT_CONNECTIVES.join("|")})\\s+["'\`]([a-z0-9_]+(?:\\.[a-z0-9_]+)*)["'\`]`,
+  "g",
+);
+
+/**
+ * Whether this refusal blames a parameter that is **not this mechanism's**
+ * ([`CONFLICT_CONNECTIVES`]).
+ *
+ * A body naming the mechanism's own key after a connective is not this: `The
+ * conversation must end with a user message when `output_config` asks for
+ * structured output.` is about the mechanism's request, and is disqualified a
+ * line earlier for what it actually is.
+ */
+function blamesAnotherParameter(body: string, keys: readonly string[]): boolean {
+  for (const match of body.matchAll(BLAMES_ANOTHER_PARAMETER)) {
+    const blamed = match[1];
+    if (keys.some((key) => blamed === key || blamed.startsWith(`${key}.`))) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Every position where `body` spells `key` as **the key itself** — not those
+ * letters inside a longer word, and not a segment of a longer path — offered to
+ * `accept` until one of them takes it.
+ *
+ * A refusal is prose with a parameter name in it, so the recognizer reads it as
+ * a substring — but a substring test alone answers "yes" to `text` inside
+ * `context`, and `This model does not support 'store: false' in this context.`
+ * is a 400 about a *setting* that would otherwise be read as the Responses
+ * wire's native parameter being absent, ladder once for nothing, and (worse)
+ * leave `native` recorded as refused for that pairing for the life of the
+ * process. Requiring the match to begin and end at something other than an
+ * identifier character is what separates `'text.format'`, `"text"` and
+ * `supplied: text` — every way a service names the key — from `context`.
+ *
+ * A match the complaint **descends into** — `response_format.json_schema.…`,
+ * `output_config.format.…` — is not this key being named either, and that one is
+ * worse than a word boundary because it is worse than wrong: a service that
+ * walked the path to complain about what is *inside* the parameter has the
+ * parameter. Reading `Unrecognized request argument supplied:
+ * response_format.json_schema.format` as "this endpoint has no
+ * `response_format`" ladders on a request-shape bug, the forced-tool rung is
+ * well formed and **succeeds**, and the defect ships behind a memoized refusal
+ * nothing will look at again. The other direction of being wrong costs a
+ * request; this one costs the bug.
+ *
+ * A key that is also an ordinary word ([`WORD_SHAPED_KEYS`]) is held to one more
+ * thing here, and only it: it may not be the **tail** of somebody else's path.
+ * `messages.3.content.0.text` is a message's own text, and a complaint addressed
+ * there says nothing about the Responses wire's `text` — where the distinctive
+ * spellings are the opposite case, because a path that *ends* at one of those is
+ * that parameter addressed under a root a service chose to name
+ * (`body.response_format: Extra inputs are not permitted`).
+ *
+ * `body` arrives lowercased, so the character classes are written that way.
+ */
+function spelled(body: string, key: string, accept: (at: number) => boolean): boolean {
+  const identifier = /[a-z0-9_]/;
+  const wordShaped = WORD_SHAPED_KEYS.has(key);
+  // `charAt` answers `""` off either end, which is not an identifier character —
+  // a key at the very start or end of the body is named by it.
+  for (let at = body.indexOf(key); at >= 0; at = body.indexOf(key, at + 1)) {
+    const before = body.charAt(at - 1);
+    const after = body.charAt(at + key.length);
+    if (identifier.test(before) || identifier.test(after)) continue;
+    // …and not the head of a longer path. Only a `.` followed by a segment is
+    // one: a key at the end of a sentence is followed by a full stop.
+    if (after === "." && identifier.test(body.charAt(at + key.length + 1))) continue;
+    if (wordShaped && before === ".") continue;
+    if (accept(at)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether `body` names `key` at all — [`spelled`] as the key itself, and, where
+ * the key is a **word** as well as a key ([`WORD_SHAPED_KEYS`]), named the way a
+ * service names a parameter ([`namedAsParameter`]) rather than used as a word.
+ */
+function namesKey(body: string, key: string): boolean {
+  const wordShaped = WORD_SHAPED_KEYS.has(key);
+  return spelled(body, key, (at) => !wordShaped || namedAsParameter(body, at, key));
+}
+
+/**
+ * The [`MECHANISM_KEYS`] spellings that are **ordinary English words** as well as
+ * request keys, and so cannot be read as this parameter merely because a refusal
+ * used the word.
+ *
+ * `text` is the only one, and dropping it is not an option: it is the Responses
+ * wire's own name for the parameter `text.format` sits inside, and a gateway that
+ * has never heard of the wire refuses it under that name. But it is also a word
+ * every other refusal on that surface is free to use. `This model does not
+ * support text input.`, `Invalid value: 'text/plain'. … Unsupported parameter:
+ * file content type.` and `Unsupported parameter: 'reasoning.summary' is not
+ * supported with this model. Use the text output instead.` each clear
+ * [`namesKey`]'s word boundary and each carries an [`UNSUPPORTED_PARAMETER`]
+ * phrase, and not one of them says the endpoint lacks `text.format`.
+ *
+ * Reading one of those as a missing mechanism is the direction of being wrong
+ * that **hides itself**: the loss is recorded before the retry is sent
+ * ([`structuredAnswer`]), so `native` is gone for that pairing for the life of
+ * the process, the retry carries the same offending request to the other rung and
+ * fails there for the same reason, and the run dies claiming there is nothing to
+ * configure about an endpoint that has both mechanisms.
+ *
+ * The distinctive spellings — `output_config`, `response_format`, `tool_choice`,
+ * `text.format` — are exempt, because a body carrying one of those is talking
+ * about it however it is punctuated, and holding *them* to a quoting rule would
+ * lose the plain `response_format is not supported for this model.` a service is
+ * free to send.
+ */
+const WORD_SHAPED_KEYS: ReadonlySet<string> = new Set(["text"]);
+
+/**
+ * Whether the run of letters at `at` is `body` naming a **parameter** rather than
+ * using the same letters as a word in a sentence.
+ *
+ * Three ways, and no more than three, because each is a punctuation mark a
+ * service reaches for when it lifts an identifier out of prose:
+ *
+ *   * **quoted on both sides** — `'text'`, `"text"`, `` `text` ``. Both sides is
+ *     the load-bearing half: `'text/plain'` opens with the quote and is a media
+ *     type;
+ *   * …and the two ways of **pointing at** it ([`pointedAt`]) — labelled, and
+ *     named after a colon.
+ *
+ * Anything else — `text input`, `the text output` — is the word, and a refusal
+ * carrying it is about something this ladder has no business moving on.
+ */
+function namedAsParameter(body: string, at: number, key: string): boolean {
+  const quote = /["'`]/;
+  if (quote.test(body.charAt(at - 1)) && quote.test(body.charAt(at + key.length))) return true;
+  return pointedAt(body, at, key);
+}
+
+/**
+ * Whether the run of letters at `at` is the parameter a complaint is **pointed
+ * at**, rather than one a sentence mentions on its way to saying something else.
+ *
+ * The narrow half of [`namedAsParameter`], and the difference is quoting on its
+ * own: a service that puts a parameter's name in quotes mid-sentence is as often
+ * talking *about* it as complaining about it — `` The conversation must end with
+ * a user message when `tool_choice` forces a tool. `` is the sentence that
+ * matters here, and it is not a complaint about `tool_choice`. What a service
+ * does when it means "this is the parameter I am refusing" is put a colon
+ * between the complaint and the name, one way round or the other:
+ *
+ *   * **labelled**, `output_config: Extra inputs are not permitted` — the
+ *     pydantic-shaped address a bare top-level key arrives as;
+ *   * **named after a colon**, `Unrecognized request argument supplied:
+ *     response_format`, `Invalid parameter: 'response_format'` — OpenAI's way of
+ *     pointing at the argument, with or without the quotes it lifts the name out
+ *     of prose with.
+ *
+ * `slice` off the front of the string answers `""` rather than throwing, so a key
+ * at position 0 or 1 is simply not named after a colon.
+ */
+function pointedAt(body: string, at: number, key: string): boolean {
+  const quote = /["'`]/;
+  const after = body.charAt(at + key.length);
+  if (after === ":") return true;
+  // The colon is in front of the quotes when there are quotes, so the search
+  // starts from the opening one.
+  const opened = quote.test(body.charAt(at - 1)) && quote.test(after);
+  const from = opened ? at - 1 : at;
+  return from >= 2 && body.slice(from - 2, from) === ": ";
+}
+
+/**
+ * Whether the body points a complaint at one of **this mechanism's** keys
+ * ([`pointedAt`]).
+ */
+function pointsAtKey(body: string, keys: readonly string[]): boolean {
+  return keys.some((key) => spelled(body, key, (at) => pointedAt(body, at, key)));
+}
+
+/**
+ * Every place in the request a refusal **addresses** a complaint to, as the
+ * pydantic-shaped dialects write them: `output_config.format.name: Extra inputs
+ * are not permitted`, `messages.3: This model does not support assistant message
+ * prefill.`
+ *
+ * A dotted path in front of a colon is a service saying where in the body it
+ * stopped, and the prose around it does not look like one — the bare words a
+ * sentence puts before a colon (`Unrecognized request argument supplied:`,
+ * `Invalid parameter:`) carry no dot, and a JSON envelope's own keys are
+ * separated from their colon by the closing quote. So the pattern reads the
+ * addresses and leaves the sentences alone.
+ *
+ * What it cannot tell apart from an address is the **name of whatever answered**:
+ * a gateway that re-wraps the refusal it got from the service upstream prefixes
+ * the whole body with its own exception class or label — `litellm.BadRequestError:
+ * AnthropicException - …`, `openai.BadRequestError: …`, `provider.openai: …` —
+ * and `provider.openai` is spelled exactly like `messages.3`. Reading one as an
+ * address would leave every refusal a proxy relays unladdered, which is the one
+ * deployment q53's ladder is most for. So the disqualifier does not rest on the
+ * pattern alone: a body that **points at** this mechanism's key
+ * ([`addressedElsewhere`], [`pointsAtKey`]) is about this mechanism whatever name
+ * stands in front of it.
+ */
+const COMPLAINT_ADDRESS = /(?:^|[^a-z0-9_.])[a-z0-9_]+(?:\.[a-z0-9_]+)+:/g;
+
+/**
+ * Whether this refusal is addressed at a place in the request that is **not**
+ * this mechanism's parameter.
+ *
+ * The disqualifier a phrase list cannot spell. A strict gateway refuses a
+ * conversation ending on the assistant with `messages.3: This model does not
+ * support assistant message prefill. The conversation must end with a user
+ * message when `tool_choice` forces a tool.` — a sentence that names
+ * `tool_choice`, says "does not support", and is not about `tool_choice` at all.
+ * Read as a capability refusal it would ladder, be refused again on the other
+ * rung for the same reason, and report an endpoint that "carries neither
+ * mechanism … there is nothing to configure" when what the runtime has is a
+ * conversation it composed wrongly — the misdirection this ladder exists to
+ * avoid, aimed at the one bug that would put it there.
+ *
+ * It is the *shape* half of that defence rather than the whole of it: the
+ * address is a dialect a gateway may or may not write, so the sentence it
+ * addresses is disqualified by [`ABOUT_THE_CONVERSATION`] as well, whichever way
+ * it is worded. What this catches that a phrase list cannot is the **rest** of
+ * the family — every other complaint a service walks somewhere else in the
+ * request to make.
+ *
+ * A body that **points at** this mechanism's key settles it the other way before
+ * any of that ([`pointsAtKey`]) — the key labelled as the address itself
+ * (`output_config: Extra inputs are not permitted`) or named as the argument the
+ * complaint is about (`Unrecognized request argument supplied: response_format`).
+ * That is what keeps a **re-wrapped** refusal readable: a gateway relaying the
+ * upstream service's words puts its own dotted name in front of them
+ * ([`COMPLAINT_ADDRESS`]), and the complaint it carried still points where it
+ * always pointed. A key merely *quoted* in a sentence is not that, which is the
+ * whole of the difference between the two bodies this function has to separate:
+ * `` messages.3: … when `tool_choice` forces a tool. `` mentions the key on its
+ * way to complaining about somewhere else.
+ *
+ * A body with no address at all is left to the rest of the recognizer: OpenAI's
+ * dialect names the parameter after the phrase rather than in front of a colon,
+ * so most capability refusals address nothing.
+ */
+function addressedElsewhere(body: string, keys: readonly string[]): boolean {
+  if (pointsAtKey(body, keys)) return false;
+  // `match` over a global pattern answers every address or `null`, and keeps no
+  // `lastIndex` between calls the way `test` would.
+  return body.match(COMPLAINT_ADDRESS) !== null;
+}
+
+/**
+ * Whether this refusal says the **mechanism** is unsupported — the one condition
+ * that moves the ladder (PRD §9 resolved q53).
+ *
+ * Deliberately conservative, and it is the conservatism rather than the coverage
+ * that is load-bearing: everything this does not recognize keeps behaving
+ * exactly as it did before the ladder existed. A 401, a 429, a 5xx, a body that
+ * is not JSON, a content refusal and a schema the decoder will not compile are
+ * all *not* this, and each still reaches [`callModel`]'s route ladder as itself.
+ *
+ * Six things must hold at once: the status is one a service refuses a request
+ * with rather than one it fails under (400, and 422 for the services that use
+ * it); the complaint is not about the **conversation** this runtime composed
+ * ([`ABOUT_THE_CONVERSATION`]); it is not about this parameter's **contents**
+ * ([`NOT_ABOUT_THE_MECHANISM`]) nor about **another parameter** this same request
+ * carried ([`blamesAnotherParameter`]), unless it also says the endpoint is what
+ * lacks the mechanism ([`ABOUT_THE_ENDPOINT`]); it is not addressed at some other
+ * part of the request ([`addressedElsewhere`]); the body names the key this
+ * mechanism is spelled with on this wire — as that key ([`namesKey`]), not as
+ * letters inside another word, a segment of a longer path, or an English word
+ * that happens to be spelled like a request key ([`WORD_SHAPED_KEYS`]); and the
+ * body carries one of the ways of saying "that parameter is not one I have".
+ */
+function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unknown): boolean {
+  if (!(error instanceof ProviderFailure)) return false;
+  if (error.status !== 400 && error.status !== 422) return false;
+  const body = error.body.toLowerCase();
+  const keys = MECHANISM_KEYS[wire][mechanism];
+  const carries = (phrases: readonly string[]): boolean =>
+    phrases.some((phrase) => body.includes(phrase));
+  // First, and with nothing able to re-qualify it: a refusal about the shape of
+  // the conversation is a refusal about this runtime's own request.
+  if (carries(ABOUT_THE_CONVERSATION)) return false;
+  // …then the two a statement about the endpoint outranks — what is *inside* the
+  // parameter, and what is *beside* it in the same body.
+  if (!carries(ABOUT_THE_ENDPOINT)) {
+    if (carries(NOT_ABOUT_THE_MECHANISM)) return false;
+    if (blamesAnotherParameter(body, keys)) return false;
+  }
+  if (addressedElsewhere(body, keys)) return false;
+  if (!keys.some((key) => namesKey(body, key))) return false;
+  return carries(UNSUPPORTED_PARAMETER);
+}
+
+/**
+ * The error a pairing that carries neither mechanism fails with.
+ *
+ * It quotes **both** refusals because the operator has nothing else to go on and
+ * nothing to set: q53's ruling is that there is no knob, so a message naming one
+ * would be a lie and a message naming neither would leave a reader to guess
+ * which of the two calls in their provider's log was the real one.
+ *
+ * A plain `Error`, so [`classify`] answers `undefined` for it and the route
+ * ladder treats it exactly as it treats the 400 that would have ended the call
+ * before this ladder existed: it fails the call rather than failing over
+ * (grammar 12.2 routes on infrastructure conditions only). The second refusal is
+ * the `cause`, because it is the one this call ended on.
+ */
+function bothMechanismsRefused(
+  wire: Wire,
+  model: ModelBinding,
+  first: OutputMechanism,
+  firstRefusal: unknown,
+  second: OutputMechanism,
+  secondRefusal: unknown,
+): Error {
+  const named = (mechanism: OutputMechanism): string =>
+    `\`${MECHANISM_KEYS[wire][mechanism][0]}\``;
+  return new Error(
+    `\`${model.address}\` asked \`${model.provider.address}\` for structured output both ways its wire has and neither was accepted: ${named(first)} was refused with ${describe(firstRefusal)}, and ${named(second)} was refused with ${describe(secondRefusal)}. There is nothing to configure — this runtime tries both mechanisms and this endpoint carries neither (PRD resolved q53)`,
+    { cause: secondRefusal },
+  );
 }
 
 async function callMessages(
   model: ModelBinding,
-  request: {
-    readonly system: string;
-    readonly turns: readonly Turn[];
-    readonly tools: readonly ToolSpec[];
-    readonly pinned?: ToolSpec;
-  },
+  request: ModelRequest,
+  mechanism: OutputMechanism,
   signal: AbortSignal,
 ): Promise<ModelAnswer> {
+  // Which of the wire's two ways of asking for an object this request uses
+  // (PRD §9 resolved q53). Read once, because it decides three things that must
+  // agree: whether the synthetic output tool is *offered*, whether the request
+  // pins it, and where the answer's object is read from.
+  const native = request.pinned !== undefined && mechanism === "native";
   const settings = { ...model.settings };
   const maxTokens = settings["max_tokens"] ?? ANTHROPIC_MAX_TOKENS;
   delete settings["max_tokens"];
@@ -2280,7 +3101,59 @@ async function callMessages(
     messages.push({ role: "assistant", content });
   }
 
-  const offered = [...request.tools, ...(request.pinned === undefined ? [] : [request.pinned])];
+  // The synthetic output tool is on offer only where the request is going to
+  // **pin** it. Under the native mechanism the schema travels in
+  // `output_config` and there is no such tool at all: offering one anyway would
+  // put a tool the composition never declared in front of a model that was not
+  // asked to call it, and a model that took the invitation would answer with a
+  // `tool_use` block the loop above would then dispatch nowhere.
+  //
+  // The **agent's own** tools stay on offer either way, and under the native
+  // rung nothing pins the turn — the posture Chat Completions has had for as
+  // long as it has sent `response_format` (`WIRE-NOTES` (3)), reaching this wire
+  // with `output_config`, where a forced `tool_choice` used to promise that the
+  // turn *was* the pinned call. That promise is what is being given up, and it
+  // is worth being explicit about why, because the request has two shapes that
+  // could keep it and neither is taken.
+  //
+  // The tools cannot be **dropped**: the history this request replays carries
+  // `tool_use`/`tool_result` blocks, and both surfaces refuse a request naming
+  // tools it does not declare. That holds for every agent that has any.
+  //
+  // What is left is `tool_choice: {type: "none"}` beside the format, and it is
+  // not sent — for two reasons, because the first covers only half the providers
+  // that reach here and a rule with a gap in it is not a rule:
+  //
+  //   * Where the provider declares `server_tools:`, forbidding tool use would
+  //     forbid **its** tools along with the agent's, and Decision D122 puts them
+  //     on this very call: a pinned call that runs a web search and then writes
+  //     its object is the turn the per-run text split below exists to read.
+  //   * Where it declares none — the common case, and the one the reason above
+  //     says nothing about — the answer is the ladder's own. This rung's only
+  //     way out of an endpoint that will not take its request is a refusal that
+  //     names the rung's key ([`MECHANISM_KEYS`]), and a `tool_choice` beside the
+  //     format is a second capability the request would depend on whose refusal
+  //     names the **other** rung's key. An endpoint carrying `output_config` and
+  //     not `tool_choice: {type: "none"}` — a gateway validating the parameter it
+  //     knows against an older schema while passing the newer one through — would
+  //     then fail outright where today it answers, and fail unladderably. Buying
+  //     a closed failure mode with an unrecoverable one is the wrong trade on the
+  //     rung whose whole job is to survive endpoints of different vintages.
+  //     Sending it only where there are no server tools would also make the shape
+  //     of this one call differ between two providers of one kind, which is a
+  //     second thing an operator comparing two traces would have to establish
+  //     before the comparison meant anything.
+  //
+  // So a model that answers the closing turn with one more `tool_use` is left to
+  // `callAgent`, which reports it as the absence it is ("asked for `…` and the
+  // answer carried no structured output (`stop_reason: tool_use`)") rather than
+  // as an endpoint that lacks a mechanism — it refused nothing. What that costs
+  // is bounded and diagnosed: a model ignoring a fixed instruction to produce its
+  // result, named as such, on a node a `retry:` policy runs again.
+  const offered = [
+    ...request.tools,
+    ...(request.pinned === undefined || native ? [] : [request.pinned]),
+  ];
   const body: Record<string, unknown> = {
     model: model.id,
     max_tokens: maxTokens,
@@ -2313,7 +3186,20 @@ async function callMessages(
     ];
   }
   if (request.pinned !== undefined) {
-    body["tool_choice"] = { type: "tool", name: request.pinned.name };
+    if (native) {
+      // The Messages API's own structured output: `output_config`'s `format`,
+      // carrying the agent's schema, and the answer comes back as text that
+      // parses (PRD §9 resolved q53). The **current** spelling — the earlier
+      // top-level `output_format` is deprecated and is not sent here — and the
+      // format object takes its `type` and its `schema` and nothing else: the
+      // pinned tool's *name* is this compiler's, not the wire's, and there is
+      // no call for it to name.
+      body["output_config"] = {
+        format: { type: "json_schema", schema: request.pinned.schema },
+      };
+    } else {
+      body["tool_choice"] = { type: "tool", name: request.pinned.name };
+    }
   }
 
   const answer = await send(
@@ -2328,7 +3214,35 @@ async function callMessages(
   );
 
   const blocks = (answer["content"] ?? []) as { type: string; [key: string]: unknown }[];
-  const texts = blocks.filter((block) => block.type === "text").map((block) => block["text"]);
+  // **Per run of `text`**, not one flat list of blocks — the same split
+  // [`callResponses`] makes per `message` item, for the same hazard. A turn on
+  // this wire can hold more than one run of text: a preamble the model wrote
+  // before a server tool ran, and the shaped answer it wrote after (Decision
+  // D122). `text` is everything the assistant said, which is what a replay on
+  // another wire has to carry; the *structured* answer is the last run alone,
+  // because `output_config`'s format shapes what the turn ends with and says
+  // nothing about what precedes it. Flattening them and parsing the join is how
+  // `Let me search.{"answer":"…"}` reaches `JSON.parse`.
+  //
+  // It is the **native** rung that makes such a turn reachable at all on this
+  // wire: `tool_choice: {type: "tool"}` was a promise that the turn is one
+  // `tool_use` block, so a pinned call could not run a server tool, and the
+  // object came out of that block whatever prose surrounded it. Without a pin
+  // the pinned call is an ordinary turn, and a provider whose `server_tools:`
+  // are on it may answer with one.
+  const runs: string[] = [];
+  let run: string[] = [];
+  for (const block of blocks) {
+    if (block.type === "text") {
+      run.push(String(block["text"] ?? ""));
+      continue;
+    }
+    if (run.length > 0) {
+      runs.push(run.join(""));
+      run = [];
+    }
+  }
+  if (run.length > 0) runs.push(run.join(""));
   // `tool_use` **exactly**, which is what keeps a server tool out of the tool
   // loop (Decision D122). A provider that ran one answers with a
   // `server_tool_use` block and its paired `*_tool_result` beside it: the call
@@ -2339,11 +3253,13 @@ async function callMessages(
   // They travel instead on `content`, which [`replayed`] sends back unaltered.
   const uses = blocks.filter((block) => block.type === "tool_use");
   const pinnedUse =
-    request.pinned === undefined
+    request.pinned === undefined || native
       ? undefined
       : uses.find((use) => use["name"] === request.pinned!.name);
+  const said = runs.length > 0 ? runs.join("") : null;
+  const shaped = runs.length > 0 ? runs[runs.length - 1]! : null;
   return {
-    text: texts.length > 0 ? texts.join("") : null,
+    text: said,
     toolCalls: uses
       .filter((use) => use !== pinnedUse)
       .map((use) => ({
@@ -2351,9 +3267,22 @@ async function callMessages(
         name: String(use["name"]),
         args: use["input"],
       })),
-    structured: pinnedUse === undefined ? null : (pinnedUse["input"] ?? null),
+    // What was **constrained** is what is parsed, whichever mechanism did the
+    // constraining (PRD 9.16): the pinned call's arguments, or — under
+    // `output_config` — the last run of text that format shaped. An answer that
+    // carried neither is an absence rather than a throw, for [`shapedOutput`]'s
+    // reason: `callAgent` names the agent and what the surface said about why,
+    // and a `SyntaxError` from inside the journaled call would record a call
+    // that worked as one that did not.
+    structured:
+      request.pinned === undefined
+        ? null
+        : native
+          ? shapedOutput(shaped)
+          : (pinnedUse?.["input"] ?? null),
     stopReason: (answer["stop_reason"] as string | null) ?? null,
     content: blocks,
+    ...(request.pinned === undefined ? {} : { mechanism }),
   };
 }
 
@@ -2374,14 +3303,16 @@ function textBlocks(content: unknown): unknown[] {
 
 async function callChatCompletions(
   model: ModelBinding,
-  request: {
-    readonly system: string;
-    readonly turns: readonly Turn[];
-    readonly tools: readonly ToolSpec[];
-    readonly pinned?: ToolSpec;
-  },
+  request: ModelRequest,
+  mechanism: OutputMechanism,
   signal: AbortSignal,
 ): Promise<ModelAnswer> {
+  // Which of this wire's two ways of asking for an object the request uses
+  // (PRD §9 resolved q53). `response_format` is the preferred one and the one
+  // this wire has had since q16; a forced function is the other rung, for the
+  // gateway that proxies a model generation whose `response_format` it has
+  // never heard of.
+  const forced = request.pinned !== undefined && mechanism === "forced_tool";
   // What this request declares is also what its **history** may name on this
   // surface, and that is the one rule the two wires do not share: Chat
   // Completions re-validates an assistant turn's `tool_calls` against `tools`
@@ -2454,33 +3385,62 @@ async function callChatCompletions(
   // and carries, and dropping it here would make that warning a lie
   // (Decision D122).
   const server = model.provider.serverTools ?? [];
-  if (request.tools.length > 0 || server.length > 0) {
-    body["tools"] = [
-      // Every client tool is a function tool here, the two built-ins included:
-      // this surface has no provider-defined types, so what the Messages wire
-      // declares as `{"type": "bash_20250124"}` is declared here as an ordinary
-      // function under the same name with the compiler's own schema
-      // ([`ToolSpec.providerType`], PRD resolved q54 ruling d). Same names, same
-      // arguments, same handlers.
-      ...request.tools.map((tool) => ({
-        type: "function",
-        function: { name: tool.name, description: tool.description, parameters: tool.schema },
-      })),
-      ...server,
-    ];
+  // Every client tool is a function tool here, the two built-ins included: this
+  // surface has no provider-defined types, so what the Messages wire declares as
+  // `{"type": "bash_20250124"}` is declared here as an ordinary function under
+  // the same name with the compiler's own schema ([`ToolSpec.providerType`],
+  // PRD resolved q54 ruling d). Same names, same arguments, same handlers.
+  const functions: { readonly type: string; readonly function: Record<string, unknown> }[] =
+    request.tools.map((tool) => ({
+      type: "function",
+      function: { name: tool.name, description: tool.description, parameters: tool.schema },
+    }));
+  if (forced) {
+    // …and the synthetic output tool joins them, **last** among the client
+    // tools: it is the one function this request adds to what the agent
+    // declares, so a reader comparing this body with a loop call's sees the
+    // agent's own list unchanged with the pin appended. `strict` rides the
+    // function itself on this wire (WIRE-NOTES (13)), under the same
+    // [`strictable`] decision `response_format` carries.
+    functions.push({
+      type: "function",
+      function: {
+        name: request.pinned!.name,
+        description: request.pinned!.description,
+        parameters: request.pinned!.schema,
+        strict: strictable(request.pinned!.schema),
+      },
+    });
+  }
+  if (functions.length > 0 || server.length > 0) {
+    body["tools"] = [...functions, ...server];
   }
   if (request.pinned !== undefined) {
-    // `response_format` rather than a forced function: the schema shapes the
-    // content and leaves the request's own `tools` callable, which is what an
-    // agent whose loop has just ended still has on offer (WIRE-NOTES (3)).
-    body["response_format"] = {
-      type: "json_schema",
-      json_schema: {
-        name: request.pinned.name,
-        strict: strictable(request.pinned.schema),
-        schema: request.pinned.schema,
-      },
-    };
+    if (forced) {
+      // The other rung (PRD §9 resolved q53): the pinned function above, forced
+      // by name, which is the mechanism every OpenAI-shaped surface has had for
+      // as long as it has had tools — and so the one a gateway that refuses
+      // `response_format` still takes.
+      body["tool_choice"] = { type: "function", function: { name: request.pinned.name } };
+    } else {
+      // `response_format` rather than a forced function: the schema shapes the
+      // content and leaves the request's own `tools` callable, which is what an
+      // agent whose loop has just ended still has on offer (WIRE-NOTES (3)).
+      // Nothing pins the turn here either, and for the reasons [`callMessages`]
+      // sets out at length over the same choice: the tools cannot be dropped
+      // from a request replaying a history that names them, and a `tool_choice`
+      // forbidding them would forbid the provider's own with them and make the
+      // rung depend on a second capability whose refusal names the other rung's
+      // key.
+      body["response_format"] = {
+        type: "json_schema",
+        json_schema: {
+          name: request.pinned.name,
+          strict: strictable(request.pinned.schema),
+          schema: request.pinned.schema,
+        },
+      };
+    }
   }
 
   const provider = model.provider;
@@ -2499,16 +3459,33 @@ async function callChatCompletions(
       args: JSON.parse(String(fn["arguments"] ?? "{}")) as unknown,
     };
   });
+  // Under the forced function the object is the pinned call's arguments, which
+  // `calls` above has already parsed — the same reading the Messages wire's
+  // pinned `tool_use` gets, on the surface that spells it differently. Under
+  // `response_format` it is the message's own content, read through
+  // [`shapedOutput`] for that function's reason: this wire's two rungs have to
+  // report a turn that carried no object the *same* way, and `strict: false` —
+  // which is what an output schema with an `optional:` property gets
+  // ([`strictable`]) — leaves the decoder free to answer in prose, as does a
+  // gateway that takes `response_format` and ignores it.
+  const pinnedCall = forced
+    ? calls.find((call) => call.name === request.pinned!.name)
+    : undefined;
   return {
     text: content,
     toolCalls: request.pinned === undefined ? calls : [],
     structured:
-      request.pinned === undefined || content === null ? null : (JSON.parse(content) as unknown),
+      request.pinned === undefined
+        ? null
+        : forced
+          ? (pinnedCall?.args ?? null)
+          : shapedOutput(content),
     stopReason: (choice["finish_reason"] as string | null) ?? null,
     // A refusal is `content: null` beside a stated reason (WIRE-NOTES (3)). The
     // absence of content is what every other branch here sees; the reason is the
     // only thing that tells a refusal from a `max_tokens` cut.
     refusal: (message["refusal"] as string | null) ?? null,
+    ...(request.pinned === undefined ? {} : { mechanism }),
   };
 }
 
@@ -2570,14 +3547,14 @@ async function callChatCompletions(
  */
 async function callResponses(
   model: ModelBinding,
-  request: {
-    readonly system: string;
-    readonly turns: readonly Turn[];
-    readonly tools: readonly ToolSpec[];
-    readonly pinned?: ToolSpec;
-  },
+  request: ModelRequest,
+  mechanism: OutputMechanism,
   signal: AbortSignal,
 ): Promise<ModelAnswer> {
+  // This wire's other rung, for the same reason Chat Completions has one
+  // (PRD §9 resolved q53): `text.format` is preferred, a forced function is what
+  // an endpoint that will not take it still answers.
+  const forced = request.pinned !== undefined && mechanism === "forced_tool";
   const input: unknown[] = [];
   for (const turn of request.turns) {
     if (turn.role === "user") {
@@ -2667,18 +3644,34 @@ async function callResponses(
     parameters: tool.schema,
     strict: strictable(tool.schema),
   }));
+  // …and the synthetic output tool last among them where this request pins it
+  // rather than shaping the text, exactly as [`callChatCompletions`] appends it
+  // (PRD §9 resolved q53). Flat here, like every other tool on this wire.
+  if (forced) {
+    functions.push({
+      type: "function",
+      name: request.pinned!.name,
+      description: request.pinned!.description,
+      parameters: request.pinned!.schema,
+      strict: strictable(request.pinned!.schema),
+    });
+  }
   if (functions.length > 0 || server.length > 0) {
     body["tools"] = [...functions, ...server];
   }
   if (request.pinned !== undefined) {
-    body["text"] = {
-      format: {
-        type: "json_schema",
-        name: request.pinned.name,
-        strict: strictable(request.pinned.schema),
-        schema: request.pinned.schema,
-      },
-    };
+    if (forced) {
+      body["tool_choice"] = { type: "function", name: request.pinned.name };
+    } else {
+      body["text"] = {
+        format: {
+          type: "json_schema",
+          name: request.pinned.name,
+          strict: strictable(request.pinned.schema),
+          schema: request.pinned.schema,
+        },
+      };
+    }
   }
 
   const { headers } = openAiRequest(model.provider);
@@ -2725,32 +3718,50 @@ async function callResponses(
     incomplete !== null && incomplete["reason"] !== undefined
       ? String(incomplete["reason"])
       : ((answer["status"] as string | null) ?? null);
+  // The pinned function's arguments where this request forced one, and the
+  // shaped final message where `text.format` did the shaping.
+  const pinnedCall = forced
+    ? calls.find((call) => call.name === request.pinned!.name)
+    : undefined;
   return {
     text,
     toolCalls: request.pinned === undefined ? calls : [],
-    structured: request.pinned === undefined ? null : shapedOutput(shaped),
+    structured:
+      request.pinned === undefined
+        ? null
+        : forced
+          ? (pinnedCall?.args ?? null)
+          : shapedOutput(shaped),
     stopReason,
     content: output,
     // …and whose vocabulary those are, because a failover ladder may hand this
     // turn to a member on another wire ([`ContentWire`]).
     wire: "responses",
     refusal,
+    ...(request.pinned === undefined ? {} : { mechanism }),
   };
 }
 
 /**
- * The structured answer a Responses turn's final message carries, or `null`.
+ * The structured answer a turn's assistant **text** carries, or `null` — how
+ * all three wires read the native mechanism (PRD §9 resolved q53).
  *
- * `text.format` shapes that message, so parsing it is parsing what the format
- * constrained — but only the **service** guarantees the shape, and a turn that
- * came back with prose where the schema was asked for is an answer this runtime
- * cannot use rather than a call that failed. So the absence is reported as an
- * absence, which is the same posture the Messages wire has when the pinned
- * `tool_use` block is not in the turn: `callAgent` then names the agent, the
- * output it asked for, and what the surface said about why — a stated refusal,
- * or a `max_output_tokens` cut. A `SyntaxError` thrown from here would name
- * none of those, and would be thrown *inside* the journaled model call, which
- * would record a call that worked as a call that did not.
+ * `output_config`, `text.format` and `response_format` each shape that text, so
+ * parsing it is parsing what the format constrained — but only the **service**
+ * guarantees the shape, and a turn that came back with prose where the schema
+ * was asked for is an answer this runtime cannot use rather than a call that
+ * failed. So the absence is reported as an absence, which is the same posture
+ * every wire has when the pinned `tool_use` / function call is not in the turn:
+ * `callAgent` then names the agent, the output it asked for, and what the
+ * surface said about why — a stated refusal, or a `max_output_tokens` cut. A
+ * `SyntaxError` thrown from here would name none of those, and would be thrown
+ * *inside* the journaled model call, which would record a call that worked as a
+ * call that did not — and a resume would replay that recorded failure forever.
+ *
+ * Prose is reachable without a misbehaving service, too: `strict: false` is what
+ * an output schema the OpenAI decoders cannot close is sent with
+ * ([`strictable`]), and an unstrict decoder is not constrained by the schema at
+ * all.
  */
 function shapedOutput(text: string | null): unknown {
   if (text === null) return null;

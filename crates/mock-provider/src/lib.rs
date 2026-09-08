@@ -64,9 +64,10 @@
 //! | route | what it does |
 //! |---|---|
 //! | `POST /_mock/enqueue` | one [`Script`], or a list of them |
+//! | `POST /_mock/personality` | one [`Endpoint`], or a list of them — which structured-output mechanisms a model's endpoint carries ([`Personality`], PRD §9 resolved q53) |
 //! | `GET /_mock/requests` | every recorded request, in arrival order |
-//! | `GET /_mock/state` | queue depths and counts |
-//! | `POST /_mock/reset` | discard both, answering with what was discarded |
+//! | `GET /_mock/state` | queue depths, counts, and the personalities staged |
+//! | `POST /_mock/reset` | discard all three, answering with what was discarded |
 //!
 //! A scripted outcome is the JSON spelling of [`Script`], and the two optional
 //! keys are the ones a shared model queue needs:
@@ -120,10 +121,10 @@ use std::sync::Arc;
 
 pub use client::{Client, Request, Response};
 pub use control::{
-    CREATED, Delay, Failure, HARNESS_HEADER, HARNESS_STATUS, Outcome, REFUSED_INVALID,
-    REFUSED_MISMATCH, REFUSED_UNSCRIPTED, REFUSED_UNSENDABLE, RecordedRequest, Reply, ReplyBody,
-    Script, ServerToolUse, Snapshot, Store, StructuredOutput, Surface, ToolCall, Usage,
-    ValidationFailure, Verdict,
+    CREATED, Delay, Endpoint, Failure, HARNESS_HEADER, HARNESS_STATUS, Outcome, OutputMechanism,
+    Personality, REFUSED_INVALID, REFUSED_MISMATCH, REFUSED_UNSCRIPTED, REFUSED_UNSENDABLE,
+    REFUSED_UNSUPPORTED, RecordedRequest, Reply, ReplyBody, Script, ServerToolUse, Snapshot, Store,
+    StructuredOutput, Surface, ToolCall, Usage, ValidationFailure, Verdict,
 };
 pub use server::serve;
 
@@ -224,6 +225,18 @@ impl MockProvider {
         for script in scripts {
             self.enqueue(script);
         }
+    }
+
+    /// Stage which structured-output mechanisms one model's endpoint carries
+    /// ([`Personality`], PRD §9 resolved q53).
+    ///
+    /// Not a scripted outcome: it is a property of the endpoint, so it takes
+    /// nothing from a queue and applies to every request for that model until
+    /// [`MockProvider::reset`]. A model nothing stages behaves as
+    /// [`Personality::NativeSupported`], which is the endpoint every other test
+    /// in the suite is talking to.
+    pub fn personality(&self, model: impl Into<String>, personality: Personality) {
+        self.store.set_personality(model, personality);
     }
 
     /// Every request the server has seen, in arrival order.

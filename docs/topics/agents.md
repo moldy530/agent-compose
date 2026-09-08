@@ -193,13 +193,20 @@ bound and fails the node, with the error naming the last refusal it was holding.
 
 ## The call that ends it
 
-The structured output is a separate, final model call: the output schema goes on
-the wire as a tool and the answer is pinned to it. The loop before it ends on the
-model's own answer, so the runtime **closes the exchange with one fixed user
-turn** — `Now produce the structured result.` — before pinning. That is a wire
-shape rather than a knob: a conversation ending on an assistant turn is the
-prefill feature, and strict Anthropic-compatible gateways refuse prefill beside a
-forced tool choice. The turn belongs to that one request; it is not part of the
+The structured output is a separate, final model call. **How** the schema is
+asked for on that call is the provider integration's problem and never yours:
+the runtime prefers each wire's own structured-output parameter — `output_config`
+on Messages, `response_format` on Chat Completions, `text.format` on Responses —
+and keeps a synthetic tool carrying the schema, pinned by name, as the other
+rung, choosing between them per endpoint at run time. There is no key for it; the
+trace records which one answered (`agent-compose docs models`).
+
+The loop before that call ends on the model's own answer, so the runtime **closes
+the exchange with one fixed user turn** — `Now produce the structured result.` —
+before making it. That is a wire shape rather than a knob: a conversation ending
+on an assistant turn is the prefill feature, and strict Anthropic-compatible
+gateways refuse prefill beside a structured-output ask, whichever of the two
+shapes it takes. The turn belongs to that one request; it is not part of the
 agent's conversation and does not appear in the trace.
 
 ## As a node

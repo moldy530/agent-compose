@@ -1,6 +1,6 @@
 {
   "name": "models-and-flow-tools",
-  "about": "An agent node whose route failed over once and whose loop called a flow-as-tool twice: two model-call spans with failover and tool_call events, two dispatch spans carrying the instances they ran, and the span links resolved q51 asks for — model call to the dispatch it filed, by instance path.",
+  "about": "An agent node whose route failed over once and whose loop called a flow-as-tool twice, and then closed on the call that asked for its output: three model-call spans — two with failover and tool_call events, the third naming the mechanism that answered (§7.5) and carrying neither — two dispatch spans carrying the instances they ran, and the span links resolved q51 asks for — model call to the dispatch it filed, by instance path.",
   "context": {
     "target": "staging",
     "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000b3",
@@ -64,6 +64,13 @@
                 "error": "ToolCallRefused: `unknown_tool` is not a tool this agent offers"
               }
             ]
+          },
+          {
+            "model": "model.smart",
+            "servedBy": "model.smart",
+            "fallback": 0,
+            "failovers": [],
+            "outputMechanism": "forced_tool"
           }
         ],
         "toolDispatches": [
@@ -493,6 +500,52 @@
                     ]
                   }
                 ],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "96fc6322ce160081d6420744000860af",
+                "spanId": "d48643840df7a823",
+                "parentSpanId": "25dc6bab41b01a72",
+                "name": "model.smart",
+                "kind": 3,
+                "startTimeUnixNano": "1788260400000000000",
+                "endTimeUnixNano": "1788260412000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.served_by",
+                    "value": {
+                      "stringValue": "model.smart"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.fallback",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.failovers",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.output_mechanism",
+                    "value": {
+                      "stringValue": "forced_tool"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
                 "status": {
                   "code": 1
                 }

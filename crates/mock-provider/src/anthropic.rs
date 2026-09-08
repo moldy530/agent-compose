@@ -1,12 +1,20 @@
 //! The Anthropic Messages surface: `POST /v1/messages`.
 //!
 //! This is the surface an `anthropic` provider (grammar 12.1) reaches, and it is
-//! where PRD 5.2's load-bearing promise is kept: an agent's structured output
-//! arrives as **forced tool use**. The request carries the agent's output schema
-//! as a tool's `input_schema` and pins `tool_choice: {type: "tool", name: …}`;
-//! the answer is one `tool_use` block whose `input` is the structured object. A
-//! script that says `Outcome::structured(…)` is rendered exactly that way, so a
-//! test writes the object the agent should produce and never writes wire shapes.
+//! where PRD 5.2's load-bearing promise is kept — **two** ways, since PRD §9
+//! resolved q53:
+//!
+//! * `output_config: { format: { type: "json_schema", schema } }`, the API's own
+//!   structured output, answered with a text block that parses;
+//! * **forced tool use** — the agent's output schema as a tool's `input_schema`
+//!   with `tool_choice: {type: "tool", name: …}` pinning it, answered with one
+//!   `tool_use` block whose `input` is the object.
+//!
+//! A compiled graph sends one or the other and this server refuses the mechanism
+//! its model's [`crate::Personality`] does not carry, which is how the runtime's
+//! ladder between them is held by conformance. A script that says
+//! `Outcome::structured(…)` is rendered into whichever the *request* asked for,
+//! so a test writes the object the agent should produce and never a wire shape.
 //!
 //! # What is checked
 //!
@@ -21,10 +29,11 @@
 //! * the **tool surface** — names unique and well formed, `input_schema` an
 //!   object schema, and `tools` present whenever a tool block appears anywhere
 //!   in the conversation;
-//! * **prefill against a forced tool** — a request that pins
-//!   `tool_choice: {type: "tool", …}` over a conversation ending on an assistant
-//!   turn, which is the shape strict Anthropic-compatible gateways refuse and
-//!   `api.anthropic.com` happens to tolerate (PRD §9 resolved q52);
+//! * **prefill under a structured-output ask** — a request that pins
+//!   `tool_choice: {type: "tool", …}` or carries `output_config` over a
+//!   conversation ending on an assistant turn, which is the shape strict
+//!   Anthropic-compatible gateways refuse and `api.anthropic.com` happens to
+//!   tolerate (PRD §9 resolved q52, and both mechanisms of resolved q53);
 //! * the **required envelope** — `model`, `messages`, `max_tokens`, the
 //!   `anthropic-version` header, and a JSON content type. Not the *presence* of
 //!   `x-api-key`: a keyless provider behind a gateway is a legal composition and
@@ -47,7 +56,7 @@ use crate::control::{
     request_id,
 };
 use crate::strict::{Checker, Dialect, Kind, at, listed};
-use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED};
+use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED, UNSUPPORTED};
 
 /// The top-level keys the Messages API accepts.
 ///
@@ -68,6 +77,7 @@ const REQUEST_KEYS: &[&str] = &[
     "metadata",
     "tools",
     "tool_choice",
+    "output_config",
     "thinking",
     "service_tier",
 ];
@@ -125,12 +135,24 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
             "messages: Requests which include `tool_use` or `tool_result` blocks must define tools.",
         );
     }
+    let format = check_output_config(&mut checker, body);
     check_streaming(&mut checker, body);
 
-    let structured_output = forced.and_then(|name| {
-        let schema = tool_schema(body, &name)?;
-        Some(StructuredOutput::ForcedTool { name, schema })
-    });
+    // The wire's two structured-output mechanisms, and the order is the answer
+    // to "which one is this request asking through" (PRD §9 resolved q53). A
+    // compiled graph sends **one**: `output_config` shapes the assistant's text
+    // and a pinned `tool_choice` promises a call, and a request carrying both
+    // would be asking for the answer in two places at once. The forced tool
+    // wins where a body somehow carries the pair, for the reason
+    // [`crate::openai`]'s `structured_destination` gives on its own surface — a
+    // pin decides whether the turn has text at all, so reading the other one
+    // would describe an answer this API cannot send.
+    let structured_output = forced
+        .and_then(|name| {
+            let schema = tool_schema(body, &name)?;
+            Some(StructuredOutput::ForcedTool { name, schema })
+        })
+        .or(format);
 
     Parsed {
         model,
@@ -524,16 +546,16 @@ fn check_tool_choice(
     }
 }
 
-/// A forced `tool_choice` may not sit on a conversation that ends on the
-/// assistant (PRD §9 resolved q52).
+/// A request that asks for structured output may not sit on a conversation that
+/// ends on the assistant (PRD §9 resolved q52).
 ///
 /// A trailing assistant message *is* the Messages API's prefill feature — "carry
-/// on from here" — and `tool_choice: {type: "tool", name: …}` is "your answer
-/// must be this call". The two contradict each other, and which of them a service
-/// believes is not something a client should have to find out: `api.anthropic.com`
-/// tolerates the pair, and strict Anthropic-compatible gateways (the Bedrock-style
-/// proxies that are the norm in enterprise deployments) refuse it with a 400
-/// naming the shape.
+/// on from here" — and asking for an object under a schema is "your answer must
+/// be this shape". The two contradict each other, and which of them a service
+/// believes is not something a client should have to find out:
+/// `api.anthropic.com` tolerates the pair, and strict Anthropic-compatible
+/// gateways (the Bedrock-style proxies that are the norm in enterprise
+/// deployments) refuse it with a 400 naming the shape.
 ///
 /// This server refuses it **unconditionally**, and that is what an oracle is for.
 /// The class of bug q52 closes reached a live 0.6.0 deployment precisely because
@@ -543,8 +565,16 @@ fn check_tool_choice(
 /// the ladder. A conformance oracle earns its keep by being the strictest wire
 /// the runtime must satisfy, so the leniency is not inherited here.
 ///
-/// Only `type: "tool"` — an `any` or `auto` choice is not a promise about the
-/// next turn's content, and prefill beside it is the ordinary feature.
+/// **Both** of the wire's structured-output mechanisms are held to it (PRD §9
+/// resolved q53). q52's repair is one fixed user turn appended before the output
+/// is asked for, and it is composed above the mechanism — so a rule that fired
+/// only on the pinned tool would stop watching the rung the runtime *prefers*,
+/// and a ladder that dropped the turn on its native shape would pass every test
+/// this file has. The two spellings are the two ways of asking, so the sentence
+/// names whichever one the request used.
+///
+/// A `tool_choice` of `any` or `auto` is not a promise about the next turn's
+/// content, and prefill beside one is the ordinary feature.
 fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
     let forced = body
         .get("tool_choice")
@@ -552,9 +582,16 @@ fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
         .and_then(|choice| choice.get("type"))
         .and_then(Value::as_str)
         == Some("tool");
-    if !forced {
+    // Presence, not shape: a malformed `output_config` is still a request asking
+    // for structured output, and [`check_output_config`] answers its shape.
+    let native = body.contains_key("output_config");
+    let asked = if forced {
+        "`tool_choice` forces a tool"
+    } else if native {
+        "`output_config` asks for structured output"
+    } else {
         return;
-    }
+    };
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return;
     };
@@ -569,10 +606,58 @@ fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
         checker.fail(
             &at("messages", last),
             format!(
-                "messages.{last}: This model does not support assistant message prefill. The conversation must end with a user message when `tool_choice` forces a tool."
+                "messages.{last}: This model does not support assistant message prefill. The conversation must end with a user message when {asked}."
             ),
         );
     }
+}
+
+/// `output_config`, and the structured output it asks for (PRD §9 resolved q53).
+///
+/// The Messages API's **own** structured output, and the mechanism a compiled
+/// graph prefers on this wire: `output_config: { format: { type: "json_schema",
+/// schema } }`, answered with a text block that parses rather than with a call.
+///
+/// Two things about the shape are checked because they are the two a codegen bug
+/// takes. The parameter is the **current** spelling: the earlier top-level
+/// `output_format` is deprecated, is not in [`REQUEST_KEYS`], and a request that
+/// sent it is refused as the unknown argument it now is. And the format object
+/// is closed to `type` and `schema` — there is no `name` here, unlike every
+/// OpenAI spelling of the same idea, because a format constrains the assistant's
+/// text and has no call to name; a `name` beside it is a key this server has
+/// never seen the API take.
+///
+/// What is **not** checked is whether the schema is closed enough for the
+/// service's decoder to compile. `WIRE-NOTES` (26) records that as an
+/// unconfirmed assumption with what would settle it: the generated runtime never
+/// sends a schema it believes this format would refuse — it starts such an agent
+/// on the forced tool instead — so a check here would be this server asserting a
+/// rule it cannot confirm against a request that never arrives.
+fn check_output_config(
+    checker: &mut Checker,
+    body: &Map<String, Value>,
+) -> Option<StructuredOutput> {
+    let config = checker
+        .optional("", body, "output_config", Kind::Object)?
+        .as_object()?;
+    checker.closed("output_config", config, &["format"]);
+    let format = checker
+        .optional("output_config", config, "format", Kind::Object)?
+        .as_object()?;
+    checker.closed("output_config.format", format, &["type", "schema"]);
+    let kind = checker.required("output_config.format", format, "type")?;
+    checker.one_of("output_config.format.type", kind, &["json_schema"])?;
+    let schema = checker.required_object("output_config.format", format, "schema")?;
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        checker.fail(
+            "output_config.format.schema.type",
+            "output_config.format.schema.type: Input should be 'object'",
+        );
+        return None;
+    }
+    Some(StructuredOutput::OutputConfig {
+        schema: Value::Object(schema.clone()),
+    })
 }
 
 /// The schema a named tool declares.
@@ -1028,18 +1113,44 @@ fn reply_answer(
                     ),
                 );
             }
-            (vec![text_block(text)], "end_turn")
-        }
-        ReplyBody::Structured(value) => {
-            let Some(StructuredOutput::ForcedTool { name, .. }) = structured else {
+            // The same rule for this wire's other mechanism (PRD §9 resolved
+            // q53), and the same reason: `output_config`'s format constrains the
+            // decoder, so the text of such a turn parses. Free prose there is a
+            // turn the API cannot send, and a codegen PR that scripted one would
+            // be testing its parser against an answer no service produces.
+            if matches!(structured, Some(StructuredOutput::OutputConfig { .. })) {
                 return mismatch(
                     sequence,
-                    "a `structured` reply needs a request that forces a tool: this one carries no \
-                     `tool_choice: {type: \"tool\", name: …}`, so there is no schema to answer",
+                    "a `text` reply cannot answer a request carrying `output_config: {format: \
+                     {type: \"json_schema\", …}}`: the Messages API shapes that turn's text into \
+                     the schema, never into free prose. Script `structured` for the object the \
+                     agent should produce, or `raw` for a response generated code must reject",
                 );
-            };
-            (vec![tool_use_block(sequence, 0, name, value)], "tool_use")
+            }
+            (vec![text_block(text)], "end_turn")
         }
+        // Where the object goes is the request's decision, not the script's
+        // (PRD §9 resolved q53): a pinned tool is answered with a `tool_use`
+        // block, and `output_config`'s format is answered with the text it
+        // shaped. A test writes the object either way and never the wire shape,
+        // which is what lets one script drive both mechanisms.
+        ReplyBody::Structured(value) => match structured {
+            Some(StructuredOutput::ForcedTool { name, .. }) => {
+                (vec![tool_use_block(sequence, 0, name, value)], "tool_use")
+            }
+            Some(StructuredOutput::OutputConfig { .. }) => {
+                (vec![text_block(&canonical(value))], "end_turn")
+            }
+            _ => {
+                return mismatch(
+                    sequence,
+                    "a `structured` reply needs a request that asked for structured output: this \
+                     one carries neither `tool_choice: {type: \"tool\", name: …}` nor \
+                     `output_config: {format: {type: \"json_schema\", …}}`, so there is no schema \
+                     to answer",
+                );
+            }
+        },
         ReplyBody::Tools { calls, text } => {
             // The mirror of the two refusals above, in the other direction: a
             // request may make tool use *impossible* as surely as it can pin it,
@@ -1341,6 +1452,13 @@ fn tool_use_block(sequence: u64, index: usize, name: &str, input: &Value) -> Val
 /// tool's `name` comes off that same declaration — the Messages wire carries
 /// both, and the result block is named after the name rather than the dated
 /// type.
+///
+/// A use that scripted a **preamble** ([`ServerToolUse::preamble`]) puts a
+/// `text` block in front of its own two: what the model said before the tool
+/// ran. That is the one composition in which a turn carries two runs of
+/// assistant text — the API normalises contiguous text into a single block — and
+/// it is the composition a native structured-output reader has to get right,
+/// because the format shaped the run at the *end* (PRD §9 resolved q53).
 fn server_tool_blocks(
     sequence: u64,
     request: &Value,
@@ -1348,6 +1466,18 @@ fn server_tool_blocks(
 ) -> Result<Vec<Value>, Answer> {
     let mut blocks = Vec::new();
     for (index, use_) in uses.iter().enumerate() {
+        if let Some(said) = &use_.preamble {
+            if said.is_empty() {
+                return Err(mismatch(
+                    sequence,
+                    "the script runs a server tool preceded by the empty string: \
+                     `{\"type\": \"text\", \"text\": \"\"}` is a block the Messages API refuses, \
+                     so a turn opening with one is not an answer it can send. Drop the preamble, \
+                     or script a `raw` response",
+                ));
+            }
+            blocks.push(text_block(said));
+        }
         let Some(name) = declared_server_tool(request, &use_.type_name) else {
             return Err(mismatch(
                 sequence,
@@ -1457,6 +1587,23 @@ fn error(sequence: u64, status: u16, kind: &str, message: &str) -> Response {
 /// the credential and nothing else. Every other failure is the 400 the API sends
 /// for a body it could not accept.
 pub(crate) fn rejected(sequence: u64, failures: &[ValidationFailure]) -> Answer {
+    refused(sequence, failures, INVALID)
+}
+
+/// The answer to a **well-formed** request asking for a structured-output
+/// mechanism this endpoint does not carry (`Personality`, PRD §9 resolved q53).
+///
+/// The same 400 in the same envelope — a service refusing an argument it does
+/// not have answers its ordinary bad-request error, which is the whole point of
+/// staging one — and a different [`HARNESS_HEADER`](crate::control::HARNESS_HEADER)
+/// value, because `invalid-request` would tell a reader the request was
+/// malformed while the transcript beside it records the request as valid.
+pub(crate) fn unsupported(sequence: u64, failures: &[ValidationFailure]) -> Answer {
+    refused(sequence, failures, UNSUPPORTED)
+}
+
+/// The body both refusals above share, under the label that says which it is.
+fn refused(sequence: u64, failures: &[ValidationFailure], label: &str) -> Answer {
     let (status, kind, reported) = classify(failures);
     let message = reported
         .iter()
@@ -1464,7 +1611,7 @@ pub(crate) fn rejected(sequence: u64, failures: &[ValidationFailure]) -> Answer 
         .collect::<Vec<_>>()
         .join("; ");
     error(sequence, status, kind, &message)
-        .harness(INVALID)
+        .harness(label)
         .answer()
 }
 
@@ -1931,6 +2078,65 @@ mod tests {
         );
     }
 
+    /// What the model said **before** a server tool ran is a `text` block ahead
+    /// of the tool's own two — the one composition in which a Messages turn
+    /// carries two runs of assistant text, and the one a native
+    /// structured-output reader has to get right (PRD §9 resolved q53).
+    #[test]
+    fn a_scripted_preamble_precedes_the_server_tools_own_blocks() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "web_search_20250305", "name": "web_search" }],
+        }));
+        let blocks = server_tool_blocks(
+            7,
+            &request,
+            &[crate::control::ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "does it?" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            )
+            .preceded_by("Let me search.")],
+        )
+        .expect("a declared server tool");
+        let kinds: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| block.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["text", "server_tool_use", "web_search_tool_result"],
+            "the prose the model wrote first comes first: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["text"], "Let me search.");
+    }
+
+    /// …and the empty string is not a preamble: the API refuses an empty `text`
+    /// block, so a turn opening with one is not an answer it can send.
+    #[test]
+    fn an_empty_preamble_is_refused() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "web_search_20250305", "name": "web_search" }],
+        }));
+        let refusal = server_tool_blocks(
+            7,
+            &request,
+            &[
+                crate::control::ServerToolUse::new("web_search_20250305", json!({}), Value::Null)
+                    .preceded_by(""),
+            ],
+        );
+        let Err(Answer::Respond(answer)) = refusal else {
+            panic!("an empty text block is not one this API sends");
+        };
+        assert_eq!(answer.status, HARNESS_STATUS, "{answer:?}");
+        assert!(
+            answer.body.to_string().contains("the empty string"),
+            "the refusal names what the script wrote: {answer:?}"
+        );
+    }
+
     /// `tool_choice` must name a tool the request actually offers — the codegen
     /// bug where the structured-output tool is renamed in one place only.
     #[test]
@@ -1999,7 +2205,7 @@ mod tests {
         assert_eq!(
             parsed
                 .structured_output
-                .map(|output| output.name().to_string()),
+                .and_then(|output| output.name().map(str::to_string)),
             Some("extract".to_string())
         );
     }
@@ -2044,9 +2250,49 @@ mod tests {
         );
     }
 
+    /// …and so is the **other** mechanism's shape, which pins no tool at all
+    /// (resolved q53).
+    ///
+    /// The rung the runtime prefers on this wire asks through `output_config`
+    /// and sends no `tool_choice`, so a rule keyed on the pin would have stopped
+    /// watching the request that is now the common one — and a ladder that
+    /// dropped q52's closing turn while composing its native shape would pass
+    /// every other test here. The refusal names the parameter that asked.
+    #[test]
+    fn output_config_over_a_trailing_assistant_turn_is_refused() {
+        let loop_ended = json!([
+            { "role": "user", "content": "{\"goal\":\"ship it\"}" },
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "query": "it" } },
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a snippet" },
+            ]},
+            { "role": "assistant", "content": [{ "type": "text", "text": "found it" }] },
+        ]);
+        let request = messages(json!({
+            "messages": loop_ended,
+            "tools": [{ "name": "lookup", "input_schema": { "type": "object" } }],
+            "output_config": { "format": {
+                "type": "json_schema",
+                "schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+            }},
+        }));
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.3");
+        assert_eq!(
+            failures[0].message,
+            "messages.3: This model does not support assistant message prefill. \
+             The conversation must end with a user message when `output_config` \
+             asks for structured output."
+        );
+    }
+
     /// The same conversation with the closing user turn the runtime now appends
-    /// (resolved q52), and an unpinned request over the old shape: prefill is
-    /// only refused where a forced `tool_choice` contradicts it.
+    /// (resolved q52), on **both** mechanisms, and an unpinned request over the
+    /// old shape: prefill is only refused where a structured-output ask
+    /// contradicts it.
     #[test]
     fn a_forced_tool_choice_over_a_trailing_user_turn_is_accepted() {
         let tools = json!([
@@ -2067,8 +2313,8 @@ mod tests {
         let parsed = parse(
             &headers(),
             Some(&messages(json!({
-                "messages": closed,
-                "tools": tools,
+                "messages": closed.clone(),
+                "tools": tools.clone(),
                 "tool_choice": { "type": "tool", "name": "extract" },
             }))),
         );
@@ -2076,12 +2322,28 @@ mod tests {
         assert_eq!(
             parsed
                 .structured_output
-                .map(|output| output.name().to_string()),
+                .and_then(|output| output.name().map(str::to_string)),
             Some("extract".to_string())
         );
 
+        // The native rung over the same closed history: also served, and read as
+        // the structured output it is.
+        let native = parse(
+            &headers(),
+            Some(&messages(json!({
+                "messages": closed,
+                "tools": tools,
+                "output_config": { "format": {
+                    "type": "json_schema",
+                    "schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+                }},
+            }))),
+        );
+        assert!(native.failures.is_empty(), "{:?}", native.failures);
+        assert!(native.structured_output.is_some());
+
         // Prefill itself is untouched: an assistant turn to carry on from, with
-        // nothing forcing a call, is the API's own feature.
+        // nothing asking for an object, is the API's own feature.
         let prefill = parse(
             &headers(),
             Some(&messages(json!({

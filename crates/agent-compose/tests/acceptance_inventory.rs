@@ -292,6 +292,108 @@ const CODEGEN: &[Criterion] = &[
                 "the_pinned_call_after_a_tool_loop_ends_on_the_turn_that_closes_it",
                 Status::Live,
             ),
+            // …and **how** that call asks for its object, which PRD §9 resolved
+            // q53 makes the provider integration's problem and never a consumer
+            // surface: each wire's native structured-output parameter first, the
+            // synthetic pinned tool as the other rung, a capability-shaped 400
+            // laddering between them inside one call, and the winner memoized per
+            // provider-and-model for the process. A row per thing that can be
+            // wrong independently — which mechanism a healthy endpoint answers on
+            // and what the trace says about it, the ladder and its memo in each
+            // direction and what the memo is keyed by, the endpoint that carries
+            // neither, the refusals that must **not** ladder (including the two
+            // whose other rung would have *worked*, which is the way of being
+            // wrong that hides itself) and the borderline wordings that must —
+            // among them the bodies a **proxy relayed** under its own name, which
+            // is what most deployments of a gateway a generation behind the wire
+            // actually answer with — the native mechanism's own reading path, and
+            // resolved q52's closing turn surviving both shapes.
+            (
+                "a_structured_output_call_records_the_mechanism_that_answered_it",
+                Status::Live,
+            ),
+            (
+                "a_native_refusing_endpoint_is_laddered_past_once_and_remembered",
+                Status::Live,
+            ),
+            (
+                "an_output_schema_the_native_format_could_not_close_starts_on_the_forced_tool",
+                Status::Live,
+            ),
+            (
+                "two_agents_on_one_model_ask_the_way_their_own_schemas_allow",
+                Status::Live,
+            ),
+            (
+                "an_endpoint_carrying_neither_mechanism_fails_with_both_refusals_quoted",
+                Status::Live,
+            ),
+            (
+                "a_refusal_that_is_not_about_the_mechanism_does_not_ladder",
+                Status::Live,
+            ),
+            (
+                "a_refusal_naming_the_key_as_a_word_or_blaming_another_parameter_does_not_ladder",
+                Status::Live,
+            ),
+            (
+                "a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends",
+                Status::Live,
+            ),
+            (
+                "a_capability_refusal_a_gateway_relayed_still_ladders",
+                Status::Live,
+            ),
+            (
+                "a_relayed_complaint_about_another_part_of_the_request_still_does_not_ladder",
+                Status::Live,
+            ),
+            (
+                "a_refusal_about_the_conversations_shape_is_not_read_as_a_missing_mechanism",
+                Status::Live,
+            ),
+            (
+                "the_memo_holds_per_model_rather_than_per_endpoint",
+                Status::Live,
+            ),
+            (
+                "the_memo_holds_per_endpoint_rather_than_per_model",
+                Status::Live,
+            ),
+            (
+                "a_pinned_messages_turn_carrying_no_object_is_reported_as_no_structured_output",
+                Status::Live,
+            ),
+            // …and the turn shapes the native rung makes reachable on that wire,
+            // both of which come of the same thing — that nothing pins the turn.
+            // The pinned call may run a server tool and answer after it, in two
+            // runs of `text`, only the last of which the format shaped; and it
+            // may answer with one more tool call instead of the object, which is
+            // an absence rather than an endpoint that lacks a mechanism.
+            (
+                "a_native_answer_after_a_server_tool_is_read_from_the_turns_last_text",
+                Status::Live,
+            ),
+            (
+                "a_native_pinned_call_answered_with_a_tool_call_carries_no_structured_output",
+                Status::Live,
+            ),
+            (
+                "a_pinned_chat_completions_turn_carrying_no_object_is_reported_as_no_structured_output",
+                Status::Live,
+            ),
+            (
+                "the_closing_turn_precedes_the_pinned_call_on_both_mechanisms",
+                Status::Live,
+            ),
+            (
+                "the_chat_completions_wire_ladders_to_a_forced_function",
+                Status::Live,
+            ),
+            (
+                "the_responses_wire_ladders_to_a_forced_function",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).
@@ -719,6 +821,22 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_node_that_succeeded_on_a_retry_records_what_its_earlier_attempt_called",
+                Status::Live,
+            ),
+            // …and the seam with the *other* ladder PRD §9 resolved q53 put
+            // inside one route member's call. Both directions, because each is
+            // one `throw` away from being wrong and neither is declared
+            // anywhere: a condition the mechanism ladder's second rung answers
+            // with is still the route's to act on, and the double refusal — an
+            // endpoint that carries neither mechanism — is not a condition at
+            // all and must end the node where it stands rather than pass the
+            // run to a member that would hide it.
+            (
+                "a_route_condition_the_mechanism_ladder_uncovered_still_fails_over",
+                Status::Live,
+            ),
+            (
+                "an_endpoint_carrying_neither_mechanism_fails_the_node_without_failing_over",
                 Status::Live,
             ),
         ],

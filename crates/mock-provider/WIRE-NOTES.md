@@ -88,20 +88,25 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   parameter**, and both Azure routes authenticate with an `api-key` header (a
   bearer token is also accepted, for AAD). The newer `/openai/v1/...` route makes
   `api-version` optional — see (7), where the route forms live.
-* **A forced `tool_choice` needs the conversation to end on the user.** A
-  trailing assistant message is the Messages API's *prefill* feature, and prefill
-  under `tool_choice: {type: "tool", …}` contradicts it. `api.anthropic.com`
-  tolerates the pair; strict Anthropic-compatible gateways refuse it with a 400,
-  which is what took a compiled graph down in the field (PRD §9 resolved q52).
-  This server refuses it as they do — see (24) for the sentence, and the runtime
-  closes its tool loop with a fixed user turn so the shape never leaves it.
+* **A request asking for structured output needs the conversation to end on the
+  user.** A trailing assistant message is the Messages API's *prefill* feature,
+  and prefill under `tool_choice: {type: "tool", …}` — or under the
+  `output_config` the other mechanism asks through (PRD §9 resolved q53) —
+  contradicts it. `api.anthropic.com` tolerates the pair; strict
+  Anthropic-compatible gateways refuse it with a 400, which is what took a
+  compiled graph down in the field (PRD §9 resolved q52). This server refuses it
+  as they do — see (24) for the sentences, and the runtime closes its tool loop
+  with a fixed user turn, above the mechanism, so the shape never leaves it.
 * **A pinned tool choice guarantees a call.** Anthropic's `tool_choice: {type:
   "tool", …}` and `{type: "any"}`, OpenAI's forced function and `tool_choice:
   "required"`, and OpenAI's `response_format: {type: "json_schema"}` each make
-  free prose an impossible answer. A `text` reply scripted against one of them
-  is refused as a `script-mismatch` for the same reason a `structured` reply to
-  a request that pinned nothing is: the harness must not teach generated code
-  that a provider answers in a way it cannot.
+  free prose an impossible answer. So does every wire's *native* structured
+  output — Anthropic's `output_config.format` and Responses' `text.format` —
+  which shapes the turn's text into the schema rather than pinning a call
+  (26). A `text` reply scripted against any of them is refused as a
+  `script-mismatch` for the same reason a `structured` reply to a request that
+  pinned nothing is: the harness must not teach generated code that a provider
+  answers in a way it cannot.
 * **A pinned tool choice outranks a `response_format`.** The consequence of the
   rule above on a Chat Completions request that carries *both* mechanisms:
   `response_format` shapes the content, and a pinned `tool_choice` decides
@@ -213,7 +218,10 @@ then read the structured object out of the returned `tool_use` block's `input`.
 
 *This server*: accepts exactly that, and renders `Outcome::structured(v)` as one
 `tool_use` block. It also accepts `tool_choice: {type: "any"}` when exactly one
-tool is on offer, which is the same request in effect.
+tool is on offer, which is the same request in effect. It is no longer the
+**only** way a compiled graph asks this wire for an object — see (26) for
+`output_config`, and (27) for the endpoints that carry one mechanism and not the
+other.
 *Confirmed by*: the first live e2e's recorded request carrying
 `tool_choice.type == "tool"`.
 *If wrong*: a structured reply is refused as a `script-mismatch` (see (11) for
@@ -367,6 +375,17 @@ a clean snapshot, and a graph that failed for no visible reason.
 transcript entry.
 *If wrong* (some client retries 422s): the transcript still shows the refusal,
 and the run fails with the queue empty rather than passing.
+
+The header has a **fifth** value that is none of the above, and it is deliberately
+not a harness refusal at all: `unsupported-mechanism`, on a well-formed request
+asking for a structured-output mechanism the endpoint's `Personality` does not
+carry (27). That one wears the *provider's* own 400 rather than 422, because it
+is emulating a refusal a real endpoint sends and a compiled graph is meant to
+read it as one. What the header buys is the reading of a raw exchange: the
+transcript records such a request as `valid`, so labelling it `invalid-request`
+would have the response and the transcript contradicting each other about whether
+generated code composed the request correctly. Read the header's **value**, never
+its presence.
 
 ### 12. Request-header checks are presence checks, and only where the grammar makes the header unconditional
 
@@ -779,32 +798,47 @@ carries these blocks through its loop opaquely, which is exactly the property th
 acceptance suite asserts. A wrong member name here would therefore fail nothing
 that is not already failing.
 
-### 23. One Responses turn may hold more than one `message`, and `text.format` shapes the last
+### 23. A turn may hold more than one run of assistant text, and a native format shapes the last
 
 The other side of (19)'s "the conversation is a list of items": a `message` is an
-item like any other, so a turn may carry several — a preamble the model wrote
-before a server tool ran, then the shaped answer after it, with the
-`<type>_call` of (22) between them. Neither of the other two wires can produce
-that shape: the Messages API answers a pinned request with a `tool_use` block
-whose `input` **is** the object, and Chat Completions has exactly one
-`choices[0].message.content`.
+item like any other, so a Responses turn may carry several — a preamble the model
+wrote before a server tool ran, then the shaped answer after it, with the
+`<type>_call` of (22) between them.
 
-So a `text.format` of type `json_schema` constrains the turn's **final** message
-and says nothing about what precedes it, and a reader that concatenates every
-`output_text` and parses the join parses something the format never shaped. The
-runtime reads the last message-bearing item for its structured answer and keeps
-the join only as the turn's text (`callResponses`, `shapedOutput`);
-`compiled_graph_acceptance.rs`'s
-`a_pinned_responses_turn_is_read_at_the_message_the_format_shaped` is what
-decides it, served with a **raw** response because `reply_answer` writes at most
-one `message` item per scripted answer and so cannot compose the shape.
+**The Messages wire reaches the same shape**, in blocks rather than items:
+`text`, `server_tool_use`, `<name>_tool_result`, `text`. That became reachable
+when PRD §9 resolved q53 made `output_config` the rung a compiled graph prefers.
+Under the older mechanism it was not: `tool_choice: {type: "tool", name}` is a
+promise that the turn is one `tool_use` block, so no server tool could run on a
+pinned call and the object came out of that block whatever prose surrounded it.
+A format pins nothing, so the pinned call of an agent whose provider declares
+`server_tools:` is an ordinary turn, and a search answer's usual shape — announce
+the search, run it, answer — is two runs of text. Only Chat Completions is exempt,
+and by its shape rather than by anything a runtime does: a turn there is the
+single string `choices[0].message.content`.
+
+So each wire's native format constrains the turn's **final** run and says nothing
+about what precedes it, and a reader that concatenates every `output_text` /
+`text` block and parses the join parses something the format never shaped. The
+runtime reads the last message-bearing item (`callResponses`) and the last run of
+`text` blocks (`callMessages`) for its structured answer, and keeps the join only
+as the turn's text; `compiled_graph_acceptance.rs`'s
+`a_pinned_responses_turn_is_read_at_the_message_the_format_shaped` and
+`a_native_answer_after_a_server_tool_is_read_from_the_turns_last_text` are what
+decide it.
+
+A script composes the shape with `ServerToolUse::preceded_by`, and the preamble
+belongs to the **use** rather than to the reply because that is what makes it a
+turn a service could have sent: contiguous assistant text arrives as one block —
+one `message` on Responses — so the only thing that can separate two runs of it
+is something between them, and here that is the tool that ran.
 
 *What is assumed* is that the service is willing to send a preamble beside a
-shaped answer at all. If it never does, nothing is lost — a single-message turn
-reads identically — and if it does, the alternative is a `JSON.parse` of prose
-thrown inside the journaled model call, which a resume then replays.
+shaped answer at all. If it never does, nothing is lost — a single-run turn reads
+identically — and if it does, the alternative is a node failed for carrying no
+structured output over a turn that carried one.
 
-### 24. The sentence a forced choice over a prefilled turn is refused with
+### 24. The sentence a structured-output ask over a prefilled turn is refused with
 
 *What is certain*: that strict Anthropic-compatible gateways refuse the shape
 (PRD §9 resolved q52, from a live 0.6.0 field report), and that
@@ -816,17 +850,30 @@ the ladder.
 *What is assumed* is the wording. The gateways answer along the lines of "This
 model does not support assistant message prefill. The conversation must end with
 a user message"; this server says that and names the condition it is refusing
-under, since it accepts prefill wherever no tool is forced:
+under, since it accepts prefill wherever nothing asks for an object:
 
 ```
 messages.<n>: This model does not support assistant message prefill. The
 conversation must end with a user message when `tool_choice` forces a tool.
+messages.<n>: This model does not support assistant message prefill. The
+conversation must end with a user message when `output_config` asks for
+structured output.
 ```
+
+**Both of the wire's structured-output mechanisms are held to it** (PRD §9
+resolved q53). q52's repair is one fixed user turn composed *above* the
+mechanism, so the rule is about the ask rather than about the pin: a check that
+fired only on `tool_choice` would stop watching the rung the runtime now prefers,
+and a ladder that dropped the closing turn while composing its `output_config`
+shape would pass every test in this crate. An `any` or `auto` choice with no
+`output_config` beside it still asks for nothing in particular, and prefill under
+one is the ordinary feature.
 
 *If wrong*: a message, not a verdict. The rule decides what a compiled graph may
 send, and the runtime satisfies it by appending the closing user turn of
 resolved q52 — `a_forced_tool_choice_needs_the_conversation_to_end_on_the_user`
-in `tests/anthropic_wire.rs` locks both halves.
+and `output_config_needs_the_conversation_to_end_on_the_user` in
+`tests/anthropic_wire.rs` lock both halves of each.
 
 ### 25. A provider-defined tool the **client** runs is a client tool
 
@@ -857,6 +904,80 @@ text editor's `max_characters` is the plausible one — would be refused here un
 this list grows, which is the same intended failure mode as the accepted-key
 lists below: a silently accepted unknown key is how a bound stops taking effect
 without anyone noticing.
+
+### 26. `output_config`, and what this server does *not* check about its schema
+
+PRD §9 resolved q53 gives every wire two structured-output mechanisms, and this
+is the Messages wire's second one: `output_config: { format: { type:
+"json_schema", schema } }`, answered with a text block that parses rather than
+with a `tool_use`.
+
+*What is certain*: that this is the **current** spelling, and that the earlier
+top-level `output_format` is deprecated. This server does not accept
+`output_format` at all — it is not in `REQUEST_KEYS`, so a request that sent one
+is refused as the unknown argument it is, which is the failure mode a compiled
+graph that regressed to the old spelling should have.
+
+*What is assumed* is the format object's key set — `type` and `schema`, and no
+`name`, unlike all three OpenAI spellings of the same idea — and, more
+importantly, **what is deliberately not checked**: whether the service refuses a
+`schema` that is not closed (`additionalProperties: false` on every object, every
+property in `required`), the way OpenAI's `strict: true` does (13). The generated
+runtime believes it does, and acts on that belief by starting an agent whose
+schema is *not* closed on the forced tool instead — a schema shape that reaches
+this parameter is therefore one the runtime already decided the format can take.
+
+*If wrong in the permissive direction* (the service takes a loose schema): the
+runtime sends such agents through the forced tool for no reason, which works and
+costs nothing but the preference. *If wrong in the other* (this server should
+refuse a loose schema here): the check belongs in `check_output_config`, and the
+test that would have caught it is the acceptance suite's
+`an_output_schema_the_native_format_could_not_close_starts_on_the_forced_tool`,
+which pins the runtime's side of the same claim.
+
+### 27. Which structured-output mechanisms an endpoint carries
+
+Every note above describes one endpoint: the vendor's, as it is today. PRD §9
+resolved q53 is about the ones that are not — a gateway a generation behind the
+wire it proxies, which 400s the native structured-output parameter, and the
+newest model generation, which 400s forced tool use — because a compiled graph
+has to work against both without being told which it is talking to.
+
+`Personality` is how a test stages one (`POST /_mock/personality`, or
+`MockProvider::personality`). It is not a scripted outcome: a mechanism the
+endpoint does not carry is refused **before** anything is taken from a queue,
+exactly as a malformed request is, because what a generated graph does about that
+refusal is send the same call again the other way — a personality that ate an
+outcome per refusal would make the ladder unscriptable.
+
+It is refused in the surface's ordinary 400 envelope, and recorded — and
+labelled — apart from a malformed one: the transcript's `verdict` says `valid`,
+its `unsupported` names the mechanism, and the response's `x-mock-provider-error`
+says `unsupported-mechanism` rather than `invalid-request` (11). The two say
+opposite things about the generated code — a rejection is a codegen bug, and this
+is the endpoint being what a test staged — so a run that laddered exactly as it
+was asked to still reads as one in which every request was composed correctly.
+
+*What is certain*: that the newest Anthropic generation answers a forced
+`tool_choice` of type `tool` or `any` with a 400, and that gateways refuse
+arguments they do not know.
+
+*What is assumed* is the four sentences, one per surface and mechanism, in
+`control::unsupported_mechanism`. They are the load-bearing part of the
+personality rather than the status is: the generated runtime decides whether to
+ladder by reading the body, so a wording no service uses would let a recognizer
+that matches nothing pass its tests. Each is one of the two families the ruling
+names — an unknown key (`output_config: Extra inputs are not permitted`,
+`Unrecognized request argument supplied: response_format`) or a key this model
+does not take (`tool_choice: type "tool" and "any" are not supported for this
+model.`, `Invalid parameter: 'tool_choice' of type 'function' is not supported
+with this model.`).
+
+*If wrong*: the recognizer is the thing to widen, not this server — it lives in
+one table in the emitted `src/runtime.ts` (`MECHANISM_KEYS`,
+`UNSUPPORTED_PARAMETER`) and being wrong in the permissive direction costs one
+extra request that also fails. `tests/mechanism_personalities.rs` pins every
+sentence here so that widening one is a diff rather than a discovery.
 
 ---
 

@@ -62,13 +62,18 @@ use serde_json::Value;
 /// from itself on every run. 2023-11-14T22:13:20Z, chosen only for being round.
 pub const CREATED: u64 = 1_700_000_000;
 
-/// The header a response carries when the *harness* refused the request rather
-/// than a provider having failed.
+/// The header a response carries when this server decided the answer itself,
+/// rather than a script having asked for one.
 ///
 /// A test that sees it knows the run never reached a scripted outcome: the
-/// request was malformed, unscripted, or asked for something the script could
-/// not render. Generated code classifies provider failures by status (5.9), so
-/// these answers deliberately carry a status no failover condition claims.
+/// request was malformed, unscripted, asked for something the script could not
+/// render, or asked this endpoint for a structured-output mechanism its
+/// [`Personality`] does not carry. The **value** is what says which of those,
+/// and a reader has to look at it rather than at the header's presence — the
+/// four say different things about whose bug it is, and only
+/// [`REFUSED_UNSUPPORTED`] is not a bug at all. Generated code classifies
+/// provider failures by status (5.9), so the three harness refusals deliberately
+/// carry a status no failover condition claims.
 pub const HARNESS_HEADER: &str = "x-mock-provider-error";
 
 /// The status every harness refusal carries.
@@ -103,6 +108,24 @@ pub const REFUSED_MISMATCH: &str = "script-mismatch";
 /// [`HARNESS_HEADER`] on a scripted outcome that could not be put on the wire at
 /// all — a `raw` outcome carrying a header name or value HTTP cannot carry.
 pub const REFUSED_UNSENDABLE: &str = "unsendable-response";
+/// [`HARNESS_HEADER`] on a **well-formed** request asking this endpoint for a
+/// structured-output mechanism its [`Personality`] does not carry (PRD §9
+/// resolved q53).
+///
+/// Apart from [`REFUSED_INVALID`] because the two say opposite things about the
+/// generated code: a malformed request is a codegen bug, and this is the
+/// endpoint being what a test staged — the same request is recorded with
+/// [`Verdict::Valid`] beside `unsupported: Some(_)`, and what the graph does
+/// about it is send the call again the other way. Labelling both `invalid-request`
+/// would put the wire response and the transcript in contradiction, and would
+/// make "no request in this run was malformed" — the natural way to assert that
+/// every request was composed correctly — fail on every correct laddering run.
+///
+/// It rides the *provider's* own 400 rather than [`HARNESS_STATUS`], because
+/// unlike the other three this refusal is one a real endpoint sends; the header
+/// is only how a reader of a transcript tells a staged one from a scripted
+/// `raw` 400.
+pub const REFUSED_UNSUPPORTED: &str = "unsupported-mechanism";
 
 /// The two refusals that happen **after** an outcome has been taken from its
 /// queue, spelled as [`RecordedRequest::served`] records them.
@@ -547,6 +570,24 @@ pub struct ServerToolUse {
     /// between the use and its result itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// What the model said **before** running this tool, if anything — the
+    /// preamble a search answer opens with (`Let me look that up.`).
+    ///
+    /// It belongs to the use rather than to the [`Reply`] because that is what
+    /// makes it a turn the service could have sent: prose, then the record of
+    /// the tool that ran, then whatever the model said knowing what it found.
+    /// The only way a turn carries two runs of assistant text is that something
+    /// separated them, and in a scripted turn that something is the server tool
+    /// this preamble belongs to — contiguous text arrives as one block on the
+    /// Messages wire and as one `message` on Responses, so a preamble with
+    /// nothing between it and the answer would be a shape neither sends.
+    ///
+    /// The two runs are what a structured-output reader has to tell apart: the
+    /// native mechanisms shape the turn's **last** run, so a runtime that parsed
+    /// the join would find `Let me look that up.{"answer":"…"}` where the object
+    /// was (PRD §9 resolved q53).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preamble: Option<String>,
 }
 
 impl ServerToolUse {
@@ -558,6 +599,17 @@ impl ServerToolUse {
             input: Some(input),
             result: Some(result),
             id: None,
+            preamble: None,
+        }
+    }
+
+    /// The same use, with what the model said before running it (see
+    /// [`ServerToolUse::preamble`]).
+    #[must_use]
+    pub fn preceded_by(self, said: impl Into<String>) -> Self {
+        Self {
+            preamble: Some(said.into()),
+            ..self
         }
     }
 }
@@ -918,12 +970,25 @@ impl Verdict {
 /// surface of PRD 5.2 — every agent declares an output schema, and codegen has
 /// to ask the provider for it in the provider's own way. A test asserts on this
 /// rather than re-walking the request body it already knows the shape of.
+///
+/// Four spellings across three wires, and [`Self::mechanism`] is the axis that
+/// matters to PRD §9 resolved q53: each wire has one **native** parameter and
+/// one **forced-tool** pin, and a generated graph rides whichever the endpoint
+/// accepts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StructuredOutput {
     /// Anthropic: a tool the request forces the model to call, whose
     /// `input_schema` is the agent's output schema.
     ForcedTool { name: String, schema: Value },
+    /// Anthropic: `output_config: { format: { type: json_schema, schema } }` —
+    /// the Messages API's own structured output (PRD §9 resolved q53).
+    ///
+    /// **Nameless**, and that is the wire's shape rather than an omission: the
+    /// forced tool's name is the compiler's own synthetic one and exists to be
+    /// pinned by `tool_choice`, while a format constrains the assistant's text
+    /// and has no call to name.
+    OutputConfig { schema: Value },
     /// OpenAI: `response_format: { type: json_schema, json_schema: {…} }`.
     JsonSchema {
         name: String,
@@ -940,19 +1005,188 @@ impl StructuredOutput {
     pub fn schema(&self) -> &Value {
         match self {
             Self::ForcedTool { schema, .. }
+            | Self::OutputConfig { schema }
             | Self::JsonSchema { schema, .. }
             | Self::ForcedFunction { schema, .. } => schema,
         }
     }
 
-    /// The name the request gave it.
+    /// The name the request gave it, on the three spellings that have one.
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> Option<&str> {
         match self {
             Self::ForcedTool { name, .. }
             | Self::JsonSchema { name, .. }
-            | Self::ForcedFunction { name, .. } => name,
+            | Self::ForcedFunction { name, .. } => Some(name),
+            Self::OutputConfig { .. } => None,
         }
+    }
+
+    /// Which of the two mechanisms this spelling is (PRD §9 resolved q53).
+    #[must_use]
+    pub fn mechanism(&self) -> OutputMechanism {
+        match self {
+            Self::OutputConfig { .. } | Self::JsonSchema { .. } => OutputMechanism::Native,
+            Self::ForcedTool { .. } | Self::ForcedFunction { .. } => OutputMechanism::ForcedTool,
+        }
+    }
+}
+
+/// Which of a wire's two ways of asking for an object a request used
+/// (PRD §9 resolved q53).
+///
+/// The same two rungs the generated runtime ladders between, spelled the same
+/// way its trace spells them (`docs/trace.md` §7) so a transcript here and a
+/// trace there use one vocabulary:
+///
+///  * `native` — the wire's own structured-output parameter: `output_config`'s
+///    `format` on the Messages wire, `response_format` on Chat Completions,
+///    `text.format` on Responses;
+///  * `forced_tool` — the synthetic output tool, pinned by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMechanism {
+    Native,
+    ForcedTool,
+}
+
+impl OutputMechanism {
+    /// How this mechanism is spelled in a control-plane document.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::ForcedTool => "forced_tool",
+        }
+    }
+}
+
+/// Which structured-output mechanisms one endpoint carries (PRD §9 resolved
+/// q53, ruling c).
+///
+/// The one thing about this server that is a property of the **endpoint** rather
+/// than of a scripted answer, and the reason it is not a [`Script`]: a mechanism
+/// this endpoint does not have is refused *before* anything is taken from a
+/// queue, exactly as a malformed request is, because a generated graph's
+/// response to that refusal is to send the **same** call again the other way. A
+/// personality that ate a scripted outcome per refusal would make the ladder
+/// unscriptable — the second, working call would find the queue one short.
+///
+/// Registered per model id, like a queue, and cleared by
+/// [`Store::reset`]. The default is the endpoint every other test in the suite
+/// has always been talking to: one that takes both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Personality {
+    /// Both mechanisms work — `api.anthropic.com` and `api.openai.com` today,
+    /// and the default for every model nothing has registered.
+    #[default]
+    NativeSupported,
+    /// A **lagging gateway**: an Anthropic- or OpenAI-compatible proxy a
+    /// generation behind the wire it forwards, which has never heard of the
+    /// native structured-output parameter and 400s it. Forced tool use works,
+    /// which is why that mechanism was the least common denominator for as long
+    /// as it was.
+    NativeRejected,
+    /// The **newest model generation**, which removed forced tool use outright
+    /// and names structured outputs as the replacement: `tool_choice` of type
+    /// `tool`/`any` is a 400 and the native parameter works.
+    ForcedToolRemoved,
+    /// Neither — the endpoint a compiled graph cannot use at all, and the one
+    /// the double-refusal diagnostic exists for.
+    BothRejected,
+}
+
+impl Personality {
+    /// Whether an endpoint of this personality carries `mechanism`.
+    #[must_use]
+    pub fn carries(self, mechanism: OutputMechanism) -> bool {
+        match (self, mechanism) {
+            (Self::NativeSupported, _) => true,
+            (Self::BothRejected, _) => false,
+            (Self::NativeRejected, mechanism) => mechanism == OutputMechanism::ForcedTool,
+            (Self::ForcedToolRemoved, mechanism) => mechanism == OutputMechanism::Native,
+        }
+    }
+
+    /// How this personality is spelled in a control-plane document.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeSupported => "native_supported",
+            Self::NativeRejected => "native_rejected",
+            Self::ForcedToolRemoved => "forced_tool_removed",
+            Self::BothRejected => "both_rejected",
+        }
+    }
+}
+
+/// One model's registered [`Personality`], as the control plane spells it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    /// The model id whose endpoint this describes.
+    pub model: String,
+    /// Which mechanisms it carries.
+    pub personality: Personality,
+}
+
+impl Endpoint {
+    /// `model`'s endpoint, with this personality.
+    #[must_use]
+    pub fn new(model: impl Into<String>, personality: Personality) -> Self {
+        Self {
+            model: model.into(),
+            personality,
+        }
+    }
+}
+
+/// How an endpoint refuses a structured-output mechanism it does not carry
+/// (PRD §9 resolved q53, ruling c).
+///
+/// **The refusal texts are the load-bearing part of the personality**, not the
+/// status: the generated runtime decides whether to ladder by reading the body,
+/// so a mock that refused with a wording no service uses would let a recognizer
+/// that matches nothing pass. Each of these is one of the two families the
+/// ruling names — an unknown key, and a key this model does not take — written
+/// in the dialect of the surface that is answering.
+///
+/// Stated once here rather than per surface module so that the four sentences a
+/// test pins and the four a run receives cannot drift apart.
+pub(crate) fn unsupported_mechanism(
+    surface: Surface,
+    mechanism: OutputMechanism,
+) -> ValidationFailure {
+    match (surface, mechanism) {
+        // The Messages API validates with pydantic, so an argument it has never
+        // heard of is an extra input — the same sentence [`crate::strict`]'s
+        // Anthropic dialect writes for every other unknown key.
+        (Surface::Anthropic, OutputMechanism::Native) => ValidationFailure::new(
+            "output_config",
+            "output_config: Extra inputs are not permitted",
+        ),
+        // …and the newest generation's own words for the mechanism it removed.
+        (Surface::Anthropic, OutputMechanism::ForcedTool) => ValidationFailure::new(
+            "tool_choice",
+            "tool_choice: type \"tool\" and \"any\" are not supported for this model.",
+        ),
+        (Surface::Responses, OutputMechanism::Native) => ValidationFailure::new(
+            "text.format",
+            "Invalid parameter: 'text.format' of type 'json_schema' is not supported with this model.",
+        ),
+        // A gateway that forwards Chat Completions for a model generation whose
+        // structured outputs it predates: the argument is not one it knows.
+        (Surface::OpenAi | Surface::AzureOpenAi, OutputMechanism::Native) => {
+            ValidationFailure::new(
+                "response_format",
+                "Unrecognized request argument supplied: response_format",
+            )
+        }
+        (_, OutputMechanism::ForcedTool) => ValidationFailure::new(
+            "tool_choice",
+            "Invalid parameter: 'tool_choice' of type 'function' is not supported with this model.",
+        ),
     }
 }
 
@@ -995,6 +1229,17 @@ pub struct RecordedRequest {
     pub server_tools: Vec<String>,
     /// How the request asked for structured output, if it did.
     pub structured_output: Option<StructuredOutput>,
+    /// The mechanism this **endpoint** refused, when its [`Personality`] does
+    /// not carry the one the request asked for (PRD §9 resolved q53).
+    ///
+    /// A refusal that is not a complaint about the request: `verdict` stays
+    /// `valid` because the request was well formed, and this is what says the
+    /// client got a 400 anyway. A generated graph answers it by sending the same
+    /// call through the other mechanism, so a transcript carrying one of these
+    /// followed by an answered call **is** the ladder, and a second run of the
+    /// same process carrying none is the memoization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsupported: Option<OutputMechanism>,
     /// What the server **answered** it with — not merely what the queue handed
     /// over.
     ///
@@ -1034,6 +1279,13 @@ impl RecordedRequest {
             .expect("the recorded request carries a JSON body")
     }
 
+    /// Whether this endpoint refused the structured-output mechanism the
+    /// request asked for ([`Self::unsupported`], PRD §9 resolved q53).
+    #[must_use]
+    pub fn was_unsupported(&self) -> bool {
+        self.unsupported.is_some()
+    }
+
     /// Whether the harness refused this call after taking its scripted
     /// outcome — a `script-mismatch` or an `unsendable-response`.
     ///
@@ -1066,6 +1318,22 @@ pub struct Snapshot {
     /// touched, this one after, which is why it needs a counter of its own for
     /// [`Self::is_drained`] to mean what it says.
     pub refused: usize,
+    /// How many well-formed requests this server refused for asking through a
+    /// structured-output mechanism the model's [`Personality`] does not carry
+    /// (PRD §9 resolved q53).
+    ///
+    /// Counted, and deliberately **not** counted by [`Self::is_drained`]: it is
+    /// the only refusal here that is a property of the endpoint a test staged
+    /// rather than of the request a graph sent, so a run that laddered exactly
+    /// as it was asked to is a clean run. What keeps that from hiding a real
+    /// failure is that it takes nothing from a queue — a graph that never sent
+    /// the second call leaves the scripted answer behind, and the queue depth
+    /// `is_drained` does read says so.
+    pub unsupported: usize,
+    /// Which models have a [`Personality`] registered, and which one — so a
+    /// test reading `/_mock/state` can see the endpoint it staged.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub personalities: BTreeMap<String, Personality>,
 }
 
 impl Snapshot {
@@ -1085,6 +1353,17 @@ pub enum Decision {
     /// Refuse: the request was malformed. The surface renders the failures into
     /// its own error shape.
     Rejected(Vec<ValidationFailure>),
+    /// Refuse: the request was **well formed** and this endpoint does not carry
+    /// the structured-output mechanism it asked for ([`Personality`], PRD §9
+    /// resolved q53).
+    ///
+    /// Rendered by the same surface method [`Self::Rejected`] is — a service
+    /// refusing an argument it does not have answers its ordinary 400 — and
+    /// recorded differently, because the two say opposite things about the
+    /// generated code: a rejection is a codegen bug, and this is the endpoint
+    /// being what it is. It takes **nothing** from the queue, so the retry that
+    /// follows it finds the scripted answer waiting.
+    Unsupported(Vec<ValidationFailure>),
     /// Refuse: the model's queue had nothing for this request.
     Unscripted { model: String, reason: String },
 }
@@ -1098,6 +1377,9 @@ pub struct Store {
 #[derive(Debug, Default)]
 struct State {
     queues: BTreeMap<String, VecDeque<Script>>,
+    /// Which structured-output mechanisms each model's endpoint carries
+    /// ([`Personality`]). Absent means the default: both.
+    personalities: BTreeMap<String, Personality>,
     requests: Vec<RecordedRequest>,
 }
 
@@ -1134,6 +1416,16 @@ impl Store {
             .push_back(script);
     }
 
+    /// Register which structured-output mechanisms one model's endpoint carries
+    /// ([`Personality`], PRD §9 resolved q53).
+    ///
+    /// Last registration wins, and [`Personality::NativeSupported`] is what a
+    /// model nothing has registered already behaves as — so this is only ever
+    /// written by a test staging an endpoint that is *not* today's.
+    pub fn set_personality(&self, model: impl Into<String>, personality: Personality) {
+        self.lock().personalities.insert(model.into(), personality);
+    }
+
     /// Every request the server has seen, in arrival order.
     #[must_use]
     pub fn requests(&self) -> Vec<RecordedRequest> {
@@ -1149,6 +1441,7 @@ impl Store {
         let mut state = self.lock();
         let snapshot = Self::snapshot_of(&state);
         state.queues.clear();
+        state.personalities.clear();
         state.requests.clear();
         snapshot
     }
@@ -1193,6 +1486,12 @@ impl Store {
                 .iter()
                 .filter(|request| request.was_refused())
                 .count(),
+            unsupported: state
+                .requests
+                .iter()
+                .filter(|request| request.was_unsupported())
+                .count(),
+            personalities: state.personalities.clone(),
         }
     }
 
@@ -1214,10 +1513,29 @@ impl Store {
             .body
             .as_ref()
             .map_or_else(|| incoming.body_text.clone(), canonical);
-        let decision = if incoming.failures.is_empty() {
-            Self::take(&mut state.queues, &incoming.model, &matched_against)
+        // What this endpoint does not carry, before what its queue holds: a
+        // mechanism refusal is decided by the *endpoint* and takes nothing, so
+        // it has to be answered ahead of the take (PRD §9 resolved q53).
+        let unsupported: Option<OutputMechanism> = if incoming.failures.is_empty() {
+            let personality = state
+                .personalities
+                .get(&incoming.model)
+                .copied()
+                .unwrap_or_default();
+            incoming.structured_output.as_ref().and_then(|asked| {
+                let mechanism = asked.mechanism();
+                (!personality.carries(mechanism)).then_some(mechanism)
+            })
         } else {
-            Decision::Rejected(incoming.failures.clone())
+            None
+        };
+
+        let decision = match (incoming.failures.is_empty(), unsupported) {
+            (false, _) => Decision::Rejected(incoming.failures.clone()),
+            (true, Some(mechanism)) => {
+                Decision::Unsupported(vec![unsupported_mechanism(incoming.surface, mechanism)])
+            }
+            (true, None) => Self::take(&mut state.queues, &incoming.model, &matched_against),
         };
 
         let verdict = if incoming.failures.is_empty() {
@@ -1231,6 +1549,7 @@ impl Store {
         let served = match &decision {
             Decision::Serve(outcome) => outcome.served().to_string(),
             Decision::Rejected(_) => "rejected".to_string(),
+            Decision::Unsupported(_) => "unsupported".to_string(),
             Decision::Unscripted { .. } => "unscripted".to_string(),
         };
 
@@ -1248,6 +1567,7 @@ impl Store {
             tools: incoming.tools,
             server_tools: incoming.server_tools,
             structured_output: incoming.structured_output,
+            unsupported,
             served,
         });
 

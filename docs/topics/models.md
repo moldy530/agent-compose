@@ -390,6 +390,104 @@ start is one neither `validate` nor a diff can see.
 **There are no inline settings overrides on agents.** Different settings means
 another named model. That is the whole reason the two namespaces exist.
 
+## How structured output rides each wire
+
+**There is nothing to configure here.** This section is for reading a trace, not
+for writing YAML: every agent declares an `output:` schema, and how that schema
+is asked for on the wire is the provider integration's problem and never yours.
+No key, no capability flag, no model table you have to keep up to date.
+
+What there *is* to know is that each wire has **two** ways of asking a model for
+an object under a schema, and they move with model generations:
+
+| wire | native | forced tool |
+|---|---|---|
+| Messages (`anthropic`) | `output_config: { format: { type: json_schema, schema } }` | a synthetic tool carrying the schema, pinned with `tool_choice: { type: "tool" }` |
+| Chat Completions (`openai`, `openai_compatible`, `azure_openai`) | `response_format: { type: json_schema, … }` | the same tool as a function, pinned with `tool_choice: { type: "function" }` |
+| Responses (`openai` with `server_tools:`) | `text.format` of type `json_schema` | the same, pinned by name |
+
+The runtime prefers the **native** parameter and keeps the forced tool as the
+other rung. A refusal that names the mechanism — a 400 for an argument the
+endpoint has never heard of, one it has but keeps behind a beta header, an API
+version or an account flag, or the newest Anthropic generation's
+`tool_choice: type "tool" and "any" are not supported for this model.` — makes it
+send the *same* call once more the other way. The rung an endpoint **refused** is
+remembered per provider-and-model for the life of the process, so only the first
+call of a pairing pays that extra round trip. Both halves of that key are load
+bearing: what one model behind a gateway refuses says nothing about the model
+beside it, and what a gateway refuses says nothing about the vendor endpoint
+serving the same model name.
+
+A proxy that **relays** the refusal it got upstream is read the same way. Behind
+a gateway you rarely see the service's own envelope: what comes back is the
+gateway's exception class or vendor label with the upstream sentence inside it —
+`litellm.BadRequestError: AnthropicException - {"…":"output_config: Extra inputs
+are not permitted"}`. What decides the ladder is the complaint that arrived, not
+the name in front of it, so a proxied deployment ladders exactly as a direct one
+does.
+
+One thing decides the order before any of that, and it is a property of the agent
+rather than of the endpoint — but only on the **Messages** wire. `output_config`
+constrains a decoder over a **closed** schema and refuses one that is not, so an
+agent whose `output:` nests an object with `optional:` properties starts on the
+forced tool there. The OpenAI wires send such a schema with `strict: false`,
+which constrains nothing and refuses nothing, so they stay on the native
+parameter. Two agents on one Anthropic model can therefore ask in two different
+ways, and a trace showing exactly that is not a bug.
+
+An agent with `tools:` still **offers** them on the call that asks for its
+output, under either mechanism — the exchange being replayed names them, so the
+request has to declare them, and the provider's own `server_tools:` are on that
+call too. The forced tool pins the answer; the native parameter shapes it without
+forbidding anything, and nothing else on that call forbids tool use either: a
+`tool_choice` that did would forbid the provider's server tools along with the
+agent's, and would make the native rung depend on a second parameter whose
+refusal the ladder cannot read — an endpoint refusing *that* would leave nowhere
+to ladder to. So on the native rung a model can answer that last turn with
+one more tool call instead of the object, and the node then fails with "asked
+for … and the answer carried no structured output", naming
+`stop_reason: tool_use` as what the surface said about why.
+That is a model ignoring a fixed instruction to produce its result, not an
+endpoint that lacks a mechanism — nothing was refused, and nothing laddered.
+
+Nothing else ladders. A 401, a 429, a 5xx, a content refusal, a schema the
+decoder will not compile, a complaint about the **conversation** rather than
+about a parameter — a strict gateway refusing a history that ends on an assistant
+turn — and a parameter refused because of **another parameter in the same
+request**, such as `output_config` beside a `settings:` key this model will not
+take it with, are refusals about something other than the mechanism, and each
+behaves exactly as it always has. The last of those is the one worth knowing
+about, because it is the only refusal here that *does* name something in your
+composition to change: you get the endpoint's own sentence, and it names the key. Including for `route_on:`, which is untouched: the
+mechanism ladder is *inside* one call to one route member, so a condition the
+working rung answers with is the route's to act on as it always was, and a route
+still fails over only on grammar 12.2's infrastructure conditions — which the
+double refusal below is not.
+
+**Where to see it.** Each model call's trace record carries `outputMechanism` —
+`"native"` or `"forced_tool"` — on the one call per agent node that asks for the
+output object (`agent-compose docs trace`). Two deployments of one composition
+can answer through different mechanisms: a gateway a generation behind the wire
+it proxies takes only the forced tool, the newest model generation takes only the
+native parameter, and the same YAML runs on both. That comparison is usually made
+on a collector rather than in two files, so a `trace_sink:` sending OTLP carries
+the same fact as `agentcompose.model.output_mechanism` on the model call's span.
+
+The ladder itself is **inside** one model call, so it does not add a record: a
+first call that discovered its rung is one `models[]` entry naming the mechanism
+that answered, and the rung that was refused leaves none. Where the extra round
+trip shows up is your provider's own request log — two requests against one
+trace record — and in that call's timing. So `outputMechanism: "forced_tool"` is
+what says the discovery happened at all, with the one exception the paragraph
+above names: on the Messages wire an agent whose schema is not closed starts
+there, and nothing was discovered.
+
+**When both are refused**, the run fails with a diagnostic quoting *both*
+refusals verbatim. That is deliberate and it is not a missing knob: the runtime
+has already tried everything the wire offers, so what is left to say is what the
+endpoint said. Read the two bodies — they name the endpoint, not your
+composition.
+
 ## Capability checks
 
 Every model an agent references must come from a provider declaring

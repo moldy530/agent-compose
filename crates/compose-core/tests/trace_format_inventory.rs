@@ -673,6 +673,7 @@ fn the_walk_reaches_every_record_the_envelope_carries() {
         "Failover",
         "HumanPause",
         "ModelCall",
+        "OutputMechanism",
         "Refusal",
         "RouteCondition",
         "RoutingDecision",
