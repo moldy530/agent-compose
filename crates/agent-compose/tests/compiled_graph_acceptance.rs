@@ -3515,12 +3515,8 @@ fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
 /// The one 400 whose sentence reads like a capability refusal without being one,
 /// and the reason the recognizer reads more than a phrase list. A strict gateway
 /// holds q52's rule — a forced `tool_choice` over a history ending on the
-/// assistant is prefill against a forced call — and words it *at the message it
-/// stopped on* while naming the mechanism's own key in the clause that says why.
-/// Both spellings of the sentence are here because the mock writes both
-/// (`crates/mock-provider/src/anthropic.rs`, `check_prefill`): the rule covers
-/// whichever way the request asked for its object, so a recognizer that fell for
-/// one would fall for the other.
+/// assistant is prefill against a forced call — and names the mechanism's own key
+/// in the clause that says why.
 ///
 /// Read as "this endpoint has no forced tool use" it would ladder — and the
 /// closing turn is composed *above* the mechanism, so the other rung carries the
@@ -3528,56 +3524,71 @@ fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
 /// the endpoint carries neither mechanism and there is nothing to configure.
 /// Every word of which would be false: what such a run has is a q52 regression,
 /// and the diagnostic would send its operator to the endpoint to look for it.
+///
+/// Four wordings, because the sentence varies in two independent ways and the
+/// defence must not depend on either:
+///
+///   * **which mechanism asked** — the mock writes both clauses
+///     (`crates/mock-provider/src/anthropic.rs`, `check_prefill`), since the rule
+///     covers whichever way the request asked for its object, so a recognizer
+///     that fell for one would fall for the other;
+///   * **whether the complaint carries an address** — `messages.3: …` is what
+///     this project's mock sends and what `WIRE-NOTES` (24) records as an
+///     *assumed* wording. A gateway that states the same rule as a bare sentence
+///     is the case where the shape-reading disqualifier has nothing to read, and
+///     the phrase family is what has to answer instead.
 #[test]
 fn a_refusal_about_the_conversations_shape_is_not_read_as_a_missing_mechanism() {
     for asked in [
         "`tool_choice` forces a tool",
         "`output_config` asks for structured output",
     ] {
-        let provider = MockProvider::start().expect("a loopback port");
-        provider.enqueue(Script::new(
-            SONNET,
-            Outcome::raw(
-                400,
-                json!({
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": format!(
-                            "messages.3: This model does not support assistant message \
-                             prefill. The conversation must end with a user message when \
-                             {asked}."
-                        ),
-                    },
-                }),
-            ),
-        ));
+        for address in ["messages.3: ", ""] {
+            let message = format!(
+                "{address}This model does not support assistant message prefill. The \
+                 conversation must end with a user message when {asked}."
+            );
+            let provider = MockProvider::start().expect("a loopback port");
+            provider.enqueue(Script::new(
+                SONNET,
+                Outcome::raw(
+                    400,
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": message.as_str(),
+                        },
+                    }),
+                ),
+            ));
 
-        let Some(run) = harness::invoke(
-            "agent-anthropic",
-            "flow.review",
-            &[("goal", "ship it"), ("draft", "a draft")],
-            &provider,
-        ) else {
-            return;
-        };
-        let failure = run.failed();
-        assert!(
-            failure.contains("assistant message prefill"),
-            "the complaint the endpoint actually made is what the node failed \
-             with, for `{asked}`: {failure}"
-        );
-        assert!(
-            !failure.contains("nothing to configure"),
-            "…and not the double-refusal diagnostic, which would be a false \
-             statement about the endpoint, for `{asked}`: {failure}"
-        );
-        assert_eq!(
-            provider.requests().len(),
-            1,
-            "…and the same illegal conversation was not sent a second time in \
-             the other shape, for `{asked}`"
-        );
+            let Some(run) = harness::invoke(
+                "agent-anthropic",
+                "flow.review",
+                &[("goal", "ship it"), ("draft", "a draft")],
+                &provider,
+            ) else {
+                return;
+            };
+            let failure = run.failed();
+            assert!(
+                failure.contains("assistant message prefill"),
+                "the complaint the endpoint actually made is what the node failed \
+                 with, for `{message}`: {failure}"
+            );
+            assert!(
+                !failure.contains("nothing to configure"),
+                "…and not the double-refusal diagnostic, which would be a false \
+                 statement about the endpoint, for `{message}`: {failure}"
+            );
+            assert_eq!(
+                provider.requests().len(),
+                1,
+                "…and the same illegal conversation was not sent a second time in \
+                 the other shape, for `{message}`"
+            );
+        }
     }
 }
 

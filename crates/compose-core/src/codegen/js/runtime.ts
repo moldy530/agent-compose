@@ -2524,6 +2524,44 @@ const ABOUT_THE_ENDPOINT: readonly string[] = [
 ];
 
 /**
+ * …and what a service says when what it will not take is the **conversation**,
+ * which outranks everything above.
+ *
+ * The one refusal family that is a statement about a request *this runtime
+ * composed* rather than about anything the endpoint has or lacks, and therefore
+ * the only one whose disqualification cannot be re-qualified: a strict gateway
+ * holding q52's rule refuses a structured-output ask over a history that ends on
+ * the assistant with `This model does not support assistant message prefill. The
+ * conversation must end with a user message when \`output_config\` asks for
+ * structured output.` — a sentence that names the rung's own key, carries "does
+ * not support", and is about neither.
+ *
+ * [`addressedElsewhere`] catches that sentence when the gateway writes it at the
+ * message it stopped on (`messages.3: …`), which is the wording this project's
+ * mock provider sends and the one its `WIRE-NOTES` (24) records as *assumed*. An
+ * assumed dialect is not a defence: the same gateway wording the same rule as a
+ * bare sentence carries no address, and a runtime whose closing turn had
+ * regressed would then send the **same illegal conversation** at the other rung,
+ * be refused for the same reason, and fail with a diagnostic saying the endpoint
+ * carries neither mechanism and there is nothing to configure — every word of
+ * which would be false, aimed at the one bug this recognizer exists to keep out
+ * of the diagnostic. So the family is spelled here too, where no address and no
+ * "for this model" beside it changes the answer.
+ *
+ * Being wrong here costs a run that could have laddered, and only for an endpoint
+ * that words a *capability* refusal in terms of prefill or of which role the last
+ * turn has — which is not a sentence about a parameter at all.
+ */
+const ABOUT_THE_CONVERSATION: readonly string[] = [
+  // The feature a trailing assistant turn is, named by every dialect that
+  // refuses it.
+  "prefill",
+  // …and the rule itself, cut short of the noun so that "user message" and
+  // "user turn" are both this sentence.
+  "must end with a user",
+];
+
+/**
  * Whether `body` names `key` as **the key itself**, rather than carrying those
  * letters inside a longer word or a longer path.
  *
@@ -2584,16 +2622,23 @@ const COMPLAINT_ADDRESS = /(?:^|[^a-z0-9_.])([a-z0-9_]+(?:\.[a-z0-9_]+)+):/g;
  * Whether this refusal is addressed at a place in the request that is **not**
  * this mechanism's parameter.
  *
- * The disqualifier a phrase list cannot spell, and the one q52 needs. A strict
- * gateway refuses a conversation ending on the assistant with `messages.3: This
- * model does not support assistant message prefill. The conversation must end
- * with a user message when `tool_choice` forces a tool.` — a sentence that
- * names `tool_choice`, says "does not support", and is not about `tool_choice`
- * at all. Read as a capability refusal it would ladder, be refused again on the
- * other rung for the same reason, and report an endpoint that "carries neither
+ * The disqualifier a phrase list cannot spell. A strict gateway refuses a
+ * conversation ending on the assistant with `messages.3: This model does not
+ * support assistant message prefill. The conversation must end with a user
+ * message when `tool_choice` forces a tool.` — a sentence that names
+ * `tool_choice`, says "does not support", and is not about `tool_choice` at all.
+ * Read as a capability refusal it would ladder, be refused again on the other
+ * rung for the same reason, and report an endpoint that "carries neither
  * mechanism … there is nothing to configure" when what the runtime has is a
  * conversation it composed wrongly — the misdirection this ladder exists to
  * avoid, aimed at the one bug that would put it there.
+ *
+ * It is the *shape* half of that defence rather than the whole of it: the
+ * address is a dialect a gateway may or may not write, so the sentence it
+ * addresses is disqualified by [`ABOUT_THE_CONVERSATION`] as well, whichever way
+ * it is worded. What this catches that a phrase list cannot is the **rest** of
+ * the family — every other complaint a service walks somewhere else in the
+ * request to make.
  *
  * An address that **is** one of this mechanism's spellings settles it the other
  * way immediately, and a body with no address at all is left to the rest of the
@@ -2619,15 +2664,16 @@ function addressedElsewhere(body: string, keys: readonly string[]): boolean {
  * is not JSON, a content refusal and a schema the decoder will not compile are
  * all *not* this, and each still reaches [`callModel`]'s route ladder as itself.
  *
- * Four things must hold at once: the status is one a service refuses a request
+ * Five things must hold at once: the status is one a service refuses a request
  * with rather than one it fails under (400, and 422 for the services that use
- * it); the complaint is not addressed at some other part of the request
- * ([`addressedElsewhere`]); the body names the key this mechanism is spelled
- * with on this wire — as that key ([`namesKey`]), not as letters inside another
- * word or a segment of a longer path; and the body carries one of the ways of
- * saying "that parameter is not one I have" without carrying one of the ways of
- * saying "that parameter's contents are wrong" that is not also a statement
- * about the endpoint ([`ABOUT_THE_ENDPOINT`]).
+ * it); the complaint is not about the **conversation** this runtime composed
+ * ([`ABOUT_THE_CONVERSATION`]); it is not addressed at some other part of the
+ * request ([`addressedElsewhere`]); the body names the key this mechanism is
+ * spelled with on this wire — as that key ([`namesKey`]), not as letters inside
+ * another word or a segment of a longer path; and the body carries one of the
+ * ways of saying "that parameter is not one I have" without carrying one of the
+ * ways of saying "that parameter's contents are wrong" that is not also a
+ * statement about the endpoint ([`ABOUT_THE_ENDPOINT`]).
  */
 function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unknown): boolean {
   if (!(error instanceof ProviderFailure)) return false;
@@ -2636,6 +2682,9 @@ function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unk
   const keys = MECHANISM_KEYS[wire][mechanism];
   const carries = (phrases: readonly string[]): boolean =>
     phrases.some((phrase) => body.includes(phrase));
+  // First, and with nothing able to re-qualify it: a refusal about the shape of
+  // the conversation is a refusal about this runtime's own request.
+  if (carries(ABOUT_THE_CONVERSATION)) return false;
   if (carries(NOT_ABOUT_THE_MECHANISM) && !carries(ABOUT_THE_ENDPOINT)) return false;
   if (addressedElsewhere(body, keys)) return false;
   if (!keys.some((key) => namesKey(body, key))) return false;

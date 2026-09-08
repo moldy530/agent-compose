@@ -437,11 +437,15 @@ for … and the answer carried no structured output", naming
 That is a model ignoring a fixed instruction to produce its result, not an
 endpoint that lacks a mechanism — nothing was refused, and nothing laddered.
 
-Nothing else ladders. A 401, a 429, a 5xx, a content refusal and a schema the
-decoder will not compile are refusals about something other than the mechanism,
-and each behaves exactly as it always has — including for `route_on:`, which is
-untouched: the mechanism ladder is *inside* one call to one route member, and a
-route still fails over only on grammar 12.2's infrastructure conditions.
+Nothing else ladders. A 401, a 429, a 5xx, a content refusal, a schema the
+decoder will not compile, and a complaint about the **conversation** rather than
+about a parameter — a strict gateway refusing a history that ends on an assistant
+turn — are refusals about something other than the mechanism, and each behaves
+exactly as it always has. Including for `route_on:`, which is untouched: the
+mechanism ladder is *inside* one call to one route member, so a condition the
+working rung answers with is the route's to act on as it always was, and a route
+still fails over only on grammar 12.2's infrastructure conditions — which the
+double refusal below is not.
 
 **Where to see it.** Each model call's trace record carries `outputMechanism` —
 `"native"` or `"forced_tool"` — on the one call per agent node that asks for the
