@@ -6,6 +6,8 @@
 
 **PRD discipline**: new design questions land in the PRD's Open Questions section and must be resolved (moved to the Resolved Questions log, with rationale in the relevant section) before implementing the affected area. Never implement against an unresolved question.
 
+**Collision check — before drafting any new question or campaign spec, re-read the FULL Resolved Questions log** (and the grammar's decision log for grammar-facing surfaces). Session context gets compacted; memory of what already shipped does not survive it, and the PRD does. A proposal that touches tools, triggers, deploy keys, the trace, or the wire must name every existing resolved question and decision it builds on, amends, or supersedes — a spec that says "the two valid names" without knowing a prior question already shipped four is how q54 silently superseded q31's builtin set and left the owner ratifying the collision after the fact. Supersession is a legitimate outcome, but it is the owner's call, made in the question text before the campaign runs — never an implementer's inference from an incomplete spec.
+
 ## Stack
 
 - **Compiler/CLI**: Rust, shipped as a single static binary (`agent-compose`). Parse → resolve → validate → codegen, no language-runtime dependency. `validate` must stay in the millisecond budget.
