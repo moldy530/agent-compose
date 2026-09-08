@@ -1452,6 +1452,13 @@ fn tool_use_block(sequence: u64, index: usize, name: &str, input: &Value) -> Val
 /// tool's `name` comes off that same declaration — the Messages wire carries
 /// both, and the result block is named after the name rather than the dated
 /// type.
+///
+/// A use that scripted a **preamble** ([`ServerToolUse::preamble`]) puts a
+/// `text` block in front of its own two: what the model said before the tool
+/// ran. That is the one composition in which a turn carries two runs of
+/// assistant text — the API normalises contiguous text into a single block — and
+/// it is the composition a native structured-output reader has to get right,
+/// because the format shaped the run at the *end* (PRD §9 resolved q53).
 fn server_tool_blocks(
     sequence: u64,
     request: &Value,
@@ -1459,6 +1466,18 @@ fn server_tool_blocks(
 ) -> Result<Vec<Value>, Answer> {
     let mut blocks = Vec::new();
     for (index, use_) in uses.iter().enumerate() {
+        if let Some(said) = &use_.preamble {
+            if said.is_empty() {
+                return Err(mismatch(
+                    sequence,
+                    "the script runs a server tool preceded by the empty string: \
+                     `{\"type\": \"text\", \"text\": \"\"}` is a block the Messages API refuses, \
+                     so a turn opening with one is not an answer it can send. Drop the preamble, \
+                     or script a `raw` response",
+                ));
+            }
+            blocks.push(text_block(said));
+        }
         let Some(name) = declared_server_tool(request, &use_.type_name) else {
             return Err(mismatch(
                 sequence,
@@ -2056,6 +2075,65 @@ mod tests {
         assert!(
             answer.body.to_string().contains("does not declare"),
             "the refusal says the request never offered it as a server tool: {answer:?}"
+        );
+    }
+
+    /// What the model said **before** a server tool ran is a `text` block ahead
+    /// of the tool's own two — the one composition in which a Messages turn
+    /// carries two runs of assistant text, and the one a native
+    /// structured-output reader has to get right (PRD §9 resolved q53).
+    #[test]
+    fn a_scripted_preamble_precedes_the_server_tools_own_blocks() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "web_search_20250305", "name": "web_search" }],
+        }));
+        let blocks = server_tool_blocks(
+            7,
+            &request,
+            &[crate::control::ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "does it?" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            )
+            .preceded_by("Let me search.")],
+        )
+        .expect("a declared server tool");
+        let kinds: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| block.get("type").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            kinds,
+            ["text", "server_tool_use", "web_search_tool_result"],
+            "the prose the model wrote first comes first: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["text"], "Let me search.");
+    }
+
+    /// …and the empty string is not a preamble: the API refuses an empty `text`
+    /// block, so a turn opening with one is not an answer it can send.
+    #[test]
+    fn an_empty_preamble_is_refused() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "web_search_20250305", "name": "web_search" }],
+        }));
+        let refusal = server_tool_blocks(
+            7,
+            &request,
+            &[
+                crate::control::ServerToolUse::new("web_search_20250305", json!({}), Value::Null)
+                    .preceded_by(""),
+            ],
+        );
+        let Err(Answer::Respond(answer)) = refusal else {
+            panic!("an empty text block is not one this API sends");
+        };
+        assert_eq!(answer.status, HARNESS_STATUS, "{answer:?}");
+        assert!(
+            answer.body.to_string().contains("the empty string"),
+            "the refusal names what the script wrote: {answer:?}"
         );
     }
 

@@ -646,7 +646,7 @@ fn reply_answer(
                     },
                 );
             }
-            output.push(message_item(sequence, text));
+            output.push(message_item(sequence, output.len(), text));
         }
         // Where the object goes is the request's decision (PRD §9 resolved
         // q53): the shaped final message under `text.format`, and the pinned
@@ -672,7 +672,7 @@ fn reply_answer(
                     "status": "completed",
                 }));
             }
-            Some(_) => output.push(message_item(sequence, &canonical(value))),
+            Some(_) => output.push(message_item(sequence, output.len(), &canonical(value))),
         },
         ReplyBody::Tools {
             calls: scripted,
@@ -687,7 +687,7 @@ fn reply_answer(
                 );
             }
             if let Some(text) = text {
-                output.push(message_item(sequence, text));
+                output.push(message_item(sequence, output.len(), text));
             }
             for (index, call) in scripted.iter().enumerate() {
                 if !offered.contains(&call.name) {
@@ -774,10 +774,15 @@ fn reply_answer(
 }
 
 /// One assistant `message` item carrying text.
-fn message_item(sequence: u64, text: &str) -> Value {
+///
+/// `index` is the item's own position in the turn, and it is in the id because a
+/// turn can carry **more than one** `message`: a preamble before a server tool
+/// ran and the answer after it are two items, and two items of one response
+/// sharing an id would be a shape no service sends.
+fn message_item(sequence: u64, index: usize, text: &str) -> Value {
     json!({
         "type": "message",
-        "id": format!("msg_mock_{sequence:08}"),
+        "id": format!("msg_mock_{sequence:08}_{index}"),
         "status": "completed",
         "role": "assistant",
         "content": [{ "type": "output_text", "text": text, "annotations": [] }],
@@ -793,6 +798,13 @@ fn message_item(sequence: u64, text: &str) -> Value {
 ///
 /// Held to the request the same way the Messages wire's is: a provider runs only
 /// the server tools its `tools` array carries.
+///
+/// A use that scripted a **preamble** ([`ServerToolUse::preamble`]) puts a
+/// `message` item in front of its own: what the model said before the tool ran.
+/// That is what makes a turn carry two `message` items, which is the shape a
+/// native structured-output reader has to get right — `text.format` shapes the
+/// **last** message and says nothing about the ones before it (PRD §9 resolved
+/// q53).
 fn server_tool_items(
     sequence: u64,
     request: &Value,
@@ -800,6 +812,17 @@ fn server_tool_items(
 ) -> Result<Vec<Value>, Answer> {
     let mut items = Vec::new();
     for (index, use_) in uses.iter().enumerate() {
+        if let Some(said) = &use_.preamble {
+            if said.is_empty() {
+                return Err(mismatch(
+                    sequence,
+                    "the script runs a server tool preceded by the empty string: a `message` item \
+                     whose only `output_text` is empty is not a turn this API sends. Drop the \
+                     preamble, or script a `raw` response",
+                ));
+            }
+            items.push(message_item(sequence, items.len(), said));
+        }
         if !declares_server_tool(request, &use_.type_name) {
             return Err(mismatch(
                 sequence,

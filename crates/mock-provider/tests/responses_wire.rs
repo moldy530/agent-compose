@@ -271,6 +271,70 @@ fn a_scripted_server_tool_use_is_woven_into_the_turn() {
     assert_eq!(output[1]["type"], "message");
 }
 
+/// A use scripted with a **preamble** puts what the model said first in a
+/// `message` item of its own, so the turn carries two — which is the shape
+/// `text.format` shapes only the **last** of (PRD §9 resolved q53).
+///
+/// The two items are distinct answers to distinct questions, and a reader that
+/// flattened them would find `Let me look that up.{"verdict":"approve"}` where
+/// the object was. The ids say the same thing: one response, two items, two ids.
+#[test]
+fn a_preamble_is_a_message_item_of_its_own_ahead_of_the_use() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search",
+                json!({ "type": "search", "query": "agent-compose" }),
+                json!([{ "url": "https://docs.example.com/a", "title": "A" }]),
+            )
+            .preceded_by("Let me look that up."),
+        ]),
+    ));
+
+    let body = send(&provider.client(), &structured_request()).json();
+    let output = body["output"].as_array().expect("an output list");
+    let kinds: Vec<&str> = output
+        .iter()
+        .filter_map(|item| item["type"].as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["message", "web_search_call", "message"],
+        "prose, the search it announced, then the shaped answer: {output:?}"
+    );
+    assert_eq!(output[0]["content"][0]["text"], "Let me look that up.");
+    assert_eq!(output[2]["content"][0]["text"], "{\"verdict\":\"approve\"}");
+    assert_ne!(
+        output[0]["id"], output[2]["id"],
+        "two items of one turn, two ids: {output:?}"
+    );
+}
+
+/// …and the empty string is not a preamble: a `message` whose only `output_text`
+/// is empty is not a turn this API sends.
+#[test]
+fn an_empty_preamble_is_refused_on_this_wire() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })).with_server_tools(vec![
+            ServerToolUse::new("web_search", json!({}), json!([])).preceded_by(""),
+        ]),
+    ));
+
+    let response = send(&provider.client(), &structured_request());
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert!(
+        response.json()["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("the empty string")),
+        "the refusal names what the script wrote: {}",
+        response.json()
+    );
+}
+
 /// A provider runs only the server tools it was given: a script naming one the
 /// request does not declare is the harness bug it looks like.
 #[test]

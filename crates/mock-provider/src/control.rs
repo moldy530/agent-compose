@@ -570,6 +570,24 @@ pub struct ServerToolUse {
     /// between the use and its result itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// What the model said **before** running this tool, if anything — the
+    /// preamble a search answer opens with (`Let me look that up.`).
+    ///
+    /// It belongs to the use rather than to the [`Reply`] because that is what
+    /// makes it a turn the service could have sent: prose, then the record of
+    /// the tool that ran, then whatever the model said knowing what it found.
+    /// The only way a turn carries two runs of assistant text is that something
+    /// separated them, and in a scripted turn that something is the server tool
+    /// this preamble belongs to — contiguous text arrives as one block on the
+    /// Messages wire and as one `message` on Responses, so a preamble with
+    /// nothing between it and the answer would be a shape neither sends.
+    ///
+    /// The two runs are what a structured-output reader has to tell apart: the
+    /// native mechanisms shape the turn's **last** run, so a runtime that parsed
+    /// the join would find `Let me look that up.{"answer":"…"}` where the object
+    /// was (PRD §9 resolved q53).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preamble: Option<String>,
 }
 
 impl ServerToolUse {
@@ -581,6 +599,17 @@ impl ServerToolUse {
             input: Some(input),
             result: Some(result),
             id: None,
+            preamble: None,
+        }
+    }
+
+    /// The same use, with what the model said before running it (see
+    /// [`ServerToolUse::preamble`]).
+    #[must_use]
+    pub fn preceded_by(self, said: impl Into<String>) -> Self {
+        Self {
+            preamble: Some(said.into()),
+            ..self
         }
     }
 }
