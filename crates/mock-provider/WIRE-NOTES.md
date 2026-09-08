@@ -858,6 +858,72 @@ this list grows, which is the same intended failure mode as the accepted-key
 lists below: a silently accepted unknown key is how a bound stops taking effect
 without anyone noticing.
 
+### 26. `output_config`, and what this server does *not* check about its schema
+
+PRD §9 resolved q53 gives every wire two structured-output mechanisms, and this
+is the Messages wire's second one: `output_config: { format: { type:
+"json_schema", schema } }`, answered with a text block that parses rather than
+with a `tool_use`.
+
+*What is certain*: that this is the **current** spelling, and that the earlier
+top-level `output_format` is deprecated. This server does not accept
+`output_format` at all — it is not in `REQUEST_KEYS`, so a request that sent one
+is refused as the unknown argument it is, which is the failure mode a compiled
+graph that regressed to the old spelling should have.
+
+*What is assumed* is the format object's key set — `type` and `schema`, and no
+`name`, unlike all three OpenAI spellings of the same idea — and, more
+importantly, **what is deliberately not checked**: whether the service refuses a
+`schema` that is not closed (`additionalProperties: false` on every object, every
+property in `required`), the way OpenAI's `strict: true` does (13). The generated
+runtime believes it does, and acts on that belief by starting an agent whose
+schema is *not* closed on the forced tool instead — a schema shape that reaches
+this parameter is therefore one the runtime already decided the format can take.
+
+*If wrong in the permissive direction* (the service takes a loose schema): the
+runtime sends such agents through the forced tool for no reason, which works and
+costs nothing but the preference. *If wrong in the other* (this server should
+refuse a loose schema here): the check belongs in `check_output_config`, and the
+test that would have caught it is the acceptance suite's
+`an_output_schema_the_native_format_could_not_close_starts_on_the_forced_tool`,
+which pins the runtime's side of the same claim.
+
+### 27. Which structured-output mechanisms an endpoint carries
+
+Every note above describes one endpoint: the vendor's, as it is today. PRD §9
+resolved q53 is about the ones that are not — a gateway a generation behind the
+wire it proxies, which 400s the native structured-output parameter, and the
+newest model generation, which 400s forced tool use — because a compiled graph
+has to work against both without being told which it is talking to.
+
+`Personality` is how a test stages one (`POST /_mock/personality`, or
+`MockProvider::personality`). It is not a scripted outcome: a mechanism the
+endpoint does not carry is refused **before** anything is taken from a queue,
+exactly as a malformed request is, because what a generated graph does about that
+refusal is send the same call again the other way — a personality that ate an
+outcome per refusal would make the ladder unscriptable.
+
+*What is certain*: that the newest Anthropic generation answers a forced
+`tool_choice` of type `tool` or `any` with a 400, and that gateways refuse
+arguments they do not know.
+
+*What is assumed* is the four sentences, one per surface and mechanism, in
+`control::unsupported_mechanism`. They are the load-bearing part of the
+personality rather than the status is: the generated runtime decides whether to
+ladder by reading the body, so a wording no service uses would let a recognizer
+that matches nothing pass its tests. Each is one of the two families the ruling
+names — an unknown key (`output_config: Extra inputs are not permitted`,
+`Unrecognized request argument supplied: response_format`) or a key this model
+does not take (`tool_choice: type "tool" and "any" are not supported for this
+model.`, `Invalid parameter: 'tool_choice' of type 'function' is not supported
+with this model.`).
+
+*If wrong*: the recognizer is the thing to widen, not this server — it lives in
+one table in the emitted `src/runtime.ts` (`MECHANISM_KEYS`,
+`UNSUPPORTED_PARAMETER`) and being wrong in the permissive direction costs one
+extra request that also fails. `tests/mechanism_personalities.rs` pins every
+sentence here so that widening one is a diff rather than a discovery.
+
 ---
 
 ## Accepted-key lists are curated, not exhaustive

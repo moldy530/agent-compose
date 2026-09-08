@@ -131,6 +131,36 @@ agent.researcher:
       description: What was found, as text.
       type: string
 
+agent.loose_reviewer:
+  description: A reviewer whose output nests an object no decoder can close.
+  # The one agent here whose `output:` is **not** strictable (grammar 3.4's
+  # `optional:` on a nested object), which is what makes it the fixture for the
+  # rung a structured-output call starts on when the wire's native format could
+  # not take the schema at all (PRD §9 resolved q53). Everything else about it
+  # is `agent.reviewer`.
+  model: model.smart
+  prompt: |
+    You are a meticulous technical reviewer.
+  input:
+    goal:
+      description: What the draft must accomplish.
+      type: string
+  output:
+    verdict:
+      description: The routable decision.
+      enum: [approve, revise]
+    detail:
+      description: The parts of the review, one of which may be omitted.
+      type: object
+      properties:
+        headline:
+          description: The one-line verdict.
+          type: string
+        aside:
+          description: An optional remark — the property that opens the schema.
+          type: string
+      optional: [aside]
+
 flow.review:
   description: Review one draft and return the verdict.
   inputs:
@@ -255,4 +285,22 @@ flow.research_pair:
   edges:
     - { from: start, to: research }
     - { from: research, to: review }
+    - { from: review, to: end }
+
+flow.loose_review:
+  description: One call whose output schema the native format could not close.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+  nodes:
+    review:
+      agent: agent.loose_reviewer
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: review }
     - { from: review, to: end }

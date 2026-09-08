@@ -68,6 +68,7 @@ const REQUEST_KEYS: &[&str] = &[
     "metadata",
     "tools",
     "tool_choice",
+    "output_config",
     "thinking",
     "service_tier",
 ];
@@ -125,12 +126,24 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
             "messages: Requests which include `tool_use` or `tool_result` blocks must define tools.",
         );
     }
+    let format = check_output_config(&mut checker, body);
     check_streaming(&mut checker, body);
 
-    let structured_output = forced.and_then(|name| {
-        let schema = tool_schema(body, &name)?;
-        Some(StructuredOutput::ForcedTool { name, schema })
-    });
+    // The wire's two structured-output mechanisms, and the order is the answer
+    // to "which one is this request asking through" (PRD §9 resolved q53). A
+    // compiled graph sends **one**: `output_config` shapes the assistant's text
+    // and a pinned `tool_choice` promises a call, and a request carrying both
+    // would be asking for the answer in two places at once. The forced tool
+    // wins where a body somehow carries the pair, for the reason
+    // [`crate::openai`]'s `structured_destination` gives on its own surface — a
+    // pin decides whether the turn has text at all, so reading the other one
+    // would describe an answer this API cannot send.
+    let structured_output = forced
+        .and_then(|name| {
+            let schema = tool_schema(body, &name)?;
+            Some(StructuredOutput::ForcedTool { name, schema })
+        })
+        .or(format);
 
     Parsed {
         model,
@@ -573,6 +586,54 @@ fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
             ),
         );
     }
+}
+
+/// `output_config`, and the structured output it asks for (PRD §9 resolved q53).
+///
+/// The Messages API's **own** structured output, and the mechanism a compiled
+/// graph prefers on this wire: `output_config: { format: { type: "json_schema",
+/// schema } }`, answered with a text block that parses rather than with a call.
+///
+/// Two things about the shape are checked because they are the two a codegen bug
+/// takes. The parameter is the **current** spelling: the earlier top-level
+/// `output_format` is deprecated, is not in [`REQUEST_KEYS`], and a request that
+/// sent it is refused as the unknown argument it now is. And the format object
+/// is closed to `type` and `schema` — there is no `name` here, unlike every
+/// OpenAI spelling of the same idea, because a format constrains the assistant's
+/// text and has no call to name; a `name` beside it is a key this server has
+/// never seen the API take.
+///
+/// What is **not** checked is whether the schema is closed enough for the
+/// service's decoder to compile. `WIRE-NOTES` (26) records that as an
+/// unconfirmed assumption with what would settle it: the generated runtime never
+/// sends a schema it believes this format would refuse — it starts such an agent
+/// on the forced tool instead — so a check here would be this server asserting a
+/// rule it cannot confirm against a request that never arrives.
+fn check_output_config(
+    checker: &mut Checker,
+    body: &Map<String, Value>,
+) -> Option<StructuredOutput> {
+    let config = checker
+        .optional("", body, "output_config", Kind::Object)?
+        .as_object()?;
+    checker.closed("output_config", config, &["format"]);
+    let format = checker
+        .optional("output_config", config, "format", Kind::Object)?
+        .as_object()?;
+    checker.closed("output_config.format", format, &["type", "schema"]);
+    let kind = checker.required("output_config.format", format, "type")?;
+    checker.one_of("output_config.format.type", kind, &["json_schema"])?;
+    let schema = checker.required_object("output_config.format", format, "schema")?;
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        checker.fail(
+            "output_config.format.schema.type",
+            "output_config.format.schema.type: Input should be 'object'",
+        );
+        return None;
+    }
+    Some(StructuredOutput::OutputConfig {
+        schema: Value::Object(schema.clone()),
+    })
 }
 
 /// The schema a named tool declares.
@@ -1028,18 +1089,44 @@ fn reply_answer(
                     ),
                 );
             }
-            (vec![text_block(text)], "end_turn")
-        }
-        ReplyBody::Structured(value) => {
-            let Some(StructuredOutput::ForcedTool { name, .. }) = structured else {
+            // The same rule for this wire's other mechanism (PRD §9 resolved
+            // q53), and the same reason: `output_config`'s format constrains the
+            // decoder, so the text of such a turn parses. Free prose there is a
+            // turn the API cannot send, and a codegen PR that scripted one would
+            // be testing its parser against an answer no service produces.
+            if matches!(structured, Some(StructuredOutput::OutputConfig { .. })) {
                 return mismatch(
                     sequence,
-                    "a `structured` reply needs a request that forces a tool: this one carries no \
-                     `tool_choice: {type: \"tool\", name: …}`, so there is no schema to answer",
+                    "a `text` reply cannot answer a request carrying `output_config: {format: \
+                     {type: \"json_schema\", …}}`: the Messages API shapes that turn's text into \
+                     the schema, never into free prose. Script `structured` for the object the \
+                     agent should produce, or `raw` for a response generated code must reject",
                 );
-            };
-            (vec![tool_use_block(sequence, 0, name, value)], "tool_use")
+            }
+            (vec![text_block(text)], "end_turn")
         }
+        // Where the object goes is the request's decision, not the script's
+        // (PRD §9 resolved q53): a pinned tool is answered with a `tool_use`
+        // block, and `output_config`'s format is answered with the text it
+        // shaped. A test writes the object either way and never the wire shape,
+        // which is what lets one script drive both mechanisms.
+        ReplyBody::Structured(value) => match structured {
+            Some(StructuredOutput::ForcedTool { name, .. }) => {
+                (vec![tool_use_block(sequence, 0, name, value)], "tool_use")
+            }
+            Some(StructuredOutput::OutputConfig { .. }) => {
+                (vec![text_block(&canonical(value))], "end_turn")
+            }
+            _ => {
+                return mismatch(
+                    sequence,
+                    "a `structured` reply needs a request that asked for structured output: this \
+                     one carries neither `tool_choice: {type: \"tool\", name: …}` nor \
+                     `output_config: {format: {type: \"json_schema\", …}}`, so there is no schema \
+                     to answer",
+                );
+            }
+        },
         ReplyBody::Tools { calls, text } => {
             // The mirror of the two refusals above, in the other direction: a
             // request may make tool use *impossible* as surely as it can pin it,
@@ -1999,7 +2086,7 @@ mod tests {
         assert_eq!(
             parsed
                 .structured_output
-                .map(|output| output.name().to_string()),
+                .and_then(|output| output.name().map(str::to_string)),
             Some("extract".to_string())
         );
     }
@@ -2076,7 +2163,7 @@ mod tests {
         assert_eq!(
             parsed
                 .structured_output
-                .map(|output| output.name().to_string()),
+                .and_then(|output| output.name().map(str::to_string)),
             Some("extract".to_string())
         );
 

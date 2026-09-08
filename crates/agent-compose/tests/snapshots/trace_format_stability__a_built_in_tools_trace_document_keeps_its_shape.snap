@@ -86,6 +86,7 @@ expression: held
           "failovers": [],
           "fallback": 0,
           "model": "model.claude",
+          "outputMechanism": "native",
           "servedBy": "model.claude"
         }
       ],

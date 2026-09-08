@@ -18,6 +18,7 @@ expression: document(&run)
           ],
           "fallback": 1,
           "model": "model.default",
+          "outputMechanism": "native",
           "servedBy": "model.fast"
         }
       ],

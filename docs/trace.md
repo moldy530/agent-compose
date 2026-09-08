@@ -664,6 +664,7 @@ reader infers from a provider's own logs.
 | `fallback` | integer | with `servedBy` | Its ordinal in the route, `0` for the first — so `1` reads as "fallback #1". |
 | `failovers` | array of [refusals](#71-refusals) | always, possibly empty | Every member that refused **and moved the ladder on**, in the order they were tried. Empty on every call that did not fail over — a direct binding's, and a route whose first member answered — which is most of them. |
 | `refused` | [refusal](#71-refusals) | when no member answered | What ended the call. Such a record carries no `servedBy` and no `fallback`. |
+| `outputMechanism` | `OutputMechanism` | on an answered call that asked for structured output | Which of the answering wire's two ways of asking for an object under a schema produced this answer: `"native"` — the wire's own structured-output parameter (`output_config`'s `format` on the Messages wire, `response_format` on Chat Completions, `text.format` on Responses), whose object arrives as the assistant's text — or `"forced_tool"` — the synthetic output tool pinned by name, whose object arrives as that call's arguments. See [§7.5](#75-which-mechanism-answered). |
 | `toolCalls` | array of [tool calls](#73-tool-calls) | when this call's answer asked for at least one and the loop resolved it | What the model asked the agent's tools to do, in the order its answer asked, and what became of each (§7.3). Never empty: a call whose answer asked for none carries no key, and the pinned structured-output call that ends a loop is always one of those. A call that **ended the node** — a `"failed"` one — is the last entry rather than a missing one: the calls after it in the same answer never ran, and are absent because they did not happen. A `"refused"` one is not the last of anything: every call of an answer comes back to the model, refused or not, so the records after it exist — grammar D119 is that rule, and names the one wire shape that carries a refusal outside its own call's id. The one tool call with no entry is the one a node deadline caught **mid-flight** (§5.3), which resolved neither a result nor a failure; where it was the first the answer asked for, this key is absent rather than empty. |
 
 Every record therefore carries exactly one of the two accounts of how it ended:
@@ -794,6 +795,40 @@ it is: the command's **output**, the file's **contents**, the arguments of any
 other tool, and the resolved workspace. `stdout`, `stderr` and a file view are
 the tool's *answer* and stay under §11's rule with every other tool's; the
 journal holds them, and §11 says why that is a different artifact.
+
+### 7.5 Which mechanism answered
+
+`outputMechanism`, on the §7 record of a **structured-output** call — the pinned
+call that ends an agent node, and no other. PRD resolved q53 ruling b is
+the decision behind it: how an agent's `output:` contract is asked for on the
+wire is handled inside the provider integration and is **never** a consumer
+surface — no YAML key, no capability flag, no shipped model table — and the
+trace is the one place it surfaces at all.
+
+Every wire this runtime speaks has two ways of asking for an object under a
+schema, and the runtime prefers the wire's own native parameter and falls back to
+the synthetic output tool when the endpoint refuses the first with a
+capability-shaped 400 (or the reverse, for the model generation that has removed
+forced tool use). Which one answered is therefore a property of the **endpoint**
+rather than of the composition: one spec deployed against a gateway a generation
+behind and against the newest model generation answers through different
+mechanisms, with the same YAML on both. Without this field a reader comparing two
+traces of one spec — or reading the extra round trip a laddered first call cost —
+has nothing to read it off.
+
+The field is on the calls that asked for an object and on nothing else. A tool
+loop's calls pin nothing, so there is no mechanism to name, and their records
+carry no key at all. A call **replayed from a journal** carries what that journal
+recorded, so one written before this field existed carries none — the same
+compatible reading `docs/durability.md` §11.2 gives every field added to a record
+type.
+
+**This is an addition rather than a change**, under §10.2's first bullet: a field
+added to an existing record type. A reader written against `trace_version` 4 sees
+a key it does not recognize and ignores it, which is what §10.1 already requires
+of it. No version bump, nothing recorded before is recorded differently, and
+§11's exclusions are untouched — the mechanism is a fact about the *request's*
+shape, not about the prompt, the answer, or anything a provider was told.
 
 ---
 
@@ -968,7 +1003,8 @@ At a given `trace_version`, a reader MAY rely on:
   `HumanPause.settled`,
   `StoreRecord.op`,
   `StoreRecord.effect`, `StoreRecord.via`, `StoreRecord.scope`, a refusal's
-  `condition`, and an edge decision's `reason` — the last being a closed
+  `condition`, a model call's `outputMechanism`, and an edge decision's
+  `reason` — the last being a closed
   vocabulary spelled as a sentence, which §4.1 enumerates and the MUST NOT below
   names as the one message-shaped field a reader may match on. `op` is the one
   whose type in `src/runtime.ts` is `string` rather than the union — the union is

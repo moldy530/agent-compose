@@ -87,10 +87,118 @@ fn a_scripted_structured_output_arrives_as_forced_tool_use() {
         recorded[0]
             .structured_output
             .as_ref()
-            .map(|output| output.name()),
+            .and_then(|output| output.name()),
         Some("reviewer_output")
     );
     assert!(provider.snapshot().is_drained(), "the script was consumed");
+}
+
+/// The wire's **other** structured-output mechanism: `output_config`'s format,
+/// answered with a text block that parses (PRD §9 resolved q53,
+/// `WIRE-NOTES` (26)).
+///
+/// The same scripted object as the test above, and the script says nothing about
+/// which mechanism asked — the *request* decides where the object goes, which is
+/// what lets one script drive both rungs of the runtime's ladder.
+#[test]
+fn an_output_config_structured_output_arrives_as_the_assistant_text() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "" })),
+    ));
+
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "max_tokens": 4096,
+            "system": "You are a meticulous technical reviewer.",
+            "messages": [{ "role": "user", "content": "{\"goal\":\"ship it\"}" }],
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "verdict": { "type": "string", "enum": ["approve", "revise"] },
+                            "feedback": { "type": "string" },
+                        },
+                        "required": ["verdict", "feedback"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+        }),
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["stop_reason"], "end_turn", "no call ended this turn");
+    assert_eq!(body["content"][0]["type"], "text");
+    let text = body["content"][0]["text"]
+        .as_str()
+        .expect("the format shaped the assistant's text")
+        .to_string();
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).expect("which parses"),
+        json!({ "verdict": "approve", "feedback": "" })
+    );
+
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert!(
+        recorded[0].tools.is_empty(),
+        "this mechanism declares no tool at all: {:?}",
+        recorded[0].tools
+    );
+    assert_eq!(
+        recorded[0]
+            .structured_output
+            .as_ref()
+            .map(mock_provider::StructuredOutput::mechanism),
+        Some(mock_provider::OutputMechanism::Native)
+    );
+    assert_eq!(
+        recorded[0]
+            .structured_output
+            .as_ref()
+            .and_then(|output| output.name()),
+        None,
+        "…and no name: a format constrains the text and has no call to name"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The **deprecated** spelling is not this wire's parameter, and a request that
+/// sent one is refused as the unknown argument it is (`WIRE-NOTES` (26)).
+///
+/// The failure mode a compiled graph that regressed to `output_format` should
+/// have: refused here, in CI, rather than accepted by a server more forgiving
+/// than the API.
+#[test]
+fn the_deprecated_output_format_spelling_is_an_unknown_argument() {
+    let provider = MockProvider::start().expect("a port");
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "output_format": { "type": "json_schema", "schema": { "type": "object" } },
+        }),
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(response.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    let recorded = provider.requests();
+    assert!(!recorded[0].is_valid());
+    assert_eq!(
+        recorded[0].failures()[0].message,
+        "output_format: Extra inputs are not permitted"
+    );
+    assert_eq!(
+        recorded[0].unsupported, None,
+        "a malformed request is not an endpoint refusing a mechanism"
+    );
 }
 
 /// The tool surface a request carries is observable, in request order.

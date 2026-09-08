@@ -1,6 +1,6 @@
 //! The connection loop and the routing table.
 //!
-//! Nine routes and nothing else. Two are model surfaces, three more are the
+//! Ten routes and nothing else. Two are model surfaces, three more are the
 //! Azure spellings of one of them, two are the embeddings surface a `vector`
 //! store's `embed:` reaches (grammar 11.2), and the rest is the control plane
 //! under `/_mock/`. Anything else is a 404 that says so in the harness's own
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::control::{
-    Decision, Delay, HARNESS_HEADER, Incoming, Outcome, Script, Store, Surface, canonical,
+    Decision, Delay, Endpoint, HARNESS_HEADER, Incoming, Outcome, Script, Store, Surface, canonical,
 };
 use crate::wire::{Answer, HARNESS_STATUS, MISMATCH, Response as Wire, UNSENDABLE};
 use crate::{anthropic, openai, responses};
@@ -187,6 +187,11 @@ fn route(
         // [`embeddings`].
         ("POST", "/v1/embeddings") | ("POST", "/openai/v1/embeddings") => embeddings(bytes),
         ("POST", "/_mock/enqueue") => enqueue(store, bytes),
+        // Which structured-output mechanisms a model's endpoint carries
+        // (PRD §9 resolved q53). Its own route rather than a key on a `Script`,
+        // for [`crate::control::Personality`]'s reason: it is a property of the
+        // endpoint, and the refusal it produces takes nothing from a queue.
+        ("POST", "/_mock/personality") => personality(store, bytes),
         ("POST", "/_mock/reset") => {
             let discarded = store.reset();
             ok(json!({ "discarded": discarded })).answer()
@@ -333,7 +338,13 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
                 let answer = anthropic::render(sequence, &body, structured.as_ref(), &outcome);
                 recorded(store, sequence, &outcome, answer)
             }
-            Decision::Rejected(failures) => anthropic::rejected(sequence, &failures),
+            // The two refusals that take nothing from a queue, rendered the
+            // same way and recorded apart: a malformed request is a codegen
+            // bug, and a mechanism this endpoint does not carry is the endpoint
+            // being what a test staged (PRD §9 resolved q53).
+            Decision::Rejected(failures) | Decision::Unsupported(failures) => {
+                anthropic::rejected(sequence, &failures)
+            }
             Decision::Unscripted { model, reason } => {
                 anthropic::unscripted(sequence, &model, &reason)
             }
@@ -343,7 +354,9 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
                 let answer = openai::render(sequence, &body, &model, structured.as_ref(), &outcome);
                 recorded(store, sequence, &outcome, answer)
             }
-            Decision::Rejected(failures) => openai::rejected(sequence, &failures),
+            Decision::Rejected(failures) | Decision::Unsupported(failures) => {
+                openai::rejected(sequence, &failures)
+            }
             Decision::Unscripted { model, reason } => openai::unscripted(sequence, &model, &reason),
         },
         // The Responses surface renders its own answers and borrows the two
@@ -356,7 +369,9 @@ fn provider(store: &Store, reached: Reached<'_>, arriving: Arriving<'_>) -> Answ
                     responses::render(sequence, &body, &model, structured.as_ref(), &outcome);
                 recorded(store, sequence, &outcome, answer)
             }
-            Decision::Rejected(failures) => openai::rejected(sequence, &failures),
+            Decision::Rejected(failures) | Decision::Unsupported(failures) => {
+                openai::rejected(sequence, &failures)
+            }
             Decision::Unscripted { model, reason } => openai::unscripted(sequence, &model, &reason),
         },
     }
@@ -417,6 +432,33 @@ fn enqueue(store: &Store, bytes: &[u8]) -> Answer {
         store.enqueue(script);
     }
     ok(json!({ "queued": queued, "state": store.snapshot() })).answer()
+}
+
+/// Register one model's endpoint personality (PRD §9 resolved q53, ruling c).
+///
+/// One [`Endpoint`] document, or a list of them — the shape `/_mock/enqueue`
+/// takes, for the same reason: a scenario stages several models at once.
+fn personality(store: &Store, bytes: &[u8]) -> Answer {
+    let document: Value = match serde_json::from_slice(bytes) {
+        Ok(document) => document,
+        Err(error) => return control_error(format!("the request body is not JSON: {error}")),
+    };
+    let endpoints: Vec<Endpoint> = if document.is_array() {
+        match serde_json::from_value(document) {
+            Ok(endpoints) => endpoints,
+            Err(error) => return control_error(format!("not a list of endpoints: {error}")),
+        }
+    } else {
+        match serde_json::from_value::<Endpoint>(document) {
+            Ok(endpoint) => vec![endpoint],
+            Err(error) => return control_error(format!("not an endpoint: {error}")),
+        }
+    };
+    let registered = endpoints.len();
+    for endpoint in endpoints {
+        store.set_personality(endpoint.model, endpoint.personality);
+    }
+    ok(json!({ "registered": registered, "state": store.snapshot() })).answer()
 }
 
 /// A control-plane request the harness could not understand. Loud, and never a

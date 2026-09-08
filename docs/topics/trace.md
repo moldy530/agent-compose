@@ -118,6 +118,15 @@ A flow whose `start` edges carry guards gets a synthetic entry node,
 `node: "$start"`. The `$` sigil is outside the identifier grammar, so it
 collides with nothing you can declare.
 
+**`models`** holds one record per model call: the `model.*` the node named, the
+route member that answered (`servedBy`, `fallback`), and every member that
+refused on the way (`failovers`). The last call of an agent node — the one that
+asks for its `output:` — also carries `outputMechanism`, `"native"` or
+`"forced_tool"`: which of the wire's two ways of asking for an object under a
+schema the endpoint actually answered. It is not a setting and there is nothing
+to configure; `agent-compose docs models` says what the two are and when the
+runtime moves between them.
+
 ## Routing decisions
 
 `routing` is the record that makes a change reviewable: `edges` (one decision

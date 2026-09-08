@@ -83,7 +83,7 @@ fn a_json_schema_structured_output_arrives_in_the_message_content() {
         recorded[0]
             .structured_output
             .as_ref()
-            .map(mock_provider::StructuredOutput::name),
+            .and_then(mock_provider::StructuredOutput::name),
         Some("reviewer_output")
     );
 }

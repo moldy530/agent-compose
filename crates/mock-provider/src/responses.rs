@@ -129,8 +129,21 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
     check_settings(&mut checker, body);
     let tools = check_tools(&mut checker, body);
     check_input(&mut checker, body, &tools.names);
-    let structured_output = check_text_format(&mut checker, body);
+    let forced = check_tool_choice(&mut checker, body, &tools.names);
+    let format = check_text_format(&mut checker, body);
     check_streaming(&mut checker, body);
+
+    // This wire's two structured-output mechanisms, and the pin wins where a
+    // body somehow carries both — the same rule [`crate::openai`]'s
+    // `structured_destination` keeps, for the same reason: `text.format` shapes
+    // the turn's text and a forced function decides whether the turn has any
+    // text at all (PRD §9 resolved q53). A compiled graph sends one.
+    let structured_output = forced
+        .and_then(|name| {
+            let schema = function_schema(body, &name)?;
+            Some(StructuredOutput::ForcedFunction { name, schema })
+        })
+        .or(format);
 
     Parsed {
         model,
@@ -139,6 +152,70 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
         server_tools: tools.server,
         structured_output,
     }
+}
+
+/// `tool_choice`, and the function it forces if it forces one.
+///
+/// This wire's **other** structured-output mechanism (PRD §9 resolved q53), and
+/// the rung a compiled graph falls to when an endpoint refuses `text.format`.
+/// Flat, like every other tool reference here: `{type: "function", name}`, where
+/// Chat Completions nests the name under `function`.
+///
+/// The same rule the other two surfaces keep about the key itself: `tool_choice`
+/// says how the model may use `tools`, so a request that offers none has nothing
+/// for it to say.
+fn check_tool_choice(
+    checker: &mut Checker,
+    body: &Map<String, Value>,
+    offered: &[String],
+) -> Option<String> {
+    let choice = body.get("tool_choice")?;
+    if !body.contains_key("tools") {
+        checker.fail(
+            "tool_choice",
+            "Invalid value: 'tool_choice' may only be specified when 'tools' are provided.",
+        );
+        return None;
+    }
+    match choice {
+        Value::String(_) => {
+            checker.one_of("tool_choice", choice, &["none", "auto", "required"]);
+            None
+        }
+        Value::Object(chosen) => {
+            checker.closed("tool_choice", chosen, &["type", "name"]);
+            if let Some(kind) = checker.required("tool_choice", chosen, "type") {
+                checker.one_of("tool_choice.type", kind, &["function"]);
+            }
+            let name = checker.required_string("tool_choice", chosen, "name")?;
+            let name = name.to_string();
+            if !offered.contains(&name) {
+                checker.fail(
+                    "tool_choice.name",
+                    format!("Invalid value: 'tool_choice' names the function '{name}', which this request does not offer."),
+                );
+                return None;
+            }
+            Some(name)
+        }
+        other => {
+            checker.typed("tool_choice", other, Kind::Object);
+            None
+        }
+    }
+}
+
+/// The `parameters` a named function declares in this request's `tools`.
+fn function_schema(body: &Map<String, Value>, name: &str) -> Option<Value> {
+    body.get("tools")?
+        .as_array()?
+        .iter()
+        .find(|tool| {
+            tool.get("type").and_then(Value::as_str) == Some("function")
+                && tool.get("name").and_then(Value::as_str) == Some(name)
+        })?
+        .get("parameters")
+        .cloned()
 }
 
 /// The sampling knobs, by type and by range.
@@ -547,28 +624,54 @@ fn reply_answer(
 
     match &reply.body {
         ReplyBody::Text(text) => {
-            if structured.is_some() {
+            if let Some(asked) = structured {
                 return mismatch(
                     sequence,
-                    "a `text` reply cannot answer a request carrying `text.format` of type \
-                     `json_schema`: the Responses API answers that with parseable JSON, never \
-                     with free prose. Script `structured` for the object the agent should \
-                     produce, or `raw` for a response generated code must reject",
+                    &match asked {
+                        StructuredOutput::ForcedFunction { name, .. } => format!(
+                            "a `text` reply cannot answer a request pinning `tool_choice: {{type: \
+                             \"function\", name: \"{name}\"}}`: the Responses API answers a forced \
+                             function with a call to it, never with prose and no call. Script \
+                             `structured` for the object the agent should produce, or `raw` for a \
+                             response generated code must reject"
+                        ),
+                        _ => "a `text` reply cannot answer a request carrying `text.format` of \
+                              type `json_schema`: the Responses API answers that with parseable \
+                              JSON, never with free prose. Script `structured` for the object the \
+                              agent should produce, or `raw` for a response generated code must \
+                              reject"
+                            .to_string(),
+                    },
                 );
             }
             output.push(message_item(sequence, text));
         }
-        ReplyBody::Structured(value) => {
-            if structured.is_none() {
+        // Where the object goes is the request's decision (PRD §9 resolved
+        // q53): the shaped final message under `text.format`, and the pinned
+        // call's `arguments` under a forced function. One script, both wires'
+        // mechanisms.
+        ReplyBody::Structured(value) => match structured {
+            None => {
                 return mismatch(
                     sequence,
                     "a `structured` reply cannot answer a request that asked for no structured \
                      output: the Responses API shapes an answer only where `text.format` names a \
-                     schema. Script `text`, or `raw` for a response generated code must reject",
+                     schema or `tool_choice` forces a function. Script `text`, or `raw` for a \
+                     response generated code must reject",
                 );
             }
-            output.push(message_item(sequence, &canonical(value)));
-        }
+            Some(StructuredOutput::ForcedFunction { name, .. }) => {
+                output.push(json!({
+                    "type": "function_call",
+                    "id": format!("fc_mock_{sequence:08}_0"),
+                    "call_id": format!("call_mock_{sequence:08}_0"),
+                    "name": name,
+                    "arguments": canonical(value),
+                    "status": "completed",
+                }));
+            }
+            Some(_) => output.push(message_item(sequence, &canonical(value))),
+        },
         ReplyBody::Tools {
             calls: scripted,
             text,
@@ -590,6 +693,27 @@ fn reply_answer(
                         sequence,
                         &format!(
                             "the script calls the function `{}`, which this request does not offer",
+                            call.name
+                        ),
+                    );
+                }
+                // Offered is not enough against a pin: `tool_choice: {type:
+                // "function", name: X}` is a promise that X is what gets
+                // called, so a call to a sibling is as impossible an answer as
+                // prose is — the same rule the Messages surface keeps for its
+                // own pin (PRD §9 resolved q53).
+                if let Some(StructuredOutput::ForcedFunction { name, .. }) = structured
+                    && &call.name != name
+                {
+                    return mismatch(
+                        sequence,
+                        &format!(
+                            "the script calls the function `{}`, but this request pins \
+                             `tool_choice: {{type: \"function\", name: \"{name}\"}}`: the \
+                             Responses API answers a forced function with a call to *that* \
+                             function and no other. Script a call to `{name}` — or `structured`, \
+                             which is rendered as its arguments — or `raw` for a response \
+                             generated code must reject",
                             call.name
                         ),
                     );

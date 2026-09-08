@@ -12,6 +12,7 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
+          "outputMechanism": "native",
           "servedBy": "model.smart"
         }
       ],
@@ -44,6 +45,7 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
+          "outputMechanism": "native",
           "servedBy": "model.smart"
         }
       ],
@@ -90,6 +92,7 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
+          "outputMechanism": "native",
           "servedBy": "model.smart"
         }
       ],
@@ -122,6 +125,7 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
+          "outputMechanism": "native",
           "servedBy": "model.smart"
         }
       ],
@@ -168,6 +172,7 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
+          "outputMechanism": "native",
           "servedBy": "model.smart"
         }
       ],
@@ -200,6 +205,7 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
+          "outputMechanism": "native",
           "servedBy": "model.smart"
         }
       ],
@@ -246,6 +252,7 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
+          "outputMechanism": "native",
           "servedBy": "model.smart"
         }
       ],
@@ -278,6 +285,7 @@ expression: document(&run)
           "failovers": [],
           "fallback": 0,
           "model": "model.smart",
+          "outputMechanism": "native",
           "servedBy": "model.smart"
         }
       ],

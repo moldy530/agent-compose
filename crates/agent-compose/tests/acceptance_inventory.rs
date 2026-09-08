@@ -292,6 +292,45 @@ const CODEGEN: &[Criterion] = &[
                 "the_pinned_call_after_a_tool_loop_ends_on_the_turn_that_closes_it",
                 Status::Live,
             ),
+            // …and **how** that call asks for its object, which PRD §9 resolved
+            // q53 makes the provider integration's problem and never a consumer
+            // surface: each wire's native structured-output parameter first, the
+            // synthetic pinned tool as the other rung, a capability-shaped 400
+            // laddering between them inside one call, and the winner memoized per
+            // provider-and-model for the process. Six rows, because six things
+            // can be wrong independently — which mechanism a healthy endpoint
+            // answers on and what the trace says about it, the ladder and its
+            // memo in each direction, the endpoint that carries neither, the
+            // refusals that must **not** ladder, and resolved q52's closing turn
+            // surviving both shapes.
+            (
+                "a_structured_output_call_records_the_mechanism_that_answered_it",
+                Status::Live,
+            ),
+            (
+                "a_native_refusing_endpoint_is_laddered_past_once_and_remembered",
+                Status::Live,
+            ),
+            (
+                "an_output_schema_the_native_format_could_not_close_starts_on_the_forced_tool",
+                Status::Live,
+            ),
+            (
+                "an_endpoint_carrying_neither_mechanism_fails_with_both_refusals_quoted",
+                Status::Live,
+            ),
+            (
+                "a_refusal_that_is_not_about_the_mechanism_does_not_ladder",
+                Status::Live,
+            ),
+            (
+                "the_closing_turn_precedes_the_pinned_call_on_both_mechanisms",
+                Status::Live,
+            ),
+            (
+                "the_chat_completions_wire_ladders_to_a_forced_function",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).

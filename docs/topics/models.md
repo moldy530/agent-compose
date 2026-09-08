@@ -390,6 +390,51 @@ start is one neither `validate` nor a diff can see.
 **There are no inline settings overrides on agents.** Different settings means
 another named model. That is the whole reason the two namespaces exist.
 
+## How structured output rides each wire
+
+**There is nothing to configure here.** This section is for reading a trace, not
+for writing YAML: every agent declares an `output:` schema, and how that schema
+is asked for on the wire is the provider integration's problem and never yours.
+No key, no capability flag, no model table you have to keep up to date.
+
+What there *is* to know is that each wire has **two** ways of asking a model for
+an object under a schema, and they move with model generations:
+
+| wire | native | forced tool |
+|---|---|---|
+| Messages (`anthropic`) | `output_config: { format: { type: json_schema, schema } }` | a synthetic tool carrying the schema, pinned with `tool_choice: { type: "tool" }` |
+| Chat Completions (`openai`, `openai_compatible`, `azure_openai`) | `response_format: { type: json_schema, … }` | the same tool as a function, pinned with `tool_choice: { type: "function" }` |
+| Responses (`openai` with `server_tools:`) | `text.format` of type `json_schema` | the same, pinned by name |
+
+The runtime prefers the **native** parameter and keeps the forced tool as the
+other rung. A refusal that names the mechanism — a 400 for an argument the
+endpoint has never heard of, or the newest Anthropic generation's
+`tool_choice: type "tool" and "any" are not supported for this model.` — makes it
+send the *same* call once more the other way. The mechanism that works is
+remembered per provider-and-model for the life of the process, so only the first
+call of a pairing pays that extra round trip.
+
+Nothing else ladders. A 401, a 429, a 5xx, a content refusal and a schema the
+decoder will not compile are refusals about something other than the mechanism,
+and each behaves exactly as it always has — including for `route_on:`, which is
+untouched: the mechanism ladder is *inside* one call to one route member, and a
+route still fails over only on grammar 12.2's infrastructure conditions.
+
+**Where to see it.** Each model call's trace record carries `outputMechanism` —
+`"native"` or `"forced_tool"` — on the one call per agent node that asks for the
+output object (`agent-compose docs trace`). Two deployments of one composition
+can answer through different mechanisms: a gateway a generation behind the wire
+it proxies takes only the forced tool, the newest model generation takes only the
+native parameter, and the same YAML runs on both. When a trace shows two
+provider-side calls where you expected one, that is the first call of a pairing
+discovering which rung this endpoint is on.
+
+**When both are refused**, the run fails with a diagnostic quoting *both*
+refusals verbatim. That is deliberate and it is not a missing knob: the runtime
+has already tried everything the wire offers, so what is left to say is what the
+endpoint said. Read the two bodies — they name the endpoint, not your
+composition.
+
 ## Capability checks
 
 Every model an agent references must come from a provider declaring

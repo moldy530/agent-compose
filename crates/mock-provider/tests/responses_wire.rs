@@ -88,9 +88,126 @@ fn a_text_format_structured_output_arrives_as_the_assistant_text() {
         recorded[0]
             .structured_output
             .as_ref()
-            .map(mock_provider::StructuredOutput::name),
+            .and_then(mock_provider::StructuredOutput::name),
         Some("reviewer_output")
     );
+}
+
+/// This wire's **other** structured-output mechanism: a flat forced function,
+/// answered with the `function_call` item its arguments ride (PRD §9 resolved
+/// q53).
+///
+/// The rung a compiled graph falls to when an endpoint refuses `text.format`.
+/// One script drives either — where the object goes is the *request's* decision.
+#[test]
+fn a_forced_function_structured_output_arrives_as_the_calls_arguments() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "instructions": "You are a meticulous technical reviewer.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "{\"goal\":\"ship it\"}" }],
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "reviewer_output",
+                "description": "The structured output agent.reviewer must produce.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "verdict": { "type": "string", "enum": ["approve", "revise"] },
+                    },
+                    "required": ["verdict"],
+                    "additionalProperties": false,
+                },
+                "strict": true,
+            }],
+            "tool_choice": { "type": "function", "name": "reviewer_output" },
+        }),
+    );
+    assert_eq!(response.status, 200, "{}", response.text());
+    let body = response.json();
+    assert_eq!(body["output"][0]["type"], "function_call");
+    assert_eq!(body["output"][0]["name"], "reviewer_output");
+    let arguments = body["output"][0]["arguments"]
+        .as_str()
+        .expect("arguments travel as a JSON string on this wire")
+        .to_string();
+    assert_eq!(
+        serde_json::from_str::<Value>(&arguments).expect("which parses"),
+        json!({ "verdict": "approve" })
+    );
+
+    let recorded = provider.requests();
+    assert!(recorded[0].is_valid(), "{:?}", recorded[0].failures());
+    assert_eq!(
+        recorded[0]
+            .structured_output
+            .as_ref()
+            .map(mock_provider::StructuredOutput::mechanism),
+        Some(mock_provider::OutputMechanism::ForcedTool)
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A pin is a promise about **which** function is called, so a script that calls
+/// a sibling is an answer this wire cannot send.
+#[test]
+fn a_scripted_call_to_a_sibling_of_the_pinned_function_is_refused() {
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::tool_calls(vec![ToolCall::new("lookup", json!({ "query": "a fact" }))]),
+    ));
+
+    let response = send(
+        &provider.client(),
+        &json!({
+            "model": MODEL,
+            "instructions": "You are a researcher.",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "{\"goal\":\"ship it\"}" }],
+            }],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look one thing up.",
+                    "parameters": { "type": "object", "properties": {}, "additionalProperties": false },
+                },
+                {
+                    "type": "function",
+                    "name": "reviewer_output",
+                    "description": "The agent's output.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "verdict": { "type": "string" } },
+                        "required": ["verdict"],
+                        "additionalProperties": false,
+                    },
+                },
+            ],
+            "tool_choice": { "type": "function", "name": "reviewer_output" },
+        }),
+    );
+    assert_eq!(response.status, HARNESS_STATUS);
+    assert!(
+        response.text().contains("this request pins `tool_choice"),
+        "the refusal names the pin it contradicts: {}",
+        response.text()
+    );
+    assert!(provider.requests()[0].was_refused());
 }
 
 /// The provider's suite reaches the wire **as written**, and is recorded apart
