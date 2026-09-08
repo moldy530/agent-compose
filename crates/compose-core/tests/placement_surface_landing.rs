@@ -82,10 +82,16 @@ tool.notarize:
   exec:
     command: notarytool
 
+tool.sandbox:
+  builtin: bash
+  workspace: "${BUILD_ROOT}"
+  env:
+    SIGNING_PROFILE: "${SIGNING_PROFILE}"
+
 agent.signer:
   model: model.smart
   prompt: Build the requested scheme and report what the log says.
-  tools: [tool.xcodebuild]
+  tools: [tool.xcodebuild, tool.sandbox]
   input:
     scheme: { type: string }
   output:
@@ -135,6 +141,7 @@ placements:
     members:
       - agent.signer
       - tool.xcodebuild
+      - tool.sandbox
       - tool.notarize
     description: The machine with the signing keys.
   gpu_pool:
@@ -268,7 +275,12 @@ fn the_deploy_layer_carries_every_key_into_the_artifact() {
         .collect();
     assert_eq!(
         members,
-        ["agent.signer", "tool.xcodebuild", "tool.notarize"],
+        [
+            "agent.signer",
+            "tool.xcodebuild",
+            "tool.sandbox",
+            "tool.notarize"
+        ],
         "a placement's members reach the artifact in the order they were written"
     );
     assert!(
@@ -676,6 +688,71 @@ fn the_environment_manifest_is_partitioned_per_process() {
             .contains("export const joinTokenEnv: string | undefined = \"MESH_INERTNESS_TOKEN\";"),
         "the module does not name the variable the hub reads its join token from: {deployment}"
     );
+}
+
+/// A built-in tool joins the executes-in closure exactly as an `exec:` tool
+/// does, and its declared environment lands in the placement it executes in
+/// (PRD resolved q41, q45, q54).
+///
+/// Both halves of the q54 ruling that placement is the feature rather than a
+/// leak, over the one fixture in this workspace that has a mesh and a built-in
+/// at once. `tool.sandbox` is a `builtin: bash` attached by `agent.signer`,
+/// which is placed — so what it declares belongs to that placement's manifest
+/// and to no other, and the hub, which runs neither, demands neither variable.
+///
+/// The pair is asserted against `tool.xcodebuild`'s own variables rather than in
+/// isolation, because the claim is an *equality*: whatever an `exec:` tool's
+/// environment does here, a built-in's does. A rule that carried one and not the
+/// other would be a placed agent whose shell starts on the worker with a
+/// variable the manifest never asked for — the failure §9.1 exists to prevent,
+/// reached through the one binding whose program the model writes.
+#[test]
+fn a_builtin_tools_environment_lands_where_the_agent_attaching_it_executes() {
+    let ir = resolve_clean("builtin-environment");
+    let generated = compose_core::emit(&ir, &compose_core::Authored::none());
+    let contents = |path: &str| {
+        generated
+            .file(path)
+            .unwrap_or_else(|| panic!("every project emits `{path}`"))
+            .contents
+            .as_str()
+    };
+    let environment = contents("src/env.ts");
+    let deployment = contents("src/deployment.ts");
+
+    let placements = deployment
+        .split_once("export const hubEnvironment")
+        .expect("the module declares the hub's list after the placements")
+        .0;
+    for variable in ["BUILD_ROOT", "SIGNING_PROFILE"] {
+        assert!(
+            !environment.contains(variable),
+            "`src/env.ts` demands `{variable}`, which a built-in on a placed agent spends on the              worker and nowhere else: a launch check over a value nothing in the hub reads is the              false requirement `docs/distributed.md` §9.1 is written against — {environment}"
+        );
+        assert_eq!(
+            placements.matches(&format!("\"{variable}\",")).count(),
+            1,
+            "`{variable}` belongs to exactly the manifest of the placement `agent.signer`              executes in, because that is where its built-in runs (PRD resolved q41, q45,              q54): {placements}"
+        );
+    }
+    // The equality the claim is about: the one manifest carrying the built-in's
+    // variables is `mac_signing_pool`'s, which is the placement the agent
+    // attaching it executes in — and not `gpu_pool`'s, whose agent attaches
+    // nothing.
+    let signing_pool = placements
+        .split_once("name: \"mac_signing_pool\",")
+        .expect("`src/deployment.ts` carries a manifest for `mac_signing_pool`")
+        .1;
+    let signing_pool = signing_pool
+        .split_once("    name: \"")
+        .map_or(signing_pool, |(block, _)| block);
+    for variable in ["BUILD_ROOT", "SIGNING_PROFILE"] {
+        assert!(
+            signing_pool.contains(&format!("\"{variable}\",")),
+            "`{variable}` is not on `mac_signing_pool`'s list, which is the placement the agent \
+             attaching the built-in executes in: {signing_pool}"
+        );
+    }
 }
 
 /// Every shipped document says the runtime landed.

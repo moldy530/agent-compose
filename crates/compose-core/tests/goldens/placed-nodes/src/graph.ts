@@ -27,6 +27,7 @@ import {
   agentEscalatorOutput,
   agentSignerOutput,
   agentStamperOutput,
+  builtinBashInput,
   flowAbandonedInputs,
   flowAttestedInputs,
   flowBatchInputs,
@@ -532,6 +533,41 @@ const agentSigner: runtime.AgentBinding = {
         toolSign(
           runtime.parseToolArguments(toolSignInput, args, "the arguments `sign` was called with"),
           context,
+        ),
+    },
+    {
+      name: "bash",
+      address: "builtin.bash",
+      description: "Run a `bash` command in a persistent shell session and return what it printed, with its exit status. The working directory and any shell state carry over from one call to the next, and each command runs under a deadline.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "default": "",
+            "description": "The shell command to run, as one line of `bash`.",
+            "type": "string"
+          },
+          "restart": {
+            "default": false,
+            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      providerType: "bash_20250124",
+      invoke: (args, context, call) =>
+        runtime.runBuiltin(
+          {
+            tool: "bash",
+            workspace: [],
+            timeout: { millis: 120000, written: "120s" },
+            env: [],
+          },
+          runtime.parseToolArguments(builtinBashInput, args, "the arguments `bash` was called with"),
+          context,
+          call,
         ),
     },
   ],
@@ -2420,6 +2456,14 @@ async function quiesceFlow(
     // quiesced.
     const parked = runtime.staysOpen(executionId, outcome);
     stores.releaseExecution(executionId, parked);
+    // …and the directory this run's built-in tools worked in, under the same
+    // rule and for the same reason (grammar 6.1, PRD resolved q54): a workspace
+    // nobody configured belongs to the execution, so it goes when the execution
+    // ends — and stays where the row stays open, because the generation that
+    // resumes it runs past the frontier into files the recorded prefix wrote.
+    // A binding that named its own `workspace:` is the composition's and is
+    // never removed.
+    await runtime.releaseWorkspaces(executionId, parked);
   };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way

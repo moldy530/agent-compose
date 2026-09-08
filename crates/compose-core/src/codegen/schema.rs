@@ -527,7 +527,7 @@ fn attached_builtins(ir: &Ir) -> Vec<(Builtin, Span)> {
         };
         for builtin in &agent.builtins {
             found
-                .entry(builtin.tool.value)
+                .entry(builtin.value)
                 .or_insert_with(|| builtin.span.clone());
         }
     }

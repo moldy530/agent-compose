@@ -358,4 +358,10 @@ pub enum ToolImplementation {
         /// The file, the environment it may read, and what it imports.
         module: super::binding::Module,
     },
+    /// One of the built-in tools, configured — the binding that hands the
+    /// **model** the program (grammar 6.1, PRD resolved q54).
+    Builtin {
+        /// Which built-in, and the bounds it runs under.
+        builtin: super::binding::Builtin,
+    },
 }

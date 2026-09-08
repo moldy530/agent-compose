@@ -724,12 +724,13 @@ cost of one indirection for the part that is a run of its own.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `name` | string | always | The tool the model called, spelled as the request offered it — a `tool.*`'s local name, a `flow.*`'s (grammar §5.4), a synthesized store tool's (grammar §11.5), or a runtime built-in's (`bash`, `read_file`, `write_file`, `list` — grammar §5.5). |
+| `name` | string | always | The tool the model called, spelled as the request offered it — a `tool.*`'s local name, a `flow.*`'s (grammar §5.4), a synthesized store tool's (grammar §11.5), or a built-in's — `bash` and `str_replace_based_edit_tool`, which are the names the provider-defined tool types dictate rather than the definition keys (grammar §5.5, §6.1). |
 | `target` | string | when the agent offers a tool of that name | The component behind the name, as a typed address (grammar §2.2). Absent on the one call that has none: a name the agent does not offer, which is a model answering with a tool that was never on the wire. That call is recorded `"refused"` and handed back to the model with the names it does have (grammar D119). |
 | `outcome` | `"completed"` \| `"refused"` \| `"failed"` | always | What the loop did with the call. `"completed"` handed the model the tool's result. `"refused"` handed it the **refusal** instead: the tool's declared contract did not admit the call — arguments its schema refuses, on any of the three surfaces, or a name the agent never offered — and grammar D119 makes that a call the model is asked to make again, so the node did not end and records after it exist. `"failed"` is the tool's *execution* failing, which ended the node: the failure left the tool, the node's own `on_error:` decided the run (grammar §9.2), and the model saw nothing back. §5.1 names the one failure no `on_error:` decided: a `human` node inside the flow the call ran, on a run that could not answer it. |
 | `instance` | string | flow-as-tool calls that started an instance | The **link**: the subflow instance this call ran, named exactly as the dispatch record carrying that instance's trace names itself in `idempotencyKey`, so the join between the two is string equality (§5, §8). Absent on every call that instantiated nothing — a `tool.*`, a store tool — and on a `"refused"` flow-as-tool call, which is arguments that failed the flow's own `inputs:` before an instance existed. A refused call spends **no** call ordinal (grammar §9.4, D119) — that ordinal counts invocations and this call reached no flow — so the instance path of the call that follows it is the one it would have had with no refusal ahead of it. |
 | `result` | any | `"completed"` flow-as-tool calls, with `instance` | **The result the model saw**: the value the loop handed back, which for this tool is the instance's declared `outputs:` (grammar §5.4). PRD §9.20 asks the tool-call entry to record it, and it is the one tool result this format carries — §11 is where the rule it is carved out of is stated, and where the other two tool surfaces are left under it. Its calls are a **subset** of `instance`'s, not the same set: `instance` says an instance ran, `result` says the loop handed that instance's outputs back, so a call carrying `result` carries `instance` and not the other way round. Absent on a `"failed"` call and on a `"refused"` one, where the absence is the record — the first left the tool and the second never entered it, and in neither did the model see a result. A flow-as-tool call whose instance failed is exactly that call with an `instance` and no `result`. |
 | `error` | string | `"failed"`, `"refused"` | What went wrong, in §3's `<error name>: <message>` shape. On a `"refused"` call the `<message>` half is **byte for byte the sentence the model was handed back**, and the `<error name>` half — `ToolCallRefused` — is this format's own envelope, which the model's copy does not carry: the two strings differ by that prefix and by nothing else, so a reader joining a record to a provider transcript compares the record's message half, never the whole string. That sentence names the tool, the field and the constraint the way a compiler diagnostic would (PRD G3) and may quote an excerpt of the arguments — see §11. |
+| `program` | [built-in program](#74-what-a-built-in-ran) | calls that reached a **built-in** tool | **What the model ran** (§7.4): the `bash` command and its exit status, or the file operation and the path. The one carve-out from §11's rule that this format carries no tool arguments, and PRD resolved q54 ruling c is what carves it: for every other binding the program is the composition's and a reader already has it, while a built-in runs what the model wrote at run time. Present on every call that reached one — `"completed"`, `"failed"`, and the `"refused"` calls the *tool* refused (a path that leaves the workspace) — and absent on a built-in call refused before it, which never reached the tool, as well as on every call to any other tool. |
 
 **What is deliberately not here.** The **arguments** the model sent are absent
 as a field of their own, and that is §11's rule rather than an omission: this
@@ -741,19 +742,58 @@ nowhere". It is carried for the one tool whose result is the composition's own
 declared data; a `tool.*`'s answer and a store tool's stay out, the second of
 them because §6 already carries it in `StoreRecord.answer`.
 
-A **runtime built-in**'s answer stays out with them, and that is the whole of
-what the built-ins changed here: a `bash`'s stdout and a `read_file`'s contents
-are a tool's answer under §11's rule, so what this format records is the call —
-`name`, `target: "builtin.bash"`, the outcome, and the error where there was
-one. The full answer is in the durability journal, which is private recovery
-data rather than a document a run hands out (`docs/durability.md` §3.2, §8, PRD
-resolved q31).
+A **built-in tool**'s answer stays out with them: a `bash`'s stdout and a file
+view's contents are a tool's answer under §11's rule, so what this format records
+of one is the call — `name`, the address it was attached by as the `target`
+(`builtin.bash` for a shorthand, `tool.sandbox` for a configured one), the
+outcome, the error where there was one, and — this and no more of it — the
+**program** the model wrote, which §7.4 specifies. The answer itself is in the
+durability journal, which is private recovery data rather than a document a run
+hands out (`docs/durability.md` §3.2, §8, PRD resolved q54).
 
 A `"refused"` call's `error` is where an excerpt of those arguments can appear,
 and it is not an exception to the rule above but the same one read where the
 message goes: the refusal is written **for the model**, which chose the
 arguments and is being asked to choose again, so quoting the offending value
 back at it costs nothing (grammar D119, §11.1).
+
+### 7.4 What a built-in ran
+
+`BuiltinProgram`, on `ToolCallRecord.program`. The named carve-out §11 gives the
+two built-in tools (grammar §5.5, §6.1), and PRD resolved q54 ruling c is the
+decision behind it: "the trace includes what the model ran … for these tools the
+model's program *is* the interesting record".
+
+The reason it is only these two. Every other implementation binding fixes **what
+runs** at build time — an `exec:`'s command, an `http:`'s URL, a `module:`'s file
+— and lets the model fill parameters a schema constrains, so a reader who wants
+to know what a tool call ran opens the composition. A built-in inverts that: the
+model authors the program at run time, so a trace that recorded only "`bash` was
+called, and it completed" would say an agent ran *something* on a machine and
+nothing whatever about what. The trust level is the one grammar D135 states out
+loud, and this is the record that makes it auditable.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `tool` | `"bash"` \| `"files"` | always | Which built-in ran it. It is the binding's `builtin:` keyword rather than the name the model called — `"files"` for the tool the wire calls `str_replace_based_edit_tool` — so a reader joins it to the composition rather than to the transcript. |
+| `command` | string | `"bash"` calls | The shell command **as the model wrote it**, capped at 1000 characters. A call that asked only to restart the session records the word `restart`, which is the whole of what such a call is; one that asked for a restart *and* a command records the command, which is what ran. |
+| `operation` | `"view"` \| `"create"` \| `"str_replace"` \| `"insert"` | `"files"` calls naming one of them | Which file operation was asked for. Absent where the model named something else, which is a call the tool refused: the record then carries the `path` and the refusal in `error`. |
+| `path` | string | `"files"` calls | The path **as the model wrote it**, capped at 1000 characters — never the resolved one, which would carry the directory a `${WORKSPACE}` resolved to on this machine (§11.1). |
+| `exitCode` | integer | `"bash"` calls whose command completed | `$?`. Absent where no command completed — a command killed at its bound, a shell that exited under it, a call that only restarted the session — which is the difference between "the command failed" and "the command did not finish" (and, for the restart, never began). |
+| `timedOut` | boolean | `"bash"` calls the command bound killed | `true` where the command outran the binding's `timeout:` and its process group was killed. The call is still a `"completed"` one: PRD resolved q54 makes a spent deadline a **tool result** the model is handed rather than a node failure, so the loop went on with what the command had printed by then. |
+| `change` | string | `"files"` calls that changed a file | What the edit did, as a sentence this runtime composes: `wrote 412 bytes`, `replaced one occurrence at line 12`, `inserted 3 line(s) after line 40`. The **bound** §11 asks for, and it is a bound of kind rather than of length: an excerpt of what was written would be a file's contents in a trace, so what is carried is the shape of the edit and never its bytes. |
+
+**This is an addition rather than a change.** A new record type reachable from an
+existing one, and a new field on §7.3's record, are both compatible under
+§10.2 — a reader written against `trace_version` 4 sees a key it does not
+recognize and ignores it, which is what §10.1 already requires of it. No version
+bump, and nothing that was recorded before is recorded differently.
+
+**What is still not here**, so the carve-out's edge is where this document says
+it is: the command's **output**, the file's **contents**, the arguments of any
+other tool, and the resolved workspace. `stdout`, `stderr` and a file view are
+the tool's *answer* and stay under §11's rule with every other tool's; the
+journal holds them, and §11 says why that is a different artifact.
 
 ---
 
@@ -1162,6 +1202,20 @@ The version number alone is a promise; two tests make it a checkable one:
   stay under the rule: a `tool.*`'s answer is an external system's, and a store
   tool's is already in `StoreRecord.answer`, so recording it twice would buy
   nothing.
+
+  **The named carve-out: a built-in tool's program.** The rule above is about
+  what a model *sent a tool*, and it has exactly one exception, which PRD
+  resolved q54 ruling c states and §7.4 specifies: a call to `builtin.bash` or
+  `builtin.files` carries `ToolCallRecord.program` — the command and its exit
+  status, or the file operation and the path, and for an edit a sentence about
+  what changed. Every other binding fixes what runs at build time, so a reader
+  who wants the program opens the composition; a built-in has the **model author
+  it at run time**, and a format that kept it out would record that an agent ran
+  something on a machine and nothing about what. It is an exception in one
+  direction only: the built-ins' *answers* — a command's stdout and stderr, a
+  file's contents, an edit's bytes — stay out with every other tool's, and the
+  bound on what `program` carries is written into §7.4 rather than left to
+  whatever a model happened to write.
 * **The execution journal.** A compiled project keeps a second record beside
   this one, and the two are not the same artifact: the journal holds every
   effect's full payload — model completions, tool results, what a store
@@ -1247,7 +1301,8 @@ runs in, so an error is reproducible and a trace snapshot is comparable across
 machines.
 
 What a message *does* quote from outside this process is **what the other side
-answered**, and a reader should treat that text as untrusted:
+answered** — and, for the two built-in tools, what the **model** asked them to
+run. A reader should treat all of it as untrusted:
 
 | field | what it can carry from outside |
 |---|---|
@@ -1256,10 +1311,13 @@ answered**, and a reader should treat that text as untrusted:
 | `ToolCallRecord.error` | the same text, from the tool a model called (§7.3). On a `"failed"` call, the tool's execution failing: a `tool.*`'s refused response or child stderr, a store op's failure, or one raised inside a flow-as-tool call's instance. On a `"refused"` one it is this runtime's own sentence rather than the other side's — the tool, the field and the constraint, with an excerpt of the **arguments** the model sent, at whichever of the three surfaces refused them (grammar D119) |
 | `TraceDocument.error` | the same text, when that failure is what stopped the run |
 | `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
+| `BuiltinProgram.command`, `BuiltinProgram.path` | the **program the model wrote** for a built-in tool, carried verbatim and capped at 1000 characters each: the `bash` command's text, and the `files` path as the model asked for it (§7.4). Not what a system answered but what the model chose, so it is the one text here that is adversarial by construction wherever a model read something it should not have — a `command` is shell source and a `path` is arbitrary bytes, and neither is a name this runtime composed. `BuiltinProgram.change` beside them is this runtime's own sentence about an edit (`replaced one occurrence at line 12`) and carries nothing of the file |
 
 A target that echoes back what it was sent puts that echo in the trace — a 404
 body naming the path it did not route, a command that prints its own arguments
-on stderr. This format records what it was answered; it does not audit it.
+on stderr. This format records what it was answered; it does not audit it. The
+built-in row is the same posture read one step earlier: it records what an agent
+was told to run, and does not vouch for it.
 
 Two fields are the composition's own to fill, and both are carried verbatim:
 `StoreRecord.answer` is what a read answered (§6), and `ToolCallRecord.result`
@@ -1267,7 +1325,10 @@ is the `outputs:` a subflow a model called answered with (§7.3). A run that
 reads a secret out of a store, or writes one into a flow's declared outputs, has
 put it there itself; the trace records both like any other value. Neither is
 derived from a resolved `${ENV}` reference by this runtime, which is what §11.1
-opens by promising.
+opens by promising. `ToolCallRecord.program` is a third field carried verbatim
+and is in the table above rather than here, because the party that fills it is
+the **model** rather than the composition — the reason it is untrusted text and
+these two are not.
 
 ### 11.2 Where a resolved value would otherwise have escaped
 

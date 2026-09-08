@@ -303,6 +303,44 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
         else {
             continue;
         };
+        // A **provider-defined client tool**: a dated type the vendor defines
+        // and the *client* runs — `bash_20250124`, `text_editor_20250728`
+        // (grammar 6.1, PRD resolved q54 ruling d). It carries no
+        // `input_schema`, because the schema is the provider's; it is called
+        // with an ordinary `tool_use` block and answered with an ordinary
+        // `tool_result`, because the graph is what runs it. So it is a **client**
+        // tool here — its name goes into `names`, where a scripted call is held
+        // to it — and the entry shape is closed, unlike a server tool's.
+        // `WIRE-NOTES` (25).
+        if let Some(kind) = tool.get("type").and_then(Value::as_str)
+            && let Some(family) = provider_defined_client_tool(kind)
+        {
+            checker.closed(&pointer, tool, &["type", "name", "cache_control"]);
+            let Some(name) = checker.required_string(&pointer, tool, "name") else {
+                continue;
+            };
+            let name = name.to_string();
+            // The name a dated type dictates, where this server knows the type.
+            // Two tiers, exactly as (22) has for a server tool's: the family is
+            // what this server can decide about a revision it may predate, and
+            // the name is what it can decide about the ones it has met.
+            if let Some(required) = family
+                && name != required
+            {
+                checker.fail(
+                    &at(&pointer, "name"),
+                    format!("tools: `{kind}` must be named `{required}`, not `{name}`."),
+                );
+            }
+            if !seen.insert(name.clone()) {
+                checker.fail(
+                    &at(&pointer, "name"),
+                    format!("tools: Duplicate tool name `{name}`."),
+                );
+            }
+            names.push(name);
+            continue;
+        }
         // A **server tool**: a tool the service runs on its own side, named by a
         // `type:` out of Anthropic's own vocabulary (grammar 12.1, Decision
         // D122). Its config keys are the vendor's, not this API's closed entry
@@ -376,6 +414,35 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
         names.push(name);
     }
     Tools { names, server }
+}
+
+/// Whether a `type:` names a tool the **vendor defines and the client runs**,
+/// and the name that type dictates where this server has met it.
+///
+/// `Some(Some(name))` is a type this server knows the pairing for;
+/// `Some(None)` is a later revision of a family it knows — still a client tool,
+/// with its name a presence check rather than a value one, which is
+/// `WIRE-NOTES` (22)'s two tiers read for this family. `None` is not one of
+/// these at all.
+///
+/// The families are Anthropic's shell and text editor, which is what PRD
+/// resolved q54's two built-ins go out as. They are told apart from a **server**
+/// tool by who runs them rather than by anything on the wire: a `web_search` is
+/// answered by the service inside the turn, while these arrive as a `tool_use`
+/// the graph has to run and answer — which is why they are `names` here and a
+/// scripted call to one is checked against that list.
+fn provider_defined_client_tool(kind: &str) -> Option<Option<&'static str>> {
+    const KNOWN: &[(&str, &str)] = &[
+        ("bash_20250124", "bash"),
+        ("text_editor_20250728", "str_replace_based_edit_tool"),
+    ];
+    if let Some((_, name)) = KNOWN.iter().find(|(dated, _)| *dated == kind) {
+        return Some(Some(name));
+    }
+    if kind.starts_with("bash_") || kind.starts_with("text_editor_") {
+        return Some(None);
+    }
+    None
 }
 
 /// What a request's `tools` array holds, split by who runs them.
@@ -1313,7 +1380,16 @@ fn server_tool_blocks(
 
 /// The `name` this request declared for a server tool of this `type`, if it
 /// declared one at all.
+///
+/// A **provider-defined client tool** is not one, however dated its type looks:
+/// `bash_20250124` is a tool the graph runs and answers, so a script that ran it
+/// as a server tool would be scripting a turn the service cannot send — the
+/// blocks would say the provider had already answered a call the runtime is
+/// waiting to make. Refused as an undeclared server tool, which is what it is.
 fn declared_server_tool(request: &Value, type_name: &str) -> Option<String> {
+    if provider_defined_client_tool(type_name).is_some() {
+        return None;
+    }
     request
         .get("tools")
         .and_then(Value::as_array)?
@@ -1743,6 +1819,115 @@ mod tests {
                 "tools.2.name",
                 "tools.3.input_schema",
             ]
+        );
+    }
+
+    /// A **provider-defined client tool** is a client tool: it carries no
+    /// schema, its name is the one its type dictates, and a scripted call to it
+    /// is a call this request offers (grammar 6.1, PRD resolved q54,
+    /// `WIRE-NOTES` (25)).
+    #[test]
+    fn a_provider_defined_client_tool_is_one_of_the_requests_own() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [
+                { "type": "bash_20250124", "name": "bash" },
+                { "type": "text_editor_20250728", "name": "str_replace_based_edit_tool" },
+                // A revision this server has not met is still one of the family:
+                // carried, with its name a presence check ((22)'s two tiers).
+                { "type": "bash_20991231", "name": "bash_next" },
+                { "name": "extract", "input_schema": { "type": "object" } },
+            ],
+        }));
+        let parsed = parse(&headers(), Some(&request));
+        assert!(parsed.failures.is_empty(), "{:?}", parsed.failures);
+        assert_eq!(
+            parsed.tools,
+            [
+                "bash",
+                "str_replace_based_edit_tool",
+                "bash_next",
+                "extract"
+            ],
+            "the graph runs all four, so all four are the request's own tools"
+        );
+        assert!(
+            parsed.server_tools.is_empty(),
+            "a tool the client runs is not one the provider does: {:?}",
+            parsed.server_tools
+        );
+    }
+
+    /// …and the two things this server can still decide about one: the name a
+    /// dated type it knows dictates, and the keys the entry may carry.
+    #[test]
+    fn a_provider_defined_client_tool_is_held_to_its_name_and_its_shape() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [
+                { "type": "bash_20250124", "name": "shell" },
+                {
+                    "type": "text_editor_20250728",
+                    "name": "str_replace_based_edit_tool",
+                    "input_schema": { "type": "object" },
+                },
+                { "type": "bash_20250124", "name": "bash" },
+                { "type": "text_editor_20250728", "name": "bash" },
+            ],
+        }));
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(
+            failures
+                .iter()
+                .map(|failure| failure.pointer.clone())
+                .collect::<Vec<_>>(),
+            [
+                "tools.0.name",
+                "tools.1.input_schema",
+                "tools.3.name",
+                "tools.3.name"
+            ],
+            "{failures:?}"
+        );
+        assert!(
+            failures[0].message.contains("must be named `bash`"),
+            "the name a dated type dictates is named in the refusal: {failures:?}"
+        );
+        assert!(
+            failures[1].message.contains("input_schema"),
+            "a provider-defined tool carries no schema of ours: {failures:?}"
+        );
+        assert!(
+            failures[3].message.contains("Duplicate tool name"),
+            "…and one namespace holds every tool of the array, whoever runs it: {failures:?}"
+        );
+    }
+
+    /// A provider-defined **client** tool cannot be scripted as a server tool:
+    /// the service does not run it, so a turn saying it already had is a turn
+    /// the API cannot send.
+    #[test]
+    fn a_client_tool_scripted_as_a_server_tool_is_refused() {
+        let request = messages(json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "bash_20250124", "name": "bash" }],
+        }));
+        let refusal = server_tool_blocks(
+            7,
+            &request,
+            &[crate::control::ServerToolUse::new(
+                "bash_20250124",
+                json!({ "command": "ls" }),
+                json!("a.txt"),
+            )],
+        );
+        let Err(Answer::Respond(answer)) = refusal else {
+            panic!("a client tool is not one the provider runs");
+        };
+        assert_eq!(answer.status, HARNESS_STATUS, "{answer:?}");
+        assert!(
+            answer.body.to_string().contains("does not declare"),
+            "the refusal says the request never offered it as a server tool: {answer:?}"
         );
     }
 

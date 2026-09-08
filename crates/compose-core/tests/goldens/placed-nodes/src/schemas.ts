@@ -361,6 +361,15 @@ export const toolStampOutput = z.object({
 }).strict();
 export type ToolStampOutput = z.infer<typeof toolStampOutput>;
 
+/**
+ * `builtin.bash` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
+ */
+export const builtinBashInput = z.object({
+  command: z.string().describe("The shell command to run, as one line of `bash`.").default(""),
+  restart: z.boolean().describe("Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.").default(false),
+}).strict();
+export type BuiltinBashInput = z.infer<typeof builtinBashInput>;
+
 /** State channel `approval` — its declared type (grammar 10.1). */
 export const stateApproval = z.string().describe("What the person on the other branch said.").default("");
 export type StateApproval = z.infer<typeof stateApproval>;

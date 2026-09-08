@@ -575,6 +575,40 @@ fn stamping(stamp: &str) -> Vec<Script> {
     ]
 }
 
+/// The same, with a **built-in** call ahead of the attached tool's (PRD
+/// resolved q54).
+///
+/// `agent.signer` holds `builtin.bash` by the shorthand, so its loop can run a
+/// command — and, being placed, runs it on the worker that took the dispatch.
+///
+/// The command is `pwd`, and it is `pwd` because a constant would print the same
+/// thing from either process: the shorthand takes the **default** workspace, one
+/// directory under the data root of whichever process is running the execution
+/// (grammar 6.1), so what the command prints is the one fact in this transcript
+/// that can tell a worker-side run from a hub-side one. It is also a bash
+/// builtin, which matters here: the shorthand declares no `env:`, so the child
+/// is scrubbed and has no `PATH` to look a program up on.
+fn signing_after_a_command(signature: &str) -> Vec<Script> {
+    vec![
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("bash", json!({ "command": "pwd" }))]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "sign",
+                json!({ "path": "release.dmg" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("signed, and here is the signature")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "signature": signature })),
+        ),
+    ]
+}
+
 /// Wait until `wanted` answers `true`, or fail with what `said` describes.
 fn until(what: &str, said: impl Fn() -> String, wanted: impl Fn() -> bool) {
     let deadline = Instant::now() + PATIENCE;
@@ -2164,8 +2198,8 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
         return;
     };
     mesh.provider
-        .enqueue_all(signing("signed-for-the-collector"));
-    let _worker = mesh.worker("exporting");
+        .enqueue_all(signing_after_a_command("signed-for-the-collector"));
+    let worker = mesh.worker("exporting");
 
     let execution = mesh.start_execution("/releases", &json!({ "path": "release.dmg" }));
     let outputs = mesh.completed(&execution);
@@ -2211,6 +2245,62 @@ fn a_mesh_execution_exports_its_whole_trace_from_the_hub() {
             .as_array()
             .is_some_and(|calls| !calls.is_empty()),
         "the worker's model calls did not reach the hub's export: {signed:#}"
+    );
+
+    // …and the **program** a built-in ran there, which is the mesh half of PRD
+    // resolved q54: a placed agent runs model-authored commands on the worker
+    // that took its dispatch, and the record of what it ran comes home on the
+    // same result as everything else the node did (`docs/trace.md` §7.4,
+    // `docs/distributed.md` §3.4). A mesh that carried the model calls and lost
+    // this would leave the one machine an operator most wants an account of
+    // with no account of the command it ran.
+    let programs: Vec<&Value> = signed["models"]
+        .as_array()
+        .expect("the placed node's model calls")
+        .iter()
+        .flat_map(|call| call["toolCalls"].as_array().into_iter().flatten())
+        .filter_map(|call| call.get("program"))
+        .collect();
+    assert_eq!(
+        programs,
+        vec![&json!({ "tool": "bash", "command": "pwd", "exitCode": 0 })],
+        "the placed agent's `builtin.bash` call is missing from the hub's trace, or          carries something other than what the model ran: {signed:#}"
+    );
+
+    // …and it ran **on the worker**, which is the other half of the mesh claim
+    // and the half a program record cannot make on its own: the command is the
+    // same string whichever process executed it. What differs is where it
+    // printed from — the default workspace is one directory under the *running*
+    // process's data root (grammar 6.1), and the worker's is the `--data-dir`
+    // this test gave it, a directory the hub has never heard of. So the answer
+    // the model was handed names that directory, and a build that hoisted a
+    // placed agent's built-in calls back to the hub would hand it the hub
+    // project's path instead and fail here.
+    let ran_under = std::fs::canonicalize(&worker.data_dir)
+        .expect("the worker's data directory")
+        .display()
+        .to_string();
+    let hub_side = std::fs::canonicalize(&mesh.project)
+        .expect("the hub's project directory")
+        .display()
+        .to_string();
+    let transcript: Vec<String> = mesh
+        .provider
+        .requests()
+        .iter()
+        .map(|asked| asked.body().to_string())
+        .collect();
+    assert!(
+        transcript.iter().any(|body| body.contains(&ran_under)),
+        "the placed agent's command printed a working directory that is not under the \
+         worker's own data directory `{ran_under}`, so it did not run on the worker: \
+         {transcript:#?}"
+    );
+    assert!(
+        !transcript.iter().any(|body| body.contains(&hub_side)),
+        "the placed agent's command printed a working directory under the **hub's** \
+         project `{hub_side}`: a placed built-in runs inside the dispatch, on the machine \
+         that took it (`docs/distributed.md` §3.2): {transcript:#?}"
     );
 
     // **…and from nowhere else**, which is the half resolved q51's "export is

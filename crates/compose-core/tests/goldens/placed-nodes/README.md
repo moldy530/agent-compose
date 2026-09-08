@@ -447,6 +447,30 @@ the two is the budget you wrote, whichever machine reached the node. The worker'
 own clock does not reach the status route — a deadline shown to a person has to be
 the deadline this process will fire, and two machines' clocks disagree.
 
+## Where a built-in tool works, and what it may run
+
+This composition holds `builtin.bash` or `builtin.files` — the one binding whose
+program the **model** writes rather than the author. Every other tool fixes what
+runs at build time and lets the model fill parameters a schema constrains; these
+two run the command or the edit a model composes at the moment it composes it.
+That is the trust level an `exec:` tool already extends to author-chosen
+binaries, extended to the model: an agent holding `builtin.bash` can run anything
+the process running this graph can run. There is no container and no syscall
+filter in this release; what bounds a call is the workspace, the command
+`timeout:`, and the environment the binding declared.
+
+A binding that names a `workspace:` works there. One that does not works here:
+
+```text
+.agent-compose/workspaces/<execution id>/     one directory per execution
+```
+
+It is made fresh when the execution's first built-in call runs, shared by every
+built-in of that execution that took the default, and **removed when the run
+settles** — kept only while the execution's journal row stays open, so that a
+`resume` finds the files the run had written. A `workspace:` you named is never
+removed by this project.
+
 ## Pinned versions
 
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a

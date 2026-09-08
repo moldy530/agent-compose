@@ -1384,40 +1384,97 @@ const DURABILITY: &[Criterion] = &[
     },
 ];
 
-/// PRD §7 M3's second bullet, its runtime half: the four built-ins, what bounds
+/// PRD §7 M3's second bullet, its runtime half: the built-ins, what bounds
 /// them, and what a bound being crossed does.
 ///
 /// One sentence rather than an enumeration, so — like `HARNESS` and
 /// `DURABILITY` — its phrases are held to it by containment. Three claims: that
-/// the tools exist and run, that the root bounds them, and that the timeout
+/// the tools exist and run, that the workspace bounds them, and that the timeout
 /// does. The failure and refusal rules are not separate phrases of the bullet —
 /// resolved q31 states them as "the standing rules" — so they hang off the two
 /// bounds they are reached through.
+///
+/// PRD resolved q54 replaced the four-tool set this bullet was written against
+/// with `builtin.bash` and `builtin.files`, and both halves are named below. The
+/// file tool's rows are its round trip — `create`, `str_replace`, `insert` and
+/// `view` under the workspace, in the provider-defined editor's own operations —
+/// and the two crossings that workspace has to refuse: a path that *resolves*
+/// outside it, and a second **name** for a file outside it, which no resolution
+/// can catch because a hard link has no target to follow.
+///
+/// What no row here reaches is the inside of one call, which is a limit of this
+/// corpus rather than a gap in it: an acceptance case drives a model loop, and
+/// what a loop shows is the wire, the trace and the bounce. The rest — every
+/// other way out of a workspace, the read bound, the session held across two
+/// activities, the scrubbed child — is asserted against a generated project's
+/// own runtime by
+/// `the_built_in_tools_are_bounded_by_their_workspace_session_and_deadline` in
+/// `compose-core`'s `generated_code_gates.rs`.
 const BUILTINS: &[Criterion] = &[
     Criterion {
         bullet: Bullet::BuiltinTools,
         phrase: "runtime bash/file tools",
         tests: &[
-            // All four, in one turn, each asserted on something only a real call
-            // could produce — including the one whose effect outlives the
-            // process.
+            // The shell, in one turn, asserted on things only real calls could
+            // produce — including the one whose effect outlives the process, and
+            // the program the trace carries of each (resolved q54 ruling c).
             (
-                "every_builtin_runs_inside_its_root_and_answers_the_model",
+                "the_builtin_shell_runs_inside_its_workspace_and_answers_the_model",
                 Status::Live,
             ),
-            // …and the one of the four whose answer is a shape rather than a
-            // value: a listing's ordering, its glob, and the flag that says it
-            // stopped short.
+            // …and what makes it a *session* rather than a fork per command: a
+            // `cd` in one call is still in effect in the next, which is the
+            // difference between a tool a model can drive and one it has to
+            // re-explain itself to (resolved q54).
             (
-                "a_listing_matches_globs_in_order_and_says_when_it_stopped_short",
+                "a_shells_state_carries_across_the_calls_of_one_node_activity",
+                Status::Live,
+            ),
+            // …and the cost that session has: the shell reads its script from
+            // the same standard input the commands are typed into, so a command
+            // that reads standard input would read this runtime's own protocol
+            // — silently, as a command with no exit status or one that spends
+            // its whole bound answering with marker text.
+            (
+                "a_command_that_reads_standard_input_does_not_eat_the_marker_protocol",
+                Status::Live,
+            ),
+            // …and the file tool, round-tripped: create, edit, view, and a
+            // `view_range` window of the same file, with the provider-defined
+            // text editor's own operations and parameter names.
+            (
+                "the_file_tool_creates_edits_and_views_inside_its_workspace",
                 Status::Live,
             ),
             // …and the half of the loop that is not the tool running: a call the
-            // schema refuses is the model's to make again, which is what keeps a
-            // built-in's contract the same contract every other tool surface has
-            // (Decision D119).
+            // contract refuses is the model's to make again, which is what keeps
+            // a built-in's contract the same contract every other tool surface
+            // has (Decision D119).
             (
                 "arguments_a_builtin_refuses_bounce_back_to_the_model",
+                Status::Live,
+            ),
+            // …including a key the argument set does not carry at all: the
+            // Messages wire declares the provider-defined text editor with no
+            // schema, so what arrives is whatever the model was trained to
+            // fill, and the refusal has to name the key it refused for the loop
+            // to be a cost rather than a dead end.
+            (
+                "an_argument_outside_a_builtins_schema_is_refused_naming_the_key",
+                Status::Live,
+            ),
+            // …and the same rule where a *file* path is what the model got
+            // wrong, which is the one refusal that is also a bound.
+            (
+                "a_file_path_that_leaves_the_workspace_bounces_back_to_the_model",
+                Status::Live,
+            ),
+            // …and the crossing a *resolution* cannot catch either, which is why
+            // it is refused at the write: a hard link has no target, so a second
+            // name for a file outside the workspace resolves to the path inside
+            // it and an edit through that name lands outside.
+            (
+                "a_write_to_a_file_with_a_second_name_is_refused_to_the_model",
                 Status::Live,
             ),
             // …and what a built-in buys over the `exec:` tool an author could
@@ -1427,11 +1484,27 @@ const BUILTINS: &[Criterion] = &[
                 "a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again",
                 Status::Live,
             ),
-            // …and the one thing q31 says about *where* the shell comes from:
-            // `PATH`, at the call, with a host that has none failing as an
-            // execution failure that names the requirement.
+            // …and the one thing q54 keeps from q31 about *where* the shell
+            // comes from: `PATH`, at the call, with a host that has none failing
+            // as an execution failure that names the requirement.
             (
                 "a_host_with_no_bash_on_path_fails_the_call_naming_the_requirement",
+                Status::Live,
+            ),
+            // …and what the *wire* carries, which resolved q54 ruling d makes a
+            // requirement rather than an implementation detail: on the Messages
+            // wire the two go out as the dated provider-defined tool types, so
+            // the behaviour the model was trained into engages.
+            (
+                "the_builtins_go_out_as_provider_defined_tools_on_the_messages_wire",
+                Status::Live,
+            ),
+            // …and the wire the other half of that ruling is about: on Chat
+            // Completions the same two tools are function tools carrying this
+            // compiler's own schemas, because that surface has no
+            // provider-defined types.
+            (
+                "the_builtins_go_out_as_function_tools_on_the_openai_wire",
                 Status::Live,
             ),
         ],
@@ -1440,47 +1513,32 @@ const BUILTINS: &[Criterion] = &[
         bullet: Bullet::BuiltinTools,
         phrase: "opted into per agent node, bounded by root",
         tests: &[
-            // The bound, crossed the way a string comparison would catch…
-            (
-                "a_path_that_climbs_out_of_the_root_is_refused_and_fails_the_node",
-                Status::Live,
-            ),
-            // …and the way only resolution does, which is what resolved q31
-            // spells out ("symlinks and `..` count").
-            (
-                "a_symlink_that_points_out_of_the_root_is_refused",
-                Status::Live,
-            ),
-            // …and the two shapes of that same crossing where there is nothing
-            // at the path to resolve, which is where q31 says the *parent* is
-            // resolved instead: a link pointing at a file that does not exist
-            // yet, and a new file under a linked directory. Both are writes, and
-            // a write is the one built-in whose escape leaves something behind.
-            (
-                "a_write_through_a_dangling_symlink_is_refused",
-                Status::Live,
-            ),
-            (
-                "a_write_to_a_new_file_under_a_symlinked_directory_is_refused",
-                Status::Live,
-            ),
-            // …and the crossing that asks no path at all: a listing walks where
-            // the tree goes, so it is the root check's other half — the walk
-            // stops at a link rather than reporting what is behind it.
-            (
-                "a_listing_does_not_descend_into_a_symlinked_directory",
-                Status::Live,
-            ),
-            // …and the two ways a bound can fail to be a bound at all: a root
+            // The two ways a bound can fail to be a bound at all: a workspace
             // that names no directory, and one the environment answered with
             // nothing — which would leave the tool bounded to wherever the
-            // runtime was started, the ambient capability D123 refuses.
+            // runtime was started, the ambient capability D135 refuses.
             (
-                "a_root_that_names_no_directory_fails_the_call",
+                "a_workspace_that_names_no_directory_fails_the_call",
                 Status::Live,
             ),
             (
-                "a_root_that_resolves_to_nothing_fails_the_call",
+                "a_workspace_that_resolves_to_nothing_fails_the_call",
+                Status::Live,
+            ),
+            // …and the bound a composition did *not* write, which resolved q54
+            // gives a lifetime rather than leaving to the process's own working
+            // directory: one directory per execution, shared by every built-in
+            // of that execution that took the default, gone when the run
+            // settles.
+            (
+                "the_default_workspace_is_the_executions_own_and_goes_when_the_run_settles",
+                Status::Live,
+            ),
+            // …and the bound q54 ruling b adds beside the workspace: the child
+            // environment, scrubbed to what the binding declared, with an
+            // explicit opt-in for the machines where inheriting is the point.
+            (
+                "a_shells_environment_holds_what_its_binding_declared_and_nothing_else",
                 Status::Live,
             ),
         ],
@@ -1489,16 +1547,19 @@ const BUILTINS: &[Criterion] = &[
         bullet: Bullet::BuiltinTools,
         phrase: "bounded by root + timeout",
         tests: &[
-            // The deadline, reached — and reached at the *attachment's* value,
-            // since the fixture binds the same built-in at two.
+            // The deadline, reached — and reached at the *binding's* value,
+            // since the fixture binds the same built-in at two. What it answers
+            // is the **model**: resolved q54 makes a spent deadline a tool
+            // result, so the loop goes on and the run completes.
             (
-                "a_command_that_outruns_its_timeout_is_killed_and_fails_the_node",
+                "a_command_that_outruns_its_timeout_comes_back_as_a_timeout_result",
                 Status::Live,
             ),
-            // …and the other execution failure a shell has, which is where the
-            // node's own `on_error:` gets to decide the run.
+            // …and the other thing a command can do that is not a failure of the
+            // tool: exit nonzero, which for a program the *model* wrote is a
+            // fact it asked for rather than a contract of the composition's.
             (
-                "a_command_that_exits_nonzero_fails_the_node_under_its_on_error",
+                "a_command_that_exits_nonzero_comes_back_to_the_model_with_its_status",
                 Status::Live,
             ),
             // …and what the deadline has to end besides the shell: the work the

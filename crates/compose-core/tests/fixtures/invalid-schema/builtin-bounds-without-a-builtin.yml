@@ -1,0 +1,19 @@
+# rule: `workspace:`/`timeout:`/`env:`/`inherit_env:` are a built-in's bounds (grammar 6.1 / D135)
+# at: /tool.probe
+# via: /$defs/toolDef/allOf/1/then/required
+tool.probe:
+  description: Probe an endpoint.
+  input:
+    url: { type: string }
+  output:
+    body: { type: string }
+  workspace: "./work"
+  exec:
+    command: curl
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

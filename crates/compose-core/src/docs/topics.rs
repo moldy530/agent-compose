@@ -62,7 +62,7 @@ pub const TOPICS: &[Topic] = &[
     },
     Topic {
         name: "tools",
-        summary: "`exec`/`http`/`function`/`module` implementations, and the def/use split",
+        summary: "`exec`/`http`/`function`/`module`/`builtin` implementations, and the def/use split",
         body: include_str!("../../../../docs/topics/tools.md"),
     },
     Topic {

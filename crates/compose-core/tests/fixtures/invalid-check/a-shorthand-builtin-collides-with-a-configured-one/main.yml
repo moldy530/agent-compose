@@ -1,0 +1,47 @@
+# rule: a shorthand beside a configured tool binding the same built-in is one tool on the model's side (grammar 5.5, 6.1, D135)
+# code: tool-name-collision
+# message: `agent.a` attaches `builtin.bash` and `tool.sandbox`, which are one `bash` tool on the model's side
+# at: main.yml:36:7
+# label: main.yml:35:7 the other is attached here
+# help: an attached tool's name is its address's local name — or, for a `builtin:` tool, the name the provider fixes — and a shorthand built-in's is the compiler's (grammar 5.4, 5.5, 6.1): rename the definition, change what it binds, or drop one of the two attachments
+#
+# The pair grammar 5.5 states in those words — "a shorthand beside a configured
+# tool binding the same built-in" — and the one that only a `builtin:` binding
+# can make: `tool.sandbox` is `bash` to the model whatever its definition key
+# says, so *renaming* it repairs nothing. What has to go is one of the two
+# attachments, or the `builtin:` the configured one binds.
+#
+# The near neighbour is `builtin-name-collides-with-an-attached-tool`, where the
+# other side is an `exec:` tool that happens to be *called* `tool.bash`: that one
+# collides through the address's local name, this one through the name the wire
+# fixes, and only this one exercises it.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+tool.sandbox:
+  description: Run a command, with this composition's bounds on it.
+  builtin: bash
+  timeout: 120s
+  env:
+    PATH: "/usr/bin:/bin"
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools:
+    - tool.sandbox
+    - builtin.bash
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

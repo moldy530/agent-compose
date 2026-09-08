@@ -7,13 +7,21 @@ agent.fixer:
   prompt: |
     You write minimal unified diffs. Read the file, fix exactly the described
     defect in it, and change nothing else.
-  # A runtime built-in, opted into by name and bounded by the one directory it
-  # may reach (grammar 5.5). Reading is all this agent needs: it answers with a
-  # diff rather than applying one, so it holds no `builtin.write_file` and no
-  # `builtin.bash` — which is the whole point of an opt-in that is read off the
-  # entry rather than granted by a switch.
+  # A built-in tool, configured once as `tool.checkout` (see tools/checkout.yml)
+  # and attached here by its address. A built-in is the one binding that hands
+  # the **model** the program — this agent's file operations are whatever it
+  # decides to run — so it is opted into by name and bounded by the one
+  # directory it may reach (grammar 5.5, 6.1).
+  #
+  # Read that grant as what it is: `builtin.files` **writes**. Its operations
+  # are `view`, `create`, `str_replace` and `insert`, so this agent can edit any
+  # file under `${REPO_ROOT}`, and the `patch:` it answers with is what it
+  # decided to report rather than the only way it can act. The workspace is the
+  # whole of the bound. What it does *not* hold is `builtin.bash`, which is
+  # arbitrary code execution on the host rather than edits under one directory —
+  # a line worth drawing, and one that is drawn by the entry not being here.
   tools:
-    - builtin.read_file: { root: "${REPO_ROOT}" }
+    - tool.checkout
   input:
     file: { type: string }
     patch_hint: { type: string }

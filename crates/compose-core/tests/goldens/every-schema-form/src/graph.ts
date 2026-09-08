@@ -23,9 +23,7 @@ import {
   agentShaperOutput,
   agentSpreaderOutput,
   builtinBashInput,
-  builtinListInput,
-  builtinReadFileInput,
-  builtinWriteFileInput,
+  builtinFilesInput,
   flowCondenseInputs,
   flowCondenseNodeReduceOutput,
   flowShapeInputs,
@@ -40,6 +38,7 @@ import {
   toolLookupOutput,
   toolPingInput,
   toolPingOutput,
+  toolSandboxInput,
 } from "./schemas.ts";
 import { State } from "./state.ts";
 import type { GraphState } from "./state.ts";
@@ -514,124 +513,116 @@ const agentShaper: runtime.AgentBinding = {
         ),
     },
     {
-      name: "read_file",
-      address: "builtin.read_file",
-      description: "Read one text file and return its contents. The path is relative to this agent's root directory, and a path that resolves outside it is refused.",
+      name: "bash",
+      address: "tool.sandbox",
+      description: "Run a `bash` command in a persistent shell session and return what it printed, with its exit status. The working directory and any shell state carry over from one call to the next, and each command runs under a deadline.",
       schema: {
         "additionalProperties": false,
         "properties": {
-          "path": {
-            "description": "The file to read, relative to the tool's root directory.",
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      },
-      invoke: (args, context) =>
-        runtime.runBuiltin(
-          {
-            tool: "read_file",
-            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.read_file.root" }],
-          },
-          runtime.parseToolArguments(builtinReadFileInput, args, "the arguments `read_file` was called with"),
-          context,
-        ),
-    },
-    {
-      name: "write_file",
-      address: "builtin.write_file",
-      description: "Write one text file, replacing whatever it held, and return how many bytes were written. The path is relative to this agent's root directory, a path that resolves outside it is refused, and the directory it names must already exist.",
-      schema: {
-        "additionalProperties": false,
-        "properties": {
-          "content": {
-            "description": "The bytes to write, replacing whatever the file held.",
-            "type": "string"
-          },
-          "path": {
-            "description": "The file to write, relative to the tool's root directory.",
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "path",
-          "content"
-        ],
-        "type": "object"
-      },
-      invoke: (args, context) =>
-        runtime.runBuiltin(
-          {
-            tool: "write_file",
-            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.write_file.root" }],
-          },
-          runtime.parseToolArguments(builtinWriteFileInput, args, "the arguments `write_file` was called with"),
-          context,
-        ),
-    },
-    {
-      name: "list",
-      address: "builtin.list",
-      description: "List the entries of one directory, optionally filtered by a glob. Paths are relative to this agent's root directory, a path that resolves outside it is refused, and a directory entry is reported with a trailing `/`.",
-      schema: {
-        "additionalProperties": false,
-        "properties": {
-          "glob": {
+          "command": {
             "default": "",
-            "description": "A glob to match entries against — `*` and `?` within one path segment, `**` across segments. Empty lists the directory's own entries.",
+            "description": "The shell command to run, as one line of `bash`.",
             "type": "string"
           },
-          "path": {
-            "default": ".",
-            "description": "The directory to list, relative to the tool's root directory.",
-            "type": "string"
+          "restart": {
+            "default": false,
+            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.",
+            "type": "boolean"
           }
         },
         "required": [],
         "type": "object"
       },
-      invoke: (args, context) =>
+      providerType: "bash_20250124",
+      invoke: (args, context, call) =>
         runtime.runBuiltin(
           {
-            tool: "list",
-            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.list.root" }],
+            tool: "bash",
+            workspace: [{ env: "WORKSPACE", site: "tool.sandbox.workspace" }, "/build"],
+            timeout: { millis: 30000, written: "30s" },
+            env: [
+              { name: "PATH", value: ["/usr/bin:/bin"] },
+              { name: "HOME", value: [{ env: "WORKSPACE", site: "tool.sandbox.env.HOME" }] },
+            ],
           },
-          runtime.parseToolArguments(builtinListInput, args, "the arguments `list` was called with"),
+          runtime.parseToolArguments(toolSandboxInput, args, "the arguments `bash` was called with"),
           context,
+          call,
         ),
     },
     {
-      name: "bash",
-      address: "builtin.bash",
-      description: "Run one `bash` command in this agent's root directory and return what it printed. The command runs under a deadline, and a command that exits nonzero or outruns it fails the node rather than answering.",
+      name: "str_replace_based_edit_tool",
+      address: "builtin.files",
+      description: "View, create and edit files inside this agent's workspace. Every path is relative to that workspace, and a path that resolves outside it is refused.",
       schema: {
         "additionalProperties": false,
         "properties": {
           "command": {
-            "description": "The shell command to run, as one line of `bash`.",
+            "description": "The file operation to perform: `view` reads a file or lists a directory, `create` writes a whole file, `str_replace` swaps one occurrence of a string, `insert` adds text at a line.",
+            "enum": [
+              "view",
+              "create",
+              "str_replace",
+              "insert"
+            ],
+            "type": "string"
+          },
+          "file_text": {
+            "default": "",
+            "description": "The whole contents of the file, for `create`.",
+            "type": "string"
+          },
+          "insert_line": {
+            "default": 0,
+            "description": "The line to insert after, for `insert`; `0` inserts at the top of the file.",
+            "maximum": 1000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "new_str": {
+            "default": "",
+            "description": "The text to put in its place, for `str_replace` and `insert`.",
+            "type": "string"
+          },
+          "old_str": {
+            "default": "",
+            "description": "The exact text to replace, for `str_replace`. It must appear exactly once.",
+            "type": "string"
+          },
+          "path": {
+            "description": "The file or directory, relative to this tool's workspace.",
             "minLength": 1,
             "type": "string"
+          },
+          "view_range": {
+            "default": [],
+            "description": "The first and last line to show, for `view` of a file: `[10, 40]`. Lines count from 1 and both ends are included; `-1` as the last line reads to the end of the file. Omitted, the whole file is shown.",
+            "items": {
+              "maximum": 1000000,
+              "minimum": -1,
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "type": "array"
           }
         },
         "required": [
-          "command"
+          "command",
+          "path"
         ],
         "type": "object"
       },
-      invoke: (args, context) =>
+      providerType: "text_editor_20250728",
+      invoke: (args, context, call) =>
         runtime.runBuiltin(
           {
-            tool: "bash",
-            root: [{ env: "WORKSPACE", site: "agent.shaper.tools.builtin.bash.root" }, "/build"],
-            timeout: { millis: 30000, written: "30s" },
+            tool: "files",
+            workspace: [],
+            env: [],
           },
-          runtime.parseToolArguments(builtinBashInput, args, "the arguments `bash` was called with"),
+          runtime.parseToolArguments(builtinFilesInput, args, "the arguments `str_replace_based_edit_tool` was called with"),
           context,
+          call,
         ),
     },
   ],
@@ -685,6 +676,41 @@ const agentSpreader: runtime.AgentBinding = {
         runtime.callSubflowTool(
           { name: "condense", binding: flowCondenseBinding, inputs: flowCondenseInputs },
           args,
+          context,
+          call,
+        ),
+    },
+    {
+      name: "bash",
+      address: "builtin.bash",
+      description: "Run a `bash` command in a persistent shell session and return what it printed, with its exit status. The working directory and any shell state carry over from one call to the next, and each command runs under a deadline.",
+      schema: {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "default": "",
+            "description": "The shell command to run, as one line of `bash`.",
+            "type": "string"
+          },
+          "restart": {
+            "default": false,
+            "description": "Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      providerType: "bash_20250124",
+      invoke: (args, context, call) =>
+        runtime.runBuiltin(
+          {
+            tool: "bash",
+            workspace: [],
+            timeout: { millis: 120000, written: "120s" },
+            env: [],
+          },
+          runtime.parseToolArguments(builtinBashInput, args, "the arguments `bash` was called with"),
           context,
           call,
         ),
@@ -1440,6 +1466,14 @@ async function quiesceFlow(
     // quiesced.
     const parked = runtime.staysOpen(executionId, outcome);
     stores.releaseExecution(executionId, parked);
+    // …and the directory this run's built-in tools worked in, under the same
+    // rule and for the same reason (grammar 6.1, PRD resolved q54): a workspace
+    // nobody configured belongs to the execution, so it goes when the execution
+    // ends — and stays where the row stays open, because the generation that
+    // resumes it runs past the frontier into files the recorded prefix wrote.
+    // A binding that named its own `workspace:` is the composition's and is
+    // never removed.
+    await runtime.releaseWorkspaces(executionId, parked);
   };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way

@@ -1,10 +1,10 @@
 # rule: a built-in's name is on the wire beside the agent's other tools, so a
-# rule: `tool.*` of that local name is one tool with it (grammar 5.5, 11.5, D123)
+# rule: `tool.*` of that local name is one tool with it (grammar 5.5, 11.5, D135)
 # code: tool-name-collision
 # message: `agent.a` attaches `builtin.bash` and `tool.bash`, which are one `bash` tool on the model's side
 # at: main.yml:33:7
 # label: main.yml:32:7 the other is attached here
-# help: an attached tool's name is its address's local name and a built-in's is fixed by the compiler (grammar 5.4, 5.5): rename the definition, or drop one of the two attachments
+# help: an attached tool's name is its address's local name — or, for a `builtin:` tool, the name the provider fixes — and a shorthand built-in's is the compiler's (grammar 5.4, 5.5, 6.1): rename the definition, change what it binds, or drop one of the two attachments
 #
 # Not decidable in one file: the built-in's name is fixed by the compiler and
 # the name it collides with is the *definition key* of a `tool.*` declared
@@ -30,7 +30,7 @@ agent.a:
   prompt: Decide.
   tools:
     - tool.bash
-    - builtin.bash: { root: "./work", timeout: 30s }
+    - builtin.bash
   output:
     verdict: { type: string }
 flow.f:

@@ -1,10 +1,11 @@
 //! The six definition namespaces (grammar 5, 6, 7, 11, 12).
 
+use crate::ast::binding::BuiltinBlock;
 use crate::ast::common::{Address, Namespace};
 use crate::ast::definition::{
-    AgentAccess, Builtin, BuiltinAttachment, DefinitionBody, DirectModel, EmbedBlock, ModelDef,
-    ProviderDef, ProviderKind, RouteCondition, RouteModel, Settings, StoreDef, StoreKind,
-    StoreScope, ToolDef, ToolImplementation,
+    AgentAccess, Builtin, DefinitionBody, DirectModel, EmbedBlock, ModelDef, ProviderDef,
+    ProviderKind, RouteCondition, RouteModel, Settings, StoreDef, StoreKind, StoreScope, ToolDef,
+    ToolImplementation,
 };
 use crate::ast::schema::{FieldMap, Surface};
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
@@ -13,7 +14,7 @@ use crate::yaml::{Node, Yaml};
 use super::binding;
 use super::flow;
 use super::lexical;
-use super::reader::{Cx, Fields, expect_mapping, expect_sequence, list, suggest};
+use super::reader::{Cx, Fields, expect_mapping, expect_sequence, expect_string, list, suggest};
 use super::schema;
 use super::schema::literal;
 
@@ -115,31 +116,32 @@ fn agent(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> crate::ast::def
 }
 
 /// Read an agent's `tools:` list, which carries two kinds of entry (grammar 5.4,
-/// 5.5, Decision D123).
+/// 5.5, Decision D135).
 ///
-/// A **scalar** entry is a `tool.*` or `flow.*` address, exactly as it always
-/// was. A **mapping** entry attaches one of the four runtime built-ins, under
-/// its own name, with the bounds that name requires beside it:
+/// A **reference** entry is a `tool.*` or `flow.*` address, exactly as it always
+/// was — and a `tool.*` whose implementation is a `builtin:` binding (§6.1) is
+/// one of those, so a configured built-in is attached the way every other
+/// configured tool is. A **shorthand** entry is one of the built-ins written as
+/// its own address, which attaches it under its defaults:
 ///
 /// ```yaml
 /// tools:
 ///   - tool.repo_grep
-///   - builtin.read_file: { root: "${WORKSPACE}" }
-///   - builtin.bash:      { root: "${WORKSPACE}", timeout: 30s }
+///   - tool.sandbox      # a `builtin: bash` with a workspace and a timeout
+///   - builtin.files     # the same tool under every default
 /// ```
 ///
-/// One entry attaches one tool, which is why a mapping carrying two keys is
-/// refused rather than read as two attachments: PRD resolved q31 makes the
-/// opt-in "one tool name at a time … never a single switch that grants the set",
-/// and a shape that let one entry grant two would be the beginning of that
-/// switch.
+/// There is no third shape. Bounds are written on a `tool.*` definition, where
+/// every other implementation writes them, rather than inline in the list: a
+/// built-in configured once is attachable from more than one agent, and an
+/// entry that carried its own bounds could not be.
 fn agent_tools(
     fields: &mut Fields<'_>,
     subject: &str,
     cx: &mut Cx,
-) -> (Vec<Spanned<Address>>, Vec<BuiltinAttachment>) {
+) -> (Vec<Spanned<Address>>, Vec<Spanned<Builtin>>) {
     let mut references: Vec<Spanned<Address>> = Vec::new();
-    let mut builtins: Vec<BuiltinAttachment> = Vec::new();
+    let mut builtins: Vec<Spanned<Builtin>> = Vec::new();
     let Some(node) = fields.take("tools") else {
         return (references, builtins);
     };
@@ -147,53 +149,68 @@ fn agent_tools(
         return (references, builtins);
     };
     for item in items {
-        if item.as_mapping().is_some() {
-            if let Some(attachment) = builtin_attachment(item, subject, cx) {
-                if let Some(first) = builtins
-                    .iter()
-                    .find(|other| other.tool.value == attachment.tool.value)
-                {
-                    cx.push(
-                        Diagnostic::error(
-                            DiagnosticCode::InvalidValue,
-                            attachment.tool.span.clone(),
-                            format!("`tools` lists `{}` twice", attachment.tool.value.address()),
-                        )
-                        .with_label(first.tool.span.clone(), "first listed here")
-                        .with_help(format!(
-                            "one entry attaches one built-in under one set of bounds; a second \
-                             entry for the same name would offer the model two `{}` tools \
-                             (grammar 5.5, 11.5)",
-                            attachment.tool.value.as_str()
-                        )),
-                    );
-                    continue;
-                }
-                builtins.push(attachment);
-            }
+        // The bounded mapping form the built-ins once took. The name is right
+        // and the shape is not, so the repair names the surface the bounds moved
+        // to rather than leaving a reader with a wrong-type diagnostic about a
+        // sequence entry (PRD G3, resolved q54).
+        if let Some(mapping) = item.as_mapping() {
+            builtin_bounds_moved(item, mapping.entries().first(), cx);
             continue;
         }
-        // A built-in written as a bare address: the name is right and the shape
-        // is not, so the repair is the shape rather than the namespace list a
-        // reference diagnostic would print.
         if let Yaml::String(text) = &item.value
             && let Some(tool) = Builtin::from_address(text)
         {
+            if let Some(first) = builtins.iter().find(|other| other.value == tool) {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        item.span.clone(),
+                        format!("`tools` lists `{text}` twice"),
+                    )
+                    .with_label(first.span.clone(), "first listed here")
+                    .with_help(format!(
+                        "one entry attaches one built-in; a second entry for the same name \
+                         would offer the model two `{}` tools (grammar 5.5, 11.5)",
+                        tool.as_str()
+                    )),
+                );
+                continue;
+            }
+            builtins.push(Spanned::new(tool, item.span.clone()));
+            continue;
+        }
+        // A `builtin.*` that is not one of the two. Read here rather than left
+        // to `lexical::reference`, which would report it as an entry in no
+        // namespace at all and offer a list of six that does not contain the
+        // thing the author was reaching for: the shorthand is the first spelling
+        // a reader types, and `builtin.fils` is the likeliest way to get it
+        // wrong (grammar 5.5, PRD G3).
+        if let Yaml::String(text) = &item.value
+            && let Some(name) = text.strip_prefix("builtin.")
+        {
+            // Compared on the **name** rather than on the whole address: every
+            // candidate shares the `builtin.` prefix, so a whole-address
+            // comparison measures eight equal characters and then calls
+            // `builtin.grep` a near miss for `builtin.bash`.
+            let names: Vec<&str> = Builtin::ALL.iter().map(|tool| tool.keyword()).collect();
             cx.push(
                 Diagnostic::error(
-                    DiagnosticCode::InvalidReference,
+                    DiagnosticCode::UnknownVariant,
                     item.span.clone(),
-                    format!("`{text}` is a built-in tool, not a definition to reference"),
+                    format!("`{text}` is not a built-in tool"),
                 )
-                .with_help(format!(
-                    "a built-in is attached as a mapping carrying its bounds: \
-                     `- {text}: {{ {} }}` (grammar 5.5)",
-                    if tool.runs_a_command() {
-                        "root: <directory>, timeout: 30s"
-                    } else {
-                        "root: <directory>"
-                    }
-                )),
+                .with_optional_help(
+                    suggest(name, &names)
+                        .and_then(Builtin::from_keyword)
+                        .map(|tool| format!("did you mean `{}`?", tool.address()))
+                        .or_else(|| {
+                            Some(format!(
+                                "the built-ins are {}, and the set is closed; every other tool is \
+                                 a `tool.*` or `flow.*` address (grammar 5.5)",
+                                builtin_addresses()
+                            ))
+                        }),
+                ),
             );
             continue;
         }
@@ -224,139 +241,188 @@ fn agent_tools(
     (references, builtins)
 }
 
-/// Read one `builtin.*` entry of a `tools:` list (grammar 5.5, Decision D123).
-fn builtin_attachment(
-    item: &Node,
-    subject: &str,
-    cx: &mut Cx,
-) -> Option<crate::ast::definition::BuiltinAttachment> {
-    let entries = expect_mapping(item, "each entry of `tools`", cx)?.entries();
-    let names = || list(Builtin::ALL.iter().map(|tool| tool.address()));
-    let [entry] = entries else {
-        cx.push(
-            Diagnostic::error(
-                DiagnosticCode::InvalidValue,
-                item.span.clone(),
-                format!(
-                    "each entry of `tools` attaches one tool, and this one declares {}",
-                    if entries.is_empty() {
-                        "none".to_string()
-                    } else {
-                        format!("{}", entries.len())
-                    }
-                ),
-            )
-            .with_help(format!(
-                "a built-in is attached one name at a time — `- builtin.bash: {{ root: …, \
-                 timeout: 30s }}` — so that what an agent holds is readable off the entry that \
-                 holds it; the built-ins are {} (grammar 5.5)",
-                names()
-            )),
-        );
-        return None;
-    };
-    let key = &entry.key;
-    let Some(tool) = Builtin::from_address(&key.value) else {
-        cx.push(
-            Diagnostic::error(
-                DiagnosticCode::UnknownVariant,
-                key.span.clone(),
-                format!("`{}` is not a built-in tool", key.value),
-            )
-            .with_optional_help(
-                // Suggested on the **local** names, with the shared
-                // `builtin.` prefix taken off both sides. Left on, every pair
-                // of names is eight characters closer than it is, and the
-                // distance budget — a third of the length — is eight characters
-                // wider: `builtin.grep` comes back as "did you mean
-                // `builtin.bash`?", which is a nudge toward the one built-in
-                // nobody should be nudged toward by accident (PRD G3).
-                suggest(
-                    key.value.strip_prefix("builtin.").unwrap_or(&key.value),
-                    &Builtin::ALL
-                        .iter()
-                        .map(|tool| tool.as_str())
-                        .collect::<Vec<_>>(),
-                )
-                .map(|name| format!("did you mean `builtin.{name}`?"))
-                .or_else(|| {
-                    Some(format!(
-                        "the built-ins are {}; a `tool.*` or `flow.*` is attached as a bare \
-                         address instead (grammar 5.4, 5.5)",
-                        names()
-                    ))
-                }),
+/// Every built-in, written as the address a shorthand entry spells.
+fn builtin_addresses() -> String {
+    list(Builtin::ALL.iter().map(|tool| tool.address()))
+}
+
+/// A `tools:` entry written as a mapping — the bounded form the built-ins took
+/// before their configuration moved onto a `tool.*` definition (grammar 5.5,
+/// 6.1, PRD resolved q54).
+///
+/// Reported here rather than left to `lexical::reference`'s wrong-type
+/// diagnostic, because the author's mistake is not the entry's *type*: they
+/// wrote bounds, and the only thing that changed is where bounds are written.
+fn builtin_bounds_moved(item: &Node, first: Option<&crate::yaml::Entry>, cx: &mut Cx) {
+    let named = first.and_then(|entry| Builtin::from_address(&entry.key.value));
+    let (message, help) = match named {
+        Some(tool) => (
+            format!("`{}` carries no bounds in a `tools:` list", tool.address()),
+            format!(
+                "a built-in is configured on a `tool.*` definition and attached by its address — \
+                 `tool.sandbox: {{ builtin: {}, workspace: ./work{} }}`, then `- tool.sandbox` — \
+                 so one configuration serves every agent that attaches it; `- {}` on its own \
+                 attaches it under its defaults (grammar 5.5, 6.1)",
+                tool.keyword(),
+                if tool.runs_a_command() {
+                    ", timeout: 120s"
+                } else {
+                    ""
+                },
+                tool.address()
             ),
-        );
-        return None;
+        ),
+        None => (
+            "each entry of `tools` is an address, not a mapping".to_string(),
+            format!(
+                "a `tool.*` or `flow.*` is attached by its address, and so is a built-in: the \
+                 built-ins are {} (grammar 5.4, 5.5)",
+                builtin_addresses()
+            ),
+        ),
     };
-    let context = format!("`{}` in {subject}", tool.address());
-    let mapping = expect_mapping(&entry.value, &context, cx)?;
-    let mut fields = Fields::new(mapping, entry.value.span.clone(), &context);
-    // Required **and** non-empty. `root: ""` would satisfy the key check and
-    // then resolve, at the call, to whatever directory the runtime happened to
-    // be started in — the ambient capability D123 refuses in its own words, read
-    // off no entry and different on a developer's machine and a deployment's. A
-    // `${VAR}` that comes back empty is the same hole reached through the
-    // environment, and the runtime closes that half where it resolves the root.
-    let root = fields
-        .require("root", cx)
-        .and_then(|node| lexical::interpolated(node, "`root`", cx))
-        .filter(|root| {
-            if !root.value.as_str().is_empty() {
+    cx.push(
+        Diagnostic::error(DiagnosticCode::WrongType, item.span.clone(), message).with_help(help),
+    );
+}
+
+/// Read a `builtin:` implementation binding (grammar 6.1, Decision D135,
+/// PRD resolved q54).
+///
+/// `builtin:` names the tool and the bounds are written **beside** it, on the
+/// definition itself, rather than under it: there is no contract for them to sit
+/// inside, so a nested block would be a level of indentation carrying one key.
+/// `tool.sandbox: { builtin: bash }` is a shell under every default; the bounds
+/// are `workspace:`, and — for the shell alone — `timeout:`, `env:` and
+/// `inherit_env:`.
+fn builtin_block(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> Option<BuiltinBlock> {
+    let span = fields.span.clone();
+    let builtin = fields
+        .require("builtin", cx)
+        .and_then(|node| builtin_name(node, subject, cx));
+    // Interpolable exactly as an `exec:` block's `cwd:` is (grammar 4.3
+    // class 2): which directory a graph is allowed to work in is a property of
+    // the machine running it. Non-empty when written, for the reason an empty
+    // `cwd:` is refused — `""` resolves to whatever directory the runtime
+    // happened to be started in, which is an ambient capability nobody wrote.
+    // Omitting the key is the way to take the default, and says so.
+    let workspace = fields
+        .take("workspace")
+        .and_then(|node| lexical::interpolated(node, "`workspace`", cx))
+        .filter(|workspace| {
+            if !workspace.value.as_str().is_empty() {
                 return true;
             }
             cx.push(
                 Diagnostic::error(
                     DiagnosticCode::InvalidValue,
-                    root.span.clone(),
-                    format!("`root` in {context} must not be empty"),
+                    workspace.span.clone(),
+                    format!("`workspace` in {subject} must not be empty"),
                 )
-                .with_help(format!(
-                    "name the directory this tool is bounded to — `- {}: {{ root: ./workspace{} }}`; \
-                     an empty root would bound it to wherever the runtime was started instead \
-                     (grammar 5.5)",
-                    tool.address(),
-                    if tool.runs_a_command() {
-                        ", timeout: 30s"
-                    } else {
-                        ""
-                    }
-                )),
+                .with_help(
+                    "name the directory this tool works inside, or omit `workspace:` to take the \
+                     execution's own built-in workspace; an empty one would bound the tool to \
+                     wherever the runtime was started instead (grammar 6.1)",
+                ),
             );
             false
         });
-    let timeout = if tool.runs_a_command() {
-        fields
-            .require("timeout", cx)
-            .and_then(|node| lexical::duration(node, "`timeout`", cx))
-    } else {
-        // Taken so `finish` does not report it as a plain unknown key: the
-        // sentence a reader needs here is why this tool has no timeout, not a
-        // list of the keys it does take.
-        if let Some(node) = fields.take("timeout") {
-            cx.push(
-                Diagnostic::error(
-                    DiagnosticCode::UnknownKey,
-                    node.span.clone(),
-                    format!("unknown key `timeout` in {context}"),
-                )
-                .with_help(
-                    "`timeout:` bounds the command `builtin.bash` runs; a file tool has no \
-                     command to bound, and a node-level `timeout:` bounds the whole agent node \
-                     (grammar 5.5, 9.2)",
-                ),
-            );
+
+    let timeout = shell_only(fields, "timeout", builtin.as_ref(), cx)
+        .and_then(|node| lexical::duration(node, "`timeout`", cx));
+    let env = shell_only(fields, "env", builtin.as_ref(), cx)
+        .map(|node| binding::interpolated_map(node, "`env`", binding::NameForm::EnvVar, cx))
+        .unwrap_or_default();
+    let inherit_env = shell_only(fields, "inherit_env", builtin.as_ref(), cx).and_then(|node| {
+        match &node.value {
+            Yaml::Bool(value) => Some(Spanned::new(*value, node.span.clone())),
+            _ => {
+                cx.wrong_type(node, "`inherit_env`", "a boolean");
+                None
+            }
         }
-        None
-    };
-    fields.finish(cx);
-    Some(crate::ast::definition::BuiltinAttachment {
-        tool: Spanned::new(tool, key.span.clone()),
-        root,
+    });
+
+    Some(BuiltinBlock {
+        builtin,
+        workspace,
         timeout,
-        span: item.span.clone(),
+        env,
+        inherit_env,
+        span,
     })
+}
+
+/// Take a `builtin:` block key that only the shell takes, reporting it as an
+/// unknown key on the file tool with the sentence a reader needs.
+///
+/// `builtin.files` reads and writes through the runtime and forks nothing, so a
+/// command bound and a child environment there configure nobody — the inert key
+/// Decision D50 refuses. Taken rather than left to `finish`, so the report says
+/// *why* rather than listing the keys this block does take.
+fn shell_only<'a>(
+    fields: &mut Fields<'a>,
+    key: &'static str,
+    builtin: Option<&Spanned<Builtin>>,
+    cx: &mut Cx,
+) -> Option<&'a Node> {
+    let node = fields.take(key)?;
+    let Some(tool) = builtin else {
+        return Some(node);
+    };
+    if tool.value.runs_a_command() {
+        return Some(node);
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::UnknownKey,
+            node.span.clone(),
+            format!(
+                "unknown key `{key}` in a `builtin: {}` binding",
+                tool.value.keyword()
+            ),
+        )
+        .with_label(tool.span.clone(), "the built-in is named here")
+        .with_help(
+            "`timeout:`, `env:` and `inherit_env:` bound the child processes `builtin.bash` \
+             forks; `builtin.files` reads and writes through the runtime itself and forks none, \
+             so it has no child to bound (grammar 6.1)",
+        ),
+    );
+    None
+}
+
+/// Read the word a `builtin:` binding names its tool with (grammar 6.1).
+fn builtin_name(node: &Node, subject: &str, cx: &mut Cx) -> Option<Spanned<Builtin>> {
+    let text = expect_string(node, "`builtin`", cx)?;
+    if let Some(tool) = Builtin::from_keyword(&text.value) {
+        return Some(Spanned::new(tool, text.span));
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::UnknownVariant,
+            text.span.clone(),
+            format!("`{}` is not a built-in tool", text.value),
+        )
+        .with_optional_help(
+            suggest(
+                &text.value,
+                &Builtin::ALL
+                    .iter()
+                    .map(|tool| tool.keyword())
+                    .collect::<Vec<_>>(),
+            )
+            .map(|name| format!("did you mean `{name}`?"))
+            .or_else(|| {
+                Some(format!(
+                    "the built-ins are {}; {subject} names one of those, and every other tool \
+                     is written with `exec:`, `http:`, `function:` or `module:` (grammar 6.1)",
+                    list(Builtin::ALL.iter().map(|tool| tool.keyword()))
+                ))
+            }),
+        ),
+    );
+    None
 }
 
 /// The implementation bindings a `tool.*` may carry, of which it carries
@@ -368,18 +434,52 @@ fn builtin_attachment(
 /// them for an agent choosing what to read (`docs::topics`, whose tests pin the
 /// two together). A binding added to the language and not to the summary is a
 /// surface an agent discovering this compiler never learns exists.
-pub(crate) const TOOL_IMPLEMENTATIONS: &[&str] = &["exec", "http", "function", "module"];
+pub(crate) const TOOL_IMPLEMENTATIONS: &[&str] = &["exec", "http", "function", "module", "builtin"];
 
 fn tool(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ToolDef {
-    let description = fields
-        .require("description", cx)
-        .and_then(|node| lexical::non_empty_text(node, "`description`", cx));
-    let input = fields.require("input", cx).and_then(|node| {
-        schema::field_map(node, &format!("`input` of {subject}"), Surface::Input, cx)
-    });
-    let output = fields.require("output", cx).and_then(|node| {
-        schema::field_map(node, &format!("`output` of {subject}"), Surface::Result, cx)
-    });
+    // A built-in defines its own contract, so the three keys every other tool
+    // declares are read differently here: `description:` stays optional prose
+    // the author may sharpen, and `input:`/`output:` are refused outright
+    // (grammar 6.1, Decision D135). Decided before any of them is read, so the
+    // report is one sentence about the binding rather than two missing keys.
+    let is_builtin = fields.contains("builtin");
+    let description = if is_builtin {
+        fields
+            .take("description")
+            .and_then(|node| lexical::non_empty_text(node, "`description`", cx))
+    } else {
+        fields
+            .require("description", cx)
+            .and_then(|node| lexical::non_empty_text(node, "`description`", cx))
+    };
+    let (input, output) = if is_builtin {
+        for key in ["input", "output"] {
+            let Some(entry) = fields.take_entry(key) else {
+                continue;
+            };
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::UnknownKey,
+                    entry.key.span.clone(),
+                    format!("unknown key `{key}` in {subject}"),
+                )
+                .with_help(
+                    "a `builtin:` tool declares no contract of its own: the model authors the \
+                     program rather than filling parameters an author wrote, so its arguments \
+                     and its result are this compiler's (grammar 6.1, PRD resolved q54)",
+                ),
+            );
+        }
+        (None, None)
+    } else {
+        let input = fields.require("input", cx).and_then(|node| {
+            schema::field_map(node, &format!("`input` of {subject}"), Surface::Input, cx)
+        });
+        let output = fields.require("output", cx).and_then(|node| {
+            schema::field_map(node, &format!("`output` of {subject}"), Surface::Result, cx)
+        });
+        (input, output)
+    };
 
     let bindings = TOOL_IMPLEMENTATIONS;
     fields.note_known(bindings);
@@ -400,7 +500,7 @@ fn tool(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ToolDef {
                         list(bindings)
                     ),
                 )
-                .with_help("`exec` runs a subprocess, `http` calls an endpoint, `function` names a host-registered function, `module` names a TypeScript file in this project"),
+                .with_help("`exec` runs a subprocess, `http` calls an endpoint, `function` names a host-registered function, `module` names a TypeScript file in this project, `builtin` names one of the built-in tools"),
             );
             None
         }
@@ -454,6 +554,12 @@ fn implementation(
     subject: &str,
     cx: &mut Cx,
 ) -> Option<ToolImplementation> {
+    // Read off the definition's own keys rather than out of a nested block: a
+    // built-in's bounds are written beside `builtin:` because there is no
+    // contract under it for them to sit inside (grammar 6.1, Decision D135).
+    if key == "builtin" {
+        return builtin_block(fields, subject, cx).map(ToolImplementation::Builtin);
+    }
     let node = match key {
         "exec" => fields.take_entry("exec"),
         "http" => fields.take_entry("http"),
@@ -1123,4 +1229,80 @@ fn reference_list(
 pub(crate) fn suggest_namespace(prefix: &str) -> Option<&'static str> {
     let names: Vec<&str> = Namespace::ALL.iter().map(|n| n.as_str()).collect();
     suggest(prefix, &names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TOOL_IMPLEMENTATIONS;
+
+    /// §6's normative key table, which is the summary a reader meets **before**
+    /// §6.1's prose — the table rows between the section heading and its first
+    /// subsection.
+    fn tool_key_table() -> String {
+        let grammar = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .expect("the manifest directory has a grandparent")
+                .join("docs/grammar.md"),
+        )
+        .expect("the grammar is readable");
+        let section = grammar
+            .split_once("\n## 6. Tool definitions\n")
+            .expect("the grammar has a §6")
+            .1;
+        let body = section
+            .split_once("\n### 6.1")
+            .expect("§6 ends where §6.1 begins")
+            .0;
+        body.lines()
+            .filter(|line| line.starts_with("| `"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The table names every implementation binding a tool can carry.
+    ///
+    /// The same closed set the `tools` topic's index summary is held to
+    /// (`crate::docs::topics`), pinned here against the **normative** document
+    /// for the reason that one is pinned against the index: a table is where a
+    /// reader — or an agent — settles what the language admits before reading
+    /// the prose under it, and a binding missing from it reads as a binding
+    /// that does not exist. `builtin:` was added to the language by PRD
+    /// resolved q54, and this row is what a reader checks a composition
+    /// against.
+    #[test]
+    fn the_grammar_tool_table_names_every_implementation_binding() {
+        let table = tool_key_table();
+        for binding in TOOL_IMPLEMENTATIONS {
+            assert!(
+                table.contains(&format!("`{binding}`")),
+                "§6's key table does not name the `{binding}` binding:\n{table}"
+            );
+        }
+    }
+
+    /// …and it says which of the three declared keys a `builtin:` tool reads
+    /// differently.
+    ///
+    /// The half that made the stale table *wrong* rather than merely
+    /// incomplete: `description:` is optional under `builtin:`, and `input:`
+    /// and `output:` are compile errors there (grammar 6.1, Decision D135), so
+    /// a row marking any of the three unconditionally required sends a reader
+    /// to write the one composition the parser refuses.
+    #[test]
+    fn the_grammar_tool_table_qualifies_the_keys_a_builtin_reads_differently() {
+        let table = tool_key_table();
+        for key in ["description", "input", "output"] {
+            let row = table
+                .lines()
+                .find(|line| line.starts_with(&format!("| `{key}` |")))
+                .unwrap_or_else(|| panic!("§6's key table has a `{key}` row:\n{table}"));
+            assert!(
+                row.contains("builtin"),
+                "§6's key table states `{key}`'s requirement without the `builtin:` \
+                 qualification §6.1 puts on it: {row}"
+            );
+        }
+    }
 }

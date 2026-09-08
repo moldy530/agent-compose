@@ -718,6 +718,15 @@ fn tools(
         let DefinitionBody::Tool(tool) = &definition.body else {
             continue;
         };
+        // A `builtin:` tool has no function of its own to emit: the call goes
+        // straight to the runtime's own handler from the agent's tool list,
+        // where the arguments are parsed and a refusal has a model to go back
+        // to (grammar 6.1, Decision D135). Nothing else in a generated project
+        // may reach it, because a built-in is not a `function:` node's binding
+        // — an agent's `tools:` list is its only call site.
+        if matches!(tool.implementation, ToolImplementation::Builtin { .. }) {
+            continue;
+        }
         let input_schema = names.value(&format!("{address}.input"));
         let output_schema = names.value(&format!("{address}.output"));
         imported.push(input_schema.to_string());
@@ -745,6 +754,8 @@ fn tools(
                     ToolImplementation::Http { .. } => "an HTTP request",
                     ToolImplementation::Function { .. } => "a host-registered function",
                     ToolImplementation::Module { .. } => "an authored module",
+                    // Unreachable: the loop skips a built-in above.
+                    ToolImplementation::Builtin { .. } => "a built-in tool",
                 }
             )],
         ));
@@ -807,6 +818,8 @@ fn tools(
                     names::string(&format!("the result of `{address}`"))
                 ));
             }
+            // Unreachable: the loop skips a built-in above.
+            ToolImplementation::Builtin { .. } => {}
         }
         text.push_str("}\n");
     }
@@ -894,6 +907,18 @@ fn agents(
                     }
                     continue;
                 };
+                if let ToolImplementation::Builtin { builtin } = &tool.implementation {
+                    text.push_str(&builtin_tool(
+                        names,
+                        surfaces,
+                        &tool_address,
+                        builtin.builtin.value,
+                        Some(builtin),
+                        &tool.description.value,
+                        imported,
+                    ));
+                    continue;
+                }
                 let local_name = tool_address
                     .split_once('.')
                     .map_or(tool_address.as_str(), |(_, rest)| rest);
@@ -940,7 +965,7 @@ fn agents(
                 ));
                 text.push_str("    },\n");
             }
-            text.push_str(&builtin_tools(names, surfaces, address, agent, imported));
+            text.push_str(&builtin_tools(names, surfaces, agent, imported));
             text.push_str(&store_tools(ir, names, surfaces, agent, imported));
             text.push_str("  ],\n");
         }
@@ -955,6 +980,18 @@ fn agents(
 
 /// Grammar 5's default for `max_tool_iterations:` (Decision D51, PRD §9.14).
 const DEFAULT_TOOL_ITERATIONS: i64 = 8;
+
+/// Grammar 6.1's default for a `builtin: bash` binding's `timeout:`, as written.
+///
+/// Longer than a build step and shorter than a wedged process: a composition
+/// that wants either says so, and a command nobody bounded would hold an agent
+/// node until §9.2's own deadline took the whole loop with it (Decision D135).
+const DEFAULT_BUILTIN_TIMEOUT: &str = "120s";
+
+/// [`DEFAULT_BUILTIN_TIMEOUT`] in milliseconds, which is what the timer is set
+/// to. The two are one value written twice, for the reason the emitted binding
+/// carries both: the timer reads one and a failure message quotes the other.
+const DEFAULT_BUILTIN_TIMEOUT_MILLIS: u128 = 120_000;
 
 /// One `flow.*` in an agent's `tools:` — flow-as-tool (grammar 5.4, PRD 5.1).
 ///
@@ -1037,105 +1074,166 @@ fn flow_tool(
     text
 }
 
-/// The runtime built-ins an agent opted into, one `AgentTool` per entry
-/// (grammar 5.5, Decision D123, PRD resolved q31).
+/// The built-ins an agent attached by shorthand, one `AgentTool` per entry
+/// (grammar 5.5, Decision D135, PRD resolved q54).
 ///
-/// Everything about a built-in that varies is the **attachment's**: `root:`, and
-/// `builtin.bash`'s `timeout:`. Everything else — the name the model calls, the
-/// argument schema, what the call does — is this compiler's, so what is emitted
-/// here is a call to one runtime function carrying the bounds the entry wrote.
-///
-/// The `root:` is emitted **unresolved**, as the interpolation parts every other
-/// class-2 surface is (grammar 4.3): the value reaches the process at start, the
-/// artifact stays committable, and the journal keys the call on the root *as
-/// written* rather than on the directory one machine resolved it to
-/// (`docs/durability.md` §3.2).
+/// A shorthand entry carries no bounds — that is what makes it a shorthand — so
+/// what is emitted is the tool under its defaults. A built-in with bounds is a
+/// `tool.*` carrying a `builtin:` binding and is emitted from the attached-tool
+/// loop above, through the same [`builtin_tool`].
 ///
 /// They are appended after the declared `tool.*`/`flow.*` attachments and before
 /// the stores' synthesized tools, so a transcript reads in the order the
-/// composition declares: references first, then built-ins, then `stores:`.
+/// composition declares: references first, then shorthand built-ins, then
+/// `stores:`.
 fn builtin_tools(
     names: &Names,
     surfaces: &[schema::Surface<'_>],
-    address: &str,
     agent: &Agent,
     imported: &mut Vec<String>,
 ) -> String {
     let mut text = String::new();
     for builtin in &agent.builtins {
-        let tool = builtin.tool.value;
-        let path = format!("{}.input", tool.address());
-        let schema_name = names.value(&path).to_string();
-        imported.push(schema_name.clone());
-        let arguments = surface_fields(surfaces, &path);
-        text.push_str("    {\n");
-        text.push_str(&format!("      name: {},\n", names::string(tool.as_str())));
-        text.push_str(&format!(
-            "      address: {},\n",
-            names::string(tool.address())
+        let tool = builtin.value;
+        text.push_str(&builtin_tool(
+            names,
+            surfaces,
+            tool.address(),
+            tool,
+            None,
+            &crate::check::model::builtin_description(tool),
+            imported,
         ));
-        text.push_str(&format!(
-            "      description: {},\n",
-            names::string(&builtin_description(tool))
-        ));
-        text.push_str(&format!(
-            "      schema: {},\n",
-            json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
-        ));
-        text.push_str(&format!(
-            "      invoke: (args, context) =>\n        runtime.runBuiltin(\n          \
-             {{\n            tool: {},\n            root: {},\n{}          }},\n          \
-             runtime.parseToolArguments({schema_name}, args, {}),\n          context,\n        ),\n",
-            names::string(tool.as_str()),
-            interpolation(
-                &builtin.root.value,
-                &format!("{address}.tools.{}.root", tool.address())
-            ),
-            builtin.timeout.as_ref().map_or_else(String::new, |timeout| {
-                format!(
-                    "            timeout: {{ millis: {}, written: {} }},\n",
-                    timeout.value.as_millis(),
-                    names::string(timeout.value.as_str())
-                )
-            }),
-            names::string(&format!(
-                "the arguments `{}` was called with",
-                tool.as_str()
-            ))
-        ));
-        text.push_str("    },\n");
     }
     text
 }
 
-/// What a runtime built-in tells the model it does.
+/// One built-in, emitted as the `AgentTool` an agent's loop calls.
 ///
-/// The compiler's own text, because the tool is the compiler's: an author
-/// attaches a name and bounds it, and there is no `description:` on the entry to
-/// write one in. Each says the thing a model has to know to call it correctly —
-/// that paths are relative to a root it cannot see and cannot leave, and that
-/// `bash` is bounded by a deadline — because that is the difference between a
-/// model correcting itself and a model spending the loop's budget guessing
-/// (PRD G3, Decision D119).
-fn builtin_description(tool: Builtin) -> String {
-    match tool {
-        Builtin::Bash => "Run one `bash` command in this agent's root directory and return what \
-             it printed. The command runs under a deadline, and a command that \
-             exits nonzero or outruns it fails the node rather than answering."
-            .to_string(),
-        Builtin::ReadFile => "Read one text file and return its contents. The path is relative to \
-             this agent's root directory, and a path that resolves outside it is refused."
-            .to_string(),
-        Builtin::WriteFile => "Write one text file, replacing whatever it held, and return how \
-             many bytes were written. The path is relative to this agent's root directory, a \
-             path that resolves outside it is refused, and the directory it names must already \
-             exist."
-            .to_string(),
-        Builtin::List => "List the entries of one directory, optionally filtered by a glob. \
-             Paths are relative to this agent's root directory, a path that resolves outside it \
-             is refused, and a directory entry is reported with a trailing `/`."
-            .to_string(),
-    }
+/// Everything about a built-in that varies is the **binding's**: `workspace:`,
+/// and `builtin.bash`'s `timeout:`. Everything else — the name the model calls,
+/// the argument schema, what the call does — is this compiler's, so what is
+/// emitted here is a call to one runtime function carrying the bounds the
+/// binding wrote.
+///
+/// The workspace is emitted **unresolved**, as the interpolation parts every
+/// other class-2 surface is (grammar 4.3): the value reaches the process at
+/// start, the artifact stays committable, and the journal keys the call on the
+/// workspace *as written* rather than on the directory one machine resolved it
+/// to (`docs/durability.md` §3.2). A binding that wrote none emits none, which
+/// is how the runtime is told to use the execution's own workspace.
+///
+/// `env:` is emitted the same way and for the same reason, and `inherit_env:`
+/// only where it is `true`: the scrubbed child is the default (PRD resolved q54
+/// ruling b), so the emitted binding carries the opt-in rather than the state.
+/// The same values reach the environment manifest through `codegen::env`, which
+/// is what makes a placement demand exactly what a built-in's children read
+/// (resolved q41).
+///
+/// The **wire type** is emitted beside the schema rather than instead of it:
+/// the Messages wire declares these as Anthropic's own dated tool types, which
+/// is what engages a model's trained behaviour, and the OpenAI wires declare the
+/// same arguments as a function tool from the schema. One set of runtime
+/// handlers serves both, because the argument names are the same
+/// (`ast::definition::Builtin::provider_type`).
+fn builtin_tool(
+    names: &Names,
+    surfaces: &[schema::Surface<'_>],
+    address: &str,
+    tool: Builtin,
+    binding: Option<&crate::ir::binding::Builtin>,
+    description: &str,
+    imported: &mut Vec<String>,
+) -> String {
+    let path = format!("{address}.input");
+    let schema_name = names.value(&path).to_string();
+    imported.push(schema_name.clone());
+    let arguments = surface_fields(surfaces, &path);
+    let mut text = String::from("    {\n");
+    text.push_str(&format!("      name: {},\n", names::string(tool.as_str())));
+    text.push_str(&format!("      address: {},\n", names::string(address)));
+    text.push_str(&format!(
+        "      description: {},\n",
+        names::string(description)
+    ));
+    text.push_str(&format!(
+        "      schema: {},\n",
+        json_literal(&schema::json_field_map(arguments.as_ref()), "      ")
+    ));
+    // The dated type the Messages wire declares this tool as, which is what
+    // engages a model's trained behaviour for it (PRD resolved q54 ruling d).
+    // Emitted beside the schema rather than instead of it: the OpenAI wires have
+    // no provider-defined types and declare the same arguments as a function
+    // tool, and the runtime reads whichever its wire has.
+    text.push_str(&format!(
+        "      providerType: {},\n",
+        names::string(tool.provider_type())
+    ));
+    let workspace = binding
+        .and_then(|binding| binding.workspace.as_ref())
+        .map_or_else(
+            || "[]".to_string(),
+            |workspace| interpolation(&workspace.value, &format!("{address}.workspace")),
+        );
+    let timeout = match binding.and_then(|binding| binding.timeout.as_ref()) {
+        Some(timeout) => format!(
+            "            timeout: {{ millis: {}, written: {} }},\n",
+            timeout.value.as_millis(),
+            names::string(timeout.value.as_str())
+        ),
+        // The default is emitted rather than left to the runtime, for the
+        // reason every other class-2 value is written out here: what bounded a
+        // call is a fact of the artifact, and a command bounded by a number
+        // nobody can read off the emitted graph is a bound nobody wrote
+        // (grammar 6.1). `builtin.files` runs no command, so it takes none.
+        None if tool.runs_a_command() => format!(
+            "            timeout: {{ millis: {}, written: {} }},\n",
+            DEFAULT_BUILTIN_TIMEOUT_MILLIS,
+            names::string(DEFAULT_BUILTIN_TIMEOUT)
+        ),
+        None => String::new(),
+    };
+    // `env:` as written, exactly as an `exec:` binding carries it (grammar 4.3
+    // class 2): the child's environment is a property of the machine running the
+    // graph, and a resolved credential in the artifact — or in the effect record
+    // the journal keys this call under — is one this project does not write.
+    let environment = binding.map_or_else(Vec::new, |binding| binding.env.clone());
+    let env = if environment.is_empty() {
+        "            env: [],\n".to_string()
+    } else {
+        let mut entries = String::from("            env: [\n");
+        for entry in &environment {
+            entries.push_str(&format!(
+                "              {{ name: {}, value: {} }},\n",
+                names::string(&entry.name.value),
+                interpolation(
+                    &entry.value.value,
+                    &format!("{address}.env.{}", entry.name.value)
+                )
+            ));
+        }
+        entries.push_str("            ],\n");
+        entries
+    };
+    // …and the opt-in that widens it, written only where it is `true`: the
+    // scrubbed child is the default PRD resolved q54 ruling b fixes, and an
+    // `inheritEnv: false` on every other binding would be a key nobody wrote.
+    let inherit = match binding.and_then(|binding| binding.inherit_env.as_ref()) {
+        Some(inherit) if inherit.value => "            inheritEnv: true,\n",
+        _ => "",
+    };
+    text.push_str(&format!(
+        "      invoke: (args, context, call) =>\n        runtime.runBuiltin(\n          \
+         {{\n            tool: {},\n            workspace: {workspace},\n{timeout}{env}{inherit}          }},\n          \
+         runtime.parseToolArguments({schema_name}, args, {}),\n          context,\n          call,\n        ),\n",
+        names::string(tool.keyword()),
+        names::string(&format!(
+            "the arguments `{}` was called with",
+            tool.as_str()
+        ))
+    ));
+    text.push_str("    },\n");
+    text
 }
 
 /// The tools an agent's attached stores synthesize (grammar 11.5, PRD 5.8).
@@ -1251,14 +1349,18 @@ fn output_tool_name(ir: &Ir, agent: &Agent, local: &str) -> String {
             })
         })
         .collect();
-    // A built-in is on the wire under its own name too (grammar 5.5), so an
-    // agent attaching `builtin.list` and called `agent.list` does not get to
-    // pin an output tool called `list`.
+    // A built-in is on the wire under a name of its own too (grammar 5.5, and
+    // the provider dictates it: `bash`, `str_replace_based_edit_tool`), so
+    // those names are the pinned output tool's to avoid like any other. No
+    // built-in this release ships can collide — neither name is spelled
+    // `<something>_output` — but the set grows by resolution and the suffix is
+    // this function's, so the one that could is a built-in added here rather
+    // than a rule remembered there.
     attached.extend(
         agent
             .builtins
             .iter()
-            .map(|builtin| builtin.tool.value.as_str().to_string()),
+            .map(|builtin| builtin.value.as_str().to_string()),
     );
     // The synthesized store tools are on the wire beside the declared ones
     // (grammar 11.5), so they are names the pinned output tool has to avoid too:
@@ -3865,6 +3967,14 @@ async function quiesceFlow(
     // quiesced.
     const parked = runtime.staysOpen(executionId, outcome);
     stores.releaseExecution(executionId, parked);
+    // …and the directory this run's built-in tools worked in, under the same
+    // rule and for the same reason (grammar 6.1, PRD resolved q54): a workspace
+    // nobody configured belongs to the execution, so it goes when the execution
+    // ends — and stays where the row stays open, because the generation that
+    // resumes it runs past the frontier into files the recorded prefix wrote.
+    // A binding that named its own `workspace:` is the composition's and is
+    // never removed.
+    await runtime.releaseWorkspaces(executionId, parked);
   };
   // `runtime.quiesce` keeps the last state each superstep produced, which is
   // what makes a failure's trace survive; the one failure it restates on the way

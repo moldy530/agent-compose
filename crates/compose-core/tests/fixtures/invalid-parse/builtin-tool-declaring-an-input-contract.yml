@@ -1,0 +1,17 @@
+# rule: a built-in declares no contract of its own — the model authors the
+# rule: program rather than filling declared parameters (grammar 6.1, D135)
+# code: unknown-key
+# message: unknown key `input` in tool definition `tool.sandbox`
+# at: 9:3
+# help: a `builtin:` tool declares no contract of its own: the model authors the program rather than filling parameters an author wrote, so its arguments and its result are this compiler's (grammar 6.1, PRD resolved q54)
+tool.sandbox:
+  builtin: bash
+  input:
+    command: { type: string }
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

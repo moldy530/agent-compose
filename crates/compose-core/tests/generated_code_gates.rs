@@ -16,7 +16,8 @@
 //! that is a published surface rather than a behaviour; the three after that are
 //! about a `human` pause — the board a run holds one on, the terminal it answers
 //! one at, and the process's own standard input that terminal really is; and the
-//! last is about the one built-in tool whose work is this process's own:
+//! last is about the two built-in tools a model drives, read from inside one
+//! call of them:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -226,22 +227,29 @@
 //!     and the runner arms a timer of its own: a run that printed its answer and
 //!     then sat there is the one failure a passing test cannot tell from a slow
 //!     one. Gate 13 asks both cases of Node.
-//! 22. **What a listing costs and what stops it** — `builtin.list`, driven out
-//!     of a golden's own runtime. It is the one built-in whose work happens in
-//!     *this* process — `bash` is a child the runtime kills, the other two file
-//!     tools touch one path each — and both of its inputs are a **model's**: the
-//!     directory it names and the glob it writes. PRD resolved q31 bounds a
-//!     built-in with a root and a timeout, and grammar 5.5 gives a file tool no
-//!     `timeout:`, so what stands between one call and a spent machine is the
-//!     matcher's complexity and the walk's answer to `context.signal` — a search
-//!     exponential in how many `**` a pattern holds, or a walk that finishes a
-//!     tree the graph has already reported as failed, both look exactly like a
-//!     correct listing from outside. Three claims: a run of `**` over a deep
-//!     directory answers correctly and *quickly*, an aborted signal stops the
-//!     walk and is raised as it came rather than restated as a file-system
-//!     fault, and the glob table answers what it has always answered — which is
-//!     what keeps the first two from being bought with a matcher that matches
-//!     less.
+//! 22. **What a built-in call stays inside** — `builtin.bash` and
+//!     `builtin.files`, driven out of a golden's own runtime. The acceptance
+//!     suite drives both through a model loop, which is where the wire, the
+//!     trace records and Decision D119's bounces are settled; what a loop
+//!     cannot show is the inside of a call, and that is where every bound PRD
+//!     resolved q54 puts on these two lives. Nine of them: that a path
+//!     climbing out of the workspace — `..`, an absolute path, or a symlink
+//!     whose own parents do not exist yet — leaves what is outside
+//!     **untouched** rather than merely drawing a complaint, that a
+//!     `view_range` reads a window of a file under the file's own numbering and
+//!     refuses the ranges it cannot read rather than answering with the wrong
+//!     lines, that a file larger
+//!     than the runtime reads is viewed from the front and edited not at all,
+//!     that one shell is held across the calls of a node activity and across no
+//!     more than that, that a `restart` ends that session without swallowing
+//!     the command sent beside it, that a command printing more than a tool
+//!     result can hold still comes back with its status, that a scrubbed child
+//!     sees the declared variables and no others, that a command's deadline
+//!     answers the *model* rather than failing the node, and that a defaulted
+//!     workspace is one directory per execution that goes when the execution
+//!     settles. Break any one of them and the call still answers something that
+//!     reads correctly from outside, which is why they are driven from within
+//!     the runtime rather than read off a transcript.
 //!
 //! # The toolchain fixture
 //!
@@ -386,6 +394,70 @@ fn runners(directory: &Path) -> Vec<String> {
     }
     names.sort();
     names
+}
+
+/// Every runner this file names is a runner the fixture still holds.
+///
+/// The module header above is written as this suite's own index — a numbered
+/// entry per gate, naming the subject it drives and the runner it drives it
+/// out of — and prose is the one part of a test file the compiler never reads.
+/// A gate that changed subject took its runner's name with it once already: the
+/// entry for gate 22 went on describing a `builtin.list` and a listing runner
+/// that the grammar and the fixture had both stopped holding, so a reader
+/// navigating by the index was sent to a test that does not exist, by the name
+/// of a file nothing on disk answers to. Nothing here can check that an entry
+/// still *describes* its gate — but a deleted runner is a **name**, and a name
+/// is checkable: every `*.mjs` this file mentions, in a `runner(…)` call or in a
+/// doc comment or in a prose aside, has to be a file [`runners`] finds in
+/// `tests/toolchain/`. Which makes the deletion of a runner the moment the prose
+/// naming it fails, rather than the moment someone reads it.
+///
+/// One direction only: the fixture also holds runners other suites spawn, and
+/// this file has no business naming those.
+#[test]
+fn this_suite_names_only_runners_the_fixture_holds() {
+    const SOURCE: &str = include_str!("generated_code_gates.rs");
+
+    let held: BTreeSet<String> = runners(&toolchain::root()).into_iter().collect();
+    assert!(
+        held.contains("builtin-tools.mjs"),
+        "the fixture holds none of the runners this file drives, so the scan below asserts \
+         nothing — the fixture moved: {held:?}"
+    );
+
+    let bytes = SOURCE.as_bytes();
+    let mut named: BTreeSet<&str> = BTreeSet::new();
+    for (end, _) in SOURCE.match_indices(".mjs") {
+        let start = bytes[..end]
+            .iter()
+            .rposition(
+                |byte| !matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_'),
+            )
+            .map_or(0, |before| before + 1);
+        // `".mjs"` itself, as the extension [`runners`] filters on: an extension
+        // is not a runner, and no file is named for one.
+        if start == end {
+            continue;
+        }
+        named.insert(&SOURCE[start..end + ".mjs".len()]);
+    }
+    assert!(
+        named.len() > 10,
+        "the scan found {} runner names in a file that spawns a dozen — it stopped reading \
+         the shape a runner is named in: {named:?}",
+        named.len()
+    );
+
+    let missing: Vec<&str> = named
+        .iter()
+        .copied()
+        .filter(|name| !held.contains(*name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "this file names {missing:?}, which `tests/toolchain/` does not hold — a runner was \
+         renamed or deleted and the prose that names it was left standing"
+    );
 }
 
 /// Why gate 13 cannot run here, or `None` when it can.
@@ -3617,160 +3689,626 @@ fn the_local_backends_behaved(answer: &Value) {
     );
 }
 
-/// Gate 22: what a `builtin.list` costs, what stops one, and what it matches —
-/// `src/runtime.ts`, driven directly.
+/// Gate 22: what the two built-in tools do inside one call — `src/runtime.ts`,
+/// driven directly.
 ///
-/// The listing is the one built-in whose work happens inside the runtime's own
-/// process, and both of its inputs belong to the **model**: the directory it
-/// names and the glob it writes. PRD resolved q31 bounds a built-in with a root
-/// and a timeout, and grammar 5.5 gives a file tool no `timeout:` — so what
-/// keeps one listing from spending a machine is the matcher's complexity and the
-/// walk's answer to `context.signal`, neither of which a golden diff or a
-/// happy-path listing can show.
+/// The acceptance suite drives these through a model loop, which is where the
+/// wire, the trace records and Decision D119's bounces are decided. What a loop
+/// cannot show is the inside of a call, and each of these is a claim PRD
+/// resolved q54 makes there: that an escaping path leaves everything outside the
+/// workspace **untouched**, that a `create` with an empty `file_text` writes the
+/// empty file rather than refusing a capability away, that a `view_range` reads
+/// a window of a file under the file's own line numbers and refuses the ranges
+/// that cannot be read, that a file larger than
+/// the runtime reads is viewed from the front and edited not at all, that one
+/// shell really is held across
+/// the calls of a node activity and not across two, that a command redirecting
+/// that shell's own streams (`exec > run.log 2>&1`) still settles and leaves the
+/// session usable, that a `restart` the model
+/// asked for ends that session and does not swallow the command sent with it,
+/// that a scrubbed child sees the declared variables and no others, that a
+/// command's deadline answers the model rather than failing the node, and that a
+/// defaulted workspace is one directory per execution that goes when the
+/// execution settles.
 #[test]
-fn a_listing_is_bounded_work_a_deadline_can_stop() {
+fn the_built_in_tools_are_bounded_by_their_workspace_session_and_deadline() {
     let Some(root) = installed() else {
         return;
     };
-    let project = staged(goldens::golden("triage-fanout"), root, "listing");
-    let trees = root.join("projects").join("listing").join("trees");
-    let _ = fs::remove_dir_all(&trees);
-    fs::create_dir_all(&trees).expect("the scratch area is writable");
+    let project = staged(goldens::golden("triage-fanout"), root, "builtins");
+    let scratch = root.join("projects").join("builtins").join("scratch");
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).expect("the scratch area is writable");
 
-    let output = runner("builtin-listing.mjs")
+    let output = runner("builtin-tools.mjs")
         .arg(&project)
-        .arg(&trees)
+        .arg(&scratch)
         .output()
         .expect("bun runs");
     assert!(
         output.status.success(),
-        "the listing runner failed:\n{}",
+        "the built-in runner failed:\n{}",
         String::from_utf8_lossy(&output.stderr),
     );
     let answer: Value =
         serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
-    the_listing_was_bounded_stoppable_and_unchanged(&answer);
+    the_built_ins_stayed_inside_their_bounds(&answer);
 }
 
-/// What `builtin-listing.mjs` has to come back with.
-///
-/// The budget is wall-clock and it is deliberately loose: what it separates is
-/// not a fast matcher from a slow one but a **polynomial** search from an
-/// exponential one. Sixteen `**` over a directory twelve deep answered in
-/// single-digit milliseconds when this was written and took twelve seconds
-/// against the recursion it replaced — and sixteen is a number chosen to keep
-/// that failure *finite*, since a model can write thirty as easily and the
-/// search runs with the event loop held.
-fn the_listing_was_bounded_stoppable_and_unchanged(answer: &Value) {
-    // Sized by the runner, and read from its answer so the budget below is read
-    // against the pattern that was really matched.
-    let deep = &answer["deep"];
+/// What `builtin-tools.mjs` has to come back with.
+fn the_built_ins_stayed_inside_their_bounds(answer: &Value) {
+    // --- Containment (PRD resolved q54, Decision D119) --------------------
+    let containment = &answer["containment"];
     assert_eq!(
-        deep["entries"],
-        json!(["d0/d1/d2/d3/d4/d5/d6/d7/d8/d9/d10/d11/zzz.txt"]),
-        "a run of `**` reaches the file at the bottom — the answer is asserted beside the \
-         clock, because a matcher that got fast by matching less would pass a clock alone"
+        containment["refused"],
+        json!({
+            "climb": true,
+            "absolute": true,
+            "symlink": true,
+            "dangling": true,
+            "read": true,
+            "linkedDirectory": true,
+            "underLinkedDirectory": true,
+            "farUnderLinkedDirectory": true,
+            "prefixSibling": true
+        }),
+        "every way out of the workspace is refused **as a refusal**, which is what goes back to \
+         the model rather than failing the node: {containment}"
     );
-    let elapsed = deep["elapsedMs"]
-        .as_u64()
-        .expect("the runner times the listing it made");
+    assert_eq!(
+        (
+            &containment["outsideUnchanged"],
+            &containment["outsideNotCreated"]
+        ),
+        (&json!(true), &json!(true)),
+        "the file outside the workspace was written through anyway, so the refusals above are a \
+         message rather than a bound: {containment}"
+    );
+    // The two crossings a *parent-only* resolution lets through leave nothing on
+    // disk to find by name, because they name directories that did not exist
+    // before the call: what says they were refused is that the directory outside
+    // the workspace still holds exactly what it held.
+    assert_eq!(
+        containment["outsideEntries"],
+        json!(["secret.txt"]),
+        "a `create` through a symlinked directory, at a path whose own parents do not exist yet, \
+         made them outside the workspace: `create` makes its parents, so the containment check \
+         has to resolve the deepest ancestor that exists rather than stop at the parent \
+         (grammar 6.1, PRD resolved q54): {containment}"
+    );
+    // The crossing every case above is blind to: a *sibling* whose name extends
+    // the workspace's, which a resolution catches and a prefix comparison that
+    // does not count the separator does not. Everything else here resolves under
+    // a different directory outright, so this is the only case that can tell the
+    // two comparisons apart — and the write it would have let through lands in a
+    // directory the composition never offered (`/srv/work-backup` beside
+    // `/srv/work`).
+    assert_eq!(
+        (
+            &containment["siblingUnchanged"],
+            &containment["siblingEntries"]
+        ),
+        (&json!(true), &json!(["secret.txt"])),
+        "a `create` at `../<workspace>-evil/secret.txt` reached the sibling directory: a real \
+         path that merely *starts* with the workspace's is not inside it, so the containment \
+         check has to compare whole path segments (grammar 6.1, PRD resolved q54): {containment}"
+    );
+    let through = containment["throughLinkMessage"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        elapsed < 3_000,
-        "{stars} `**` over a tree {depth} deep took {elapsed}ms: a listing is work proportional \
-         to the tree and the pattern, and nothing else bounds it (PRD resolved q31)",
-        stars = deep["stars"],
-        depth = deep["depth"],
+        through.contains("resolves outside this tool's workspace")
+            && through.contains("out/deep/nested.txt"),
+        "…and the refusal quotes the path the model chose rather than the link it went through \
+         (PRD G3): {through}"
+    );
+    assert_eq!(
+        containment["program"],
+        json!({
+            "tool": "files",
+            "operation": "create",
+            "path": "../outside/secret.txt"
+        }),
+        "a refused call still records what the model asked for (`docs/trace.md` §7.4): \
+         {containment}"
+    );
+    let refusal = containment["message"].as_str().unwrap_or_default();
+    assert!(
+        refusal.contains("resolves outside this tool's workspace") && refusal.contains(".."),
+        "the refusal says what was wrong and quotes the path the model chose (PRD G3): {refusal}"
     );
 
-    // …and the walk observes the node's deadline rather than running to the end
-    // of a tree the graph has stopped waiting for (grammar 9.2, Decision D124).
-    let wide = &answer["wide"];
+    // --- The file tool, end to end ----------------------------------------
+    let editing = &answer["editingTool"];
     assert_eq!(
-        wide["completed"],
-        json!(false),
-        "an aborted signal stopped the walk: {wide}"
+        editing["created"],
+        json!({ "path": "notes/todo.md", "bytes_written": 14, "change": "wrote 14 bytes" }),
+        "`create` wrote the whole file, making the directory it named: {editing}"
     );
     assert_eq!(
-        wide["raisedTheAbort"],
+        editing["viewed"],
+        json!({ "path": "notes/todo.md", "content": "     1\tone\n     2\ttwo\n     3\tthree" }),
+        "`view` answers with numbered lines, which is what the provider-defined tool answers \
+         and what `insert_line` counts: {editing}"
+    );
+    assert_eq!(
+        editing["replaced"],
+        json!({
+            "path": "notes/todo.md",
+            "replaced_at_line": 2,
+            "snippet": "     1\tone\n     2\tTWO\n     3\tthree",
+            "change": "replaced one occurrence at line 2"
+        }),
+        "{editing}"
+    );
+    assert_eq!(
+        editing["inserted"],
+        json!({
+            "path": "notes/todo.md",
+            "inserted_after_line": 1,
+            "lines_inserted": 1,
+            "snippet": "     1\tone\n     2\tone and a half\n     3\tTWO\n     4\tthree",
+            "change": "inserted 1 line(s) after line 1"
+        }),
+        "{editing}"
+    );
+    assert_eq!(
+        editing["onDisk"], "one\none and a half\nTWO\nthree\n",
+        "the four operations left the file the edits describe, trailing newline included: \
+         {editing}"
+    );
+    assert_eq!(
+        editing["listed"],
+        json!({ "path": "notes", "entries": ["todo.md"], "truncated": false }),
+        "a `view` of a directory lists it one level deep: {editing}"
+    );
+    assert_eq!(
+        (
+            &editing["ambiguousRefused"],
+            &editing["missingRefused"],
+            &editing["absentRefused"]
+        ),
+        (&json!(true), &json!(true), &json!(true)),
+        "a `str_replace` that matched twice, one that matched nothing, and a `view` of a path \
+         that is not there are all the model's to correct: {editing}"
+    );
+    let ambiguous = editing["ambiguousMessage"].as_str().unwrap_or_default();
+    assert!(
+        ambiguous.contains("2 times") && ambiguous.contains("surrounding text"),
+        "the ambiguous edit's refusal says how many it found and what to do about it: {ambiguous}"
+    );
+    assert_eq!(
+        editing["createdProgram"],
+        json!({ "tool": "files", "operation": "create", "path": "notes/todo.md", "change": "wrote 14 bytes" }),
+        "the trace's record of an edit is the operation, the path and a **sentence** — never the \
+         bytes written (`docs/trace.md` §7.4, §11): {editing}"
+    );
+
+    // The empty file, asked for both ways a model can ask for one. `file_text`
+    // is defaulted so the operations that never read it are callable without it,
+    // and the parse fills that default in — so a `""` sent deliberately and a
+    // `file_text` left out are one call by the time the handler sees them. Both
+    // write the file: refusing the pair would leave `.gitkeep` and
+    // `__init__.py` with no spelling that works for an agent holding only this
+    // tool, which is a capability lost rather than a mistake bounced.
+    assert_eq!(
+        editing["emptyCreated"],
+        json!({ "path": "keep/.gitkeep", "bytes_written": 0, "change": "wrote 0 bytes" }),
+        "an explicit empty `file_text` writes the empty file, as the provider-defined text \
+         editor does with one: {editing}"
+    );
+    assert_eq!(
+        editing["omittedCreated"],
+        json!({ "path": "keep/.keep", "bytes_written": 0, "change": "wrote 0 bytes" }),
+        "…and so does a `create` that carried no `file_text` at all, because the two are the \
+         same call here — the answer's `wrote 0 bytes` is what tells a model which it made: \
+         {editing}"
+    );
+    assert_eq!(
+        (&editing["emptyOnDisk"], &editing["omittedOnDisk"]),
+        (&json!(true), &json!(true)),
+        "…and both are on disk, empty, rather than answered for and not written: {editing}"
+    );
+    assert_eq!(
+        editing["emptyProgram"],
+        json!({ "tool": "files", "operation": "create", "path": "keep/.gitkeep", "change": "wrote 0 bytes" }),
+        "…and the trace says what it wrote, which is how an empty file is told from a \
+         forgotten one after the fact: {editing}"
+    );
+    assert_eq!(
+        editing["blankLineRefused"],
         json!(true),
-        "…and what it raised is the abort's own reason, not a `could not list` restatement \
-         wearing a file-system error's clothes: {wide}"
+        "`insert` keeps the refusal an empty argument gets, because there it closes nothing \
+         off: {editing}"
+    );
+    let blank_line = editing["blankLineMessage"].as_str().unwrap_or_default();
+    assert!(
+        blank_line.contains("lone newline"),
+        "…and the refusal names the spelling that works, which is what makes it a cost of one \
+         call rather than a dead end: {blank_line}"
     );
     assert_eq!(
-        (&wide["whole"], &wide["wholeTruncated"]),
-        (&json!(1000), &json!(true)),
-        "…over a tree the same call walks end to end when nothing aborts it — a full answer's \
-         worth of entries and more behind them — which is what makes the stop above a stop \
-         rather than an empty directory: {wide}"
+        editing["blankLineOnDisk"], "\na\n",
+        "…and that spelling really inserts the blank line: {editing}"
     );
 
-    // The table the two claims above could quietly break: `*` and `?` stay
-    // inside one path segment, `**` spans zero segments as readily as several,
-    // and a run of `**` says exactly what one says.
-    let shapes = &answer["shapes"];
-    for (glob, entries) in [
-        ("*.md", json!(["a.md"])),
-        ("?.md", json!(["a.md"])),
-        ("docs/*.md", json!(["docs/one.md"])),
-        ("docs", json!(["docs/"])),
+    // --- The window a `view` can be asked for ------------------------------
+    //
+    // `view_range` is the provider-defined text editor's own parameter, and the
+    // only way the far end of a long file is reachable through this tool: a
+    // whole-file view is cut at the answer bound counting from line 1. So the
+    // window has to keep the **file's** numbering — a `str_replace` composed out
+    // of one is composed against lines the next `view` will agree with — and the
+    // ways a range can be wrong have to come back as refusals rather than as a
+    // view of the wrong lines (Decision D119).
+    let ranged = &answer["viewWindow"];
+    assert_eq!(
+        ranged["middle"],
+        json!({ "path": "ranged.txt", "content": "     2\tb\n     3\t\n     4\td" }),
+        "a window is the file's own lines under the file's own numbers, blank line included — \
+         a re-split of the window's joined text would have dropped that blank line, because a \
+         trailing empty line is a fact about a whole file and not about a slice of one: \
+         {ranged}"
+    );
+    assert_eq!(
+        (&ranged["toTheEnd"], &ranged["clamped"]),
         (
-            "**/*.md",
-            json!([
-                "a.md",
-                "docs/deep/deeper/four.md",
-                "docs/deep/three.md",
-                "docs/one.md"
-            ]),
+            &json!({ "path": "ranged.txt", "content": "     4\td\n     5\te" }),
+            &json!({ "path": "ranged.txt", "content": "     4\td\n     5\te" })
+        ),
+        "`-1` and a last line past the end are the same request — read what is there — so the \
+         second is clamped rather than refused: {ranged}"
+    );
+    assert_eq!(
+        ranged["emptyRange"],
+        json!({
+            "path": "ranged.txt",
+            "content": "     1\ta\n     2\tb\n     3\t\n     4\td\n     5\te"
+        }),
+        "…and the empty range is the whole file, which is what the parameter's `default: []` \
+         means: a model that sent nothing and one that sent `[]` are one call here: {ranged}"
+    );
+    assert_eq!(
+        (
+            &ranged["pastTheEndRefused"],
+            &ranged["backwardsRefused"],
+            &ranged["oneNumberRefused"],
+            &ranged["fromZeroRefused"],
+            &ranged["onDirectoryRefused"]
         ),
         (
-            "**/**/**/*.md",
-            json!([
-                "a.md",
-                "docs/deep/deeper/four.md",
-                "docs/deep/three.md",
-                "docs/one.md"
-            ]),
+            &json!(true),
+            &json!(true),
+            &json!(true),
+            &json!(true),
+            &json!(true)
         ),
+        "a start past the end, a range that ends before it starts, one number where two belong, \
+         a start below line 1, and a range on a directory are each the model's to correct \
+         rather than a view of whatever the runtime made of them: {ranged}"
+    );
+    let past = ranged["pastTheEndMessage"].as_str().unwrap_or_default();
+    assert!(
+        past.contains("5 line(s)") && past.contains("counts a file's own lines from 1"),
+        "…and the refusal says how long the file is, which is the number the model needs to \
+         ask again (PRD G3): {past}"
+    );
+    let backwards = ranged["backwardsMessage"].as_str().unwrap_or_default();
+    assert!(
+        backwards.contains("ends before it starts") && backwards.contains("-1"),
+        "…and the backwards range names the spelling that reads to the end: {backwards}"
+    );
+    let one_number = ranged["oneNumberMessage"].as_str().unwrap_or_default();
+    assert!(
+        one_number.contains("not two line numbers") && one_number.contains("[first, last]"),
+        "…and a range of one number says what a range is: {one_number}"
+    );
+    let from_zero = ranged["fromZeroMessage"].as_str().unwrap_or_default();
+    assert!(
+        from_zero.contains("a file's first line is 1"),
+        "…and a start below 1 says where a file starts, since 0-based is the guess a model \
+         makes: {from_zero}"
+    );
+    let on_directory = ranged["onDirectoryMessage"].as_str().unwrap_or_default();
+    assert!(
+        on_directory.contains("it is a directory"),
+        "…and a directory has no lines to window, so an unnumbered listing is not the answer to \
+         the question that was asked: {on_directory}"
+    );
+    assert_eq!(
+        ranged["program"],
+        json!({ "tool": "files", "operation": "view", "path": "ranged.txt" }),
+        "the trace's record of a windowed read is the operation and the path it already \
+         carried: the window is a bound on the *answer*, and `docs/trace.md` §7.4's fields do \
+         not change because one was asked for: {ranged}"
+    );
+
+    // --- The bound on what one `files` call reads --------------------------
+    //
+    // The path is the model's, so the size of the read is the model's too unless
+    // the runtime bounds it — the same reason the shell's buffer is bounded as
+    // its bytes arrive, reached from the other end. `view` takes the front and
+    // says so; an edit is refused, because it writes back what it read.
+    let heavy = &answer["readBound"];
+    assert!(
+        heavy["bytesOnDisk"].as_u64().unwrap_or_default() > 4_000_000,
+        "the case needs a file past the runtime's read bound to be about anything: {heavy}"
+    );
+    assert!(
+        heavy["viewedLength"].as_u64().unwrap_or_default() < 40_000
+            && heavy["saidItStopped"] == json!(true),
+        "a `view` of a file larger than the runtime reads answers with a bounded head and says \
+         where it stopped, rather than pulling the file into this process: {heavy}"
+    );
+    assert_eq!(
+        (&heavy["tailFirstNumber"], &heavy["tailSaidItStopped"]),
+        (&json!(39_990), &json!(true)),
+        "…and a `view_range` reaches the part of that file the bounded head cannot: the window \
+         starts at the line it asked for, tens of thousands of lines past where the whole-file \
+         view was cut, and still says the read stopped short of the file's end: {heavy}"
+    );
+    assert!(
+        heavy["tailLength"].as_u64().unwrap_or_default() < 30_000,
+        "…and it is a window rather than the rest of the file: eleven lines, not the answer \
+         bound's worth of them: {heavy}"
+    );
+    assert_eq!(
+        (&heavy["editRefused"], &heavy["stillWholeOnDisk"]),
+        (&json!(true), &json!(true)),
+        "an edit of a file past the read bound is refused **and** leaves the file whole: an edit \
+         rewrites what it read, so a truncated read there would truncate the file rather than \
+         the answer: {heavy}"
+    );
+    let heavy_message = heavy["editMessage"].as_str().unwrap_or_default();
+    assert!(
+        heavy_message.contains("an edit rewrites the whole file") && heavy_message.contains("bash"),
+        "…and the refusal says why and names the tool with no such bound (PRD G3, D119): \
+         {heavy_message}"
+    );
+
+    // --- The shell session (one per node activity) -------------------------
+    let session = &answer["session"];
+    assert_eq!(
+        session["stayedInInner"],
+        json!(true),
+        "a `cd` in one call is still in effect in the next: one shell per node activity is what \
+         makes `cd build && cmake ..` then `make` a thing a model can write: {session}"
+    );
+    assert_eq!(
+        session["remembered"], "[42]",
+        "…and so is a variable it set: {session}"
+    );
+    let fresh = session["freshActivity"].as_str().unwrap_or_default();
+    assert!(
+        fresh.ends_with("[]") && !fresh.contains("/inner"),
+        "a second activity starts in the workspace with none of the first's state — the \
+         ordinal-reset rule read for a shell: {session}"
+    );
+    assert_eq!(
+        session["failed"],
+        json!({ "stdout": "out\n", "stderr": "err\n", "exit_code": 3 }),
+        "a nonzero exit is an **answer**: both streams and the status come back to the model, \
+         and the node did not fail: {session}"
+    );
+    assert_eq!(
+        session["failedProgram"],
+        json!({
+            "tool": "bash",
+            "command": "echo out; echo err >&2; (exit 3)",
+            "exitCode": 3
+        }),
+        "…and the trace records the command and the status, which is the q54 ruling c carve-out: \
+         {session}"
+    );
+    let quit = session["quitNotice"].as_str().unwrap_or_default();
+    assert!(
+        quit.contains("the shell exited") && quit.contains("fresh shell"),
+        "a model that ended its own shell is told so, and told what the next call will find, \
+         rather than left to wonder where its state went: {session}"
+    );
+
+    // --- A command that redirects the shell's own streams -------------------
+    //
+    // The completion markers are this runtime talking to itself down the pipes
+    // the command answers on, and `exec > run.log 2>&1` moves where those pipes
+    // are for the rest of the session. Markers that went with them would leave
+    // the call in flight waiting out its `timeout:` — and the next call, and the
+    // one after that — from a command that did exactly what it said.
+    let redirected = &answer["redirectedShell"];
+    assert_eq!(
+        redirected["first"],
+        json!({ "stdout": "", "stderr": "", "exit_code": 0 }),
+        "a command that redirected the shell's own streams **settled**, with its status: what \
+         it printed went to the file it named, and the marker that closes it did not: \
+         {redirected}"
+    );
+    assert_eq!(
+        redirected["after"],
+        json!({ "stdout": "", "stderr": "", "exit_code": 4 }),
+        "…and so did the command after it, with a status of its own: {redirected}"
+    );
+    assert_eq!(
+        redirected["log"], "the redirected line\nsecond line\nto stderr\n",
+        "…in that same shell, which is what the file says rather than the answers: the second \
+         command's output is under the first's in the log the first one opened, so the \
+         redirection is still in force and this is still the session that made it — and no \
+         marker text is in there with them: {redirected}"
+    );
+    let redirect_ms = redirected["elapsedMs"]
+        .as_u64()
+        .expect("the runner times the pair of calls");
+    assert!(
+        redirect_ms < 4_000,
+        "both calls answered well inside one 5s bound, rather than spending it: a session whose \
+         markers followed the redirection answers nothing until the deadline kills it, and this \
+         pair took {redirect_ms}ms"
+    );
+    assert_eq!(
+        redirected["restored"]["stdout"], "captured again\n",
+        "…and the model gets captured output back the way it always could, by restarting the \
+         session it redirected: {redirected}"
+    );
+
+    // --- The restart the model asks for (PRD resolved q54) -----------------
+    let restart = &answer["restart"];
+    assert_eq!(
+        restart["alone"],
+        json!({
+            "stdout": "",
+            "stderr": "",
+            "notice": "the shell session was restarted: its working directory is the workspace \
+                       again, and no shell state carried over"
+        }),
+        "a restart on its own answers with what it did and **no** `exit_code`: no command ran, \
+         so there is no status to report: {restart}"
+    );
+    assert_eq!(
+        restart["aloneProgram"],
+        json!({ "tool": "bash", "command": "restart" }),
+        "…and the trace's record of it says the same, which is `docs/trace.md` §7.4's presence \
+         rule for `exitCode` — absent where no command completed: {restart}"
+    );
+    let after = restart["after"].as_str().unwrap_or_default();
+    assert!(
+        after.ends_with("[unset]") && !after.contains("/inner"),
+        "…and the session really ended: the next call is in the workspace with none of the \
+         state the restart threw away: {restart}"
+    );
+    assert_eq!(
+        restart["commandRan"],
+        json!(true),
+        "a `command` sent **with** a restart runs — a runtime that dropped it would answer the \
+         model `exit_code: 0` for a write that never happened: {restart}"
+    );
+    let where_it_ran = restart["whereItRan"].as_str().unwrap_or_default();
+    assert!(
+        where_it_ran.ends_with("[unset]") && !where_it_ran.contains("/inner"),
+        "…in the **fresh** session, which is what the restart beside it asked for: {restart}"
+    );
+    assert_eq!(
+        restart["withCommand"]["exit_code"],
+        json!(5),
+        "…and it comes back with its own status rather than a manufactured one: {restart}"
+    );
+    let restarted_notice = restart["withCommand"]["notice"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        restarted_notice.contains("the model asked for a restart")
+            && restarted_notice.contains("fresh shell"),
+        "…and the model is told which session it ran in: {restart}"
+    );
+    assert_eq!(
+        restart["withCommandProgram"]["command"],
+        json!("printf \"ran\\n\" > made-by-restart.txt; pwd; echo \"[${kept-unset}]\"; (exit 5)"),
+        "…and the trace records the command that ran, with its status, rather than the word \
+         `restart`: {restart}"
+    );
+    assert_eq!(
+        restart["withCommandProgram"]["exitCode"],
+        json!(5),
+        "…with the status it really exited: {restart}"
+    );
+
+    // --- A command that prints more than the runtime holds -----------------
+    let bounded = &answer["bounded"];
+    assert_eq!(
+        bounded["exitCode"],
+        json!(0),
+        "a command that printed megabytes still settled with its status: {bounded}"
+    );
+    let length = bounded["length"]
+        .as_u64()
+        .expect("the runner measures what came back");
+    assert!(
+        length < 200_000,
+        "what a call answers with is bounded, and this one came back with {length}          characters: a tool result is text a model reads (PRD resolved q54)"
+    );
+    assert_eq!(
         (
-            "docs/**/*.md",
-            json!([
-                "docs/deep/deeper/four.md",
-                "docs/deep/three.md",
-                "docs/one.md"
-            ]),
+            &bounded["keptTheHead"],
+            &bounded["keptTheTail"],
+            &bounded["saidWhatItDropped"]
         ),
+        (&json!(true), &json!(true), &json!(true)),
+        "the **middle** is what a bound drops: the head is the answer and the tail is          where a command's ending is, and the drop is said rather than silent: {bounded}"
+    );
+    assert_eq!(
+        bounded["after"]["stdout"], "still usable\n",
+        "…and the session survived it, which is what says the trim did not eat the          marker that closes a command: {bounded}"
+    );
+
+    // --- The scrubbed environment (PRD resolved q54 ruling b) --------------
+    let environment = &answer["environment"];
+    assert_eq!(
+        environment["scrubbed"], "[unset][unset]",
+        "a child of a binding that declared nothing sees nothing — not even a variable this \
+         process holds: {environment}"
+    );
+    assert_eq!(
+        environment["declared"], "[unset][a value the binding wrote]",
+        "…the declared one and no more: {environment}"
+    );
+    assert_eq!(
+        environment["inherited"], "[the value this process holds][unset]",
+        "…and `inherit_env: true` is the explicit opt-in that widens it: {environment}"
+    );
+
+    // --- The command deadline ---------------------------------------------
+    let timeout = &answer["timeout"];
+    assert_eq!(
+        timeout["result"]["timed_out"],
+        json!(true),
+        "a command that outran its bound comes back as a tool result: {timeout}"
+    );
+    assert_eq!(
+        timeout["program"],
+        json!({ "tool": "bash", "command": "sleep 30", "timedOut": true }),
+        "…recorded with the command and no exit status, because none completed: {timeout}"
+    );
+    let elapsed = timeout["elapsedMs"]
+        .as_u64()
+        .expect("the runner times the call it made");
+    assert!(
+        elapsed < 10_000,
+        "the 300ms bound was reached at its own deadline rather than at the `sleep`'s \
+         (took {elapsed}ms): {timeout}"
+    );
+    let notice = timeout["result"]["notice"].as_str().unwrap_or_default();
+    assert!(
+        notice.contains("`300ms`") && notice.contains("fresh shell"),
+        "the model is told which bound it hit and that its shell state went with it: {notice}"
+    );
+    assert_eq!(
+        timeout["after"]["stdout"], "still here\n",
+        "…and the call after it runs in a shell the runtime opened to replace the one it killed: \
+         {timeout}"
+    );
+
+    // --- The default workspace --------------------------------------------
+    let workspaces = &answer["workspaces"];
+    assert_eq!(
         (
-            "docs/**",
-            json!([
-                "docs/",
-                "docs/deep/",
-                "docs/deep/deeper/",
-                "docs/deep/deeper/four.md",
-                "docs/deep/three.md",
-                "docs/one.md",
-                "docs/two.txt"
-            ]),
+            &workspaces["underTheDataDirectory"],
+            &workspaces["sharedByBothTools"]
         ),
-        (
-            "**/deep/**/*.md",
-            json!(["docs/deep/deeper/four.md", "docs/deep/three.md"]),
-        ),
-        (
-            "**",
-            json!([
-                "a.md",
-                "docs/",
-                "docs/deep/",
-                "docs/deep/deeper/",
-                "docs/deep/deeper/four.md",
-                "docs/deep/three.md",
-                "docs/one.md",
-                "docs/two.txt"
-            ]),
-        ),
-    ] {
-        assert_eq!(shapes[glob], entries, "`{glob}` matched something else");
-    }
+        (&json!(true), &json!(true)),
+        "a binding that wrote no `workspace:` works in one directory per execution, under the \
+         project's data directory, shared with every other built-in that took the default: \
+         {workspaces}"
+    );
+    assert_eq!(
+        workspaces["keptWhenParked"],
+        json!(true),
+        "an execution whose row stays open keeps what it wrote, because the generation that \
+         resumes it reads past the frontier into those files (`docs/durability.md` §5): \
+         {workspaces}"
+    );
+    assert_eq!(
+        workspaces["goneWhenSettled"],
+        json!(true),
+        "…and a run that ended takes its workspace with it: {workspaces}"
+    );
 }
 
 /// The runner both `http:` request gates read, run once per gate so each one

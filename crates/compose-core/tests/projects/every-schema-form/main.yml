@@ -275,23 +275,33 @@ flow.condense:
     - { from: start, to: reduce }
     - { from: reduce, to: end }
 
+# The configured built-in: a shell bounded by a workspace, a per-command
+# deadline, and the environment its children may read — the only binding whose
+# program the **model** writes (grammar 6.1, PRD resolved q54). It declares no
+# `input:`/`output:`, because a built-in's contract is the compiler's.
+tool.sandbox:
+  builtin: bash
+  workspace: "${WORKSPACE}/build"
+  timeout: 30s
+  env:
+    PATH: "/usr/bin:/bin"
+    HOME: "${WORKSPACE}"
+  inherit_env: false
+
 agent.shaper:
   description: Produces one of everything.
   model: model.m
   prompt: Produce a shape.
   # A flow attached as a tool, which is the other half of the shape above, and
-  # all four runtime built-ins beside it (grammar 5.5, D123). The list is the one
-  # place two entry *shapes* meet — a bare address and a single-key mapping —
-  # and each built-in's emitted binding carries a schema and a bound this
-  # composition is the only golden to spell, so `tsc` and the pinned parse see
-  # every one of them.
+  # both built-ins beside it, one in each spelling (grammar 5.5, 6.1, D135):
+  # `builtin.files` as the shorthand, under every default, and the shell as a
+  # `tool.*` carrying a `builtin:` binding with every bound written out. Each
+  # emitted binding carries a schema and a bound this composition is the only
+  # golden to spell, so `tsc` and the pinned parse see every one of them.
   tools:
     - flow.condense
-    - builtin.read_file: { root: "${WORKSPACE}" }
-    - builtin.write_file: { root: "${WORKSPACE}" }
-    - builtin.list: { root: "${WORKSPACE}" }
-    # The bounded one: a working directory and a deadline, both required.
-    - builtin.bash: { root: "${WORKSPACE}/build", timeout: 30s }
+    - builtin.files
+    - tool.sandbox
   input:
     goal: { type: string, description: What to shape. }
   output:
@@ -326,7 +336,11 @@ agent.spreader:
   description: Shapes one goal of a batch.
   model: model.m
   prompt: Shape one goal.
-  tools: [flow.condense]
+  # The shell under every default — the shape `agent.shaper` above cannot hold
+  # beside its configured `tool.sandbox`, since both are `bash` on the model's
+  # side. What it pins is the emitted default bound: a shorthand carries no
+  # `timeout:` and the graph is what says what bounded the command (grammar 6.1).
+  tools: [flow.condense, builtin.bash]
   input:
     goal: { type: string }
   output:

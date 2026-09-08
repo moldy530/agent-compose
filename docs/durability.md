@@ -319,7 +319,7 @@ Each of them changes what the call is or what its answer means, so a binding
 that moved in any one of them is a call this run does not make and a recorded
 answer is not its.
 
-A **runtime built-in** (`docs/grammar.md` §5.5, Decision D123) is one more
+A **built-in tool** (`docs/grammar.md` §5.5, §6.1, Decision D135) is one more
 record of this kind, and is journaled for the reason the kind exists: a `bash`
 that appended a line to a file appended it once, whatever number of process
 generations the execution takes. A resumed generation is handed the recorded
@@ -327,15 +327,28 @@ stdout and stderr and runs no command — the record is consumed exactly as an
 `exec:` tool's is, and replay is where a built-in and a hand-rolled `exec:`
 tool are indistinguishable.
 
-Its request identity is the **attachment** as the composition wrote it — which
-built-in, its `root:` unresolved, and `builtin.bash`'s `timeout:` as written —
-plus the arguments the model chose. Unresolved for the reason above; whole for
-the other one: a root that moved is a different directory to have read, and a
-timeout that moved is a different bound to have survived, so neither is a call
-this run makes under the recorded key. What the record holds is the tool's whole
-answer — a file's contents, a command's output — which is §8's posture and not
-the trace's: `docs/trace.md` §11 keeps a tool's answer out of the trace, and
-this record is private recovery data that a `run --format json` never carries.
+Its request identity is the **binding** as the composition wrote it — which
+built-in, its `workspace:` unresolved, and `builtin.bash`'s `timeout:`, `env:`
+and `inherit_env:` as written — plus the arguments the model chose. Unresolved
+for the reason above; whole for the other one: a workspace that moved is a
+different directory to have worked in, a timeout that moved is a different bound
+to have survived, and an environment that moved is a different program, so none
+is a call this run makes under the recorded key.
+
+The one thing a replay does not restore is the **shell session**. A
+`builtin.bash` shell lives for the agent node activity that opened it, and a
+replayed command is a command that did not run — so a generation that resumes
+past the frontier opens a fresh shell in the workspace, whatever the recorded
+prefix had `cd`ed into. The recorded answers are still the recorded answers;
+what changed is where the *next* live command starts, which is the same thing a
+node `retry:` does to a session and for the same reason. A composition whose
+later commands depend on a directory an earlier one moved to should say so in
+each command — `cd build && make` rather than a `cd` a resume may not have
+made. What the record holds is
+the tool's whole answer — a file's contents, a command's output — which is §8's
+posture and not the trace's: `docs/trace.md` §11 keeps a tool's answer out of the
+trace, and this record is private recovery data that a `run --format json` never
+carries.
 
 A **detached** `map` delivery (`docs/grammar.md` §8.6 rule 7) is journaled like
 any other effect under the dispatch's own instance path. Its outcome is never

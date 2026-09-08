@@ -1,0 +1,17 @@
+# rule: `env:` names the environment a child runs with, and `builtin: files`
+# rule: forks none (grammar 6.1, D50, D135)
+# code: unknown-key
+# message: unknown key `env` in a `builtin: files` binding
+# at: 10:5
+# help: `timeout:`, `env:` and `inherit_env:` bound the child processes `builtin.bash` forks; `builtin.files` reads and writes through the runtime itself and forks none, so it has no child to bound (grammar 6.1)
+tool.sandbox:
+  builtin: files
+  env:
+    PATH: "/usr/bin"
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

@@ -1760,18 +1760,41 @@ const CASES: &[Case] = &[
         after: &[("providers.yml", "      max_uses: 3", "      max_uses: 1")],
         differs: true,
     },
-    // A built-in's `root:` is the whole of what bounds it (grammar 5.5,
-    // Decision D123), so moving it changes what an agent may reach without
+    // A built-in's `workspace:` is the whole of what bounds it (grammar 6.1,
+    // Decision D135), so moving it changes what an agent may reach without
     // touching a node, a prompt or a schema — the same shape of edit as the one
     // above, on the side of the wire this runtime dispatches.
     Case {
-        what: "a built-in's root widened",
+        what: "a built-in's workspace widened",
         before: &[],
         after: &[(
-            "agents/fixer.yml",
-            "    - builtin.read_file: { root: \"${REPO_ROOT}\" }",
-            "    - builtin.read_file: { root: \"${REPO_ROOT}/src\" }",
+            "tools/checkout.yml",
+            "  workspace: \"${REPO_ROOT}\"",
+            "  workspace: \"${REPO_ROOT}/src\"",
         )],
+        differs: true,
+    },
+    // …and the same bound moved to a *different* machine fact, which is the
+    // half of a class-2 surface a plan reads separately: the env refs the
+    // workspace names, rather than the text around them (grammar 4.3).
+    Case {
+        what: "a built-in's workspace read from another variable",
+        before: &[],
+        after: &[(
+            "tools/checkout.yml",
+            "  workspace: \"${REPO_ROOT}\"",
+            "  workspace: \"${CHECKOUT_ROOT}\"",
+        )],
+        differs: true,
+    },
+    // …and which built-in a tool binds is the capability itself: swapping the
+    // file editor for a shell is the widest edit this grammar admits without a
+    // node changing, so a plan that did not report it would hide the one thing
+    // PRD resolved q54 asks to be said loudly.
+    Case {
+        what: "a built-in tool rebound to the shell",
+        before: &[],
+        after: &[("tools/checkout.yml", "  builtin: files", "  builtin: bash")],
         differs: true,
     },
     Case {
@@ -2540,6 +2563,157 @@ fn sides(under: &str, at: usize, case: &Case) -> (Ir, Ir) {
     let _ = fs::remove_dir_all(&before);
     let _ = fs::remove_dir_all(&after);
     (old, new)
+}
+
+/// A built-in reaching an agent by its **shorthand** is named in the plan (PRD
+/// resolved q54, `docs/plan.md` §3, §4).
+///
+/// The three cases above move a built-in's bounds, which is enough for the
+/// completeness walk and not enough for the property q54 asks for: what a
+/// built-in grants is the widest capability this grammar hands out, so an author
+/// reading a plan has to *see* one arrive. Asserted on the records' addresses
+/// rather than on the rendered text, because the addresses are the machine
+/// surface `docs/plan.md` fixes and the rendering follows them. The configured
+/// spelling is the test below.
+#[test]
+fn a_builtin_arriving_at_an_agent_is_named_in_the_plan() {
+    let case = Case {
+        what: "an agent given both built-ins",
+        before: &[],
+        after: &[(
+            "agents/fixer.yml",
+            "    - tool.checkout",
+            "    - tool.checkout\n    - builtin.bash",
+        )],
+        differs: true,
+    };
+    let (old, new) = sides("builtin-arrival", 0, &case);
+    let plan = plan(
+        Composition {
+            entrypoint: "before/main.yml",
+            ir: &old,
+            resolution: &[],
+        },
+        Composition {
+            entrypoint: "after/main.yml",
+            ir: &new,
+            resolution: &[],
+        },
+    );
+    let agent = plan
+        .components
+        .iter()
+        .find(|change| change.address == "agent.fixer")
+        .expect("the agent that gained a built-in is a component change");
+    let fields: Vec<&str> = agent
+        .fields
+        .iter()
+        .map(|field| field.path.as_str())
+        .collect();
+    assert!(
+        fields.contains(&"builtins"),
+        "a shorthand built-in reached an agent and the plan named no `builtins` field: \
+         {fields:?}"
+    );
+    let said = agent
+        .fields
+        .iter()
+        .find(|field| field.path == "builtins")
+        .map(|field| format!("{:?}", field.after))
+        .unwrap_or_default();
+    assert!(
+        said.contains("builtin.bash"),
+        "the plan does not say which built-in arrived, which is the whole of what it grants: \
+         {said}"
+    );
+}
+
+/// …and the **configured** spelling, which is a definition arriving rather than
+/// a list growing (PRD resolved q54, `docs/plan.md` §3).
+///
+/// The shorthand says what it grants in the agent's own `builtins` field. A
+/// `tool.*` carrying a `builtin:` binding says it nowhere unless the arrival
+/// carries it: an added definition reports no fields, so `+ tool.sandbox` would
+/// read exactly like `+ tool.repo_grep` — and the configured form is now the
+/// only way to grant a *bounded* shell, so it is the spelling a plan reader most
+/// needs told. One field, `builtin`, holding the name.
+#[test]
+fn a_configured_builtin_arriving_says_what_it_binds() {
+    let case = Case {
+        what: "a tool binding a shell, added and attached",
+        before: &[],
+        after: &[
+            (
+                "tools/checkout.yml",
+                "tool.checkout:",
+                "tool.sandbox:\n  builtin: bash\n  workspace: \"${REPO_ROOT}\"\n  timeout: 90s\ntool.checkout:",
+            ),
+            (
+                "agents/fixer.yml",
+                "    - tool.checkout",
+                "    - tool.checkout\n    - tool.sandbox",
+            ),
+        ],
+        differs: true,
+    };
+    let (old, new) = sides("builtin-definition", 0, &case);
+    let arrived = plan(
+        Composition {
+            entrypoint: "before/main.yml",
+            ir: &old,
+            resolution: &[],
+        },
+        Composition {
+            entrypoint: "after/main.yml",
+            ir: &new,
+            resolution: &[],
+        },
+    );
+    let tool = arrived
+        .components
+        .iter()
+        .find(|change| change.address == "tool.sandbox")
+        .expect("the tool that arrived is a component change");
+    let said: Vec<(&str, String)> = tool
+        .fields
+        .iter()
+        .map(|field| (field.path.as_str(), format!("{:?}", field.after)))
+        .collect();
+    assert!(
+        said.iter()
+            .any(|(path, after)| *path == "builtin" && after.contains("bash")),
+        "a `tool.*` binding a shell arrived and the plan does not say it binds one, so it reads \
+         like any other tool arriving: {said:?}"
+    );
+    // …and the same tool leaving says the same thing, on the other side: the two
+    // artifacts compared the other way round.
+    let left = plan(
+        Composition {
+            entrypoint: "before/main.yml",
+            ir: &new,
+            resolution: &[],
+        },
+        Composition {
+            entrypoint: "after/main.yml",
+            ir: &old,
+            resolution: &[],
+        },
+    );
+    let tool = left
+        .components
+        .iter()
+        .find(|change| change.address == "tool.sandbox")
+        .expect("the tool that left is a component change");
+    let said: Vec<(&str, String)> = tool
+        .fields
+        .iter()
+        .map(|field| (field.path.as_str(), format!("{:?}", field.before)))
+        .collect();
+    assert!(
+        said.iter()
+            .any(|(path, before)| *path == "builtin" && before.contains("bash")),
+        "a capability leaving is as much of a plan as one arriving: {said:?}"
+    );
 }
 
 #[test]

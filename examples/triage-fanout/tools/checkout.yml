@@ -1,0 +1,19 @@
+# A built-in tool, configured: the `files` built-in bounded to one checkout.
+#
+# The `builtin:` binding is the one implementation that does not fix what runs
+# at build time — the model authors the file operations at run time, which is
+# the trust level `exec:` already extends to author-arbitrary binaries, extended
+# to the model (grammar 6.1, PRD resolved q54). What an author writes here is
+# the bound: the directory it may work in, and nothing else.
+#
+# It carries no `input:`/`output:` because a built-in declares its own contract,
+# and no `description:` because the compiler's is accurate — one is written
+# anyway, since "the repository checkout" is the fact this composition knows and
+# the compiler does not.
+tool.checkout:
+  builtin: files
+  workspace: "${REPO_ROOT}"
+  description: >-
+    View and edit files in the repository checkout under review. Paths are
+    relative to the checkout root, and a path that resolves outside it is
+    refused.

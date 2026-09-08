@@ -232,7 +232,8 @@ pub fn expressions(ir: &Ir) -> Vec<Expression<'_>> {
                 }
                 crate::ir::flow::ToolImplementation::Exec { .. }
                 | crate::ir::flow::ToolImplementation::Function { .. }
-                | crate::ir::flow::ToolImplementation::Module { .. } => {}
+                | crate::ir::flow::ToolImplementation::Module { .. }
+                | crate::ir::flow::ToolImplementation::Builtin { .. } => {}
             },
             crate::ir::definition::DefinitionBody::Flow(flow) => {
                 for node in &flow.nodes {

@@ -1,0 +1,118 @@
+---
+source: crates/agent-compose/tests/trace_format_stability.rs
+expression: held
+---
+{
+  "entries": [
+    {
+      "attempts": 1,
+      "flow": "flow.both",
+      "models": [
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.claude",
+          "servedBy": "model.claude",
+          "toolCalls": [
+            {
+              "name": "bash",
+              "outcome": "completed",
+              "program": {
+                "command": "printf 'one\ntwo\n' > notes.txt",
+                "exitCode": 0,
+                "tool": "bash"
+              },
+              "target": "tool.shell"
+            },
+            {
+              "name": "str_replace_based_edit_tool",
+              "outcome": "completed",
+              "program": {
+                "operation": "view",
+                "path": "notes.txt",
+                "tool": "files"
+              },
+              "target": "tool.editor"
+            },
+            {
+              "name": "str_replace_based_edit_tool",
+              "outcome": "completed",
+              "program": {
+                "change": "wrote 41 bytes",
+                "operation": "create",
+                "path": "plan.md",
+                "tool": "files"
+              },
+              "target": "tool.editor"
+            },
+            {
+              "name": "bash",
+              "outcome": "completed",
+              "program": {
+                "command": "restart",
+                "tool": "bash"
+              },
+              "target": "tool.shell"
+            },
+            {
+              "name": "bash",
+              "outcome": "completed",
+              "program": {
+                "command": "cat plan.md",
+                "exitCode": 0,
+                "tool": "bash"
+              },
+              "target": "tool.shell"
+            },
+            {
+              "name": "bash",
+              "outcome": "completed",
+              "program": {
+                "command": "test -f nothing-here",
+                "exitCode": 1,
+                "tool": "bash"
+              },
+              "target": "tool.shell"
+            }
+          ]
+        },
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.claude",
+          "servedBy": "model.claude"
+        },
+        {
+          "failovers": [],
+          "fallback": 0,
+          "model": "model.claude",
+          "servedBy": "model.claude"
+        }
+      ],
+      "node": "do",
+      "outcome": "completed",
+      "routing": {
+        "counters": {},
+        "edges": [
+          {
+            "reason": "unconditional",
+            "taken": true,
+            "to": "__end__"
+          }
+        ],
+        "targets": [
+          "__end__"
+        ]
+      },
+      "step": 1,
+      "traversal": 0,
+      "writes": [
+        "summary"
+      ]
+    }
+  ],
+  "execution_id": "<execution-id>",
+  "flow": "flow.both",
+  "status": "completed",
+  "trace_version": 4
+}

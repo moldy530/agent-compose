@@ -89,6 +89,10 @@ const LOCAL: &str = "qwen3-coder-30b";
 /// the whole point of the pair (Decision D122).
 const GPT5: &str = "gpt-5";
 const GPT_MINI: &str = "gpt-4o-mini";
+/// The `builtin-tools` fixture's OpenAI model, which is the wire PRD resolved
+/// q54 ruling d's other half is about: no provider-defined tool types, so the
+/// two built-ins go out as ordinary function tools.
+const GPT41: &str = "gpt-4.1";
 /// The `provider-kinds` fixture's two models: one per Chat Completions kind that
 /// is neither `openai_compatible` nor already bound elsewhere.
 const AZURE_HOSTED: &str = "gpt-4o-mini";
@@ -7795,7 +7799,8 @@ fn the_triage_fanout_example_routes_every_finding_and_joins_them_in_source_order
         // which is the only arrangement under which the join means anything.
         //
         // Two calls per dispatched instance, for `agent.triage`'s reason one
-        // level down: `agent.fixer` holds `builtin.read_file` (grammar 5.5), so
+        // level down: `agent.fixer` holds `tool.checkout`, a `builtin: files`
+        // binding (grammar 5.5, 6.1), so
         // each instance makes a loop call before its pinned one. The pair is
         // told apart by which item the request carries rather than by position,
         // since two instances run concurrently and either may ask first.
@@ -12359,17 +12364,21 @@ fn openai_agent_request() -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// PRD §7 M3, second bullet — "Built-in tools", the runtime half (resolved q31).
+// PRD §7 M3, second bullet — "Built-in tools", the runtime half (resolved q54).
 // ---------------------------------------------------------------------------
 
 /// A scratch directory a `builtin-tools` run is bounded to, and the environment
 /// that points the fixture at it.
 ///
-/// The `root:` every entry declares is `${BUILTIN_ROOT}` — a class 2 surface
-/// (grammar 4.3) resolved at process start — so the bound is a property of the
-/// machine running the graph. Each test gets its own directory, which is what
-/// lets the suite run in parallel and what makes "the file is there afterwards"
-/// an assertion about *this* run.
+/// The `workspace:` every configured entry declares is `${BUILTIN_ROOT}` — a
+/// class 2 surface (grammar 4.3) resolved at process start — so the bound is a
+/// property of the machine running the graph. Each test gets its own directory,
+/// which is what lets the suite run in parallel and what makes "the file is
+/// there afterwards" an assertion about *this* run.
+///
+/// `PATH` travels with it, because the fixture's `env:` declares one: a built-in
+/// child is scrubbed (PRD resolved q54 ruling b), so a shell that is to run
+/// anything but its own builtins is given the `PATH` this process has.
 fn bounded_root(
     provider: &MockProvider,
     purpose: &str,
@@ -12379,6 +12388,10 @@ fn bounded_root(
     std::fs::create_dir_all(&root).expect("the scratch area is writable");
     let mut environment = harness::environment(provider);
     environment.push(("BUILTIN_ROOT".to_string(), root.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+    ));
     (scratch, environment)
 }
 
@@ -12387,33 +12400,34 @@ fn root_of(scratch: &harness::Scratch) -> std::path::PathBuf {
     scratch.path().join("root")
 }
 
-/// All four built-ins, called by a real model loop, doing real work
-/// (grammar 5.5, Decision D123, PRD resolved q31).
+/// The built-in shell, called by a real model loop, doing real work
+/// (grammar 5.5, 6.1, Decision D135, PRD resolved q54).
 ///
-/// One answer carries four calls, so the whole set is exercised in one turn and
-/// the results come back in one tool-result message the transcript can be read
-/// off. What each one is asserted on is the thing only a real call could
-/// produce: the bytes of a file that was on disk before the run, the entries of
-/// a directory the harness made, the stdout of a command, and — the only one
-/// visible outside the transcript — a file that exists on disk afterwards.
+/// A built-in is the one binding whose program the **model** writes, so what it
+/// is asserted on is the thing only a real call could produce: the stdout of a
+/// command the model composed, and — the only one visible outside the transcript
+/// — a file that exists on disk afterwards because that command wrote it.
+///
+/// And what the *trace* has that no other tool call does: the program, which is
+/// PRD resolved q54 ruling c's carve-out (`docs/trace.md` §7.4). A run that
+/// recorded three `bash` calls and nothing about what they ran would be the
+/// record this feature is not allowed to leave behind.
 #[test]
-fn every_builtin_runs_inside_its_root_and_answers_the_model() {
+fn the_builtin_shell_runs_inside_its_workspace_and_answers_the_model() {
     let provider = MockProvider::start().expect("a loopback port");
     let (scratch, environment) = bounded_root(&provider, "builtins-run");
     let root = root_of(&scratch);
     std::fs::write(root.join("notes.txt"), "the note this file held")
         .expect("the root is writable");
-    std::fs::create_dir_all(root.join("sub")).expect("the root is writable");
 
     provider.enqueue_all([
         Script::new(
             SONNET,
             Outcome::tool_calls(vec![
-                ToolCall::new("read_file", json!({ "path": "notes.txt" })),
-                ToolCall::new("list", json!({ "path": ".", "glob": "" })),
+                ToolCall::new("bash", json!({ "command": "cat notes.txt" })),
                 ToolCall::new(
-                    "write_file",
-                    json!({ "path": "written.txt", "content": "what the graph wrote" }),
+                    "bash",
+                    json!({ "command": "printf 'what the graph wrote' > written.txt" }),
                 ),
                 ToolCall::new(
                     "bash",
@@ -12424,43 +12438,40 @@ fn every_builtin_runs_inside_its_root_and_answers_the_model() {
         Script::new(SONNET, Outcome::text("I have what I need.")),
         Script::new(
             SONNET,
-            Outcome::structured(json!({ "summary": "read, listed, wrote and ran" })),
+            Outcome::structured(json!({ "summary": "read, wrote and ran" })),
         ),
     ]);
 
     let Some(run) = harness::invoke_with(
         "builtin-tools",
         "flow.work",
-        &json!({ "goal": "do the four things" }),
+        &json!({ "goal": "do the three things" }),
         &environment,
     ) else {
         return;
     };
     run.succeeded();
-    assert_eq!(run.outputs()["summary"], "read, listed, wrote and ran");
+    assert_eq!(run.outputs()["summary"], "read, wrote and ran");
 
-    // The one effect that outlives the process: `write_file` really wrote.
+    // The one effect that outlives the process: the command really wrote.
     assert_eq!(
         std::fs::read_to_string(root.join("written.txt")).expect("the file was written"),
         "what the graph wrote"
     );
 
-    // …and the three that are only visible in what the model was handed back,
+    // …and the two that are only visible in what the model was handed back,
     // which is the request that replays this turn's results.
     let asked = provider.requests();
     assert_eq!(asked.len(), 3, "the loop turned twice and then pinned");
     let handed = asked[1].body().to_string();
     for expected in [
-        // `read_file` answered with the bytes that were on disk.
+        // The first command read a file that was on disk before the run.
         "the note this file held",
-        // `list` answered with the directory's entries, a directory marked.
-        "notes.txt",
-        "sub/",
-        // `write_file` answered with the byte count.
-        "bytes_written",
-        // …and `bash` ran with the root as its working directory, which is what
-        // the command printed the basename of.
+        // …and the last ran with the workspace as its working directory, which
+        // is what the command printed the basename of.
         "ran in root",
+        // …and each answer carries the status the model reasons about.
+        "exit_code",
     ] {
         assert!(
             handed.contains(expected),
@@ -12468,9 +12479,10 @@ fn every_builtin_runs_inside_its_root_and_answers_the_model() {
         );
     }
 
-    // The trace records each call as a `ToolCallRecord` and nothing more:
-    // `docs/trace.md` §11 keeps a tool's answer out of the format, and a
-    // built-in is a tool (PRD resolved q31 — "traces are unchanged").
+    // The trace records each call as a `ToolCallRecord`, under the **tool's**
+    // address rather than the built-in's, because a configured built-in is a
+    // `tool.*` like any other (grammar 6.1) — and each carries the **program**
+    // the model wrote, which is the carve-out of `docs/trace.md` §7.4.
     let calls = tool_calls_of(&run, "do");
     assert_eq!(
         calls
@@ -12484,382 +12496,301 @@ fn every_builtin_runs_inside_its_root_and_answers_the_model() {
             .collect::<Vec<_>>(),
         vec![
             (
-                "read_file".to_string(),
-                "builtin.read_file".to_string(),
-                "completed".to_string(),
-                false
-            ),
-            (
-                "list".to_string(),
-                "builtin.list".to_string(),
-                "completed".to_string(),
-                false
-            ),
-            (
-                "write_file".to_string(),
-                "builtin.write_file".to_string(),
+                "bash".to_string(),
+                "tool.shell".to_string(),
                 "completed".to_string(),
                 false
             ),
             (
                 "bash".to_string(),
-                "builtin.bash".to_string(),
+                "tool.shell".to_string(),
+                "completed".to_string(),
+                false
+            ),
+            (
+                "bash".to_string(),
+                "tool.shell".to_string(),
                 "completed".to_string(),
                 false
             ),
         ],
-        "each call is recorded under the built-in's address, with no result beside it"
+        "each call is recorded under the tool's address, with no result beside it"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["program"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!({ "tool": "bash", "command": "cat notes.txt", "exitCode": 0 }),
+            json!({
+                "tool": "bash",
+                "command": "printf 'what the graph wrote' > written.txt",
+                "exitCode": 0
+            }),
+            json!({
+                "tool": "bash",
+                "command": "printf 'ran in %s' \"$(basename \"$PWD\")\"",
+                "exitCode": 0
+            }),
+        ],
+        "the trace carries what the model ran and what it exited with, and nothing the \
+         command printed (`docs/trace.md` §7.4, §11): {calls:?}"
+    );
+    assert!(
+        !run.trace()
+            .iter()
+            .any(|entry| entry.to_string().contains("the note this file held")),
+        "a command's stdout is a tool's *answer* and stays out of the trace with every \
+         other tool's (`docs/trace.md` §11)"
     );
     assert!(provider.snapshot().is_drained());
 }
 
-/// What a `list` answers: the entries in order, a glob matched within and across
-/// path segments, and a flag when it stopped short (grammar 5.5).
+/// One shell per node **activity**: what a command did is still true for the
+/// command after it (PRD resolved q54).
 ///
-/// The glob matcher is this runtime's own — one fewer pinned dependency, which
-/// is the posture the whole emitted runtime is written in — so its two rules
-/// need exercising rather than asserting: `*` and `?` stay inside one segment
-/// and `**` spans them. The cap is here for the same reason: a bound nothing
-/// reaches is a bound nobody knows the shape of, and `truncated` is what tells a
-/// model its listing is a prefix rather than an answer.
+/// The claim that makes `bash` a tool a model can drive rather than one it has to
+/// re-explain itself to: `cd build` and then `make` is one thought. A runtime
+/// that forked per call would answer the second command from the workspace root
+/// with the model's own account of the first as the only evidence, so what is
+/// asserted here is the thing only a live session produces — a working directory
+/// and a shell variable that outlived the call that set them.
 #[test]
-fn a_listing_matches_globs_in_order_and_says_when_it_stopped_short() {
+fn a_shells_state_carries_across_the_calls_of_one_node_activity() {
     let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-glob");
-    let root = root_of(&scratch);
-    // A tree deep enough that `*` and `**` disagree about it.
-    std::fs::create_dir_all(root.join("docs/deep")).expect("the root is writable");
-    for path in [
-        "docs/one.md",
-        "docs/two.txt",
-        "docs/deep/three.md",
-        "top.md",
-    ] {
-        std::fs::write(root.join(path), "x").expect("the root is writable");
-    }
-    // …and a directory with more entries than one answer carries.
-    let crowd = root.join("crowd");
-    std::fs::create_dir_all(&crowd).expect("the root is writable");
-    for index in 0..1001 {
-        std::fs::write(crowd.join(format!("{index:04}.txt")), "x").expect("the root is writable");
-    }
+    let (scratch, environment) = bounded_root(&provider, "builtins-session");
+    std::fs::create_dir_all(root_of(&scratch).join("inner")).expect("the root is writable");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "cd inner; kept=carried-over" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "printf 'in %s with %s' \"$(basename \"$PWD\")\" \"$kept\"" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("The shell remembered.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the session carried" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "change directory, then look around" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    // The second command's answer, as the model was handed it: the directory the
+    // *first* call moved to, and the variable it set.
+    let handed = provider.requests()[2].body().to_string();
+    assert!(
+        handed.contains("in inner with carried-over"),
+        "the second command ran in a shell that still held the first's working \
+         directory and variables: {handed}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A command that reads **standard input** gets one of its own, rather than the
+/// pipe this runtime types its commands into (PRD resolved q54).
+///
+/// The one place the runtime's own protocol and the model's program would share
+/// a channel. `builtin.bash` is a session, so the shell reads its script from
+/// standard input and each command is typed into that pipe followed by the marker
+/// lines that close it — which is exactly what a command reading standard input
+/// would read. Both failures are silent, which is why this is asserted rather
+/// than left to the other tests:
+///
+///  * `read` swallows the line carrying `$?`, so the call settles with **no
+///    status** — a completed command recorded as one that did not finish, which
+///    `docs/trace.md` §7.4 says is the difference between "the command failed"
+///    and "the command did not finish";
+///  * `cat` swallows both `printf`s, spends the whole `timeout:` and answers the
+///    model with this runtime's marker text as the command's own output.
+///
+/// So both are run, and what is asserted is a status on each and a session still
+/// usable after them.
+#[test]
+fn a_command_that_reads_standard_input_does_not_eat_the_marker_protocol() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-stdin");
 
     provider.enqueue_all([
         Script::new(
             SONNET,
             Outcome::tool_calls(vec![
-                // `*` does not cross a `/`, so `docs/deep/three.md` is not a match.
-                ToolCall::new("list", json!({ "path": ".", "glob": "docs/*.md" })),
-                // `**` does, and reaches the file the one above cannot.
-                ToolCall::new("list", json!({ "path": ".", "glob": "**/*.md" })),
-                // …and the listing that has to stop.
-                ToolCall::new("list", json!({ "path": "crowd", "glob": "" })),
+                ToolCall::new(
+                    "bash",
+                    json!({
+                        "command":
+                            "read -r line; printf 'read exited %s and the line is [%s]' \"$?\" \"$line\""
+                    }),
+                ),
+                ToolCall::new("bash", json!({ "command": "cat" })),
+                ToolCall::new(
+                    "bash",
+                    json!({ "command": "printf 'still in %s' \"$(basename \"$PWD\")\"" }),
+                ),
             ]),
         ),
-        Script::new(SONNET, Outcome::text("I have the listings.")),
-        Script::new(SONNET, Outcome::structured(json!({ "summary": "listed" }))),
+        Script::new(SONNET, Outcome::text("The shell answered all three.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "nothing ate the protocol" })),
+        ),
     ]);
 
     let Some(run) = harness::invoke_with(
         "builtin-tools",
         "flow.work",
-        &json!({ "goal": "list the tree" }),
+        &json!({ "goal": "run three commands, two of which read standard input" }),
         &environment,
     ) else {
         return;
     };
     run.succeeded();
+    assert_eq!(run.outputs()["summary"], "nothing ate the protocol");
 
+    // Each call completed with a status, which is the assertion: a `read` that
+    // had eaten the status line would be recorded with no `exitCode` at all, and
+    // a `cat` that had eaten the markers would be recorded `timedOut`.
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["program"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!({
+                "tool": "bash",
+                "command":
+                    "read -r line; printf 'read exited %s and the line is [%s]' \"$?\" \"$line\"",
+                "exitCode": 0
+            }),
+            json!({ "tool": "bash", "command": "cat", "exitCode": 0 }),
+            json!({
+                "tool": "bash",
+                "command": "printf 'still in %s' \"$(basename \"$PWD\")\"",
+                "exitCode": 0
+            }),
+        ],
+        "a command that reads standard input reads its own, so each of the three completed \
+         with the status `docs/trace.md` §7.4 records where one did: {calls:?}"
+    );
+
+    // …and what the model was handed: the `read` reported the end of an input
+    // with nothing in it rather than a line of this runtime's protocol, and the
+    // third command proves the session survived the two.
     let handed = provider.requests()[1].body().to_string();
-    // Segment-bounded: the two files directly under `docs/`, in order, and not
-    // the one a level down.
     assert!(
-        handed.contains(r#"[\"docs/one.md\"]"#),
-        "`docs/*.md` matches inside one segment only: {handed}"
+        handed.contains("read exited 1 and the line is []"),
+        "the `read` found the end of an empty input rather than the marker line: {handed}"
     );
-    // Segment-spanning: everything with that suffix, wherever it sits.
     assert!(
-        handed.contains(r#"[\"docs/deep/three.md\",\"docs/one.md\",\"top.md\"]"#),
-        "`**/*.md` crosses segments, and the entries are in order: {handed}"
+        !handed.contains("__agent_compose_"),
+        "no answer carries this runtime's own marker protocol back to the model: {handed}"
     );
-    // …and the listing that ran out says so rather than looking complete.
     assert!(
-        handed.contains(r#"\"truncated\":true"#) && handed.contains(r#"\"0000.txt\""#),
-        "a listing past the cap answers a prefix and reports that it is one: {handed}"
+        handed.contains("still in root"),
+        "the session outlived both of them, in the workspace it started in: {handed}"
     );
     assert!(provider.snapshot().is_drained());
 }
 
-/// A path that climbs out of the root with `..` is **refused**, and refusing it
-/// fails the node rather than going back to the model (PRD resolved q31).
+/// A command that exits nonzero **comes back to the model** with its status
+/// (PRD resolved q54, Decision D119).
 ///
-/// The file it climbs to really exists, which is what makes the assertion about
-/// the *rule* rather than about a missing file: a runtime comparing strings, or
-/// one resolving the path and then opening the raw one, would read it.
+/// The split this feature moves: for every other binding an exit status outside
+/// `expect_exit:` is the composition's own contract failing, and for a built-in
+/// there is no such contract — the model wrote the command, so the status is a
+/// *fact it asked for* and it is the one that decides what to do about it. A
+/// runtime that failed the node here would end a run over a `grep` that matched
+/// nothing.
 #[test]
-fn a_path_that_climbs_out_of_the_root_is_refused_and_fails_the_node() {
+fn a_command_that_exits_nonzero_comes_back_to_the_model_with_its_status() {
     let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-escape");
-    std::fs::write(scratch.path().join("secret.txt"), "not for the model")
-        .expect("the scratch area is writable");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "read_file",
-            json!({ "path": "../secret.txt" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "read the secret" }),
-        &environment,
-    ) else {
-        return;
-    };
-    let said = run.failed();
-    assert!(
-        said.contains("resolves outside `root:`") && said.contains("../secret.txt"),
-        "the refusal names the path and the bound it left: {said}"
-    );
-
-    // …and it is a *failure*, not a refusal handed back: the model saw nothing,
-    // the node ended, and the trace says so (Decision D119).
-    let calls = tool_calls_of(&run, "do");
-    assert_eq!(
-        calls.len(),
-        1,
-        "the loop ended at the first call: {calls:?}"
-    );
-    assert_eq!(calls[0]["outcome"], "failed");
-    assert_eq!(
-        provider.requests().len(),
-        1,
-        "a failed call ends the node, so the loop does not turn again"
-    );
-}
-
-/// A **symlink** that points out of the root is refused too, which is the half a
-/// string comparison passes and a resolution does not (PRD resolved q31:
-/// "resolution, not string prefix — symlinks and `..` count").
-#[cfg(unix)]
-#[test]
-fn a_symlink_that_points_out_of_the_root_is_refused() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-symlink");
-    let outside = scratch.path().join("secret.txt");
-    std::fs::write(&outside, "not for the model").expect("the scratch area is writable");
-    // The link's own path is inside the root and stays inside it under every
-    // string rule there is; only resolving it says otherwise.
-    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("inside.txt"))
-        .expect("the root is writable");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "read_file",
-            json!({ "path": "inside.txt" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "read through the link" }),
-        &environment,
-    ) else {
-        return;
-    };
-    let said = run.failed();
-    assert!(
-        said.contains("resolves outside `root:`") && said.contains("inside.txt"),
-        "a link out of the root is refused where it points, not where it sits: {said}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&outside).expect("the file is still there"),
-        "not for the model",
-        "nothing outside the root was touched"
-    );
-}
-
-/// A **write** through a symlink whose target does not exist yet is refused
-/// rather than creating the file the link points at (PRD resolved q31).
-///
-/// This is the escape a resolution check can pass *by resolving nothing*.
-/// Resolving the whole path fails — there is nothing at the other end of the
-/// link — so what is left is the not-yet-existing case, where the **parent** is
-/// resolved and the last component appended: the parent is the root itself, the
-/// result sits under it, and every check says yes. `writeFile` then follows the
-/// link and creates a file outside the bound. Refusing the dangling link is what
-/// closes that, and the target being a path that does not exist yet is exactly
-/// what makes it a file this call would have created.
-#[cfg(unix)]
-#[test]
-fn a_write_through_a_dangling_symlink_is_refused() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-dangling");
-    let outside = scratch.path().join("not-yet.txt");
-    assert!(
-        !outside.exists(),
-        "the link points at nothing to begin with"
-    );
-    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("dangling.txt"))
-        .expect("the root is writable");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "write_file",
-            json!({ "path": "dangling.txt", "content": "written out of the root" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "write through the link" }),
-        &environment,
-    ) else {
-        return;
-    };
-    let said = run.failed();
-    assert!(
-        said.contains("will not follow `dangling.txt`")
-            && said.contains("symbolic link whose target does not exist"),
-        "a link with nothing to resolve is refused rather than written through: {said}"
-    );
-    assert!(
-        !outside.exists(),
-        "the write reached `{}`, outside the root",
-        outside.display()
-    );
-    let calls = tool_calls_of(&run, "do");
-    assert_eq!(calls[0]["outcome"], "failed");
-}
-
-/// A write to a file that does not exist yet, under a directory that is a
-/// **symlink out of the root**, is refused — which is the case resolved q31
-/// names in as many words ("a write to a not-yet-existing path resolves its
-/// parent").
-///
-/// Nothing at the requested path exists, so there is nothing to resolve whole;
-/// where the *parent* really is decides the call. A runtime that checked the
-/// lexically-resolved path instead would find no `..` in `linkdir/new.txt`,
-/// agree it sits under the root, and write into a directory the composition
-/// never granted.
-#[cfg(unix)]
-#[test]
-fn a_write_to_a_new_file_under_a_symlinked_directory_is_refused() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-linked-parent");
-    let outside = scratch.path().join("elsewhere");
-    std::fs::create_dir_all(&outside).expect("the scratch area is writable");
-    std::os::unix::fs::symlink(&outside, root_of(&scratch).join("linkdir"))
-        .expect("the root is writable");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "write_file",
-            json!({ "path": "linkdir/new.txt", "content": "written out of the root" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.work",
-        &json!({ "goal": "write through the linked directory" }),
-        &environment,
-    ) else {
-        return;
-    };
-    let said = run.failed();
-    assert!(
-        said.contains("resolves outside `root:`") && said.contains("linkdir/new.txt"),
-        "a new file is checked against where its parent really is: {said}"
-    );
-    assert!(
-        !outside.join("new.txt").exists(),
-        "the write reached `{}`, outside the root",
-        outside.join("new.txt").display()
-    );
-    let calls = tool_calls_of(&run, "do");
-    assert_eq!(calls[0]["outcome"], "failed");
-}
-
-/// A listing **does not descend into** a symlinked directory, so no path outside
-/// the root reaches the model through a walk nobody asked a path check of
-/// (grammar 5.5, PRD resolved q31).
-///
-/// `list` is the one built-in that answers with paths the model never named: a
-/// glob walk goes wherever the tree goes, and every entry it finds is reported
-/// without going back through the root check the *listed* path went through. Not
-/// following links is what keeps that sound. The link itself is still an entry —
-/// reported as a link, without the trailing `/` a directory gets — and reading
-/// it is a `read_file` call, where the check is asked and refused.
-#[cfg(unix)]
-#[test]
-fn a_listing_does_not_descend_into_a_symlinked_directory() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (scratch, environment) = bounded_root(&provider, "builtins-linked-listing");
-    let root = root_of(&scratch);
-    let outside = scratch.path().join("elsewhere");
-    std::fs::create_dir_all(&outside).expect("the scratch area is writable");
-    std::fs::write(outside.join("not-for-the-model.txt"), "x")
-        .expect("the scratch area is writable");
-    // …and a real subdirectory beside the link, so what the walk *does* descend
-    // into is asserted in the same answer as what it does not.
-    std::fs::create_dir_all(root.join("sub")).expect("the root is writable");
-    std::fs::write(root.join("a.txt"), "x").expect("the root is writable");
-    std::fs::write(root.join("sub/b.txt"), "x").expect("the root is writable");
-    std::os::unix::fs::symlink(&outside, root.join("linkdir")).expect("the root is writable");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-nonzero");
 
     provider.enqueue_all([
-        // `**` spans segments, so this asks for everything the walk can reach.
         Script::new(
             SONNET,
             Outcome::tool_calls(vec![ToolCall::new(
-                "list",
-                json!({ "path": ".", "glob": "**" }),
+                "bash",
+                json!({ "command": "echo 'the command said why' >&2; (exit 3)" }),
             )]),
         ),
-        Script::new(SONNET, Outcome::text("I have the listing.")),
-        Script::new(SONNET, Outcome::structured(json!({ "summary": "listed" }))),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "printf 'recovered'" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("Handled it.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the second command worked" })),
+        ),
     ]);
 
     let Some(run) = harness::invoke_with(
         "builtin-tools",
         "flow.work",
-        &json!({ "goal": "list everything" }),
+        &json!({ "goal": "run something that fails, then recover" }),
         &environment,
     ) else {
         return;
     };
     run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the second command worked");
 
     let handed = provider.requests()[1].body().to_string();
     assert!(
-        handed.contains(r#"[\"a.txt\",\"linkdir\",\"sub/\",\"sub/b.txt\"]"#),
-        "the walk descended the real directory and stopped at the link, which is \
-         reported as an entry rather than as a directory: {handed}"
+        handed.contains("\\\"exit_code\\\":3") && handed.contains("the command said why"),
+        "the model was handed the status and what the command said on stderr: {handed}"
     );
-    assert!(
-        !handed.contains("not-for-the-model.txt"),
-        "a name from outside the root reached the model through the listing: {handed}"
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["outcome"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["completed", "completed"],
+        "a command that exited nonzero is a call that **completed**: the tool ran and \
+         answered, and what it answered is the model's to act on: {calls:?}"
     );
-    assert!(provider.snapshot().is_drained());
+    assert_eq!(
+        calls[0]["program"]["exitCode"], 3,
+        "…and the status is what the trace records of it (`docs/trace.md` §7.4): {calls:?}"
+    );
 }
 
-/// A command that outruns its attachment's `timeout:` is **killed**, and the
-/// call fails the node (grammar 5.5, PRD resolved q31).
+/// A command that outruns its binding's `timeout:` is **killed and reported**
+/// (grammar 6.1, PRD resolved q54).
 ///
-/// `agent.impatient` binds the same `builtin.bash` at one second where
-/// `agent.worker` binds it at thirty, so what this decides is the *attachment's*
-/// bound rather than a constant: the command asks for far longer than either.
+/// `agent.impatient` binds the same built-in at one second where `agent.worker`
+/// binds it at thirty, so what this decides is the *binding's* bound rather than
+/// a constant: the command asks for far longer than either. The deadline answers
+/// the model — the loop goes on, the model is told what it hit and that its shell
+/// state went with it, and the run completes — which is the same D119 split the
+/// exit status is on.
 #[test]
-fn a_command_that_outruns_its_timeout_is_killed_and_fails_the_node() {
+fn a_command_that_outruns_its_timeout_comes_back_as_a_timeout_result() {
     let provider = MockProvider::start().expect("a loopback port");
     let (_scratch, environment) = bounded_root(&provider, "builtins-timeout");
 
@@ -12868,13 +12799,23 @@ fn a_command_that_outruns_its_timeout_is_killed_and_fails_the_node() {
     // that waited for the child's streams to close would wait for the `sleep`
     // rather than for its own timer, and the bound would become the command's to
     // honour rather than the composition's.
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "bash",
-            json!({ "command": "sleep 30 & wait" }),
-        )]),
-    ));
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "sleep 30 & wait" }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::text("It did not finish, so I will report that."),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the command was cut short" })),
+        ),
+    ]);
 
     let started = std::time::Instant::now();
     let Some(run) = harness::invoke_with(
@@ -12885,68 +12826,43 @@ fn a_command_that_outruns_its_timeout_is_killed_and_fails_the_node() {
     ) else {
         return;
     };
-    let said = run.failed();
-    assert!(
-        said.contains("ran longer than `1s`"),
-        "the failure names the bound the composition wrote: {said}"
-    );
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the command was cut short");
     // Comfortably under the `sleep`, and comfortably over the deadline plus a
     // build: what this rules out is the run having waited for the grandchild.
     assert!(
-        started.elapsed() < Duration::from_secs(15),
+        started.elapsed() < Duration::from_secs(20),
         "the command was killed at its deadline rather than waited out"
     );
-    let calls = tool_calls_of(&run, "do");
-    assert_eq!(calls[0]["outcome"], "failed");
-}
 
-/// A command that exits nonzero fails the agent node, and the node's own
-/// `on_error:` decides the run — the standing rule for every `exec:` tool,
-/// reached by a built-in (grammar 9.2, PRD resolved q31).
-#[test]
-fn a_command_that_exits_nonzero_fails_the_node_under_its_on_error() {
-    let provider = MockProvider::start().expect("a loopback port");
-    let (_scratch, environment) = bounded_root(&provider, "builtins-nonzero");
-
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "bash",
-            json!({ "command": "echo 'the command said why' >&2; exit 3" }),
-        )]),
-    ));
-
-    let Some(run) = harness::invoke_with(
-        "builtin-tools",
-        "flow.tolerant",
-        &json!({ "goal": "run something that fails" }),
-        &environment,
-    ) else {
-        return;
-    };
-    // The run **completes**, which is only possible because the node failed and
-    // `on_error: skip` absorbed it: the value in `summary` is the one the node
-    // after it wrote, not the agent's.
-    run.succeeded();
-    assert_eq!(run.outputs()["summary"], "the node was skipped");
-
-    let entries = run.entries("attempt");
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["outcome"], "skipped");
-    let said = entries[0]["error"].as_str().unwrap_or_default();
+    let handed = provider.requests()[1].body().to_string();
     assert!(
-        said.contains("`builtin.bash` exited 3") && said.contains("the command said why"),
-        "the node's error names the exit status and what the command said: {said}"
+        handed.contains("timed_out") && handed.contains("`1s`"),
+        "the model was told the bound it hit, in the units the composition wrote: {handed}"
+    );
+    assert!(
+        handed.contains("fresh shell"),
+        "…and that the session went with it, which is the part it has to know: {handed}"
+    );
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(calls[0]["outcome"], "completed");
+    assert_eq!(
+        calls[0]["program"],
+        json!({ "tool": "bash", "command": "sleep 30 & wait", "timedOut": true }),
+        "the trace records the command and that it was cut short, with no exit status \
+         because none completed (`docs/trace.md` §7.4): {calls:?}"
     );
 }
 
-/// Arguments a built-in's own schema refuses go **back to the model**, which is
-/// the other side of the split (Decision D119, PRD resolved q22 and q31).
+/// Arguments a built-in's own contract refuses go **back to the model**, which is
+/// the other side of the split (Decision D119, PRD resolved q22 and q54).
 ///
-/// The first answer calls `read_file` with no `path` at all; the loop hands the
-/// refusal back, the model corrects itself, and the run completes. A runtime
-/// that failed the node on a schema refusal would end the run here, and one that
-/// answered the bad call would read a file nobody named.
+/// The first answer calls `bash` with no `command` and no `restart` — the one
+/// shape the schema admits and the tool cannot, since the provider-defined tool
+/// takes either. The loop hands the refusal back, the model corrects itself, and
+/// the run completes. A runtime that failed the node on a refusal would end the
+/// run here, and one that answered the bad call would run a command nobody wrote.
 #[test]
 fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -12960,13 +12876,13 @@ fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
     provider.enqueue_all([
         Script::new(
             SONNET,
-            Outcome::tool_calls(vec![ToolCall::new("read_file", json!({}))]),
+            Outcome::tool_calls(vec![ToolCall::new("bash", json!({}))]),
         ),
         Script::new(
             SONNET,
             Outcome::tool_calls(vec![ToolCall::new(
-                "read_file",
-                json!({ "path": "notes.txt" }),
+                "bash",
+                json!({ "command": "cat notes.txt" }),
             )]),
         ),
         Script::new(SONNET, Outcome::text("Now I have it.")),
@@ -12994,24 +12910,786 @@ fn arguments_a_builtin_refuses_bounce_back_to_the_model() {
             .map(|call| call["outcome"].as_str().unwrap_or_default().to_string())
             .collect::<Vec<_>>(),
         ["refused", "completed"],
-        "the schema refusal came back to the model and the corrected call ran: {calls:?}"
+        "the refusal came back to the model and the corrected call ran: {calls:?}"
     );
     let refusal = calls[0]["error"].as_str().unwrap_or_default();
     assert!(
-        refusal.starts_with("ToolCallRefused: ") && refusal.contains("read_file"),
-        "the refusal is recorded in the shape `docs/trace.md` §3 gives one: {refusal}"
+        refusal.starts_with("ToolCallRefused: ") && refusal.contains("`restart`"),
+        "the refusal is recorded in the shape `docs/trace.md` §3 gives one, and says which \
+         of the two the model may send: {refusal}"
     );
     // …and the model was handed the same sentence, which is what it corrects on.
     let handed = provider.requests()[1].body().to_string();
     assert!(
-        handed.contains("read_file"),
+        handed.contains("no `command` and no `restart`"),
         "the refusal reached the model: {handed}"
     );
     assert!(provider.snapshot().is_drained());
 }
 
+/// A key the built-in's argument set does not carry (grammar 5.5, Decision
+/// D119, PRD resolved q54).
+///
+/// The set is **closed**, and it is the compiler's rather than the model's: on
+/// the Messages wire `builtin.files` goes out as `text_editor_20250728` with no
+/// schema at all, so what arrives is whatever the model was trained to fill —
+/// the declared names for the most part, and now and then a key from some other
+/// editor it has seen, or one it invented for the call it had in mind. The
+/// compiler's Zod is `.strict()`, so that call is refused before the tool is
+/// reached.
+///
+/// What has to hold for that to be a *cost* rather than a dead end is the whole
+/// of D119: the refusal names the key it refused, the model corrects, and the
+/// run completes — spending one turn of `max_tool_iterations`, which is what
+/// `agent-compose docs tools` tells an author to budget for. The vendor's own
+/// `view_range` is **not** an example of this any more: it is implemented, and
+/// `the_file_tool_creates_edits_and_views_inside_its_workspace` drives it.
+///
+/// And the presence rule the other half of the campaign wrote down: this call is
+/// refused **before** it reaches the tool, so its record carries no `program`
+/// (`docs/trace.md` §7.3) — the arguments the model chose are in the `error`,
+/// where a refusal is allowed to quote them, and nowhere else.
+#[test]
+fn an_argument_outside_a_builtins_schema_is_refused_naming_the_key() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-unknown-key");
+    std::fs::write(
+        root_of(&scratch).join("notes.txt"),
+        "one\ntwo\nthree\nfour\n",
+    )
+    .expect("the root is writable");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({ "command": "view", "path": "notes.txt", "line_numbers": false }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({ "command": "view", "path": "notes.txt" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("The whole file will do.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "read the whole file instead" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.edit",
+        &json!({ "goal": "read the notes" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "read the whole file instead");
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["outcome"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["refused", "completed"],
+        "the unknown key bounced and the corrected call ran: {calls:?}"
+    );
+    let refusal = calls[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        refusal.starts_with("ToolCallRefused: ")
+            && refusal.contains("Unrecognized key")
+            && refusal.contains("line_numbers"),
+        "the refusal **names the key it refused**, which is the difference between a model \
+         that corrects itself and one that guesses (PRD G3): {refusal}"
+    );
+    assert!(
+        calls[0].get("program").is_none(),
+        "a call refused before it reached the tool records no program — nothing ran, and \
+         `docs/trace.md` §7.3 says the record carries one only where the built-in was \
+         reached: {calls:?}"
+    );
+    // …and the model was handed the same sentence, which is what it corrects on.
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("line_numbers"),
+        "the refusal reached the model with the offending key in it: {handed}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// The file tool, round-tripped by a real model loop: create, edit, view
+/// (grammar 5.5, 6.1, PRD resolved q54).
+///
+/// The operations and their parameter names are the provider-defined text
+/// editor's, because on the Messages wire this *is* that tool — including the
+/// `view_range` a fourth call reads a window with, which is how a file longer
+/// than one answer is read. What is asserted is the file system afterwards and
+/// the two views the model was handed, which together are the only proof the
+/// calls were one file's story rather than four separate answers.
+#[test]
+fn the_file_tool_creates_edits_and_views_inside_its_workspace() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-editing");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({
+                    "command": "create",
+                    "path": "notes/plan.md",
+                    "file_text": "one\ntwo\nthree\n",
+                }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({
+                    "command": "str_replace",
+                    "path": "notes/plan.md",
+                    "old_str": "two",
+                    "new_str": "the second line",
+                }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({ "command": "view", "path": "notes/plan.md" }),
+            )]),
+        ),
+        // …and the same file read as a **window**, which is the provider-defined
+        // editor's own `view_range` and the way a file longer than one answer is
+        // read at all. `-1` as the last line reads to the end of the file.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({ "command": "view", "path": "notes/plan.md", "view_range": [2, -1] }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("The file reads the way it should.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "wrote it, edited it, read it back" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.edit",
+        &json!({ "goal": "write a plan and fix its second line" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["summary"],
+        "wrote it, edited it, read it back"
+    );
+
+    // On disk: the file the `create` wrote, with the edit the `str_replace`
+    // made, in a directory neither of them had to make first.
+    assert_eq!(
+        std::fs::read_to_string(root_of(&scratch).join("notes/plan.md"))
+            .expect("the file was created inside the workspace"),
+        "one\nthe second line\nthree\n"
+    );
+
+    // …and what the model was handed for the `view`: the file, numbered, which
+    // is what makes an `insert_line` a line the model can count to.
+    let viewed = provider.requests()[3].body().to_string();
+    assert!(
+        // Two backslashes, because the tool result is a JSON string *inside* a
+        // JSON body: the tab is escaped once by `JSON.stringify` and again by
+        // the reading here.
+        viewed.contains(r"     1\\tone") && viewed.contains(r"     2\\tthe second line"),
+        "the view came back numbered: {viewed}"
+    );
+    // …and what it was handed for the **window**: those lines and no others,
+    // under the file's own numbers, which is what makes a `str_replace`
+    // composed out of one window match what the next one shows.
+    let answering = provider.requests()[4].body()["messages"]
+        .as_array()
+        .and_then(|turns| turns.last())
+        .map(|turn| turn["content"][0]["content"].clone())
+        .unwrap_or_default();
+    let ranged: serde_json::Value = serde_json::from_str(
+        answering
+            .as_str()
+            .expect("the tool result is the JSON the runtime answered with"),
+    )
+    .expect("…and it parses");
+    assert_eq!(
+        ranged["content"], "     2\tthe second line\n     3\tthree",
+        "`view_range: [2, -1]` answered with line 2 to the end of the file, numbered 2 and 3 — \
+         a window, not a re-numbered copy of one: {ranged}"
+    );
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["program"].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            json!({
+                "tool": "files",
+                "operation": "create",
+                "path": "notes/plan.md",
+                "change": "wrote 14 bytes"
+            }),
+            json!({
+                "tool": "files",
+                "operation": "str_replace",
+                "path": "notes/plan.md",
+                "change": "replaced one occurrence at line 2"
+            }),
+            json!({ "tool": "files", "operation": "view", "path": "notes/plan.md" }),
+            json!({ "tool": "files", "operation": "view", "path": "notes/plan.md" }),
+        ],
+        "the trace carries the operation, the path and a sentence about the edit — never \
+         the file's contents (`docs/trace.md` §7.4, §11), and a windowed read records the \
+         same two fields as any other, because the window bounds the *answer*: {calls:?}"
+    );
+    assert!(
+        !run.trace()
+            .iter()
+            .any(|entry| entry.to_string().contains("the second line")),
+        "…and what the file holds is a tool's answer, which stays out of the format"
+    );
+}
+
+/// A path that leaves the workspace is **refused to the model**, which corrects
+/// itself and finishes the run (PRD resolved q54, Decision D119).
+///
+/// The bound is the workspace and the refusal is the shape of it: the model chose
+/// the path, so it is the one that can choose another — and a runtime that failed
+/// the node instead would end a run over a `..` the next call would have fixed.
+/// What makes this an assertion about a *bound* rather than about a message is
+/// the file outside the workspace, which is read back afterwards.
+#[test]
+fn a_file_path_that_leaves_the_workspace_bounces_back_to_the_model() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-escape");
+    let outside = scratch.path().join("outside.txt");
+    std::fs::write(&outside, "the file outside the workspace").expect("the scratch is writable");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({
+                    "command": "create",
+                    "path": "../outside.txt",
+                    "file_text": "clobbered",
+                }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({
+                    "command": "create",
+                    "path": "inside.txt",
+                    "file_text": "written where it belongs",
+                }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("Wrote it in the workspace instead.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "stayed inside" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.edit",
+        &json!({ "goal": "write the file" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "stayed inside");
+
+    // The bound, as the file system saw it.
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("the file outside is still there"),
+        "the file outside the workspace",
+        "a path that resolves outside the workspace is refused rather than written"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_of(&scratch).join("inside.txt"))
+            .expect("the corrected call wrote inside the workspace"),
+        "written where it belongs"
+    );
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["outcome"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["refused", "completed"],
+        "{calls:?}"
+    );
+    assert_eq!(
+        calls[0]["program"],
+        json!({ "tool": "files", "operation": "create", "path": "../outside.txt" }),
+        "a refused call still records what the model asked for: {calls:?}"
+    );
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("resolves outside this tool's workspace"),
+        "the model was told what was wrong with the path it chose: {handed}"
+    );
+}
+
+/// A file inside the workspace that carries a **second name** is refused for
+/// writing (PRD resolved q54, Decision D119).
+///
+/// The one escape the resolution check cannot see, and the reason the refusal
+/// lives at the write instead. `targetWithinWorkspace` answers "where is this
+/// path really", which is the whole answer for a symbolic link — a link has a
+/// target — and no answer at all for a hard one: a second directory entry for one
+/// inode has nothing to resolve, so the path is inside the workspace and the
+/// bytes it names are also outside it. A `str_replace` through the name inside
+/// would rewrite what the name outside reads, with every path check passed.
+///
+/// Reachable through a **configured** `workspace:` that something else populated
+/// — a checkout, a package manager that links rather than copies — which is the
+/// shape `tool.editor` has. What is asserted is the file outside, read back after
+/// the run: a refusal message alone would pass against a runtime that wrote the
+/// file and then said something about it.
+#[test]
+fn a_write_to_a_file_with_a_second_name_is_refused_to_the_model() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (scratch, environment) = bounded_root(&provider, "builtins-hard-link");
+    let outside = scratch.path().join("outside.txt");
+    std::fs::write(&outside, "the file outside the workspace").expect("the scratch is writable");
+    // The second name, inside the workspace. Not a symlink: there is no target
+    // for a resolution to follow, which is the whole point of the case.
+    std::fs::hard_link(&outside, root_of(&scratch).join("linked.txt"))
+        .expect("the scratch and its root are one filesystem");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({
+                    "command": "str_replace",
+                    "path": "linked.txt",
+                    "old_str": "outside the workspace",
+                    "new_str": "clobbered",
+                }),
+            )]),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "str_replace_based_edit_tool",
+                json!({
+                    "command": "create",
+                    "path": "copy.txt",
+                    "file_text": "written where it belongs",
+                }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("I worked on a copy instead.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "left the linked file alone" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.edit",
+        &json!({ "goal": "edit the file" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "left the linked file alone");
+
+    // The bound, as the file system saw it: the edit did not land, on either
+    // name.
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("the file outside is still there"),
+        "the file outside the workspace",
+        "a write through a second name is refused rather than made"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root_of(&scratch).join("copy.txt"))
+            .expect("the corrected call wrote inside the workspace"),
+        "written where it belongs"
+    );
+
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["outcome"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        ["refused", "completed"],
+        "the refusal came back to the model and the corrected call ran: {calls:?}"
+    );
+    assert_eq!(
+        calls[0]["program"],
+        json!({ "tool": "files", "operation": "str_replace", "path": "linked.txt" }),
+        "a refused call still records what the model asked for, and no `change`, because \
+         nothing changed (`docs/trace.md` §7.4): {calls:?}"
+    );
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("names point at that one file"),
+        "the model was told what it was about to write through: {handed}"
+    );
+
+    // …and the read is deliberately left alone: a path inside the workspace is
+    // inside the bound whatever else names it, so refusing the `view` would buy
+    // nothing a `bash` could not undo.
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A built-in's children see **what the binding declared and nothing else**
+/// (PRD resolved q54 ruling b).
+///
+/// Both directions in one test, because either alone passes against a runtime
+/// that is wrong the other way: a variable this harness holds is invisible to a
+/// scrubbed shell and visible to one whose binding wrote `inherit_env: true`,
+/// while the variable the binding *declared* is there for the first and not for
+/// the second, which declares none of its own.
+///
+/// The scrubbed direction is what keeps a placement's environment manifest the
+/// whole answer to what a machine is asked for (resolved q41): a command a model
+/// wrote cannot read a credential nobody handed it.
+#[test]
+fn a_shells_environment_holds_what_its_binding_declared_and_nothing_else() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, mut environment) = bounded_root(&provider, "builtins-env");
+    environment.push((
+        "HARNESS_SECRET".to_string(),
+        "the value this process holds".to_string(),
+    ));
+
+    let look = json!({
+        "command": "printf '[%s][%s]' \"${HARNESS_SECRET-unset}\" \"${DECLARED-unset}\"",
+    });
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("bash", look.clone())]),
+        ),
+        Script::new(SONNET, Outcome::text("That is what I can see.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "looked at the environment" })),
+        ),
+    ]);
+
+    let Some(scrubbed) = harness::invoke_with(
+        "builtin-tools",
+        "flow.work",
+        &json!({ "goal": "print what you can see" }),
+        &environment,
+    ) else {
+        return;
+    };
+    scrubbed.succeeded();
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("[unset][the value the binding wrote]"),
+        "a scrubbed child sees the binding's declared variables and not this process's: \
+         {handed}"
+    );
+
+    // …and the same command under a binding that opted into inheriting, which is
+    // the explicit widening for the machines where that is the point.
+    provider.reset();
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("bash", look)]),
+        ),
+        Script::new(SONNET, Outcome::text("That is what I can see.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "looked again" })),
+        ),
+    ]);
+    let Some(inherited) = harness::invoke_with(
+        "builtin-tools",
+        "flow.inherited",
+        &json!({ "goal": "print what you can see" }),
+        &environment,
+    ) else {
+        return;
+    };
+    inherited.succeeded();
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("[the value this process holds][unset]"),
+        "`inherit_env: true` is the opt-in, and it inherits rather than adding to a \
+         declared set this binding does not have: {handed}"
+    );
+}
+
+/// A binding that wrote no `workspace:` works in one **fresh directory per
+/// execution**, removed when the run settles (grammar 6.1, PRD resolved q54).
+///
+/// The default is the shape an author reaches for first, and it is the one whose
+/// lifetime nothing else in the composition states: the directory is the
+/// execution's, under the project's own data directory, and it goes when the run
+/// does — `scope: execution` read for a directory. The run prints where it is,
+/// which is the only way a test outside the process can find out; the assertion
+/// is that the path is where this format says and that nothing is there
+/// afterwards.
+///
+/// The configured half is the contrast, and it is asserted by every other test
+/// in this section: `${BUILTIN_ROOT}` is the composition's directory rather than
+/// the run's, so what a run wrote there is still there when the run has gone —
+/// which is what
+/// `the_builtin_shell_runs_inside_its_workspace_and_answers_the_model` reads
+/// `written.txt` back out of, after its run has ended.
+#[test]
+fn the_default_workspace_is_the_executions_own_and_goes_when_the_run_settles() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-workspace");
+
+    provider.enqueue_all([
+        Script::new(
+            GPT41,
+            Outcome::tool_calls(vec![
+                ToolCall::new(
+                    "str_replace_based_edit_tool",
+                    json!({
+                        "command": "create",
+                        "path": "made.txt",
+                        "file_text": "by the file tool\n",
+                    }),
+                ),
+                ToolCall::new("bash", json!({ "command": "cat made.txt; pwd" })),
+            ]),
+        ),
+        Script::new(GPT41, Outcome::text("Both tools saw one directory.")),
+        Script::new(
+            GPT41,
+            Outcome::structured(json!({ "summary": "one workspace, two tools" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.elsewhere",
+        &json!({ "goal": "write a file and read it back" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    // What the shell printed: the file the *file tool* wrote — so both built-ins
+    // of this execution took one directory — and where that directory is.
+    let handed = provider.requests()[1].body().to_string();
+    assert!(
+        handed.contains("by the file tool"),
+        "the shell read the file the file tool wrote, which is what \"shared by every \
+         built-in of that execution\" means: {handed}"
+    );
+    let printed = handed
+        .split(".agent-compose/workspaces/")
+        .nth(1)
+        .and_then(|rest| rest.split(['\\', '"', ' ']).next())
+        .expect("the shell printed its working directory");
+    let workspace = run
+        .project
+        .join(".agent-compose")
+        .join("workspaces")
+        .join(printed);
+    assert!(
+        printed.starts_with("exec_"),
+        "the default workspace is named for the execution it belongs to: {printed}"
+    );
+    assert!(
+        !workspace.exists(),
+        "the execution settled and its workspace is still at `{}`: a directory nobody \
+         configured belongs to the run (grammar 6.1)",
+        workspace.display()
+    );
+}
+
+/// Both built-ins are declared on the Messages wire as the **provider-defined
+/// tool types** (PRD resolved q54 ruling d).
+///
+/// The half of that ruling the PRD calls the point rather than the incident: a
+/// model is *trained* against `bash_20250124` and `text_editor_20250728`, and a
+/// request that offered the same two tools as ordinary custom tools carrying
+/// this compiler's own `input_schema` would still work — the arguments come
+/// back the same, which is what lets one set of handlers serve every wire — and
+/// engage none of that training. Nothing about the graph's own behaviour
+/// distinguishes the two, so the assertion is on the **request**, entry for
+/// entry: the dated type, the name that type dictates, and nothing beside them.
+///
+/// The mock is the other half of the check and cannot be skipped past: it holds
+/// a provider-defined entry to `{type, name, cache_control}` and to the name its
+/// dated type requires (`crates/mock-provider` `WIRE-NOTES` (25)), so a request
+/// naming `text_editor_20250728` `files` is a 400 rather than a run.
+#[test]
+fn the_builtins_go_out_as_provider_defined_tools_on_the_messages_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-messages");
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "printf 'ran on the trained wire'" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("Done.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the trained wire ran it" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.both",
+        &json!({ "goal": "run one command" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the trained wire ran it");
+
+    let asked = provider.requests();
+    let declared = asked[0].body();
+    assert_eq!(
+        declared["tools"],
+        json!([
+            { "type": "bash_20250124", "name": "bash" },
+            { "type": "text_editor_20250728", "name": "str_replace_based_edit_tool" },
+        ]),
+        "a built-in reaches the Messages wire as its dated provider-defined type and the \
+         name that type dictates — an `input_schema` beside it, or a `description`, is this \
+         compiler declaring an ordinary custom tool and losing the trained behaviour the \
+         ruling is for: {declared}"
+    );
+    assert!(
+        asked[1]
+            .body()
+            .to_string()
+            .contains("ran on the trained wire"),
+        "and the loop really ran it: {}",
+        asked[1].body()
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// Both built-ins drive a loop on a **non-Anthropic wire** (PRD resolved q54
+/// ruling d).
+///
+/// The Messages wire declares these as the provider-defined tool types, and this
+/// is the other half of that ruling: on Chat Completions there are no such types,
+/// so the same two tools go out as ordinary function tools carrying this
+/// compiler's own schemas — same names, same argument names, same handlers. What
+/// the test reads is the request, because the *point* of the ruling is what the
+/// wire carries.
+#[test]
+fn the_builtins_go_out_as_function_tools_on_the_openai_wire() {
+    let provider = MockProvider::start().expect("a loopback port");
+    let (_scratch, environment) = bounded_root(&provider, "builtins-openai");
+
+    provider.enqueue_all([
+        Script::new(
+            GPT41,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "printf 'ran on the other wire'" }),
+            )]),
+        ),
+        Script::new(GPT41, Outcome::text("Done.")),
+        Script::new(
+            GPT41,
+            Outcome::structured(json!({ "summary": "the other wire ran it" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke_with(
+        "builtin-tools",
+        "flow.elsewhere",
+        &json!({ "goal": "run one command" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the other wire ran it");
+
+    let asked = provider.requests();
+    let declared = asked[0].body();
+    let tools = declared["tools"]
+        .as_array()
+        .expect("the request declares the agent's tools");
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| (
+                tool["type"].as_str().unwrap_or_default().to_string(),
+                tool["function"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("function".to_string(), "bash".to_string()),
+            (
+                "function".to_string(),
+                "str_replace_based_edit_tool".to_string()
+            ),
+        ],
+        "on this wire a built-in is a function tool under the name the other wire's \
+         provider-defined type dictates: {declared}"
+    );
+    assert!(
+        tools[0]["function"]["parameters"]["properties"]["command"].is_object(),
+        "…carrying this compiler's own schema, which is what makes one set of handlers \
+         serve both wires: {declared}"
+    );
+    assert!(
+        provider.requests()[1]
+            .body()
+            .to_string()
+            .contains("ran on the other wire"),
+        "and the loop really ran it"
+    );
+}
+
 /// A run killed mid-graph resumes **without running its recorded `bash` again**
-/// (PRD resolved q31, `docs/durability.md` §3.2).
+/// (PRD resolved q54, `docs/durability.md` §3.2).
 ///
 /// The command appends a line to a file outside the graph's own state, so
 /// "it ran twice" is a fact a test can count rather than one it has to infer:
@@ -13115,11 +13793,11 @@ fn a_resumed_run_consumes_a_recorded_builtin_instead_of_running_it_again() {
 /// The shell is almost never where the work is: `npm run build`, `a | b`,
 /// `(cd sub && make)` are all `bash` *forking*, and a `SIGKILL` aimed at the
 /// shell's own pid ends the shell while every one of those children keeps
-/// running — inside the very `root:` the attachment bounded them to — with the
-/// graph already told the call failed. Under `retry:` that is two generations of
-/// one command writing one root; with `on_error: skip` it is a downstream node
-/// reading files a "killed" command is still producing. Either way the
-/// `timeout:` would be a message rather than a bound.
+/// running — inside the very workspace the binding bounded them to, with the
+/// model already told the command was cut short. Under `retry:` that is two
+/// generations of one command writing one workspace; with a loop that carries on
+/// it is the *next* command reading files a killed one is still producing. Either
+/// way the `timeout:` would be a message rather than a bound.
 ///
 /// So the command forks a **foreground** subshell — not a backgrounded job,
 /// which is the only shape the grammar ever set aside — that writes nothing
@@ -13134,34 +13812,34 @@ fn a_killed_command_takes_the_work_it_forked_with_it() {
     let (scratch, environment) = bounded_root(&provider, "builtins-forked");
     let escaped = root_of(&scratch).join("escaped.txt");
 
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "bash",
-            json!({ "command": "( sleep 4; printf escaped > escaped.txt ); echo done" }),
-        )]),
-    ));
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "( sleep 4; printf escaped > escaped.txt ); echo done" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("Cut short.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the command was cut short" })),
+        ),
+    ]);
 
     let Some(run) = harness::invoke_with(
         "builtin-tools",
-        "flow.outlived",
+        "flow.deadline",
         &json!({ "goal": "fork something that would outlive the deadline" }),
         &environment,
     ) else {
         return;
     };
 
-    // The node failed at its own bound, and the run went on without it.
+    // The command was cut short at the binding's bound and the run went on.
     run.succeeded();
-    assert_eq!(run.outputs()["summary"], "the node was skipped");
-    let entries = run.entries("attempt");
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["outcome"], "skipped");
-    let said = entries[0]["error"].as_str().unwrap_or_default();
-    assert!(
-        said.contains("ran longer than `1s`"),
-        "the node's error names the bound the attachment wrote: {said}"
-    );
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(calls[0]["program"]["timedOut"], json!(true), "{calls:?}");
 
     // Past the moment the forked work would have written, had anything been left
     // running to write. The run is long over; this is the file system being asked
@@ -13169,23 +13847,23 @@ fn a_killed_command_takes_the_work_it_forked_with_it() {
     std::thread::sleep(Duration::from_secs(8));
     assert!(
         !escaped.exists(),
-        "the subshell the killed command forked wrote `{}` after the node had \
-         already failed: the deadline ended the shell and left the work running \
+        "the subshell the killed command forked wrote `{}` after the deadline had \
+         already answered the model: the kill ended the shell and left the work running \
          (grammar 5.5, D124)",
         escaped.display()
     );
 }
 
-/// A run **asked to stop** takes the command it was running with it, and still
+/// A run **asked to stop** takes the shell it was running with it, and still
 /// stops (grammar 5.5, Decision D124).
 ///
-/// Detaching the command is what puts its process group within the deadline's
+/// Detaching the shell is what puts its process group within the deadline's
 /// reach, and the same move puts it outside the *terminal's*: its group is no
 /// longer the foreground one, so the `SIGINT` a person types reaches this process
 /// and nothing below it. Left there, `Ctrl-C` would have traded the deadline's
-/// orphan for its own — a build still writing into `root:` with the graph gone —
-/// and done it where an `exec:` tool's child dies. So the runtime sweeps the live
-/// groups itself.
+/// orphan for its own — a build still writing into the workspace with the graph
+/// gone — and done it where an `exec:` tool's child dies. So the runtime sweeps
+/// the live groups itself.
 ///
 /// The sweep is a signal handler, which is the other half of what this asserts
 /// and the half that would hurt a person rather than a file: a handler that ate
@@ -13291,16 +13969,16 @@ fn a_run_asked_to_stop_takes_its_command_with_it() {
 
 /// A killed command's **escapee** does not keep this runtime alive, and the
 /// output it goes on writing is not still being read (grammar 5.5, resolved
-/// q31).
+/// q54).
 ///
-/// `builtin.bash` settles its call at the deadline rather than at the child's
+/// `builtin.bash` settles its call at the deadline rather than at the shell's
 /// `close`, because a process the group kill cannot reach can still be holding
 /// the output pipes. Settling is only half of ending the call: the pipes and
-/// their `data` handlers are still this runtime's, and a call that has already
-/// failed must not keep them. Kept, they are an event-loop handle that holds the
+/// their `data` handlers are still this runtime's, and a session that has been
+/// killed must not keep them. Kept, they are an event-loop handle that holds the
 /// process open for as long as that process lives and a buffer that goes on
-/// growing for a result nobody will ever read — in `serve`, or any host
-/// embedding a compiled graph, unbounded memory minutes after the node failed.
+/// growing for a result nobody will ever read — in `serve`, or any host embedding
+/// a compiled graph, unbounded memory minutes after the command was cut short.
 ///
 /// `set -m` is what makes this a test rather than a tautology. The deadline kills
 /// the command's process group (Decision D124, asserted above), which is where an
@@ -13311,10 +13989,8 @@ fn a_run_asked_to_stop_takes_its_command_with_it() {
 /// external program is needed to write it.
 ///
 /// The two are one defect and this is the observable half: the command leaves a
-/// process holding the pipes for a minute, the node fails at its one-second
-/// deadline, `on_error: skip` absorbs it — and the **process** is asked when it
-/// is done. A run that ended at the failure would exit on its own and prove
-/// nothing, which is why this flow completes instead.
+/// process holding the pipes for a minute, the deadline answers the model at one
+/// second, the run finishes — and the **process** is asked when it is done.
 #[test]
 fn a_killed_commands_grandchild_does_not_hold_the_runtime_open() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -13322,18 +13998,25 @@ fn a_killed_commands_grandchild_does_not_hold_the_runtime_open() {
 
     // The escapee writes once and then holds both pipes open for a minute, long
     // after the shell above it is killed at one second.
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::tool_calls(vec![ToolCall::new(
-            "bash",
-            json!({ "command": "set -m; { printf 'still here'; sleep 60; } & wait" }),
-        )]),
-    ));
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "bash",
+                json!({ "command": "set -m; { printf 'still here'; sleep 60; } & wait" }),
+            )]),
+        ),
+        Script::new(SONNET, Outcome::text("Cut short.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "the command was cut short" })),
+        ),
+    ]);
 
     let started = std::time::Instant::now();
     let Some(run) = harness::invoke_with(
         "builtin-tools",
-        "flow.outlived",
+        "flow.deadline",
         &json!({ "goal": "leave something behind" }),
         &environment,
     ) else {
@@ -13341,43 +14024,35 @@ fn a_killed_commands_grandchild_does_not_hold_the_runtime_open() {
     };
     let elapsed = started.elapsed();
 
-    // The node failed at its own bound, and the run went on without it.
     run.succeeded();
-    assert_eq!(run.outputs()["summary"], "the node was skipped");
-    let entries = run.entries("attempt");
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    assert_eq!(entries[0]["outcome"], "skipped");
-    let said = entries[0]["error"].as_str().unwrap_or_default();
-    assert!(
-        said.contains("ran longer than `1s`"),
-        "the node's error names the bound the attachment wrote: {said}"
-    );
+    let calls = tool_calls_of(&run, "do");
+    assert_eq!(calls[0]["program"]["timedOut"], json!(true), "{calls:?}");
 
     // …and the process was done when the graph was. Everything here — the build,
     // the run, the deadline — is seconds; the grandchild is a minute. A runtime
     // still holding its pipes would be sitting in the event loop for the rest of
     // that minute with the flow long since finished.
     assert!(
-        elapsed < Duration::from_secs(30),
+        elapsed < Duration::from_secs(45),
         "the run exited when the graph finished rather than when the grandchild \
          let go of the pipes (took {elapsed:?})"
     );
 }
 
-/// A `root:` that resolves to **nothing** fails the call, rather than quietly
-/// bounding the tool to whatever directory the process was started in
-/// (grammar 5.5, D123).
+/// A `workspace:` that resolves to **nothing** fails the call, rather than
+/// quietly bounding the tool to whatever directory the process was started in
+/// (grammar 6.1, Decision D135).
 ///
-/// The parser refuses an empty `root:` as written, so the only way to reach this
-/// is the environment: `${BUILTIN_ROOT}` is present — the presence check of PRD
-/// 5.9 is satisfied — and empty. `path.resolve("")` is the process's working
+/// The parser refuses an empty `workspace:` as written, so the only way to reach
+/// this is the environment: `${BUILTIN_ROOT}` is present — the presence check of
+/// PRD 5.9 is satisfied — and empty. `path.resolve("")` is the process's working
 /// directory, so a runtime that skipped this check would answer the call from
 /// wherever it happened to be started, which is the ambient capability every
-/// bound in q31 is written out to refuse. The file the model asks for is one
-/// that really exists beside the running test, so a runtime with the hole
+/// bound in q54 is written out to refuse. The file the model asks for is one that
+/// really exists beside the running test, so a runtime with the hole
 /// **succeeds** at reading it and this test fails on the missing failure.
 #[test]
-fn a_root_that_resolves_to_nothing_fails_the_call() {
+fn a_workspace_that_resolves_to_nothing_fails_the_call() {
     let provider = MockProvider::start().expect("a loopback port");
     let (_scratch, mut environment) = bounded_root(&provider, "builtins-empty-root");
     environment.push(("BUILTIN_ROOT".to_string(), String::new()));
@@ -13385,8 +14060,8 @@ fn a_root_that_resolves_to_nothing_fails_the_call() {
     provider.enqueue(Script::new(
         SONNET,
         Outcome::tool_calls(vec![ToolCall::new(
-            "read_file",
-            json!({ "path": "Cargo.toml" }),
+            "bash",
+            json!({ "command": "cat Cargo.toml" }),
         )]),
     ));
 
@@ -13404,23 +14079,24 @@ fn a_root_that_resolves_to_nothing_fails_the_call() {
         "the failure names the bound that came back empty: {said}"
     );
     assert!(
-        !said.contains("could not read"),
-        "the call failed on the root rather than reaching the file system at all: {said}"
+        !said.contains("exit_code"),
+        "the call failed on the workspace rather than reaching the shell at all: {said}"
     );
 }
 
-/// A `root:` naming a directory that does not exist fails the call, as itself
-/// (grammar 5.5).
+/// A `workspace:` naming a directory that does not exist fails the call, as
+/// itself (grammar 6.1).
 ///
-/// The root is resolved once per call precisely so that this is reported as the
-/// bound being wrong rather than as every path inside it failing to resolve, and
-/// it is an *execution* failure, so `retry:`/`on_error:` decide the run
-/// (Decision D119). Nothing else in the suite holds that message, and the
-/// degradation it guards against is quiet: a `root:` pointing at a **file**, or
-/// at a path with a typo, would otherwise surface as a confusing per-path error
-/// from inside the tool.
+/// The workspace is resolved once per call precisely so that this is reported as
+/// the bound being wrong rather than as every path inside it failing to resolve,
+/// and it is an *execution* failure, so `retry:`/`on_error:` decide the run
+/// (Decision D119): a model cannot make a directory exist by calling differently.
+/// Nothing else in the suite holds that message, and the degradation it guards
+/// against is quiet: a `workspace:` pointing at a **file**, or at a path with a
+/// typo, would otherwise surface as a confusing per-path error from inside the
+/// tool.
 #[test]
-fn a_root_that_names_no_directory_fails_the_call() {
+fn a_workspace_that_names_no_directory_fails_the_call() {
     let provider = MockProvider::start().expect("a loopback port");
     let (scratch, mut environment) = bounded_root(&provider, "builtins-absent-root");
     let absent = scratch.path().join("not-a-directory");
@@ -13429,38 +14105,53 @@ fn a_root_that_names_no_directory_fails_the_call() {
     provider.enqueue(Script::new(
         SONNET,
         Outcome::tool_calls(vec![ToolCall::new(
-            "read_file",
-            json!({ "path": "notes.txt" }),
+            "bash",
+            json!({ "command": "cat notes.txt" }),
         )]),
     ));
 
     let Some(run) = harness::invoke_with(
         "builtin-tools",
-        "flow.work",
+        "flow.tolerant",
         &json!({ "goal": "read a note" }),
         &environment,
     ) else {
         return;
     };
-    let said = run.failed();
+    // The run **completes**, which is only possible because the node failed and
+    // `on_error: skip` absorbed it: the value in `summary` is the one the node
+    // after it wrote, not the agent's. That is the half of the split a built-in
+    // still has — the *tool* being unusable is the world's, not the model's.
+    run.succeeded();
+    assert_eq!(run.outputs()["summary"], "the node was skipped");
+    let entries = run.entries("attempt");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["outcome"], "skipped");
+    let said = entries[0]["error"].as_str().unwrap_or_default();
     assert!(
         said.contains("is not a directory that exists") && said.contains("${BUILTIN_ROOT}"),
-        "the failure is the root's, named as the root: {said}"
+        "the failure is the workspace's, named as the workspace: {said}"
     );
-    let calls = tool_calls_of(&run, "do");
+    let calls = tool_calls_of(&run, "attempt");
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert_eq!(calls[0]["outcome"], "failed");
+    assert_eq!(
+        calls[0]["program"],
+        json!({ "tool": "bash", "command": "cat notes.txt" }),
+        "a call that failed still records what the model asked it to run — which is the \
+         record a reader opens the trace for (`docs/trace.md` §7.4): {calls:?}"
+    );
 }
 
 /// A host with **no `bash` on `PATH`** fails the call with an error naming the
-/// requirement (PRD resolved q31, grammar 5.5).
+/// requirement (PRD resolved q54, grammar 5.5).
 ///
-/// q31 fixes the posture: the shell is "resolved from `PATH` at runtime, and a
+/// q54 keeps q31's posture: the shell is resolved from `PATH` at the call, and a
 /// host with no bash fails the call as an execution failure with an error naming
-/// the requirement" — the compiler does not decide at build time what a
-/// deployment machine has. So the `PATH` the graph runs under is the subject
-/// here, and it carries the JavaScript runtime and nothing else: an empty one
-/// would decide the test before the graph started.
+/// the requirement — the compiler does not decide at build time what a deployment
+/// machine has. So the `PATH` the graph runs under is the subject here, and it
+/// carries the JavaScript runtime and nothing else: an empty one would decide the
+/// test before the graph started.
 #[cfg(unix)]
 #[test]
 fn a_host_with_no_bash_on_path_fails_the_call_naming_the_requirement() {

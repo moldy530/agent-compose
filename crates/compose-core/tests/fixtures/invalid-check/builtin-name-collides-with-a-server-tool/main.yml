@@ -1,10 +1,10 @@
 # rule: a built-in reaches the same `tools` array a provider's suite is appended
-# rule: to, so one name there is one tool (grammar 5.5, 12.1, D122, D123)
+# rule: to, so one name there is one tool (grammar 5.5, 12.1, D122, D135)
 # code: tool-name-collision
-# message: `agent.a` attaches `builtin.list`, whose name collides with the `list` server tool `provider.p` declares
+# message: `agent.a` attaches `builtin.bash`, whose name collides with the `bash` server tool `provider.p` declares
 # at: main.yml:35:7
 # label: main.yml:26:7 the server tool is declared here
-# help: a server tool is appended to the `tools` of every request that connection serves, and the wire refuses an array carrying `list` twice: drop the built-in, whose name is not an author's to change, or declare the suite on a provider this agent's model does not reach (grammar 12.1, 11.5, Decision D122)
+# help: a server tool is appended to the `tools` of every request that connection serves, and the wire refuses an array carrying `bash` twice: drop the built-in, whose name is not an author's to change, or declare the suite on a provider this agent's model does not reach (grammar 12.1, 11.5, Decision D122)
 # count: 2
 #
 # The Messages wire is the one where a server tool and a client tool sit under
@@ -23,8 +23,8 @@ provider.p:
   kind: anthropic
   api_key: ${K}
   server_tools:
-    - type: directory_listing_20260101
-      name: list
+    - type: remote_shell_20260101
+      name: bash
 model.m:
   provider: provider.p
   id: some-model
@@ -32,7 +32,7 @@ agent.a:
   model: model.m
   prompt: Decide.
   tools:
-    - builtin.list: { root: "./work" }
+    - builtin.bash
   output:
     verdict: { type: string }
 flow.f:

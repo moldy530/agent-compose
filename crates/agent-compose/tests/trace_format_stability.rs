@@ -31,7 +31,7 @@
 //! INSTA_UPDATE=always cargo test -p agent-compose --test trace_format_stability
 //! ```
 //!
-//! # Why these seven runs
+//! # Why these eight runs
 //!
 //! Between them they reach every record **type** the format has, every member of
 //! `TraceDocument.status`, and the entry shapes a reader meets first: a bounded
@@ -44,8 +44,11 @@
 //! whose rules (no writes, routing only where routing failed) exist nowhere
 //! else; a run that ended holding a `human` pause, for the `human` record
 //! and the `"interrupted"` document status version `2` introduced (§10.3.1);
-//! and a flow attached as a tool and called twice, for the tool-call record and
-//! the second dispatch-record carrier version `3` introduced (§10.3.2).
+//! a flow attached as a tool and called twice, for the tool-call record and
+//! the second dispatch-record carrier version `3` introduced (§10.3.2); and an
+//! agent holding both **built-in** tools, for the `BuiltinProgram` record and
+//! the two shapes it takes — a command with an exit status, a file operation
+//! with a path (§7.4, PRD resolved q54).
 //!
 //! A run added here is what keeps that first sentence true: the count is a claim
 //! about coverage, so a record type or a status member added to the format
@@ -76,7 +79,7 @@
 //!
 //! # …and the promises a snapshot cannot make
 //!
-//! Seven claims of `docs/trace.md` are about a *rule* rather than about a shape,
+//! Eight claims of `docs/trace.md` are about a *rule* rather than about a shape,
 //! and each is asserted directly, because a snapshot of a document that happens
 //! to satisfy a rule would go on passing after the rule was dropped: that the
 //! third delivery surface carries the version beside its trace **and only
@@ -97,9 +100,15 @@
 //! that held the wait and on no node above it (§3), which
 //! [`document`] holds every snapshot run to as well and
 //! [`a_pause_is_recorded_on_the_node_that_held_it_and_on_no_node_above_it`]
-//! reaches at the two constructs a pause can be nested under.
+//! reaches at the two constructs a pause can be nested under — and that the
+//! **program a model wrote** is carried capped at the character bound §7.4
+//! states, which
+//! [`a_command_past_the_program_bound_is_recorded_capped_at_the_documented_length`]
+//! reaches with a command longer than that bound, since every command in a
+//! snapshot run here is short enough that a cap no longer applied would leave
+//! each of those documents byte-identical.
 //!
-//! Two of the seven ride on a run this file already makes rather than on a run
+//! Two of the eight ride on a run this file already makes rather than on a run
 //! of their own: the §6 pair on the store run — a presence rule is a claim about
 //! a record the snapshot already holds, and the two are asserted before
 //! `assert_snapshot!` so a change to the rule fails as itself rather than as a
@@ -658,6 +667,128 @@ fn a_refused_tool_calls_trace_document_keeps_its_shape() {
     insta::assert_snapshot!(document(&run));
 }
 
+/// A built-in tool's calls: the **program** the model wrote, which is the one
+/// thing this format carries of a tool's arguments (`docs/trace.md` §7.4, PRD
+/// resolved q54 ruling c).
+///
+/// Both shapes a `BuiltinProgram` takes, from one run: a `bash` command with the
+/// status it exited, and a file operation with the path it was given and a
+/// sentence about what it changed. They are different halves of one record type
+/// — every field of it is optional, and which ones are present is what says
+/// which tool ran — so a snapshot holding only one would leave the other's
+/// presence rule to prose.
+///
+/// The **`restart`** is here for the same reason read the other way: it is the
+/// one `bash` call that runs no command, and §7.4 says `exitCode` is absent
+/// where none completed. A record carrying `exitCode: 0` for it would be this
+/// format contradicting its own presence rule, which a snapshot catches and an
+/// assertion about the run's outcome would not.
+///
+/// And the half a snapshot makes visible that an assertion would not: what is
+/// **not** in the document. The command writes, the `view` reads it back, the
+/// `create` writes a file and the `cat` prints one, and none of that content is
+/// anywhere in the trace — a tool's answer stays under §11's rule with every
+/// other tool's, and a regression that started carrying stdout would land here
+/// as a diff rather than as a test nobody wrote.
+///
+/// The sentinel the loop below looks for is the file the `create` wrote and the
+/// `cat` printed, because that text appears in **no command**: a guard written
+/// against what the `printf` wrote would be looking for a string the recorded
+/// command itself contains, and could only ever be satisfied by a trace missing
+/// the record §7.4 requires.
+///
+/// The workspace is `${BUILTIN_ROOT}`, pointed at a scratch directory of this
+/// test's own: a resolved path is exactly what §11.1 keeps out of the format, so
+/// a snapshot that started holding one would fail as an unexplained diff.
+#[test]
+fn a_built_in_tools_trace_document_keeps_its_shape() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![
+                ToolCall::new(
+                    "bash",
+                    json!({ "command": "printf 'one\ntwo\n' > notes.txt" }),
+                ),
+                ToolCall::new(
+                    "str_replace_based_edit_tool",
+                    json!({ "command": "view", "path": "notes.txt" }),
+                ),
+                ToolCall::new(
+                    "str_replace_based_edit_tool",
+                    json!({
+                        "command": "create",
+                        "path": "plan.md",
+                        "file_text": "the plan this agent wrote\nover two lines\n",
+                    }),
+                ),
+                // …the one `bash` call that runs nothing, whose record carries no
+                // `exitCode` because no command completed (§7.4).
+                ToolCall::new("bash", json!({ "restart": true })),
+                // …one whose *output* is text no command in this run contains,
+                // which is what makes the absence assertions below say anything.
+                ToolCall::new("bash", json!({ "command": "cat plan.md" })),
+                // …and one that exits nonzero, which is a **completed** call
+                // carrying the status rather than a failure (resolved q54).
+                ToolCall::new("bash", json!({ "command": "test -f nothing-here" })),
+            ]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "wrote a note and a plan" })),
+        ),
+    ]);
+
+    let scratch = harness::Scratch::new("stability-builtins");
+    let root = scratch.path().join("root");
+    std::fs::create_dir_all(&root).expect("the scratch area is writable");
+    let mut environment = harness::environment(&provider);
+    environment.push(("BUILTIN_ROOT".to_string(), root.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+    ));
+
+    let Some(run) = harness::run_with(
+        "builtin-tools",
+        "flow.both",
+        &[("goal", "write a note and a plan")],
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    let held = document(&run);
+    // The file's two lines, and the pair of them as a **JSON string** would
+    // carry them: a newline inside one is the two characters `\n`, never the
+    // byte, so a guard written with a real newline asserts the absence of
+    // something this document could not hold whatever regressed.
+    for answered in [
+        "the plan this agent wrote",
+        "over two lines",
+        "the plan this agent wrote\\nover two lines",
+    ] {
+        assert!(
+            !held.contains(answered),
+            "a built-in's *answer* reached the trace: `{answered}` is a file's contents, \
+             written by a `create` and printed by a `cat`, which §11 keeps out of this \
+             format with every other tool's"
+        );
+    }
+    // …and the same rule read as a shape rather than as a string, which is what
+    // catches an answer this fixture's sentinels happen not to appear in.
+    for key in ["\"stdout\"", "\"stderr\"", "\"content\"", "\"file_text\""] {
+        assert!(
+            !held.contains(key),
+            "a key carrying a tool's answer is in the document: {key} is what a built-in \
+             answers *with*, and §7.4 carries the program the model wrote and no more of it"
+        );
+    }
+    insta::assert_snapshot!(held);
+}
+
 /// A store round trip: a read's recorded answer, a write's key and dedupe flag,
 /// and both of PRD 5.8's consumption surfaces (`docs/trace.md` §6).
 ///
@@ -1181,6 +1312,98 @@ fn a_failure_a_run_survived_carries_its_class_like_one_that_ended_a_run() {
     assert!(
         error.starts_with("NodeFailure: ") && error.contains("timed out"),
         "…and it names the class in front of the budget that ended it: {error:?}"
+    );
+}
+
+/// The model's own program is carried **capped**, at the length §7.4 states in
+/// characters (PRD resolved q54 ruling c).
+///
+/// The bound is the whole reason the carve-out is safe to make. Every other
+/// field of this format is something the compiler or this runtime composed, and
+/// `BuiltinProgram.command` is the one text a **model** wrote at run time
+/// (§11.5) — arbitrary length as well as arbitrary content, since a model may
+/// send a here-doc with a file in it and call it a command. A trace is read by
+/// people and shipped to sinks, so §7.4 answers that with a number, and a number
+/// in a document is a promise until something holds the runtime to it.
+///
+/// The snapshot runs cannot: every command in them is short, and a cap that
+/// stopped being applied would leave each of those documents byte-identical. So
+/// this drives a command past the bound and reads the field back off the trace
+/// on disk — the length that was kept, the sentence that says what was dropped,
+/// and the dropped text itself, which must be nowhere in the document.
+#[test]
+fn a_command_past_the_program_bound_is_recorded_capped_at_the_documented_length() {
+    // `docs/trace.md` §7.4, for `command` and for `path` — one constant in the
+    // emitted runtime (`PROGRAM_LIMIT`), read here as the document states it.
+    const BOUND: usize = 1_000;
+
+    let provider = MockProvider::start().expect("a loopback port");
+    // A command that really runs and is far longer than the trace will carry:
+    // everything past the `#` is a comment, so the shell prints one line
+    // whatever the padding is. `past-the-cap` sits at the very end, which is
+    // what makes the absence assertion below say something.
+    let command = format!("printf 'ran\\n' # {} past-the-cap", "y".repeat(1_200));
+    assert!(
+        command.len() > BOUND,
+        "the fixture's own premise: the command is longer than the bound it is testing"
+    );
+
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new("bash", json!({ "command": command }))]),
+        ),
+        Script::new(SONNET, Outcome::text("I have what I need.")),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "summary": "ran the long command" })),
+        ),
+    ]);
+
+    let scratch = harness::Scratch::new("stability-program-bound");
+    let root = scratch.path().join("root");
+    std::fs::create_dir_all(&root).expect("the scratch area is writable");
+    let mut environment = harness::environment(&provider);
+    environment.push(("BUILTIN_ROOT".to_string(), root.display().to_string()));
+    environment.push((
+        "PATH".to_string(),
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+    ));
+
+    let Some(run) = harness::run_with(
+        "builtin-tools",
+        "flow.work",
+        &[("goal", "run the long command")],
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let entries = run.entries("do");
+    let [entry] = entries.as_slice() else {
+        panic!("the flow's one agent node has one entry: {entries:?}");
+    };
+    let program = &entry["models"][0]["toolCalls"][0]["program"];
+    let recorded = program["command"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a `bash` call's record carries the command it ran: {entry}"));
+    assert_eq!(
+        recorded,
+        format!(
+            "{}\n…[{} more characters, not shown]",
+            &command[..BOUND],
+            command.len() - BOUND
+        ),
+        "the recorded command is the model's first {BOUND} characters and a sentence saying how \
+         many were dropped: the bound is exact, and what was cut is **said** rather than left \
+         for a reader to infer from a round number"
+    );
+    let held = run.trace_document().to_string();
+    assert!(
+        !held.contains("past-the-cap"),
+        "the tail of the command is in the document: a cap that kept the text somewhere else in \
+         the trace would be a bound on one field rather than on what the format carries: {held}"
     );
 }
 

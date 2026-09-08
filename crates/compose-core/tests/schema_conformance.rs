@@ -908,16 +908,16 @@ fn the_published_schema_pins_the_signature_keywords_the_compilers_tables_do() {
     }
 }
 
-/// Every built-in the compiler admits is one the published schema admits, with
-/// the bounds that name requires and nothing else (grammar 5.5, Decision D123).
+/// Every built-in the compiler admits is one the published schema admits, in
+/// both spellings and with the bounds that name takes (grammar 5.5, 6.1,
+/// Decision D135).
 ///
-/// The negative half is five fixtures under `invalid-schema/`, and it cannot
-/// carry the positive one: `additionalProperties: false` over four named
-/// properties is a shape where the *accepting* direction is the one that breaks
-/// silently. A fifth built-in added to the compiler and forgotten here would
-/// leave an editor underlining a composition `validate` accepts — the failure
-/// mode Appendix B exists to prevent, and the one nothing in this workspace
-/// would otherwise see.
+/// The negative half is six fixtures under `invalid-schema/`, and it cannot
+/// carry the positive one: a closed `enum` over two names is a shape where the
+/// *accepting* direction is the one that breaks silently. A third built-in added
+/// to the compiler and forgotten here would leave an editor underlining a
+/// composition `validate` accepts — the failure mode Appendix B exists to
+/// prevent, and the one nothing in this workspace would otherwise see.
 ///
 /// The names are derived from [`Builtin::ALL`] rather than listed, so the two
 /// tables cannot fall out of step, and the bounds are keyed on the same
@@ -930,24 +930,30 @@ fn the_published_schema_accepts_every_builtin_with_its_own_bounds() {
         "the built-in set is what this test quantifies over"
     );
     for builtin in Builtin::ALL {
-        let bounds = if builtin.runs_a_command() {
-            json!({ "root": "${WORKSPACE}", "timeout": "30s" })
-        } else {
-            json!({ "root": "${WORKSPACE}" })
-        };
+        let mut bound = serde_json::Map::new();
+        bound.insert("builtin".to_string(), json!(builtin.keyword()));
+        bound.insert("workspace".to_string(), json!("${WORKSPACE}"));
+        if builtin.runs_a_command() {
+            bound.insert("timeout".to_string(), json!("30s"));
+            bound.insert("env".to_string(), json!({ "PATH": "/usr/bin" }));
+            bound.insert("inherit_env".to_string(), json!(false));
+        }
         let instance = json!({
             "version": "0.1",
+            "tool.sandbox": Value::Object(bound),
             "agent.fixer": {
                 "model": "model.smart",
                 "prompt": "Fix it.",
-                "tools": ["tool.repo_grep", { builtin.address(): bounds }],
+                // Both spellings in one list: the configured tool, and the
+                // shorthand that takes every default.
+                "tools": ["tool.repo_grep", "tool.sandbox", builtin.address()],
                 "output": { "summary": { "type": "string" } },
             },
         });
         let errors = validation_errors(&validator, &instance);
         assert!(
             errors.is_empty(),
-            "the published schema must accept `{}` with the bounds it requires:\n{}\n{}",
+            "the published schema must accept `{}` in both spellings:\n{}\n{}",
             builtin.address(),
             serde_json::to_string_pretty(&instance).expect("a printable instance"),
             errors.join("\n")

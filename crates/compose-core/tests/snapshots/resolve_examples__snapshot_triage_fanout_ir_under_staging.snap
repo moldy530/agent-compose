@@ -49,6 +49,10 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
       "role": "import"
     },
     {
+      "path": "tools/checkout.yml",
+      "role": "import"
+    },
+    {
       "path": "tools/dead_letter.yml",
       "role": "import"
     },
@@ -75,136 +79,136 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
         "max": 1,
         "backoff": {
           "value": "2s",
-          "span": "main.yml:33:29..33:31"
+          "span": "main.yml:34:29..34:31"
         },
-        "span": "main.yml:33:10..33:33"
+        "span": "main.yml:34:10..34:33"
       },
       "timeout": {
         "value": "90s",
-        "span": "main.yml:32:12..32:15"
+        "span": "main.yml:33:12..33:15"
       },
       "on_error": {
         "strategy": "fail",
-        "span": "main.yml:34:13..34:17"
+        "span": "main.yml:35:13..35:17"
       }
     },
-    "span": "main.yml:32:3..34:17"
+    "span": "main.yml:33:3..35:17"
   },
   "state": {
     "entries": {
       "human_decision": {
         "name": {
           "value": "human_decision",
-          "span": "main.yml:65:3..65:17"
+          "span": "main.yml:66:3..66:17"
         },
         "type": {
           "description": {
             "value": "What the reviewer decided about the run as a whole.",
-            "span": "main.yml:66:18..66:69"
+            "span": "main.yml:67:18..67:69"
           },
-          "span": "main.yml:66:5..68:21",
+          "span": "main.yml:67:5..69:21",
           "form": "enum",
           "variants": [
             {
               "value": "approve",
-              "span": "main.yml:67:12..67:19"
+              "span": "main.yml:68:12..68:19"
             },
             {
               "value": "reject",
-              "span": "main.yml:67:21..67:27"
+              "span": "main.yml:68:21..68:27"
             }
           ],
           "default": {
             "value": "approve",
-            "span": "main.yml:68:14..68:21"
+            "span": "main.yml:69:14..69:21"
           }
         },
-        "span": "main.yml:65:3..68:21"
+        "span": "main.yml:66:3..69:21"
       },
       "matches": {
         "name": {
           "value": "matches",
-          "span": "main.yml:42:3..42:10"
+          "span": "main.yml:43:3..43:10"
         },
         "type": {
           "description": {
             "value": "Raw grep hits handed to the triage agent.",
-            "span": "main.yml:43:18..43:59"
+            "span": "main.yml:44:18..44:59"
           },
-          "span": "main.yml:43:5..45:28",
+          "span": "main.yml:44:5..46:28",
           "form": "array",
           "items": {
-            "span": "main.yml:45:12..45:28",
+            "span": "main.yml:46:12..46:28",
             "form": "scalar",
             "type": "string"
           }
         },
-        "span": "main.yml:42:3..45:28"
+        "span": "main.yml:43:3..46:28"
       },
       "patches": {
         "name": {
           "value": "patches",
-          "span": "main.yml:53:3..53:10"
+          "span": "main.yml:54:3..54:10"
         },
         "type": {
           "description": {
             "value": "Patches produced by the fixer instances.",
-            "span": "main.yml:54:18..54:58"
+            "span": "main.yml:55:18..55:58"
           },
-          "span": "main.yml:54:5..58:19",
+          "span": "main.yml:55:5..59:19",
           "form": "array",
           "items": {
-            "span": "main.yml:57:12..57:28",
+            "span": "main.yml:58:12..58:28",
             "form": "scalar",
             "type": "string"
           },
           "max_items": 200
         },
         "reduce": "append",
-        "span": "main.yml:53:3..58:19"
+        "span": "main.yml:54:3..59:19"
       },
       "report_normalized": {
         "name": {
           "value": "report_normalized",
-          "span": "main.yml:37:3..37:20"
+          "span": "main.yml:38:3..38:20"
         },
         "type": {
           "description": {
             "value": "The report after flow.enrich has normalized it.",
-            "span": "main.yml:38:18..38:65"
+            "span": "main.yml:39:18..39:65"
           },
-          "span": "main.yml:38:5..40:16",
+          "span": "main.yml:39:5..41:16",
           "form": "scalar",
           "type": "string",
           "default": {
             "value": "",
-            "span": "main.yml:40:14..40:16"
+            "span": "main.yml:41:14..41:16"
           }
         },
-        "span": "main.yml:37:3..40:16"
+        "span": "main.yml:38:3..41:16"
       },
       "summary": {
         "name": {
           "value": "summary",
-          "span": "main.yml:60:3..60:10"
+          "span": "main.yml:61:3..61:10"
         },
         "type": {
           "description": {
             "value": "Human-readable summary of the triage run.",
-            "span": "main.yml:61:18..61:59"
+            "span": "main.yml:62:18..62:59"
           },
-          "span": "main.yml:61:5..63:16",
+          "span": "main.yml:62:5..64:16",
           "form": "scalar",
           "type": "string",
           "default": {
             "value": "",
-            "span": "main.yml:63:14..63:16"
+            "span": "main.yml:64:14..64:16"
           }
         },
-        "span": "main.yml:60:3..63:16"
+        "span": "main.yml:61:3..64:16"
       }
     },
-    "span": "main.yml:37:3..68:21"
+    "span": "main.yml:38:3..69:21"
   },
   "triggers": {
     "entries": {
@@ -382,7 +386,7 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
         "value": "agent.fixer",
         "span": "agents/fixer.yml:4:1..4:12"
       },
-      "span": "agents/fixer.yml:4:1..26:19",
+      "span": "agents/fixer.yml:4:1..34:19",
       "namespace": "agent",
       "model": {
         "value": "model.fast",
@@ -398,14 +402,14 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "patch",
-              "span": "agents/fixer.yml:21:5..21:10"
+              "span": "agents/fixer.yml:29:5..29:10"
             },
             "type": {
               "description": {
                 "value": "A unified diff.",
-                "span": "agents/fixer.yml:22:20..22:35"
+                "span": "agents/fixer.yml:30:20..30:35"
               },
-              "span": "agents/fixer.yml:22:7..23:19",
+              "span": "agents/fixer.yml:30:7..31:19",
               "form": "scalar",
               "type": "string"
             }
@@ -413,20 +417,20 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "explanation",
-              "span": "agents/fixer.yml:24:5..24:16"
+              "span": "agents/fixer.yml:32:5..32:16"
             },
             "type": {
               "description": {
                 "value": "One sentence describing the change.",
-                "span": "agents/fixer.yml:25:20..25:55"
+                "span": "agents/fixer.yml:33:20..33:55"
               },
-              "span": "agents/fixer.yml:25:7..26:19",
+              "span": "agents/fixer.yml:33:7..34:19",
               "form": "scalar",
               "type": "string"
             }
           }
         ],
-        "span": "agents/fixer.yml:21:5..26:19"
+        "span": "agents/fixer.yml:29:5..34:19"
       },
       "input": {
         "surface": "input",
@@ -434,10 +438,10 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "file",
-              "span": "agents/fixer.yml:18:5..18:9"
+              "span": "agents/fixer.yml:26:5..26:9"
             },
             "type": {
-              "span": "agents/fixer.yml:18:11..18:27",
+              "span": "agents/fixer.yml:26:11..26:27",
               "form": "scalar",
               "type": "string"
             }
@@ -445,33 +449,21 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
           {
             "name": {
               "value": "patch_hint",
-              "span": "agents/fixer.yml:19:5..19:15"
+              "span": "agents/fixer.yml:27:5..27:15"
             },
             "type": {
-              "span": "agents/fixer.yml:19:17..19:33",
+              "span": "agents/fixer.yml:27:17..27:33",
               "form": "scalar",
               "type": "string"
             }
           }
         ],
-        "span": "agents/fixer.yml:18:5..19:33"
+        "span": "agents/fixer.yml:26:5..27:33"
       },
-      "builtins": [
+      "tools": [
         {
-          "tool": {
-            "value": "builtin.read_file",
-            "span": "agents/fixer.yml:16:7..16:24"
-          },
-          "root": {
-            "value": {
-              "text": "${REPO_ROOT}",
-              "env_refs": [
-                "REPO_ROOT"
-              ]
-            },
-            "span": "agents/fixer.yml:16:34..16:49"
-          },
-          "span": "agents/fixer.yml:16:7..16:50"
+          "value": "tool.checkout",
+          "span": "agents/fixer.yml:24:7..24:20"
         }
       ],
       "description": {
@@ -2246,6 +2238,198 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
       "description": {
         "value": "What this session has already triaged.",
         "span": "stores/triage_memory.yml:7:16..7:54"
+      }
+    },
+    "tool.checkout": {
+      "address": {
+        "value": "tool.checkout",
+        "span": "tools/checkout.yml:13:1..13:14"
+      },
+      "span": "tools/checkout.yml:13:1..20:1",
+      "namespace": "tool",
+      "description": {
+        "value": "View and edit files in the repository checkout under review. Paths are relative to the checkout root, and a path that resolves outside it is refused.",
+        "span": "tools/checkout.yml:17:5..20:1"
+      },
+      "input": {
+        "surface": "input",
+        "fields": [
+          {
+            "name": {
+              "value": "command",
+              "span": "tools/checkout.yml:14:3..20:1"
+            },
+            "type": {
+              "description": {
+                "value": "The file operation to perform: `view` reads a file or lists a directory, `create` writes a whole file, `str_replace` swaps one occurrence of a string, `insert` adds text at a line.",
+                "span": "tools/checkout.yml:14:3..20:1"
+              },
+              "span": "tools/checkout.yml:14:3..20:1",
+              "form": "enum",
+              "variants": [
+                {
+                  "value": "view",
+                  "span": "tools/checkout.yml:14:3..20:1"
+                },
+                {
+                  "value": "create",
+                  "span": "tools/checkout.yml:14:3..20:1"
+                },
+                {
+                  "value": "str_replace",
+                  "span": "tools/checkout.yml:14:3..20:1"
+                },
+                {
+                  "value": "insert",
+                  "span": "tools/checkout.yml:14:3..20:1"
+                }
+              ]
+            }
+          },
+          {
+            "name": {
+              "value": "path",
+              "span": "tools/checkout.yml:14:3..20:1"
+            },
+            "type": {
+              "description": {
+                "value": "The file or directory, relative to this tool's workspace.",
+                "span": "tools/checkout.yml:14:3..20:1"
+              },
+              "span": "tools/checkout.yml:14:3..20:1",
+              "form": "scalar",
+              "type": "string",
+              "min_length": 1
+            }
+          },
+          {
+            "name": {
+              "value": "view_range",
+              "span": "tools/checkout.yml:14:3..20:1"
+            },
+            "type": {
+              "description": {
+                "value": "The first and last line to show, for `view` of a file: `[10, 40]`. Lines count from 1 and both ends are included; `-1` as the last line reads to the end of the file. Omitted, the whole file is shown.",
+                "span": "tools/checkout.yml:14:3..20:1"
+              },
+              "span": "tools/checkout.yml:14:3..20:1",
+              "form": "array",
+              "items": {
+                "span": "tools/checkout.yml:14:3..20:1",
+                "form": "scalar",
+                "type": "integer",
+                "minimum": -1,
+                "maximum": 1000000
+              },
+              "max_items": 2,
+              "default": {
+                "value": [],
+                "span": "tools/checkout.yml:14:3..20:1"
+              }
+            }
+          },
+          {
+            "name": {
+              "value": "file_text",
+              "span": "tools/checkout.yml:14:3..20:1"
+            },
+            "type": {
+              "description": {
+                "value": "The whole contents of the file, for `create`.",
+                "span": "tools/checkout.yml:14:3..20:1"
+              },
+              "span": "tools/checkout.yml:14:3..20:1",
+              "form": "scalar",
+              "type": "string",
+              "default": {
+                "value": "",
+                "span": "tools/checkout.yml:14:3..20:1"
+              }
+            }
+          },
+          {
+            "name": {
+              "value": "old_str",
+              "span": "tools/checkout.yml:14:3..20:1"
+            },
+            "type": {
+              "description": {
+                "value": "The exact text to replace, for `str_replace`. It must appear exactly once.",
+                "span": "tools/checkout.yml:14:3..20:1"
+              },
+              "span": "tools/checkout.yml:14:3..20:1",
+              "form": "scalar",
+              "type": "string",
+              "default": {
+                "value": "",
+                "span": "tools/checkout.yml:14:3..20:1"
+              }
+            }
+          },
+          {
+            "name": {
+              "value": "new_str",
+              "span": "tools/checkout.yml:14:3..20:1"
+            },
+            "type": {
+              "description": {
+                "value": "The text to put in its place, for `str_replace` and `insert`.",
+                "span": "tools/checkout.yml:14:3..20:1"
+              },
+              "span": "tools/checkout.yml:14:3..20:1",
+              "form": "scalar",
+              "type": "string",
+              "default": {
+                "value": "",
+                "span": "tools/checkout.yml:14:3..20:1"
+              }
+            }
+          },
+          {
+            "name": {
+              "value": "insert_line",
+              "span": "tools/checkout.yml:14:3..20:1"
+            },
+            "type": {
+              "description": {
+                "value": "The line to insert after, for `insert`; `0` inserts at the top of the file.",
+                "span": "tools/checkout.yml:14:3..20:1"
+              },
+              "span": "tools/checkout.yml:14:3..20:1",
+              "form": "scalar",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000,
+              "default": {
+                "value": 0,
+                "span": "tools/checkout.yml:14:3..20:1"
+              }
+            }
+          }
+        ],
+        "span": "tools/checkout.yml:14:3..20:1"
+      },
+      "output": {
+        "surface": "result",
+        "fields": [],
+        "span": "tools/checkout.yml:14:3..20:1"
+      },
+      "binding": "builtin",
+      "builtin": {
+        "builtin": {
+          "value": "builtin.files",
+          "span": "tools/checkout.yml:14:12..14:17"
+        },
+        "workspace": {
+          "value": {
+            "text": "${REPO_ROOT}",
+            "env_refs": [
+              "REPO_ROOT"
+            ]
+          },
+          "span": "tools/checkout.yml:15:14..15:28"
+        },
+        "span": "tools/checkout.yml:14:3..20:1"
       }
     },
     "tool.dead_letter": {

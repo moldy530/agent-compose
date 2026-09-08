@@ -313,23 +313,84 @@ mod tests {
             .find("armCommandSweep();")
             .expect("`forkBoundShell` arms the stop sweep");
         let spawned = forked
-            .find("return spawn(\"bash\", [\"-c\", command], {")
+            .find("return spawn(executable, SHELL_ARGUMENTS, {")
             .expect("`forkBoundShell` forks the shell");
         assert!(
             armed < spawned,
             "the sweep is armed after the shell is forked, so a stop signal arriving in between \
-             is met by the kernel's default disposition: the graph ends and the command's process \
-             group is left running inside `root:` (grammar 5.5, Decision D124): {forked}"
+             is met by the kernel's default disposition: the graph ends and the shell's process \
+             group is left running inside the workspace (grammar 5.5, Decision D124): {forked}"
         );
         // …and the fork has **one** call site, which is what makes the ordering
         // above a property of the runtime rather than of one function: a second
         // `spawn` of the shell would carry its own ordering, and the window this
         // closes is reopened by whichever one forgets.
         assert_eq!(
-            SOURCE.matches("spawn(\"bash\"").count(),
+            SOURCE.matches("SHELL_ARGUMENTS, {").count(),
             1,
             "a `builtin.bash` shell is forked somewhere other than `forkBoundShell`, which is the \
              one call site that arms the stop sweep first"
+        );
+    }
+
+    /// A typed command reads **its own** standard input, never the shell's
+    /// (grammar 5.5, PRD resolved q54).
+    ///
+    /// The one place this runtime's protocol and the model's program share a
+    /// channel. `builtin.bash` is a session, so the shell reads its script from
+    /// standard input (`-s`) and each command is *typed* into that pipe followed
+    /// by the marker lines that close it — which means a command that reads
+    /// standard input reads them: `read -r line` consumes the `…_status=$?` line
+    /// and the call settles with no status, and `cat` consumes both `printf`s,
+    /// spends the whole `timeout:` and answers the model with this runtime's own
+    /// marker text as the command's output. Neither is a failure a test of the
+    /// tool's *behaviour* would notice, because both look exactly like a command
+    /// that did what it was asked.
+    ///
+    /// So it is pinned as text: the command runs inside a brace group whose
+    /// standard input is `/dev/null`. A group rather than a subshell, because
+    /// `cd build` has to still be true for the next call, which is the whole of
+    /// what a session is.
+    #[test]
+    fn a_typed_command_is_redirected_away_from_the_shells_own_input() {
+        let typed = function_body("async function typeIntoShell(");
+        assert!(
+            typed.contains(r"`{ ${command}\n") && typed.contains(r"\n} < /dev/null\n"),
+            "the command is typed into the shell without a standard input of its own, so a \
+             command that reads one reads this runtime's marker protocol instead (grammar 5.5, \
+             PRD resolved q54): {typed}"
+        );
+    }
+
+    /// Every `builtin.files` write goes through the hard-link check
+    /// (PRD resolved q54, Decision D119).
+    ///
+    /// `targetWithinWorkspace` answers "is this path inside the workspace" by
+    /// resolving it, which is the whole answer for a symbolic link and no answer
+    /// at all for a hard one: a second name for an inode has no target, so
+    /// `realpath` reports the path inside the workspace and a write through it
+    /// changes what a name outside reads. The refusal therefore lives at the
+    /// write rather than at the resolution — and a second `writeFile` reached
+    /// from anywhere else would be a write with no such refusal in front of it,
+    /// which is what this pins.
+    #[test]
+    fn every_file_write_is_preceded_by_the_second_name_refusal() {
+        assert_eq!(
+            SOURCE.matches("fs.promises.writeFile(").count(),
+            1,
+            "`builtin.files` writes a file somewhere other than `writeFileText`, which is the \
+             one call site the hard-link refusal stands in front of"
+        );
+        let written = function_body("async function writeFileText(");
+        let refused = written
+            .find("await refuseSecondName(operation, requested, target);")
+            .expect("`writeFileText` refuses a target with a second name");
+        let wrote = written
+            .find("await fs.promises.writeFile(target, contents, \"utf8\");")
+            .expect("`writeFileText` writes the file");
+        assert!(
+            refused < wrote,
+            "the hard-link refusal runs after the write it is meant to prevent: {written}"
         );
     }
 

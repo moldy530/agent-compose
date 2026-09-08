@@ -828,6 +828,36 @@ send, and the runtime satisfies it by appending the closing user turn of
 resolved q52 — `a_forced_tool_choice_needs_the_conversation_to_end_on_the_user`
 in `tests/anthropic_wire.rs` locks both halves.
 
+### 25. A provider-defined tool the **client** runs is a client tool
+
+The Messages wire carries two kinds of entry with a `type:` on them, and (22) is
+about only one of them. A `web_search_20250305` is a **server** tool: the service
+runs it inside the turn and the answer arrives already made. A `bash_20250124` or
+a `text_editor_20250728` is the opposite — the vendor defines the type and the
+*client* runs it, so the model answers with an ordinary `tool_use` block and the
+graph is what has to answer it with a `tool_result`. PRD resolved q54 makes those
+two the wire form of `builtin.bash` and `builtin.files` (grammar §6.1).
+
+*What is certain*: that these are called and answered as ordinary client tools,
+that the entry carries no `input_schema` (the schema is the provider's), and that
+each dated type dictates the `name` it must be declared under — `bash` and
+`str_replace_based_edit_tool` for the two this compiler emits.
+
+So this server classifies them as client tools: the name goes into the request's
+own tool list, a scripted `tools` reply may call it, and the entry shape is
+**closed** to `type`, `name` and `cache_control` — unlike a server tool's, whose
+config keys are the vendor's and are carried unchecked. The name is checked
+against the type for the revisions this server has met and is a presence check
+for a later one, which is (22)'s two tiers reached the other way round. A script
+that ran one as a *server* tool is refused: the service does not run it, so a turn
+saying it already had is a turn the API cannot send.
+
+*What is assumed* is the closed key set. A revision that adds a config key — the
+text editor's `max_characters` is the plausible one — would be refused here until
+this list grows, which is the same intended failure mode as the accepted-key
+lists below: a silently accepted unknown key is how a bound stops taking effect
+without anyone noticing.
+
 ---
 
 ## Accepted-key lists are curated, not exhaustive

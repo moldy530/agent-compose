@@ -656,6 +656,11 @@ mod tests {
         //  * `releaseExecution` — grammar 11.1's `scope: execution` lifetime,
         //    run by `runFlow` when a run ends. It removes what the run owned;
         //    running it twice removes it twice.
+        //  * `releaseWorkspaces` — the same lifetime for the directory a
+        //    built-in tool worked in where its binding wrote no `workspace:`
+        //    (grammar 6.1, PRD resolved q54). Run by `runFlow` beside
+        //    `releaseExecution`, and for its reason: it removes what the run
+        //    owned, and a run whose journal row stays open keeps it.
         //  * `attemptDelivery` — one attempt at a lifecycle delivery: an `http`
         //    trigger's `callback:` webhook, or the settled trace a
         //    `trace_sink:` ships (grammar 13.3, 14.5, `docs/durability.md`
@@ -675,8 +680,9 @@ mod tests {
         //    behind (§2), and `journalExists`. These are the record itself. A
         //    replay that "re-executed" them would be a replay reading its own
         //    journal, which is what a replay *is*.
-        const NOT_AN_EFFECT: [(&str, &str); 8] = [
+        const NOT_AN_EFFECT: [(&str, &str); 9] = [
             ("src/stores.ts", "releaseExecution"),
+            ("src/runtime.ts", "releaseWorkspaces"),
             ("src/delivery.ts", "attemptDelivery"),
             ("src/cli.ts", "writeTrace"),
             ("src/journal.ts", "SqliteJournal"),

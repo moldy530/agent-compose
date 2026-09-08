@@ -369,39 +369,39 @@ export type ToolPingInput = z.infer<typeof toolPingInput>;
 export const toolPingOutput = z.object({}).strict();
 export type ToolPingOutput = z.infer<typeof toolPingOutput>;
 
+/** `tool.sandbox` — its parameters (grammar 6). */
+export const toolSandboxInput = z.object({
+  command: z.string().describe("The shell command to run, as one line of `bash`.").default(""),
+  restart: z.boolean().describe("Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.").default(false),
+}).strict();
+export type ToolSandboxInput = z.infer<typeof toolSandboxInput>;
+
+/** `tool.sandbox` — its result (grammar 6). */
+export const toolSandboxOutput = z.object({}).strict();
+export type ToolSandboxOutput = z.infer<typeof toolSandboxOutput>;
+
 /**
  * `builtin.bash` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
  */
 export const builtinBashInput = z.object({
-  command: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The shell command to run, as one line of `bash`."),
+  command: z.string().describe("The shell command to run, as one line of `bash`.").default(""),
+  restart: z.boolean().describe("Set to `true` to end this shell session and start a fresh one in the workspace, which is how a wedged shell is recovered. Sent alone it runs nothing; sent with a `command`, that command runs in the fresh session.").default(false),
 }).strict();
 export type BuiltinBashInput = z.infer<typeof builtinBashInput>;
 
 /**
- * `builtin.read_file` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
+ * `builtin.files` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
  */
-export const builtinReadFileInput = z.object({
-  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file to read, relative to the tool's root directory."),
+export const builtinFilesInput = z.object({
+  command: z.enum(["view", "create", "str_replace", "insert"]).describe("The file operation to perform: `view` reads a file or lists a directory, `create` writes a whole file, `str_replace` swaps one occurrence of a string, `insert` adds text at a line."),
+  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file or directory, relative to this tool's workspace."),
+  view_range: z.array(z.number().int().min(-1).max(1000000)).max(2).describe("The first and last line to show, for `view` of a file: `[10, 40]`. Lines count from 1 and both ends are included; `-1` as the last line reads to the end of the file. Omitted, the whole file is shown.").default([]),
+  file_text: z.string().describe("The whole contents of the file, for `create`.").default(""),
+  old_str: z.string().describe("The exact text to replace, for `str_replace`. It must appear exactly once.").default(""),
+  new_str: z.string().describe("The text to put in its place, for `str_replace` and `insert`.").default(""),
+  insert_line: z.number().int().min(0).max(1000000).describe("The line to insert after, for `insert`; `0` inserts at the top of the file.").default(0),
 }).strict();
-export type BuiltinReadFileInput = z.infer<typeof builtinReadFileInput>;
-
-/**
- * `builtin.write_file` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
- */
-export const builtinWriteFileInput = z.object({
-  path: z.string().refine((value) => codePoints(value) >= 1, { message: "expected at least 1 character" }).describe("The file to write, relative to the tool's root directory."),
-  content: z.string().describe("The bytes to write, replacing whatever the file held."),
-}).strict();
-export type BuiltinWriteFileInput = z.infer<typeof builtinWriteFileInput>;
-
-/**
- * `builtin.list` — the arguments of the runtime built-in of that name, which every attachment of it offers (grammar 5.5).
- */
-export const builtinListInput = z.object({
-  path: z.string().describe("The directory to list, relative to the tool's root directory.").default("."),
-  glob: z.string().describe("A glob to match entries against — `*` and `?` within one path segment, `**` across segments. Empty lists the directory's own entries.").default(""),
-}).strict();
-export type BuiltinListInput = z.infer<typeof builtinListInput>;
+export type BuiltinFilesInput = z.infer<typeof builtinFilesInput>;
 
 /** State channel `anything` — its declared type (grammar 10.1). */
 export const stateAnything = z.string().regex(/(?:)/);

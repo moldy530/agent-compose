@@ -1,0 +1,47 @@
+# rule: two configured tools binding the same built-in are one tool on the model's side (grammar 5.4, 5.5, 6.1, D135)
+# code: tool-name-collision
+# message: `agent.a` attaches `tool.sandbox` and `tool.roomier_sandbox`, which are one `bash` tool on the model's side
+# at: main.yml:36:7
+# label: main.yml:35:7 the first is attached here
+# help: an attached tool's name is its address's local name — or, for a `builtin:` tool, the name the provider fixes — and it is the only name it has on the model's side (grammar 5.4, 6.1, 11.5): rename one of the two definitions, or drop one of the attachments
+#
+# Two definition keys a reader can tell apart, one name on the wire. Nothing in
+# the *addresses* collides — which is the whole case: a built-in's name is the
+# provider's, so two `builtin: bash` bindings on one agent put `bash` in the
+# request's `tools` array twice, and the surfaces refuse that array outright.
+#
+# The repair the help offers is the honest one for this pair: renaming a
+# definition changes nothing here, so one of the two attachments has to go — or
+# one of them has to bind the *other* built-in.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${K}
+model.m:
+  provider: provider.p
+  id: some-model
+tool.sandbox:
+  description: Run a command, briefly.
+  builtin: bash
+  timeout: 10s
+tool.roomier_sandbox:
+  description: Run a command that takes a while.
+  builtin: bash
+  timeout: 600s
+agent.a:
+  model: model.m
+  prompt: Decide.
+  tools:
+    - tool.sandbox
+    - tool.roomier_sandbox
+  output:
+    verdict: { type: string }
+flow.f:
+  outputs: {}
+  nodes:
+    n:
+      agent: agent.a
+      input: "'x'"
+  edges:
+    - { from: start, to: n }
+    - { from: n, to: end }

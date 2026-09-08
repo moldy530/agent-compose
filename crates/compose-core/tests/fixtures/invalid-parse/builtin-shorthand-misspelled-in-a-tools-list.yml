@@ -1,0 +1,13 @@
+# rule: the built-in set is closed at the shorthand too, and a near miss is told
+# rule: which name it missed (grammar 5.5, D135, PRD resolved q54)
+# code: unknown-variant
+# message: `builtin.fils` is not a built-in tool
+# at: 11:7
+# help: did you mean `builtin.files`?
+agent.fixer:
+  model: model.fast
+  prompt: Fix the failing test.
+  tools:
+    - builtin.fils
+  output:
+    summary: { type: string }

@@ -667,6 +667,7 @@ export interface TraceEntry {
 fn the_walk_reaches_every_record_the_envelope_carries() {
     let reached: BTreeSet<String> = reachable(&runtime()).into_keys().collect();
     let expected: BTreeSet<String> = [
+        "BuiltinProgram",
         "DispatchRecord",
         "EdgeDecision",
         "Failover",
@@ -811,14 +812,23 @@ fn every_store_op_is_documented() {
     );
 }
 
-/// The field names this format writes free diagnostic text under.
+/// The field names this format writes free text under.
 ///
-/// Two spellings and no more: `error` on the three records that carry a failure,
-/// and `detail` on the one that carries what a provider answered. Every other
-/// field of the format is a name, a number, a boolean or a member of a closed
-/// enumeration — so a field with one of these names is a message, and a message
-/// is the one thing in a trace that can hold bytes from outside this process.
-const MESSAGE_FIELDS: &[&str] = &["error", "detail"];
+/// Five spellings and no more. Two carry a **diagnostic**: `error` on the three
+/// records that carry a failure, and `detail` on the one that carries what a
+/// provider answered. Three carry the **program a model wrote** — `command`,
+/// `path` and `change` on the built-in record §7.4 specifies — which is the
+/// carve-out PRD resolved q54 ruling c makes to §11's rule that a tool's
+/// arguments stay out. Every other field of the format is a name, a number, a
+/// boolean or a member of a closed enumeration.
+///
+/// So a field with one of these names is a message, and a message is the one
+/// thing in a trace that can hold bytes this process did not compose — bytes an
+/// *answering system* wrote, for the first two, and bytes the **model** wrote,
+/// for the last three, which is the more adversarial of the two origins and the
+/// reason the built-in fields are named here rather than trusted for being
+/// short.
+const MESSAGE_FIELDS: &[&str] = &["error", "detail", "command", "path", "change"];
 
 /// Every message field is classified in the section that warns about untrusted
 /// text.

@@ -140,34 +140,10 @@ fn agent(source: &ast_def::AgentDef) -> Option<ir::definition::Agent> {
         output: field_map(source.output.as_ref()?)?,
         input: optional(source.input.as_ref(), field_map)?,
         tools: source.tools.clone(),
-        builtins: source
-            .builtins
-            .iter()
-            .map(builtin)
-            .collect::<Option<Vec<_>>>()?,
+        builtins: source.builtins.clone(),
         stores: source.stores.clone(),
         description: source.description.clone(),
         max_tool_iterations: source.max_tool_iterations.as_ref().map(|value| value.value),
-    })
-}
-
-/// One `builtin.*` attachment, with its bounds required (grammar 5.5,
-/// Decision D123).
-///
-/// `root:` is required of every built-in and `timeout:` of `builtin.bash`, so an
-/// attachment missing either is dropped exactly as an agent missing its `model:`
-/// is: the parser has already reported it, and the artifact only ever holds a
-/// composition that declared everything it needs.
-fn builtin(source: &ast_def::BuiltinAttachment) -> Option<ir::definition::BuiltinTool> {
-    let timeout = source.timeout.clone();
-    if source.tool.value.runs_a_command() && timeout.is_none() {
-        return None;
-    }
-    Some(ir::definition::BuiltinTool {
-        tool: source.tool.clone(),
-        root: source.root.clone()?,
-        timeout,
-        span: source.span.clone(),
     })
 }
 
@@ -200,7 +176,38 @@ fn tool(source: &ast_def::ToolDef) -> Option<ir::definition::Tool> {
                 span: block.span.clone(),
             },
         },
+        ast_def::ToolImplementation::Builtin(block) => ir::flow::ToolImplementation::Builtin {
+            builtin: ir::binding::Builtin {
+                builtin: block.builtin.clone()?,
+                workspace: block.workspace.clone(),
+                timeout: block.timeout.clone(),
+                env: block.env.iter().map(interpolated_entry).collect(),
+                inherit_env: block.inherit_env.clone(),
+                span: block.span.clone(),
+            },
+        },
     };
+    // A built-in declares no contract of its own, so the resolver supplies the
+    // one this compiler fixes: the description a model selects on, the argument
+    // schema its calls are parsed against, and an empty result map — the answer
+    // is what the shell printed or what the editor did, and no field map
+    // constrains it (grammar 6.1, Decision D135).
+    if let ir::flow::ToolImplementation::Builtin { builtin } = &implementation {
+        let tool = builtin.builtin.value;
+        let span = builtin.span.clone();
+        return Some(ir::definition::Tool {
+            description: source.description.clone().unwrap_or_else(|| {
+                Spanned::new(crate::check::model::builtin_description(tool), span.clone())
+            }),
+            input: crate::check::model::builtin_tool_input(tool, &span),
+            output: ir::schema::FieldMap {
+                fields: Vec::new(),
+                surface: crate::ast::schema::Surface::Result,
+                span,
+            },
+            implementation,
+        });
+    }
     Some(ir::definition::Tool {
         description: source.description.clone()?,
         input: field_map(source.input.as_ref()?)?,

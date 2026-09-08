@@ -1,0 +1,13 @@
+# rule: `timeout:` bounds a child process, and `builtin: files` forks none (grammar 6.1 / D50, D135)
+# at: /tool.sandbox
+# via: /$defs/toolDef/allOf/2/then/not
+tool.sandbox:
+  builtin: files
+  timeout: 30s
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

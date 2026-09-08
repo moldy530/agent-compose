@@ -1,0 +1,16 @@
+# rule: a built-in declares no `input:`/`output:` of its own (grammar 6.1 / D135)
+# at: /tool.sandbox
+# via: /$defs/toolDef/allOf/0/then/not
+tool.sandbox:
+  builtin: bash
+  input:
+    command: { type: string }
+  output:
+    stdout: { type: string }
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - tool.sandbox
+  output:
+    verdict: { enum: [approve, revise] }

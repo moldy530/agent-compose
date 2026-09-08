@@ -1,0 +1,10 @@
+# rule: every entry of an agent's `tools:` is an address; bounds live on a `tool.*` (grammar 5.4, 5.5, 6.1 / D135)
+# at: /agent.reviewer/tools/0
+# via: /$defs/agentTool/anyOf
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.bash: { workspace: "./work", timeout: 30s }
+  output:
+    verdict: { enum: [approve, revise] }

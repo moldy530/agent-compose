@@ -959,11 +959,26 @@ format's `<error name>: <message>` shape. The model's copy is that sentence with
 no class in front of it; the record's is the same sentence under the envelope
 every error in a trace wears.
 
-### 5.5 Runtime built-in tools
+### 5.5 Built-in tools
 
-Four tools this runtime implements — a shell and three file operations — are
-attached from the same `tools:` list, one name at a time, each carrying the
-bounds it runs under:
+Two tools this runtime implements — a shell and a file editor — are attached
+from the same `tools:` list. They are the one binding that does not fix *what
+runs* at build time: every other implementation names a program the author chose
+and lets the model fill schema-validated parameters, while a built-in has the
+**model author the program at run time** (PRD resolved q54).
+
+| Built-in | What the model calls it | What it is |
+|---|---|---|
+| `builtin.bash` | `bash` | a shell session the model drives |
+| `builtin.files` | `str_replace_based_edit_tool` | view, create and edit files under a workspace |
+
+The set is **closed**: `builtin.<anything else>` is a compile error, and it grows
+by a resolved question rather than by a release adding a name.
+
+**Two spellings.** A `tools:` entry is either an address — a `tool.*`, a
+`flow.*`, or one of the two built-ins written as its own address — or nothing at
+all: there is no third shape, and a mapping entry is a compile error naming the
+surface bounds moved to.
 
 ```yaml
 agent.fixer:
@@ -971,108 +986,63 @@ agent.fixer:
   prompt: Fix the failing test, then say what you changed.
   tools:
     - tool.repo_grep
-    - builtin.read_file:  { root: "${WORKSPACE}" }
-    - builtin.write_file: { root: "${WORKSPACE}" }
-    - builtin.list:       { root: "${WORKSPACE}" }
-    - builtin.bash:       { root: "${WORKSPACE}", timeout: 30s }
+    - builtin.files        # the shorthand: every default
+    - tool.sandbox         # a `builtin: bash` with its bounds (§6.1)
   output:
     summary: { type: string }
 ```
 
-| Built-in | Arguments | Result | Bounds |
-|---|---|---|---|
-| `builtin.bash` | `command` | `stdout`, `stderr` | `root` (working directory), `timeout` |
-| `builtin.read_file` | `path` | `content` | `root` |
-| `builtin.write_file` | `path`, `content` | `bytes_written` | `root` |
-| `builtin.list` | `path` (default `.`), `glob` (default none) | `entries`, `truncated` | `root` |
+The **shorthand** attaches a built-in under its defaults — the execution's own
+workspace, the runtime's command bound, a scrubbed child environment. The
+**configured** form is a `tool.*` carrying a `builtin:` binding (§6.1), attached
+by its address like any other tool, so one configuration serves every agent that
+attaches it. Duplicate entries in either spelling are a compile error, and so is
+a shorthand beside a configured tool binding the same built-in: they are one
+tool on the model's side (§11.5).
 
-The set is **closed**: `builtin.<anything else>` is a compile error, and it grows
-by a resolved question rather than by a release adding a name (PRD resolved q31).
-
-**The entry shape.** A `tools:` entry is either a bare `tool.*`/`flow.*` address
-(§5.4) or a **single-key mapping** whose key is the built-in's name and whose
-value is its bounds. One entry attaches one built-in; a mapping carrying two keys
-is a compile error, and there is no key anywhere that grants the set. A built-in
-written as a bare address is a compile error naming the mapping form, because the
-bounds are not optional.
-
-**`root:` is required on every built-in**, on `builtin.bash` as much as on the
-file tools, and it must be **non-empty**: `root: ""` is a compile error, and a
-`root:` whose `${VAR}` resolves to the empty string fails the call, because an
-empty path is the directory the runtime happened to be started in and a bound
-nobody wrote is not a bound. It is interpolable (§4.3 class 2), resolved at
-process start, and resolved again as a real directory at each call — a `root:`
-naming a directory that does not exist fails the call. Every path argument is
-taken relative to it, and a path that **resolves** outside it is refused:
-resolution, not string comparison, so a `..` that climbs out and a symlink that
-points out are both refused, and a write to a file that does not exist yet
-resolves through its parent. A symlink whose target does not exist is refused
-rather than followed: there is nothing to resolve, so where it points cannot be
-checked, and a write through it would create the file it names. A `builtin.list`
-walk does not **descend** into a symlinked directory for the same bound's sake —
-the link is one entry of the listing, reported without the trailing `/` a
-directory gets, because a walk that followed it would answer with paths outside
-the root that no path check was asked of. `builtin.bash` runs with the resolved
-root as its working directory.
-
-**`timeout:` is required on `builtin.bash`** and is a §4.4 duration. It bounds
-one command; §9.2's node-level `timeout:` bounds the whole agent node, deadline
-included, and the two compose rather than replace one another. `timeout:` on a
-file tool is an unknown key — there is no command there to bound. What bounds a
-file tool is that node-level deadline: a `builtin.list` walk stops where it is
-when the node's `timeout:` runs out or the run is cancelled, rather than
-finishing a listing the graph has already stopped waiting for
-([D124](#d124-a-built-ins-deadline-kills-the-commands-process-group-not-just-the-shell)).
-
-`builtin.list`'s `glob` matches `*` and `?` within one path segment and `**`
-across them, which is the spelling most tools use. `**` matches *zero* or more
-segments, so a run of them accepts exactly what one accepts.
-
-What the deadline kills is the shell **and every process it started**, and what
-it ends is the **call**. The command runs in a process group of its own and the
-deadline kills the *group*, because the shell is almost never where the work is:
-`npm run build`, `a | b`, `(cd sub && make)` and a plain `some-server &` are all
-`bash` forking, and a kill aimed at the shell alone would leave every one of them
-running — still writing inside `root:` — after the node they belonged to had
-already failed. Under `retry:` that would be two generations of one command in
-one root ([D124](#d124-a-built-ins-deadline-kills-the-commands-process-group-not-just-the-shell)).
-
-What outlives the deadline is what **left the group deliberately**: a command
-that calls `setsid`, a shell that turned job control on (`set -m`), a daemon that
-double-forks away. Those are exactly the processes a hand-rolled `exec:` tool
-would have left behind too; the runtime stops reading what such a process holds
-rather than waiting on it, so the bound is the composition's however long the
-escapee lives. Cleaning up after one is the command's own business, and
-containing it is the distribution work's (below).
-
-**A built-in's name on the wire is its local name** — `bash`, `read_file`,
-`write_file`, `list` — exactly as an attached `tool.*`'s is, so a `tool.bash` on
-the same agent is a `tool-name-collision` (§11.5). Its **address** is what
-`docs/trace.md` §7.3 records as the call's target.
+**A built-in's name on the wire is the provider's**, not the definition key's:
+these go out as the provider-defined tool types, each of which carries a name the
+wire dictates. So `tool.sandbox` above is `bash` to the model, a `tool.bash`
+beside it is a `tool-name-collision`, and the same holds against a provider's
+server-tool suite (§12.1). Its **address** — `builtin.files` for a shorthand,
+`tool.sandbox` for a configured one — is what
+[`docs/trace.md`](trace.md) §7.3 records as the call's target, beside the one
+thing that format carries for these two tools and for no others: the **program**
+the model wrote, which §7.4 specifies (PRD resolved q54 ruling c).
 
 **Failure and refusal follow §5.4's split unchanged.** Arguments the built-in's
-own schema refuses are handed back to the model
+own schema refuses, and paths that resolve outside the workspace, are handed back
+to the model
 ([D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node)).
-Everything else — a nonzero exit, a command killed at the timeout, a path that
-resolved outside the root, a host with no `bash` on `PATH` — is an *execution*
-failure and fails the agent node, where §9's chain decides the run exactly as it
-does for an `exec:` tool.
+An *execution* failure — a host with no `bash` on `PATH`, a workspace that names
+no directory — fails the agent node, where §9's chain decides the run exactly as
+it does for an `exec:` tool.
 
-**What bounds a built-in is the root and the timeout, and nothing else.** The
-tools run with the privileges of the process running the graph, which is what a
-hand-rolled `exec:` tool has always done: a model holding `builtin.bash` holds
-arbitrary code execution on that host. Container and syscall isolation, and any
-refusal keyed on a deploy target, are the distribution work's and are stated here
-rather than implied (PRD resolved q31). That work has not answered it: resolved
-q37–q44 settled the topology, the binding surface and the wire without taking
-containment up, so it stays open and is filed as such in
+**What a command *said* is neither.** A nonzero exit status, and a command killed
+at its `timeout:`, come back to the model as the tool's **result**: the model
+wrote the program, so how it ended is a fact it asked for rather than a contract
+of the composition's, and there is no `expect_exit:` here for one to sit on. The
+loop goes on and the node does not end. That is the one place a built-in's split
+reads differently from an `exec:` tool's, and it reads differently because the
+author of the program is different.
+
+**What bounds a built-in is the workspace and the timeout, and nothing else.**
+The tools run with the privileges of the process running the graph, which is what
+a hand-rolled `exec:` tool has always done: a model holding `builtin.bash` holds
+arbitrary code execution on that host, and this is the one place in the grammar
+where the trust boundary moves from the author to the model. Container and
+syscall isolation, and any refusal keyed on a deploy target, are the distribution
+work's and are stated here rather than implied
+([D135](#d135-a-builtin-binding-hands-the-model-the-program-and-says-so)). That
+work has not answered it, so it stays open and is filed as such in
 [`docs/distributed.md`](distributed.md) §13.
 
-Traces gain no surface: a built-in call is a `ToolCallRecord` like any other, and
-`docs/trace.md` §11 keeps its answer out of the format exactly as it keeps an
-`exec:` tool's. The **journal** holds the answer in full, which is what makes a
-resumed execution consume a recorded `bash` rather than run it again
-(`docs/durability.md` §3.2).
+**Placement is the feature, not a leak.** An agent holding built-in tools joins
+the executes-in closure exactly as one holding `exec:` tools does (§14.1), so a
+placed agent runs its model-authored commands on the worker that took its
+dispatch — which is precisely what "the machine with the capability" placements
+exist for — and the environment its children read lands in that placement's
+manifest ([`docs/distributed.md`](distributed.md) §9.1).
 
 ---
 
@@ -1130,10 +1100,10 @@ tool.web_search:
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `description` | string (non-empty) | **yes** | LLM-facing; the selection signal (PRD 5.5) |
-| `input` | field map (input surface) | **yes** | tool parameters; `{}` for no-arg tools |
-| `output` | field map (result surface, §3.5) | **yes** | result schema; makes edges serializable (PRD 5.7) |
-| `exec` \| `http` \| `function` \| `module` | block | **exactly one** | implementation binding |
+| `description` | string (non-empty) | **yes**, and **optional** under `builtin` | LLM-facing; the selection signal (PRD 5.5). The compiler writes a built-in's own, which a composition may sharpen (§6.1, [D135](#d135-a-builtin-binding-hands-the-model-the-program-and-says-so)) |
+| `input` | field map (input surface) | **yes**, and **refused** under `builtin` | tool parameters; `{}` for no-arg tools. A built-in declares no contract, so writing one is a compile error (§6.1, D135) |
+| `output` | field map (result surface, §3.5) | **yes**, and **refused** under `builtin` | result schema; makes edges serializable (PRD 5.7). Refused under `builtin` for the same reason (§6.1, D135) |
+| `exec` \| `http` \| `function` \| `module` \| `builtin` | block, or — for `builtin` — an enum with its bounds beside it | **exactly one** | implementation binding (§6.1) |
 
 ### 6.1 Implementation bindings
 
@@ -1146,6 +1116,11 @@ are not in scope, and referencing one is a compile error (§4.1, Decision
 [D65](#d65-a-tool-implementation-binding-sees-only-the-tools-own-input)).
 Everything a tool needs arrives through its declared parameters, which is what
 makes the same definition usable from both surfaces.
+
+A tool carries **exactly one** implementation binding: `exec:`, `http:`,
+`function:`, `module:` or `builtin:`. The first four fix *what runs* at build
+time; the fifth hands the program to the model
+([D135](#d135-a-builtin-binding-hands-the-model-the-program-and-says-so)).
 
 **`exec`** — shell/subprocess (PRD 5.5):
 
@@ -1421,6 +1396,81 @@ already pins at another version, and so are two tools pinning one package at two
 versions, each naming both sides. The code is `invalid-dependency`. What is
 accepted is folded into the generated `package.json`, which stays
 pure-generated (D132, D133).
+
+**`builtin`** — one of the two built-in tools, configured (§5.5, PRD resolved
+q54):
+
+```yaml
+tool.sandbox:
+  builtin: bash             # or `files`
+  workspace: "${WORK_DIR}"
+  timeout: 120s
+  env:
+    PATH: "/usr/bin:/bin"
+  inherit_env: false
+```
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `builtin` | enum `bash files` | yes | which built-in; any other name is `unknown-variant` |
+| `workspace` | string (non-empty, interpolable) | no | the directory this tool works inside; default is the execution's own built-in workspace |
+| `timeout` | duration (§4.4) | no | `bash` only; bounds one command. Default **120s** |
+| `env` | map env-var-name (`[A-Za-z_][A-Za-z0-9_]*`) → string (interpolable) | no | `bash` only; exactly the `exec:` shape |
+| `inherit_env` | boolean | no | `bash` only; default `false` |
+
+Unlike the other four, this binding's keys are written **beside** `builtin:`
+rather than under it: there is no contract for them to sit inside, so a nested
+block would be a level of indentation carrying one key.
+
+**A built-in declares no contract.** `input:` and `output:` are compile errors
+here — the arguments and the result are this compiler's, because the model writes
+the program rather than filling parameters an author declared. `description:`,
+required of every other binding, is **optional**: the compiler writes one, and a
+composition may sharpen it with the fact only it knows ("the repository checkout
+under review").
+
+**So an agent's `tools:` list is its only call site.** §6's two usage surfaces
+are one surface for this binding: a `function:` node naming a `builtin:` tool,
+and a `map` dispatching to one, are each a compile error naming the repair
+(`invalid-value`). Both of those surfaces pass the **composition's** arguments —
+checked field by field against a declared `input:` (§8.4, §8.6 rule 12) — and
+read a declared result, and a built-in has neither to offer them. There is
+nothing for such a node to bind and nothing for it to write.
+
+**`workspace:` is where the tool works.** `builtin.bash` runs there, and every
+`builtin.files` path is taken relative to it and refused if it **resolves**
+outside it — resolution, not string comparison, so a `..` that climbs out and a
+symlink that points out are both refused, and a write to a file that does not
+exist yet resolves through its parent. Resolution is the whole answer for a
+*symbolic* link and no answer at all for a **hard** one, which has no target: a
+second name for a file is inside the workspace while the bytes it names are also
+outside, so a `builtin.files` **write** to a file with more than one name is
+refused instead — a `view` of one is not, since reading a path inside the
+workspace is inside the bound whatever else names it. It is interpolable (§4.3
+class 2), because which directory a graph may work in is a property of the
+machine running it.
+Written, it must name something: `workspace: ""` is a compile error and a
+`${VAR}` that resolves empty fails the call, because an empty path is the
+directory the runtime happened to be started in and a bound nobody wrote is not a
+bound. **Omitting** it is the way to take the default — one fresh directory per
+execution, shared by every built-in of that execution that took it, removed when
+the execution settles.
+
+**`timeout:` defaults to 120s**, which is a bound chosen to be longer than a
+build step and shorter than a wedged process: a model that wanted longer says so,
+and a command nobody bounded would hold an agent node until §9.2's own deadline
+took the whole loop with it.
+
+**`timeout:`, `env:` and `inherit_env:` are `builtin.bash`'s alone.**
+`builtin.files` reads and writes through the runtime itself and forks nothing, so
+a command bound and a child environment there would be keys with nothing to do
+(D50); each is an unknown key on `builtin: files`. `timeout:` bounds one command,
+and §9.2's node-level `timeout:` bounds the whole agent node — the two compose
+rather than replace one another. `env:` is the `exec:` block's `env:` exactly,
+and `inherit_env:` defaults to **false**: a built-in's children see the variables
+the binding declared and nothing else, which is what keeps a placement's
+environment manifest the whole answer (PRD resolved q41). `inherit_env: true` is
+the explicit opt-in for the machines where inheriting is the point.
 
 **Empty result schema.** `output: {}` (legal at every result surface except an
 agent's, §3.9) declares a tool with no result: stdout, the response body, or the
@@ -7328,101 +7378,22 @@ where a server tool and a client tool sit under one key, a Responses built-in is
 addressed by its `type` while a function tool carries a `name`, and no table
 could say what a gateway keys its vocabulary on. *PRD 5.9, resolved q30.*
 
-### D123. A built-in is one `tools:` entry carrying its own bounds
+### D123. A built-in is one `tools:` entry carrying its own bounds — superseded by D135
 
-The four runtime built-ins (§5.5) are attached from an agent's `tools:` list, one
-name per entry, spelled as a **single-key mapping** whose key is the built-in's
-address and whose value is the bounds that address requires — `root:` on all
-four, and `timeout:` on `builtin.bash` as well:
+**Superseded.** This entry recorded PRD resolved q31's four-tool set
+(`builtin.bash`, `builtin.read_file`, `builtin.write_file`, `builtin.list`),
+attached as single-key mappings carrying a mandatory `root:` and, on the shell, a
+mandatory `timeout:`. PRD resolved q54 replaced that set with `builtin.bash` and
+`builtin.files` and moved the bounds onto a `tool.*` definition, where every other
+implementation writes them
+([D135](#d135-a-builtin-binding-hands-the-model-the-program-and-says-so)).
 
-```yaml
-tools:
-  - tool.repo_grep
-  - builtin.read_file: { root: "${WORKSPACE}" }
-  - builtin.bash:      { root: "${WORKSPACE}", timeout: 30s }
-```
-
-**Rationale**. PRD resolved q31 fixes three things this spelling has to carry at
-once, and they pull against the shapes that would otherwise be obvious. The
-opt-in is "one tool name at a time … never ambient, and never a single switch
-that grants the set, because *which capabilities does this agent hold* must be
-readable off the node that holds them"; the bounds are mandatory; and the set is
-closed and named. A key of its own — `builtins: [bash, read_file]` — would answer
-the first and lose the second, because a list of names has nowhere to put a root,
-and every alternative that puts the roots somewhere else (a sibling `builtin_
-root:`, a block above the list) separates the capability from its bound by
-exactly the distance a reader has to close to answer the only question that
-matters about it. Putting the bounds *in the entry* is what makes the answer
-local: the line that grants `bash` is the line that says where it runs and for
-how long.
-
-**The entry is where it is because the wire is one array.** A built-in is offered
-to the model beside the agent's `tool.*`s and its stores' synthesized tools —
-§11.5's one-name-one-tool rule reaches it unchanged, and a `tool.bash` on the same
-agent is a collision — so a second list would have made "what is this agent
-offered" a question with two places to look and one of them able to contradict
-the other. It also settles the ordering with no new rule: entries reach the wire
-in the order `tools:` declares, then the stores'.
-
-**Why a single-key mapping rather than a discriminator object.**
-`{ builtin: bash, root: … }` was the other candidate and reads worse in exactly
-the place this decision is about: the name of the capability stops being the
-entry's subject and becomes one field of it, three characters from a `root:` that
-looks like a sibling rather than a bound. The mapping form also gives the
-published schema a precise shape with no `if`/`then` — four named properties,
-`additionalProperties: false`, `minProperties`/`maxProperties` of 1 — so "one
-name at a time" is enforced by an editor before `validate` ever runs, and each
-name's own bounds are checked against its own row (Appendix B).
-
-**`root:` is required on `builtin.bash` too**, though q31 introduces it as the
-file tools'. The headline is "bounded by a mandatory root and a timeout", and a
-shell whose working directory defaulted to wherever the runtime happened to be
-started would be the ambient capability the whole decision refuses — read off no
-entry, different on a developer's machine and a deployment's.
-
-**Required means non-empty**, on all four, for exactly that reason and in two
-places. `root: ""` is a compile error, because it is a key present and a bound
-absent — `""` resolves to the process's own working directory, so an entry
-spelling it would grant precisely the ambient capability the paragraph above
-refuses, while *looking* bounded to a reader. And because the value is
-interpolable, the same hole is reachable through an environment variable that is
-set and empty: `${WORKSPACE}` satisfying the presence check of PRD 5.9 with
-nothing in it. The parser cannot see that one, so the runtime refuses an empty
-*resolved* root as an execution failure, under §9 like every other bound the
-call could not honour. One rule, checked wherever it can be broken. `timeout:` is
-required rather than defaulted for the same reason and with the same words: "a
-model holding bash is arbitrary code execution on the host running the graph,
-which is why every bound here is explicit". A default is a bound nobody wrote and
-nobody read.
-
-`timeout:` is **illegal on the file tools** rather than accepted and ignored,
-which is [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)'s
-rule reaching the smallest surface it has: there is no command there to bound, and
-a key that did nothing would teach a reader that the file tools were bounded in
-time when they are not. `root:`, by contrast, is one key with one meaning on all
-four — the directory this tool may not leave — which is what lets an author read
-four entries sharing a `${WORKSPACE}` as one grant.
-
-**What the bounds are not.** Neither is a parameter: the model names a `path:` and
-a `command:`, never a root and never a deadline, because a model that could widen
-its own bound would not be bounded. And a built-in takes no `retry:`/`timeout:`/
-`on_error:` of its own, exactly as a `tool.*` definition does not
-([D25](#d25-tool-defs-require-description-input-and-output-and-exactly-one-binding),
-§6.2): policy is a property of the use site, and the use site here is the agent
-node, whose §9.2 deadline bounds the whole loop that a `timeout:` bounds one
-command of.
-
-**Failure, refusal, trace and journal are all borrowed rather than invented.** A
-call the argument schema refuses bounces back to the model
-([D119](#d119-a-refused-tool-call-returns-to-the-model-and-a-failed-one-ends-the-node));
-a root escape, a nonzero exit, a timeout kill and a missing shell are execution
-failures that end the node under §9. The trace records a built-in call as the
-`ToolCallRecord` it is, with the built-in's address as the target and, per
-`docs/trace.md` §11, no result; the journal records the answer in full, so a
-resumed execution consumes a recorded `bash` instead of running it a second time
-(`docs/durability.md` §3.2). That last one is the property that makes a built-in
-worth having over a hand-rolled `exec:` tool at all — it is the same property,
-reached with none of the boilerplate. *PRD 5.5, 5.12, resolved q31, G3.*
+What survives, restated there rather than repeated here: the opt-in is per agent
+and read off the entry that holds it; the built-in set is closed and grows by
+resolution; a built-in's name reaches the model on the same `tools` array its
+`tool.*`s and store tools do, so §11.5's one-name-one-tool rule covers it; and
+failure, refusal, trace and journal are all borrowed from the surfaces a tool call
+already has rather than invented. *PRD 5.5, 5.12, resolved q31, q54, G3.*
 
 ### D124. A built-in's deadline kills the command's process group, not just the shell
 
@@ -7431,18 +7402,23 @@ reached with none of the boilerplate. *PRD 5.5, 5.12, resolved q31, G3.*
 cancelled run — and so does a stop signal delivered to the process running the
 graph while a command is in flight.
 
-**Rationale**. §5.5 promises that a command which outruns its `timeout:` "is
-killed", and the bound is one of the two things q31 says a built-in *has*: "a
+**Rationale**. §5.5 promises that a command which outruns its `timeout:` is
+killed, and the bound is one of the two things q31 says a built-in *has*: "a
 model holding bash is arbitrary code execution on the host running the graph,
 which is why every bound here is explicit". A kill aimed at the shell's own pid
 does not keep that promise, because the shell is almost never where the work is.
 `bash -c 'npm run build'` forks; so does a pipeline, a subshell, a command list.
 Kill the shell and every one of those children keeps running — and keeps writing
-inside the `root:` the attachment bounded it to — while the graph has already
-reported the call as failed and moved on. With `retry: 2` that is two generations
-of one command writing one root with the composition believing exactly one is
-live; with `on_error: skip` it is a downstream node reading files a "killed"
-command is still producing. The bound would be a message rather than a fact.
+inside the `workspace:` the binding bounded it to — while the model has already
+been told the command was killed.
+
+**And here the loop goes on**, which is what makes the orphan worse rather than
+better: a spent `timeout:` comes back as the call's *result* and the node does
+not end (§5.5), so the model's next command runs in the same workspace beside the
+one the deadline was supposed to have ended, and reads what it is still writing.
+A node `retry:` opens a third shell beside both, and `on_error: skip` leaves a
+downstream node reading files a "killed" command is still producing. The bound
+would be a message rather than a fact.
 
 **What this costs and why it is worth it.** A detached command is out of the
 **terminal's** reach as well as the shell's: its group is no longer the
@@ -7466,15 +7442,20 @@ and syscall isolation §5.5 defers there. The runtime stops **reading** what suc
 process holds rather than waiting on it, so the call is still bounded even when
 the process is not.
 
-**The same rule inside this process.** `builtin.list` is the one built-in whose
-work is the runtime's own — a walk over a directory the model named, matching a
-glob the model wrote — and both of those size it. An abort stops that walk where
-it is, for the reason it kills a process group: an activity the graph has stopped
-*waiting* for is not an activity that may go on working, and a compiled graph is
-embedded code, so a listing left running is a core taken from every other
-execution in the same process. The walk also hands the event loop back as it
-goes, because a deadline is a timer and a timer cannot fire inside work that
-never yields. *PRD resolved q31, §5.5, §9.2.*
+**The other built-in has no group to kill, and is bounded another way.**
+`builtin.files` forks nothing — it reads and writes through the runtime itself,
+which is why §6.1 gives it no `timeout:` at all — so what could run away inside
+this process is not a child but an *allocation*: the path is the model's, and a
+`view` of a very large file would pull it whole into a process that is running
+every other execution too. So the file tool is sized rather than deadlined: a
+directory is listed one level deep rather than walked, and a read stops at a
+bound this runtime sets. A `view` past it answers with the front of the file and
+says so; an edit past it is refused outright, because `str_replace` and `insert`
+write back what they read and a truncated read there would truncate the file
+rather than the answer. Both bounds are the same statement this decision makes
+about a process group, made about memory: a compiled graph is embedded code, and
+work no one is waiting for is a resource taken from every other execution beside
+it. *PRD resolved q31, q54, §5.5, §6.1, §9.2.*
 
 ### D125. Inbound `auth:` is one scheme per trigger, with env-ref secrets
 
@@ -8072,6 +8053,97 @@ what it spends (resolved q41, [`docs/distributed.md`](distributed.md) §9.1).
 
 ---
 
+### D135. A `builtin:` binding hands the model the program, and says so
+
+`builtin:` is the fifth implementation binding (§6.1), taking `bash` or `files`
+and, beside it, the bounds it runs under: `workspace:` on both, and `timeout:`,
+`env:` and `inherit_env:` on the shell. The same two tools are attachable
+directly from an agent's `tools:` list as `builtin.bash` and `builtin.files`,
+which is the same tool under every default. `input:` and `output:` are compile
+errors on such a tool; `description:` is optional.
+
+**Rationale.**
+
+*Why this is a binding rather than a fifth kind of thing.* PRD resolved q54's
+doctrine is that the agent **node's** boundary is the contract — `input:` in, an
+`output:` schema out, `max_tool_iterations` bounding the loop, the trace at the
+edges — and that a model which cannot adapt inside that boundary pushes the work
+back onto a person. What a built-in changes is named rather than hidden: every
+other binding fixes *what runs* at build time and lets the model fill
+schema-validated parameters, while this one has the model **author the program at
+run time**. That is the trust level `exec:` already extends to author-arbitrary
+binaries, extended to the model — so it belongs beside `exec:` in the one place a
+reader already looks to answer "what does this tool run", and the docs and `plan`
+output say what it is rather than burying it.
+
+*Why the bounds moved off the `tools:` entry.* D123 put them there, and the
+reason it gave — that the line granting `bash` should be the line saying where it
+runs — is right about one agent and wrong about two. A workspace and a command
+deadline are configuration, and configuration attached to a use site cannot be
+shared: two agents working in the same checkout had to write the same bounds
+twice, and a third that got one of them wrong looked identical. On a `tool.*` the
+bounds are written once, named, referenced by address, and reported by `plan` as
+a definition changing rather than as an agent's list changing. The shorthand is
+what is left of D123's locality argument, and it is enough of it: an entry
+granting a built-in still says which capability it grants, and now it also says —
+by carrying no bounds — that the tool takes the defaults.
+
+*Why the keys sit beside `builtin:` rather than under it.* The other four
+bindings nest because they have something to nest: a command and its arguments, a
+method and its URL. A built-in has a name and two or four bounds, and no
+contract; `builtin: { name: bash, workspace: … }` would be a level of indentation
+whose only content is a name this compiler already fixed.
+
+*Why the set is two, and closed.* `builtin.files` is one tool rather than three
+because that is what the trained wire surface is: on the Messages wire these go
+out as the provider-defined `bash_*` and `text_editor_*` tool types, whose
+parameter names a model has been trained to fill, and splitting the editor into
+`read_file`/`write_file`/`list` would mean declaring our own schemas against a
+model that has already learned another's. The set stays closed for the reason
+q31 gave and q54 restates: what these tools grant is a decision with a record.
+
+*Why the name is the provider's.* A provider-defined tool type dictates the name
+it is called under — `bash`, `str_replace_based_edit_tool` — so a configured
+built-in is **not** offered under its definition key. That makes `tool.sandbox`
+and a `tool.bash` beside it one tool on the model's side, which §11.5's rule
+already refuses; the only new thing is which name the rule compares.
+
+*Why `input:`/`output:` are errors rather than ignored.* A tool's declared
+contract is what its arguments are parsed against and what its result is validated
+with. A built-in's are this compiler's, so a declared one would be either a
+contradiction the validator has to rank or a document nothing reads — the
+silently-inert key [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)
+refuses, at the widest surface it has. `description:` survives because it is
+prose and not contract: the compiler's text is accurate and an author's can be
+sharper ("the repository checkout under review").
+
+*Why only one of §6's two surfaces takes it.* The same sentence, read one step
+along: a `function:` node and a `map` dispatch are the surfaces where the
+**composition** writes the arguments, and it writes them against a declared
+`input:`. A built-in has none, so a node naming one has nothing to bind, nothing
+to read back, and no model in the loop to have authored the program — which is
+the whole of what this binding is. It is refused by the validator rather than
+left to the emitter, which writes no function for a built-in at all: unchecked,
+the spec compiles to a project calling a function nothing defines, and a
+composition `validate` accepted would fail at `tsc`. This is the rule §6.1 states
+and `check/bindings.rs` decides.
+
+*Why `inherit_env:` defaults to false.* A built-in's children are the one place a
+composition's environment can leak wholesale, and a placement's environment
+manifest (PRD resolved q41) is only the whole answer if the children read nothing
+the manifest did not name. Scrubbed is therefore the default and inheriting is
+the opt-in, which inverts what a bare `child_process.spawn` would do — deliberately,
+because the machines where inheriting is the point are the ones whose authors know
+they want it.
+
+*What is still not bounded.* The workspace and the timeout, and nothing else: the
+tools run with the privileges of the process running the graph. Container and
+syscall isolation stay PRD §13's deferred row, stated here rather than implied,
+and an agent holding built-in tools joins the executes-in closure exactly as one
+holding `exec:` tools does — so a placed agent runs model-authored commands on the
+worker, which is what those placements are for. *PRD 5.5, 5.12, resolved q41,
+q45, q54, G3.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -8093,7 +8165,9 @@ It is necessarily **looser** than `agent-compose validate`, which is the
 authority. The schema cannot see across files, so it does not check:
 
 - reference resolution or reference typing (`model.smart` existing, and being a
-  model);
+  model) — including which *implementation* a referenced tool carries, so a
+  `function:` node or a `map` dispatch naming a `builtin:` tool, which no node
+  may call (§6.1, D135), is the validator's;
 - singleton-section cardinality across files, or duplicate addresses;
 - whether `version:` is present in a file that turns out to be the entrypoint
   (it is required whenever `imports:` or a deploy section is present, which is
@@ -8171,13 +8245,18 @@ absence of any `context:` key, which is a `flow:` node's alone because a
 dispatch's history isolation is unconditional (rule 13, D105) —
 the field-map-only `input:` on the node kinds that name their
 fields (§8.0, D88), the non-empty `expect_exit`/`expect_status` lists (§6.1), the
-direct-XOR-route split on model definitions (§12.2), the built-in entries of an
-agent's `tools:` — one name per entry over the closed four, `root:` required on
-every one of them and `timeout:` required on `builtin.bash` and refused on the
-file tools (§5.5, D123), which is an `if`/`then` keyed on the entry's own
-*type* rather than on a sibling literal: a string is an address and a mapping is
-a built-in, so an editor underlines the missing `root:` rather than reporting
-that the entry is neither kind of thing — the `human` timeout/route
+direct-XOR-route split on model definitions (§12.2), the shape of an agent's
+`tools:` entries — every entry a **string**, either a `tool.*`/`flow.*` address
+or one of the two built-in shorthands as a closed enum, so a mapping entry is
+refused outright and a misspelled `builtin.*` is underlined against the two
+names (§5.5, D135) — and, on a tool definition, the `builtin:` binding beside
+the other four in the same `oneOf`, with the three conditionals its bounds carry:
+`input:`/`output:` refused on a built-in and required on every other binding,
+`workspace:`/`timeout:`/`env:`/`inherit_env:` legal only where `builtin:` is
+written, and the last three refused on `builtin: files`, which forks nothing to
+bound (§6.1, D50, D135) — each an `if`/`then` on a sibling literal in the same
+object, so an editor underlines the key that does not belong rather than
+reporting that the definition is no kind of tool — the `human` timeout/route
 pairing (§8.7) and the absence of node-level `timeout:`/`retry:` on a `human`
 node (§8.7, D52 — the other two levels of that exemption are resolution
 semantics, with nothing to reject), the `fail`/`skip`-only `on_error:` in
@@ -8253,18 +8332,22 @@ agent.<name>:
   prompt: <text>                    # required
   output: <field map>               # required
   input: <field map>                # optional (default string-in)
-  tools:                            # references, and built-ins with their bounds
+  tools:                            # addresses, built-in shorthands included
     - tool.<t> | flow.<f>
-    - builtin.read_file: { root: <dir> }        # also write_file, list
-    - builtin.bash:      { root: <dir>, timeout: <dur> }
+    - builtin.bash | builtin.files    # every default; bounds live on a tool.*
   stores: [store.<s>]
   max_tool_iterations: <int>        # default 8
 
 tool.<name>:
-  description: <text>               # required, LLM-facing
-  input: <field map>                # required
-  output: <field map>               # required
-  exec|http|function: {...}         # exactly one
+  description: <text>               # required, LLM-facing (optional on builtin:)
+  input: <field map>                # required (refused on builtin:)
+  output: <field map>               # required (refused on builtin:)
+  exec|http|function|module: {...}  # exactly one of these five bindings
+  builtin: bash|files               # …and its bounds sit beside it:
+  workspace: <dir>                  #   both; default: the execution's own
+  timeout: <dur>                    #   bash only
+  env: { NAME: <value> }            #   bash only
+  inherit_env: <bool>               #   bash only, default false
 
 flow.<name>:
   description: <text>               # required when used as a tool

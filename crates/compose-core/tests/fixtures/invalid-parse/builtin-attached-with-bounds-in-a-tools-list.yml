@@ -1,0 +1,13 @@
+# rule: a built-in's bounds are written on a `tool.*` definition, not inline in
+# rule: an agent's `tools:` list (grammar 5.5, 6.1, D135)
+# code: wrong-type
+# message: `builtin.bash` carries no bounds in a `tools:` list
+# at: 11:7
+# help: a built-in is configured on a `tool.*` definition and attached by its address — `tool.sandbox: { builtin: bash, workspace: ./work, timeout: 120s }`, then `- tool.sandbox` — so one configuration serves every agent that attaches it; `- builtin.bash` on its own attaches it under its defaults (grammar 5.5, 6.1)
+agent.reviewer:
+  model: model.smart
+  prompt: Review the draft.
+  tools:
+    - builtin.bash: { workspace: "./work", timeout: 30s }
+  output:
+    verdict: { enum: [approve, revise] }

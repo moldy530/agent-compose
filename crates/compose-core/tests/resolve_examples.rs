@@ -81,8 +81,8 @@ fn snapshot_triage_fanout_ir_under_staging() {
 fn examples_resolve_with_every_file_they_read() {
     for (project, target, expected) in [
         ("examples/review-loop", "local", 8),
-        ("examples/triage-fanout", "local", 15),
-        ("examples/triage-fanout", "staging", 15),
+        ("examples/triage-fanout", "local", 16),
+        ("examples/triage-fanout", "staging", 16),
     ] {
         let entrypoint = repo_root().join(project).join("main.yml");
         let resolution = resolve_with_target(&entrypoint, target);
