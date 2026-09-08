@@ -417,6 +417,14 @@ bearing: what one model behind a gateway refuses says nothing about the model
 beside it, and what a gateway refuses says nothing about the vendor endpoint
 serving the same model name.
 
+A proxy that **relays** the refusal it got upstream is read the same way. Behind
+a gateway you rarely see the service's own envelope: what comes back is the
+gateway's exception class or vendor label with the upstream sentence inside it —
+`litellm.BadRequestError: AnthropicException - {"…":"output_config: Extra inputs
+are not permitted"}`. What decides the ladder is the complaint that arrived, not
+the name in front of it, so a proxied deployment ladders exactly as a direct one
+does.
+
 One thing decides the order before any of that, and it is a property of the agent
 rather than of the endpoint — but only on the **Messages** wire. `output_config`
 constrains a decoder over a **closed** schema and refuses one that is not, so an

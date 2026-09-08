@@ -3442,7 +3442,8 @@ fn a_refusal_that_is_not_about_the_mechanism_does_not_ladder() {
 ///     mechanism `text.format` and the top-level parameter that sits inside
 ///     `text`, and `text` is a word every other refusal on that surface is free to
 ///     use: a model that takes no text input, a media type, a sentence pointing
-///     at "the text output" as the remedy for something else. Each of those
+///     at "the text output" as the remedy for something else, and the `text` a
+///     **message** carries, addressed at the path it sits on. Each of those
 ///     clears a word boundary and each says "not supported", and none of them
 ///     says the endpoint lacks `text.format`;
 ///   * the mechanism refused **beside another parameter this same request
@@ -3509,6 +3510,19 @@ fn a_refusal_naming_the_key_as_a_word_or_blaming_another_parameter_does_not_ladd
                     "message": "Unsupported parameter: 'reasoning.summary' is not supported with this model. Use the text output instead.",
                     "type": "invalid_request_error",
                     "param": "reasoning.summary",
+                },
+            }),
+        ),
+        (
+            // Addressed, and at a path whose **last segment** is the key: a
+            // message's own text is not the wire parameter `text.format` sits
+            // inside, however a service spells the address it stopped at.
+            "the word `text` as the tail of another parameter's path",
+            json!({
+                "error": {
+                    "message": "input.3.content.0.text: Extra inputs are not permitted",
+                    "type": "invalid_request_error",
+                    "param": "input.3.content.0.text",
                 },
             }),
         ),
@@ -3635,6 +3649,231 @@ fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
         }),
         json!({ "verdict": "approve", "feedback": "" }),
         "approve",
+    );
+}
+
+/// …and a refusal a **gateway relayed** ladders on the complaint it relayed,
+/// never on the name it put in front of it (PRD §9 resolved q53).
+///
+/// A proxy in front of a vendor endpoint is the deployment this ladder is most
+/// for — running a generation behind the wire it forwards is what a proxy does —
+/// and it does not answer in the upstream service's envelope. It wraps the
+/// refusal it received in its own exception class or vendor label:
+/// `litellm.BadRequestError: AnthropicException - {…}`, `openai.BadRequestError:
+/// …`, `provider.openai: …`.
+///
+/// That prefix is a dotted name in front of a colon, which is spelled exactly
+/// like the address a pydantic dialect writes when it stopped somewhere else in
+/// the request (`messages.3:`). A recognizer that read every such name as an
+/// address would refuse to ladder for every proxied deployment there is, hand its
+/// operator the raw 400, and pair it with a ruling that says there is nothing to
+/// configure — the outcome q53 exists to prevent, at the endpoints most likely to
+/// need it. What settles it instead is the complaint the wrapper carried: it
+/// still **points at** the parameter it was always about, by labelling it or by
+/// naming it after the colon, which is what a key merely quoted inside a sentence
+/// about somewhere else never does.
+///
+/// Every wire and both directions, because neither the wrapper nor the key it
+/// hides is the same twice: the rung refused is the one the endpoint lacks, and
+/// which rung a call starts on is decided before any of it (`flow.loose_review`'s
+/// schema starts it on the forced tool, so the mirror image is reachable at all).
+#[test]
+fn a_capability_refusal_a_gateway_relayed_still_ladders() {
+    let ladders = |project: &str,
+                   flow: &str,
+                   inputs: &[(&str, &str)],
+                   model: &str,
+                   before: &[Outcome],
+                   about: &str,
+                   refusal: Value,
+                   answers: &[Value],
+                   refused: OutputMechanism,
+                   answered: OutputMechanism,
+                   node: &str| {
+        let provider = MockProvider::start().expect("a loopback port");
+        for outcome in before {
+            provider.enqueue(Script::new(model, outcome.clone()));
+        }
+        provider.enqueue(Script::new(model, Outcome::raw(400, refusal)));
+        for answer in answers {
+            provider.enqueue(Script::new(model, Outcome::structured(answer.clone())));
+        }
+
+        let Some(run) = harness::invoke(project, flow, inputs, &provider) else {
+            return;
+        };
+        run.succeeded();
+
+        let recorded = provider.requests();
+        assert_eq!(
+            recorded.len(),
+            before.len() + answers.len() + 1,
+            "{about}: the wrapper is not what the refusal is about, so the same \
+             call went out once more the other way"
+        );
+        assert!(recorded.iter().all(RecordedRequest::is_valid));
+        let pinned = before.len();
+        assert_eq!(
+            [pinned, pinned + 1]
+                .into_iter()
+                .map(|at| recorded[at]
+                    .structured_output
+                    .as_ref()
+                    .map(StructuredOutput::mechanism))
+                .collect::<Vec<_>>(),
+            [Some(refused), Some(answered)],
+            "{about}: the rung the relayed body named is the one that was tried \
+             and dropped"
+        );
+        assert_eq!(
+            run.entries(node)[0]["models"][pinned]["outputMechanism"],
+            answered.as_str(),
+            "{about}: …and the rung that answered is the one the trace names"
+        );
+        assert!(provider.snapshot().is_drained());
+    };
+
+    let review = &[("goal", "ship it"), ("draft", "a draft")][..];
+    ladders(
+        "agent-anthropic",
+        "flow.review",
+        review,
+        SONNET,
+        &[],
+        "a proxy relaying the Messages API's unknown-argument wording",
+        json!({
+            "error": {
+                "message": "litellm.BadRequestError: AnthropicException - {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"output_config: Extra inputs are not permitted\"}}",
+                "code": "400",
+            },
+        }),
+        &[json!({ "verdict": "revise", "feedback": "tighten it" })],
+        OutputMechanism::Native,
+        OutputMechanism::ForcedTool,
+        "review",
+    );
+    ladders(
+        "agent-openai",
+        "flow.review",
+        review,
+        LOCAL,
+        &[],
+        "a proxy relaying Chat Completions' unknown-argument wording",
+        json!({
+            "error": {
+                "message": "openai.BadRequestError: Unrecognized request argument supplied: response_format",
+                "code": "400",
+            },
+        }),
+        &[json!({ "verdict": "approve", "feedback": "" })],
+        OutputMechanism::Native,
+        OutputMechanism::ForcedTool,
+        "review",
+    );
+    ladders(
+        "server-tools",
+        "flow.respond",
+        &[("question", "does it?")],
+        GPT5,
+        // The loop's own turn: prose and no calls, so the next request is the
+        // pinned one this case is about (grammar 5, D51).
+        &[Outcome::text("I have what I need.")],
+        "a vendor label in front of the Responses wire's own wording",
+        json!({
+            "error": {
+                "message": "provider.openai: Invalid parameter: 'text.format' of type 'json_schema' is not supported with this model.",
+                "code": "400",
+            },
+        }),
+        &[json!({ "answer": "the docs say yes" })],
+        OutputMechanism::Native,
+        OutputMechanism::ForcedTool,
+        "ask",
+    );
+    // The mirror image: the rung the relayed body names is the forced tool, and
+    // the ladder runs the other way — the second node then starts on what worked,
+    // which is the memo reading a refusal it only ever saw through a wrapper.
+    ladders(
+        "agent-anthropic",
+        "flow.loose_review",
+        &[("goal", "ship it")],
+        SONNET,
+        &[],
+        "a proxy relaying the newest generation's forced-tool removal",
+        json!({
+            "error": {
+                "message": "litellm.BadRequestError: AnthropicException - {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"tool_choice: type \\\"tool\\\" and \\\"any\\\" are not supported for this model.\"}}",
+                "code": "400",
+            },
+        }),
+        &[
+            json!({ "verdict": "revise", "detail": { "headline": "it slips" } }),
+            json!({ "verdict": "approve", "detail": { "headline": "it holds" } }),
+        ],
+        OutputMechanism::ForcedTool,
+        OutputMechanism::Native,
+        "review",
+    );
+}
+
+/// …and the same wrapper does **not** turn a complaint about somewhere else in
+/// the request into a mechanism refusal (PRD §9 resolved q53).
+///
+/// The other side of the case above, and the one that decides how far reading
+/// past a wrapper is allowed to go. What re-qualifies a relayed body is that the
+/// complaint inside it **points at** the mechanism's key; a body that points
+/// somewhere else and merely *quotes* the key on its way past is the family the
+/// address disqualifier exists for, wrapper or no wrapper. Both cases here would
+/// ladder under a rule that re-qualified on any mention:
+///
+///   * a **setting** refused at its own address, naming `output_config` as the
+///     remedy — the run has one `settings:` key to drop, which is the opposite
+///     of an endpoint with nothing to configure;
+///   * q52's rule as a strict gateway relays it. This is the one that must not
+///     move: the closing turn is composed above the mechanism, so a runtime that
+///     had regressed it would carry the same illegal conversation to the other
+///     rung, be refused again, and report an endpoint carrying neither mechanism
+///     — sending its operator to the endpoint to look for this project's bug.
+#[test]
+fn a_relayed_complaint_about_another_part_of_the_request_still_does_not_ladder() {
+    let unladdered = |about: &str, body: Value| {
+        let provider = MockProvider::start().expect("a loopback port");
+        provider.enqueue(Script::new(SONNET, Outcome::raw(400, body)));
+
+        let Some(run) = harness::invoke(
+            "agent-anthropic",
+            "flow.review",
+            &[("goal", "ship it"), ("draft", "a draft")],
+            &provider,
+        ) else {
+            return;
+        };
+        run.failed();
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "a relayed 400 about {about} is not a mechanism this endpoint lacks, \
+             so the call ended where it always did — no retry"
+        );
+    };
+
+    unladdered(
+        "a setting at its own address, with the mechanism named as the remedy",
+        json!({
+            "error": {
+                "message": "litellm.BadRequestError: AnthropicException - {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"thinking.budget_tokens: Extra inputs are not permitted. Use `output_config` instead.\"}}",
+                "code": "400",
+            },
+        }),
+    );
+    unladdered(
+        "the shape of the conversation",
+        json!({
+            "error": {
+                "message": "litellm.BadRequestError: AnthropicException - {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.3: This model does not support assistant message prefill. The conversation must end with a user message when `output_config` asks for structured output.\"}}",
+                "code": "400",
+            },
+        }),
     );
 }
 

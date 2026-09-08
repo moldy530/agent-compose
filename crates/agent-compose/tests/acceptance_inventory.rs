@@ -303,9 +303,11 @@ const CODEGEN: &[Criterion] = &[
             // direction and what the memo is keyed by, the endpoint that carries
             // neither, the refusals that must **not** ladder (including the two
             // whose other rung would have *worked*, which is the way of being
-            // wrong that hides itself) and the borderline wordings that must, the
-            // native mechanism's own reading path, and resolved q52's closing
-            // turn surviving both shapes.
+            // wrong that hides itself) and the borderline wordings that must —
+            // among them the bodies a **proxy relayed** under its own name, which
+            // is what most deployments of a gateway a generation behind the wire
+            // actually answer with — the native mechanism's own reading path, and
+            // resolved q52's closing turn surviving both shapes.
             (
                 "a_structured_output_call_records_the_mechanism_that_answered_it",
                 Status::Live,
@@ -336,6 +338,14 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends",
+                Status::Live,
+            ),
+            (
+                "a_capability_refusal_a_gateway_relayed_still_ladders",
+                Status::Live,
+            ),
+            (
+                "a_relayed_complaint_about_another_part_of_the_request_still_does_not_ladder",
                 Status::Live,
             ),
             (

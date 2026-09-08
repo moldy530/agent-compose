@@ -2650,8 +2650,9 @@ function blamesAnotherParameter(body: string, keys: readonly string[]): boolean 
 }
 
 /**
- * Whether `body` names `key` as **the key itself**, rather than carrying those
- * letters inside a longer word or a longer path.
+ * Every position where `body` spells `key` as **the key itself** — not those
+ * letters inside a longer word, and not a segment of a longer path — offered to
+ * `accept` until one of them takes it.
  *
  * A refusal is prose with a parameter name in it, so the recognizer reads it as
  * a substring — but a substring test alone answers "yes" to `text` inside
@@ -2674,27 +2675,42 @@ function blamesAnotherParameter(body: string, keys: readonly string[]): boolean 
  * nothing will look at again. The other direction of being wrong costs a
  * request; this one costs the bug.
  *
- * And where the key is a **word** as well as a key ([`WORD_SHAPED_KEYS`]), a word
- * boundary is not enough on its own: the body has to name it the way a service
- * names a parameter ([`namedAsParameter`]).
+ * A key that is also an ordinary word ([`WORD_SHAPED_KEYS`]) is held to one more
+ * thing here, and only it: it may not be the **tail** of somebody else's path.
+ * `messages.3.content.0.text` is a message's own text, and a complaint addressed
+ * there says nothing about the Responses wire's `text` — where the distinctive
+ * spellings are the opposite case, because a path that *ends* at one of those is
+ * that parameter addressed under a root a service chose to name
+ * (`body.response_format: Extra inputs are not permitted`).
  *
  * `body` arrives lowercased, so the character classes are written that way.
  */
-function namesKey(body: string, key: string): boolean {
+function spelled(body: string, key: string, accept: (at: number) => boolean): boolean {
   const identifier = /[a-z0-9_]/;
   const wordShaped = WORD_SHAPED_KEYS.has(key);
   // `charAt` answers `""` off either end, which is not an identifier character —
   // a key at the very start or end of the body is named by it.
   for (let at = body.indexOf(key); at >= 0; at = body.indexOf(key, at + 1)) {
+    const before = body.charAt(at - 1);
     const after = body.charAt(at + key.length);
-    if (identifier.test(body.charAt(at - 1)) || identifier.test(after)) continue;
+    if (identifier.test(before) || identifier.test(after)) continue;
     // …and not the head of a longer path. Only a `.` followed by a segment is
     // one: a key at the end of a sentence is followed by a full stop.
     if (after === "." && identifier.test(body.charAt(at + key.length + 1))) continue;
-    if (wordShaped && !namedAsParameter(body, at, key)) continue;
-    return true;
+    if (wordShaped && before === ".") continue;
+    if (accept(at)) return true;
   }
   return false;
+}
+
+/**
+ * Whether `body` names `key` at all — [`spelled`] as the key itself, and, where
+ * the key is a **word** as well as a key ([`WORD_SHAPED_KEYS`]), named the way a
+ * service names a parameter ([`namedAsParameter`]) rather than used as a word.
+ */
+function namesKey(body: string, key: string): boolean {
+  const wordShaped = WORD_SHAPED_KEYS.has(key);
+  return spelled(body, key, (at) => !wordShaped || namedAsParameter(body, at, key));
 }
 
 /**
@@ -2737,24 +2753,57 @@ const WORD_SHAPED_KEYS: ReadonlySet<string> = new Set(["text"]);
  *   * **quoted on both sides** — `'text'`, `"text"`, `` `text` ``. Both sides is
  *     the load-bearing half: `'text/plain'` opens with the quote and is a media
  *     type;
- *   * **labelled**, `text: …` — the pydantic-shaped address a bare top-level key
- *     arrives as;
- *   * **named after a colon**, `Unrecognized request argument supplied: text` —
- *     OpenAI's way of pointing at the argument it did not know, and so the
- *     wording of the one refusal this entry exists for.
+ *   * …and the two ways of **pointing at** it ([`pointedAt`]) — labelled, and
+ *     named after a colon.
  *
  * Anything else — `text input`, `the text output` — is the word, and a refusal
  * carrying it is about something this ladder has no business moving on.
+ */
+function namedAsParameter(body: string, at: number, key: string): boolean {
+  const quote = /["'`]/;
+  if (quote.test(body.charAt(at - 1)) && quote.test(body.charAt(at + key.length))) return true;
+  return pointedAt(body, at, key);
+}
+
+/**
+ * Whether the run of letters at `at` is the parameter a complaint is **pointed
+ * at**, rather than one a sentence mentions on its way to saying something else.
+ *
+ * The narrow half of [`namedAsParameter`], and the difference is quoting on its
+ * own: a service that puts a parameter's name in quotes mid-sentence is as often
+ * talking *about* it as complaining about it — `` The conversation must end with
+ * a user message when `tool_choice` forces a tool. `` is the sentence that
+ * matters here, and it is not a complaint about `tool_choice`. What a service
+ * does when it means "this is the parameter I am refusing" is put a colon
+ * between the complaint and the name, one way round or the other:
+ *
+ *   * **labelled**, `output_config: Extra inputs are not permitted` — the
+ *     pydantic-shaped address a bare top-level key arrives as;
+ *   * **named after a colon**, `Unrecognized request argument supplied:
+ *     response_format`, `Invalid parameter: 'response_format'` — OpenAI's way of
+ *     pointing at the argument, with or without the quotes it lifts the name out
+ *     of prose with.
  *
  * `slice` off the front of the string answers `""` rather than throwing, so a key
  * at position 0 or 1 is simply not named after a colon.
  */
-function namedAsParameter(body: string, at: number, key: string): boolean {
+function pointedAt(body: string, at: number, key: string): boolean {
   const quote = /["'`]/;
   const after = body.charAt(at + key.length);
-  if (quote.test(body.charAt(at - 1)) && quote.test(after)) return true;
   if (after === ":") return true;
-  return at >= 2 && body.slice(at - 2, at) === ": ";
+  // The colon is in front of the quotes when there are quotes, so the search
+  // starts from the opening one.
+  const opened = quote.test(body.charAt(at - 1)) && quote.test(after);
+  const from = opened ? at - 1 : at;
+  return from >= 2 && body.slice(from - 2, from) === ": ";
+}
+
+/**
+ * Whether the body points a complaint at one of **this mechanism's** keys
+ * ([`pointedAt`]).
+ */
+function pointsAtKey(body: string, keys: readonly string[]): boolean {
+  return keys.some((key) => spelled(body, key, (at) => pointedAt(body, at, key)));
 }
 
 /**
@@ -2764,13 +2813,24 @@ function namedAsParameter(body: string, at: number, key: string): boolean {
  * prefill.`
  *
  * A dotted path in front of a colon is a service saying where in the body it
- * stopped, and nothing else in a refusal looks like one — the bare words a
+ * stopped, and the prose around it does not look like one — the bare words a
  * sentence puts before a colon (`Unrecognized request argument supplied:`,
  * `Invalid parameter:`) carry no dot, and a JSON envelope's own keys are
  * separated from their colon by the closing quote. So the pattern reads the
- * addresses and leaves the prose alone.
+ * addresses and leaves the sentences alone.
+ *
+ * What it cannot tell apart from an address is the **name of whatever answered**:
+ * a gateway that re-wraps the refusal it got from the service upstream prefixes
+ * the whole body with its own exception class or label — `litellm.BadRequestError:
+ * AnthropicException - …`, `openai.BadRequestError: …`, `provider.openai: …` —
+ * and `provider.openai` is spelled exactly like `messages.3`. Reading one as an
+ * address would leave every refusal a proxy relays unladdered, which is the one
+ * deployment q53's ladder is most for. So the disqualifier does not rest on the
+ * pattern alone: a body that **points at** this mechanism's key
+ * ([`addressedElsewhere`], [`pointsAtKey`]) is about this mechanism whatever name
+ * stands in front of it.
  */
-const COMPLAINT_ADDRESS = /(?:^|[^a-z0-9_.])([a-z0-9_]+(?:\.[a-z0-9_]+)+):/g;
+const COMPLAINT_ADDRESS = /(?:^|[^a-z0-9_.])[a-z0-9_]+(?:\.[a-z0-9_]+)+:/g;
 
 /**
  * Whether this refusal is addressed at a place in the request that is **not**
@@ -2794,18 +2854,27 @@ const COMPLAINT_ADDRESS = /(?:^|[^a-z0-9_.])([a-z0-9_]+(?:\.[a-z0-9_]+)+):/g;
  * the family — every other complaint a service walks somewhere else in the
  * request to make.
  *
- * An address that **is** one of this mechanism's spellings settles it the other
- * way immediately, and a body with no address at all is left to the rest of the
- * recognizer: OpenAI's dialect names the parameter after the phrase rather than
- * in front of a colon, so most capability refusals address nothing.
+ * A body that **points at** this mechanism's key settles it the other way before
+ * any of that ([`pointsAtKey`]) — the key labelled as the address itself
+ * (`output_config: Extra inputs are not permitted`) or named as the argument the
+ * complaint is about (`Unrecognized request argument supplied: response_format`).
+ * That is what keeps a **re-wrapped** refusal readable: a gateway relaying the
+ * upstream service's words puts its own dotted name in front of them
+ * ([`COMPLAINT_ADDRESS`]), and the complaint it carried still points where it
+ * always pointed. A key merely *quoted* in a sentence is not that, which is the
+ * whole of the difference between the two bodies this function has to separate:
+ * `` messages.3: … when `tool_choice` forces a tool. `` mentions the key on its
+ * way to complaining about somewhere else.
+ *
+ * A body with no address at all is left to the rest of the recognizer: OpenAI's
+ * dialect names the parameter after the phrase rather than in front of a colon,
+ * so most capability refusals address nothing.
  */
 function addressedElsewhere(body: string, keys: readonly string[]): boolean {
-  let addressed = false;
-  for (const match of body.matchAll(COMPLAINT_ADDRESS)) {
-    if (keys.includes(match[1])) return false;
-    addressed = true;
-  }
-  return addressed;
+  if (pointsAtKey(body, keys)) return false;
+  // `match` over a global pattern answers every address or `null`, and keeps no
+  // `lastIndex` between calls the way `test` would.
+  return body.match(COMPLAINT_ADDRESS) !== null;
 }
 
 /**
