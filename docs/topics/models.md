@@ -412,7 +412,10 @@ endpoint has never heard of, or the newest Anthropic generation's
 `tool_choice: type "tool" and "any" are not supported for this model.` — makes it
 send the *same* call once more the other way. The rung an endpoint **refused** is
 remembered per provider-and-model for the life of the process, so only the first
-call of a pairing pays that extra round trip.
+call of a pairing pays that extra round trip. Both halves of that key are load
+bearing: what one model behind a gateway refuses says nothing about the model
+beside it, and what a gateway refuses says nothing about the vendor endpoint
+serving the same model name.
 
 One thing decides the order before any of that, and it is a property of the agent
 rather than of the endpoint — but only on the **Messages** wire. `output_config`
@@ -422,6 +425,17 @@ forced tool there. The OpenAI wires send such a schema with `strict: false`,
 which constrains nothing and refuses nothing, so they stay on the native
 parameter. Two agents on one Anthropic model can therefore ask in two different
 ways, and a trace showing exactly that is not a bug.
+
+An agent with `tools:` still **offers** them on the call that asks for its
+output, under either mechanism — the exchange being replayed names them, so the
+request has to declare them, and the provider's own `server_tools:` are on that
+call too. The forced tool pins the answer; the native parameter shapes it without
+forbidding anything. So on the native rung a model can answer that last turn with
+one more tool call instead of the object, and the node then fails with "asked
+for … and the answer carried no structured output", naming
+`stop_reason: tool_use` as what the surface said about why.
+That is a model ignoring a fixed instruction to produce its result, not an
+endpoint that lacks a mechanism — nothing was refused, and nothing laddered.
 
 Nothing else ladders. A 401, a 429, a 5xx, a content refusal and a schema the
 decoder will not compile are refusals about something other than the mechanism,

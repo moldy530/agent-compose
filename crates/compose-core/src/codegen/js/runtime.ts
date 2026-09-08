@@ -2802,6 +2802,22 @@ async function callMessages(
   // put a tool the composition never declared in front of a model that was not
   // asked to call it, and a model that took the invitation would answer with a
   // `tool_use` block the loop above would then dispatch nowhere.
+  //
+  // The **agent's own** tools stay on offer either way, and under the native
+  // rung nothing pins the turn — the posture Chat Completions has had for as
+  // long as it has sent `response_format` (`WIRE-NOTES` (3)), reaching this wire
+  // with `output_config`, where a forced `tool_choice` used to promise that the
+  // turn *was* the pinned call. Neither half of that is free to change here. The
+  // tools cannot be dropped: the history this request replays carries
+  // `tool_use`/`tool_result` blocks, and both surfaces refuse a request naming
+  // tools it does not declare. And `tool_choice: {type: "none"}` beside the
+  // format would forbid the **provider's** server tools with them, which
+  // Decision D122 puts on this very call — a pinned call that runs a web search
+  // and then writes its object is the turn the per-run text split below exists
+  // to read. So a model that answers the closing turn with one more `tool_use`
+  // is left to `callAgent`, which reports it as the absence it is ("asked for
+  // `…` and the answer carried no structured output (`stop_reason: tool_use`)")
+  // rather than as an endpoint that lacks a mechanism — it refused nothing.
   const offered = [
     ...request.tools,
     ...(request.pinned === undefined || native ? [] : [request.pinned]),

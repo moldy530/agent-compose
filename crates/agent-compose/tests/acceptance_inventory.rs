@@ -350,12 +350,18 @@ const CODEGEN: &[Criterion] = &[
                 "a_pinned_messages_turn_carrying_no_object_is_reported_as_no_structured_output",
                 Status::Live,
             ),
-            // …and the turn shape the native rung makes reachable on that wire:
-            // no pin means the pinned call may run a server tool and answer
-            // after it, in two runs of `text`, only the last of which the format
-            // shaped.
+            // …and the turn shapes the native rung makes reachable on that wire,
+            // both of which come of the same thing — that nothing pins the turn.
+            // The pinned call may run a server tool and answer after it, in two
+            // runs of `text`, only the last of which the format shaped; and it
+            // may answer with one more tool call instead of the object, which is
+            // an absence rather than an endpoint that lacks a mechanism.
             (
                 "a_native_answer_after_a_server_tool_is_read_from_the_turns_last_text",
+                Status::Live,
+            ),
+            (
+                "a_native_pinned_call_answered_with_a_tool_call_carries_no_structured_output",
                 Status::Live,
             ),
             (

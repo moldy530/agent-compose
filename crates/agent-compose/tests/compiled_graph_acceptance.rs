@@ -3786,6 +3786,95 @@ fn the_memo_holds_per_endpoint_rather_than_per_model() {
     assert!(vendor.snapshot().is_drained());
 }
 
+/// The **native** rung's pinned call leaves the agent's tools callable, and a
+/// model that calls one instead of answering fails the node the way an absent
+/// object always has (PRD §9 resolved q53).
+///
+/// The posture is the one Chat Completions has had for as long as it has sent
+/// `response_format` (`WIRE-NOTES` (3)), and on the Messages wire it is new: a
+/// forced `tool_choice: {type: "tool"}` was a promise that the turn is the
+/// pinned call, so a closing turn that called something else was unreachable
+/// there. Under `output_config` it is reachable, and this pins what happens —
+/// the same "carried no structured output" the wire's other absences produce,
+/// naming the agent, the output it asked for, and the stop reason.
+///
+/// It is deliberately not closed by sending `tool_choice: {type: "none"}` beside
+/// the native parameter. The tools cannot simply be dropped — the history this
+/// request replays carries `tool_use`/`tool_result` blocks and the Messages API
+/// refuses a request that names tools it does not declare — and forbidding tool
+/// use outright would forbid the **provider's** server tools with them, which
+/// Decision D122 puts on this very call: a pinned call that runs a web search
+/// and then writes its object is the turn `callMessages`' per-run text split
+/// exists to read. The cost of leaving it open is this failure, which is a model
+/// ignoring a fixed instruction to produce its result, reported as such.
+#[test]
+fn a_native_pinned_call_answered_with_a_tool_call_carries_no_structured_output() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The turn that ends the loop: prose, no calls (grammar 5, D51).
+        Script::new(SONNET, Outcome::text("found it")),
+        // …and the closing call answered with one more call instead of the
+        // object. Nothing about it is a refusal: the endpoint accepted the
+        // request and the model answered something this runtime cannot use.
+        Script::new(
+            SONNET,
+            Outcome::tool_calls(vec![ToolCall::new(
+                "lookup",
+                json!({ "query": "one more thing" }),
+            )]),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`agent.researcher` asked for")
+            && failure.contains("the answer carried no structured output"),
+        "the node error names the agent and what it asked for: {failure}"
+    );
+    assert!(
+        failure.contains("stop_reason: tool_use"),
+        "…and what the surface said about why there was none: {failure}"
+    );
+    assert!(
+        !failure.contains("nothing to configure"),
+        "…and not the double-refusal diagnostic, which would say the endpoint \
+         carries neither mechanism when it refused nothing at all: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "the loop's turn and the pinned call, with no retry: an answer this \
+         runtime cannot use is not a mechanism the endpoint lacks"
+    );
+    assert_eq!(
+        recorded[1]
+            .structured_output
+            .as_ref()
+            .map(StructuredOutput::mechanism),
+        Some(OutputMechanism::Native),
+        "…and the call that got it asked the native way, which is the rung this \
+         is about"
+    );
+    assert_eq!(
+        recorded[1].tools,
+        ["lookup"],
+        "the pinned call offers the agent's own tools and pins none of them: {:?}",
+        recorded[1].tools
+    );
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A pinned **Messages** turn that came back as prose fails the node with the
 /// sentence the other wires fail it with (PRD §9 resolved q53).
 ///
