@@ -347,6 +347,10 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             (
+                "a_pinned_chat_completions_turn_carrying_no_object_is_reported_as_no_structured_output",
+                Status::Live,
+            ),
+            (
                 "the_closing_turn_precedes_the_pinned_call_on_both_mechanisms",
                 Status::Live,
             ),

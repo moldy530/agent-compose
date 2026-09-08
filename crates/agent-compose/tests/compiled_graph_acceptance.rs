@@ -3698,6 +3698,80 @@ fn a_pinned_messages_turn_carrying_no_object_is_reported_as_no_structured_output
     );
 }
 
+/// …and so does a pinned **Chat Completions** turn, which is the wire where
+/// prose is reachable without any misbehaviour at all.
+///
+/// The third of the three sibling readings, and the one with an ordinary route
+/// into it. `flow.triage`'s output nests an `optional:` property, so this wire's
+/// `response_format` goes out with `strict: false` — the row
+/// `a_nested_optional_property_costs_the_strict_decoder_and_not_the_parse` pins
+/// — and an unstrict decoder is not constrained by the schema at all, so prose
+/// is a legal answer to it. (So is a gateway that takes `response_format` and
+/// ignores it, which is the endpoint class the ladder exists for.) A
+/// `JSON.parse` here would fail the node with `SyntaxError`, naming neither the
+/// agent, nor the output it asked for, nor what the surface said about why —
+/// and would throw *inside* the journaled model call, recording a call that
+/// answered as one that failed, which a resume would then replay forever.
+#[test]
+fn a_pinned_chat_completions_turn_carrying_no_object_is_reported_as_no_structured_output() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::raw(
+            200,
+            json!({
+                "id": "chatcmpl_prose",
+                "object": "chat.completion",
+                "created": 1_735_689_600,
+                "model": LOCAL,
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "Sorry, I could not triage that." },
+                    "finish_reason": "stop",
+                }],
+                "usage": { "prompt_tokens": 12, "completion_tokens": 9, "total_tokens": 21 },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.triage",
+        &[("report", "the build is red")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`agent.triager` asked for")
+            && failure.contains("the answer carried no structured output"),
+        "the node error names the agent and what it asked for: {failure}"
+    );
+    assert!(
+        failure.contains("stop_reason: stop"),
+        "…and what the surface said about why there was none: {failure}"
+    );
+    assert!(
+        !failure.contains("SyntaxError"),
+        "…rather than the parser's message: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|request| request
+                .structured_output
+                .as_ref()
+                .map(StructuredOutput::mechanism))
+            .collect::<Vec<_>>(),
+        [Some(OutputMechanism::Native)],
+        "…and the call that got it really did ask through `response_format`, \
+         which is the reading path this is about"
+    );
+}
+
 /// Resolved q52's closing user turn is on **both** mechanisms' requests.
 ///
 /// The turn is composed above the wire and above the mechanism — one fixed user

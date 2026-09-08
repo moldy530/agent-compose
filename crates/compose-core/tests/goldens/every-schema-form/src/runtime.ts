@@ -3084,7 +3084,13 @@ async function callChatCompletions(
   });
   // Under the forced function the object is the pinned call's arguments, which
   // `calls` above has already parsed — the same reading the Messages wire's
-  // pinned `tool_use` gets, on the surface that spells it differently.
+  // pinned `tool_use` gets, on the surface that spells it differently. Under
+  // `response_format` it is the message's own content, read through
+  // [`shapedOutput`] for that function's reason: this wire's two rungs have to
+  // report a turn that carried no object the *same* way, and `strict: false` —
+  // which is what an output schema with an `optional:` property gets
+  // ([`strictable`]) — leaves the decoder free to answer in prose, as does a
+  // gateway that takes `response_format` and ignores it.
   const pinnedCall = forced
     ? calls.find((call) => call.name === request.pinned!.name)
     : undefined;
@@ -3096,9 +3102,7 @@ async function callChatCompletions(
         ? null
         : forced
           ? (pinnedCall?.args ?? null)
-          : content === null
-            ? null
-            : (JSON.parse(content) as unknown),
+          : shapedOutput(content),
     stopReason: (choice["finish_reason"] as string | null) ?? null,
     // A refusal is `content: null` beside a stated reason (WIRE-NOTES (3)). The
     // absence of content is what every other branch here sees; the reason is the
@@ -3362,18 +3366,25 @@ async function callResponses(
 }
 
 /**
- * The structured answer a Responses turn's final message carries, or `null`.
+ * The structured answer a turn's assistant **text** carries, or `null` — how
+ * all three wires read the native mechanism (PRD §9 resolved q53).
  *
- * `text.format` shapes that message, so parsing it is parsing what the format
- * constrained — but only the **service** guarantees the shape, and a turn that
- * came back with prose where the schema was asked for is an answer this runtime
- * cannot use rather than a call that failed. So the absence is reported as an
- * absence, which is the same posture the Messages wire has when the pinned
- * `tool_use` block is not in the turn: `callAgent` then names the agent, the
- * output it asked for, and what the surface said about why — a stated refusal,
- * or a `max_output_tokens` cut. A `SyntaxError` thrown from here would name
- * none of those, and would be thrown *inside* the journaled model call, which
- * would record a call that worked as a call that did not.
+ * `output_config`, `text.format` and `response_format` each shape that text, so
+ * parsing it is parsing what the format constrained — but only the **service**
+ * guarantees the shape, and a turn that came back with prose where the schema
+ * was asked for is an answer this runtime cannot use rather than a call that
+ * failed. So the absence is reported as an absence, which is the same posture
+ * every wire has when the pinned `tool_use` / function call is not in the turn:
+ * `callAgent` then names the agent, the output it asked for, and what the
+ * surface said about why — a stated refusal, or a `max_output_tokens` cut. A
+ * `SyntaxError` thrown from here would name none of those, and would be thrown
+ * *inside* the journaled model call, which would record a call that worked as a
+ * call that did not — and a resume would replay that recorded failure forever.
+ *
+ * Prose is reachable without a misbehaving service, too: `strict: false` is what
+ * an output schema the OpenAI decoders cannot close is sent with
+ * ([`strictable`]), and an unstrict decoder is not constrained by the schema at
+ * all.
  */
 function shapedOutput(text: string | null): unknown {
   if (text === null) return null;
