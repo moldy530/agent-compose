@@ -116,6 +116,8 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::codegen::test_support::ir_of;
 
@@ -178,6 +180,83 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
             RESOURCE_ATTRIBUTES.len(),
             "`resourceAttributes` sets {set} attributes and `docs/trace.md` §12.6 documents {}",
             RESOURCE_ATTRIBUTES.len()
+        );
+    }
+
+    /// **§12.5's table is the whole span-attribute set, in both directions.**
+    ///
+    /// The resource attributes above are a *promise* and are held as a list;
+    /// the span attributes are a **rendering** of the trace format, and the way
+    /// they go wrong is quieter: a field added to a record type reaches the
+    /// envelope through the one shape §7 publishes and reaches a collector only
+    /// if somebody also wrote a line in `src/otlp.ts`. Nothing about the export
+    /// fails when that line is missing — every fixture still round-trips,
+    /// because a regenerated expectation agrees with whatever the mapper
+    /// produced — so the omission surfaces as an operator unable to find on a
+    /// collector what the trace file plainly says. `outputMechanism` (§7.5, PRD
+    /// §9 resolved q53 ruling b) is the field that found this hole: it exists to
+    /// be compared *across deployments*, which is the reading a collector is
+    /// for.
+    ///
+    /// So the two sides are read off each other. Every `agentcompose.` key the
+    /// emitted module sets must be a row of §12.5's table — §12.7 lets a reader
+    /// rely on those names, and one nothing documents is one nothing promised —
+    /// and every key the table names must be one the module sets, so a row
+    /// cannot outlive the attribute it describes.
+    #[test]
+    fn the_span_attributes_are_the_documented_ones() {
+        let mut emitted: BTreeSet<&str> = BTreeSet::new();
+        let mut rest = SOURCE;
+        while let Some(at) = rest.find("\"agentcompose.") {
+            let after = &rest[at + 1..];
+            let end = after
+                .find('"')
+                .expect("a string literal in `src/otlp.ts` closes");
+            emitted.insert(&after[..end]);
+            rest = &after[end..];
+        }
+        assert!(
+            !emitted.is_empty(),
+            "`src/otlp.ts` sets no `agentcompose.` attribute at all, which is not \
+             a mapping of `docs/trace.md` §12.5"
+        );
+
+        // The table's **first** column only: the other two are prose, and prose
+        // naming a field is not the document promising an attribute of that name.
+        let document = include_str!("../../../../docs/trace.md");
+        let section = document
+            .split_once("### 12.5 Attributes")
+            .expect("`docs/trace.md` carries §12.5")
+            .1;
+        let section = section
+            .split_once("\n### ")
+            .map_or(section, |(head, _)| head);
+        let mut documented: BTreeSet<&str> = BTreeSet::new();
+        for row in section.lines().filter(|line| line.starts_with('|')) {
+            let cell = row
+                .trim_start_matches('|')
+                .split('|')
+                .next()
+                .unwrap_or_default();
+            documented.extend(
+                cell.split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|held| held.starts_with("agentcompose.")),
+            );
+        }
+
+        let undocumented: Vec<&&str> = emitted.difference(&documented).collect();
+        assert!(
+            undocumented.is_empty(),
+            "`src/otlp.ts` sets {undocumented:?}, which `docs/trace.md` §12.5 does \
+             not name — a collector receives an attribute no reader was told to expect"
+        );
+        let unset: Vec<&&str> = documented.difference(&emitted).collect();
+        assert!(
+            unset.is_empty(),
+            "`docs/trace.md` §12.5 documents {unset:?}, which `src/otlp.ts` sets on \
+             nothing — a row promising an attribute no export carries"
         );
     }
 

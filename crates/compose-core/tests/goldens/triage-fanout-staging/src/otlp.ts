@@ -532,6 +532,18 @@ function modelSpan(
         ? []
         : [integer("agentcompose.model.fallback", call.fallback)]),
       integer("agentcompose.model.failovers", call.failovers.length),
+      // Which of the wire's two ways of asking for an object answered
+      // (`docs/trace.md` §7.5, PRD §9 resolved q53 ruling b). It is on the
+      // pinned call and on no other, so most model spans carry no such
+      // attribute — and it is exported rather than left in the envelope because
+      // the fact it carries is a property of the **endpoint**: two deployments
+      // of one composition answer through different mechanisms, and a collector
+      // is exactly where an operator has both to compare. Leaving it out would
+      // make the one place that fact surfaces the one delivery surface that
+      // dropped it.
+      ...(call.outputMechanism === undefined
+        ? []
+        : [text("agentcompose.model.output_mechanism", call.outputMechanism)]),
     ],
     events,
     links,

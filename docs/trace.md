@@ -823,12 +823,22 @@ recorded, so one written before this field existed carries none — the same
 compatible reading `docs/durability.md` §11.2 gives every field added to a record
 type.
 
+It reaches a **collector** too, as `agentcompose.model.output_mechanism` on the
+model call's span (§12.5). The comparison the field exists for is between two
+deployments, and a collector is where an operator has both; an export that
+carried every other field of the record and not this one would drop the fact on
+the one delivery surface built for reading it.
+
 **This is an addition rather than a change**, under §10.2's first bullet: a field
 added to an existing record type. A reader written against `trace_version` 4 sees
 a key it does not recognize and ignores it, which is what §10.1 already requires
-of it. No version bump, nothing recorded before is recorded differently, and
-§11's exclusions are untouched — the mechanism is a fact about the *request's*
-shape, not about the prompt, the answer, or anything a provider was told.
+of it. The span attribute is the same addition on the other surface, and §12.7
+says so from the reader's side: a reader MUST NOT rely on the absence of an
+attribute the document does not name, so a collector meeting this one for the
+first time is meeting a case it was already told to expect. No version bump,
+nothing recorded before is recorded differently, and §11's exclusions are
+untouched — the mechanism is a fact about the *request's* shape, not about the
+prompt, the answer, or anything a provider was told.
 
 ---
 
@@ -1584,6 +1594,13 @@ Every attribute this export sets is under the `agentcompose.` prefix, except the
 resource attributes of §12.6. The values come from the fields §2 to §7 specify
 and add nothing to them.
 
+This table is the whole set, and that is checked rather than asserted:
+`crates/compose-core/src/codegen/otlp.rs`'s
+`the_span_attributes_are_the_documented_ones` reads every `agentcompose.` key the
+emitted module sets and every one this table names, and fails on either
+direction — an attribute a collector receives that no reader was told to expect,
+or a row promising one nothing sets.
+
 | attribute | on | from |
 |---|---|---|
 | `agentcompose.execution.id` | root | the envelope's `execution_id` |
@@ -1598,13 +1615,14 @@ and add nothing to them.
 | `agentcompose.routing` | entry | the **whole** routing decision (§4), serialized as one JSON string. An OTLP attribute is a scalar or an array of scalars and a routing decision is neither, and PRD 5.3 makes routing data — so it travels losslessly rather than partially |
 | `agentcompose.routing.targets` | entry | the same decision's `targets`, repeated as a string array, because "which way did it go" is the question a collector filters on |
 | `agentcompose.dispatch.carrier` | dispatch | `map` for a record on `dispatches`, `tool` for one on `toolDispatches` |
-| `agentcompose.dispatch.index`, `.target`, `.outcome`, `.route`, `.variant`, and `agentcompose.attempts` | dispatch | the record's own fields |
+| `agentcompose.dispatch.index`, `agentcompose.dispatch.target`, `agentcompose.dispatch.outcome`, `agentcompose.dispatch.route`, `agentcompose.dispatch.variant`, `agentcompose.attempts` | dispatch | the record's own fields |
 | `agentcompose.model` | model call | the `model.*` the agent asked for |
-| `agentcompose.model.served_by`, `.fallback`, `.failovers` | model call | which member answered, its ordinal in the route, and how many refused on the way |
-| `agentcompose.model.member`, `.condition`, `.detail` | failover and refusal events | the refusing member, the `route_on:` condition, and what it said |
-| `agentcompose.tool.name`, `.target`, `.outcome` | tool-call event | the call's own fields |
-| `agentcompose.store`, `.op`, `.effect`, `.via`, `.scope`, `.key`, `.deduped` | store event | the store record's own fields |
-| `agentcompose.human.expires_at`, `.settled` | the two pause events | the pause's budget and how it ended |
+| `agentcompose.model.served_by`, `agentcompose.model.fallback`, `agentcompose.model.failovers` | model call | which member answered, its ordinal in the route, and how many refused on the way |
+| `agentcompose.model.output_mechanism` | model call | §7.5's `outputMechanism` — which of the wire's two ways of asking for an object answered. On the one call per agent node that asked for one, and on no other, so most model spans carry no such attribute |
+| `agentcompose.model.member`, `agentcompose.model.condition`, `agentcompose.model.detail` | failover and refusal events | the refusing member, the `route_on:` condition, and what it said |
+| `agentcompose.tool.name`, `agentcompose.tool.target`, `agentcompose.tool.outcome` | tool-call event | the call's own fields |
+| `agentcompose.store`, `agentcompose.store.op`, `agentcompose.store.effect`, `agentcompose.store.via`, `agentcompose.store.scope`, `agentcompose.store.key`, `agentcompose.store.deduped` | store event | the store record's own fields |
+| `agentcompose.human.expires_at`, `agentcompose.human.settled` | the two pause events | the pause's budget and how it ended |
 
 **What is deliberately not exported.** §11's exclusions hold automatically —
 the mapping's input is the envelope, which never held them — and the mapping adds
