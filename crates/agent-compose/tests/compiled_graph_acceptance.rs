@@ -3574,8 +3574,8 @@ fn a_refusal_naming_the_key_as_a_word_or_blaming_another_parameter_does_not_ladd
 /// …and a refusal that **is** about the mechanism ladders however the service
 /// happened to word it (PRD §9 resolved q53).
 ///
-/// The recognizer's two hard edges, one case each, and both are wordings a
-/// gateway sends rather than inventions:
+/// The recognizer's hard edges, one case each, and every one a wording a gateway
+/// sends rather than an invention:
 ///
 ///   * a capability refusal wearing a schema complaint's clothes — `Invalid
 ///     schema for response_format: json_schema response format is not supported
@@ -3587,7 +3587,15 @@ fn a_refusal_naming_the_key_as_a_word_or_blaming_another_parameter_does_not_ladd
 ///     schema's contents does that;
 ///   * `Unexpected parameter: output_config` — the same family as the
 ///     "unrecognized"/"unknown" spellings already read, in the words a service
-///     that validates against a signature uses.
+///     that validates against a signature uses;
+///   * …and the family neither of those is: a parameter the service **has** and
+///     this deployment will not carry. `output_config: This feature requires the
+///     beta header anthropic-beta: structured-outputs-2025-11-13.` and `Invalid
+///     parameter: 'response_format' is not available on this API version.` say
+///     "not here" without saying "unknown" or "not supported" once, and gating
+///     is the likeliest way a *young* native parameter is refused by the
+///     endpoints q53 is for — a generation behind, or a version behind, the wire
+///     they serve. The forced tool answers both.
 #[test]
 fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
     let ladders =
@@ -3649,6 +3657,34 @@ fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
         }),
         json!({ "verdict": "approve", "feedback": "" }),
         "approve",
+    );
+    ladders(
+        "agent-anthropic",
+        SONNET,
+        "a native parameter this deployment gates behind a beta header",
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "output_config: This feature requires the beta header `anthropic-beta: structured-outputs-2025-11-13`.",
+            },
+        }),
+        json!({ "verdict": "approve", "feedback": "" }),
+        "approve",
+    );
+    ladders(
+        "agent-openai",
+        LOCAL,
+        "a native parameter this API version does not have yet",
+        json!({
+            "error": {
+                "message": "Invalid parameter: 'response_format' is not available on this API version.",
+                "type": "invalid_request_error",
+                "param": "response_format",
+            },
+        }),
+        json!({ "verdict": "revise", "feedback": "one more pass" }),
+        "revise",
     );
 }
 

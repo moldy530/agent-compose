@@ -2448,13 +2448,26 @@ const MECHANISM_KEYS: Readonly<Record<Wire, Readonly<Record<OutputMechanism, rea
 /**
  * What a service says when a **parameter** is one it does not have.
  *
- * Both families the ruling names are here: an unknown key (a gateway a
+ * The two families the ruling names are here: an unknown key (a gateway a
  * generation behind the wire it proxies — `output_config: Extra inputs are not
  * permitted` in the Messages API's pydantic wording, `Unrecognized request
  * argument supplied: response_format` in OpenAI's) and a key the service knows
  * and this model does not take (`tool_choice: type "tool" and "any" are not
  * supported for this model.`, which is how the newest Anthropic generation
  * refuses forced tool use).
+ *
+ * …and a third the ruling did not have to spell, because it is neither of those
+ * and is refused in neither's words: the service **has** the key and this
+ * deployment will not carry it — gated behind a beta header, an API version or an
+ * account flag, or withdrawn again.
+ * `output_config: This feature requires the beta header anthropic-beta:
+ * structured-outputs-2025-11-13.`, `output_config is not available on this API
+ * version.`, `output_config: not enabled for this organization.` Not one of
+ * those carries a phrase from the two families above, and every one of them is a
+ * plain statement that this endpoint does not have the parameter — the most
+ * likely refusal a *young* parameter draws, which the native rung is, from
+ * exactly the deployment this ladder exists for. The forced tool would have
+ * answered all three.
  *
  * Matched case-insensitively as substrings, which is as much as a body written
  * for a person can be held to. Being wrong in the **permissive** direction costs
@@ -2471,6 +2484,7 @@ const MECHANISM_KEYS: Readonly<Record<Wire, Readonly<Record<OutputMechanism, rea
  * remembered as an endpoint that lacks a mechanism.
  */
 const UNSUPPORTED_PARAMETER: readonly string[] = [
+  // A key the service has never heard of.
   "extra inputs are not permitted",
   "unrecognized request argument",
   "unrecognized key",
@@ -2480,8 +2494,20 @@ const UNSUPPORTED_PARAMETER: readonly string[] = [
   "unexpected keyword argument",
   "unknown field",
   "is not a valid parameter",
+  // …a key it has and this model does not take.
   "not supported",
   "does not support",
+  // …and a key it has and this deployment does not carry — gated behind a beta,
+  // an API version or an account flag, or gone. The two beta spellings name the
+  // gate rather than carrying the bare word, which a complaint about something
+  // *inside* the parameter is free to use.
+  "beta header",
+  "requires the beta",
+  "not available",
+  "not yet available",
+  "no longer available",
+  "no longer supported",
+  "not enabled",
 ];
 
 /**

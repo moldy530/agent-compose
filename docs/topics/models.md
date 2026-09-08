@@ -408,7 +408,8 @@ an object under a schema, and they move with model generations:
 
 The runtime prefers the **native** parameter and keeps the forced tool as the
 other rung. A refusal that names the mechanism — a 400 for an argument the
-endpoint has never heard of, or the newest Anthropic generation's
+endpoint has never heard of, one it has but keeps behind a beta header, an API
+version or an account flag, or the newest Anthropic generation's
 `tool_choice: type "tool" and "any" are not supported for this model.` — makes it
 send the *same* call once more the other way. The rung an endpoint **refused** is
 remembered per provider-and-model for the life of the process, so only the first
