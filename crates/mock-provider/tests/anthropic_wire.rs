@@ -483,8 +483,91 @@ fn a_forced_tool_choice_needs_the_conversation_to_end_on_the_user() {
     assert_eq!(snapshot.invalid, 1, "by the second request, not the first");
 }
 
+/// …and so does the **native** mechanism, whose request pins nothing at all
+/// (PRD §9 resolved q53).
+///
+/// The rung the runtime prefers on this wire asks through `output_config`, so an
+/// oracle that only watched the pin would have stopped watching the request that
+/// is now the common one: a ladder that composed its native shape without q52's
+/// closing turn would meet the strict gateway's 400 in a deployment rather than
+/// here. Same history, same pair of runs, the other parameter.
+#[test]
+fn output_config_needs_the_conversation_to_end_on_the_user() {
+    let loop_turns = [
+        json!({ "role": "user", "content": "{\"goal\":\"ship it\"}" }),
+        json!({ "role": "assistant", "content": [
+            { "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "query": "it" } },
+        ]}),
+        json!({ "role": "user", "content": [
+            { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a looked-up snippet" },
+        ]}),
+        json!({ "role": "assistant", "content": [{ "type": "text", "text": "found it" }] }),
+    ];
+    let asked = |messages: Value| {
+        json!({
+            "model": MODEL,
+            "max_tokens": 4096,
+            "system": "You are a meticulous technical reviewer.",
+            "messages": messages,
+            "tools": [
+                { "name": "lookup", "description": "Look one fact up.", "input_schema": { "type": "object" } },
+            ],
+            "output_config": { "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": { "verdict": { "type": "string" } },
+                    "required": ["verdict"],
+                    "additionalProperties": false,
+                },
+            }},
+        })
+    };
+
+    let provider = MockProvider::start().expect("a port");
+    provider.enqueue(Script::new(
+        MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+
+    let refused = send(
+        &provider.client(),
+        &asked(Value::Array(loop_turns.to_vec())),
+    );
+    assert_eq!(refused.status, 400);
+    assert_eq!(refused.header(HARNESS_HEADER), Some(REFUSED_INVALID));
+    let body = refused.json();
+    assert_eq!(
+        body["error"]["message"],
+        "messages.3: This model does not support assistant message prefill. \
+         The conversation must end with a user message when `output_config` \
+         asks for structured output.",
+        "{body}"
+    );
+    assert_eq!(
+        provider.snapshot().queues[MODEL],
+        1,
+        "a refused request consumes nothing"
+    );
+
+    let mut closed = loop_turns.to_vec();
+    closed.push(json!({ "role": "user", "content": "Now produce the structured result." }));
+    let served = send(&provider.client(), &asked(Value::Array(closed)));
+    assert_eq!(served.status, 200);
+    let body = served.json();
+    assert_eq!(
+        body["content"][0]["type"], "text",
+        "the native mechanism answers in the assistant's text: {body}"
+    );
+    assert_eq!(body["content"][0]["text"], "{\"verdict\":\"approve\"}");
+    assert!(
+        provider.snapshot().queues.is_empty(),
+        "the script was taken"
+    );
+}
+
 /// Prefill on its own is **not** refused: it is the Messages API's own feature,
-/// and only a forced `tool_choice` beside it makes the pair a contradiction.
+/// and only a structured-output ask beside it makes the pair a contradiction.
 ///
 /// Without this the rule above would be indistinguishable from "assistant turns
 /// may not end a conversation", which is a different and wrong server.

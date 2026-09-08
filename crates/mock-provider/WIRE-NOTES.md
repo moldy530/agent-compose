@@ -88,13 +88,15 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
   parameter**, and both Azure routes authenticate with an `api-key` header (a
   bearer token is also accepted, for AAD). The newer `/openai/v1/...` route makes
   `api-version` optional — see (7), where the route forms live.
-* **A forced `tool_choice` needs the conversation to end on the user.** A
-  trailing assistant message is the Messages API's *prefill* feature, and prefill
-  under `tool_choice: {type: "tool", …}` contradicts it. `api.anthropic.com`
-  tolerates the pair; strict Anthropic-compatible gateways refuse it with a 400,
-  which is what took a compiled graph down in the field (PRD §9 resolved q52).
-  This server refuses it as they do — see (24) for the sentence, and the runtime
-  closes its tool loop with a fixed user turn so the shape never leaves it.
+* **A request asking for structured output needs the conversation to end on the
+  user.** A trailing assistant message is the Messages API's *prefill* feature,
+  and prefill under `tool_choice: {type: "tool", …}` — or under the
+  `output_config` the other mechanism asks through (PRD §9 resolved q53) —
+  contradicts it. `api.anthropic.com` tolerates the pair; strict
+  Anthropic-compatible gateways refuse it with a 400, which is what took a
+  compiled graph down in the field (PRD §9 resolved q52). This server refuses it
+  as they do — see (24) for the sentences, and the runtime closes its tool loop
+  with a fixed user turn, above the mechanism, so the shape never leaves it.
 * **A pinned tool choice guarantees a call.** Anthropic's `tool_choice: {type:
   "tool", …}` and `{type: "any"}`, OpenAI's forced function and `tool_choice:
   "required"`, and OpenAI's `response_format: {type: "json_schema"}` each make
@@ -810,7 +812,7 @@ shaped answer at all. If it never does, nothing is lost — a single-message tur
 reads identically — and if it does, the alternative is a `JSON.parse` of prose
 thrown inside the journaled model call, which a resume then replays.
 
-### 24. The sentence a forced choice over a prefilled turn is refused with
+### 24. The sentence a structured-output ask over a prefilled turn is refused with
 
 *What is certain*: that strict Anthropic-compatible gateways refuse the shape
 (PRD §9 resolved q52, from a live 0.6.0 field report), and that
@@ -822,17 +824,30 @@ the ladder.
 *What is assumed* is the wording. The gateways answer along the lines of "This
 model does not support assistant message prefill. The conversation must end with
 a user message"; this server says that and names the condition it is refusing
-under, since it accepts prefill wherever no tool is forced:
+under, since it accepts prefill wherever nothing asks for an object:
 
 ```
 messages.<n>: This model does not support assistant message prefill. The
 conversation must end with a user message when `tool_choice` forces a tool.
+messages.<n>: This model does not support assistant message prefill. The
+conversation must end with a user message when `output_config` asks for
+structured output.
 ```
+
+**Both of the wire's structured-output mechanisms are held to it** (PRD §9
+resolved q53). q52's repair is one fixed user turn composed *above* the
+mechanism, so the rule is about the ask rather than about the pin: a check that
+fired only on `tool_choice` would stop watching the rung the runtime now prefers,
+and a ladder that dropped the closing turn while composing its `output_config`
+shape would pass every test in this crate. An `any` or `auto` choice with no
+`output_config` beside it still asks for nothing in particular, and prefill under
+one is the ordinary feature.
 
 *If wrong*: a message, not a verdict. The rule decides what a compiled graph may
 send, and the runtime satisfies it by appending the closing user turn of
 resolved q52 — `a_forced_tool_choice_needs_the_conversation_to_end_on_the_user`
-in `tests/anthropic_wire.rs` locks both halves.
+and `output_config_needs_the_conversation_to_end_on_the_user` in
+`tests/anthropic_wire.rs` lock both halves of each.
 
 ### 25. A provider-defined tool the **client** runs is a client tool
 

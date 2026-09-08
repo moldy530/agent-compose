@@ -29,10 +29,11 @@
 //! * the **tool surface** — names unique and well formed, `input_schema` an
 //!   object schema, and `tools` present whenever a tool block appears anywhere
 //!   in the conversation;
-//! * **prefill against a forced tool** — a request that pins
-//!   `tool_choice: {type: "tool", …}` over a conversation ending on an assistant
-//!   turn, which is the shape strict Anthropic-compatible gateways refuse and
-//!   `api.anthropic.com` happens to tolerate (PRD §9 resolved q52);
+//! * **prefill under a structured-output ask** — a request that pins
+//!   `tool_choice: {type: "tool", …}` or carries `output_config` over a
+//!   conversation ending on an assistant turn, which is the shape strict
+//!   Anthropic-compatible gateways refuse and `api.anthropic.com` happens to
+//!   tolerate (PRD §9 resolved q52, and both mechanisms of resolved q53);
 //! * the **required envelope** — `model`, `messages`, `max_tokens`, the
 //!   `anthropic-version` header, and a JSON content type. Not the *presence* of
 //!   `x-api-key`: a keyless provider behind a gateway is a legal composition and
@@ -545,16 +546,16 @@ fn check_tool_choice(
     }
 }
 
-/// A forced `tool_choice` may not sit on a conversation that ends on the
-/// assistant (PRD §9 resolved q52).
+/// A request that asks for structured output may not sit on a conversation that
+/// ends on the assistant (PRD §9 resolved q52).
 ///
 /// A trailing assistant message *is* the Messages API's prefill feature — "carry
-/// on from here" — and `tool_choice: {type: "tool", name: …}` is "your answer
-/// must be this call". The two contradict each other, and which of them a service
-/// believes is not something a client should have to find out: `api.anthropic.com`
-/// tolerates the pair, and strict Anthropic-compatible gateways (the Bedrock-style
-/// proxies that are the norm in enterprise deployments) refuse it with a 400
-/// naming the shape.
+/// on from here" — and asking for an object under a schema is "your answer must
+/// be this shape". The two contradict each other, and which of them a service
+/// believes is not something a client should have to find out:
+/// `api.anthropic.com` tolerates the pair, and strict Anthropic-compatible
+/// gateways (the Bedrock-style proxies that are the norm in enterprise
+/// deployments) refuse it with a 400 naming the shape.
 ///
 /// This server refuses it **unconditionally**, and that is what an oracle is for.
 /// The class of bug q52 closes reached a live 0.6.0 deployment precisely because
@@ -564,8 +565,16 @@ fn check_tool_choice(
 /// the ladder. A conformance oracle earns its keep by being the strictest wire
 /// the runtime must satisfy, so the leniency is not inherited here.
 ///
-/// Only `type: "tool"` — an `any` or `auto` choice is not a promise about the
-/// next turn's content, and prefill beside it is the ordinary feature.
+/// **Both** of the wire's structured-output mechanisms are held to it (PRD §9
+/// resolved q53). q52's repair is one fixed user turn appended before the output
+/// is asked for, and it is composed above the mechanism — so a rule that fired
+/// only on the pinned tool would stop watching the rung the runtime *prefers*,
+/// and a ladder that dropped the turn on its native shape would pass every test
+/// this file has. The two spellings are the two ways of asking, so the sentence
+/// names whichever one the request used.
+///
+/// A `tool_choice` of `any` or `auto` is not a promise about the next turn's
+/// content, and prefill beside one is the ordinary feature.
 fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
     let forced = body
         .get("tool_choice")
@@ -573,9 +582,16 @@ fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
         .and_then(|choice| choice.get("type"))
         .and_then(Value::as_str)
         == Some("tool");
-    if !forced {
+    // Presence, not shape: a malformed `output_config` is still a request asking
+    // for structured output, and [`check_output_config`] answers its shape.
+    let native = body.contains_key("output_config");
+    let asked = if forced {
+        "`tool_choice` forces a tool"
+    } else if native {
+        "`output_config` asks for structured output"
+    } else {
         return;
-    }
+    };
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return;
     };
@@ -590,7 +606,7 @@ fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
         checker.fail(
             &at("messages", last),
             format!(
-                "messages.{last}: This model does not support assistant message prefill. The conversation must end with a user message when `tool_choice` forces a tool."
+                "messages.{last}: This model does not support assistant message prefill. The conversation must end with a user message when {asked}."
             ),
         );
     }
@@ -2139,9 +2155,49 @@ mod tests {
         );
     }
 
+    /// …and so is the **other** mechanism's shape, which pins no tool at all
+    /// (resolved q53).
+    ///
+    /// The rung the runtime prefers on this wire asks through `output_config`
+    /// and sends no `tool_choice`, so a rule keyed on the pin would have stopped
+    /// watching the request that is now the common one — and a ladder that
+    /// dropped q52's closing turn while composing its native shape would pass
+    /// every other test here. The refusal names the parameter that asked.
+    #[test]
+    fn output_config_over_a_trailing_assistant_turn_is_refused() {
+        let loop_ended = json!([
+            { "role": "user", "content": "{\"goal\":\"ship it\"}" },
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "query": "it" } },
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "a snippet" },
+            ]},
+            { "role": "assistant", "content": [{ "type": "text", "text": "found it" }] },
+        ]);
+        let request = messages(json!({
+            "messages": loop_ended,
+            "tools": [{ "name": "lookup", "input_schema": { "type": "object" } }],
+            "output_config": { "format": {
+                "type": "json_schema",
+                "schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+            }},
+        }));
+        let failures = parse(&headers(), Some(&request)).failures;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].pointer, "messages.3");
+        assert_eq!(
+            failures[0].message,
+            "messages.3: This model does not support assistant message prefill. \
+             The conversation must end with a user message when `output_config` \
+             asks for structured output."
+        );
+    }
+
     /// The same conversation with the closing user turn the runtime now appends
-    /// (resolved q52), and an unpinned request over the old shape: prefill is
-    /// only refused where a forced `tool_choice` contradicts it.
+    /// (resolved q52), on **both** mechanisms, and an unpinned request over the
+    /// old shape: prefill is only refused where a structured-output ask
+    /// contradicts it.
     #[test]
     fn a_forced_tool_choice_over_a_trailing_user_turn_is_accepted() {
         let tools = json!([
@@ -2162,8 +2218,8 @@ mod tests {
         let parsed = parse(
             &headers(),
             Some(&messages(json!({
-                "messages": closed,
-                "tools": tools,
+                "messages": closed.clone(),
+                "tools": tools.clone(),
                 "tool_choice": { "type": "tool", "name": "extract" },
             }))),
         );
@@ -2175,8 +2231,24 @@ mod tests {
             Some("extract".to_string())
         );
 
+        // The native rung over the same closed history: also served, and read as
+        // the structured output it is.
+        let native = parse(
+            &headers(),
+            Some(&messages(json!({
+                "messages": closed,
+                "tools": tools,
+                "output_config": { "format": {
+                    "type": "json_schema",
+                    "schema": { "type": "object", "properties": { "verdict": { "type": "string" } } },
+                }},
+            }))),
+        );
+        assert!(native.failures.is_empty(), "{:?}", native.failures);
+        assert!(native.structured_output.is_some());
+
         // Prefill itself is untouched: an assistant turn to carry on from, with
-        // nothing forcing a call, is the API's own feature.
+        // nothing asking for an object, is the API's own feature.
         let prefill = parse(
             &headers(),
             Some(&messages(json!({
