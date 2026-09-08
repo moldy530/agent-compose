@@ -160,6 +160,17 @@ pub const FIXTURES: &[&str] = &[
 
 /// The `${MOCK_BASE_URL}` every fixture's providers resolve at process start.
 pub const BASE_URL: &str = "MOCK_BASE_URL";
+/// The `${MOCK_TWIN_BASE_URL}` a **second** endpoint resolves
+/// (`agent-anthropic`'s `provider.twin`).
+///
+/// [`environment`] points it at the same server as [`BASE_URL`], because an
+/// `${ENV}` a composition references has to be set or the run is refused before
+/// it starts (PRD 5.9) and every other test of that fixture never reaches the
+/// second provider. The one test that does — two endpoints serving one model id,
+/// which is what the structured-output memo is keyed on (PRD §9 resolved q53) —
+/// overrides this entry with a [`MockProvider`] of its own, and *that* is the
+/// only way two servers can be told apart at all.
+pub const TWIN_BASE_URL: &str = "MOCK_TWIN_BASE_URL";
 /// The `${MOCK_API_KEY}` they send. Any non-empty value: the harness needs no
 /// API keys, but a request still has to carry the header a client sends.
 pub const API_KEY: &str = "MOCK_API_KEY";
@@ -290,6 +301,7 @@ pub fn fixture(name: &str) -> PathBuf {
 pub fn environment(provider: &MockProvider) -> Vec<(String, String)> {
     vec![
         (BASE_URL.to_string(), provider.base_url()),
+        (TWIN_BASE_URL.to_string(), provider.base_url()),
         (API_KEY.to_string(), "mock-provider-key".to_string()),
         (GATEWAY_TOKEN.to_string(), "mock-gateway-token".to_string()),
         (OPS_BIN.to_string(), "/bin".to_string()),

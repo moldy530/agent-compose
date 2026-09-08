@@ -22,7 +22,9 @@
 # string property, so the raw stdout binds to it (grammar 6.1) and the result is
 # the same on every machine.
 #
-# Every provider here declares `base_url: ${MOCK_BASE_URL}`. That is what lets
+# Every provider here declares a `base_url:` that is an env ref — `provider.mock`
+# the shared `${MOCK_BASE_URL}`, `provider.twin` the second address one test
+# points at a server of its own. That is what lets
 # the acceptance harness point a compiled graph at the mock provider without the
 # spec differing between a scripted run and a real one (PRD 5.9: env refs survive
 # unresolved into the IR and resolve at process start), and it is why the fixtures
@@ -71,6 +73,30 @@ provider.mock:
 
 model.smart:
   provider: provider.mock
+  id: claude-sonnet-4-6
+  settings:
+    max_tokens: 4096
+
+provider.twin:
+  # A **second endpoint serving the same model name**, which is the one shape a
+  # single-provider fixture cannot make: an Anthropic-compatible gateway in
+  # front of `claude-sonnet-4-6` beside `api.anthropic.com` in front of
+  # `claude-sonnet-4-6`. What a structured-output mechanism is accepted by is
+  # the endpoint, not the name it serves (PRD §9 resolved q53), so the memo that
+  # remembers a refusal is keyed by both — and only two endpoints under one
+  # model id can tell a memo that holds the pair from one that holds the name.
+  #
+  # `${MOCK_TWIN_BASE_URL}` is its own variable for exactly that reason: every
+  # other fixture provider resolves the single `${MOCK_BASE_URL}`, so a test
+  # that wants two servers needs a second address to point at one.
+  kind: anthropic
+  api_key: ${MOCK_API_KEY}
+  base_url: ${MOCK_TWIN_BASE_URL}
+
+model.smart_twin:
+  # The same `id:` as `model.smart` above, deliberately: two bindings, two
+  # providers, one model name.
+  provider: provider.twin
   id: claude-sonnet-4-6
   settings:
     max_tokens: 4096
@@ -161,6 +187,32 @@ agent.loose_reviewer:
           description: An optional remark — the property that opens the schema.
           type: string
       optional: [aside]
+
+agent.twin_reviewer:
+  description: The reviewer again, on the second endpoint serving the same model.
+  # Identical to `agent.reviewer` in everything except `model:`, which is the
+  # point: what differs between the two nodes of `flow.twin_endpoints` is the
+  # endpoint their calls go to and nothing else.
+  model: model.smart_twin
+  prompt: |
+    You are a meticulous technical reviewer.
+
+    Approve only when the draft fully satisfies the goal. Otherwise ask for a
+    revision and list every required change.
+  input:
+    goal:
+      description: What the draft must accomplish.
+      type: string
+    draft:
+      description: The draft under review.
+      type: string
+  output:
+    verdict:
+      description: The routable decision.
+      enum: [approve, revise]
+    feedback:
+      description: Required changes; empty when approving.
+      type: string
 
 flow.review:
   description: Review one draft and return the verdict.
@@ -350,3 +402,42 @@ flow.mixed_review:
     - { from: start, to: review }
     - { from: review, to: loose_review }
     - { from: loose_review, to: end }
+
+flow.twin_endpoints:
+  description: One model name on two endpoints, asked for its object in turn.
+  # The fixture for the *other* half of the memo's key (PRD §9 resolved q53).
+  # `flow.loose_review` runs two nodes over one endpoint, which is what makes a
+  # remembered refusal observable at all; this runs two nodes over two endpoints
+  # serving one model name, which is what makes a refusal that should **not**
+  # travel observable. The refusing endpoint goes first, so a memo keyed by the
+  # model name alone would already be in place when the second node's call is
+  # composed — and that run still succeeds, on a rung nobody chose, which is why
+  # it takes a fixture rather than an assertion on an existing one.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+    draft:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "input.draft"
+
+    twin_review:
+      agent: agent.twin_reviewer
+      input:
+        goal: "input.goal"
+        draft: "input.draft"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: twin_review }
+    - { from: twin_review, to: end }

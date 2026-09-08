@@ -343,6 +343,10 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             (
+                "the_memo_holds_per_endpoint_rather_than_per_model",
+                Status::Live,
+            ),
+            (
                 "a_pinned_messages_turn_carrying_no_object_is_reported_as_no_structured_output",
                 Status::Live,
             ),

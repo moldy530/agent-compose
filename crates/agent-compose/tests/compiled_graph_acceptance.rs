@@ -3668,6 +3668,124 @@ fn the_memo_holds_per_model_rather_than_per_endpoint() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// …and by the **endpoint** as well, which takes two of them (PRD §9 resolved
+/// q53).
+///
+/// The other half of the same key, and the half no single-server fixture can
+/// decide: `flow.triage` above holds that one *model*'s refusal does not travel
+/// to another, and every model in it is behind one address, so a memo that had
+/// dropped the address from its key would pass it unchanged.
+///
+/// What that would break is the pairing this fixture makes instead: a lagging
+/// Anthropic-compatible gateway and the vendor endpoint beside it, both serving
+/// `claude-sonnet-4-6`. The gateway's refusal is a fact about the *gateway*, and
+/// a memo keyed by the name alone would demote the vendor endpoint's rung with
+/// it — silently, because the run still succeeds: the second node answers
+/// through the forced tool, produces exactly the object it was going to produce,
+/// and only this transcript and the trace say a mechanism nobody chose was used.
+/// So the assertion that matters is the **second endpoint's** log: one request,
+/// asked the way it prefers, no discovery.
+#[test]
+fn the_memo_holds_per_endpoint_rather_than_per_model() {
+    let lagging = MockProvider::start().expect("a loopback port");
+    let vendor = MockProvider::start().expect("a loopback port");
+    lagging.personality(SONNET, Personality::NativeRejected);
+    lagging.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
+    ));
+    vendor.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "verdict": "approve", "feedback": "looks good" })),
+    ));
+
+    // The one place in this suite where two servers are told apart: every
+    // fixture provider resolves `${MOCK_BASE_URL}`, and `provider.twin` resolves
+    // the second address the harness names — pointed here at a server of its
+    // own rather than at the one every other test shares.
+    let environment: Vec<(String, String)> = harness::environment(&lagging)
+        .into_iter()
+        .map(|(name, value)| {
+            if name == harness::TWIN_BASE_URL {
+                (name, vendor.base_url())
+            } else {
+                (name, value)
+            }
+        })
+        .collect();
+
+    let Some(run) = harness::invoke_with(
+        "agent-anthropic",
+        "flow.twin_endpoints",
+        &json!({ "goal": "ship it", "draft": "a draft" }),
+        &environment,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["feedback"],
+        "looks good",
+        "the second node answered, which is what makes its endpoint's log the \
+         subject at all"
+    );
+
+    let mechanisms = |recorded: &[RecordedRequest]| {
+        recorded
+            .iter()
+            .map(|request| {
+                (
+                    request.unsupported,
+                    request
+                        .structured_output
+                        .as_ref()
+                        .map(StructuredOutput::mechanism),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let refused = lagging.requests();
+    assert_eq!(
+        mechanisms(&refused),
+        [
+            (Some(OutputMechanism::Native), Some(OutputMechanism::Native)),
+            (None, Some(OutputMechanism::ForcedTool)),
+        ],
+        "the gateway refused the native rung and answered on the other one"
+    );
+    let untouched = vendor.requests();
+    assert_eq!(
+        mechanisms(&untouched),
+        [(None, Some(OutputMechanism::Native))],
+        "…and the endpoint beside it, serving that very model id, was asked the \
+         way it prefers: one request, and nothing to discover"
+    );
+    for recorded in [&refused, &untouched] {
+        assert!(
+            recorded.iter().all(RecordedRequest::is_valid),
+            "{:?}",
+            recorded
+                .iter()
+                .map(RecordedRequest::failures)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    assert_eq!(
+        run.entries("review")[0]["models"][0]["outputMechanism"],
+        "forced_tool",
+        "the trace says which rung answered, per node"
+    );
+    assert_eq!(
+        run.entries("twin_review")[0]["models"][0]["outputMechanism"],
+        "native",
+        "…and the two nodes did not answer on the same one"
+    );
+    assert!(lagging.snapshot().is_drained());
+    assert!(vendor.snapshot().is_drained());
+}
+
 /// A pinned **Messages** turn that came back as prose fails the node with the
 /// sentence the other wires fail it with (PRD §9 resolved q53).
 ///
