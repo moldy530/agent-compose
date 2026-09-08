@@ -300,9 +300,12 @@ const CODEGEN: &[Criterion] = &[
             // provider-and-model for the process. A row per thing that can be
             // wrong independently — which mechanism a healthy endpoint answers on
             // and what the trace says about it, the ladder and its memo in each
-            // direction, the endpoint that carries neither, the refusals that
-            // must **not** ladder and the borderline wordings that must, and
-            // resolved q52's closing turn surviving both shapes.
+            // direction and what the memo is keyed by, the endpoint that carries
+            // neither, the refusals that must **not** ladder (including the two
+            // whose other rung would have *worked*, which is the way of being
+            // wrong that hides itself) and the borderline wordings that must, the
+            // native mechanism's own reading path, and resolved q52's closing
+            // turn surviving both shapes.
             (
                 "a_structured_output_call_records_the_mechanism_that_answered_it",
                 Status::Live,
@@ -329,6 +332,18 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends",
+                Status::Live,
+            ),
+            (
+                "a_refusal_about_the_conversations_shape_is_not_read_as_a_missing_mechanism",
+                Status::Live,
+            ),
+            (
+                "the_memo_holds_per_model_rather_than_per_endpoint",
+                Status::Live,
+            ),
+            (
+                "a_pinned_messages_turn_carrying_no_object_is_reported_as_no_structured_output",
                 Status::Live,
             ),
             (

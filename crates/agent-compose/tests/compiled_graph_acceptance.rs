@@ -3175,7 +3175,7 @@ fn an_endpoint_carrying_neither_mechanism_fails_with_both_refusals_quoted() {
 ///
 /// **Every wire**, because the recognizer is per wire: each reads its own key
 /// out of its own service's dialect, so a table widened on one of them is a
-/// regression the other two's tests would never see. Three shapes, one per way
+/// regression the other two's tests would never see. Four shapes, one per way
 /// of being wrong:
 ///
 ///   * a credential — the family that has nothing to do with the mechanism at
@@ -3192,7 +3192,15 @@ fn an_endpoint_carrying_neither_mechanism_fails_with_both_refusals_quoted() {
 ///     letters `text` inside the word `context`: a substring test alone answers
 ///     that a wire parameter is missing, spends a request finding out otherwise,
 ///     and leaves `native` recorded as refused for the pairing for the life of
-///     the process.
+///     the process;
+///   * a key **inside** the parameter — the one whose cost is not a wasted
+///     request. Each of these is a codegen slip that puts one wire's nesting
+///     inside another's parameter, refused at the path it sits on: a service
+///     that walked into `output_config.format` to complain has `output_config`.
+///     A recognizer reading the mention rather than the path ladders, the
+///     forced-tool rung is well formed, the run **succeeds**, and the malformed
+///     request ships behind a memoized refusal — the one way of being wrong that
+///     hides itself.
 #[test]
 fn a_refusal_that_is_not_about_the_mechanism_does_not_ladder() {
     // One run, and the claim is always the same: the request count did not grow.
@@ -3260,6 +3268,16 @@ fn a_refusal_that_is_not_about_the_mechanism_does_not_ladder() {
                         },
                     }),
                 ),
+                (
+                    "a key one level inside the parameter",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "output_config.format.name: Extra inputs are not permitted",
+                        },
+                    }),
+                ),
             ],
         ),
         (
@@ -3296,6 +3314,16 @@ fn a_refusal_that_is_not_about_the_mechanism_does_not_ladder() {
                             "message": "This model does not support 'store: false' in this context.",
                             "type": "invalid_request_error",
                             "param": "store",
+                        },
+                    }),
+                ),
+                (
+                    "a key one level inside the parameter",
+                    json!({
+                        "error": {
+                            "message": "Unrecognized request argument supplied: response_format.json_schema.format",
+                            "type": "invalid_request_error",
+                            "param": "response_format.json_schema.format",
                         },
                     }),
                 ),
@@ -3337,6 +3365,16 @@ fn a_refusal_that_is_not_about_the_mechanism_does_not_ladder() {
                             "message": "This model does not support 'store: false' in this context.",
                             "type": "invalid_request_error",
                             "param": "store",
+                        },
+                    }),
+                ),
+                (
+                    "a key one level inside the parameter",
+                    json!({
+                        "error": {
+                            "message": "Unrecognized request argument supplied: text.format.json_schema",
+                            "type": "invalid_request_error",
+                            "param": "text.format.json_schema",
                         },
                     }),
                 ),
@@ -3427,6 +3465,236 @@ fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
         }),
         json!({ "verdict": "approve", "feedback": "" }),
         "approve",
+    );
+}
+
+/// A refusal about the **conversation's shape** is not a mechanism this endpoint
+/// lacks, and is not reported as one (PRD §9 resolved q52 and q53).
+///
+/// The one 400 whose sentence reads like a capability refusal without being one,
+/// and the reason the recognizer reads more than a phrase list. A strict gateway
+/// holds q52's rule — a forced `tool_choice` over a history ending on the
+/// assistant is prefill against a forced call — and words it *at the message it
+/// stopped on* while naming the mechanism's own key in the clause that says why.
+/// Both spellings of the sentence are here because the mock writes both
+/// (`crates/mock-provider/src/anthropic.rs`, `check_prefill`): the rule covers
+/// whichever way the request asked for its object, so a recognizer that fell for
+/// one would fall for the other.
+///
+/// Read as "this endpoint has no forced tool use" it would ladder — and the
+/// closing turn is composed *above* the mechanism, so the other rung carries the
+/// same conversation, is refused for the same reason, and the run fails saying
+/// the endpoint carries neither mechanism and there is nothing to configure.
+/// Every word of which would be false: what such a run has is a q52 regression,
+/// and the diagnostic would send its operator to the endpoint to look for it.
+#[test]
+fn a_refusal_about_the_conversations_shape_is_not_read_as_a_missing_mechanism() {
+    for asked in [
+        "`tool_choice` forces a tool",
+        "`output_config` asks for structured output",
+    ] {
+        let provider = MockProvider::start().expect("a loopback port");
+        provider.enqueue(Script::new(
+            SONNET,
+            Outcome::raw(
+                400,
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": format!(
+                            "messages.3: This model does not support assistant message \
+                             prefill. The conversation must end with a user message when \
+                             {asked}."
+                        ),
+                    },
+                }),
+            ),
+        ));
+
+        let Some(run) = harness::invoke(
+            "agent-anthropic",
+            "flow.review",
+            &[("goal", "ship it"), ("draft", "a draft")],
+            &provider,
+        ) else {
+            return;
+        };
+        let failure = run.failed();
+        assert!(
+            failure.contains("assistant message prefill"),
+            "the complaint the endpoint actually made is what the node failed \
+             with, for `{asked}`: {failure}"
+        );
+        assert!(
+            !failure.contains("nothing to configure"),
+            "…and not the double-refusal diagnostic, which would be a false \
+             statement about the endpoint, for `{asked}`: {failure}"
+        );
+        assert_eq!(
+            provider.requests().len(),
+            1,
+            "…and the same illegal conversation was not sent a second time in \
+             the other shape, for `{asked}`"
+        );
+    }
+}
+
+/// The memo is keyed by the **model** as well as by the endpoint (PRD §9
+/// resolved q53).
+///
+/// What one model id refused says nothing about another on the same address:
+/// `openai_compatible` in front of a fleet is one provider serving several
+/// generations, and a gateway that 400s `response_format` for the old model it
+/// proxies takes it for the new one beside it. A memo keyed by the address alone
+/// would let the first refusal it sees demote every model behind that address
+/// for the life of the process — silently, because the run still *works*: it
+/// answers on the other rung, and only the trace and the provider's log say a
+/// mechanism nobody chose was used.
+///
+/// `flow.triage` is the fixture because its three calls are two model ids on one
+/// `provider.mock`, in the order that decides it: the refusing model goes first,
+/// so a provider-keyed memo would be in place before the other model's call is
+/// composed.
+#[test]
+fn the_memo_holds_per_model_rather_than_per_endpoint() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.personality(HAIKU, Personality::NativeRejected);
+    provider.enqueue_all([
+        Script::new(
+            HAIKU,
+            Outcome::structured(json!({ "normalized": "a normalized report" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({
+                "findings": [{ "kind": "auto_fixable", "file": "a.rs", "hint": "rename it" }],
+            })),
+        ),
+        Script::new(HAIKU, Outcome::structured(json!({ "patch": "-a\n+b" }))),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "fanout",
+        "flow.triage",
+        &[("report", "a raw report")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|request| (
+                request.model.as_str(),
+                request.unsupported,
+                request
+                    .structured_output
+                    .as_ref()
+                    .map(StructuredOutput::mechanism)
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                HAIKU,
+                Some(OutputMechanism::Native),
+                Some(OutputMechanism::Native)
+            ),
+            (HAIKU, None, Some(OutputMechanism::ForcedTool)),
+            (SONNET, None, Some(OutputMechanism::Native)),
+            (HAIKU, None, Some(OutputMechanism::ForcedTool)),
+        ],
+        "one model's refusal moved that model's calls and left the other's \
+         alone: the third request is the model nothing refused, still asking the \
+         way it prefers"
+    );
+    assert!(
+        recorded.iter().all(RecordedRequest::is_valid),
+        "{:?}",
+        recorded
+            .iter()
+            .map(RecordedRequest::failures)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        run.entries("classify")[0]["models"][0]["outputMechanism"],
+        "native",
+        "…and the trace says so for the node that ran on it"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A pinned **Messages** turn that came back as prose fails the node with the
+/// sentence the other wires fail it with (PRD §9 resolved q53).
+///
+/// The native mechanism's reading path, which is the half of the ladder that is
+/// not a request: under `output_config` the object arrives as the assistant's
+/// *text*, so what a run gets when the format did not shape it is a turn that
+/// parses as nothing. `text.format`'s twin is
+/// `a_pinned_responses_turn_carrying_no_object_is_reported_as_no_structured_output`
+/// and the argument is the same one: the absence is reported as an absence, so
+/// the node error names the agent, the output it asked for, and what the surface
+/// said about why. A `SyntaxError` raised inside `callMessages` names none of the
+/// three and is raised *inside* the journaled model call, so a resume would
+/// replay a recorded failure of a call that had in fact answered.
+#[test]
+fn a_pinned_messages_turn_carrying_no_object_is_reported_as_no_structured_output() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::raw(
+            200,
+            json!({
+                "id": "msg_prose",
+                "type": "message",
+                "role": "assistant",
+                "model": SONNET,
+                "content": [{ "type": "text", "text": "Sorry, I could not review that." }],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": { "input_tokens": 12, "output_tokens": 9 },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`agent.reviewer` asked for")
+            && failure.contains("the answer carried no structured output"),
+        "the node error names the agent and what it asked for: {failure}"
+    );
+    assert!(
+        failure.contains("stop_reason: end_turn"),
+        "…and what the surface said about why there was none: {failure}"
+    );
+    assert!(
+        !failure.contains("SyntaxError"),
+        "…rather than the parser's message: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|request| request
+                .structured_output
+                .as_ref()
+                .map(StructuredOutput::mechanism))
+            .collect::<Vec<_>>(),
+        [Some(OutputMechanism::Native)],
+        "…and the call that got it really did ask the native way, which is the \
+         reading path this is about"
     );
 }
 

@@ -2453,6 +2453,14 @@ const MECHANISM_KEYS: Readonly<Record<Wire, Readonly<Record<OutputMechanism, rea
  * one extra request that also fails and a diagnostic quoting both refusals;
  * being wrong in the strict direction costs a run that could have worked, which
  * is why the list carries the phrasings rather than one canonical one.
+ *
+ * That cost model holds only because the two families where the *other* rung
+ * would have **worked** are excluded by shape rather than by phrase — a
+ * complaint about something inside the parameter ([`namesKey`]) and a complaint
+ * addressed somewhere else entirely ([`addressedElsewhere`]). Those are the ones
+ * a permissive reading would not merely make expensive but make **silent**: the
+ * retry succeeds, the run passes, and a request this runtime composed wrongly is
+ * remembered as an endpoint that lacks a mechanism.
  */
 const UNSUPPORTED_PARAMETER: readonly string[] = [
   "extra inputs are not permitted",
@@ -2516,8 +2524,8 @@ const ABOUT_THE_ENDPOINT: readonly string[] = [
 ];
 
 /**
- * Whether `body` names `key` as a **key**, rather than carrying those letters
- * inside a longer word.
+ * Whether `body` names `key` as **the key itself**, rather than carrying those
+ * letters inside a longer word or a longer path.
  *
  * A refusal is prose with a parameter name in it, so the recognizer reads it as
  * a substring — but a substring test alone answers "yes" to `text` inside
@@ -2529,18 +2537,76 @@ const ABOUT_THE_ENDPOINT: readonly string[] = [
  * identifier character is what separates `'text.format'`, `"text"` and
  * `supplied: text` — every way a service names the key — from `context`.
  *
- * `body` arrives lowercased, so the character class is written that way.
+ * A match the complaint **descends into** — `response_format.json_schema.…`,
+ * `output_config.format.…` — is not this key being named either, and that one is
+ * worse than a word boundary because it is worse than wrong: a service that
+ * walked the path to complain about what is *inside* the parameter has the
+ * parameter. Reading `Unrecognized request argument supplied:
+ * response_format.json_schema.format` as "this endpoint has no
+ * `response_format`" ladders on a request-shape bug, the forced-tool rung is
+ * well formed and **succeeds**, and the defect ships behind a memoized refusal
+ * nothing will look at again. The other direction of being wrong costs a
+ * request; this one costs the bug.
+ *
+ * `body` arrives lowercased, so the character classes are written that way.
  */
 function namesKey(body: string, key: string): boolean {
   const identifier = /[a-z0-9_]/;
   // `charAt` answers `""` off either end, which is not an identifier character —
   // a key at the very start or end of the body is named by it.
   for (let at = body.indexOf(key); at >= 0; at = body.indexOf(key, at + 1)) {
-    if (!identifier.test(body.charAt(at - 1)) && !identifier.test(body.charAt(at + key.length))) {
-      return true;
-    }
+    const after = body.charAt(at + key.length);
+    if (identifier.test(body.charAt(at - 1)) || identifier.test(after)) continue;
+    // …and not the head of a longer path. Only a `.` followed by a segment is
+    // one: a key at the end of a sentence is followed by a full stop.
+    if (after === "." && identifier.test(body.charAt(at + key.length + 1))) continue;
+    return true;
   }
   return false;
+}
+
+/**
+ * Every place in the request a refusal **addresses** a complaint to, as the
+ * pydantic-shaped dialects write them: `output_config.format.name: Extra inputs
+ * are not permitted`, `messages.3: This model does not support assistant message
+ * prefill.`
+ *
+ * A dotted path in front of a colon is a service saying where in the body it
+ * stopped, and nothing else in a refusal looks like one — the bare words a
+ * sentence puts before a colon (`Unrecognized request argument supplied:`,
+ * `Invalid parameter:`) carry no dot, and a JSON envelope's own keys are
+ * separated from their colon by the closing quote. So the pattern reads the
+ * addresses and leaves the prose alone.
+ */
+const COMPLAINT_ADDRESS = /(?:^|[^a-z0-9_.])([a-z0-9_]+(?:\.[a-z0-9_]+)+):/g;
+
+/**
+ * Whether this refusal is addressed at a place in the request that is **not**
+ * this mechanism's parameter.
+ *
+ * The disqualifier a phrase list cannot spell, and the one q52 needs. A strict
+ * gateway refuses a conversation ending on the assistant with `messages.3: This
+ * model does not support assistant message prefill. The conversation must end
+ * with a user message when `tool_choice` forces a tool.` — a sentence that
+ * names `tool_choice`, says "does not support", and is not about `tool_choice`
+ * at all. Read as a capability refusal it would ladder, be refused again on the
+ * other rung for the same reason, and report an endpoint that "carries neither
+ * mechanism … there is nothing to configure" when what the runtime has is a
+ * conversation it composed wrongly — the misdirection this ladder exists to
+ * avoid, aimed at the one bug that would put it there.
+ *
+ * An address that **is** one of this mechanism's spellings settles it the other
+ * way immediately, and a body with no address at all is left to the rest of the
+ * recognizer: OpenAI's dialect names the parameter after the phrase rather than
+ * in front of a colon, so most capability refusals address nothing.
+ */
+function addressedElsewhere(body: string, keys: readonly string[]): boolean {
+  let addressed = false;
+  for (const match of body.matchAll(COMPLAINT_ADDRESS)) {
+    if (keys.includes(match[1])) return false;
+    addressed = true;
+  }
+  return addressed;
 }
 
 /**
@@ -2553,22 +2619,26 @@ function namesKey(body: string, key: string): boolean {
  * is not JSON, a content refusal and a schema the decoder will not compile are
  * all *not* this, and each still reaches [`callModel`]'s route ladder as itself.
  *
- * Three things must hold at once: the status is one a service refuses a request
+ * Four things must hold at once: the status is one a service refuses a request
  * with rather than one it fails under (400, and 422 for the services that use
- * it); the body names the key this mechanism is spelled with on this wire — as a
- * key ([`namesKey`]), not as letters inside another word; and the body carries
- * one of the ways of saying "that parameter is not one I have" without carrying
- * one of the ways of saying "that parameter's contents are wrong" that is not
- * also a statement about the endpoint ([`ABOUT_THE_ENDPOINT`]).
+ * it); the complaint is not addressed at some other part of the request
+ * ([`addressedElsewhere`]); the body names the key this mechanism is spelled
+ * with on this wire — as that key ([`namesKey`]), not as letters inside another
+ * word or a segment of a longer path; and the body carries one of the ways of
+ * saying "that parameter is not one I have" without carrying one of the ways of
+ * saying "that parameter's contents are wrong" that is not also a statement
+ * about the endpoint ([`ABOUT_THE_ENDPOINT`]).
  */
 function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unknown): boolean {
   if (!(error instanceof ProviderFailure)) return false;
   if (error.status !== 400 && error.status !== 422) return false;
   const body = error.body.toLowerCase();
+  const keys = MECHANISM_KEYS[wire][mechanism];
   const carries = (phrases: readonly string[]): boolean =>
     phrases.some((phrase) => body.includes(phrase));
   if (carries(NOT_ABOUT_THE_MECHANISM) && !carries(ABOUT_THE_ENDPOINT)) return false;
-  if (!MECHANISM_KEYS[wire][mechanism].some((key) => namesKey(body, key))) return false;
+  if (addressedElsewhere(body, keys)) return false;
+  if (!keys.some((key) => namesKey(body, key))) return false;
   return carries(UNSUPPORTED_PARAMETER);
 }
 
