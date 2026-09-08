@@ -660,6 +660,76 @@ fn a_providers_server_tools_reach_the_messages_wire_verbatim() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// The **last** run of assistant text is the object a native structured-output
+/// call is read from — not the join of every `text` block in the turn (PRD §9
+/// resolved q53, Decision D122).
+///
+/// This composition is only reachable on the native rung, and that is why it is
+/// a test rather than a hypothetical: `tool_choice: {type: "tool", name}` was a
+/// promise that the pinned call's turn is one `tool_use` block, so no server
+/// tool could run on it and the object came out of that block whatever prose
+/// surrounded it. `output_config` pins nothing, so the pinned call of an agent
+/// whose provider declares `server_tools:` is an ordinary turn — the model may
+/// announce a search, run it, and answer afterwards, which is the shape a web
+/// search answer most often has.
+///
+/// A runtime that flattened the turn's `text` blocks and parsed the join would
+/// hand `JSON.parse` `Let me search.{"answer":"…"}`, read no object out of a
+/// turn that carried one, and fail the node with `asked for … and the answer
+/// carried no structured output`.
+#[test]
+fn a_native_answer_after_a_server_tool_is_read_from_the_turns_last_text() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::structured(json!({ "answer": "the docs say yes" })).with_server_tools(vec![
+            ServerToolUse::new(
+                "web_search_20250305",
+                json!({ "query": "does it?" }),
+                json!([{ "type": "web_search_result", "url": "https://docs.example.com/a" }]),
+            )
+            .preceded_by("Let me search."),
+        ]),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.search",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(
+        run.outputs()["answer"],
+        "the docs say yes",
+        "the preamble is prose the model wrote before the search and is not part \
+         of the object"
+    );
+
+    let asked = provider.requests();
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].is_valid(), "{:?}", asked[0].failures());
+    assert!(
+        asked[0].body()["output_config"]["format"]["type"] == "json_schema",
+        "…on the rung that makes the composition reachable at all: {}",
+        asked[0].body_text
+    );
+    let mechanisms: Vec<Option<String>> = run
+        .trace()
+        .iter()
+        .flat_map(|entry| entry["models"].as_array().cloned().unwrap_or_default())
+        .map(|call| {
+            call["outputMechanism"]
+                .as_str()
+                .map(std::string::ToString::to_string)
+        })
+        .collect();
+    assert_eq!(mechanisms, [Some("native".to_string())], "{mechanisms:?}");
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A `server_tool_use` block in an answer the tool loop is reading is **not**
 /// dispatched, and is **not** refused (Decision D122, over Decision D119).
 ///
@@ -904,19 +974,20 @@ fn an_openai_provider_with_server_tools_runs_its_loop_on_the_responses_wire() {
 /// A pinned Responses turn that carries **more than one** `message` is read at
 /// the message `text.format` shaped, not at the concatenation of all of them.
 ///
-/// This is the one shape server tools make reachable and the other two wires
-/// cannot produce. The Messages wire reads the pinned `tool_use` block's `input`
-/// and Chat Completions parses the single `choices[0].message.content`; a
-/// Responses turn is a **list of items**, and a model that says something before
-/// its provider's search runs sends a preamble `message`, the `web_search_call`,
-/// and then the shaped `message`. Joining the two texts and parsing the join is
-/// `Let me look that up.{"answer":"…"}` reaching `JSON.parse` — a bare
-/// `SyntaxError` naming no agent and no model, thrown inside the journaled model
-/// call, so a resume replays a recorded failure and the run never recovers.
+/// A Responses turn is a **list of items**, and a model that says something
+/// before its provider's search runs sends a preamble `message`, the
+/// `web_search_call`, and then the shaped `message`. Joining the two texts and
+/// parsing the join is `Let me look that up.{"answer":"…"}` reaching
+/// `JSON.parse` — which `shapedOutput` answers as an absence, so the node
+/// fails with `asked for … and the answer carried no structured output` about a
+/// turn that carried one.
 ///
-/// Served with [`Outcome::raw`] because it is precisely what the scripted
-/// shapes will not compose: `reply_answer` pushes at most one `message` item per
-/// answer, so the harness cannot script two.
+/// The Messages wire reaches the same shape by the same route, and
+/// `a_native_answer_after_a_server_tool_is_read_from_the_turns_last_text` is
+/// that test: `output_config` pins nothing, so a pinned call may run a server
+/// tool and answer after it, in two runs of `text`. Only Chat Completions is
+/// exempt, and by its shape rather than by anything this runtime does — a turn
+/// there is the single string `choices[0].message.content`.
 #[test]
 fn a_pinned_responses_turn_is_read_at_the_message_the_format_shaped() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -924,49 +995,19 @@ fn a_pinned_responses_turn_is_read_at_the_message_the_format_shaped() {
         // The turn that ends the loop: prose, no calls.
         Script::new(GPT5, Outcome::text("I have what I need.")),
         // …and the pinned call, answered the way a turn with a server tool in it
-        // legitimately arrives.
+        // legitimately arrives: what the model said before the search, the
+        // search itself, and the message the format shaped.
         Script::new(
             GPT5,
-            Outcome::raw(
-                200,
-                json!({
-                    "id": "resp_preamble",
-                    "object": "response",
-                    "status": "completed",
-                    "model": GPT5,
-                    "output": [
-                        {
-                            "type": "message",
-                            "id": "msg_preamble",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "Let me look that up.",
-                                "annotations": [],
-                            }],
-                        },
-                        {
-                            "type": "web_search_call",
-                            "id": "srv_preamble",
-                            "status": "completed",
-                            "action": { "type": "search", "query": "what" },
-                        },
-                        {
-                            "type": "message",
-                            "id": "msg_answer",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "{\"answer\":\"a searched-for snippet\"}",
-                                "annotations": [],
-                            }],
-                        },
-                    ],
-                    "incomplete_details": null,
-                    "parallel_tool_calls": true,
-                }),
+            Outcome::structured(json!({ "answer": "a searched-for snippet" })).with_server_tools(
+                vec![
+                    ServerToolUse::new(
+                        "web_search",
+                        json!({ "type": "search", "query": "what" }),
+                        json!([{ "url": "https://docs.example.com/a", "title": "A" }]),
+                    )
+                    .preceded_by("Let me look that up."),
+                ],
             ),
         ),
     ]);

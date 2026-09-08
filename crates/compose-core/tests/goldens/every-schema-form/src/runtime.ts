@@ -2872,7 +2872,35 @@ async function callMessages(
   );
 
   const blocks = (answer["content"] ?? []) as { type: string; [key: string]: unknown }[];
-  const texts = blocks.filter((block) => block.type === "text").map((block) => block["text"]);
+  // **Per run of `text`**, not one flat list of blocks — the same split
+  // [`callResponses`] makes per `message` item, for the same hazard. A turn on
+  // this wire can hold more than one run of text: a preamble the model wrote
+  // before a server tool ran, and the shaped answer it wrote after (Decision
+  // D122). `text` is everything the assistant said, which is what a replay on
+  // another wire has to carry; the *structured* answer is the last run alone,
+  // because `output_config`'s format shapes what the turn ends with and says
+  // nothing about what precedes it. Flattening them and parsing the join is how
+  // `Let me search.{"answer":"…"}` reaches `JSON.parse`.
+  //
+  // It is the **native** rung that makes such a turn reachable at all on this
+  // wire: `tool_choice: {type: "tool"}` was a promise that the turn is one
+  // `tool_use` block, so a pinned call could not run a server tool, and the
+  // object came out of that block whatever prose surrounded it. Without a pin
+  // the pinned call is an ordinary turn, and a provider whose `server_tools:`
+  // are on it may answer with one.
+  const runs: string[] = [];
+  let run: string[] = [];
+  for (const block of blocks) {
+    if (block.type === "text") {
+      run.push(String(block["text"] ?? ""));
+      continue;
+    }
+    if (run.length > 0) {
+      runs.push(run.join(""));
+      run = [];
+    }
+  }
+  if (run.length > 0) runs.push(run.join(""));
   // `tool_use` **exactly**, which is what keeps a server tool out of the tool
   // loop (Decision D122). A provider that ran one answers with a
   // `server_tool_use` block and its paired `*_tool_result` beside it: the call
@@ -2886,7 +2914,8 @@ async function callMessages(
     request.pinned === undefined || native
       ? undefined
       : uses.find((use) => use["name"] === request.pinned!.name);
-  const said = texts.length > 0 ? texts.join("") : null;
+  const said = runs.length > 0 ? runs.join("") : null;
+  const shaped = runs.length > 0 ? runs[runs.length - 1]! : null;
   return {
     text: said,
     toolCalls: uses
@@ -2898,16 +2927,16 @@ async function callMessages(
       })),
     // What was **constrained** is what is parsed, whichever mechanism did the
     // constraining (PRD 9.16): the pinned call's arguments, or — under
-    // `output_config` — the text that format shaped. An answer that carried
-    // neither is an absence rather than a throw, for [`shapedOutput`]'s reason:
-    // `callAgent` names the agent and what the surface said about why, and a
-    // `SyntaxError` from inside the journaled call would record a call that
-    // worked as one that did not.
+    // `output_config` — the last run of text that format shaped. An answer that
+    // carried neither is an absence rather than a throw, for [`shapedOutput`]'s
+    // reason: `callAgent` names the agent and what the surface said about why,
+    // and a `SyntaxError` from inside the journaled call would record a call
+    // that worked as one that did not.
     structured:
       request.pinned === undefined
         ? null
         : native
-          ? shapedOutput(said)
+          ? shapedOutput(shaped)
           : (pinnedUse?.["input"] ?? null),
     stopReason: (answer["stop_reason"] as string | null) ?? null,
     content: blocks,

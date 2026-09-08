@@ -798,30 +798,45 @@ carries these blocks through its loop opaquely, which is exactly the property th
 acceptance suite asserts. A wrong member name here would therefore fail nothing
 that is not already failing.
 
-### 23. One Responses turn may hold more than one `message`, and `text.format` shapes the last
+### 23. A turn may hold more than one run of assistant text, and a native format shapes the last
 
 The other side of (19)'s "the conversation is a list of items": a `message` is an
-item like any other, so a turn may carry several — a preamble the model wrote
-before a server tool ran, then the shaped answer after it, with the
-`<type>_call` of (22) between them. Neither of the other two wires can produce
-that shape: the Messages API answers a pinned request with a `tool_use` block
-whose `input` **is** the object, and Chat Completions has exactly one
-`choices[0].message.content`.
+item like any other, so a Responses turn may carry several — a preamble the model
+wrote before a server tool ran, then the shaped answer after it, with the
+`<type>_call` of (22) between them.
 
-So a `text.format` of type `json_schema` constrains the turn's **final** message
-and says nothing about what precedes it, and a reader that concatenates every
-`output_text` and parses the join parses something the format never shaped. The
-runtime reads the last message-bearing item for its structured answer and keeps
-the join only as the turn's text (`callResponses`, `shapedOutput`);
-`compiled_graph_acceptance.rs`'s
-`a_pinned_responses_turn_is_read_at_the_message_the_format_shaped` is what
-decides it, served with a **raw** response because `reply_answer` writes at most
-one `message` item per scripted answer and so cannot compose the shape.
+**The Messages wire reaches the same shape**, in blocks rather than items:
+`text`, `server_tool_use`, `<name>_tool_result`, `text`. That became reachable
+when PRD §9 resolved q53 made `output_config` the rung a compiled graph prefers.
+Under the older mechanism it was not: `tool_choice: {type: "tool", name}` is a
+promise that the turn is one `tool_use` block, so no server tool could run on a
+pinned call and the object came out of that block whatever prose surrounded it.
+A format pins nothing, so the pinned call of an agent whose provider declares
+`server_tools:` is an ordinary turn, and a search answer's usual shape — announce
+the search, run it, answer — is two runs of text. Only Chat Completions is exempt,
+and by its shape rather than by anything a runtime does: a turn there is the
+single string `choices[0].message.content`.
+
+So each wire's native format constrains the turn's **final** run and says nothing
+about what precedes it, and a reader that concatenates every `output_text` /
+`text` block and parses the join parses something the format never shaped. The
+runtime reads the last message-bearing item (`callResponses`) and the last run of
+`text` blocks (`callMessages`) for its structured answer, and keeps the join only
+as the turn's text; `compiled_graph_acceptance.rs`'s
+`a_pinned_responses_turn_is_read_at_the_message_the_format_shaped` and
+`a_native_answer_after_a_server_tool_is_read_from_the_turns_last_text` are what
+decide it.
+
+A script composes the shape with `ServerToolUse::preceded_by`, and the preamble
+belongs to the **use** rather than to the reply because that is what makes it a
+turn a service could have sent: contiguous assistant text arrives as one block —
+one `message` on Responses — so the only thing that can separate two runs of it
+is something between them, and here that is the tool that ran.
 
 *What is assumed* is that the service is willing to send a preamble beside a
-shaped answer at all. If it never does, nothing is lost — a single-message turn
-reads identically — and if it does, the alternative is a `JSON.parse` of prose
-thrown inside the journaled model call, which a resume then replays.
+shaped answer at all. If it never does, nothing is lost — a single-run turn reads
+identically — and if it does, the alternative is a node failed for carrying no
+structured output over a turn that carried one.
 
 ### 24. The sentence a structured-output ask over a prefilled turn is refused with
 

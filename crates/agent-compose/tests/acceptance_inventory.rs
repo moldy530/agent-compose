@@ -346,6 +346,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_pinned_messages_turn_carrying_no_object_is_reported_as_no_structured_output",
                 Status::Live,
             ),
+            // …and the turn shape the native rung makes reachable on that wire:
+            // no pin means the pinned call may run a server tool and answer
+            // after it, in two runs of `text`, only the last of which the format
+            // shaped.
+            (
+                "a_native_answer_after_a_server_tool_is_read_from_the_turns_last_text",
+                Status::Live,
+            ),
             (
                 "a_pinned_chat_completions_turn_carrying_no_object_is_reported_as_no_structured_output",
                 Status::Live,
