@@ -438,7 +438,11 @@ An agent with `tools:` still **offers** them on the call that asks for its
 output, under either mechanism — the exchange being replayed names them, so the
 request has to declare them, and the provider's own `server_tools:` are on that
 call too. The forced tool pins the answer; the native parameter shapes it without
-forbidding anything. So on the native rung a model can answer that last turn with
+forbidding anything, and nothing else on that call forbids tool use either: a
+`tool_choice` that did would forbid the provider's server tools along with the
+agent's, and would make the native rung depend on a second parameter whose
+refusal the ladder cannot read — an endpoint refusing *that* would leave nowhere
+to ladder to. So on the native rung a model can answer that last turn with
 one more tool call instead of the object, and the node then fails with "asked
 for … and the answer carried no structured output", naming
 `stop_reason: tool_use` as what the surface said about why.
@@ -464,7 +468,9 @@ double refusal below is not.
 output object (`agent-compose docs trace`). Two deployments of one composition
 can answer through different mechanisms: a gateway a generation behind the wire
 it proxies takes only the forced tool, the newest model generation takes only the
-native parameter, and the same YAML runs on both.
+native parameter, and the same YAML runs on both. That comparison is usually made
+on a collector rather than in two files, so a `trace_sink:` sending OTLP carries
+the same fact as `agentcompose.model.output_mechanism` on the model call's span.
 
 The ladder itself is **inside** one model call, so it does not add a record: a
 first call that discovered its rung is one `models[]` entry naming the mechanism

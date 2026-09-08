@@ -4178,14 +4178,25 @@ fn the_memo_holds_per_endpoint_rather_than_per_model() {
 /// naming the agent, the output it asked for, and the stop reason.
 ///
 /// It is deliberately not closed by sending `tool_choice: {type: "none"}` beside
-/// the native parameter. The tools cannot simply be dropped — the history this
-/// request replays carries `tool_use`/`tool_result` blocks and the Messages API
-/// refuses a request that names tools it does not declare — and forbidding tool
-/// use outright would forbid the **provider's** server tools with them, which
-/// Decision D122 puts on this very call: a pinned call that runs a web search
-/// and then writes its object is the turn `callMessages`' per-run text split
-/// exists to read. The cost of leaving it open is this failure, which is a model
-/// ignoring a fixed instruction to produce its result, reported as such.
+/// the native parameter, and `provider.mock` is the case that decides it:
+/// **it declares no `server_tools:`**, so the reason that closure would break
+/// Decision D122 — forbidding the provider's own tools along with the agent's on
+/// the very call D122 puts them on — has nothing to bite on here. What holds
+/// instead is the ladder's: this rung recovers from an endpoint that will not
+/// take its request only through a refusal naming the rung's key
+/// (`MECHANISM_KEYS`), and a `tool_choice` beside the format is a second
+/// capability whose refusal names the *other* rung's key, so an endpoint
+/// carrying `output_config` and not `tool_choice: {type: "none"}` would fail
+/// with nowhere to ladder to. Sending it only where a provider declares no
+/// server tools would also make this one call's shape differ between two
+/// providers of one kind. The tools themselves cannot be dropped either — the
+/// history this request replays carries `tool_use`/`tool_result` blocks and the
+/// Messages API refuses a request that names tools it does not declare.
+///
+/// So the cost of leaving it open is this failure, which is a model ignoring a
+/// fixed instruction to produce its result, reported as such — and the request
+/// that provoked it is asserted below to be the one-parameter shape that
+/// argument describes.
 #[test]
 fn a_native_pinned_call_answered_with_a_tool_call_carries_no_structured_output() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -4249,6 +4260,27 @@ fn a_native_pinned_call_answered_with_a_tool_call_carries_no_structured_output()
         ["lookup"],
         "the pinned call offers the agent's own tools and pins none of them: {:?}",
         recorded[1].tools
+    );
+    let body = recorded[1]
+        .body
+        .as_ref()
+        .expect("the pinned call arrived as JSON");
+    assert!(
+        body.get("tool_choice").is_none(),
+        "the native rung composes one parameter and not two: a `tool_choice` \
+         beside `output_config` is the second capability the rung would depend \
+         on, and an endpoint refusing it names the other rung's key — there \
+         would be nowhere to ladder to: {body:#}"
+    );
+    assert!(
+        body.get("output_config").is_some(),
+        "…and the one parameter it does compose is the format itself: {body:#}"
+    );
+    assert!(
+        recorded[1].server_tools.is_empty(),
+        "`provider.mock` declares no `server_tools:`, which is what makes this \
+         the case Decision D122's reason does not cover: {:?}",
+        recorded[1].server_tools
     );
     assert!(recorded.iter().all(RecordedRequest::is_valid));
     assert!(provider.snapshot().is_drained());

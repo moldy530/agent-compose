@@ -3080,17 +3080,44 @@ async function callMessages(
   // rung nothing pins the turn — the posture Chat Completions has had for as
   // long as it has sent `response_format` (`WIRE-NOTES` (3)), reaching this wire
   // with `output_config`, where a forced `tool_choice` used to promise that the
-  // turn *was* the pinned call. Neither half of that is free to change here. The
-  // tools cannot be dropped: the history this request replays carries
+  // turn *was* the pinned call. That promise is what is being given up, and it
+  // is worth being explicit about why, because the request has two shapes that
+  // could keep it and neither is taken.
+  //
+  // The tools cannot be **dropped**: the history this request replays carries
   // `tool_use`/`tool_result` blocks, and both surfaces refuse a request naming
-  // tools it does not declare. And `tool_choice: {type: "none"}` beside the
-  // format would forbid the **provider's** server tools with them, which
-  // Decision D122 puts on this very call — a pinned call that runs a web search
-  // and then writes its object is the turn the per-run text split below exists
-  // to read. So a model that answers the closing turn with one more `tool_use`
-  // is left to `callAgent`, which reports it as the absence it is ("asked for
-  // `…` and the answer carried no structured output (`stop_reason: tool_use`)")
-  // rather than as an endpoint that lacks a mechanism — it refused nothing.
+  // tools it does not declare. That holds for every agent that has any.
+  //
+  // What is left is `tool_choice: {type: "none"}` beside the format, and it is
+  // not sent — for two reasons, because the first covers only half the providers
+  // that reach here and a rule with a gap in it is not a rule:
+  //
+  //   * Where the provider declares `server_tools:`, forbidding tool use would
+  //     forbid **its** tools along with the agent's, and Decision D122 puts them
+  //     on this very call: a pinned call that runs a web search and then writes
+  //     its object is the turn the per-run text split below exists to read.
+  //   * Where it declares none — the common case, and the one the reason above
+  //     says nothing about — the answer is the ladder's own. This rung's only
+  //     way out of an endpoint that will not take its request is a refusal that
+  //     names the rung's key ([`MECHANISM_KEYS`]), and a `tool_choice` beside the
+  //     format is a second capability the request would depend on whose refusal
+  //     names the **other** rung's key. An endpoint carrying `output_config` and
+  //     not `tool_choice: {type: "none"}` — a gateway validating the parameter it
+  //     knows against an older schema while passing the newer one through — would
+  //     then fail outright where today it answers, and fail unladderably. Buying
+  //     a closed failure mode with an unrecoverable one is the wrong trade on the
+  //     rung whose whole job is to survive endpoints of different vintages.
+  //     Sending it only where there are no server tools would also make the shape
+  //     of this one call differ between two providers of one kind, which is a
+  //     second thing an operator comparing two traces would have to establish
+  //     before the comparison meant anything.
+  //
+  // So a model that answers the closing turn with one more `tool_use` is left to
+  // `callAgent`, which reports it as the absence it is ("asked for `…` and the
+  // answer carried no structured output (`stop_reason: tool_use`)") rather than
+  // as an endpoint that lacks a mechanism — it refused nothing. What that costs
+  // is bounded and diagnosed: a model ignoring a fixed instruction to produce its
+  // result, named as such, on a node a `retry:` policy runs again.
   const offered = [
     ...request.tools,
     ...(request.pinned === undefined || native ? [] : [request.pinned]),
@@ -3367,6 +3394,12 @@ async function callChatCompletions(
       // `response_format` rather than a forced function: the schema shapes the
       // content and leaves the request's own `tools` callable, which is what an
       // agent whose loop has just ended still has on offer (WIRE-NOTES (3)).
+      // Nothing pins the turn here either, and for the reasons [`callMessages`]
+      // sets out at length over the same choice: the tools cannot be dropped
+      // from a request replaying a history that names them, and a `tool_choice`
+      // forbidding them would forbid the provider's own with them and make the
+      // rung depend on a second capability whose refusal names the other rung's
+      // key.
       body["response_format"] = {
         type: "json_schema",
         json_schema: {
