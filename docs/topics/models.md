@@ -414,11 +414,14 @@ send the *same* call once more the other way. The rung an endpoint **refused** i
 remembered per provider-and-model for the life of the process, so only the first
 call of a pairing pays that extra round trip.
 
-One thing decides the order before any of that, and it is a property of the
-agent rather than of the endpoint: the native formats constrain a decoder over a
-**closed** schema, so an agent whose `output:` nests an object with `optional:`
-properties starts on the forced tool. Two agents on one model can therefore ask
-in two different ways, and a trace showing exactly that is not a bug.
+One thing decides the order before any of that, and it is a property of the agent
+rather than of the endpoint — but only on the **Messages** wire. `output_config`
+constrains a decoder over a **closed** schema and refuses one that is not, so an
+agent whose `output:` nests an object with `optional:` properties starts on the
+forced tool there. The OpenAI wires send such a schema with `strict: false`,
+which constrains nothing and refuses nothing, so they stay on the native
+parameter. Two agents on one Anthropic model can therefore ask in two different
+ways, and a trace showing exactly that is not a bug.
 
 Nothing else ladders. A 401, a 429, a 5xx, a content refusal and a schema the
 decoder will not compile are refusals about something other than the mechanism,
@@ -437,9 +440,10 @@ The ladder itself is **inside** one model call, so it does not add a record: a
 first call that discovered its rung is one `models[]` entry naming the mechanism
 that answered, and the rung that was refused leaves none. Where the extra round
 trip shows up is your provider's own request log — two requests against one
-trace record — and in that call's timing. A trace whose `outputMechanism` is
-`"forced_tool"` on a wire whose native parameter this runtime prefers is what
-says the discovery happened at all.
+trace record — and in that call's timing. So `outputMechanism: "forced_tool"` is
+what says the discovery happened at all, with the one exception the paragraph
+above names: on the Messages wire an agent whose schema is not closed starts
+there, and nothing was discovered.
 
 **When both are refused**, the run fails with a diagnostic quoting *both*
 refusals verbatim. That is deliberate and it is not a missing knob: the runtime
