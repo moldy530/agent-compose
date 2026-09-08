@@ -10738,6 +10738,174 @@ fn a_condition_outside_route_on_fails_the_node_instead_of_failing_over() {
     );
 }
 
+/// A route condition raised by the **second rung** of the structured-output
+/// mechanism ladder still fails over, exactly as one raised by the first would
+/// (PRD 5.9, PRD §9 resolved q53).
+///
+/// The seam between the two ladders, in the direction that must stay open. The
+/// mechanism ladder is deliberately *inside* one route member's call — it sends
+/// the same request the other way when the endpoint says it does not carry the
+/// rung that was asked — and everything it does not recognize is re-thrown into
+/// the route ladder untouched. So a member whose working rung then answers 429 is
+/// a `rate_limit` like any other, and `route_on:` has to reach the next member.
+///
+/// Nothing but a test holds that. Nothing here declares which errors the
+/// mechanism ladder passes through: it is one `throw` of the caught value, and a
+/// later change that wrapped the second rung's refusal the way the double refusal
+/// below is wrapped would turn every such 429 into a plain `Error` whose
+/// condition classifies as nothing — and a route declaring `rate_limit` would
+/// silently stop failing over on it.
+///
+/// `model.smart`'s endpoint is a lagging gateway, so the first member ladders
+/// inside itself before it ever reaches the scripted 429: three requests, one
+/// trace record, one failover.
+#[test]
+fn a_route_condition_the_mechanism_ladder_uncovered_still_fails_over() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.personality(SONNET, Personality::NativeRejected);
+    provider.enqueue_all([
+        Script::new(SONNET, Outcome::rate_limit()),
+        Script::new(HAIKU, Outcome::structured(json!({ "answer": "42" }))),
+    ]);
+
+    let Some(run) = harness::run(
+        "model-failover",
+        "flow.ask",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "42");
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|request| (
+                request.model.as_str(),
+                request.unsupported,
+                request
+                    .structured_output
+                    .as_ref()
+                    .map(StructuredOutput::mechanism)
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                SONNET,
+                Some(OutputMechanism::Native),
+                Some(OutputMechanism::Native)
+            ),
+            (SONNET, None, Some(OutputMechanism::ForcedTool)),
+            (HAIKU, None, Some(OutputMechanism::Native)),
+        ],
+        "the first member laddered to the rung its endpoint has, was rate limited \
+         there, and the route moved on — to a member whose own endpoint carries \
+         the native parameter, since the memo is a fact about a pairing and not \
+         about the route"
+    );
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+
+    let entries = run.entries("ask");
+    let calls: Vec<&Value> = entries
+        .iter()
+        .filter_map(|entry| entry["models"].as_array())
+        .flatten()
+        .collect();
+    assert_eq!(calls.len(), 1, "one model call, laddering and all");
+    let call = calls[0];
+    assert_eq!(call["servedBy"], "model.fast", "{call}");
+    assert_eq!(call["fallback"], 1, "{call}");
+    assert_eq!(call["failovers"][0]["model"], "model.smart", "{call}");
+    assert_eq!(
+        call["failovers"][0]["condition"], "rate_limit",
+        "the 429 the second rung answered is the condition `route_on:` names, \
+         not something the mechanism ladder absorbed: {call}"
+    );
+    assert_eq!(
+        call["outputMechanism"], "native",
+        "…and the record names the mechanism that *answered*, which is the \
+         fallback's rather than the rung the member before it settled on: {call}"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and the double refusal is the other direction of the same seam: it fails the
+/// node where it stands, without spending the route (PRD 5.9, PRD §9 resolved
+/// q53).
+///
+/// An endpoint carrying neither mechanism is a statement about *that endpoint*,
+/// and grammar 12.2 routes on infrastructure conditions only — so the diagnostic
+/// is a plain `Error` that classifies as no condition and ends the node. A route
+/// that failed over on it would be worse than wasteful: the next member would
+/// answer, the run would pass, and an endpoint a compiled graph cannot use at all
+/// would be invisible until the day it was first in the ladder alone.
+///
+/// The fixture's fallback has a working answer waiting, so "the route was not
+/// spent" is checkable rather than vacuous: an untouched queue is a member that
+/// was never called.
+#[test]
+fn an_endpoint_carrying_neither_mechanism_fails_the_node_without_failing_over() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.personality(SONNET, Personality::BothRejected);
+    provider.enqueue(Script::new(
+        HAIKU,
+        Outcome::structured(json!({ "answer": "42" })),
+    ));
+
+    let Some(run) = harness::run(
+        "model-failover",
+        "flow.ask",
+        &[("question", "what is it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("nothing to configure"),
+        "the node failed on the double-refusal diagnostic: {failure}"
+    );
+    assert!(
+        !failure.contains("model.fast") && !failure.contains("spent its route"),
+        "…and named no fallback, because none was tried: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|request| (request.model.as_str(), request.unsupported))
+            .collect::<Vec<_>>(),
+        [
+            (SONNET, Some(OutputMechanism::Native)),
+            (SONNET, Some(OutputMechanism::ForcedTool)),
+        ],
+        "both rungs of the first member, and nothing else"
+    );
+    assert_eq!(
+        provider.snapshot().queues[HAIKU],
+        1,
+        "the fallback's answer is untouched: `route_on:` never saw a condition"
+    );
+
+    let entries = run.entries("ask");
+    let call = &entries[0]["models"][0];
+    assert_eq!(call["refused"]["model"], "model.smart", "{call}");
+    assert_eq!(
+        call["refused"]["condition"],
+        Value::Null,
+        "a refusal that is no `route_on:` condition is recorded as one: {call}"
+    );
+    assert_eq!(
+        call["failovers"],
+        json!([]),
+        "…and the route recorded no member spent: {call}"
+    );
+}
+
 /// The rest of `route_on:`'s vocabulary, each against the wire shape it names
 /// (grammar 12.2, PRD 5.9).
 ///

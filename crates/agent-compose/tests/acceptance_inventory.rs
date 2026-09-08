@@ -809,6 +809,22 @@ const CODEGEN: &[Criterion] = &[
                 "a_node_that_succeeded_on_a_retry_records_what_its_earlier_attempt_called",
                 Status::Live,
             ),
+            // …and the seam with the *other* ladder PRD §9 resolved q53 put
+            // inside one route member's call. Both directions, because each is
+            // one `throw` away from being wrong and neither is declared
+            // anywhere: a condition the mechanism ladder's second rung answers
+            // with is still the route's to act on, and the double refusal — an
+            // endpoint that carries neither mechanism — is not a condition at
+            // all and must end the node where it stands rather than pass the
+            // run to a member that would hide it.
+            (
+                "a_route_condition_the_mechanism_ladder_uncovered_still_fails_over",
+                Status::Live,
+            ),
+            (
+                "an_endpoint_carrying_neither_mechanism_fails_the_node_without_failing_over",
+                Status::Live,
+            ),
         ],
     },
     // The emission has landed: the built project reads its `${ENV}` references
