@@ -1289,6 +1289,10 @@ export type RouteCondition = "rate_limit" | "overloaded" | "timeout" | "server_e
  * It reaches the trace ([`ModelCall.outputMechanism`], `docs/trace.md` §7)
  * because two deployments of one composition may answer through different
  * mechanisms and nothing else in the record would say so.
+ *
+ * Which rung a given call *starts* on is [`mechanismOrder`]'s: the schema
+ * decides where the native format is even applicable, and what this process has
+ * learned about the endpoint demotes a rung that is not there.
  */
 export type OutputMechanism = "native" | "forced_tool";
 
@@ -2269,8 +2273,8 @@ async function onWire(
 }
 
 /**
- * Which mechanism a (provider, model id) pairing is known to answer through,
- * for the lifetime of **this process** (PRD §9 resolved q53).
+ * The mechanisms a (provider, model id) pairing has **refused**, for the
+ * lifetime of **this process** (PRD §9 resolved q53).
  *
  * The whole of the memoization, and deliberately as small as it looks: no file,
  * no config, no expiry, and nothing that survives a restart. What it buys is
@@ -2285,15 +2289,30 @@ async function onWire(
  * pairing, and the same id on a second provider is not — a lagging gateway and
  * `api.anthropic.com` are different endpoints serving the same names.
  *
- * Written at two moments, and the first is the one that matters: a mechanism
- * that was **refused** writes the other one here before its retry is even sent,
- * so a second call racing the first starts on the rung that is going to work
- * rather than repeating the discovery. The winner writes itself on the way out,
- * which is what makes the map say what answered rather than only what did not.
+ * It holds the **losses** rather than the wins, and that is a load-bearing
+ * choice rather than another spelling of the same thing. A loss is a fact about
+ * the *endpoint* — this one does not have that rung — and holds for every call
+ * the pairing will ever make. A win is entangled with the schema the winning
+ * call carried, and one composition's agents do not all carry the same schema
+ * ([`mechanismOrder`]): recording it instead would make a run depend on which
+ * agent happened to go first, starting an agent whose schema cannot ride the
+ * native rung there anyway because an earlier agent's could — and being refused
+ * for a reason this ladder deliberately does not move on.
+ *
+ * It is also written **earlier** than a win could be: the refusal records it
+ * before its own retry is sent, so a second call racing the first skips a rung
+ * already known to be gone rather than repeating the discovery.
  */
-const knownMechanisms = new Map<string, OutputMechanism>();
+const refusedMechanisms = new Map<string, Set<OutputMechanism>>();
 
-/** The [`knownMechanisms`] key for one binding. */
+/** Remember that this pairing does not carry this rung. */
+function rememberRefusal(key: string, mechanism: OutputMechanism): void {
+  const refused = refusedMechanisms.get(key);
+  if (refused === undefined) refusedMechanisms.set(key, new Set([mechanism]));
+  else refused.add(mechanism);
+}
+
+/** The [`refusedMechanisms`] key for one binding. */
 function mechanismKey(model: ModelBinding): string {
   // NUL rather than a printable separator: a provider address is
   // `provider.<name>` and a model id is the vendor's, and neither can carry
@@ -2340,57 +2359,65 @@ async function structuredAnswer(
   signal: AbortSignal,
 ): Promise<ModelAnswer> {
   const key = mechanismKey(model);
-  const first = preferredMechanism(wire, request.pinned!.schema, knownMechanisms.get(key));
-  const second: OutputMechanism = first === "native" ? "forced_tool" : "native";
-  const attempt = async (mechanism: OutputMechanism): Promise<ModelAnswer> => {
-    const answer = await onWire(wire, model, request, mechanism, signal);
-    knownMechanisms.set(key, mechanism);
-    return answer;
-  };
+  const [first, second] = mechanismOrder(wire, request.pinned!.schema, key);
   try {
-    return await attempt(first);
+    return await onWire(wire, model, request, first, signal);
   } catch (refused) {
     if (!unsupportedMechanism(wire, first, refused)) throw refused;
-    // The **loss**, written before the retry is sent: from here on, every call
-    // of this pairing starts where this one is about to.
-    knownMechanisms.set(key, second);
+    // The **loss**, recorded before the retry is sent: from here on, every call
+    // of this pairing skips the rung this one just found is not there.
+    rememberRefusal(key, first);
     try {
-      return await attempt(second);
+      return await onWire(wire, model, request, second, signal);
     } catch (again) {
       if (!unsupportedMechanism(wire, second, again)) throw again;
+      rememberRefusal(key, second);
       throw bothMechanismsRefused(wire, model, first, refused, second, again);
     }
   }
 }
 
 /**
- * Which rung a call starts on: the wire's native parameter, unless something
- * says otherwise.
+ * The two rungs of one call, in the order this call will try them.
  *
- * Two things can. The **memo** is what this process has learned about the
- * pairing, and it is consulted first-among-equals: it only ever reorders two
- * rungs that are both open.
+ * Two independent things decide it, and neither is a preference in the ordinary
+ * sense.
  *
- * The **schema** is not a preference but a fact, and it wins over the memo. The
- * Messages wire's native format constrains its decoder against a *closed*
- * schema — every object `additionalProperties: false`, every property in
- * `required` — which is exactly what [`strictable`] answers, and a schema that
- * fails it is refused by the format rather than decoded loosely. Forced tool use
- * asks for no such thing, and grammar 3.x's `optional:` on a nested object is a
- * perfectly legal composition, so starting such an agent on the native rung
- * would trade a working node for a 400 about its schema — a refusal that names
- * the schema rather than the mechanism, and so one this ladder deliberately does
- * **not** move on. The OpenAI wires take `strict: false` and simply constrain
- * nothing, which is the posture they have had since q16, so nothing there
- * changes.
+ * The **schema** goes first because it is a fact about *this call*. The Messages
+ * wire's native format constrains its decoder against a **closed** schema —
+ * every object `additionalProperties: false`, every property in `required`,
+ * which is exactly what [`strictable`] answers — and a schema that fails it is
+ * refused by the format rather than decoded loosely. Forced tool use asks for no
+ * such thing, and grammar 3.4's `optional:` on an object nested in an agent's
+ * `output:` is a perfectly legal composition, so starting such an agent on the
+ * native rung would trade a working node for a 400 about its **schema** — a
+ * refusal that names the schema rather than the mechanism, and so one this
+ * ladder deliberately does not move on. The OpenAI wires take `strict: false`
+ * and simply constrain nothing, which is the posture they have had since q16, so
+ * nothing there changes.
+ *
+ * What this process has **learned about the endpoint** then demotes a rung that
+ * is not there ([`refusedMechanisms`]). It is a demotion rather than a
+ * preference, which is what lets the two compose without either overruling the
+ * other: a rung nothing has refused keeps whatever order the schema gave it, and
+ * a rung that has been refused goes last however much the schema wanted it —
+ * because "this endpoint does not have it" beats "this schema would rather use
+ * it". A pairing that has refused **both** is left in schema order, which is the
+ * order that produces the clearer of the two double-refusal diagnostics.
  */
-function preferredMechanism(
+function mechanismOrder(
   wire: Wire,
   schema: JsonSchema,
-  known: OutputMechanism | undefined,
-): OutputMechanism {
-  if (wire === "messages" && !strictable(schema)) return "forced_tool";
-  return known ?? "native";
+  key: string,
+): readonly [OutputMechanism, OutputMechanism] {
+  const preferred: OutputMechanism =
+    wire === "messages" && !strictable(schema) ? "forced_tool" : "native";
+  const other: OutputMechanism = preferred === "native" ? "forced_tool" : "native";
+  const refused = refusedMechanisms.get(key);
+  if (refused !== undefined && refused.has(preferred) && !refused.has(other)) {
+    return [other, preferred];
+  }
+  return [preferred, other];
 }
 
 /**

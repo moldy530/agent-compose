@@ -2982,10 +2982,20 @@ fn a_native_refusing_endpoint_is_laddered_past_once_and_remembered() {
 fn an_output_schema_the_native_format_could_not_close_starts_on_the_forced_tool() {
     let provider = MockProvider::start().expect("a loopback port");
     provider.personality(SONNET, Personality::ForcedToolRemoved);
-    provider.enqueue(Script::new(
-        SONNET,
-        Outcome::structured(json!({ "verdict": "approve", "detail": { "headline": "it holds" } })),
-    ));
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(
+                json!({ "verdict": "revise", "detail": { "headline": "it slips" } }),
+            ),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(
+                json!({ "verdict": "approve", "detail": { "headline": "it holds" } }),
+            ),
+        ),
+    ]);
 
     let Some(run) = harness::invoke(
         "agent-anthropic",
@@ -3016,17 +3026,90 @@ fn an_output_schema_the_native_format_could_not_close_starts_on_the_forced_tool(
                 Some(OutputMechanism::ForcedTool)
             ),
             (None, Some(OutputMechanism::Native)),
+            (None, Some(OutputMechanism::Native)),
         ],
-        "the schema decided the first rung, and the endpoint decided the second"
+        "the schema decided the first node's first rung and the endpoint decided \
+         its second; the **second** node started on what worked, which is the \
+         memo overriding a preference the schema had otherwise fixed"
     );
     assert!(recorded.iter().all(RecordedRequest::is_valid));
 
-    let entries = run.entries("review");
+    for node in ["review", "review_again"] {
+        let entries = run.entries(node);
+        assert_eq!(
+            entries[0]["models"][0]["outputMechanism"], "native",
+            "and the trace names the one that answered rather than the one that \
+             was tried first, on `{node}`: {}",
+            entries[0]
+        );
+    }
+    assert!(provider.snapshot().is_drained());
+}
+
+/// Which rung an agent starts on is a property of **its own schema**, not of
+/// the model its composition shares (PRD §9 resolved q53).
+///
+/// The reason the memo records what an endpoint **refused** rather than what
+/// answered: one composition's agents do not all carry the same schema, and a
+/// memo holding the winner would put the second agent here on the rung the first
+/// one's schema earned — and have it refused for a reason the ladder does not
+/// move on. Nothing fails in this run and nothing ladders; what it decides is
+/// that two calls one after the other to one endpoint asked in two different
+/// ways, because their schemas differ.
+#[test]
+fn two_agents_on_one_model_ask_the_way_their_own_schemas_allow() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(
+            SONNET,
+            Outcome::structured(json!({ "verdict": "revise", "feedback": "tighten it" })),
+        ),
+        Script::new(
+            SONNET,
+            Outcome::structured(
+                json!({ "verdict": "approve", "detail": { "headline": "it holds" } }),
+            ),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.mixed_review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
     assert_eq!(
-        entries[0]["models"][0]["outputMechanism"], "native",
-        "and the trace names the one that answered rather than the one that was \
-         tried first: {}",
-        entries[0]
+        recorded
+            .iter()
+            .map(|request| request
+                .structured_output
+                .as_ref()
+                .map(StructuredOutput::mechanism))
+            .collect::<Vec<_>>(),
+        [
+            Some(OutputMechanism::Native),
+            Some(OutputMechanism::ForcedTool)
+        ],
+        "the closed schema rode the wire's own format; the one with an \
+         `optional:` property inside it could not, and asked the other way"
+    );
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and neither of them laddered: this endpoint carries both"
+    );
+    assert_eq!(
+        run.entries("review")[0]["models"][0]["outputMechanism"],
+        "native"
+    );
+    assert_eq!(
+        run.entries("loose_review")[0]["models"][0]["outputMechanism"],
+        "forced_tool"
     );
     assert!(provider.snapshot().is_drained());
 }
@@ -3271,6 +3354,100 @@ fn the_chat_completions_wire_ladders_to_a_forced_function() {
     assert_eq!(
         run.entries("review")[0]["models"][0]["outputMechanism"],
         "forced_tool"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and the **third** wire's, which spells both rungs differently again:
+/// Responses falls from `text.format` to a flat forced function, over a loop
+/// that also carries the provider's own server tools (Decision D122).
+///
+/// The wire where the two mechanisms are most easily confused with the tool
+/// surface around them: a client function, the provider's suite and the pinned
+/// output tool all live in one `tools` array here, so what this pins beside the
+/// ladder is that the pin joins that array without displacing either of the
+/// other two.
+#[test]
+fn the_responses_wire_ladders_to_a_forced_function() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.personality(GPT5, Personality::NativeRejected);
+    provider.enqueue_all([
+        // The turn that ends the loop: prose, no calls (grammar 5, D51).
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "the docs say yes" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert_eq!(run.outputs()["answer"], "the docs say yes");
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        3,
+        "the loop's one call, then the pinned one on each rung"
+    );
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    assert_eq!(recorded[0].surface, Surface::Responses);
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|request| request.unsupported)
+            .collect::<Vec<_>>(),
+        [None, Some(OutputMechanism::Native), None],
+        "the loop call asked for no object; the first pinned one was refused"
+    );
+
+    let answered = recorded[2].body();
+    let pinned = recorded[2]
+        .structured_output
+        .as_ref()
+        .and_then(StructuredOutput::name)
+        .expect("the second rung names the function it pins")
+        .to_string();
+    assert_eq!(
+        answered["tool_choice"],
+        json!({ "type": "function", "name": pinned }),
+        "flat here, where Chat Completions nests the name: {}",
+        recorded[2].body_text
+    );
+    assert!(
+        answered["text"].is_null(),
+        "…and one mechanism per request, never both: {}",
+        recorded[2].body_text
+    );
+    assert_eq!(
+        recorded[2].tools,
+        ["lookup", pinned.as_str()],
+        "the agent's own tool leads, the pinned output tool follows it: {:?}",
+        recorded[2].tools
+    );
+    assert_eq!(
+        recorded[2].server_tools,
+        ["web_search"],
+        "…and the provider's suite is still last and still there: {:?}",
+        recorded[2].server_tools
+    );
+    assert_eq!(
+        run.entries("ask")[0]["models"][1]["outputMechanism"],
+        "forced_tool",
+        "the trace names it on the pinned call, and on that one only: {}",
+        run.entries("ask")[0]
+    );
+    assert!(
+        run.entries("ask")[0]["models"][0]["outputMechanism"].is_null(),
+        "…the loop's call asked for no object: {}",
+        run.entries("ask")[0]
     );
     assert!(provider.snapshot().is_drained());
 }

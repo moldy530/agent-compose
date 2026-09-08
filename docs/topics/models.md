@@ -410,9 +410,15 @@ The runtime prefers the **native** parameter and keeps the forced tool as the
 other rung. A refusal that names the mechanism — a 400 for an argument the
 endpoint has never heard of, or the newest Anthropic generation's
 `tool_choice: type "tool" and "any" are not supported for this model.` — makes it
-send the *same* call once more the other way. The mechanism that works is
+send the *same* call once more the other way. The rung an endpoint **refused** is
 remembered per provider-and-model for the life of the process, so only the first
 call of a pairing pays that extra round trip.
+
+One thing decides the order before any of that, and it is a property of the
+agent rather than of the endpoint: the native formats constrain a decoder over a
+**closed** schema, so an agent whose `output:` nests an object with `optional:`
+properties starts on the forced tool. Two agents on one model can therefore ask
+in two different ways, and a trace showing exactly that is not a bug.
 
 Nothing else ladders. A 401, a 429, a 5xx, a content refusal and a schema the
 decoder will not compile are refusals about something other than the mechanism,

@@ -288,7 +288,11 @@ flow.research_pair:
     - { from: review, to: end }
 
 flow.loose_review:
-  description: One call whose output schema the native format could not close.
+  description: Two calls whose output schema the native format could not close.
+  # Two nodes over one model for `flow.pair`'s reason, pointed at the other
+  # mechanism: the first node's pinned call is where a ladder is discovered and
+  # the second is where the memo is observable (PRD §9 resolved q53). One node
+  # would decide half the claim.
   inputs:
     goal:
       type: string
@@ -301,6 +305,47 @@ flow.loose_review:
       agent: agent.loose_reviewer
       input:
         goal: "input.goal"
+
+    review_again:
+      agent: agent.loose_reviewer
+      input:
+        goal: "input.goal"
   edges:
     - { from: start, to: review }
-    - { from: review, to: end }
+    - { from: review, to: review_again }
+    - { from: review_again, to: end }
+
+flow.mixed_review:
+  description: One flow whose two agents cannot ask for their output the same way.
+  # `agent.reviewer`'s output is a closed shape and `agent.loose_reviewer`'s is
+  # not, so the rung each one's pinned call starts on is a property of the agent
+  # rather than of the model they share (PRD §9 resolved q53). Nothing about
+  # this flow is about failure: it runs against an ordinary endpoint, and what
+  # it makes visible is that one composition's agents are not all on one rung.
+  inputs:
+    goal:
+      type: string
+      min_length: 1
+    draft:
+      type: string
+      min_length: 1
+  outputs:
+    verdict:
+      enum: [approve, revise]
+    feedback:
+      type: string
+  nodes:
+    review:
+      agent: agent.reviewer
+      input:
+        goal: "input.goal"
+        draft: "input.draft"
+
+    loose_review:
+      agent: agent.loose_reviewer
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: loose_review }
+    - { from: loose_review, to: end }

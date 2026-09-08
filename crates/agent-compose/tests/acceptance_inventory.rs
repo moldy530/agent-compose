@@ -316,6 +316,10 @@ const CODEGEN: &[Criterion] = &[
                 Status::Live,
             ),
             (
+                "two_agents_on_one_model_ask_the_way_their_own_schemas_allow",
+                Status::Live,
+            ),
+            (
                 "an_endpoint_carrying_neither_mechanism_fails_with_both_refusals_quoted",
                 Status::Live,
             ),
@@ -329,6 +333,10 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "the_chat_completions_wire_ladders_to_a_forced_function",
+                Status::Live,
+            ),
+            (
+                "the_responses_wire_ladders_to_a_forced_function",
                 Status::Live,
             ),
             // The other three kinds this milestone executes, which are not the
