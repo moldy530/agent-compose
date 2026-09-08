@@ -3173,52 +3173,261 @@ fn an_endpoint_carrying_neither_mechanism_fails_with_both_refusals_quoted() {
 /// A refusal that is **not** about the mechanism does not ladder — it fails the
 /// call exactly as it did before the ladder existed (PRD §9 resolved q53).
 ///
-/// Two shapes, and the second is the one a careless recognizer gets wrong: a
-/// schema the decoder will not compile is answered 400 in a sentence that names
-/// the mechanism's own parameter *and* says "not supported", and is not a
-/// statement about the mechanism at all. Laddering on it would send the same
-/// schema at the other rung, be refused again, and report an endpoint that
-/// carries neither when what the operator has is a schema to fix.
+/// **Every wire**, because the recognizer is per wire: each reads its own key
+/// out of its own service's dialect, so a table widened on one of them is a
+/// regression the other two's tests would never see. Three shapes, one per way
+/// of being wrong:
+///
+///   * a credential — the family that has nothing to do with the mechanism at
+///     all, and the one every wire has to leave alone;
+///   * the schema *inside* the parameter — the shape a careless recognizer gets
+///     wrong, because a schema the decoder will not compile is refused in a
+///     sentence that names the mechanism's own parameter *and* says "not
+///     supported". Laddering on it would send the same schema at the other rung,
+///     be refused again, and report an endpoint that carries neither when what
+///     the operator has is a schema to fix;
+///   * a **setting** the model does not take, refused "in this context" — the
+///     one that decides the recognizer reads its keys as keys. Responses spells
+///     its native mechanism `text.format`, and a body about `store` carries the
+///     letters `text` inside the word `context`: a substring test alone answers
+///     that a wire parameter is missing, spends a request finding out otherwise,
+///     and leaves `native` recorded as refused for the pairing for the life of
+///     the process.
 #[test]
 fn a_refusal_that_is_not_about_the_mechanism_does_not_ladder() {
-    for (about, body) in [
-        (
-            "a credential",
-            json!({
-                "type": "error",
-                "error": { "type": "authentication_error", "message": "invalid x-api-key" },
-            }),
-        ),
-        (
-            "the schema inside the parameter",
-            json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "output_config.format.schema: Invalid schema for output_config.format: 'minimum' is not supported.",
-                },
-            }),
-        ),
-    ] {
+    // One run, and the claim is always the same: the request count did not grow.
+    // `before` is what the node spent before the pinned call — the loop turn a
+    // tool-carrying agent takes first — so the count is "the refused call, and
+    // nothing after it".
+    let unladdered = |project: &str,
+                      flow: &str,
+                      inputs: &[(&str, &str)],
+                      model: &str,
+                      before: &[Outcome],
+                      about: &str,
+                      body: Value| {
         let provider = MockProvider::start().expect("a loopback port");
-        provider.enqueue(Script::new(SONNET, Outcome::raw(400, body)));
+        for outcome in before {
+            provider.enqueue(Script::new(model, outcome.clone()));
+        }
+        provider.enqueue(Script::new(model, Outcome::raw(400, body)));
 
-        let Some(run) = harness::invoke(
-            "agent-anthropic",
-            "flow.review",
-            &[("goal", "ship it"), ("draft", "a draft")],
-            &provider,
-        ) else {
+        let Some(run) = harness::invoke(project, flow, inputs, &provider) else {
             return;
         };
         run.failed();
         assert_eq!(
             provider.requests().len(),
-            1,
-            "a 400 about {about} is not a mechanism this endpoint lacks, so the \
-             call ended where it always did — one request, no retry"
+            before.len() + 1,
+            "on `{project}`, a 400 about {about} is not a mechanism this endpoint \
+             lacks, so the call ended where it always did — no retry"
         );
+    };
+
+    let review = &[("goal", "ship it"), ("draft", "a draft")][..];
+    for (project, flow, inputs, model, before, cases) in [
+        (
+            "agent-anthropic",
+            "flow.review",
+            review,
+            SONNET,
+            &[][..],
+            [
+                (
+                    "a credential",
+                    json!({
+                        "type": "error",
+                        "error": { "type": "authentication_error", "message": "invalid x-api-key" },
+                    }),
+                ),
+                (
+                    "the schema inside the parameter",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "output_config.format.schema: Invalid schema for output_config.format: 'minimum' is not supported.",
+                        },
+                    }),
+                ),
+                (
+                    "a setting this model does not take",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "This model does not support 'thinking' in this context.",
+                        },
+                    }),
+                ),
+            ],
+        ),
+        (
+            "agent-openai",
+            "flow.review",
+            review,
+            LOCAL,
+            &[][..],
+            [
+                (
+                    "a credential",
+                    json!({
+                        "error": {
+                            "message": "Incorrect API key provided.",
+                            "type": "invalid_request_error",
+                            "code": "invalid_api_key",
+                        },
+                    }),
+                ),
+                (
+                    "the schema inside the parameter",
+                    json!({
+                        "error": {
+                            "message": "Invalid schema for response_format 'reviewer_output': 'minimum' is not supported.",
+                            "type": "invalid_request_error",
+                            "param": "response_format",
+                        },
+                    }),
+                ),
+                (
+                    "a setting this model does not take",
+                    json!({
+                        "error": {
+                            "message": "This model does not support 'store: false' in this context.",
+                            "type": "invalid_request_error",
+                            "param": "store",
+                        },
+                    }),
+                ),
+            ],
+        ),
+        (
+            "server-tools",
+            "flow.respond",
+            &[("question", "does it?")][..],
+            GPT5,
+            // The loop's own turn: prose and no calls, so the next request is the
+            // pinned one this is about (grammar 5, D51).
+            &[Outcome::text("I have what I need.")][..],
+            [
+                (
+                    "a credential",
+                    json!({
+                        "error": {
+                            "message": "Incorrect API key provided.",
+                            "type": "invalid_request_error",
+                            "code": "invalid_api_key",
+                        },
+                    }),
+                ),
+                (
+                    "the schema inside the parameter",
+                    json!({
+                        "error": {
+                            "message": "Invalid schema for 'text.format': 'minimum' is not supported.",
+                            "type": "invalid_request_error",
+                            "param": "text.format",
+                        },
+                    }),
+                ),
+                (
+                    "a setting this model does not take",
+                    json!({
+                        "error": {
+                            "message": "This model does not support 'store: false' in this context.",
+                            "type": "invalid_request_error",
+                            "param": "store",
+                        },
+                    }),
+                ),
+            ],
+        ),
+    ] {
+        for (about, body) in cases {
+            unladdered(project, flow, inputs, model, before, about, body);
+        }
     }
+}
+
+/// …and a refusal that **is** about the mechanism ladders however the service
+/// happened to word it (PRD §9 resolved q53).
+///
+/// The recognizer's two hard edges, one case each, and both are wordings a
+/// gateway sends rather than inventions:
+///
+///   * a capability refusal wearing a schema complaint's clothes — `Invalid
+///     schema for response_format: json_schema response format is not supported
+///     with this model.` opens with the boilerplate that disqualifies a schema
+///     refusal and then says the endpoint does not have the mechanism. Reading
+///     only the opening fails a run the forced function would have served, which
+///     is the expensive direction of being wrong; what re-qualifies it is that it
+///     names the **model** as the thing that lacks it, and no complaint about a
+///     schema's contents does that;
+///   * `Unexpected parameter: output_config` — the same family as the
+///     "unrecognized"/"unknown" spellings already read, in the words a service
+///     that validates against a signature uses.
+#[test]
+fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
+    let ladders =
+        |project: &str, model: &str, about: &str, refusal: Value, answer: Value, verdict: &str| {
+            let provider = MockProvider::start().expect("a loopback port");
+            provider.enqueue_all([
+                Script::new(model, Outcome::raw(400, refusal)),
+                Script::new(model, Outcome::structured(answer)),
+            ]);
+
+            let Some(run) = harness::invoke(
+                project,
+                "flow.review",
+                &[("goal", "ship it"), ("draft", "a draft")],
+                &provider,
+            ) else {
+                return;
+            };
+            run.succeeded();
+            assert_eq!(run.outputs()["verdict"], verdict);
+            assert_eq!(
+                provider.requests().len(),
+                2,
+                "{about}: the refusal names the mechanism, so the same call went out \
+             once more the other way"
+            );
+            assert_eq!(
+                run.entries("review")[0]["models"][0]["outputMechanism"],
+                "forced_tool",
+                "{about}: …and the rung that answered is the one the trace names"
+            );
+            assert!(provider.snapshot().is_drained());
+        };
+
+    ladders(
+        "agent-openai",
+        LOCAL,
+        "a capability refusal inside a schema complaint's boilerplate",
+        json!({
+            "error": {
+                "message": "Invalid schema for response_format: json_schema response format is not supported with this model.",
+                "type": "invalid_request_error",
+                "param": "response_format",
+            },
+        }),
+        json!({ "verdict": "revise", "feedback": "tighten it" }),
+        "revise",
+    );
+    ladders(
+        "agent-anthropic",
+        SONNET,
+        "an unknown parameter spelled `unexpected`",
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Unexpected parameter: output_config",
+            },
+        }),
+        json!({ "verdict": "approve", "feedback": "" }),
+        "approve",
+    );
 }
 
 /// Resolved q52's closing user turn is on **both** mechanisms' requests.

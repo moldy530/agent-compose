@@ -2425,6 +2425,10 @@ function mechanismOrder(
  * service names when it complains about the *top-level* key — Responses' own
  * `text` is the parameter `text.format` sits inside, and a gateway that has
  * never heard of the wire refuses it under that name.
+ *
+ * Every entry is matched by [`namesKey`] rather than by a bare `includes`, which
+ * is what makes an entry as short as `text` safe to carry: a run of letters
+ * inside a longer word is not this key being named.
  */
 const MECHANISM_KEYS: Readonly<Record<Wire, Readonly<Record<OutputMechanism, readonly string[]>>>> =
   {
@@ -2456,6 +2460,7 @@ const UNSUPPORTED_PARAMETER: readonly string[] = [
   "unrecognized key",
   "unknown parameter",
   "unsupported parameter",
+  "unexpected parameter",
   "unexpected keyword argument",
   "unknown field",
   "is not a valid parameter",
@@ -2483,6 +2488,62 @@ const NOT_ABOUT_THE_MECHANISM: readonly string[] = [
 ];
 
 /**
+ * …and what a body says when the thing that does not carry the mechanism is the
+ * **endpoint**, which outranks the disqualifier above.
+ *
+ * The disqualifier reads the whole body, because a service writes one sentence
+ * and does not tell a client which clause is the complaint. That is right for
+ * the schema refusals it is for and wrong for the one shape that carries a
+ * capability statement *inside* the same boilerplate: `Invalid schema for
+ * response_format: json_schema response format is not supported with this
+ * model.` is a gateway saying it does not have the mechanism, in a sentence that
+ * opens with the words a schema complaint opens with. Disqualifying it would
+ * fail a run the forced function would have served — the expensive direction of
+ * being wrong, per [`UNSUPPORTED_PARAMETER`].
+ *
+ * So a phrase here re-qualifies a body the disqualifier caught, and each of them
+ * names the *endpoint* as what lacks it, which is a thing no complaint about a
+ * schema's contents says: `'minimum' is not supported.` is about the schema and
+ * carries none of these. Being wrong here costs one more request that also fails
+ * and a diagnostic quoting both refusals, which is the cheap direction.
+ */
+const ABOUT_THE_ENDPOINT: readonly string[] = [
+  "with this model",
+  "for this model",
+  "on this model",
+  "with this endpoint",
+  "for this endpoint",
+];
+
+/**
+ * Whether `body` names `key` as a **key**, rather than carrying those letters
+ * inside a longer word.
+ *
+ * A refusal is prose with a parameter name in it, so the recognizer reads it as
+ * a substring — but a substring test alone answers "yes" to `text` inside
+ * `context`, and `This model does not support 'store: false' in this context.`
+ * is a 400 about a *setting* that would otherwise be read as the Responses
+ * wire's native parameter being absent, ladder once for nothing, and (worse)
+ * leave `native` recorded as refused for that pairing for the life of the
+ * process. Requiring the match to begin and end at something other than an
+ * identifier character is what separates `'text.format'`, `"text"` and
+ * `supplied: text` — every way a service names the key — from `context`.
+ *
+ * `body` arrives lowercased, so the character class is written that way.
+ */
+function namesKey(body: string, key: string): boolean {
+  const identifier = /[a-z0-9_]/;
+  // `charAt` answers `""` off either end, which is not an identifier character —
+  // a key at the very start or end of the body is named by it.
+  for (let at = body.indexOf(key); at >= 0; at = body.indexOf(key, at + 1)) {
+    if (!identifier.test(body.charAt(at - 1)) && !identifier.test(body.charAt(at + key.length))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Whether this refusal says the **mechanism** is unsupported — the one condition
  * that moves the ladder (PRD §9 resolved q53).
  *
@@ -2494,18 +2555,21 @@ const NOT_ABOUT_THE_MECHANISM: readonly string[] = [
  *
  * Three things must hold at once: the status is one a service refuses a request
  * with rather than one it fails under (400, and 422 for the services that use
- * it); the body names the key this mechanism is spelled with on this wire; and
- * the body carries one of the ways of saying "that parameter is not one I have"
- * without carrying one of the ways of saying "that parameter's contents are
- * wrong".
+ * it); the body names the key this mechanism is spelled with on this wire — as a
+ * key ([`namesKey`]), not as letters inside another word; and the body carries
+ * one of the ways of saying "that parameter is not one I have" without carrying
+ * one of the ways of saying "that parameter's contents are wrong" that is not
+ * also a statement about the endpoint ([`ABOUT_THE_ENDPOINT`]).
  */
 function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unknown): boolean {
   if (!(error instanceof ProviderFailure)) return false;
   if (error.status !== 400 && error.status !== 422) return false;
   const body = error.body.toLowerCase();
-  if (NOT_ABOUT_THE_MECHANISM.some((phrase) => body.includes(phrase))) return false;
-  if (!MECHANISM_KEYS[wire][mechanism].some((key) => body.includes(key))) return false;
-  return UNSUPPORTED_PARAMETER.some((phrase) => body.includes(phrase));
+  const carries = (phrases: readonly string[]): boolean =>
+    phrases.some((phrase) => body.includes(phrase));
+  if (carries(NOT_ABOUT_THE_MECHANISM) && !carries(ABOUT_THE_ENDPOINT)) return false;
+  if (!MECHANISM_KEYS[wire][mechanism].some((key) => namesKey(body, key))) return false;
+  return carries(UNSUPPORTED_PARAMETER);
 }
 
 /**

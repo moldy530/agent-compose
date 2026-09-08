@@ -297,12 +297,12 @@ const CODEGEN: &[Criterion] = &[
             // surface: each wire's native structured-output parameter first, the
             // synthetic pinned tool as the other rung, a capability-shaped 400
             // laddering between them inside one call, and the winner memoized per
-            // provider-and-model for the process. Six rows, because six things
-            // can be wrong independently — which mechanism a healthy endpoint
-            // answers on and what the trace says about it, the ladder and its
-            // memo in each direction, the endpoint that carries neither, the
-            // refusals that must **not** ladder, and resolved q52's closing turn
-            // surviving both shapes.
+            // provider-and-model for the process. A row per thing that can be
+            // wrong independently — which mechanism a healthy endpoint answers on
+            // and what the trace says about it, the ladder and its memo in each
+            // direction, the endpoint that carries neither, the refusals that
+            // must **not** ladder and the borderline wordings that must, and
+            // resolved q52's closing turn surviving both shapes.
             (
                 "a_structured_output_call_records_the_mechanism_that_answered_it",
                 Status::Live,
@@ -325,6 +325,10 @@ const CODEGEN: &[Criterion] = &[
             ),
             (
                 "a_refusal_that_is_not_about_the_mechanism_does_not_ladder",
+                Status::Live,
+            ),
+            (
+                "a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends",
                 Status::Live,
             ),
             (
