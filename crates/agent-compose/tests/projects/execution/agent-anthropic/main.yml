@@ -3,11 +3,12 @@
 # Two flows, one manual invocation each, and the split between them is the point.
 #
 #   * `flow.review` runs `agent.reviewer`, which has **no tools**. Its model call
-#     is therefore a single one — the output schema offered as a tool and pinned
-#     with `tool_choice` (PRD 5.2) — so a test that scripts one structured answer
-#     has nothing else in the transcript to explain away. It is also the exact
-#     twin of `agent-openai`'s reviewer, which is what makes "the provider kind
-#     is the only difference" an assertion rather than a claim.
+#     is therefore a single one — the one that asks for the output schema
+#     (PRD 5.2), in whichever of the wire's two ways the endpoint leaves open
+#     (PRD §9 resolved q53) — so a test that scripts one structured answer has
+#     nothing else in the transcript to explain away. It is also the exact twin
+#     of `agent-openai`'s reviewer, which is what makes "the provider kind is
+#     the only difference" an assertion rather than a claim.
 #   * `flow.research` runs `agent.researcher`, which carries `tools:` and the
 #     `max_tool_iterations` bound on the loop they open (D51 — an open question,
 #     see PRD §10 item 2). An agent with tools cannot have its answer pinned on

@@ -1930,11 +1930,11 @@ fn a_tagged_union_output_is_narrowed_per_variant_and_a_bad_tag_is_rejected() {
 /// schema — and writes the structured output it gets back.
 ///
 /// `agent.reviewer` carries no `tools:`, so this is the single-call shape the
-/// module header's *How many model calls an agent node makes* fixes: the output
-/// schema offered as a tool and pinned. What an agent's own `tools:` list looks
-/// like on the wire belongs to the tool-loop test — a request cannot pin the
-/// output tool and leave another one callable, so no single test can assert
-/// both.
+/// module header's *How many model calls an agent node makes* fixes: one call,
+/// asking for the output schema in whichever way this wire and this endpoint
+/// leave open (PRD resolved q53). What an agent's own `tools:` list looks like
+/// on the wire belongs to the tool-loop test — a request that *pins* the output
+/// tool cannot leave another one callable, so no single test can assert both.
 #[test]
 fn an_agent_node_sends_its_prompt_input_and_output_schema() {
     let provider = MockProvider::start().expect("a loopback port");

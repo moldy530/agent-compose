@@ -1,12 +1,20 @@
 //! The Anthropic Messages surface: `POST /v1/messages`.
 //!
 //! This is the surface an `anthropic` provider (grammar 12.1) reaches, and it is
-//! where PRD 5.2's load-bearing promise is kept: an agent's structured output
-//! arrives as **forced tool use**. The request carries the agent's output schema
-//! as a tool's `input_schema` and pins `tool_choice: {type: "tool", name: …}`;
-//! the answer is one `tool_use` block whose `input` is the structured object. A
-//! script that says `Outcome::structured(…)` is rendered exactly that way, so a
-//! test writes the object the agent should produce and never writes wire shapes.
+//! where PRD 5.2's load-bearing promise is kept — **two** ways, since PRD §9
+//! resolved q53:
+//!
+//! * `output_config: { format: { type: "json_schema", schema } }`, the API's own
+//!   structured output, answered with a text block that parses;
+//! * **forced tool use** — the agent's output schema as a tool's `input_schema`
+//!   with `tool_choice: {type: "tool", name: …}` pinning it, answered with one
+//!   `tool_use` block whose `input` is the object.
+//!
+//! A compiled graph sends one or the other and this server refuses the mechanism
+//! its model's [`crate::Personality`] does not carry, which is how the runtime's
+//! ladder between them is held by conformance. A script that says
+//! `Outcome::structured(…)` is rendered into whichever the *request* asked for,
+//! so a test writes the object the agent should produce and never a wire shape.
 //!
 //! # What is checked
 //!

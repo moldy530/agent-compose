@@ -4,8 +4,9 @@
 //! what a client on the other end of a connection actually receives — status,
 //! headers, and body — because that is what the Anthropic SDK inside a compiled
 //! graph will parse. A request here is written the way generated code will write
-//! it: the agent's output schema as a forced tool (PRD 5.2), its `tools:` and
-//! `stores:` entries as the tool surface (grammar 5.4, 11.5).
+//! it: the agent's output schema asked for either way this wire has (PRD 5.2,
+//! PRD §9 resolved q53), its `tools:` and `stores:` entries as the tool surface
+//! (grammar 5.4, 11.5).
 
 use std::time::Duration;
 

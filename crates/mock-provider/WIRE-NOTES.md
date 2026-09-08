@@ -98,10 +98,13 @@ These are load-bearing and pinned by tests in `src/` and `tests/`:
 * **A pinned tool choice guarantees a call.** Anthropic's `tool_choice: {type:
   "tool", …}` and `{type: "any"}`, OpenAI's forced function and `tool_choice:
   "required"`, and OpenAI's `response_format: {type: "json_schema"}` each make
-  free prose an impossible answer. A `text` reply scripted against one of them
-  is refused as a `script-mismatch` for the same reason a `structured` reply to
-  a request that pinned nothing is: the harness must not teach generated code
-  that a provider answers in a way it cannot.
+  free prose an impossible answer. So does every wire's *native* structured
+  output — Anthropic's `output_config.format` and Responses' `text.format` —
+  which shapes the turn's text into the schema rather than pinning a call
+  (26). A `text` reply scripted against any of them is refused as a
+  `script-mismatch` for the same reason a `structured` reply to a request that
+  pinned nothing is: the harness must not teach generated code that a provider
+  answers in a way it cannot.
 * **A pinned tool choice outranks a `response_format`.** The consequence of the
   rule above on a Chat Completions request that carries *both* mechanisms:
   `response_format` shapes the content, and a pinned `tool_choice` decides
@@ -213,7 +216,10 @@ then read the structured object out of the returned `tool_use` block's `input`.
 
 *This server*: accepts exactly that, and renders `Outcome::structured(v)` as one
 `tool_use` block. It also accepts `tool_choice: {type: "any"}` when exactly one
-tool is on offer, which is the same request in effect.
+tool is on offer, which is the same request in effect. It is no longer the
+**only** way a compiled graph asks this wire for an object — see (26) for
+`output_config`, and (27) for the endpoints that carry one mechanism and not the
+other.
 *Confirmed by*: the first live e2e's recorded request carrying
 `tool_choice.type == "tool"`.
 *If wrong*: a structured reply is refused as a `script-mismatch` (see (11) for

@@ -28,11 +28,13 @@
 //!
 //! # Structured output
 //!
-//! One mechanism, not two: `text.format.type: "json_schema"`. There is no
-//! forced-function spelling here, because a compiled graph does not use one —
-//! the runtime's Responses branch carries the pinned schema in `text.format`
-//! and parses the assistant text back out, which is q16's posture (what is
-//! constrained is exactly what is parsed) written on this wire.
+//! Two mechanisms, like every other wire since PRD §9 resolved q53:
+//! `text.format.type: "json_schema"`, which shapes the turn's final message and
+//! is the rung a compiled graph prefers, and a **flat** forced function —
+//! `tool_choice: {type: "function", name}` over a function carrying the same
+//! schema — which is where it falls when an endpoint will not take the first.
+//! Either way q16's posture holds on this wire: what is constrained is exactly
+//! what is parsed.
 //!
 //! `WIRE-NOTES.md` records the concessions.
 
