@@ -419,6 +419,18 @@ const CODEGEN: &[Criterion] = &[
                 "a_schema_keyword_refusal_fails_the_call_without_laddering_or_remembering",
                 Status::Live,
             ),
+            // …and the two schemas a row is otherwise proven over only where
+            // nothing is bounded: the pinned one on the **other** rung, and an
+            // agent's **own tool**, whose `input:` may carry the same keywords
+            // and which the Responses wire declares `strict` on.
+            (
+                "the_forced_function_rung_carries_the_lowered_schema_too",
+                Status::Live,
+            ),
+            (
+                "a_client_tools_schema_is_lowered_where_its_wire_declares_strict",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).

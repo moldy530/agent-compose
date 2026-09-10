@@ -22,6 +22,13 @@
 //! suite would pass the first and fail the second with a message about a
 //! schema rather than about a table.
 //!
+//! The table is written down a **third** time, in the topic an author is sent to
+//! (`agent-compose docs models`), and that copy is held here too: error and doc
+//! UX is a product feature (PRD G3), and the whole posture q55 takes from
+//! resolved q30 is that a vendor change is one line per statement. A published
+//! list that quietly stopped being true would be the one statement of the three
+//! nothing else could catch.
+//!
 //! The **acceptance** half of the same proof lives in
 //! `compiled_graph_acceptance.rs`: a real compiled graph sends a real
 //! array-bearing schema at a mock that enforces these lists, on all three wires.
@@ -29,6 +36,7 @@
 use std::collections::BTreeSet;
 
 use compose_core::codegen::runtime::SOURCE;
+use compose_core::docs::topics;
 use mock_provider::{OutputMechanism, Surface, lowering};
 
 /// Which surfaces one emitted `Wire` reaches.
@@ -203,6 +211,144 @@ fn every_native_rung_strips_the_keyword_d10_makes_mandatory() {
              on every result-schema array: {stripped:?}"
         );
     }
+}
+
+/// The row an author reads is the row the runtime strips and the oracle refuses
+/// (PRD §9 resolved q55, ruling a; PRD G3).
+///
+/// The published `models` topic states the same table in prose — it is where an
+/// author meets lowering at all, and `docs/topics/schemas.md` sends them there.
+/// Three statements of one list, two of them already held equal above; without
+/// this the third is held to nothing, and the next vendor edit leaves the docs
+/// telling an author a keyword comes off the request when it no longer does.
+///
+/// Read out of `compose_core::docs::topics`, which is the text `agent-compose
+/// docs models` prints, so what is checked is the published copy rather than a
+/// file that happens to sit beside it.
+#[test]
+fn the_published_table_names_the_same_keywords() {
+    let documented = documented_table();
+    assert_eq!(
+        documented.len(),
+        3,
+        "the `models` topic no longer states one row per (wire, mechanism) family: {documented:?}"
+    );
+    // Which mock rows each published row speaks for. The last is one row in the
+    // docs because it is one decoder behind three routes, which is exactly the
+    // claim `what_the_runtime_strips_is_what_the_oracle_refuses` checks
+    // surface by surface.
+    let rows: [(&str, Vec<(Surface, OutputMechanism)>); 3] = [
+        (
+            "Messages, `output_config`",
+            vec![(Surface::Anthropic, OutputMechanism::Native)],
+        ),
+        (
+            "Messages, forced tool",
+            vec![(Surface::Anthropic, OutputMechanism::ForcedTool)],
+        ),
+        (
+            "Chat Completions and Responses, either mechanism",
+            vec![
+                (Surface::OpenAi, OutputMechanism::Native),
+                (Surface::OpenAi, OutputMechanism::ForcedTool),
+                (Surface::AzureOpenAi, OutputMechanism::Native),
+                (Surface::AzureOpenAi, OutputMechanism::ForcedTool),
+                (Surface::Responses, OutputMechanism::Native),
+                (Surface::Responses, OutputMechanism::ForcedTool),
+            ],
+        ),
+    ];
+    for (index, (label, enforced_by)) in rows.into_iter().enumerate() {
+        let (published_label, published) = &documented[index];
+        assert_eq!(
+            published_label, label,
+            "the published table's rows moved; this test names each one so a reordered or renamed \
+             row is a diff rather than a keyword list compared against the wrong wire"
+        );
+        for (surface, mechanism) in enforced_by {
+            let refused: BTreeSet<&str> = lowering::enforced(surface, mechanism)
+                .iter()
+                .copied()
+                .collect();
+            let said: BTreeSet<&str> = published.iter().map(String::as_str).collect();
+            assert_eq!(
+                said,
+                refused,
+                "`docs/topics/models.md` tells an author that `{label}` takes {published:?} off \
+                 the request, and {surface:?}/{mechanism:?} refuses {refused:?}. Documented but not \
+                 refused: {:?}. Refused but not documented: {:?}. The published table is the \
+                 third statement of one list — `LOWERED_AWAY` in \
+                 `crates/compose-core/src/codegen/js/runtime.ts`, `ENFORCED` in \
+                 `crates/mock-provider/src/lowering.rs`, and this — and a vendor that changes its \
+                 subset changes all three (PRD resolved q55, resolved q30's treadmill terms, PRD \
+                 G3)",
+                said.difference(&refused).collect::<Vec<_>>(),
+                refused.difference(&said).collect::<Vec<_>>(),
+            );
+        }
+    }
+}
+
+/// The published lowering table, row by row: the label in the first cell, and
+/// the keywords the second cell names.
+///
+/// A cell that opens with `nothing` is the empty row stated in words, which is
+/// the Messages wire's forced-tool rung. Every other cell names its keywords in
+/// backticks and nothing else, which is what makes the reading a `split` rather
+/// than a parser.
+fn documented_table() -> Vec<(String, Vec<String>)> {
+    let body = topics::topic("models")
+        .expect("the `models` topic is registered")
+        .body;
+    let mut rows = Vec::new();
+    let mut inside = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with("| wire / mechanism |") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if line.starts_with("|---") {
+            continue;
+        }
+        let Some(row) = line.strip_prefix('|').and_then(|row| row.strip_suffix('|')) else {
+            break;
+        };
+        let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        assert_eq!(
+            cells.len(),
+            2,
+            "the published lowering table is two columns wide: {line}"
+        );
+        let keywords = if cells[1].starts_with("nothing") {
+            Vec::new()
+        } else {
+            backticked(cells[1])
+        };
+        rows.push((cells[0].to_string(), keywords));
+    }
+    assert!(
+        !rows.is_empty(),
+        "the `models` topic no longer carries the lowering table this test reads (its header row \
+         is `| wire / mechanism | taken off the request |`)"
+    );
+    rows
+}
+
+/// Every backtick-quoted span in one table cell, in the order it is written.
+fn backticked(cell: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = cell;
+    while let Some(open) = rest.find('`') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('`') else { break };
+        found.push(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    found
 }
 
 /// …and the one row that is deliberately empty stays a claim.

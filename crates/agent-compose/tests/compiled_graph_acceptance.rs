@@ -4939,6 +4939,14 @@ fn an_answer_over_a_stripped_bound_fails_the_parse() {
 /// mechanism as absent from an endpoint that has it — the way of being wrong
 /// that hides itself.
 ///
+/// Twice over, because a table has **two** ways of being wrong and only one of
+/// them is about a keyword it strips. The second half stages `pattern` — a
+/// constraint no table takes off the wire, deliberately, on the posture that
+/// under-stripping is the cheap direction of being wrong. That posture is only
+/// true if a refusal naming what was left on is loud rather than a ladder trip:
+/// the recognizer therefore watches every constraint keyword a schema can carry,
+/// not merely the ones some table strips.
+///
 /// `bounded-cycle`'s `write` node declares `retry: { max: 2 }`, which is what
 /// makes the *memo* observable: three attempts, and each one has to start on the
 /// native rung again. A remembered refusal would show up as the second attempt
@@ -5014,6 +5022,255 @@ fn a_schema_keyword_refusal_fails_the_call_without_laddering_or_remembering() {
         recorded.iter().all(|request| !request.was_unsupported()),
         "…and the endpoint refused no mechanism: what it refused was the schema"
     );
+
+    // …and the same, for a keyword the tables deliberately **leave on the
+    // wire**. `pattern` is one of the two: the ruling's families are array,
+    // numeric and string-length bounds, and the posture q55 takes from resolved
+    // q30 is to under-strip rather than over-strip, because a keyword left on
+    // that a decoder will not compile is a 400 that names it. That trade is only
+    // paid for if this refusal behaves exactly like the one above — which is why
+    // the recognizer's vocabulary is every constraint keyword a schema can
+    // carry, and not the union of the tables.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(
+        Script::new(
+            SONNET,
+            Outcome::raw(
+                400,
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Unsupported parameter: output_config — 'pattern' is not supported by this model.",
+                    },
+                }),
+            ),
+        )
+        .times(3)
+        .matching("research writer"),
+    );
+
+    let Some(run) = harness::invoke(
+        "bounded-cycle",
+        "flow.review_loop",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("pattern") && failure.contains("lowering table"),
+        "a keyword no table strips is still this runtime's own failure, named and repaired in the \
+         same place: {failure}"
+    );
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        3,
+        "one request per attempt: a constraint keyword the table left on the wire does not ladder \
+         either — the other rung would send the same schema"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and nothing was recorded as a mechanism this endpoint lacks"
+    );
+}
+
+/// The **forced-function** rung sends the same lowered schema, on the two wires
+/// whose forced row is not empty (PRD §9 resolved q55, ruling a).
+///
+/// The native rung is what the ruling was resolved from and what the run above
+/// proves; the other rung's row is a table entry like any other, and on the
+/// OpenAI wires it is a full one — `strict: true` on a function's `parameters`
+/// hands that schema to the same decoder `response_format` and `text.format`
+/// hand theirs to. Proven end to end rather than statically, because a
+/// forced-rung row is otherwise attested only by a mock check that never fires
+/// on a corpus whose forced-rung agents declare no bounds: a vacuous pass looks
+/// exactly like a correct one.
+///
+/// The Messages wire is deliberately absent: its forced row strips nothing, and
+/// `wire_lowering_agreement.rs` holds that empty row to the oracle's own.
+#[test]
+fn the_forced_function_rung_carries_the_lowered_schema_too() {
+    let answer = json!({
+        "headline": "three things",
+        "tallies": [
+            { "label": "one", "weight": 0.5 },
+            { "label": "two", "weight": 0.25 },
+        ],
+        "total": 2,
+    });
+    for (project, model, surface) in [
+        ("agent-openai", LOCAL, Surface::OpenAi),
+        ("server-tools", GPT5, Surface::Responses),
+    ] {
+        let provider = MockProvider::start().expect("a loopback port");
+        provider.personality(model, Personality::NativeRejected);
+        provider.enqueue(Script::new(model, Outcome::structured(answer.clone())));
+
+        let Some(run) = harness::invoke(
+            project,
+            "flow.tally",
+            &[("subject", "a short list")],
+            &provider,
+        ) else {
+            return;
+        };
+        run.succeeded();
+
+        let recorded = provider.requests();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "on `{project}`: the refused native rung, then the forced function"
+        );
+        assert!(
+            recorded.iter().all(RecordedRequest::is_valid),
+            "on `{project}`, a request this decoder cannot compile — the lowering table for the \
+             forced rung is missing a row (PRD resolved q55): {:?}",
+            recorded
+                .iter()
+                .map(RecordedRequest::failures)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(recorded[0].unsupported, Some(OutputMechanism::Native));
+        let asked = recorded[1]
+            .structured_output
+            .as_ref()
+            .expect("the second rung pins a function carrying the schema");
+        assert_eq!(asked.mechanism(), OutputMechanism::ForcedTool);
+        assert_eq!(
+            mock_provider::lowering::carries_refused_keyword(
+                surface,
+                OutputMechanism::ForcedTool,
+                asked.schema()
+            ),
+            None,
+            "on `{project}`, the pinned function's `parameters` still carries a keyword this \
+             decoder refuses: {}",
+            asked.schema()
+        );
+        assert_eq!(
+            asked.schema()["properties"]["tallies"]["description"],
+            "What was found, one note per item. At most 3 items.",
+            "…and the bound it lost is still in the model's view (ruling b): {}",
+            asked.schema()
+        );
+        assert!(provider.snapshot().is_drained());
+    }
+}
+
+/// A **client tool's** own schema is lowered wherever its wire compiles it, and
+/// left whole where it does not (PRD §9 resolved q55, ruling a; grammar §3.5).
+///
+/// The schema an agent's `output:` rides on is not the only one a request
+/// carries. A `tool.…` `input:` may declare `min_length`, `minimum` or
+/// `max_items` too, and the Responses wire declares `strict` on every function
+/// it is handed — which is the promise that puts a schema through the
+/// structured-output compiler. So `tool.lookup`'s `min_length: 1` is a live 400
+/// there unless it is lowered like anything else, and this is the run that says
+/// so: the mock enforces the subset on any function declared `strict`
+/// (`WIRE-NOTES` (28)), so an unlowered tool is a refused request rather than a
+/// green suite.
+///
+/// Chat Completions is the control, and the contrast is the point of pairing
+/// them: a client tool goes out there with no `strict` at all, nothing compiles
+/// its schema, and the bound stays where the author wrote it. Lowering is per
+/// (wire, mechanism) and it does not spread.
+#[test]
+fn a_client_tools_schema_is_lowered_where_its_wire_declares_strict() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The turn that ends the loop: prose, no calls (grammar 5, D51).
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "the docs say yes" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert!(
+        recorded.iter().all(RecordedRequest::is_valid),
+        "a tool schema this wire's `strict` decoder cannot compile is a 400 here, exactly as it \
+         is live: {:?}",
+        recorded
+            .iter()
+            .map(RecordedRequest::failures)
+            .collect::<Vec<_>>()
+    );
+    let declared = recorded[0].body()["tools"][0].clone();
+    assert_eq!(
+        declared["name"], "lookup",
+        "the agent's own tool leads this wire's `tools`: {}",
+        recorded[0].body_text
+    );
+    assert_eq!(
+        declared["strict"], true,
+        "…declared `strict`, which is what makes its schema the decoder's business: {}",
+        recorded[0].body_text
+    );
+    assert!(
+        declared["parameters"]["properties"]["query"]["minLength"].is_null(),
+        "…so the bound comes off the request: {}",
+        recorded[0].body_text
+    );
+    assert_eq!(
+        declared["parameters"]["properties"]["query"]["description"],
+        "What to look up. At least 1 character.",
+        "…and is folded into the description the model reads (ruling b): {}",
+        recorded[0].body_text
+    );
+    assert!(provider.snapshot().is_drained());
+
+    // …and the wire that declares no `strict` on a client tool sends the bound
+    // itself: nothing compiles it there, so nothing is taken off.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(LOCAL, Outcome::text("found it")),
+        Script::new(
+            LOCAL,
+            Outcome::structured(json!({ "feedback": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    let declared = recorded[0].body()["tools"][0]["function"].clone();
+    assert_eq!(declared["name"], "lookup");
+    assert!(
+        declared["strict"].is_null(),
+        "a client tool carries no `strict` on this wire: {}",
+        recorded[0].body_text
+    );
+    assert_eq!(
+        declared["parameters"]["properties"]["query"]["minLength"],
+        json!(1),
+        "…so its bound rides the request as the author wrote it: {}",
+        recorded[0].body_text
+    );
+    assert!(provider.snapshot().is_drained());
 }
 
 /// A loop answer is replayed as the model sent it, and an answer that carried

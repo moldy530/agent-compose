@@ -265,7 +265,11 @@
 //!     (nested objects, arrays of objects, `anyOf` branches, paired bounds, a
 //!     node with no description of its own, `uniqueItems: false`) and asks the
 //!     runner whether the function was deterministic and left its input alone,
-//!     which no JSON round trip could show.
+//!     which no JSON round trip could show. Its **`23b`** half is about the same
+//!     ruling's other side: the recognizer that refuses to ladder on a
+//!     schema-keyword 400 has to watch every constraint a schema can carry
+//!     rather than only the ones a table strips, because a keyword left on the
+//!     wire deliberately is exactly the one a refusal will name.
 //!
 //! # The toolchain fixture
 //!
@@ -5159,9 +5163,50 @@ fn projections() -> Vec<Projection> {
                     "Between 0 and 1.",
                 ),
                 (
+                    // Singular, because the bound is one: `min_length: 1` is
+                    // the idiom this repo's own fixtures are written in, so the
+                    // agreement is the common case rather than a corner.
                     "properties.findings.items.oneOf.1.properties.summary",
-                    "At least 1 characters.",
+                    "At least 1 character.",
                 ),
+            ],
+        },
+        Projection {
+            label: "prose the author did not punctuate, and bounds of one",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        // No full stop, which YAML `description:` text is under
+                        // no obligation to carry: the fold supplies one rather
+                        // than running the two sentences together.
+                        "notes": {
+                            "type": "array",
+                            "description": "Side notes",
+                            "maxItems": 4,
+                            "items": { "type": "string" },
+                        },
+                        // …and an author who ended on something else keeps it.
+                        "title": {
+                            "type": "string",
+                            "description": "What to call it:",
+                            "minLength": 1,
+                        },
+                        "labels": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 1,
+                            "items": { "type": "string" },
+                        },
+                    },
+                    "required": ["notes", "title", "labels"],
+                    "additionalProperties": false,
+                })
+            },
+            described: &[
+                ("properties.notes", "Side notes. At most 4 items."),
+                ("properties.title", "What to call it: At least 1 character."),
+                ("properties.labels", "Between 1 and 1 item."),
             ],
         },
         Projection {
@@ -5475,6 +5520,126 @@ const KEYWORDS_A_SCHEMA_CAN_CARRY: &[&str] = &[
     "minLength",
     "maxLength",
 ];
+
+/// …and the subset of those that **bound a value** rather than describe a shape,
+/// which is the vocabulary ruling d's recognizer reads (PRD §9 resolved q55).
+///
+/// A `type` or a `properties` in a 400 is a malformed request; a `maxItems` or a
+/// `pattern` in one is a constraint the decoder would not compile, which after
+/// lowering can only mean the runtime's table is missing a row. The two lists
+/// are stated separately because they answer different questions, and
+/// [`the_refusal_vocabulary_covers_every_constraint_a_schema_can_carry`] holds
+/// this one to being a subset of the one above.
+const CONSTRAINTS_A_SCHEMA_CAN_CARRY: &[&str] = &[
+    "format",
+    "pattern",
+    "uniqueItems",
+    "maxItems",
+    "minItems",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+];
+
+/// The keywords one `const NAME: readonly string[] = […]` of the emitted runtime
+/// names, read out of the TypeScript with its comments taken off.
+///
+/// Both shapes the formatter writes: a list long enough to break over lines, and
+/// a short one that closes on the line it opened.
+fn emitted_keywords(name: &str) -> Vec<String> {
+    let opened = format!("const {name}: readonly string[] = [");
+    let mut lines = compose_core::codegen::runtime::SOURCE
+        .lines()
+        .skip_while(|line| !line.starts_with(&opened));
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("the emitted runtime declares `{opened}…`"));
+    if let Some(inline) = first
+        .strip_prefix(opened.as_str())
+        .and_then(|rest| rest.strip_suffix("];"))
+    {
+        return quoted_on(inline);
+    }
+    let mut found = Vec::new();
+    for line in lines {
+        if line == "];" {
+            return found;
+        }
+        found.extend(quoted_on(line));
+    }
+    panic!("`{opened}…` has no closing line in the first column")
+}
+
+/// Every double-quoted string on one line of TypeScript, past a `//` comment.
+fn quoted_on(line: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = line.split_once("//").map_or(line, |(code, _)| code);
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { break };
+        found.push(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    found
+}
+
+/// Gate 23b: the refusal vocabulary is every constraint a schema can carry, not
+/// the union of the lowering tables (PRD §9 resolved q55, ruling d).
+///
+/// Ruling d says a schema-keyword 400 fails the call loudly and unmemoized
+/// rather than laddering, and the reason is about *schemas* rather than about
+/// tables: whichever keyword an endpoint names, the other rung would be sent the
+/// same schema and refuse it the same way, so laddering can only record a
+/// working mechanism as absent. A keyword a table deliberately leaves on the
+/// wire — `pattern` and `format`, on the posture that under-stripping is the
+/// cheap direction of being wrong — is therefore watched too, and that posture
+/// is only paid for while it is.
+///
+/// So the emitted vocabulary is held to this file's own closed list of what
+/// `codegen::schema`'s JSON column can write, in both directions: a constraint
+/// this compiler starts emitting is one the recognizer must start watching for,
+/// and a keyword the recognizer watches that no schema can carry is a word it
+/// could only misread a refusal by.
+#[test]
+fn the_refusal_vocabulary_covers_every_constraint_a_schema_can_carry() {
+    let carried: BTreeSet<&str> = KEYWORDS_A_SCHEMA_CAN_CARRY.iter().copied().collect();
+    for keyword in CONSTRAINTS_A_SCHEMA_CAN_CARRY {
+        assert!(
+            carried.contains(keyword),
+            "`{keyword}` is not a keyword this compiler's JSON column can write, so it cannot be \
+             a constraint one carries"
+        );
+    }
+
+    let watched: BTreeSet<String> = [
+        "ANTHROPIC_NATIVE_UNCOMPILED",
+        "OPENAI_STRICT_UNCOMPILED",
+        "CONSTRAINTS_LEFT_ON_THE_WIRE",
+    ]
+    .into_iter()
+    .flat_map(emitted_keywords)
+    .collect();
+    let constraints: BTreeSet<String> = CONSTRAINTS_A_SCHEMA_CAN_CARRY
+        .iter()
+        .map(|keyword| (*keyword).to_string())
+        .collect();
+    assert_eq!(
+        watched,
+        constraints,
+        "the emitted runtime's schema-keyword vocabulary and the constraints a schema can carry \
+         have drifted apart. Watched but uncarriable: {:?}. Carriable but unwatched: {:?}. The \
+         vocabulary is `ANTHROPIC_NATIVE_UNCOMPILED` + `OPENAI_STRICT_UNCOMPILED` + \
+         `CONSTRAINTS_LEFT_ON_THE_WIRE` in `crates/compose-core/src/codegen/js/runtime.ts`; a \
+         keyword left out of all three is one a 400 can name while the ladder trips over it and \
+         memoizes a mechanism the endpoint has (PRD resolved q55, ruling d)",
+        watched.difference(&constraints).collect::<Vec<_>>(),
+        constraints.difference(&watched).collect::<Vec<_>>(),
+    );
+}
 
 /// Ask a golden's own `src/runtime.ts` what it puts on each wire.
 fn lowered_by_the_runtime(project: &Path, cases: &[Value]) -> Value {
