@@ -4881,6 +4881,29 @@ fn an_answer_over_a_stripped_bound_fails_the_parse() {
              and the answer came back over its bound"
         );
     }
+
+    // …and the bound is where the schema says it is rather than one either side
+    // of it: the same answer with the third element and not the fourth is a run
+    // that succeeds. Which is also what makes the failures above evidence that
+    // nothing **truncated** the overrun to fit — a runtime that trimmed to
+    // `max_items` would have produced this run three times over.
+    let provider = MockProvider::start().expect("a loopback port");
+    let mut at_the_bound = overrun.clone();
+    at_the_bound["tallies"]
+        .as_array_mut()
+        .expect("the scripted answer carries an array")
+        .pop();
+    provider.enqueue(Script::new(SONNET, Outcome::structured(at_the_bound)));
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.tally",
+        &[("subject", "a short list")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert!(provider.snapshot().is_drained());
 }
 
 /// A 400 naming a **schema keyword** fails the call loudly: no ladder, no memo,
