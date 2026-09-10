@@ -66,6 +66,16 @@
 //  3. **One fewer pinned dependency** (PRD 5.12), and no SDK release able to
 //     move the runtime's semantics without moving the compiler's.
 //
+// Reason (1) is amended, not withdrawn, by PRD §9 resolved q55: where a wire's
+// decoder cannot **compile** a constraint keyword, this module strips it from
+// the request and folds it into that schema node's `description`
+// ([`loweredSchema`]), so the schema on the wire is the lowering's image and the
+// schema the answer is parsed with is still the published one whole. The delta
+// is exactly the per-(wire, mechanism) table and nothing else, which is what
+// `tests/generated_code_gates.rs` measures document by document. Sending a
+// conversion that had already dropped the constraint would leave nothing to
+// lower and no bound to fold, which is the difference between the two.
+//
 // `fetch` is global from Node 18 and the project's floor is 22.18.
 
 import { spawn } from "node:child_process";
