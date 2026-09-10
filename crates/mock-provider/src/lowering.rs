@@ -171,6 +171,42 @@ pub(crate) fn check_schema(
     );
 }
 
+/// …and the same subset over a **client tool** that promises `strict: true`.
+///
+/// `strict` on a function hands its `parameters` to the very compiler
+/// `response_format` and `text.format` hand their schema to — one decoder, three
+/// spellings — so a keyword it will not take is refused in an ordinary tool's
+/// schema exactly as it is in a pinned one, and the row asked for is the
+/// forced-function one, whose schema *is* a function's `parameters`.
+///
+/// It is enforced separately because the schema arrives separately: grammar §3.5
+/// lets a `tool.…` `input:` declare `min_length`, `minimum` or `max_items`, and a
+/// compiled graph puts every declared tool on every Responses request it sends,
+/// pinned or not. Without this, the one strict surface a real composition
+/// reaches on every call would be the one the oracle never checked.
+///
+/// A schema promised at `strict: false` is not checked, here or on the live
+/// wire: the decoder compiles nothing it was not asked to be strict about, so
+/// nothing in it can be a keyword the decoder refuses.
+pub(crate) fn check_strict_tool(
+    checker: &mut Checker,
+    dialect: Dialect,
+    surface: Surface,
+    pointer: &str,
+    subject: &str,
+    schema: &Value,
+) {
+    check_schema(
+        checker,
+        dialect,
+        surface,
+        OutputMechanism::ForcedTool,
+        pointer,
+        subject,
+        schema,
+    );
+}
+
 fn walk(
     checker: &mut Checker,
     dialect: Dialect,

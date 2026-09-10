@@ -174,8 +174,17 @@ pub(crate) fn parse(
         checker.fail("model", "Invalid value: ''. 'model' must name a model.");
     }
 
+    // Which of the two OpenAI-shaped surfaces this is. They enforce the same
+    // subset — one decoder behind two routes — but the row is asked for by name
+    // so that a table that ever splits them splits them here too.
+    let surface = if route.is_azure() {
+        Surface::AzureOpenAi
+    } else {
+        Surface::OpenAi
+    };
+
     check_settings(&mut checker, body);
-    let tools = check_tools(&mut checker, body);
+    let tools = check_tools(&mut checker, surface, body);
     let forced = check_tool_choice(&mut checker, body, &tools.names);
     check_messages(&mut checker, body, &tools.names);
     let response_format = check_response_format(&mut checker, body);
@@ -186,14 +195,6 @@ pub(crate) fn parse(
         let schema = function_schema(body, &name)?;
         Some(StructuredOutput::ForcedFunction { name, schema })
     });
-    // Which of the two OpenAI-shaped surfaces this is. They enforce the same
-    // subset — one decoder behind two routes — but the row is asked for by name
-    // so that a table that ever splits them splits them here too.
-    let surface = if route.is_azure() {
-        Surface::AzureOpenAi
-    } else {
-        Surface::OpenAi
-    };
     check_schema_subset(&mut checker, surface, body, structured_output.as_ref());
 
     Parsed {
@@ -362,9 +363,19 @@ fn check_stop(checker: &mut Checker, body: &Map<String, Value>) {
 }
 
 /// The tool surface, in request order.
-fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
+fn check_tools(checker: &mut Checker, surface: Surface, body: &Map<String, Value>) -> Tools {
     let mut names = Vec::new();
     let mut server = Vec::new();
+    // The function this request pins, if it pins one — read here only so the
+    // pinned schema draws one complaint rather than two ([`check_schema_subset`]
+    // refuses it as this request's structured output). Nested under `function`
+    // on this surface, where Responses spells it flat.
+    let pinned = body
+        .get("tool_choice")
+        .and_then(|choice| choice.get("function"))
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let Some(tools) = checker.optional("", body, "tools", Kind::Array) else {
         return Tools { names, server };
     };
@@ -452,6 +463,23 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
                 &format!("function '{name}'"),
                 parameters,
             );
+            // …and the subset that decoder compiles at all (PRD §9 resolved
+            // q55), for the reason the other OpenAI surface checks it: `strict`
+            // is what puts a function's `parameters` through the
+            // structured-output compiler, wherever the function came from. A
+            // compiled graph declares no `strict` on this surface's client tools
+            // today — the pinned function is the only one that carries it — so
+            // this stands as the claim rather than as a check that fires.
+            if pinned.as_deref() != Some(name.as_str()) {
+                lowering::check_strict_tool(
+                    checker,
+                    Dialect::OpenAi,
+                    surface,
+                    &at(&pointer, "parameters"),
+                    &format!("function '{name}'"),
+                    parameters,
+                );
+            }
         }
         names.push(name);
     }

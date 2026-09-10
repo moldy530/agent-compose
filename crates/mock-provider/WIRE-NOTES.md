@@ -990,6 +990,13 @@ one behind `response_format`, `text.format` and a function's `parameters` alike 
 excludes those and `uniqueItems`. `src/lowering.rs` holds both lists, and every
 one of them is refused here at the path it sits on.
 
+That includes an **agent's own tool**, not only the pinned schema: `strict: true`
+on a function is what hands its `parameters` to that decoder, so a client tool
+declared strict is held to the same subset as `text.format`'s schema, at
+`tools.N.parameters`. Only the Responses wire declares `strict` on a client tool
+today, which is exactly why it is checked — a `tool.…` `input:` may carry
+`min_length` (grammar §3.5) and the fixtures do.
+
 *What is certain*: that a `maxItems` inside `output_config.format.schema` is a
 400 today. That is the live field report q55 was resolved from, and it is why the
 check exists at all: grammar D10 makes `max_items` REQUIRED on every

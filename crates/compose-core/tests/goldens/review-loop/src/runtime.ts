@@ -3055,7 +3055,10 @@ function bothMechanismsRefused(
  * turns into this call's own loud failure with the body quoted
  * ([`schemaKeywordRefusal`]) — a one-line repair here — while a keyword stripped
  * that the decoder *would* have compiled is a constraint silently moved out of
- * the model's reach and into prose, which nothing reports.
+ * the model's reach and into prose, which nothing reports. That safety net is
+ * what [`CONSTRAINTS_LEFT_ON_THE_WIRE`] makes true of the two this comment
+ * names: the recognizer's vocabulary is every constraint keyword a schema can
+ * carry, not merely the ones some table strips.
  */
 const ANTHROPIC_NATIVE_UNCOMPILED: readonly string[] = [
   // Array length — the family grammar D10 makes unavoidable.
@@ -3095,9 +3098,10 @@ const ANTHROPIC_NATIVE_UNCOMPILED: readonly string[] = [
  * `pattern` and `format` appear in that list too and are not here: which side of
  * the line those two sit on has moved between revisions of the guide, they are
  * the two the decoder gains the most by honouring, and ruling d makes a wrong
- * row loud rather than silent. Under-stripping is the direction this table errs
- * in, deliberately (resolved q30's treadmill terms: a vendor accepting a keyword
- * tomorrow is an edit here, never a grammar change).
+ * row loud rather than silent — they are watched by the recognizer without being
+ * stripped ([`CONSTRAINTS_LEFT_ON_THE_WIRE`]). Under-stripping is the direction
+ * this table errs in, deliberately (resolved q30's treadmill terms: a vendor
+ * accepting a keyword tomorrow is an edit here, never a grammar change).
  */
 const OPENAI_STRICT_UNCOMPILED: readonly string[] = [
   "maxItems",
@@ -3144,17 +3148,46 @@ const LOWERED_AWAY: Readonly<Record<Wire, Readonly<Record<OutputMechanism, reado
 };
 
 /**
- * Every keyword any row of [`LOWERED_AWAY`] strips, which is what a refusal has
- * to name for ruling d to fire.
+ * The **constraint keywords a table leaves on the wire** — watched by the
+ * recognizer all the same (PRD §9 resolved q55, ruling d).
  *
- * Derived rather than written a second time: a keyword added to a table is a
- * keyword the recognizer starts watching for, in the same edit.
+ * Ruling d is about *schema keywords*, not about the table's keywords: a 400
+ * naming any constraint this compiler can emit says the decoder would not
+ * compile the schema as sent, and laddering on it sends the same schema to the
+ * other rung, is refused there for the same reason, and memoizes a mechanism as
+ * absent from an endpoint that has it. That is wrong for `pattern` in exactly
+ * the way it is wrong for `maxItems` — the only difference is which table gains
+ * the row afterwards.
+ *
+ * These two are also precisely the keywords [`ANTHROPIC_NATIVE_UNCOMPILED`]
+ * leaves on the wire deliberately, so this is the safety net that comment
+ * promises: under-stripping stays the cheap direction of being wrong because a
+ * refusal that names what was left on is loud, quoted and unmemoized rather than
+ * a ladder trip. (`uniqueItems` needs no line here — [`OPENAI_STRICT_UNCOMPILED`]
+ * already carries it.)
+ *
+ * The **structural** vocabulary is deliberately absent: `type`, `properties`,
+ * `required`, `items`, `enum` and their kin are what a schema *is* rather than a
+ * bound on a value, a complaint naming one is a malformed request rather than a
+ * missing table row, and several of them are ordinary words no quoting rule
+ * could rescue.
+ */
+const CONSTRAINTS_LEFT_ON_THE_WIRE: readonly string[] = ["pattern", "format"];
+
+/**
+ * Every constraint keyword a schema can reach a wire carrying — what a refusal
+ * has to name for ruling d to fire.
+ *
+ * The tables plus the keywords no table strips, and the table half is derived
+ * rather than written a second time: a keyword added to a table is a keyword the
+ * recognizer already watched for, and stays one.
  */
 const SCHEMA_KEYWORDS: readonly string[] = [
   ...ANTHROPIC_NATIVE_UNCOMPILED,
   ...OPENAI_STRICT_UNCOMPILED.filter(
     (keyword) => !ANTHROPIC_NATIVE_UNCOMPILED.includes(keyword),
   ),
+  ...CONSTRAINTS_LEFT_ON_THE_WIRE,
 ];
 
 /**
@@ -3163,15 +3196,24 @@ const SCHEMA_KEYWORDS: readonly string[] = [
  * used the word — [`WORD_SHAPED_KEYS`]' rule, applied to the other vocabulary
  * this recognizer reads.
  *
- * `minimum` and `maximum` are the two: `The minimum supported api version is
+ * `minimum` and `maximum` are two: `The minimum supported api version is
  * 2023-06-01.` is a sentence about a version, and reading it as a complaint
  * about a schema keyword would take a refusal that should ladder and fail the
- * call instead. Held to [`namedAsParameter`] on top of the word boundary, which
- * is how a service writes a keyword it is refusing — `'minimum' is not
- * supported.` The camelCase spellings need no such rule: no sentence uses
- * `maxItems` as a word.
+ * call instead. `pattern` is a third — `string does not match pattern.` is a
+ * service describing a value it refused — and `format` is the one that would do
+ * real damage unheld: it is a word every wire's refusals use and half of
+ * `text.format`, the Responses wire's own mechanism key. [`spelled`] already
+ * declines to read a word-shaped key as the **tail** of a path, which is what
+ * keeps `'text.format'` and `response_format` out of this vocabulary; the
+ * quoting rule is what keeps `Invalid format.` out of it. The camelCase
+ * spellings need neither: no sentence uses `maxItems` as a word.
  */
-const WORD_SHAPED_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set(["minimum", "maximum"]);
+const WORD_SHAPED_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
+  "minimum",
+  "maximum",
+  "pattern",
+  "format",
+]);
 
 /**
  * Where a subschema hides, by the shape of the position it hides in.
@@ -3243,10 +3285,10 @@ interface FoldedConstraint {
 const FOLDED_CONSTRAINTS: readonly FoldedConstraint[] = [
   {
     keywords: ["minItems", "maxItems"],
-    say: (node) => `between ${bound(node["minItems"])} and ${bound(node["maxItems"])} items`,
+    say: (node) => `between ${bound(node["minItems"])} and ${counted(node["maxItems"], "item")}`,
   },
-  { keywords: ["maxItems"], say: (node) => `at most ${bound(node["maxItems"])} items` },
-  { keywords: ["minItems"], say: (node) => `at least ${bound(node["minItems"])} items` },
+  { keywords: ["maxItems"], say: (node) => `at most ${counted(node["maxItems"], "item")}` },
+  { keywords: ["minItems"], say: (node) => `at least ${counted(node["minItems"], "item")}` },
   {
     keywords: ["uniqueItems"],
     // `uniqueItems: false` is the *absence* of a constraint — grammar 3.5's
@@ -3274,15 +3316,32 @@ const FOLDED_CONSTRAINTS: readonly FoldedConstraint[] = [
   {
     keywords: ["minLength", "maxLength"],
     say: (node) =>
-      `between ${bound(node["minLength"])} and ${bound(node["maxLength"])} characters`,
+      `between ${bound(node["minLength"])} and ${counted(node["maxLength"], "character")}`,
   },
-  { keywords: ["minLength"], say: (node) => `at least ${bound(node["minLength"])} characters` },
-  { keywords: ["maxLength"], say: (node) => `at most ${bound(node["maxLength"])} characters` },
+  {
+    keywords: ["minLength"],
+    say: (node) => `at least ${counted(node["minLength"], "character")}`,
+  },
+  { keywords: ["maxLength"], say: (node) => `at most ${counted(node["maxLength"], "character")}` },
 ];
 
 /** A bound as a sentence spells it: the number, or the JSON of whatever else. */
 function bound(value: unknown): string {
   return typeof value === "number" ? String(value) : String(JSON.stringify(value));
+}
+
+/**
+ * …and a bound over a **count**, with a noun that agrees with it.
+ *
+ * `min_length: 1` is the idiom this grammar's own fixtures are written in, so
+ * `At least 1 characters.` is the common case rather than a corner — and ruling
+ * b is about what the model is *told*, which is prose. The plural is regular for
+ * both nouns this folds ("item", "character"), and the agreement is with the
+ * number the noun follows, so a range says "between 1 and 8 items" and a range
+ * of one says "between 1 and 1 item".
+ */
+function counted(value: unknown, noun: string): string {
+  return `${bound(value)} ${noun}${value === 1 ? "" : "s"}`;
 }
 
 /**
@@ -3327,6 +3386,32 @@ export function loweredAway(wire: Wire, mechanism: OutputMechanism): readonly st
 /** The same projection over one tool spec — the pinned one, on the rungs that send it. */
 function loweredPin(pinned: ToolSpec, wire: Wire, mechanism: OutputMechanism): ToolSpec {
   return { ...pinned, schema: loweredSchema(pinned.schema, wire, mechanism) };
+}
+
+/**
+ * …and over a **client tool's** own schema, on a wire that declares `strict` on
+ * the tool itself (PRD §9 resolved q55, ruling a).
+ *
+ * `strict: true` on a function hands its `parameters` to the very decoder
+ * `text.format` hands its schema to — one structured-output compiler under three
+ * spellings — so a keyword that decoder will not compile is refused in a tool's
+ * `parameters` exactly as it is in the pinned schema, and grammar §3.5 lets a
+ * `tool.…` `input:` carry every one of them (`min_length`, `minimum`,
+ * `max_items` are all legal there). The forced-tool row is the one read, because
+ * a function's `parameters` is what that rung sends: the two OpenAI rows are the
+ * same list, and the Messages wire's is empty for the reason [`LOWERED_AWAY`]
+ * gives — a tool's schema rides that API whole.
+ *
+ * Only where the promise is actually made. Under `strict: false` this surface
+ * compiles nothing and refuses nothing ([`strictable`]), so a bound left on that
+ * request is a bound the model still reads in the schema it was written in —
+ * which is strictly more than the folded sentence says. The pinned schema is
+ * lowered at either `strict` instead, and for a reason that does not apply here:
+ * it is the document the amended q16 equality is stated over, and one projection
+ * per (wire, mechanism) is what makes that one sentence.
+ */
+function loweredStrictTool(schema: JsonSchema, wire: Wire): JsonSchema {
+  return loweredSchema(schema, wire, "forced_tool");
 }
 
 /** One schema node, lowered, with its children lowered under it. */
@@ -3391,10 +3476,23 @@ function foldedConstraints(node: Record<string, unknown>, stripped: readonly str
   return `${joined.charAt(0).toUpperCase()}${joined.slice(1)}.`;
 }
 
-/** An authored description with the folded sentence after it. */
+/**
+ * An authored description with the folded sentence after it.
+ *
+ * A **full stop** goes between them where the author's own words did not end in
+ * one. YAML `description:` text is free-form prose and need not be punctuated,
+ * so `Side notes` beside `At most 4 items.` would otherwise reach the model as
+ * `Side notes At most 4 items.` — one broken sentence, in the one place ruling b
+ * puts the bound. Everything a sentence can legitimately end on is left alone,
+ * which keeps this as deterministic as the rest of the projection: the same
+ * description and the same table produce the same bytes.
+ */
 function appended(authored: unknown, folded: string): string {
-  if (typeof authored !== "string" || authored === "") return folded;
-  return `${authored.replace(/\s+$/u, "")} ${folded}`;
+  if (typeof authored !== "string") return folded;
+  const words = authored.replace(/\s+$/u, "");
+  if (words === "") return folded;
+  const stop = /[.!?:;…]$/u.test(words) ? "" : ".";
+  return `${words}${stop} ${folded}`;
 }
 
 /**
@@ -3403,8 +3501,10 @@ function appended(authored: unknown, folded: string): string {
  * q55, ruling d).
  *
  * After lowering, a 400 naming one of [`SCHEMA_KEYWORDS`] cannot be a statement
- * about the mechanism, because the mechanism's own table says that keyword was
- * never sent. So it is a statement about this runtime: the table for this (wire,
+ * about the mechanism. Either the mechanism's own table says that keyword was
+ * never sent, or the table deliberately left it on the wire
+ * ([`CONSTRAINTS_LEFT_ON_THE_WIRE`]) and this decoder turns out not to compile
+ * it — and both are one statement about this runtime: the table for this (wire,
  * mechanism) is missing a row, and the schema went out carrying a keyword the
  * decoder will not compile. Laddering on it would send the same schema at the
  * other rung, be refused there for the same reason, and **memoize** a mechanism
@@ -4137,13 +4237,22 @@ async function callResponses(
   // reason: this surface's provider-defined types are OpenAI's own server tools,
   // which are the provider's to run, and a client tool the *graph* runs is
   // declared with the compiler's schema whatever the Messages wire calls it.
-  const functions = request.tools.map((tool) => ({
-    type: "function",
-    name: tool.name,
-    description: tool.description,
-    parameters: tool.schema,
-    strict: strictable(tool.schema),
-  }));
+  const functions = request.tools.map((tool) => {
+    // `strict` rides each tool here, so each tool's `parameters` is a schema
+    // this surface's structured-output decoder compiles — and is lowered to what
+    // that decoder takes wherever the promise is made ([`loweredStrictTool`],
+    // PRD §9 resolved q55). A `tool.…` `input:` is free to carry `min_length`,
+    // `minimum` or `max_items` (grammar §3.5), and under `strict: true` every
+    // one of them is a 400 that names the keyword.
+    const strict = strictable(tool.schema);
+    return {
+      type: "function",
+      name: tool.name,
+      description: tool.description,
+      parameters: strict ? loweredStrictTool(tool.schema, "responses") : tool.schema,
+      strict,
+    };
+  });
   // …and the synthetic output tool last among them where this request pins it
   // rather than shaping the text, exactly as [`callChatCompletions`] appends it
   // (PRD §9 resolved q53). Flat here, like every other tool on this wire.

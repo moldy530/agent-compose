@@ -440,7 +440,12 @@ compile come off the request, and each one is folded into that field's
 |---|---|
 | Messages, `output_config` | `maxItems`, `minItems`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`, `maxLength` |
 | Messages, forced tool | nothing — the schema rides as a tool's `input_schema`, whole |
-| Chat Completions and Responses, either mechanism | the same list, plus `uniqueItems` |
+| Chat Completions and Responses, either mechanism | `maxItems`, `minItems`, `uniqueItems`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`, `maxLength` |
+
+A tool's own `input:` is lowered the same way wherever the wire compiles it —
+that is the Responses wire, which declares `strict` on each function it is given.
+Nothing else about a tool changes, and a tool on the other two wires is sent
+whole.
 
 What an author meets is the description. A field written as
 
@@ -450,8 +455,9 @@ notes: { type: array, max_items: 8, items: { type: string }, description: Side n
 
 reaches an Anthropic model as `{"type": "array", "items": {"type": "string"},
 "description": "Side notes. At most 8 items."}` — your words, then the bound, in
-that order. Nothing else changes: no field is renamed, no type is rewritten, and
-a keyword the decoder *can* compile stays on the wire.
+that order, with a full stop between them if your own words did not end in one.
+Nothing else changes: no field is renamed, no type is rewritten, and a keyword
+the decoder *can* compile stays on the wire.
 
 **The bound still binds.** The emitted parse checks the whole schema, lowering
 and all, so an answer with nine notes fails the node with the same "did not match
@@ -488,22 +494,28 @@ That is a model ignoring a fixed instruction to produce its result, not an
 endpoint that lacks a mechanism — nothing was refused, and nothing laddered.
 
 Nothing else ladders. A 401, a 429, a 5xx, a content refusal, a schema the
-decoder will not compile — including a 400 that names one of the lowered
-keywords above, which after lowering can only mean the runtime's own table is
-missing a row, and which therefore fails the call loudly with the endpoint's
-body quoted rather than trying the other mechanism — a complaint about the
-**conversation** rather than
+decoder will not compile, a complaint about the **conversation** rather than
 about a parameter — a strict gateway refusing a history that ends on an assistant
 turn — and a parameter refused because of **another parameter in the same
 request**, such as `output_config` beside a `settings:` key this model will not
 take it with, are refusals about something other than the mechanism, and each
 behaves exactly as it always has. The last of those is the one worth knowing
 about, because it is the only refusal here that *does* name something in your
-composition to change: you get the endpoint's own sentence, and it names the key. Including for `route_on:`, which is untouched: the
+composition to change: you get the endpoint's own sentence, and it names the key.
+Including for `route_on:`, which is untouched: the
 mechanism ladder is *inside* one call to one route member, so a condition the
 working rung answers with is the route's to act on as it always was, and a route
 still fails over only on grammar 12.2's infrastructure conditions — which the
 double refusal below is not.
+
+The schema refusal worth spelling out is a 400 that names one of the **lowered
+keywords** above. After lowering it can only mean one thing: the runtime's own
+table is missing a row and sent a keyword this decoder cannot compile. So it
+fails the call loudly, with the endpoint's body quoted and the keyword named,
+rather than trying the other mechanism — laddering there would send the same
+schema again, be refused for the same reason, and leave a mechanism the endpoint
+does have remembered as absent. There is nothing to change in your composition
+when you see one; it is a bug report about the runtime.
 
 **Where to see it.** Each model call's trace record carries `outputMechanism` —
 `"native"` or `"forced_tool"` — on the one call per agent node that asks for the

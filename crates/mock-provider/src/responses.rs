@@ -294,6 +294,16 @@ fn check_settings(checker: &mut Checker, body: &Map<String, Value>) {
 fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
     let mut names = Vec::new();
     let mut server = Vec::new();
+    // The function this request **pins**, if it pins one, read here without
+    // being validated ([`check_tool_choice`] is what decides whether the key is
+    // well formed). It is only so the pinned function's `parameters` draws one
+    // complaint rather than two: that schema is this request's structured
+    // output, and [`check_schema_subset`] refuses it under that name.
+    let pinned = body
+        .get("tool_choice")
+        .and_then(|choice| choice.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let Some(tools) = checker.optional("", body, "tools", Kind::Array) else {
         return Tools { names, server };
     };
@@ -367,6 +377,21 @@ fn check_tools(checker: &mut Checker, body: &Map<String, Value>) -> Tools {
                 &format!("function '{name}'"),
                 parameters,
             );
+            // …and the keywords that decoder cannot compile at all (PRD §9
+            // resolved q55). A promise of `strict` puts this schema through the
+            // same compiler `text.format`'s does, so an agent's own tool is held
+            // to the same subset — except where it is the pinned one, which is
+            // refused as this request's structured output instead.
+            if pinned.as_deref() != Some(name.as_str()) {
+                lowering::check_strict_tool(
+                    checker,
+                    Dialect::OpenAi,
+                    Surface::Responses,
+                    &at(&pointer, "parameters"),
+                    &format!("function '{name}'"),
+                    parameters,
+                );
+            }
         }
         names.push(name);
     }
