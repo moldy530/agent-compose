@@ -394,6 +394,31 @@ const CODEGEN: &[Criterion] = &[
                 "the_responses_wire_ladders_to_a_forced_function",
                 Status::Live,
             ),
+            // …and **what schema** that call carries, which PRD §9 resolved q55
+            // makes a property of the (wire, mechanism) rather than of the
+            // composition: a decoder compiles a subset of JSON Schema, grammar
+            // D10 puts `max_items` on every result-schema array, and the subset
+            // excludes it — so the schema is lowered to what the decoder takes
+            // and each stripped bound is folded into its node's `description`.
+            // A row per thing that can be wrong independently: what reaches the
+            // wire on each of the three (and the mock refuses an under-lowered
+            // one, so the run is the proof), what happens to an answer that
+            // overruns a bound nothing on the wire is enforcing any more, and
+            // the refusal that means the table itself is wrong — which must
+            // fail loudly rather than ladder, because laddering would remember
+            // a mechanism as absent from an endpoint that has it.
+            (
+                "an_array_bearing_output_rides_each_wires_native_rung_lowered",
+                Status::Live,
+            ),
+            (
+                "an_answer_over_a_stripped_bound_fails_the_parse",
+                Status::Live,
+            ),
+            (
+                "a_schema_keyword_refusal_fails_the_call_without_laddering_or_remembering",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).

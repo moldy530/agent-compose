@@ -512,3 +512,74 @@ triggers:
   cross_from_messages:
     type: manual
     flow: flow.cross_from_messages
+
+agent.tallier:
+  # The shape grammar D10 makes unavoidable, and the one PRD §9 resolved q55 is
+  # about: an array inside a result schema MUST carry `max_items`, §3.5 sends it
+  # to the wire as `maxItems`, and no wire's native structured-output decoder
+  # compiles it. Every family a lowering table strips is declared here — an
+  # array bound, a pair of string lengths, numeric bounds two levels down inside
+  # an array of objects — so what reaches the wire is decidable rather than
+  # incidental, and so the *description* each stripped bound folds into is one
+  # an author wrote rather than one this fixture happens to leave empty.
+  #
+  # The same agent is declared in `agent-openai` and `server-tools`, word for
+  # word except its `model:`. Three wires, one schema: a projection that is
+  # right on one of them and wrong on another is the failure the three fixtures
+  # exist to separate.
+  description: Lists what it found, under bounds a structured-output decoder cannot compile.
+  model: model.searching_gpt
+  prompt: |
+    You are a tallier.
+
+    List what the subject contains, one note per item.
+  input:
+    subject:
+      description: What to tally.
+      type: string
+  output:
+    headline:
+      description: One line naming the subject.
+      type: string
+      min_length: 1
+      max_length: 60
+    tallies:
+      description: What was found, one note per item.
+      type: array
+      max_items: 3
+      items:
+        type: object
+        properties:
+          label:
+            description: What the note is about.
+            type: string
+          weight:
+            description: How much it matters.
+            type: number
+            minimum: 0
+            maximum: 1
+    total:
+      description: How many tallies there are.
+      type: integer
+      minimum: 0
+      maximum: 3
+
+flow.tally:
+  description: One pass over the tallier — the array-bearing schema, on this wire.
+  # `outputs: {}` deliberately. What this flow is for is the *request* and the
+  # parse: an answer that overruns `max_items` has to fail the node, and a flow
+  # that materialized the answer would need channels of its own in three
+  # fixtures for nothing either assertion reads.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    tally:
+      agent: agent.tallier
+      input:
+        subject: "input.subject"
+  edges:
+    - { from: start, to: tally }
+    - { from: tally, to: end }
