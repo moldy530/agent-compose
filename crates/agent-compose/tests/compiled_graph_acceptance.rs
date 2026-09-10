@@ -3686,6 +3686,27 @@ fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
         json!({ "verdict": "revise", "feedback": "one more pass" }),
         "revise",
     );
+    // …and the one PRD §9 resolved q55's ruling d could have taken away. Two of
+    // the keywords its tables strip — `minimum` and `maximum` — are ordinary
+    // English words, and a capability refusal is free to use one on its way to
+    // saying the endpoint lacks the parameter. Read as a schema complaint this
+    // would stop laddering and fail a run the forced tool serves, so the
+    // recognizer holds a word-shaped keyword to being *named as one* the way
+    // `text` is held on the Responses wire.
+    ladders(
+        "agent-anthropic",
+        SONNET,
+        "a capability refusal that uses `minimum` as a word",
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "output_config is not supported on this API version. The minimum version for structured outputs is 2025-11-13.",
+            },
+        }),
+        json!({ "verdict": "approve", "feedback": "" }),
+        "approve",
+    );
 }
 
 /// …and a refusal a **gateway relayed** ladders on the complaint it relayed,
