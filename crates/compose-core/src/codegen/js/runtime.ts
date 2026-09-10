@@ -2357,6 +2357,12 @@ async function structuredAnswer(
   try {
     return await onWire(wire, model, request, first, signal);
   } catch (refused) {
+    // Before anything else the ladder does: a refusal naming a **schema
+    // keyword** is this runtime's own lowering table being wrong, and it fails
+    // the call here — unladdered, unmemoized, with the endpoint's body quoted
+    // (PRD §9 resolved q55, ruling d).
+    const keyword = schemaKeywordRefusal(refused);
+    if (keyword !== undefined) throw loweringIsWrong(wire, model, first, keyword, refused);
     if (!unsupportedMechanism(wire, first, refused)) throw refused;
     // The **loss**, recorded before the retry is sent: from here on, every call
     // of this pairing skips the rung this one just found is not there.
@@ -2364,6 +2370,10 @@ async function structuredAnswer(
     try {
       return await onWire(wire, model, request, second, signal);
     } catch (again) {
+      const keywordAgain = schemaKeywordRefusal(again);
+      if (keywordAgain !== undefined) {
+        throw loweringIsWrong(wire, model, second, keywordAgain, again);
+      }
       if (!unsupportedMechanism(wire, second, again)) throw again;
       rememberRefusal(key, second);
       throw bothMechanismsRefused(wire, model, first, refused, second, again);
@@ -2704,10 +2714,21 @@ function blamesAnotherParameter(body: string, keys: readonly string[]): boolean 
  * (`body.response_format: Extra inputs are not permitted`).
  *
  * `body` arrives lowercased, so the character classes are written that way.
+ *
+ * `wordShaped` is the **caller's** fact rather than this function's, because two
+ * vocabularies are read through here now: a request parameter
+ * ([`WORD_SHAPED_KEYS`]) and a schema keyword
+ * ([`WORD_SHAPED_SCHEMA_KEYWORDS`], PRD §9 resolved q55 ruling d). Which
+ * spellings are also ordinary English words differs between them, and a set
+ * consulted here could only answer for one.
  */
-function spelled(body: string, key: string, accept: (at: number) => boolean): boolean {
+function spelled(
+  body: string,
+  key: string,
+  wordShaped: boolean,
+  accept: (at: number) => boolean,
+): boolean {
   const identifier = /[a-z0-9_]/;
-  const wordShaped = WORD_SHAPED_KEYS.has(key);
   // `charAt` answers `""` off either end, which is not an identifier character —
   // a key at the very start or end of the body is named by it.
   for (let at = body.indexOf(key); at >= 0; at = body.indexOf(key, at + 1)) {
@@ -2725,12 +2746,11 @@ function spelled(body: string, key: string, accept: (at: number) => boolean): bo
 
 /**
  * Whether `body` names `key` at all — [`spelled`] as the key itself, and, where
- * the key is a **word** as well as a key ([`WORD_SHAPED_KEYS`]), named the way a
- * service names a parameter ([`namedAsParameter`]) rather than used as a word.
+ * the key is a **word** as well as a key (`wordShaped`), named the way a service
+ * names a parameter ([`namedAsParameter`]) rather than used as a word.
  */
-function namesKey(body: string, key: string): boolean {
-  const wordShaped = WORD_SHAPED_KEYS.has(key);
-  return spelled(body, key, (at) => !wordShaped || namedAsParameter(body, at, key));
+function namesKey(body: string, key: string, wordShaped: boolean): boolean {
+  return spelled(body, key, wordShaped, (at) => !wordShaped || namedAsParameter(body, at, key));
 }
 
 /**
@@ -2823,7 +2843,9 @@ function pointedAt(body: string, at: number, key: string): boolean {
  * ([`pointedAt`]).
  */
 function pointsAtKey(body: string, keys: readonly string[]): boolean {
-  return keys.some((key) => spelled(body, key, (at) => pointedAt(body, at, key)));
+  return keys.some((key) =>
+    spelled(body, key, WORD_SHAPED_KEYS.has(key), (at) => pointedAt(body, at, key)),
+  );
 }
 
 /**
@@ -2907,10 +2929,12 @@ function addressedElsewhere(body: string, keys: readonly string[]): boolean {
  * is not JSON, a content refusal and a schema the decoder will not compile are
  * all *not* this, and each still reaches [`callModel`]'s route ladder as itself.
  *
- * Six things must hold at once: the status is one a service refuses a request
+ * Seven things must hold at once: the status is one a service refuses a request
  * with rather than one it fails under (400, and 422 for the services that use
  * it); the complaint is not about the **conversation** this runtime composed
- * ([`ABOUT_THE_CONVERSATION`]); it is not about this parameter's **contents**
+ * ([`ABOUT_THE_CONVERSATION`]); it does not name a **schema keyword** this
+ * runtime's lowering table should have stripped ([`schemaKeywordRefusal`], PRD
+ * §9 resolved q55 ruling d); it is not about this parameter's **contents**
  * ([`NOT_ABOUT_THE_MECHANISM`]) nor about **another parameter** this same request
  * carried ([`blamesAnotherParameter`]), unless it also says the endpoint is what
  * lacks the mechanism ([`ABOUT_THE_ENDPOINT`]); it is not addressed at some other
@@ -2930,6 +2954,16 @@ function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unk
   // First, and with nothing able to re-qualify it: a refusal about the shape of
   // the conversation is a refusal about this runtime's own request.
   if (carries(ABOUT_THE_CONVERSATION)) return false;
+  // …and second, for the same reason and with the same finality: a refusal that
+  // names a **schema keyword** is a refusal about a request this runtime lowered
+  // wrongly (PRD §9 resolved q55, ruling d). It is checked here rather than only
+  // at the call site so that the recognizer is right on its own — everything
+  // that reads it gets the same answer — and it sits above the endpoint
+  // re-qualification below because `'maxItems' is not supported for this model.`
+  // is a schema complaint wearing a capability sentence's clothes, and
+  // laddering on it would memoize a mechanism as absent from an endpoint that
+  // has it.
+  if (schemaKeywordRefusal(error) !== undefined) return false;
   // …then the two a statement about the endpoint outranks — what is *inside* the
   // parameter, and what is *beside* it in the same body.
   if (!carries(ABOUT_THE_ENDPOINT)) {
@@ -2937,7 +2971,7 @@ function unsupportedMechanism(wire: Wire, mechanism: OutputMechanism, error: unk
     if (blamesAnotherParameter(body, keys)) return false;
   }
   if (addressedElsewhere(body, keys)) return false;
-  if (!keys.some((key) => namesKey(body, key))) return false;
+  if (!keys.some((key) => namesKey(body, key, WORD_SHAPED_KEYS.has(key)))) return false;
   return carries(UNSUPPORTED_PARAMETER);
 }
 
@@ -2971,6 +3005,435 @@ function bothMechanismsRefused(
   );
 }
 
+// ---------------------------------------------------------------------------
+// What each decoder cannot compile: the lowering tables (PRD §9 resolved q55)
+// ---------------------------------------------------------------------------
+
+/**
+ * The constraint keywords the **Messages** wire's native decoder does not
+ * compile (PRD §9 resolved q55, ruling a).
+ *
+ * `output_config`'s format compiles a *subset* of JSON Schema, and the subset
+ * excludes array-length bounds, numeric bounds and string-length bounds. Grammar
+ * D10 makes `max_items` REQUIRED on every array inside a result schema — it is
+ * what bounds `over:` fan-out and keeps state finite — and §3.5's mapping sends
+ * it to the wire as `maxItems`, so **nearly every real composition** was a 400
+ * on the rung resolved q53 prefers. Stripping them here is what makes the native
+ * rung usable at all; ruling b puts each stripped bound back in the model's view
+ * as a sentence in the node's `description`, and ruling c leaves the emitted Zod
+ * parse as the contract, unchanged (PRD 9.16 as amended by q55).
+ *
+ * **Recursion is the one family that is not here, and it does not need to be.**
+ * The ruling names it beside the three above because the vendor's subset
+ * excludes it, but a recursive schema is unreachable from this grammar: §3 fixes
+ * a *closed* subset of JSON Schema in which `$ref` is a compile error, every
+ * type node is written inline, and §3.4 caps nesting at 8 levels — so
+ * `codegen::schema`'s JSON column has no cycle to emit and nothing to strip. It
+ * is stated rather than tabled because a table row that could never fire would
+ * read as a keyword this projection removes.
+ *
+ * `pattern`, `format` and `uniqueItems` are deliberately **left on the wire**
+ * here. The ruling's list is the three families above, and the posture q55 takes
+ * from resolved q30 is that being wrong is cheaper in the under-stripping
+ * direction: a keyword this table misses is a 400 that names it, which ruling d
+ * turns into this call's own loud failure with the body quoted
+ * ([`schemaKeywordRefusal`]) — a one-line repair here — while a keyword stripped
+ * that the decoder *would* have compiled is a constraint silently moved out of
+ * the model's reach and into prose, which nothing reports.
+ */
+const ANTHROPIC_NATIVE_UNCOMPILED: readonly string[] = [
+  // Array length — the family grammar D10 makes unavoidable.
+  "maxItems",
+  "minItems",
+  // …numbers.
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  // …and string length.
+  "minLength",
+  "maxLength",
+];
+
+/**
+ * …and the keywords the **OpenAI** wires' `strict` decoder does not compile
+ * (PRD §9 resolved q55, ruling a).
+ *
+ * One table for both OpenAI surfaces and for both of their rungs, because it is
+ * one decoder: `response_format`'s `json_schema`, Responses' `text.format` and a
+ * function tool's `parameters` are three spellings of the same
+ * structured-output compiler, and a keyword it will not take is refused wherever
+ * it is declared.
+ *
+ * It is applied at **either** `strict`, which is a decision rather than an
+ * oversight. Under `strict: false` the decoder constrains nothing at all
+ * ([`strictable`], `strict-is-refused-by-an-optional-property`), so a bound left
+ * on that request buys the model nothing the folded description does not — and
+ * one projection per (wire, mechanism) is what lets the gate state the amended
+ * q16 equality as a single sentence: the wire is constrained by the lowering's
+ * image, the parse checks the full schema, and the delta is exactly this table.
+ *
+ * Grounded in the vendor's own "type-specific keywords not supported" list —
+ * the numeric, string-length and array families — and kept **small** on purpose.
+ * `pattern` and `format` appear in that list too and are not here: which side of
+ * the line those two sit on has moved between revisions of the guide, they are
+ * the two the decoder gains the most by honouring, and ruling d makes a wrong
+ * row loud rather than silent. Under-stripping is the direction this table errs
+ * in, deliberately (resolved q30's treadmill terms: a vendor accepting a keyword
+ * tomorrow is an edit here, never a grammar change).
+ */
+const OPENAI_STRICT_UNCOMPILED: readonly string[] = [
+  "maxItems",
+  "minItems",
+  // …and the one the Anthropic table leaves alone, because the two subsets are
+  // two vendors' and not one shared list: OpenAI's guide names `uniqueItems`
+  // among the array keywords `strict` refuses.
+  "uniqueItems",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "minLength",
+  "maxLength",
+];
+
+/**
+ * One row per (wire, mechanism): what this runtime strips from the schema it
+ * puts on that request (PRD §9 resolved q55, ruling a).
+ *
+ * Held on resolved q30's treadmill terms, which is why it is a table rather than
+ * a branch: a keyword a vendor starts accepting tomorrow is a line edited here,
+ * with no grammar change, no YAML key, and nothing for an operator to set.
+ * Lowering is **per keyword** rather than all-or-nothing, so the wire keeps
+ * every constraint its decoder can compile.
+ *
+ * The Messages wire's **forced-tool** rung strips nothing, and that is a fact
+ * about the mechanism rather than a gap: the schema rides there as an ordinary
+ * tool's `input_schema`, which the API takes whole — it is `output_config`'s
+ * format compiler that has the subset. An empty row is therefore a claim, and
+ * the mock provider enforces it as one.
+ *
+ * `crates/mock-provider/src/lowering.rs` holds the same four rows as what each
+ * endpoint personality **refuses**, and
+ * `crates/agent-compose/tests/wire_lowering_agreement.rs` asserts the two are
+ * equal — so an edit to one side alone fails CI rather than shipping a
+ * projection the wire disagrees with.
+ */
+const LOWERED_AWAY: Readonly<Record<Wire, Readonly<Record<OutputMechanism, readonly string[]>>>> = {
+  messages: { native: ANTHROPIC_NATIVE_UNCOMPILED, forced_tool: [] },
+  chat_completions: { native: OPENAI_STRICT_UNCOMPILED, forced_tool: OPENAI_STRICT_UNCOMPILED },
+  responses: { native: OPENAI_STRICT_UNCOMPILED, forced_tool: OPENAI_STRICT_UNCOMPILED },
+};
+
+/**
+ * Every keyword any row of [`LOWERED_AWAY`] strips, which is what a refusal has
+ * to name for ruling d to fire.
+ *
+ * Derived rather than written a second time: a keyword added to a table is a
+ * keyword the recognizer starts watching for, in the same edit.
+ */
+const SCHEMA_KEYWORDS: readonly string[] = [
+  ...ANTHROPIC_NATIVE_UNCOMPILED,
+  ...OPENAI_STRICT_UNCOMPILED.filter(
+    (keyword) => !ANTHROPIC_NATIVE_UNCOMPILED.includes(keyword),
+  ),
+];
+
+/**
+ * The [`SCHEMA_KEYWORDS`] that are **ordinary English words** as well as
+ * keywords, and so cannot be read as a schema complaint merely because a refusal
+ * used the word — [`WORD_SHAPED_KEYS`]' rule, applied to the other vocabulary
+ * this recognizer reads.
+ *
+ * `minimum` and `maximum` are the two: `The minimum supported api version is
+ * 2023-06-01.` is a sentence about a version, and reading it as a complaint
+ * about a schema keyword would take a refusal that should ladder and fail the
+ * call instead. Held to [`namedAsParameter`] on top of the word boundary, which
+ * is how a service writes a keyword it is refusing — `'minimum' is not
+ * supported.` The camelCase spellings need no such rule: no sentence uses
+ * `maxItems` as a word.
+ */
+const WORD_SHAPED_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set(["minimum", "maximum"]);
+
+/**
+ * Where a subschema hides, by the shape of the position it hides in.
+ *
+ * The projection walks **named positions** rather than every object it meets,
+ * and that is load bearing rather than tidy: a schema's `default:`, `const` and
+ * `enum` carry *values*, and a value is free to be an object with a key spelled
+ * `maxItems`. A blind walk would strip it — silently rewriting data a
+ * composition declared into a schema this runtime invented. Grammar 3.6 refuses
+ * `default:` on a result surface, so the reachable case is nothing today; the
+ * walk is written this way so it stays nothing.
+ *
+ * Only `properties`, `items` and `oneOf` are reachable from grammar §3 (§3.1,
+ * §3.5, §3.7). The rest are here because the cost of listing a position this
+ * compiler does not emit is one line, and the cost of missing one it starts
+ * emitting is a keyword that reaches the wire inside a subschema nothing looked
+ * at.
+ */
+const SUBSCHEMA_KEYS: readonly string[] = [
+  "items",
+  "contains",
+  "not",
+  "if",
+  "then",
+  "else",
+  "propertyNames",
+  "additionalItems",
+  "unevaluatedItems",
+];
+
+/** …the positions holding a **list** of subschemas. */
+const SUBSCHEMA_LIST_KEYS: readonly string[] = ["oneOf", "anyOf", "allOf", "prefixItems"];
+
+/** …and the positions holding a **map** of names to subschemas. */
+const SUBSCHEMA_MAP_KEYS: readonly string[] = [
+  "properties",
+  "patternProperties",
+  "dependentSchemas",
+  "$defs",
+  "definitions",
+];
+
+/** One constraint, and the sentence it folds into a description (ruling b). */
+interface FoldedConstraint {
+  /** The keywords it speaks for. All of them must have been stripped. */
+  readonly keywords: readonly string[];
+  /** What the node then says, or `""` where the keyword asks for nothing. */
+  readonly say: (node: Readonly<Record<string, unknown>>) => string;
+}
+
+/**
+ * What a stripped bound is told to the model as (PRD §9 resolved q55, ruling b).
+ *
+ * "A stripped bound stays in the model's view": the decoder stops *enforcing*
+ * the keyword, so the schema says it in the one place a decoder never reads and
+ * a model always does. `{"type": "array", "maxItems": 8}` becomes `{"type":
+ * "array", "description": "At most 8 items."}` — and where the author wrote a
+ * description of their own, the sentence is appended after it, because the
+ * author's words are what the field *is* and this is a note about its bounds.
+ *
+ * Read **in order**, each rule consuming the keywords it speaks for, which is
+ * the whole of what makes the output deterministic: the same schema and the same
+ * table produce byte-identical lowered JSON, on any run and in any engine. The
+ * pair rules come before their halves so that a node carrying both bounds says
+ * "between 1 and 8 items" rather than two sentences about one range — and a pair
+ * fires only when **both** of its keywords were stripped, so a table that takes
+ * one and leaves the other still says the true thing about the one it took.
+ */
+const FOLDED_CONSTRAINTS: readonly FoldedConstraint[] = [
+  {
+    keywords: ["minItems", "maxItems"],
+    say: (node) => `between ${bound(node["minItems"])} and ${bound(node["maxItems"])} items`,
+  },
+  { keywords: ["maxItems"], say: (node) => `at most ${bound(node["maxItems"])} items` },
+  { keywords: ["minItems"], say: (node) => `at least ${bound(node["minItems"])} items` },
+  {
+    keywords: ["uniqueItems"],
+    // `uniqueItems: false` is the *absence* of a constraint — grammar 3.5's
+    // default — so it folds nothing: a description reading "duplicates are
+    // allowed" would be this runtime telling a model something no author said.
+    say: (node) => (node["uniqueItems"] === true ? "no duplicate items" : ""),
+  },
+  {
+    keywords: ["minimum", "maximum"],
+    say: (node) => `between ${bound(node["minimum"])} and ${bound(node["maximum"])}`,
+  },
+  { keywords: ["minimum"], say: (node) => `at least ${bound(node["minimum"])}` },
+  { keywords: ["maximum"], say: (node) => `at most ${bound(node["maximum"])}` },
+  {
+    keywords: ["exclusiveMinimum", "exclusiveMaximum"],
+    say: (node) =>
+      `greater than ${bound(node["exclusiveMinimum"])} and less than ${bound(node["exclusiveMaximum"])}`,
+  },
+  {
+    keywords: ["exclusiveMinimum"],
+    say: (node) => `greater than ${bound(node["exclusiveMinimum"])}`,
+  },
+  { keywords: ["exclusiveMaximum"], say: (node) => `less than ${bound(node["exclusiveMaximum"])}` },
+  { keywords: ["multipleOf"], say: (node) => `a multiple of ${bound(node["multipleOf"])}` },
+  {
+    keywords: ["minLength", "maxLength"],
+    say: (node) =>
+      `between ${bound(node["minLength"])} and ${bound(node["maxLength"])} characters`,
+  },
+  { keywords: ["minLength"], say: (node) => `at least ${bound(node["minLength"])} characters` },
+  { keywords: ["maxLength"], say: (node) => `at most ${bound(node["maxLength"])} characters` },
+];
+
+/** A bound as a sentence spells it: the number, or the JSON of whatever else. */
+function bound(value: unknown): string {
+  return typeof value === "number" ? String(value) : String(JSON.stringify(value));
+}
+
+/**
+ * The schema this (wire, mechanism) is handed: the emitted one, minus the
+ * keywords its decoder cannot compile, with each of them folded into the
+ * `description` of the node it was stripped from (PRD §9 resolved q55).
+ *
+ * **Pure**, and the input is never touched: what a composition emitted is what
+ * the emitted Zod parses and what the trace's journal replays, so a projection
+ * that mutated the schema in place would change the contract on its way to
+ * describing it. Every node the walk rebuilds keeps its key order, so the same
+ * schema and table serialize to the same bytes.
+ *
+ * The one thing it deliberately does not do is decide *whether* to lower: a row
+ * with nothing in it answers the schema it was given, which is what makes
+ * "every composer projects the schema it sends" a rule with no exception to
+ * remember.
+ */
+export function loweredSchema(
+  schema: JsonSchema,
+  wire: Wire,
+  mechanism: OutputMechanism,
+): JsonSchema {
+  const away = LOWERED_AWAY[wire][mechanism];
+  if (away.length === 0) return schema;
+  return lowerNode(schema, away) as JsonSchema;
+}
+
+/** The same projection over one tool spec — the pinned one, on the rungs that send it. */
+function loweredPin(pinned: ToolSpec, wire: Wire, mechanism: OutputMechanism): ToolSpec {
+  return { ...pinned, schema: loweredSchema(pinned.schema, wire, mechanism) };
+}
+
+/** One schema node, lowered, with its children lowered under it. */
+function lowerNode(node: unknown, away: readonly string[]): unknown {
+  if (typeof node !== "object" || node === null || Array.isArray(node)) return node;
+  const source = node as Record<string, unknown>;
+  const stripped = away.filter((keyword) => Object.hasOwn(source, keyword));
+  const folded = foldedConstraints(source, stripped);
+  const lowered: Record<string, unknown> = {};
+  let described = false;
+  for (const [key, value] of Object.entries(source)) {
+    if (stripped.includes(key)) continue;
+    if (key === "description") {
+      described = true;
+      lowered[key] = folded === "" ? value : appended(value, folded);
+      continue;
+    }
+    lowered[key] = loweredChild(key, value, away);
+  }
+  // A node that had no description of its own gains one at the end, which is
+  // where a reader of the request meets it after everything the author wrote.
+  if (!described && folded !== "") lowered["description"] = folded;
+  return lowered;
+}
+
+/** …a child, lowered where the position it sits in is a subschema and copied where it is not. */
+function loweredChild(key: string, value: unknown, away: readonly string[]): unknown {
+  if (SUBSCHEMA_KEYS.includes(key)) return lowerNode(value, away);
+  if (SUBSCHEMA_LIST_KEYS.includes(key)) {
+    return Array.isArray(value) ? value.map((item) => lowerNode(item, away)) : value;
+  }
+  if (SUBSCHEMA_MAP_KEYS.includes(key)) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+    const members: Record<string, unknown> = {};
+    for (const [name, member] of Object.entries(value as Record<string, unknown>)) {
+      members[name] = lowerNode(member, away);
+    }
+    return members;
+  }
+  // `additionalProperties` is a boolean on every object this compiler emits
+  // (grammar 3.4 closes them) and a subschema in JSON Schema at large, so it is
+  // walked only where it is one.
+  if (key === "additionalProperties" && typeof value === "object" && value !== null) {
+    return lowerNode(value, away);
+  }
+  return value;
+}
+
+/** The sentence a node's stripped keywords fold into ([`FOLDED_CONSTRAINTS`]). */
+function foldedConstraints(node: Record<string, unknown>, stripped: readonly string[]): string {
+  if (stripped.length === 0) return "";
+  const left = new Set(stripped);
+  const said: string[] = [];
+  for (const rule of FOLDED_CONSTRAINTS) {
+    if (!rule.keywords.every((keyword) => left.has(keyword))) continue;
+    for (const keyword of rule.keywords) left.delete(keyword);
+    const phrase = rule.say(node);
+    if (phrase !== "") said.push(phrase);
+  }
+  if (said.length === 0) return "";
+  const joined = said.join("; ");
+  return `${joined.charAt(0).toUpperCase()}${joined.slice(1)}.`;
+}
+
+/** An authored description with the folded sentence after it. */
+function appended(authored: unknown, folded: string): string {
+  if (typeof authored !== "string" || authored === "") return folded;
+  return `${authored.replace(/\s+$/u, "")} ${folded}`;
+}
+
+/**
+ * Whether this refusal is about a **schema keyword** — the one condition that
+ * fails the call where a capability refusal would have laddered (PRD §9 resolved
+ * q55, ruling d).
+ *
+ * After lowering, a 400 naming one of [`SCHEMA_KEYWORDS`] cannot be a statement
+ * about the mechanism, because the mechanism's own table says that keyword was
+ * never sent. So it is a statement about this runtime: the table for this (wire,
+ * mechanism) is missing a row, and the schema went out carrying a keyword the
+ * decoder will not compile. Laddering on it would send the same schema at the
+ * other rung, be refused there for the same reason, and **memoize** a mechanism
+ * as absent from an endpoint that has it — the way of being wrong q53's
+ * recognizer already refuses to be, aimed at the one bug this projection can
+ * have.
+ *
+ * Answers the keyword so the diagnostic can name it, which is the whole repair:
+ * one row of [`LOWERED_AWAY`].
+ *
+ * [`ABOUT_THE_CONVERSATION`] still outranks it, unchanged: a strict gateway
+ * refusing a history that ends on the assistant is a statement about a request
+ * this runtime composed, and it stays that whatever else the sentence mentions.
+ */
+function schemaKeywordRefusal(error: unknown): string | undefined {
+  if (!(error instanceof ProviderFailure)) return undefined;
+  if (error.status !== 400 && error.status !== 422) return undefined;
+  const body = error.body.toLowerCase();
+  if (ABOUT_THE_CONVERSATION.some((phrase) => body.includes(phrase))) return undefined;
+  return SCHEMA_KEYWORDS.find((keyword) => namesSchemaKeyword(body, keyword));
+}
+
+/** Whether `body` names `keyword` as a keyword rather than as a word in a sentence. */
+function namesSchemaKeyword(body: string, keyword: string): boolean {
+  const spelling = keyword.toLowerCase();
+  return namesKey(body, spelling, WORD_SHAPED_SCHEMA_KEYWORDS.has(spelling));
+}
+
+/**
+ * The error a schema-keyword refusal fails the call with (ruling d).
+ *
+ * Loud, and about **this runtime** rather than about the endpoint or the
+ * composition, because that is what it is: the endpoint compiled everything it
+ * was asked to compile except a keyword this projection should have taken off
+ * the wire. The provider's own body is quoted whole
+ * ([`ProviderFailure`] carries it in its message) so the missing row is readable
+ * off the failure without a second run, and the repair is named — one line, in
+ * this file.
+ *
+ * A plain `Error`, so [`classify`] answers `undefined` and the route ladder does
+ * with it exactly what it does with any other 400: fails the node rather than
+ * failing over (grammar 12.2 routes on infrastructure conditions only). Failing
+ * over would be worse than useless here — the next member is sent the same
+ * unlowered schema.
+ */
+function loweringIsWrong(
+  wire: Wire,
+  model: ModelBinding,
+  mechanism: OutputMechanism,
+  keyword: string,
+  refusal: unknown,
+): Error {
+  return new Error(
+    `\`${model.address}\` asked \`${model.provider.address}\` for structured output through \`${MECHANISM_KEYS[wire][mechanism][0]}\` and the endpoint refused the schema itself, naming \`${keyword}\`: ${describe(refusal)}. This is this runtime's own bug rather than a mechanism the endpoint lacks: \`${keyword}\` is a constraint keyword the \`${wire}\`/\`${mechanism}\` lowering table should have stripped before the request (PRD resolved q55), so nothing laddered and nothing was remembered. The emitted schema and its parse are unchanged; the repair is one row of \`LOWERED_AWAY\` in \`src/runtime.ts\``,
+    { cause: refusal },
+  );
+}
+
 async function callMessages(
   model: ModelBinding,
   request: ModelRequest,
@@ -2982,6 +3445,14 @@ async function callMessages(
   // agree: whether the synthetic output tool is *offered*, whether the request
   // pins it, and where the answer's object is read from.
   const native = request.pinned !== undefined && mechanism === "native";
+  // …and the schema *this rung's decoder can compile* (PRD §9 resolved q55):
+  // the emitted schema projected through this (wire, mechanism)'s lowering
+  // table, with every stripped bound folded into its node's description. The
+  // pinned tool's name is untouched, and so is the emitted Zod the answer is
+  // parsed with — the contract lives in the parse. On the forced-tool rung the
+  // table is empty and this is the emitted schema itself.
+  const pinned =
+    request.pinned === undefined ? undefined : loweredPin(request.pinned, "messages", mechanism);
   const settings = { ...model.settings };
   const maxTokens = settings["max_tokens"] ?? ANTHROPIC_MAX_TOKENS;
   delete settings["max_tokens"];
@@ -3144,10 +3615,7 @@ async function callMessages(
   // as an endpoint that lacks a mechanism — it refused nothing. What that costs
   // is bounded and diagnosed: a model ignoring a fixed instruction to produce its
   // result, named as such, on a node a `retry:` policy runs again.
-  const offered = [
-    ...request.tools,
-    ...(request.pinned === undefined || native ? [] : [request.pinned]),
-  ];
+  const offered = [...request.tools, ...(pinned === undefined || native ? [] : [pinned])];
   const body: Record<string, unknown> = {
     model: model.id,
     max_tokens: maxTokens,
@@ -3179,7 +3647,7 @@ async function callMessages(
       ...server,
     ];
   }
-  if (request.pinned !== undefined) {
+  if (pinned !== undefined) {
     if (native) {
       // The Messages API's own structured output: `output_config`'s `format`,
       // carrying the agent's schema, and the answer comes back as text that
@@ -3189,10 +3657,10 @@ async function callMessages(
       // pinned tool's *name* is this compiler's, not the wire's, and there is
       // no call for it to name.
       body["output_config"] = {
-        format: { type: "json_schema", schema: request.pinned.schema },
+        format: { type: "json_schema", schema: pinned.schema },
       };
     } else {
-      body["tool_choice"] = { type: "tool", name: request.pinned.name };
+      body["tool_choice"] = { type: "tool", name: pinned.name };
     }
   }
 
@@ -3247,9 +3715,7 @@ async function callMessages(
   // They travel instead on `content`, which [`replayed`] sends back unaltered.
   const uses = blocks.filter((block) => block.type === "tool_use");
   const pinnedUse =
-    request.pinned === undefined || native
-      ? undefined
-      : uses.find((use) => use["name"] === request.pinned!.name);
+    pinned === undefined || native ? undefined : uses.find((use) => use["name"] === pinned.name);
   const said = runs.length > 0 ? runs.join("") : null;
   const shaped = runs.length > 0 ? runs[runs.length - 1]! : null;
   return {
@@ -3307,6 +3773,14 @@ async function callChatCompletions(
   // gateway that proxies a model generation whose `response_format` it has
   // never heard of.
   const forced = request.pinned !== undefined && mechanism === "forced_tool";
+  // …and the schema this wire's `strict` decoder can compile, which is the
+  // emitted one minus its own table's keywords (PRD §9 resolved q55). One table
+  // serves both rungs here: `response_format`'s `json_schema` and a forced
+  // function's `parameters` are two spellings of one decoder.
+  const pinned =
+    request.pinned === undefined
+      ? undefined
+      : loweredPin(request.pinned, "chat_completions", mechanism);
   // What this request declares is also what its **history** may name on this
   // surface, and that is the one rule the two wires do not share: Chat
   // Completions re-validates an assistant turn's `tool_calls` against `tools`
@@ -3399,23 +3873,23 @@ async function callChatCompletions(
     functions.push({
       type: "function",
       function: {
-        name: request.pinned!.name,
-        description: request.pinned!.description,
-        parameters: request.pinned!.schema,
-        strict: strictable(request.pinned!.schema),
+        name: pinned!.name,
+        description: pinned!.description,
+        parameters: pinned!.schema,
+        strict: strictable(pinned!.schema),
       },
     });
   }
   if (functions.length > 0 || server.length > 0) {
     body["tools"] = [...functions, ...server];
   }
-  if (request.pinned !== undefined) {
+  if (pinned !== undefined) {
     if (forced) {
       // The other rung (PRD §9 resolved q53): the pinned function above, forced
       // by name, which is the mechanism every OpenAI-shaped surface has had for
       // as long as it has had tools — and so the one a gateway that refuses
       // `response_format` still takes.
-      body["tool_choice"] = { type: "function", function: { name: request.pinned.name } };
+      body["tool_choice"] = { type: "function", function: { name: pinned.name } };
     } else {
       // `response_format` rather than a forced function: the schema shapes the
       // content and leaves the request's own `tools` callable, which is what an
@@ -3429,9 +3903,9 @@ async function callChatCompletions(
       body["response_format"] = {
         type: "json_schema",
         json_schema: {
-          name: request.pinned.name,
-          strict: strictable(request.pinned.schema),
-          schema: request.pinned.schema,
+          name: pinned.name,
+          strict: strictable(pinned.schema),
+          schema: pinned.schema,
         },
       };
     }
@@ -3462,9 +3936,7 @@ async function callChatCompletions(
   // which is what an output schema with an `optional:` property gets
   // ([`strictable`]) — leaves the decoder free to answer in prose, as does a
   // gateway that takes `response_format` and ignores it.
-  const pinnedCall = forced
-    ? calls.find((call) => call.name === request.pinned!.name)
-    : undefined;
+  const pinnedCall = forced ? calls.find((call) => call.name === pinned!.name) : undefined;
   return {
     text: content,
     toolCalls: request.pinned === undefined ? calls : [],
@@ -3549,6 +4021,11 @@ async function callResponses(
   // (PRD §9 resolved q53): `text.format` is preferred, a forced function is what
   // an endpoint that will not take it still answers.
   const forced = request.pinned !== undefined && mechanism === "forced_tool";
+  // …under the same lowering the other OpenAI surface applies (PRD §9 resolved
+  // q55): one decoder, one table, whichever of the two spellings carries the
+  // schema.
+  const pinned =
+    request.pinned === undefined ? undefined : loweredPin(request.pinned, "responses", mechanism);
   const input: unknown[] = [];
   for (const turn of request.turns) {
     if (turn.role === "user") {
@@ -3644,25 +4121,25 @@ async function callResponses(
   if (forced) {
     functions.push({
       type: "function",
-      name: request.pinned!.name,
-      description: request.pinned!.description,
-      parameters: request.pinned!.schema,
-      strict: strictable(request.pinned!.schema),
+      name: pinned!.name,
+      description: pinned!.description,
+      parameters: pinned!.schema,
+      strict: strictable(pinned!.schema),
     });
   }
   if (functions.length > 0 || server.length > 0) {
     body["tools"] = [...functions, ...server];
   }
-  if (request.pinned !== undefined) {
+  if (pinned !== undefined) {
     if (forced) {
-      body["tool_choice"] = { type: "function", name: request.pinned.name };
+      body["tool_choice"] = { type: "function", name: pinned.name };
     } else {
       body["text"] = {
         format: {
           type: "json_schema",
-          name: request.pinned.name,
-          strict: strictable(request.pinned.schema),
-          schema: request.pinned.schema,
+          name: pinned.name,
+          strict: strictable(pinned.schema),
+          schema: pinned.schema,
         },
       };
     }
@@ -3714,9 +4191,7 @@ async function callResponses(
       : ((answer["status"] as string | null) ?? null);
   // The pinned function's arguments where this request forced one, and the
   // shaped final message where `text.format` did the shaping.
-  const pinnedCall = forced
-    ? calls.find((call) => call.name === request.pinned!.name)
-    : undefined;
+  const pinnedCall = forced ? calls.find((call) => call.name === pinned!.name) : undefined;
   return {
     text,
     toolCalls: request.pinned === undefined ? calls : [],
