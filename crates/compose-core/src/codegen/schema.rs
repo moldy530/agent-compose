@@ -180,7 +180,12 @@
 //! construction only for the JSON column, which
 //! `the_emitted_zod_agrees_with_the_json_schema_lowering` proves document by
 //! document — so [`super::runtime`]'s agent call sends [`json_field_map`]'s
-//! lowering, over `fetch`, with no `withStructuredOutput` in the path.
+//! lowering, over `fetch`, with no `withStructuredOutput` in the path. (PRD §9
+//! resolved q55 amends *that* equality, and only where a decoder cannot compile
+//! a keyword — see *The equality, as PRD §9 resolved q55 amends it* below. It
+//! does not reopen this choice: what q55 lowers is the document this column
+//! publishes, and there would be nothing to lower if the model were handed a
+//! conversion that had already dropped the constraint.)
 //!
 //! The evidence stays, and so does the gate that keeps it true:
 //! `what_the_structured_output_mechanism_would_be_handed` in
@@ -197,9 +202,46 @@
 //! 3.4) is sent `strict: false` and is constrained by nothing — while the parse
 //! still runs over this module's lowering, unchanged. That row lives in
 //! [`super::runtime`]'s ledger rather than here, because it is a property of the
-//! *request* and not of the lowering: what this module publishes is what goes on
-//! the wire and what the answer is checked against, on both surfaces and at
-//! either `strict`.
+//! *request* and not of the lowering.
+//!
+//! # The equality, as PRD §9 resolved q55 amends it
+//!
+//! What this module publishes is still one document per surface, and it is still
+//! what the answer is checked against — but it is **not**, since q55, always the
+//! document that goes out. A structured-output parameter is a schema *compiler*
+//! over a subset of JSON Schema, and the subsets exclude the constraint keywords
+//! grammar D10 makes unavoidable: `max_items` is REQUIRED on every array inside
+//! a result schema, §3.5 sends it as `maxItems`, and the Messages wire's
+//! `output_config` format compiles no array-length, numeric or string-length
+//! constraint at all. So the generated runtime projects this module's JSON
+//! through a per-(wire, mechanism) **lowering table** before the request, folding
+//! each stripped bound into that schema node's `description`.
+//!
+//! The amended reading, which is the one to hold this module to:
+//!
+//! * the **wire** is constrained by `lowering(published schema)`, per (wire,
+//!   mechanism);
+//! * the **parse** checks the published schema whole — this module's Zod column,
+//!   untouched by any of it;
+//! * the **delta** is exactly the table: equal wherever the decoder compiles the
+//!   keyword, parse-only exactly where it cannot, and nothing else.
+//!
+//! Which is the same doctrine as the `optional:` row above, one step out: when a
+//! wire cannot express a schema feature, the contract lives in the parse. An
+//! answer that overruns a stripped bound therefore fails
+//! `<agent>Output.parse(…)` exactly as any schema-violating answer does — it is
+//! never truncated to fit — and the model is still *aimed* at the bound, because
+//! the description says it.
+//!
+//! Both halves are proven document by document, as before:
+//! `the_emitted_zod_agrees_with_the_json_schema_lowering` keeps the two emitted
+//! columns equal, and
+//! `the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks` measures the
+//! delta against the runtime's own tables — over every agent `output:` in the
+//! corpus, once per (wire, mechanism). The tables themselves are held to what the
+//! wire refuses by the mock provider (`crates/mock-provider/src/lowering.rs`,
+//! `WIRE-NOTES` (28)) and to each other by
+//! `crates/agent-compose/tests/wire_lowering_agreement.rs`.
 
 use std::borrow::Cow;
 

@@ -2,7 +2,7 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Twenty-two gates. The first four are in increasing strength, each one
+//! Twenty-three gates. The first four are in increasing strength, each one
 //! existing because the one above it passes on code the one below it catches;
 //! the fifth is about a construct whose guarantees are only observable from
 //! inside the runtime; the next two are about the schemas rather than the graph;
@@ -15,9 +15,10 @@
 //! the eighteenth is about what a failure *says*, which is the one subject here
 //! that is a published surface rather than a behaviour; the three after that are
 //! about a `human` pause — the board a run holds one on, the terminal it answers
-//! one at, and the process's own standard input that terminal really is; and the
-//! last is about the two built-in tools a model drives, read from inside one
-//! call of them:
+//! one at, and the process's own standard input that terminal really is; the
+//! twenty-second is about the two built-in tools a model drives, read from
+//! inside one call of them; and the last is back to the schemas, about the one
+//! place the two columns are *not* equal and what bounds that gap:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -250,6 +251,21 @@
 //!     settles. Break any one of them and the call still answers something that
 //!     reads correctly from outside, which is why they are driven from within
 //!     the runtime rather than read off a transcript.
+//! 23. **The two schema columns after q55** — gate 6 proves the emitted Zod and
+//!     the published JSON Schema decide the same documents, which is the whole
+//!     of PRD 9.16's constrain==parse equality *until* a decoder cannot compile
+//!     a keyword. PRD §9 resolved q55 amends it: the wire is constrained by the
+//!     lowering's image, the parse checks the full schema, and the delta is
+//!     exactly the per-(wire, mechanism) table. So this runs the generated
+//!     runtime's own projection over every agent `output:` in the corpus, once
+//!     per (wire, mechanism), and holds the difference to that table keyword by
+//!     keyword — nothing else removed, nothing else changed, every stripped
+//!     bound folded into its node's `description` where the model still reads
+//!     it. It also answers the projection's own corners over a written corpus
+//!     (nested objects, arrays of objects, `anyOf` branches, paired bounds, a
+//!     node with no description of its own, `uniqueItems: false`) and asks the
+//!     runner whether the function was deterministic and left its input alone,
+//!     which no JSON round trip could show.
 //!
 //! # The toolchain fixture
 //!
@@ -4986,6 +5002,584 @@ fn mentions(schema: &Value, keyword: &str) -> bool {
         Value::Array(items) => items.iter().any(|item| mentions(item, keyword)),
         _ => false,
     }
+}
+
+/// The (wire, mechanism) pairs a structured-output request can be composed for
+/// (PRD §9 resolved q53), which is what a lowering table is indexed by.
+const RUNGS: &[(&str, &str)] = &[
+    ("messages", "native"),
+    ("messages", "forced_tool"),
+    ("chat_completions", "native"),
+    ("chat_completions", "forced_tool"),
+    ("responses", "native"),
+    ("responses", "forced_tool"),
+];
+
+/// One written schema the projection is asked about, beside what it should
+/// answer where the answer is a *sentence* rather than a shape.
+struct Projection {
+    /// What the case is for, and the key the runner reports it under.
+    label: &'static str,
+    /// The schema handed in.
+    schema: fn() -> Value,
+    /// `(JSON pointer-ish path, expected description)` on the **Messages
+    /// native** row, which is the table the ruling was written from. The path is
+    /// the dotted address of the node inside the lowered schema; an empty one is
+    /// the root.
+    described: &'static [(&'static str, &'static str)],
+}
+
+/// The corners of the projection, written out (PRD §9 resolved q55, rulings a
+/// and b).
+///
+/// The goldens answer "does the delta equal the table" over real compositions;
+/// these answer "what does it *say*", which no golden pins because the sentence
+/// is the runtime's rather than the composition's. One case per thing that can
+/// be wrong independently: which keyword a table takes, how a pair of bounds
+/// reads as one phrase, where the sentence lands when the author wrote one and
+/// when they did not, how deep the walk goes, and the one keyword whose value
+/// can ask for nothing at all.
+fn projections() -> Vec<Projection> {
+    vec![
+        Projection {
+            label: "an array of objects, bounded on both axes",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "description": "The reviewer's answer.",
+                    "properties": {
+                        "notes": {
+                            "type": "array",
+                            "description": "Side notes.",
+                            "minItems": 1,
+                            "maxItems": 8,
+                            "uniqueItems": true,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "body": { "type": "string", "maxLength": 200 },
+                                    "weight": { "type": "number", "minimum": 0, "maximum": 1 },
+                                },
+                                "required": ["body", "weight"],
+                                "additionalProperties": false,
+                            },
+                        },
+                    },
+                    "required": ["notes"],
+                    "additionalProperties": false,
+                })
+            },
+            described: &[
+                // A pair of array bounds is one phrase, after the author's own
+                // words; `uniqueItems` is not in the Messages table, so it stays
+                // on the wire and says nothing here.
+                ("properties.notes", "Side notes. Between 1 and 8 items."),
+                // …two levels down, on a node that had no description at all.
+                (
+                    "properties.notes.items.properties.body",
+                    "At most 200 characters.",
+                ),
+                (
+                    "properties.notes.items.properties.weight",
+                    "Between 0 and 1.",
+                ),
+            ],
+        },
+        Projection {
+            label: "an anyOf whose branches carry different families",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "anyOf": [
+                                { "type": "string", "minLength": 2 },
+                                {
+                                    "type": "array",
+                                    "maxItems": 3,
+                                    "items": { "type": "integer", "exclusiveMinimum": 0, "multipleOf": 5 },
+                                },
+                            ],
+                        },
+                    },
+                    "required": ["kind"],
+                    "additionalProperties": false,
+                })
+            },
+            described: &[
+                ("properties.kind.anyOf.0", "At least 2 characters."),
+                ("properties.kind.anyOf.1", "At most 3 items."),
+                (
+                    "properties.kind.anyOf.1.items",
+                    "Greater than 0; a multiple of 5.",
+                ),
+            ],
+        },
+        Projection {
+            label: "a discriminated union, the shape grammar 3.7 emits",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "findings": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "items": {
+                                "oneOf": [
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "auto_fixable" },
+                                            "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                                        },
+                                        "required": ["kind", "confidence"],
+                                        "additionalProperties": false,
+                                    },
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": { "const": "needs_human" },
+                                            "summary": { "type": "string", "minLength": 1 },
+                                        },
+                                        "required": ["kind", "summary"],
+                                        "additionalProperties": false,
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                    "required": ["findings"],
+                    "additionalProperties": false,
+                })
+            },
+            described: &[
+                ("properties.findings", "At most 16 items."),
+                (
+                    "properties.findings.items.oneOf.0.properties.confidence",
+                    "Between 0 and 1.",
+                ),
+                (
+                    "properties.findings.items.oneOf.1.properties.summary",
+                    "At least 1 characters.",
+                ),
+            ],
+        },
+        Projection {
+            label: "a value that is not a schema, and a bound that asks for nothing",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        // `uniqueItems: false` is grammar 3.5's default written
+                        // out: the OpenAI table strips it, and folding
+                        // "duplicates are allowed" into a description would be
+                        // this runtime telling a model something no author said.
+                        "tags": { "type": "array", "uniqueItems": false, "items": { "type": "string" } },
+                        // An `enum`'s members are **values**, and a value is free
+                        // to be a string spelled like a keyword. The walk visits
+                        // named subschema positions only, so nothing here moves.
+                        "mode": { "type": "string", "enum": ["maxItems", "minimum"] },
+                    },
+                    "required": ["tags", "mode"],
+                    "additionalProperties": false,
+                })
+            },
+            described: &[],
+        },
+    ]
+}
+
+/// Gate 23: the wire schema is the lowering's image of the schema the parse
+/// checks, and the delta is exactly the table (PRD §9 resolved q55, amending
+/// resolved q16).
+///
+/// Gate 6 proves the two *emitted* columns — the published JSON Schema and the
+/// Zod the answer is parsed with — decide the same documents. That was the whole
+/// of 9.16's constrain==parse equality until q55, which names the honest cost of
+/// a decoder that cannot compile a keyword: the wire is constrained by the
+/// lowering's image, the parse still checks the full schema, and the two are
+/// equal everywhere the decoder compiles the keyword and parse-only exactly
+/// where it cannot.
+///
+/// So this measures the delta, over every agent `output:` in the corpus and once
+/// per (wire, mechanism), and holds it to three things:
+///
+///   * **nothing else is removed** — a keyword gone from the wire schema is a
+///     keyword in that row's table;
+///   * **nothing else is changed** — the lowered schema and the emitted one are
+///     the same document once the table's keywords are taken out of the second
+///     and both are read without descriptions, which is what says the projection
+///     is a *projection* rather than a rewrite;
+///   * **every stripped bound is still said** — the node it came off carries a
+///     description that names it, after whatever the author wrote.
+///
+/// The parse column needs no assertion here and gets none: the emitted Zod is
+/// what gate 6 already answered the corpus with, and lowering does not touch it —
+/// `codegen::schema` emits one schema module and the runtime projects a copy on
+/// its way to the wire.
+#[test]
+fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(golden("review-loop"), root, "wire-lowering");
+
+    // Every agent `output:` the corpus declares — the schemas that actually ride
+    // a wire. A flow's `outputs:` and a tool's are results too, but nothing puts
+    // them in a structured-output request.
+    let mut cases: Vec<(String, Value)> = Vec::new();
+    for golden in GOLDENS {
+        let ir = artifact(golden);
+        for surface in compose_core::codegen::schema::surfaces(&ir) {
+            if !(surface.path.starts_with("agent.") && surface.path.ends_with(".output")) {
+                continue;
+            }
+            let schema = match &surface.body {
+                compose_core::codegen::schema::Body::Fields(fields) => {
+                    compose_core::codegen::schema::json_field_map(fields)
+                }
+                compose_core::codegen::schema::Body::Type(ty) => {
+                    compose_core::codegen::schema::json_type_node(ty)
+                }
+            };
+            cases.push((format!("{}::{}", golden.directory, surface.path), schema));
+        }
+    }
+    assert!(
+        cases.len() > 3,
+        "the corpus declares almost no agent outputs, so this gate measures nothing: {:?}",
+        cases.iter().map(|(label, _)| label).collect::<Vec<_>>()
+    );
+    let written = projections();
+    let handed: Vec<Value> = cases
+        .iter()
+        .map(|(label, schema)| json!({ "label": label, "schema": schema }))
+        .chain(
+            written
+                .iter()
+                .map(|case| json!({ "label": case.label, "schema": (case.schema)() })),
+        )
+        .collect();
+
+    let observed = lowered_by_the_runtime(&project, &handed);
+    let tables = &observed["tables"];
+    assert_eq!(
+        observed["stable"],
+        json!(true),
+        "the projection answered two different documents for one schema and one table, so a wire \
+         schema is not a byte-identical function of what the composition emitted (PRD resolved \
+         q55)"
+    );
+    assert_eq!(
+        observed["pure"],
+        json!(true),
+        "the projection rewrote the schema it was handed. That schema is what the emitted Zod \
+         parses and what the journal replays, so lowering it in place would change the contract \
+         on the way to describing it (PRD resolved q55)"
+    );
+
+    let lowered: Vec<&Value> = observed["lowered"]
+        .as_array()
+        .expect("the runner answers one entry per (case, wire, mechanism)")
+        .iter()
+        .collect();
+    assert_eq!(lowered.len(), handed.len() * RUNGS.len());
+
+    for entry in &lowered {
+        let label = entry["label"].as_str().expect("a labelled entry");
+        let wire = entry["wire"].as_str().expect("a wire");
+        let mechanism = entry["mechanism"].as_str().expect("a mechanism");
+        let table: Vec<&str> = tables[wire][mechanism]
+            .as_array()
+            .unwrap_or_else(|| panic!("the runtime declares no `{wire}`/`{mechanism}` table"))
+            .iter()
+            .map(|keyword| keyword.as_str().expect("a keyword is a string"))
+            .collect();
+        let full = handed
+            .iter()
+            .find(|case| case["label"] == json!(label))
+            .map(|case| case["schema"].clone())
+            .expect("every entry answers a case that was handed in");
+        let wire_schema = &entry["schema"];
+
+        // Nothing else removed: a keyword the wire schema no longer carries is
+        // one this row's table names.
+        for keyword in KEYWORDS_A_SCHEMA_CAN_CARRY {
+            if !mentions(&full, keyword) || mentions(wire_schema, keyword) {
+                continue;
+            }
+            assert!(
+                table.contains(keyword),
+                "`{label}` reaches `{wire}`/`{mechanism}` without `{keyword}`, which that row's \
+                 lowering table does not strip. The delta between the wire and the parse is the \
+                 table and nothing else (PRD resolved q55, amending resolved q16)"
+            );
+        }
+        // …and every keyword the table *does* name is gone.
+        for keyword in &table {
+            assert!(
+                !mentions(wire_schema, keyword),
+                "`{label}` reaches `{wire}`/`{mechanism}` still carrying `{keyword}`, which that \
+                 decoder does not compile — the composer is not projecting through the table"
+            );
+        }
+        // Nothing else changed: the same document, once the table's keywords are
+        // taken out of the emitted one and neither is read for its descriptions.
+        assert_eq!(
+            undescribed(wire_schema),
+            undescribed(&without(&full, &table)),
+            "`{label}`'s `{wire}`/`{mechanism}` schema is not the emitted schema minus this row's \
+             table: the projection changed something else on the way (PRD resolved q55)"
+        );
+        // And every stripped bound is still said, where the model reads it.
+        for (path, node) in nodes(&full) {
+            // Keywords this row strips **that ask for something**. A
+            // `uniqueItems: false` is grammar 3.5's default written out — the
+            // absence of a constraint — and it is stripped like any other
+            // keyword the decoder cannot compile while folding no sentence,
+            // because "duplicates are allowed" is not a bound a model is being
+            // aimed at.
+            let stripped: Vec<&&str> = table
+                .iter()
+                .filter(|keyword| {
+                    node.get(**keyword)
+                        .is_some_and(|value| value.is_number() || value == &json!(true))
+                })
+                .collect();
+            if stripped.is_empty() {
+                continue;
+            }
+            let at = value_at(wire_schema, &path).unwrap_or_else(|| {
+                panic!("`{label}`'s `{wire}`/`{mechanism}` schema lost the node at `{path}`")
+            });
+            let said = at
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                said.ends_with('.'),
+                "`{label}` at `{path}` lost {stripped:?} on `{wire}`/`{mechanism}` and says \
+                 nothing about it: a stripped bound is folded into that node's `description` so \
+                 the model is still aimed at it (PRD resolved q55, ruling b) — found {said:?}"
+            );
+            if let Some(authored) = node.get("description").and_then(Value::as_str) {
+                assert!(
+                    said.starts_with(authored),
+                    "`{label}` at `{path}` folded its bounds in front of the author's own words \
+                     rather than after them: {said:?}"
+                );
+            }
+            for keyword in stripped {
+                let Some(bound) = node.get(*keyword).and_then(Value::as_f64) else {
+                    continue;
+                };
+                let printed = if bound.fract() == 0.0 {
+                    format!("{bound:.0}")
+                } else {
+                    bound.to_string()
+                };
+                assert!(
+                    said.contains(&printed),
+                    "`{label}` at `{path}` lost `{keyword}: {printed}` on \
+                     `{wire}`/`{mechanism}` and its description does not name the bound: {said:?}"
+                );
+            }
+        }
+    }
+
+    // …and what the sentences actually read like, on the table the ruling was
+    // written from. The corpus above says the bound is named; these say it is
+    // named in English, and in one deterministic order.
+    for case in &written {
+        let entry = lowered
+            .iter()
+            .find(|entry| {
+                entry["label"] == json!(case.label)
+                    && entry["wire"] == json!("messages")
+                    && entry["mechanism"] == json!("native")
+            })
+            .unwrap_or_else(|| panic!("`{}` was never projected", case.label));
+        for (path, expected) in case.described {
+            let node = value_at(&entry["schema"], path)
+                .unwrap_or_else(|| panic!("`{}` has no node at `{path}`", case.label));
+            assert_eq!(
+                node.get("description").and_then(Value::as_str),
+                Some(*expected),
+                "`{}` folded something else into `{path}` (PRD resolved q55, ruling b)",
+                case.label
+            );
+        }
+    }
+    // The one case whose whole point is that nothing moves.
+    let untouched = lowered
+        .iter()
+        .find(|entry| {
+            entry["label"]
+                == json!(
+                    "a value that is not a schema, and a bound that asks for \
+                                     nothing"
+                )
+                && entry["wire"] == json!("chat_completions")
+                && entry["mechanism"] == json!("native")
+        })
+        .expect("the value case was projected");
+    assert_eq!(
+        untouched["schema"]["properties"]["mode"],
+        json!({ "type": "string", "enum": ["maxItems", "minimum"] }),
+        "an `enum`'s members are values, and the walk visits named subschema positions only — a \
+         blind walk would have rewritten data a composition declared"
+    );
+    assert_eq!(
+        untouched["schema"]["properties"]["tags"]
+            .get("description")
+            .and_then(Value::as_str),
+        None,
+        "`uniqueItems: false` is the absence of a constraint, so it folds no sentence: {:?}",
+        untouched["schema"]["properties"]["tags"]
+    );
+    assert!(
+        untouched["schema"]["properties"]["tags"]
+            .get("uniqueItems")
+            .is_none(),
+        "…and it is still stripped, because the decoder does not compile the keyword either way"
+    );
+}
+
+/// Every keyword `codegen::schema`'s JSON column can write, which is what the
+/// "nothing else removed" half of gate 23 is quantified over.
+///
+/// A closed list rather than "every key in the document", because the question
+/// is about the *schema* vocabulary: a property named `minimum` inside
+/// `properties` is a field name, and the delta is measured over keywords.
+const KEYWORDS_A_SCHEMA_CAN_CARRY: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "oneOf",
+    "anyOf",
+    "enum",
+    "const",
+    "format",
+    "pattern",
+    "default",
+    "uniqueItems",
+    "maxItems",
+    "minItems",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+];
+
+/// Ask a golden's own `src/runtime.ts` what it puts on each wire.
+fn lowered_by_the_runtime(project: &Path, cases: &[Value]) -> Value {
+    let input = json!({
+        "pairs": RUNGS.iter().map(|(wire, mechanism)| json!([wire, mechanism])).collect::<Vec<_>>(),
+        "cases": cases,
+    });
+    let path = project.join("wire-lowering-cases.json");
+    fs::write(
+        &path,
+        serde_json::to_string(&input).expect("the cases serialize"),
+    )
+    .expect("the scratch area is writable");
+    let output = runner("wire-lowering.mjs")
+        .arg(project)
+        .arg(&path)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the lowering runner did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object")
+}
+
+/// A schema with `keywords` taken out of every node — the Rust side's own
+/// reading of what lowering removes, so the projection is compared against a
+/// second implementation rather than against itself.
+fn without(schema: &Value, keywords: &[&str]) -> Value {
+    match schema {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| !keywords.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), without(value, keywords)))
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| without(item, keywords)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// …and with every `description` taken out, because that is the one thing
+/// lowering is *supposed* to change.
+fn undescribed(schema: &Value) -> Value {
+    without(schema, &["description"])
+}
+
+/// Every object inside a schema, by the dotted path that addresses it.
+///
+/// Walks values as well as subschema positions, deliberately: the caller is
+/// asking "which nodes carried a keyword this table strips", and a node the
+/// projection *should not* have touched carrying one is exactly the answer that
+/// would make the gate fail — which is what it is for.
+fn nodes(schema: &Value) -> Vec<(String, &serde_json::Map<String, Value>)> {
+    let mut found = Vec::new();
+    walk_nodes(schema, String::new(), &mut found);
+    found
+}
+
+fn walk_nodes<'a>(
+    schema: &'a Value,
+    path: String,
+    found: &mut Vec<(String, &'a serde_json::Map<String, Value>)>,
+) {
+    match schema {
+        Value::Object(map) => {
+            found.push((path.clone(), map));
+            for (key, value) in map {
+                walk_nodes(value, join(&path, key), found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                walk_nodes(item, join(&path, &index.to_string()), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn join(path: &str, member: &str) -> String {
+    if path.is_empty() {
+        member.to_string()
+    } else {
+        format!("{path}.{member}")
+    }
+}
+
+/// The value one dotted path addresses, or `None` where the path is gone.
+fn value_at<'a>(schema: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut at = schema;
+    if path.is_empty() {
+        return Some(at);
+    }
+    for member in path.split('.') {
+        at = match at {
+            Value::Object(map) => map.get(member)?,
+            Value::Array(items) => items.get(member.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(at)
 }
 
 /// The fixture, **both** its lockfiles, and the emitter pin the same versions.

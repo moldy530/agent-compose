@@ -3295,6 +3295,19 @@ export function loweredSchema(
   return lowerNode(schema, away) as JsonSchema;
 }
 
+/**
+ * What one (wire, mechanism) strips, for a reader outside this file.
+ *
+ * The table itself stays private — it is read here and nowhere else in a running
+ * graph — and this is what the schema-lowering gate
+ * (`tests/generated_code_gates.rs`) asks it, so the delta a gate measures is
+ * stated by the same table the composers project through rather than by a copy
+ * of it.
+ */
+export function loweredAway(wire: Wire, mechanism: OutputMechanism): readonly string[] {
+  return LOWERED_AWAY[wire][mechanism];
+}
+
 /** The same projection over one tool spec — the pinned one, on the rungs that send it. */
 function loweredPin(pinned: ToolSpec, wire: Wire, mechanism: OutputMechanism): ToolSpec {
   return { ...pinned, schema: loweredSchema(pinned.schema, wire, mechanism) };
