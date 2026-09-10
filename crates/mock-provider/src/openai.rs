@@ -34,9 +34,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map, Value, json};
 
 use crate::control::{
-    Failure, Outcome, Reply, ReplyBody, StructuredOutput, ValidationFailure, canonical, estimate,
-    request_id,
+    Failure, Outcome, Reply, ReplyBody, StructuredOutput, Surface, ValidationFailure, canonical,
+    estimate, request_id,
 };
+use crate::lowering;
 use crate::strict::{Checker, Dialect, Kind, at, listed};
 use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED, UNSUPPORTED};
 
@@ -185,6 +186,15 @@ pub(crate) fn parse(
         let schema = function_schema(body, &name)?;
         Some(StructuredOutput::ForcedFunction { name, schema })
     });
+    // Which of the two OpenAI-shaped surfaces this is. They enforce the same
+    // subset — one decoder behind two routes — but the row is asked for by name
+    // so that a table that ever splits them splits them here too.
+    let surface = if route.is_azure() {
+        Surface::AzureOpenAi
+    } else {
+        Surface::OpenAi
+    };
+    check_schema_subset(&mut checker, surface, body, structured_output.as_ref());
 
     Parsed {
         model,
@@ -505,6 +515,60 @@ fn check_tool_choice(
             None
         }
     }
+}
+
+/// The **subset** this surface's structured-output decoder compiles (PRD §9
+/// resolved q55).
+///
+/// The other half of what `strict` means. [`check_strict_schema`] holds a schema
+/// to being *closed* — every object `additionalProperties: false` with every
+/// property required — and this holds it to the **keywords** the decoder
+/// compiles at all: the numeric, string-length and array families its guide
+/// names as unsupported. Both spellings are held to it, because
+/// `response_format`'s `json_schema` and a forced function's `parameters` are
+/// two ways of handing one decoder one schema.
+///
+/// Enforced at either `strict`, which is how the generated runtime lowers: under
+/// `strict: false` the decoder constrains nothing, so a bound left on the
+/// request buys nothing the folded description does not, and one projection per
+/// (wire, mechanism) is what makes the amended q16 equality a single sentence.
+/// A mock stricter than the live surface is the posture this server has kept
+/// since PRD resolved q52 — the oracle is the strictest wire the runtime must
+/// satisfy — and it costs a compiled graph nothing, because the runtime already
+/// sends the lowered schema on both.
+fn check_schema_subset(
+    checker: &mut Checker,
+    surface: Surface,
+    body: &Map<String, Value>,
+    asked: Option<&StructuredOutput>,
+) {
+    let (pointer, subject) = match asked {
+        Some(StructuredOutput::JsonSchema { name, .. }) => (
+            "response_format.json_schema.schema".to_string(),
+            format!("response_format '{name}'"),
+        ),
+        Some(StructuredOutput::ForcedFunction { name, .. }) => {
+            let index = lowering::tool_index(body, name, |tool| {
+                tool.get("function")?.get("name")?.as_str()
+            })
+            .unwrap_or_default();
+            (
+                at(&at(&at("tools", index), "function"), "parameters"),
+                format!("function '{name}'"),
+            )
+        }
+        _ => return,
+    };
+    let Some(asked) = asked else { return };
+    lowering::check_schema(
+        checker,
+        Dialect::OpenAi,
+        surface,
+        asked.mechanism(),
+        &pointer,
+        &subject,
+        asked.schema(),
+    );
 }
 
 /// The schema a named function declares.

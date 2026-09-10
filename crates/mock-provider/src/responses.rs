@@ -43,9 +43,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map, Value, json};
 
 use crate::control::{
-    Outcome, Reply, ReplyBody, ServerToolUse, StructuredOutput, ValidationFailure, canonical,
-    estimate, request_id,
+    Outcome, Reply, ReplyBody, ServerToolUse, StructuredOutput, Surface, ValidationFailure,
+    canonical, estimate, request_id,
 };
+use crate::lowering;
 use crate::openai::{Tools, check_root_schema, check_strict_schema, error, well_formed};
 use crate::strict::{Checker, Dialect, Kind, at, listed};
 use crate::wire::{Answer, HARNESS_STATUS, MISMATCH, Response};
@@ -146,6 +147,7 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
             Some(StructuredOutput::ForcedFunction { name, schema })
         })
         .or(format);
+    check_schema_subset(&mut checker, body, structured_output.as_ref());
 
     Parsed {
         model,
@@ -205,6 +207,46 @@ fn check_tool_choice(
             None
         }
     }
+}
+
+/// The **subset** this surface's structured-output decoder compiles (PRD §9
+/// resolved q55).
+///
+/// The same decoder Chat Completions hands its `response_format` to, reached
+/// through this wire's own two spellings — `text.format`'s `schema` and a forced
+/// function's flat `parameters` — so the row asked for is the same one, and a
+/// keyword it will not compile is refused here exactly as it is there.
+fn check_schema_subset(
+    checker: &mut Checker,
+    body: &Map<String, Value>,
+    asked: Option<&StructuredOutput>,
+) {
+    let (pointer, subject) = match asked {
+        Some(StructuredOutput::JsonSchema { name, .. }) => (
+            "text.format.schema".to_string(),
+            format!("text.format '{name}'"),
+        ),
+        Some(StructuredOutput::ForcedFunction { name, .. }) => {
+            let index =
+                lowering::tool_index(body, name, |tool| tool.get("name").and_then(Value::as_str))
+                    .unwrap_or_default();
+            (
+                at(&at("tools", index), "parameters"),
+                format!("function '{name}'"),
+            )
+        }
+        _ => return,
+    };
+    let Some(asked) = asked else { return };
+    lowering::check_schema(
+        checker,
+        Dialect::OpenAi,
+        Surface::Responses,
+        asked.mechanism(),
+        &pointer,
+        &subject,
+        asked.schema(),
+    );
 }
 
 /// The `parameters` a named function declares in this request's `tools`.

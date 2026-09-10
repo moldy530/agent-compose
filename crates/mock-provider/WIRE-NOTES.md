@@ -979,6 +979,42 @@ one table in the emitted `src/runtime.ts` (`MECHANISM_KEYS`,
 extra request that also fails. `tests/mechanism_personalities.rs` pins every
 sentence here so that widening one is a diff rather than a discovery.
 
+### 28. The JSON Schema subset each structured-output decoder compiles
+
+PRD §9 resolved q55: a structured-output parameter is a schema **compiler**, and
+it compiles less than the schema language. The Messages wire's `output_config`
+format excludes array-length constraints (`maxItems`, `minItems`), numeric ones
+(`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`) and
+string-length ones (`minLength`, `maxLength`); OpenAI's `strict` decoder — the
+one behind `response_format`, `text.format` and a function's `parameters` alike —
+excludes those and `uniqueItems`. `src/lowering.rs` holds both lists, and every
+one of them is refused here at the path it sits on.
+
+*What is certain*: that a `maxItems` inside `output_config.format.schema` is a
+400 today. That is the live field report q55 was resolved from, and it is why the
+check exists at all: grammar D10 makes `max_items` REQUIRED on every
+result-schema array, so **every** real composition sent one.
+
+*What is assumed* is the rest of each list, the two sentences those refusals are
+worded in, and one posture. The posture: the subset is enforced at either
+`strict` on the OpenAI wires, where the live surface plausibly only compiles —
+and so only complains about — a schema it was asked to be `strict` about. That is
+the same "strictest wire the runtime must satisfy" stance (24) takes, and it
+costs a compiled graph nothing, because the runtime lowers its schema on both.
+
+*If wrong in the permissive direction* (a decoder compiles a keyword this list
+refuses): the runtime is lowering away a constraint the wire would have honoured,
+which is silent — the model is told the bound in prose instead of being
+constrained by it, and the emitted Zod still enforces it. Both tables are one
+line per keyword: `src/lowering.rs` here, `LOWERED_AWAY` in the emitted
+`src/runtime.ts` there, and
+`crates/agent-compose/tests/wire_lowering_agreement.rs` fails if only one of them
+is edited. *If wrong in the other* (a decoder refuses a keyword neither list
+carries): the acceptance suite passes and a live call 400s — and the runtime
+answers that 400 the way ruling d says it must, failing the call loudly with the
+provider's body quoted rather than laddering to the other mechanism, because
+after lowering a schema-keyword refusal can only mean the table is wrong.
+
 ---
 
 ## Accepted-key lists are curated, not exhaustive
