@@ -426,6 +426,43 @@ are not permitted"}`. What decides the ladder is the complaint that arrived, not
 the name in front of it, so a proxied deployment ladders exactly as a direct one
 does.
 
+**What the schema looks like when it gets there is not always what you wrote.**
+A structured-output parameter is a schema *compiler*, and each one compiles a
+subset of JSON Schema — a subset that excludes the bounds this grammar requires.
+`max_items` is REQUIRED on every array inside an `output:` (that is what bounds
+`over:` fan-out), and the Messages wire's `output_config` format compiles no
+array-length, numeric or string-length constraint at all. So the runtime
+**lowers** the schema per wire and mechanism: the keywords that decoder cannot
+compile come off the request, and each one is folded into that field's
+`description`, where the model still reads it.
+
+| wire / mechanism | taken off the request |
+|---|---|
+| Messages, `output_config` | `maxItems`, `minItems`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`, `maxLength` |
+| Messages, forced tool | nothing — the schema rides as a tool's `input_schema`, whole |
+| Chat Completions and Responses, either mechanism | the same list, plus `uniqueItems` |
+
+What an author meets is the description. A field written as
+
+```yaml
+notes: { type: array, max_items: 8, items: { type: string }, description: Side notes. }
+```
+
+reaches an Anthropic model as `{"type": "array", "items": {"type": "string"},
+"description": "Side notes. At most 8 items."}` — your words, then the bound, in
+that order. Nothing else changes: no field is renamed, no type is rewritten, and
+a keyword the decoder *can* compile stays on the wire.
+
+**The bound still binds.** The emitted parse checks the whole schema, lowering
+and all, so an answer with nine notes fails the node with the same "did not match
+its schema" error any other bad answer gets — it is never truncated to fit. What
+lowering costs is that the model was *asked* rather than *forced*, on that one
+bound; what it buys is that the request is one the endpoint will take at all.
+
+There is nothing to configure and no YAML for it. If a provider starts compiling
+a keyword it used to refuse, that is a table in the runtime, not a change to your
+composition.
+
 One thing decides the order before any of that, and it is a property of the agent
 rather than of the endpoint — but only on the **Messages** wire. `output_config`
 constrains a decoder over a **closed** schema and refuses one that is not, so an
@@ -451,7 +488,11 @@ That is a model ignoring a fixed instruction to produce its result, not an
 endpoint that lacks a mechanism — nothing was refused, and nothing laddered.
 
 Nothing else ladders. A 401, a 429, a 5xx, a content refusal, a schema the
-decoder will not compile, a complaint about the **conversation** rather than
+decoder will not compile — including a 400 that names one of the lowered
+keywords above, which after lowering can only mean the runtime's own table is
+missing a row, and which therefore fails the call loudly with the endpoint's
+body quoted rather than trying the other mechanism — a complaint about the
+**conversation** rather than
 about a parameter — a strict gateway refusing a history that ends on an assistant
 turn — and a parameter refused because of **another parameter in the same
 request**, such as `output_config` beside a `settings:` key this model will not
