@@ -5397,6 +5397,15 @@ fn projections() -> Vec<Projection> {
 ///     lowering is allowed to rewrite is pinned from both sides: appended to
 ///     where a bound came off, and byte-identical everywhere else.
 ///
+/// Three claims about the projection *itself* are read by the runner rather than
+/// here, because each of them stops being observable the moment a schema is
+/// serialized into this process: that two projections of one schema answer the
+/// same document, that the schema handed in is not touched, and that a lowered
+/// node's keys are the emitted node's keys **in the emitted order**. The last is
+/// the half of "byte-identical" nothing on this side can check — every assertion
+/// below reads `serde_json::Value`s, whose objects are sorted maps — and it is
+/// the half a rewrite of the walk is most likely to break.
+///
 /// The sentences themselves are read on **two** rows rather than one. The tables
 /// are not the same list — `uniqueItems` is stripped by the OpenAI one and left
 /// on the wire by the Messages one — so the clause it folds is unreachable from
@@ -5466,6 +5475,21 @@ fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
         "the projection rewrote the schema it was handed. That schema is what the emitted Zod \
          parses and what the journal replays, so lowering it in place would change the contract \
          on the way to describing it (PRD resolved q55)"
+    );
+    // …and the half of byte-identity this side cannot see. Every assertion below
+    // reads `serde_json::Value`s, whose objects are sorted maps, so key order is
+    // normalised away before it gets here — a projection that re-emitted its
+    // nodes in some other order would change the bytes of every request a
+    // generated graph ever sends and leave this whole gate green. The runner
+    // reads it where it is still observable.
+    assert_eq!(
+        observed["ordered"],
+        json!(true),
+        "a lowered node's keys are no longer the emitted node's keys in the emitted order, so a \
+         wire schema is not the byte-identical function of the emitted one that `loweredSchema` \
+         says it is — and nothing else in this gate can see it, because a JSON round trip into \
+         `serde_json` sorts them (PRD resolved q55): {}",
+        observed["disorder"]
     );
 
     let lowered: Vec<&Value> = observed["lowered"]

@@ -3367,8 +3367,12 @@ function counted(value: unknown, noun: string): string {
  * **Pure**, and the input is never touched: what a composition emitted is what
  * the emitted Zod parses and what the trace's journal replays, so a projection
  * that mutated the schema in place would change the contract on its way to
- * describing it. Every node the walk rebuilds keeps its key order, so the same
- * schema and table serialize to the same bytes.
+ * describing it. Every node the walk rebuilds keeps its key order — its own keys
+ * in the order they were written, minus what came off, with a folded
+ * `description` appended where the node had none — so the same schema and table
+ * serialize to the same bytes. That last claim is pinned by the gate's runner
+ * (`tests/toolchain/wire-lowering.mjs`), which is the one place key order is
+ * still observable: the Rust side reads these documents as sorted maps.
  *
  * The one thing it deliberately does not do is decide *whether* to lower: a row
  * with nothing in it answers the schema it was given, which is what makes
@@ -3639,9 +3643,10 @@ function schemaRefused(
  *
  * A schema keyword and a request parameter can be spelled the **same**: `format`
  * is a JSON Schema keyword the tables leave on the wire
- * ([`CONSTRAINTS_LEFT_ON_THE_WIRE`]) and also the tail of `text.format`, the
- * Responses wire's own structured-output parameter — which a gateway that has
- * never heard of that wire is free to refuse under its short name
+ * ([`CONSTRAINTS_LEFT_ON_THE_WIRE`]) and also the tail of **two** wires' own
+ * structured-output parameters — `text.format` on Responses and
+ * `response_format` on Chat Completions — either of which a gateway that has
+ * never heard of the wire it proxies is free to refuse under a short name
  * ([`MECHANISM_KEYS`] carries the short forms for exactly that reason).
  * [`spelled`] keeps `text.format` and `response_format` out of the schema
  * vocabulary, and [`WORD_SHAPED_SCHEMA_KEYWORDS`]' quoting rule keeps `Invalid
@@ -3662,11 +3667,24 @@ function schemaRefused(
  * and the operator reads the quoted body, which is in front of them.
  *
  * Derived from [`MECHANISM_KEYS`] rather than listed, so a wire that gains a
- * nested parameter gains the caveat with it, and every other wire says nothing.
+ * parameter spelled with a keyword gains the caveat with it, and a wire whose
+ * keys share no keyword with the vocabulary — Messages' `output_config` and
+ * `tool_choice` — says nothing.
+ *
+ * A parameter **ends on** the keyword with either of the two punctuation marks a
+ * vendor joins a name with: the dot of a path (`text.format`) and the underscore
+ * of a compound name (`response_format`). Reading only the dot would have left
+ * the caveat silent on Chat Completions, which is the wire where a bare `format`
+ * after a colon is *most* likely to be a service talking about its
+ * `response_format` — the same ambiguity, on the surface that draws it more
+ * often. Nothing wider than those two: a keyword that merely ends another word
+ * is not that word's parameter.
  */
 function alsoAParameterOfThisWire(wire: Wire, keyword: string): string {
   const spellings = Object.values(MECHANISM_KEYS[wire]).flat();
-  const shared = spellings.find((key) => key === keyword || key.endsWith(`.${keyword}`));
+  const shared = spellings.find(
+    (key) => key === keyword || key.endsWith(`.${keyword}`) || key.endsWith(`_${keyword}`),
+  );
   if (shared === undefined) return "";
   return `. One caveat, on this wire only: \`${shared}\` — a parameter this wire asks for structured output with — is spelled with \`${keyword}\` too, so a service refusing *that* under its short name words its 400 the same way: read the quoted body before editing a row`;
 }

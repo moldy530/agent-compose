@@ -25,8 +25,12 @@ model.smart:
     temperature: 0.2
 
 # An agent is a model call with a declared contract. `output:` is a schema, not
-# a hope: the model is constrained by it on the wire and its answer is parsed
-# with it, so downstream nodes and edge guards read typed fields (grammar 5.1).
+# a hope: every answer is parsed with it before any edge is evaluated, so
+# downstream nodes and edge guards read typed fields (grammar 5.1). The model is
+# *constrained* by as much of it as the provider's decoder compiles — a bound it
+# cannot, `max_length: 120` below among them, comes off the request and is
+# folded into that field's description instead, so the model is asked for it and
+# the parse is what still enforces it (`agent-compose docs models`).
 agent.summarizer:
   description: Summarize a document into a headline and a short abstract.
   model: model.smart

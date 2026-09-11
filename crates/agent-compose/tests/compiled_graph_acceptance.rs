@@ -4956,6 +4956,16 @@ fn an_answer_over_a_stripped_bound_fails_the_parse() {
 /// (`output_config: minimum is not supported.`) back to the ladder that memoizes
 /// a mechanism as absent from an endpoint that has it.
 ///
+/// …and a fourth, because that ambiguity is **two** wires' and the two spell it
+/// differently: Chat Completions asks for structured output with
+/// `response_format`, which ends on the same keyword with an underscore where
+/// Responses' path ends on it with a dot. It is also the wire a bare `Invalid
+/// parameter: format` is most likely to come from, so the caveat has to be
+/// derived from the punctuation a vendor actually joins a name with rather than
+/// from a path rule — read on both surfaces here, since a caveat silent on one of
+/// them would tell an operator flatly to edit a table row over a sentence that
+/// may be about a parameter.
+///
 /// `bounded-cycle`'s `write` node declares `retry: { max: 2 }`, which is what
 /// makes the *memo* observable: three attempts, and each one has to start on the
 /// native rung again. A remembered refusal would show up as the second attempt
@@ -5139,6 +5149,60 @@ fn a_schema_keyword_refusal_fails_the_call_without_laddering_or_remembering() {
     assert!(
         recorded.iter().all(|request| !request.was_unsupported()),
         "…nor to remember a mechanism as absent"
+    );
+
+    // …and the **other** OpenAI wire's spelling of the same ambiguity. Chat
+    // Completions asks with `response_format`, which ends on `format` across an
+    // underscore rather than a dot — so a caveat derived from a path separator
+    // alone would be silent exactly where a bare `Invalid parameter: format` is
+    // most likely to be a service talking about its own parameter. The
+    // classification is the same as everywhere else in this test; what is read
+    // here is that the sentence names the parameter on this wire too.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::raw(
+            400,
+            json!({
+                "error": {
+                    "message": "Invalid parameter: format",
+                    "type": "invalid_request_error",
+                },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`format` is a constraint keyword"),
+        "the keyword is read as this runtime's own repair on this wire as well: {failure}"
+    );
+    assert!(
+        failure.contains("`response_format`"),
+        "…and the caveat names *this* wire's parameter, which is spelled with the keyword across \
+         an underscore: {failure}"
+    );
+    assert!(
+        failure.contains("read the quoted body"),
+        "…so the operator is pointed at the body here too: {failure}"
+    );
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "…one request, on this wire too: nothing laddered over an ambiguous spelling"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and nothing was remembered as a mechanism this endpoint lacks"
     );
 }
 
