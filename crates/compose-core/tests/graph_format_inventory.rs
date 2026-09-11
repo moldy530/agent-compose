@@ -203,7 +203,6 @@ fn every_closed_vocabulary_is_written_out() {
             PolicyLevel::Node,
             PolicyLevel::Defaults,
             PolicyLevel::BuiltIn,
-            PolicyLevel::Exempt,
         ]
         .iter()
         .map(member)

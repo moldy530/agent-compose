@@ -92,7 +92,7 @@
             "join": "the map node's outgoing edges fire once every dispatched instance has completed or been resolved by `on_item_error`",
             "routes": [
               {
-                "node": "work/item",
+                "node": "work/(item)",
                 "default": false,
                 "target": "agent.worker",
                 "input": {
@@ -111,7 +111,7 @@
           }
         },
         {
-          "id": "work/item",
+          "id": "work/(item)",
           "kind": "agent",
           "binding": "agent.worker",
           "input": {
@@ -299,7 +299,7 @@
         },
         {
           "from": "work",
-          "to": "work/item",
+          "to": "work/(item)",
           "class": "map_route",
           "label": "each item"
         }

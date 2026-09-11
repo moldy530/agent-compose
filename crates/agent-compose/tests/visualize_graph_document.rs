@@ -247,7 +247,10 @@ fn the_map_draws_every_route_and_narrows_the_default() {
                 "tool.review_queue",
                 vec!["needs_human"]
             ),
-            ("dispatch/default", "tool.dead_letter", vec!["duplicate"]),
+            // The catch-all's satellite is spelled so that no variant tag can
+            // spell it: `default` is a legal tag (grammar §3.8) and a sibling
+            // key of `routes:` rather than a member of it.
+            ("dispatch/(default)", "tool.dead_letter", vec!["duplicate"]),
         ]
     );
     assert_eq!(

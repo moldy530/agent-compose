@@ -397,6 +397,12 @@ pub struct OnErrorView {
 }
 
 /// Which level of grammar 9.3's chain a resolved field came from.
+///
+/// The chain's fourth outcome — *exempt*, a `human` node's `timeout:` and
+/// `retry:`, which resolve at no level at all (Decision D102) — is not a member
+/// here: it never accompanies a value, and this document writes it as the key's
+/// **absence** rather than as a level (`docs/graph.md` §5.2). A member a
+/// document can never carry is a branch a consumer writes and never reaches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyLevel {
@@ -406,9 +412,6 @@ pub enum PolicyLevel {
     Defaults,
     /// Level 4: the built-in.
     BuiltIn,
-    /// Withheld from the chain entirely: a `human` node resolves no `timeout`
-    /// and no `retry` at any level (Decision D102).
-    Exempt,
 }
 
 /// An `agent:` node's resolved configuration.
@@ -781,32 +784,94 @@ pub enum EdgeClass {
 mod tests {
     use super::*;
 
+    /// Every kind of the document.
+    const KINDS: [NodeKind; 10] = [
+        NodeKind::Start,
+        NodeKind::End,
+        NodeKind::Agent,
+        NodeKind::Function,
+        NodeKind::Exec,
+        NodeKind::Http,
+        NodeKind::Human,
+        NodeKind::Store,
+        NodeKind::Flow,
+        NodeKind::Map,
+    ];
+
     /// Every kind has a badge, and no two share one: the badge is how a reader
     /// tells the kinds apart on the canvas, which is the content requirement
     /// PRD resolved q56 states.
     #[test]
     fn every_node_kind_has_its_own_badge() {
-        let kinds = [
-            NodeKind::Start,
-            NodeKind::End,
-            NodeKind::Agent,
-            NodeKind::Function,
-            NodeKind::Exec,
-            NodeKind::Http,
-            NodeKind::Human,
-            NodeKind::Store,
-            NodeKind::Flow,
-            NodeKind::Map,
-        ];
         let mut seen = std::collections::BTreeSet::new();
-        for kind in kinds {
+        for kind in KINDS {
             assert!(
                 seen.insert(kind.badge()),
                 "`{}` is two kinds' badge",
                 kind.badge()
             );
         }
-        assert_eq!(seen.len(), kinds.len());
+        assert_eq!(seen.len(), KINDS.len());
+    }
+
+    /// …and the page's own table names exactly those kinds, with those badges.
+    ///
+    /// The canvas draws `KIND[node.kind].label` out of an object literal in
+    /// `template.html`, so that table and this enumeration are two spellings of
+    /// one list — and the template **falls back**, `KIND[node.kind] ||
+    /// KIND.map`, so a kind the table had never heard of would be drawn with
+    /// the map's colour under the badge `MAP` rather than failing. Two kinds
+    /// collapsed into one is precisely the distinguishability PRD resolved q56
+    /// requires, and nothing else would notice, so the two sides are bound
+    /// here: adding a variant fails this test until the page learns to draw it.
+    #[test]
+    fn the_pages_kind_table_names_every_kind_and_badges_it_the_same() {
+        let table = kind_table();
+        let mut expected: Vec<(String, String)> = KINDS
+            .iter()
+            .map(|kind| (member(kind), kind.badge().to_string()))
+            .collect();
+        expected.sort();
+
+        let mut found: Vec<(String, String)> = table
+            .iter()
+            .map(|(key, label)| (key.clone(), label.clone()))
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found, expected,
+            "`template.html`'s `KIND` table and `NodeKind` disagree. The canvas draws \
+             `KIND[node.kind].label`, so a kind missing there is drawn as a `map`"
+        );
+    }
+
+    /// The `(key, label)` pairs of the page's `KIND` object literal.
+    fn kind_table() -> Vec<(String, String)> {
+        let template = crate::graph::TEMPLATE;
+        let from = template
+            .find("const KIND = {")
+            .expect("the page carries its kind table");
+        let rest = &template[from..];
+        let to = rest.find("};").expect("the table is closed");
+        rest[..to]
+            .lines()
+            .filter_map(|line| {
+                let (key, rest) = line.split_once(':')?;
+                let label = rest.split_once("label: \"")?.1.split_once('"')?.0;
+                Some((key.trim().to_string(), label.to_string()))
+            })
+            .collect()
+    }
+
+    /// The serde name of one kind — what the document actually carries, and
+    /// what the page indexes its table by.
+    fn member(kind: &NodeKind) -> String {
+        serde_json::to_value(kind)
+            .expect("a unit variant serializes")
+            .as_str()
+            .expect("as a string")
+            .to_string()
     }
 
     /// The version is the first key, so a consumer can dispatch on it before

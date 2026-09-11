@@ -188,9 +188,16 @@ path.edge.barrier { stroke-dasharray: 2 4; stroke-width: 1.2; }
 @media (max-width: 760px) {
   header { padding: 8px 12px; gap: 8px; }
   .legend, .hint { display: none; }
+  /* The pane becomes a sheet BELOW the canvas rather than an overlay over it.
+     An overlay would cover the drawing this file exists to show and there would
+     be nothing to dismiss it to: the pane is always populated — an empty
+     selection renders the flow overview — so it has no empty state to fall
+     back on. Stacking keeps both reachable at any width. */
+  main { flex-direction: column; }
+  #canvas { min-height: 0; }
   aside {
-    position: absolute; right: 0; top: 0; bottom: 0; width: min(380px, 94vw);
-    box-shadow: var(--shadow); z-index: 5;
+    width: auto; height: 46%; flex: none; padding: 12px 14px 20px;
+    border-left: none; border-top: 1px solid var(--line);
   }
 }
 @media (prefers-reduced-motion: no-preference) {
@@ -755,7 +762,7 @@ const DOC = {
                 }
               },
               {
-                "node": "dispatch/default",
+                "node": "dispatch/(default)",
                 "default": true,
                 "covers": [
                   "duplicate"
@@ -973,7 +980,7 @@ const DOC = {
           }
         },
         {
-          "id": "dispatch/default",
+          "id": "dispatch/(default)",
           "kind": "function",
           "binding": "tool.dead_letter",
           "description": "Record an unroutable finding for later inspection.",
@@ -1546,7 +1553,7 @@ const DOC = {
         },
         {
           "from": "dispatch",
-          "to": "dispatch/default",
+          "to": "dispatch/(default)",
           "class": "map_route",
           "label": "default"
         },
@@ -1774,7 +1781,9 @@ function refresh(id) {
     if (held.edge.from !== id && held.edge.to !== id) return;
     const geo = geometry(held.edge);
     held.path.setAttribute("d", geo.d);
-    if (held.label) held.label.setAttribute("transform", "translate(" + geo.mx + "," + geo.my + ")");
+    if (held.label) {
+      held.label.setAttribute("transform", "translate(" + geo.mx + "," + (geo.my + held.dy) + ")");
+    }
   });
   mapEls.forEach(entry => { if (entry.members.indexOf(id) >= 0) sizeBox(entry); });
 }
@@ -1807,6 +1816,13 @@ function clip(text, at) {
   return text.length > at ? text.slice(0, at - 1) + "…" : text;
 }
 
+/* What a satellite's route is called: its variant, `default` for the catch-all,
+   and `each item` for a homogeneous map, which routes by nothing and whose
+   single dispatch is neither. */
+function routeName(dispatch) {
+  return dispatch.variant || (dispatch.default ? "default" : "each item");
+}
+
 function renderFlow(address) {
   const flow = DOC.flows.filter(held => held.address === address)[0];
   if (!flow) return;
@@ -1821,8 +1837,17 @@ function renderFlow(address) {
   edgeEls = [];
   mapEls = [];
 
+  /* Four layers, painted in this order: the fan-out containers, the edges, the
+     nodes, and the edge labels LAST — a chip drawn under a node box is a
+     routing decision a reader cannot read, and every decision an execution
+     could take is supposed to be legible on the canvas (PRD resolved q56). */
+  const mapLayer = el("g", {}, view);
+  const edgeLayer = el("g", {}, view);
+  const nodeLayer = el("g", {}, view);
+  const labelLayer = el("g", {}, view);
+
   flow.nodes.filter(n => n.kind === "map").forEach(n => {
-    const group = el("g", { class: "mapbox" }, view);
+    const group = el("g", { class: "mapbox" }, mapLayer);
     const entry = {
       members: mapMembers(flow, n.id),
       rect: el("rect", { rx: 12 }, group),
@@ -1837,16 +1862,32 @@ function renderFlow(address) {
     sizeBox(entry);
   });
 
+  /* Two edges can join the same pair of nodes — a guarded edge and the
+     `on_timeout:` transfer beside it, an `else:` and an `on_error:` fallback —
+     and they share a midpoint, so their chips would land on top of each other.
+     Each pair's chips are fanned apart by the edge's index within the pair. */
+  const parallel = {};
+  flow.edges.forEach(edge => {
+    const key = edge.from + " " + edge.to;
+    parallel[key] = (parallel[key] || 0) + 1;
+  });
+  const placed = {};
+
   flow.edges.forEach(edge => {
     if (!current.byId[edge.from] || !current.byId[edge.to]) return;
+    const key = edge.from + " " + edge.to;
+    const at = placed[key] = (placed[key] || 0) + 1;
+    const dy = (at - 1 - (parallel[key] - 1) / 2) * 17;
     const geo = geometry(edge);
-    const path = el("path", { d: geo.d, class: edgeClass(edge), "marker-end": marker(edge) }, view);
+    const path = el("path", {
+      d: geo.d, class: edgeClass(edge), "marker-end": marker(edge)
+    }, edgeLayer);
     let label = null;
     if (edge.label) {
       label = el("g", {
         class: "elabel " + edge.class,
-        transform: "translate(" + geo.mx + "," + geo.my + ")"
-      }, view);
+        transform: "translate(" + geo.mx + "," + (geo.my + dy) + ")"
+      }, labelLayer);
       const text = el("text", { x: 0, y: 0, "text-anchor": "middle" }, label);
       text.textContent = clip(edge.label, 42) + (edge.max_iterations ? " ×" + edge.max_iterations : "");
       const box = text.getBBox();
@@ -1855,7 +1896,7 @@ function renderFlow(address) {
       });
       label.insertBefore(chip, text);
     }
-    edgeEls.push({ edge: edge, path: path, label: label });
+    edgeEls.push({ edge: edge, path: path, label: label, dy: dy });
   });
 
   laid.nodes.forEach(node => {
@@ -1867,7 +1908,7 @@ function renderFlow(address) {
       role: "button",
       "data-id": node.id,
       "aria-label": kind.label + " " + node.id
-    }, view);
+    }, nodeLayer);
     if (node.kind === "start" || node.kind === "end") {
       el("rect", { class: "pill", width: node.w, height: node.h, rx: node.h / 2 }, group);
       const text = el("text", {
@@ -1878,9 +1919,7 @@ function renderFlow(address) {
       el("rect", { class: "body", width: node.w, height: node.h, rx: 8 }, group);
       el("rect", { width: 4, height: node.h, rx: 2, fill: kind.color }, group);
       const badge = el("text", { class: "kind", x: 14, y: 18, fill: kind.color }, group);
-      const route = node.dispatch
-        ? "  ·  " + (node.dispatch.variant || "default")
-        : "";
+      const route = node.dispatch ? "  ·  " + routeName(node.dispatch) : "";
       badge.textContent = kind.label + route;
       const name = el("text", { class: "name", x: 14, y: 35 }, group);
       name.textContent = clip(node.id, 26);
@@ -1947,7 +1986,7 @@ function schema(held) {
   if (!list(held.fields).length) return note + '<p class="pane-sub">no fields</p>';
   return note + list(held.fields).map(field =>
     '<div class="row"><code>' + esc(field.name) + "</code><span class=\"note\">" +
-    esc(field.ty) + (field.description ? " — " + esc(field.description) : "") +
+    esc(field.type) + (field.description ? " — " + esc(field.description) : "") +
     "</span></div>").join("");
 }
 function policyRows(policy) {
@@ -2061,7 +2100,7 @@ function select(id) {
   let html =
     '<button class="pane-close" aria-label="Back to the flow overview" title="Back to the flow overview">&times;</button>' +
     '<div class="pane-kind" style="color:' + kind.color + '">' + esc(kind.label) +
-    (node.dispatch ? " · route " + esc(node.dispatch.variant || "default") : "") + "</div>" +
+    (node.dispatch ? " · route " + esc(routeName(node.dispatch)) : "") + "</div>" +
     '<div class="pane-addr">' + esc(node.id) + "</div>" +
     (node.binding ? '<div class="pane-sub mono">' + esc(node.binding) + "</div>" : "") +
     (node.description ? '<p class="desc">' + esc(node.description) + "</p>" : "");
@@ -2256,7 +2295,23 @@ LEGEND.forEach(entry => {
   legend.appendChild(span);
 });
 
-if (DOC.flows.length) renderFlow(DOC.flows[0].address);
+/* The flow a reader lands on.
+   `flows` is in address order (`docs/graph.md` §9.1), which is a fixed order
+   rather than an interesting one: a three-node subflow sorting first would be
+   the picture somebody pastes into a pull request. An execution arrives through
+   a trigger, so the flow the most triggers target is the composition's subject;
+   size breaks a tie, and the document's own order breaks that. Deterministic
+   either way — every reader of one file lands on the same tab. */
+function landing() {
+  return DOC.flows.reduce((best, flow) => {
+    const held = list(flow.triggers).length, mine = list(best.triggers).length;
+    if (held > mine) return flow;
+    if (held === mine && flow.nodes.length > best.nodes.length) return flow;
+    return best;
+  }, DOC.flows[0]);
+}
+
+if (DOC.flows.length) renderFlow(landing().address);
 else pane.innerHTML = '<p class="pane-sub">This composition declares no flows.</p>';
 </script>
 </body>

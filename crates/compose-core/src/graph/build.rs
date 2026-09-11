@@ -12,8 +12,13 @@
 //! A `map` additionally contributes one **satellite** per route: the dispatch
 //! target is where an item's work happens, and a canvas that drew the map alone
 //! would show a fan-out with nothing to fan out to. A satellite's id is
-//! `<map id>/<variant>` — a `/` is not legal in a node id (grammar 2.1), so it
-//! can collide with nothing the author wrote.
+//! `<map id>/<variant>` for a named route, and `<map id>/(default)` or
+//! `<map id>/(item)` for the two routes that have no variant tag. Neither `/`
+//! nor a parenthesis is legal in an identifier (grammar 2.1), so a satellite
+//! collides neither with a node the author wrote nor — and this is what the
+//! parentheses are for — with the satellite of a variant tagged `default`,
+//! which is a legal tag and a sibling key of `routes:` rather than a member
+//! of it (grammar 8.6).
 //!
 //! Edges are every transfer an execution could take, which is more than the
 //! `edges:` list:
@@ -202,7 +207,7 @@ fn graph_node(ir: &Ir, flow: &Flow, node: &Node) -> GraphNode {
                     retry: policy
                         .retry
                         .as_ref()
-                        .map(|retry| retry_view(retry, Level::Node)),
+                        .map(|retry| retry_view(retry, PolicyLevel::Node)),
                     timeout: policy
                         .timeout
                         .as_ref()
@@ -423,20 +428,28 @@ fn policy_view(ir: &Ir, node: &Node) -> PolicyView {
         retry: resolved
             .retry
             .0
-            .map(|retry| retry_view(retry, resolved.retry.1)),
-        timeout: resolved.timeout.0.map(|timeout| TimeoutView {
-            value: timeout.as_str().to_string(),
-            level: level(resolved.timeout.1),
-        }),
+            .zip(level(resolved.retry.1))
+            .map(|(retry, at)| retry_view(retry, at)),
+        timeout: resolved
+            .timeout
+            .0
+            .zip(level(resolved.timeout.1))
+            .map(|(timeout, at)| TimeoutView {
+                value: timeout.as_str().to_string(),
+                level: at,
+            }),
         on_error: OnErrorView {
             strategy,
             target,
-            level: level(resolved.on_error.1),
+            // `on_error:` has no exemption — every node resolves one, at one of
+            // the three levels (grammar 9.3) — so the bottom of the chain is
+            // the answer no branch here reaches.
+            level: level(resolved.on_error.1).unwrap_or(PolicyLevel::BuiltIn),
         },
     }
 }
 
-fn retry_view(retry: &Retry, at: Level) -> RetryView {
+fn retry_view(retry: &Retry, at: PolicyLevel) -> RetryView {
     RetryView {
         max: retry.max,
         backoff: retry.backoff.value.as_str().to_string(),
@@ -446,16 +459,22 @@ fn retry_view(retry: &Retry, at: Level) -> RetryView {
             .as_ref()
             .map(|held| held.value.as_str().to_string()),
         jitter: retry.jitter,
-        level: level(at),
+        level: at,
     }
 }
 
-const fn level(at: Level) -> PolicyLevel {
+/// The document's name for a level of grammar 9.3's chain.
+///
+/// `None` for the exemption a `human` node's `timeout:` and `retry:` carry
+/// (Decision D102): it pairs only with a value that is absent, and this
+/// document writes the exemption as the key's absence rather than as a level of
+/// its own (`docs/graph.md` §5.2, §5.7).
+const fn level(at: Level) -> Option<PolicyLevel> {
     match at {
-        Level::Node => PolicyLevel::Node,
-        Level::Defaults => PolicyLevel::Defaults,
-        Level::BuiltIn => PolicyLevel::BuiltIn,
-        Level::Exempt => PolicyLevel::Exempt,
+        Level::Node => Some(PolicyLevel::Node),
+        Level::Defaults => Some(PolicyLevel::Defaults),
+        Level::BuiltIn => Some(PolicyLevel::BuiltIn),
+        Level::Exempt => None,
     }
 }
 
@@ -1032,7 +1051,7 @@ fn routes<'ir>(ir: &Ir, flow: &Flow, id: &str, map: &'ir Map) -> Vec<Route<'ir>>
             writes,
             detach,
         } => vec![Route {
-            id: format!("{id}/item"),
+            id: format!("{id}/(item)"),
             variant: None,
             default: false,
             covers: Vec::new(),
@@ -1071,7 +1090,11 @@ fn routes<'ir>(ir: &Ir, flow: &Flow, id: &str, map: &'ir Map) -> Vec<Route<'ir>>
                     .into_iter()
                     .filter(|variant| !named.contains(variant))
                     .collect();
-                held.push(route_of(id, "default", None, true, covers, route));
+                // `(default)` rather than `default`: a variant tag is an
+                // identifier (grammar 3.8), so a union may declare one spelled
+                // `default`, and a satellite id the author's tag can also spell
+                // would collide with it.
+                held.push(route_of(id, "(default)", None, true, covers, route));
             }
             held
         }
@@ -1158,7 +1181,7 @@ fn item_error_view(on_item_error: &ItemError) -> ItemErrorView {
             strategy: "retry".to_string(),
             // Carried inline: there is no chain for a per-item `retry` to
             // inherit a bound from (grammar 8.6 rule 10).
-            retry: Some(retry_view(retry, Level::Node)),
+            retry: Some(retry_view(retry, PolicyLevel::Node)),
         },
     }
 }

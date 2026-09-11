@@ -153,6 +153,14 @@ globalThis.localStorage = {
 /// The paths a reader takes, in the order they take them — which is what makes
 /// a `TypeError` in one node's pane a failure here rather than a blank side
 /// panel in somebody's browser.
+///
+/// Opening every pane catches the renderer that **throws**. It does not catch
+/// the renderer that quietly renders nothing, because every value in a pane
+/// goes through `esc()`, which answers `""` for `undefined` — so a key read
+/// under the wrong name comes out as empty markup and a pane full of facts and
+/// a pane full of blanks are the same length. That is the second half, `FACTS`:
+/// named nodes, and resolved facts a reader must be able to find in their
+/// panes. A key that stops arriving fails here instead of shipping.
 const EXERCISE: &str = r#"
 let panes = 0;
 for (const flow of DOC.flows) {
@@ -170,8 +178,180 @@ for (const flow of DOC.flows) {
   fit();
 }
 if (panes < 3) throw new Error("the harness selected nothing");
+
+let facts = 0;
+for (const held of FACTS) {
+  renderFlow(held[0]);
+  const where = "`" + held[0] + "`.`" + held[1] + "`";
+  if (!current.byId[held[1]]) throw new Error(where + " is not a node of that flow");
+  select(held[1]);
+  for (const fact of held[2]) {
+    if (pane.innerHTML.indexOf(fact) < 0) {
+      throw new Error(where + "'s pane does not carry `" + fact + "`:\n" + pane.innerHTML);
+    }
+    facts += 1;
+  }
+}
 console.log("panes=" + panes);
+console.log("facts=" + facts);
 "#;
+
+/// One pane, and resolved facts a reader must find in it.
+///
+/// Every string is asserted against the pane's markup as the page writes it, so
+/// what is pinned is the whole path — the compiler resolved it, the document
+/// carried it under the name the template reads, and the template printed it.
+struct Pane {
+    /// The flow to render first.
+    flow: &'static str,
+    /// The node to select.
+    node: &'static str,
+    /// Text the pane must contain, HTML-escaped as `esc` leaves it.
+    facts: &'static [&'static str],
+}
+
+/// The panes checked for each project, chosen for the facts that are hardest to
+/// notice going missing: a resolution that happens in the compiler and appears
+/// nowhere else.
+fn panes(project: &str) -> &'static [Pane] {
+    match project {
+        "examples/triage-fanout" => &[
+            // The model resolved through to its provider, the store tool
+            // grammar 11.5 synthesizes, the policy level, and a summarized
+            // union — the four the pane is the only place a reader meets.
+            Pane {
+                flow: "flow.triage",
+                node: "classify",
+                facts: &[
+                    "model.smart",
+                    "claude-sonnet-4-6",
+                    "provider.anthropic (anthropic)",
+                    "docs_search",
+                    "synthesized from store.docs",
+                    "union on kind [auto_fixable, needs_human, duplicate]",
+                    "(max_items 50)",
+                    "90s  (defaults)",
+                ],
+            },
+            // The wait, its transfer, and the channel its answer is remapped
+            // onto.
+            Pane {
+                flow: "flow.triage",
+                node: "approve",
+                facts: &[
+                    "24h",
+                    "on_timeout",
+                    "→ escalate",
+                    "enum [approve, reject]",
+                    "→ state.human_decision",
+                ],
+            },
+            // The fan-out: both bounds, the per-item policy, and the narrowing
+            // of the catch-all.
+            Pane {
+                flow: "flow.triage",
+                node: "dispatch",
+                facts: &[
+                    "classify.output.findings",
+                    "routed",
+                    "retry (max 2, backoff 2s)",
+                    "≤ 4 concurrent",
+                    "→ tool.dead_letter · narrowed to duplicate",
+                    "skip  (node)",
+                ],
+            },
+            // A satellite, which is the only node whose configuration comes
+            // from a route rather than from a `nodes:` entry.
+            Pane {
+                flow: "flow.triage",
+                node: "dispatch/(default)",
+                facts: &["tool.dead_letter", "the catch-all route", "duplicate"],
+            },
+            // The fallback target, and an `${ENV}` reference left as written.
+            Pane {
+                flow: "flow.triage",
+                node: "announce",
+                facts: &[
+                    "https://${QUEUE_HOST}/v1/triage-started",
+                    "fallback → announce_failed",
+                ],
+            },
+            // The boundary of the subgraph, and the policy inside the instance.
+            Pane {
+                flow: "flow.triage",
+                node: "enrich",
+                facts: &["flow.enrich", "isolated", "30s"],
+            },
+        ],
+        "examples/review-loop" => &[
+            // A failover route rather than a direct model: the conditions and
+            // every member, in failover order.
+            Pane {
+                flow: "flow.review_loop",
+                node: "write",
+                facts: &[
+                    "model.default",
+                    "on rate_limit, overloaded, timeout",
+                    "↳ model.smart",
+                    "↳ model.fast",
+                    "claude-haiku-4-5",
+                    "web_search",
+                    "max 2, backoff 5s  (node)",
+                ],
+            },
+            // The bounded cycle and the two edges that leave the loop.
+            Pane {
+                flow: "flow.review_loop",
+                node: "review",
+                facts: &[
+                    "when review.output.verdict == 'revise'",
+                    "max_iterations 3",
+                    "else",
+                    "on_error: fallback",
+                ],
+            },
+        ],
+        "crates/compose-core/tests/projects/omitted-graph-keys" => &[
+            // The shapes nothing is declared on: a homogeneous fan-out, a
+            // policy resolved at the built-in, and a wait with no budget.
+            Pane {
+                flow: "flow.bare",
+                node: "work",
+                facts: &[
+                    "homogeneous",
+                    "every item",
+                    "→ agent.worker",
+                    "fail  (built_in)",
+                ],
+            },
+            Pane {
+                flow: "flow.bare",
+                node: "work/(item)",
+                facts: &["agent.worker", "one unnamed string"],
+            },
+            Pane {
+                flow: "flow.bare",
+                node: "sign_off",
+                facts: &["unbounded"],
+            },
+        ],
+        _ => &[],
+    }
+}
+
+/// The `FACTS` table the harness reads, as a JavaScript literal.
+fn facts_of(project: &str) -> String {
+    let mut held = String::from("const FACTS = [\n");
+    for pane in panes(project) {
+        held.push_str(&format!("  [{:?}, {:?}, [", pane.flow, pane.node));
+        for fact in pane.facts {
+            held.push_str(&format!("{fact:?}, "));
+        }
+        held.push_str("]],\n");
+    }
+    held.push_str("];\n");
+    held
+}
 
 /// Run one page's script under Bun with `storage`, and answer what it printed.
 fn exercise(project: &str, storage: &str) -> String {
@@ -188,7 +368,11 @@ fn exercise(project: &str, storage: &str) -> String {
     let harness = directory.join("harness.js");
     fs::write(
         &harness,
-        format!("{DOM}\n{storage}\n{}\n{EXERCISE}\n", script(&page(project))),
+        format!(
+            "{DOM}\n{storage}\n{}\n{}\n{EXERCISE}\n",
+            script(&page(project)),
+            facts_of(project)
+        ),
     )
     .expect("the harness is writable");
 
@@ -203,7 +387,18 @@ fn exercise(project: &str, storage: &str) -> String {
     stdout
 }
 
-/// Every node of every flow opens a detail pane without throwing.
+/// One count the harness printed.
+fn counted(printed: &str, what: &str) -> usize {
+    printed
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(what))
+        .unwrap_or_else(|| panic!("the harness prints `{what}`: {printed}"))
+        .parse()
+        .expect("a count")
+}
+
+/// Every node of every flow opens a detail pane without throwing, and the panes
+/// a reader reads carry the facts the compiler resolved.
 ///
 /// The third project is the one that matters most and is a fixture rather than
 /// an example: `omitted-graph-keys` is written to leave every optional array
@@ -220,15 +415,20 @@ fn every_node_of_every_flow_opens_its_pane() {
         if printed.is_empty() {
             return; // Bun is absent and this is not CI; `toolchain` said so.
         }
-        let panes: usize = printed
-            .trim()
-            .strip_prefix("panes=")
-            .expect("the harness counts the panes it opened")
-            .parse()
-            .expect("a count");
+        let panes = counted(&printed, "panes=");
         assert!(
             panes >= 3,
             "`{project}` has more nodes than {panes} on its canvases"
+        );
+        let facts = counted(&printed, "facts=");
+        let expected: usize = self::panes(project)
+            .iter()
+            .map(|pane| pane.facts.len())
+            .sum();
+        assert!(expected > 0, "`{project}` names no pane to read");
+        assert_eq!(
+            facts, expected,
+            "`{project}`'s harness checked {facts} facts of {expected}"
         );
     }
 }
@@ -247,7 +447,7 @@ fn the_page_renders_where_storage_refuses_every_call() {
         return;
     }
     assert!(
-        printed.starts_with("panes="),
+        counted(&printed, "panes=") >= 3,
         "the page still opened its panes: {printed}"
     );
 }

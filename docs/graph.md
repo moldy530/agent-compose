@@ -184,9 +184,14 @@ Four small records the rest of the document is built from.
   §7.2). Both are always present;
 * **a satellite**, one per route of a `map`. The dispatch target is where an
   item's work happens, so it is drawn: a fan-out with nothing to fan out to is
-  not a picture of a fan-out. A satellite's `id` is `<map id>/<variant>`,
-  `<map id>/default`, or `<map id>/item` — a `/` is not legal in a node id
-  (grammar §2.1), so a satellite can collide with nothing an author wrote.
+  not a picture of a fan-out. A satellite's `id` is `<map id>/<variant>` for a
+  named route, and `<map id>/(default)` or `<map id>/(item)` for the two routes
+  that carry no variant tag. Neither `/` nor a parenthesis is legal in an
+  identifier (grammar §2.1), so a satellite collides with nothing an author
+  wrote — and, because the two tagless spellings are parenthesized, with no
+  sibling satellite either: a union may declare a variant tagged `default`,
+  which is a legal tag and a sibling key of `routes:` rather than a member of
+  it (grammar §8.6).
 
 | field | type | presence | meaning |
 |---|---|---|---|
@@ -239,9 +244,14 @@ second.
 | `timeout` | `TimeoutView` | when the chain resolves to one | `value`, plus `level`. |
 | `on_error` | `OnErrorView` | always | `strategy` — `"fail"`, `"skip"` or `"fallback"` — plus `target` on a fallback (a node id, or `end`), plus `level`. Always present: the built-in is `fail` (grammar §9.2). |
 
-`level` is `"node"`, `"defaults"`, `"built_in"`, or `"exempt"` — the chain's
-levels 2, 3 and 4, and the exemption Decision D102 gives a `human` node's
-`timeout` and `retry` at every level.
+`level` is `"node"`, `"defaults"` or `"built_in"` — the chain's levels 2, 3
+and 4. The chain has a fourth outcome, the exemption Decision D102 gives a
+`human` node's `timeout:` and `retry:` at every level, and it is **not** a
+`level` a reader ever meets: an exempt field resolves to no value, so this
+document writes the exemption as the **absence** of the `retry` or `timeout`
+key. `examples/triage-fanout`'s `approve` is the worked case — its `policy`
+carries `on_error` alone — and [`HumanView`](#57-a-wait) is where the wait's own
+budget is written down instead.
 
 ### 5.3 Schemas
 
@@ -510,7 +520,7 @@ document embedded in the page — because they are one document.
 
 ### 9.4 How the two are held together
 
-The version number alone is a promise; five tests make it a checkable one:
+The version number alone is a promise; six tests make it a checkable one:
 
 * `crates/compose-core/tests/graph_format_inventory.rs` reads this document and
   the emitted one and fails when their top-level fields differ, when a record
@@ -521,6 +531,11 @@ The version number alone is a promise; five tests make it a checkable one:
   inventory over `examples/triage-fanout`: the conditional edges with their CEL,
   the `on_error:` fallback, the `on_timeout:` transfer, all three map routes
   with their narrowing, the synthesized store tool, and the model resolution.
+* `crates/compose-core/tests/graph_document_invariants.rs` checks §9.1's
+  structural promises — `id` unique within a flow, every `from` and `to` a node
+  that flow holds, a `map_route` edge arriving at its own route's satellite —
+  over a corpus that includes the composition those promises are hardest on: a
+  union with a variant tagged `default` beside a catch-all `default:` route.
 * `crates/compose-core/tests/graph_artifact_goldens.rs` commits the emitted
   bytes for two example projects, so a change to the document or to the template
   is a reviewable diff rather than a discovery made by a reader (PRD §9.15).

@@ -516,7 +516,7 @@
                 }
               },
               {
-                "node": "dispatch/default",
+                "node": "dispatch/(default)",
                 "default": true,
                 "covers": [
                   "duplicate"
@@ -734,7 +734,7 @@
           }
         },
         {
-          "id": "dispatch/default",
+          "id": "dispatch/(default)",
           "kind": "function",
           "binding": "tool.dead_letter",
           "description": "Record an unroutable finding for later inspection.",
@@ -1307,7 +1307,7 @@
         },
         {
           "from": "dispatch",
-          "to": "dispatch/default",
+          "to": "dispatch/(default)",
           "class": "map_route",
           "label": "default"
         },
