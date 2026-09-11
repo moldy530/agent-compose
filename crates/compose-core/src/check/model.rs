@@ -1004,8 +1004,13 @@ fn partial_object(properties: FieldMap, span: &Span) -> TypeNode {
 ///
 /// Written here beside [`store_tool_input`] for the same reason: both are tool
 /// surfaces the composition does not spell out, and both have to be one field
-/// map, so that the JSON the model is constrained by and the Zod the arguments
-/// are parsed with stay one document (PRD §9.16).
+/// map, so that the JSON the model is asked for and the Zod the arguments are
+/// parsed with are emitted from one document (PRD §9.16). *Emitted* from one:
+/// what a request carries is the runtime's business, and on the one wire that
+/// declares `strict` over a function's `parameters` it is that document lowered
+/// to the keywords the decoder compiles (PRD §9 resolved q55, and
+/// `codegen::runtime`'s divergence ledger). The parse is unchanged either way,
+/// which is the whole of why one field map is the requirement here.
 ///
 /// The parameter **names** are the ones Anthropic's text-editor and bash tools
 /// carry, because on the Messages wire these go out as those provider-defined

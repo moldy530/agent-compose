@@ -1010,11 +1010,22 @@ const DEFAULT_BUILTIN_TIMEOUT_MILLIS: u128 = 120_000;
 /// parameter schema.
 ///
 /// The parameter schema is emitted twice, and the two columns are the same
-/// document: the JSON below is what constrains the model, and the emitted Zod
+/// document: the JSON below is what the model is asked for, and the emitted Zod
 /// beside it is what the arguments are parsed with, which is the constrain ==
-/// parse equality PRD §9.16 makes structured output load-bearing for. A flow
-/// with no `inputs:` is a no-argument tool: no field map is written anywhere, so
-/// there is no schema to name and the instance starts on an empty object.
+/// parse equality PRD §9.16 makes structured output load-bearing for. What is
+/// *emitted* is one document; what reaches a wire need not be, and the
+/// difference is a runtime's rather than this emitter's: on a wire that declares
+/// `strict` over a function's `parameters` — the Responses wire is the one —
+/// `codegen::runtime`'s lowering takes the constraint keywords that decoder
+/// cannot compile off the request and folds them into their node's
+/// `description` (PRD §9 resolved q55, the
+/// `a-constraint-keyword-the-decoder-cannot-compile` row of that module's
+/// divergence ledger). The parse is unchanged and stays the contract, so an
+/// argument over a lowered bound is refused here exactly as any other bad one
+/// is — which is why a codegen-side assertion that the two columns are identical
+/// *on the wire* would be asserting something q55 withdrew. A flow with no
+/// `inputs:` is a no-argument tool: no field map is written anywhere, so there is
+/// no schema to name and the instance starts on an empty object.
 ///
 /// What an attachment becomes is a **tool**, unconditionally — never a source
 /// comment, and never an entry the emitter skips. This is the attachment where
@@ -1242,11 +1253,13 @@ fn builtin_tool(
 /// `agent_access:` — so a store declared `read` offers its reading ops and not
 /// its writing one, which is the least-privilege knob Decision D37 adds and PRD
 /// §9.13 accepts. The arguments are parsed against the emitted Zod for the tool's
-/// own surface before the store sees them, which is the same schema the JSON
-/// column below constrains the model with: constrain == parse, exactly as for an
-/// agent's own output (PRD §9.16). Through `runtime.parseToolArguments`, so a
-/// refusal returns to the model like every other tool surface's (Decision D119);
-/// a *backend* that then fails is the store's own failure and fails the node.
+/// own surface before the store sees them, which is the emitted twin of the JSON
+/// column below: constrain == parse, exactly as for an agent's own output, and
+/// lowered on the wire exactly as one too where a decoder cannot compile a
+/// keyword (PRD §9.16 as amended by resolved q55). Through
+/// `runtime.parseToolArguments`, so a refusal returns to the model like every
+/// other tool surface's (Decision D119); a *backend* that then fails is the
+/// store's own failure and fails the node.
 ///
 /// They are **appended** to the declared tools rather than merged into them, so
 /// a transcript reads in the order the composition declares: `tools:` first,

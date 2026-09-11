@@ -34,6 +34,11 @@
 //!   conversation ending on an assistant turn, which is the shape strict
 //!   Anthropic-compatible gateways refuse and `api.anthropic.com` happens to
 //!   tolerate (PRD §9 resolved q52, and both mechanisms of resolved q53);
+//! * the **schema subset** `output_config`'s format compiles (PRD §9 resolved
+//!   q55): a structured-output schema carrying a constraint keyword that decoder
+//!   does not take — array-length, numeric, string-length — is refused naming
+//!   the keyword and the path it sits on, which is what holds the generated
+//!   runtime's per-(wire, mechanism) lowering to the wire it is a lowering of;
 //! * the **required envelope** — `model`, `messages`, `max_tokens`, the
 //!   `anthropic-version` header, and a JSON content type. Not the *presence* of
 //!   `x-api-key`: a keyless provider behind a gateway is a legal composition and
@@ -52,9 +57,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Map, Value, json};
 
 use crate::control::{
-    Failure, Outcome, Reply, ReplyBody, StructuredOutput, ValidationFailure, canonical, estimate,
-    request_id,
+    Failure, Outcome, Reply, ReplyBody, StructuredOutput, Surface, ValidationFailure, canonical,
+    estimate, request_id,
 };
+use crate::lowering;
 use crate::strict::{Checker, Dialect, Kind, at, listed};
 use crate::wire::{Answer, HARNESS_STATUS, INVALID, MISMATCH, Response, UNSCRIPTED, UNSUPPORTED};
 
@@ -153,6 +159,7 @@ pub(crate) fn parse(headers: &BTreeMap<String, String>, body: Option<&Value>) ->
             Some(StructuredOutput::ForcedTool { name, schema })
         })
         .or(format);
+    check_schema_subset(&mut checker, body, structured_output.as_ref());
 
     Parsed {
         model,
@@ -627,12 +634,17 @@ fn check_prefill(checker: &mut Checker, body: &Map<String, Value>) {
 /// text and has no call to name; a `name` beside it is a key this server has
 /// never seen the API take.
 ///
-/// What is **not** checked is whether the schema is closed enough for the
+/// What is **not** checked here is whether the schema is closed enough for the
 /// service's decoder to compile. `WIRE-NOTES` (26) records that as an
 /// unconfirmed assumption with what would settle it: the generated runtime never
 /// sends a schema it believes this format would refuse — it starts such an agent
 /// on the forced tool instead — so a check here would be this server asserting a
 /// rule it cannot confirm against a request that never arrives.
+///
+/// What **is** checked, one step later in [`parse`], is which JSON Schema
+/// *keywords* the format compiles at all ([`check_schema_subset`], PRD §9
+/// resolved q55): that one the runtime does send, on every composition, because
+/// grammar D10 requires `max_items` on every result-schema array.
 fn check_output_config(
     checker: &mut Checker,
     body: &Map<String, Value>,
@@ -658,6 +670,60 @@ fn check_output_config(
     Some(StructuredOutput::OutputConfig {
         schema: Value::Object(schema.clone()),
     })
+}
+
+/// The **subset** this surface's structured-output decoder compiles (PRD §9
+/// resolved q55).
+///
+/// `output_config`'s format is a schema *compiler*, and it compiles less than
+/// the schema language: array-length, numeric and string-length constraints are
+/// outside it, and grammar D10 makes `max_items` REQUIRED on every result-schema
+/// array — so a compiled graph that sent its schema whole drew a 400 here on
+/// nearly every composition. The generated runtime lowers the schema per (wire,
+/// mechanism) before the request, and this is the half that proves it: an
+/// under-lowered schema is refused, in this surface's own dialect, naming the
+/// keyword and the path it sits on.
+///
+/// The **forced-tool** rung is deliberately not held to it. Its row in
+/// [`crate::lowering::enforced`] is empty because a schema rides there as an
+/// ordinary tool's `input_schema`, which this API takes whole — and this
+/// function asks the table rather than the mechanism, so the empty row is a
+/// claim the suite can fail on rather than a branch nobody reads.
+///
+/// This is what `WIRE-NOTES` (26) said could not be checked, now checked for the
+/// half that is decidable: what the format's decoder *takes*, rather than
+/// whether a schema is closed enough for it.
+fn check_schema_subset(
+    checker: &mut Checker,
+    body: &Map<String, Value>,
+    asked: Option<&StructuredOutput>,
+) {
+    let (pointer, subject) = match asked {
+        Some(StructuredOutput::OutputConfig { .. }) => (
+            "output_config.format.schema".to_string(),
+            "output_config".to_string(),
+        ),
+        Some(StructuredOutput::ForcedTool { name, .. }) => {
+            let index =
+                lowering::tool_index(body, name, |tool| tool.get("name").and_then(Value::as_str))
+                    .unwrap_or_default();
+            (
+                at(&at("tools", index), "input_schema"),
+                format!("tool '{name}'"),
+            )
+        }
+        _ => return,
+    };
+    let Some(asked) = asked else { return };
+    lowering::check_schema(
+        checker,
+        Dialect::Anthropic,
+        Surface::Anthropic,
+        asked.mechanism(),
+        &pointer,
+        &subject,
+        asked.schema(),
+    );
 }
 
 /// The schema a named tool declares.

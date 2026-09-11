@@ -107,6 +107,8 @@
 
 pub mod client;
 mod control;
+/// What each structured-output decoder refuses to compile (PRD §9 resolved q55).
+pub mod lowering;
 mod strict;
 mod wire;
 

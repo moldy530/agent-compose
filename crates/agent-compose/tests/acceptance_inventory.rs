@@ -394,6 +394,74 @@ const CODEGEN: &[Criterion] = &[
                 "the_responses_wire_ladders_to_a_forced_function",
                 Status::Live,
             ),
+            // …and **what schema** that call carries, which PRD §9 resolved q55
+            // makes a property of the (wire, mechanism) rather than of the
+            // composition: a decoder compiles a subset of JSON Schema, grammar
+            // D10 puts `max_items` on every result-schema array, and the subset
+            // excludes it — so the schema is lowered to what the decoder takes
+            // and each stripped bound is folded into its node's `description`.
+            // A row per thing that can be wrong independently: what reaches the
+            // wire on each of the three (and the mock refuses an under-lowered
+            // one, so the run is the proof), what happens to an answer that
+            // overruns a bound nothing on the wire is enforcing any more, and
+            // the refusal that means the table itself is wrong — which must
+            // fail loudly rather than ladder, because laddering would remember
+            // a mechanism as absent from an endpoint that has it.
+            (
+                "an_array_bearing_output_rides_each_wires_native_rung_lowered",
+                Status::Live,
+            ),
+            (
+                "an_answer_over_a_stripped_bound_fails_the_parse",
+                Status::Live,
+            ),
+            (
+                "a_schema_keyword_refusal_fails_the_call_without_laddering_or_remembering",
+                Status::Live,
+            ),
+            // …and the two schemas a row is otherwise proven over only where
+            // nothing is bounded: the pinned one on the **other** rung, and an
+            // agent's **own tool**, whose `input:` may carry the same keywords
+            // and which the Responses wire declares `strict` on.
+            (
+                "the_forced_function_rung_carries_the_lowered_schema_too",
+                Status::Live,
+            ),
+            (
+                "a_client_tools_schema_is_lowered_where_its_wire_declares_strict",
+                Status::Live,
+            ),
+            // …and that second schema's own refusal, which arrives on a call
+            // that pinned nothing: the same table row, the same repair, and so
+            // the same diagnostic rather than a bare 400 whose wording depends
+            // on which call of the tool loop the model stopped at. The wires
+            // that lower no client tool at all are the second row: there the
+            // repair is *not* a table row, and a diagnostic naming one would
+            // send an operator to an edit that cannot change what went out.
+            (
+                "a_schema_keyword_refusal_on_a_loop_call_names_the_tools_own_table",
+                Status::Live,
+            ),
+            (
+                "a_schema_keyword_refusal_on_a_wire_that_sends_a_tool_whole_names_no_row",
+                Status::Live,
+            ),
+            // …and the same refusal one call later, on the **pinned** request,
+            // which carries both documents at once: the repair named there has
+            // to be the one that governs the document the endpoint refused,
+            // rather than the pinned schema's row whichever schema drew it.
+            (
+                "a_schema_keyword_refusal_on_a_pinned_call_names_the_tool_that_declares_it",
+                Status::Live,
+            ),
+            // …and the evidence all of them lean on: a wire refusing a schema
+            // reports every offending node at once, so a diagnostic that quoted
+            // only as much of the body as a trace line wants would hide the
+            // second and third keywords behind a round trip each.
+            (
+                "a_schema_keyword_refusal_quotes_the_endpoints_whole_answer",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).

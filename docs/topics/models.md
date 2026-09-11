@@ -426,6 +426,49 @@ are not permitted"}`. What decides the ladder is the complaint that arrived, not
 the name in front of it, so a proxied deployment ladders exactly as a direct one
 does.
 
+**What the schema looks like when it gets there is not always what you wrote.**
+A structured-output parameter is a schema *compiler*, and each one compiles a
+subset of JSON Schema — a subset that excludes the bounds this grammar requires.
+`max_items` is REQUIRED on every array inside an `output:` (that is what bounds
+`over:` fan-out), and the Messages wire's `output_config` format compiles no
+array-length, numeric or string-length constraint at all. So the runtime
+**lowers** the schema per wire and mechanism: the keywords that decoder cannot
+compile come off the request, and each one is folded into that field's
+`description`, where the model still reads it.
+
+| wire / mechanism | taken off the request |
+|---|---|
+| Messages, `output_config` | `maxItems`, `minItems`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`, `maxLength` |
+| Messages, forced tool | nothing — the schema rides as a tool's `input_schema`, whole |
+| Chat Completions and Responses, either mechanism | `maxItems`, `minItems`, `uniqueItems`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `minLength`, `maxLength` |
+
+A tool's own `input:` is lowered the same way wherever the wire compiles it —
+that is the Responses wire, which declares `strict` on each function it is given.
+Nothing else about a tool changes, and a tool on the other two wires is sent
+whole.
+
+What an author meets is the description. A field written as
+
+```yaml
+notes: { type: array, max_items: 8, items: { type: string }, description: Side notes. }
+```
+
+reaches an Anthropic model as `{"type": "array", "items": {"type": "string"},
+"description": "Side notes. At most 8 items."}` — your words, then the bound, in
+that order, with a full stop between them if your own words did not end in one.
+Nothing else changes: no field is renamed, no type is rewritten, and a keyword
+the decoder *can* compile stays on the wire.
+
+**The bound still binds.** The emitted parse checks the whole schema, lowering
+and all, so an answer with nine notes fails the node with the same "did not match
+its schema" error any other bad answer gets — it is never truncated to fit. What
+lowering costs is that the model was *asked* rather than *forced*, on that one
+bound; what it buys is that the request is one the endpoint will take at all.
+
+There is nothing to configure and no YAML for it. If a provider starts compiling
+a keyword it used to refuse, that is a table in the runtime, not a change to your
+composition.
+
 One thing decides the order before any of that, and it is a property of the agent
 rather than of the endpoint — but only on the **Messages** wire. `output_config`
 constrains a decoder over a **closed** schema and refuses one that is not, so an
@@ -458,11 +501,27 @@ request**, such as `output_config` beside a `settings:` key this model will not
 take it with, are refusals about something other than the mechanism, and each
 behaves exactly as it always has. The last of those is the one worth knowing
 about, because it is the only refusal here that *does* name something in your
-composition to change: you get the endpoint's own sentence, and it names the key. Including for `route_on:`, which is untouched: the
+composition to change: you get the endpoint's own sentence, and it names the key.
+Including for `route_on:`, which is untouched: the
 mechanism ladder is *inside* one call to one route member, so a condition the
 working rung answers with is the route's to act on as it always was, and a route
 still fails over only on grammar 12.2's infrastructure conditions — which the
 double refusal below is not.
+
+The schema refusal worth spelling out is a 400 that names one of the **lowered
+keywords** above. After lowering it can only mean one thing: the runtime sent a
+schema carrying a keyword this decoder cannot compile — a row missing from the
+table above, or a document no table lowers at all. So it fails the call loudly,
+with the endpoint's whole answer quoted and the keyword named, rather than trying
+the other mechanism — laddering there would send the same schema again, be
+refused for the same reason, and leave a mechanism the endpoint does have
+remembered as absent. The answer is quoted in full because a wire refusing a
+schema names *every* node it objected to, and because a request can carry more
+than one schema: the agent's output schema and the agent's own tools go out
+together, so the message names the documents the keyword could have come from and
+the repair each one has, and the path in the quoted body is what tells them
+apart. There is nothing to change in your composition when you see one; it is a
+bug report about the runtime.
 
 **Where to see it.** Each model call's trace record carries `outputMechanism` —
 `"native"` or `"forced_tool"` — on the one call per agent node that asks for the

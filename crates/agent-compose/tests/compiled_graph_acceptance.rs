@@ -3686,6 +3686,27 @@ fn a_capability_refusal_ladders_in_the_other_wordings_a_gateway_sends() {
         json!({ "verdict": "revise", "feedback": "one more pass" }),
         "revise",
     );
+    // …and the one PRD §9 resolved q55's ruling d could have taken away. Two of
+    // the keywords its tables strip — `minimum` and `maximum` — are ordinary
+    // English words, and a capability refusal is free to use one on its way to
+    // saying the endpoint lacks the parameter. Read as a schema complaint this
+    // would stop laddering and fail a run the forced tool serves, so the
+    // recognizer holds a word-shaped keyword to being *named as one* the way
+    // `text` is held on the Responses wire.
+    ladders(
+        "agent-anthropic",
+        SONNET,
+        "a capability refusal that uses `minimum` as a word",
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "output_config is not supported on this API version. The minimum version for structured outputs is 2025-11-13.",
+            },
+        }),
+        json!({ "verdict": "approve", "feedback": "" }),
+        "approve",
+    );
 }
 
 /// …and a refusal a **gateway relayed** ladders on the complaint it relayed,
@@ -4696,6 +4717,1027 @@ fn the_responses_wire_ladders_to_a_forced_function() {
         run.entries("ask")[0]
     );
     assert!(provider.snapshot().is_drained());
+}
+
+/// An array-bearing output schema rides every wire's **native** rung, lowered to
+/// what that decoder compiles (PRD §9 resolved q55, rulings a and b).
+///
+/// The regression the whole ruling is about, on all three wires at once. Grammar
+/// D10 makes `max_items` REQUIRED on every array inside a result schema and §3.5
+/// sends it as `maxItems`, which no native structured-output decoder compiles —
+/// so before lowering, `agent.tallier`'s schema was a 400 on the rung resolved
+/// q53 prefers, on every wire, for every composition with an array in its
+/// `output:`. Which is nearly all of them.
+///
+/// What makes this a proof rather than an exercise is the **mock**: each surface
+/// enforces the subset its decoder compiles (`WIRE-NOTES` (28)), so an
+/// under-lowered schema is a refused request and a failed run rather than a
+/// green suite and somebody's first live call. `is_valid()` below is therefore
+/// the load-bearing assertion, and the keyword sweep beside it is what says
+/// *why* it passed.
+///
+/// The three fixtures declare one agent word for word, differing only in
+/// `model:`, so what the loop below varies is the wire and nothing else.
+#[test]
+fn an_array_bearing_output_rides_each_wires_native_rung_lowered() {
+    let answer = json!({
+        "headline": "three things",
+        "tallies": [
+            { "label": "one", "weight": 0.5 },
+            { "label": "two", "weight": 0.25 },
+        ],
+        "total": 2,
+    });
+    for (project, model, surface) in [
+        ("agent-anthropic", SONNET, Surface::Anthropic),
+        ("agent-openai", LOCAL, Surface::OpenAi),
+        ("server-tools", GPT5, Surface::Responses),
+    ] {
+        let provider = MockProvider::start().expect("a loopback port");
+        provider.enqueue(Script::new(model, Outcome::structured(answer.clone())));
+
+        let Some(run) = harness::invoke(
+            project,
+            "flow.tally",
+            &[("subject", "a short list")],
+            &provider,
+        ) else {
+            return;
+        };
+        run.succeeded();
+
+        let recorded = provider.requests();
+        assert_eq!(recorded.len(), 1, "on `{project}`: one call, and no ladder");
+        let call = &recorded[0];
+        assert!(
+            call.is_valid(),
+            "on `{project}`, the schema this runtime put on the wire is one this decoder cannot \
+             compile — the lowering table for this (wire, mechanism) is missing a row (PRD \
+             resolved q55): {:?}",
+            call.failures()
+        );
+        assert_eq!(call.surface, surface);
+        let asked = call
+            .structured_output
+            .as_ref()
+            .expect("an agent always asks for structured output (PRD 5.2)");
+        assert_eq!(
+            asked.mechanism(),
+            OutputMechanism::Native,
+            "on `{project}`: the native rung is the one an array-bearing schema now rides — \
+             demoting it to the forced tool is the alternative q55 rejected"
+        );
+        assert_eq!(
+            mock_provider::lowering::carries_refused_keyword(
+                surface,
+                OutputMechanism::Native,
+                asked.schema()
+            ),
+            None,
+            "on `{project}`, the wire schema still carries a keyword this decoder refuses: {}",
+            asked.schema()
+        );
+
+        // …and every stripped bound is still in the model's view, folded into
+        // the description of the node it came off, after the author's own words
+        // (ruling b).
+        let schema = asked.schema();
+        assert_eq!(
+            schema["properties"]["tallies"]["description"],
+            "What was found, one note per item. At most 3 items.",
+            "on `{project}`: {schema}"
+        );
+        assert_eq!(
+            schema["properties"]["headline"]["description"],
+            "One line naming the subject. Between 1 and 60 characters.",
+            "on `{project}`: {schema}"
+        );
+        assert_eq!(
+            schema["properties"]["tallies"]["items"]["properties"]["weight"]["description"],
+            "How much it matters. Between 0 and 1.",
+            "on `{project}`, two levels down inside an array of objects: {schema}"
+        );
+        assert_eq!(
+            schema["properties"]["total"]["description"],
+            "How many tallies there are. Between 0 and 3.",
+            "on `{project}`: {schema}"
+        );
+        // Nothing else moved: the shape, the names and the closure are the
+        // emitted schema's.
+        assert_eq!(
+            schema["properties"]["tallies"]["items"]["required"],
+            json!(["label", "weight"]),
+            "on `{project}`: lowering removes constraint keywords and touches nothing else"
+        );
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert!(provider.snapshot().is_drained());
+    }
+}
+
+/// An answer that overruns a **stripped** bound fails the emitted parse, exactly
+/// as any schema-violating answer does — and is never truncated to fit (PRD §9
+/// resolved q55, ruling c).
+///
+/// The other half of ruling a. Lowering takes `maxItems` off the *request*, so
+/// the decoder is no longer refusing a fourth element; what refuses it is the
+/// emitted Zod, which runs over the full schema and is what PRD 9.16 makes the
+/// contract. Nothing new was invented for the overflow — no retry, no trim, no
+/// second ask — so the failure a run gets is the one it has always got for an
+/// answer its schema does not admit.
+///
+/// On every wire, because the *reason* the bound is unenforced differs per wire
+/// and the parse does not: a suite that checked one would leave the other two's
+/// answers trimmed or accepted with nobody the wiser.
+#[test]
+fn an_answer_over_a_stripped_bound_fails_the_parse() {
+    // Four elements against `max_items: 3` — one more than the bound the wire
+    // schema no longer carries.
+    let overrun = json!({
+        "headline": "four things",
+        "tallies": [
+            { "label": "one", "weight": 0.5 },
+            { "label": "two", "weight": 0.25 },
+            { "label": "three", "weight": 0.125 },
+            { "label": "four", "weight": 0.0625 },
+        ],
+        "total": 3,
+    });
+    for (project, model) in [
+        ("agent-anthropic", SONNET),
+        ("agent-openai", LOCAL),
+        ("server-tools", GPT5),
+    ] {
+        let provider = MockProvider::start().expect("a loopback port");
+        provider.enqueue(Script::new(model, Outcome::structured(overrun.clone())));
+
+        let Some(run) = harness::invoke(
+            project,
+            "flow.tally",
+            &[("subject", "a short list")],
+            &provider,
+        ) else {
+            return;
+        };
+        let failure = run.failed();
+        assert!(
+            failure.contains("tally"),
+            "on `{project}`: the node whose answer did not parse is named: {failure}"
+        );
+        assert!(
+            failure.contains("tallies"),
+            "on `{project}`: …and so is the field whose bound it overran: {failure}"
+        );
+
+        let recorded = provider.requests();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "on `{project}`: an answer the parse refuses is a node failure, not a reason to ask \
+             again — nothing about the overflow path is new (PRD resolved q55 ruling c)"
+        );
+        assert!(recorded[0].is_valid());
+        assert!(
+            !recorded[0].was_unsupported(),
+            "on `{project}`: nothing was refused by the endpoint — the schema went out lowered \
+             and the answer came back over its bound"
+        );
+    }
+
+    // …and the bound is where the schema says it is rather than one either side
+    // of it: the same answer with the third element and not the fourth is a run
+    // that succeeds. Which is also what makes the failures above evidence that
+    // nothing **truncated** the overrun to fit — a runtime that trimmed to
+    // `max_items` would have produced this run three times over.
+    let provider = MockProvider::start().expect("a loopback port");
+    let mut at_the_bound = overrun.clone();
+    at_the_bound["tallies"]
+        .as_array_mut()
+        .expect("the scripted answer carries an array")
+        .pop();
+    provider.enqueue(Script::new(SONNET, Outcome::structured(at_the_bound)));
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.tally",
+        &[("subject", "a short list")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+    assert!(provider.snapshot().is_drained());
+}
+
+/// A 400 naming a **schema keyword** fails the call loudly: no ladder, no memo,
+/// and the endpoint's body quoted (PRD §9 resolved q55, ruling d).
+///
+/// After lowering, this refusal can only mean one thing. The mechanism's own
+/// table says that keyword was never sent, so an endpoint complaining about it
+/// is not an endpoint that lacks the mechanism — it is this runtime's lowering
+/// table missing a row. q53's recognizer would otherwise read the sentence as a
+/// capability refusal (it names the rung's key and says "not supported"), ladder
+/// to the other rung, be refused there for the same reason, and **memoize** a
+/// mechanism as absent from an endpoint that has it — the way of being wrong
+/// that hides itself.
+///
+/// Twice over, because a table has **two** ways of being wrong and only one of
+/// them is about a keyword it strips. The second half stages `pattern` — a
+/// constraint no table takes off the wire, deliberately, on the posture that
+/// under-stripping is the cheap direction of being wrong. That posture is only
+/// true if a refusal naming what was left on is loud rather than a ladder trip:
+/// the recognizer therefore watches every constraint keyword a schema can carry,
+/// not merely the ones some table strips.
+///
+/// A third half, about what this diagnostic cannot know: `format` is a schema
+/// keyword *and* the tail of `text.format`, so on the Responses wire a refusal
+/// pointing at a bare `format` is either a decoder refusing the keyword or a
+/// gateway refusing the parameter under its short name. Both readings fail the
+/// call the same way, and the message names both — the alternative, holding a
+/// word-shaped keyword to more than quoting, would hand a schema complaint
+/// (`output_config: minimum is not supported.`) back to the ladder that memoizes
+/// a mechanism as absent from an endpoint that has it.
+///
+/// …and a fourth, because that ambiguity is **two** wires' and the two spell it
+/// differently: Chat Completions asks for structured output with
+/// `response_format`, which ends on the same keyword with an underscore where
+/// Responses' path ends on it with a dot. It is also the wire a bare `Invalid
+/// parameter: format` is most likely to come from, so the caveat has to be
+/// derived from the punctuation a vendor actually joins a name with rather than
+/// from a path rule — read on both surfaces here, since a caveat silent on one of
+/// them would tell an operator flatly to edit a table row over a sentence that
+/// may be about a parameter.
+///
+/// `bounded-cycle`'s `write` node declares `retry: { max: 2 }`, which is what
+/// makes the *memo* observable: three attempts, and each one has to start on the
+/// native rung again. A remembered refusal would show up as the second attempt
+/// asking the other way.
+#[test]
+fn a_schema_keyword_refusal_fails_the_call_without_laddering_or_remembering() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // The shape that is *not* addressed at a path and *does* carry a capability
+    // phrase, which is the one q53's recognizer would have laddered on.
+    provider.enqueue(
+        Script::new(
+            SONNET,
+            Outcome::raw(
+                400,
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Unsupported parameter: output_config — 'maxItems' is not supported by this model.",
+                    },
+                }),
+            ),
+        )
+        .times(3)
+        .matching("research writer"),
+    );
+
+    let Some(run) = harness::invoke(
+        "bounded-cycle",
+        "flow.review_loop",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("maxItems"),
+        "the keyword the endpoint named is what the diagnostic is about: {failure}"
+    );
+    assert!(
+        failure.contains("lowering table"),
+        "…and the repair is named as this runtime's own, not the operator's: {failure}"
+    );
+    assert!(
+        failure.contains("'maxItems' is not supported by this model."),
+        "…with the provider's body quoted rather than paraphrased: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        3,
+        "three attempts of the node's `retry:` policy, and **one** request each: a schema-keyword \
+         400 never ladders to the other rung"
+    );
+    assert!(
+        recorded.iter().all(|request| request
+            .structured_output
+            .as_ref()
+            .map(StructuredOutput::mechanism)
+            == Some(OutputMechanism::Native)),
+        "…and every attempt starts on the native rung, so nothing was remembered: {:?}",
+        recorded
+            .iter()
+            .map(|request| request
+                .structured_output
+                .as_ref()
+                .map(StructuredOutput::mechanism))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and the endpoint refused no mechanism: what it refused was the schema"
+    );
+
+    // …and the same, for a keyword the tables deliberately **leave on the
+    // wire**. `pattern` is one of the two: the ruling's families are array,
+    // numeric and string-length bounds, and the posture q55 takes from resolved
+    // q30 is to under-strip rather than over-strip, because a keyword left on
+    // that a decoder will not compile is a 400 that names it. That trade is only
+    // paid for if this refusal behaves exactly like the one above — which is why
+    // the recognizer's vocabulary is every constraint keyword a schema can
+    // carry, and not the union of the tables.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(
+        Script::new(
+            SONNET,
+            Outcome::raw(
+                400,
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Unsupported parameter: output_config — 'pattern' is not supported by this model.",
+                    },
+                }),
+            ),
+        )
+        .times(3)
+        .matching("research writer"),
+    );
+
+    let Some(run) = harness::invoke(
+        "bounded-cycle",
+        "flow.review_loop",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("pattern") && failure.contains("lowering table"),
+        "a keyword no table strips is still this runtime's own failure, named and repaired in the \
+         same place: {failure}"
+    );
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        3,
+        "one request per attempt: a constraint keyword the table left on the wire does not ladder \
+         either — the other rung would send the same schema"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and nothing was recorded as a mechanism this endpoint lacks"
+    );
+
+    // …and the one keyword whose spelling is **also** a parameter's. `format` is
+    // a JSON Schema keyword and the tail of `text.format`, the Responses wire's
+    // own structured-output parameter, which a gateway that has never heard of
+    // that wire refuses under its short name — so a body pointing at a bare
+    // `format` is both readings at once and nothing here can decide it. The
+    // classification is the same either way (no ladder, no memo, the body
+    // quoted), so what the diagnostic owes an operator is the second reading
+    // named beside the first rather than a table row edited on a guess.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::raw(
+            400,
+            json!({
+                "error": {
+                    "message": "Unrecognized request argument supplied: format",
+                    "type": "invalid_request_error",
+                },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.tally",
+        &[("subject", "a short list")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`format` is a constraint keyword"),
+        "the keyword is read as this runtime's own repair, as every other one is: {failure}"
+    );
+    assert!(
+        failure.contains("`text.format`"),
+        "…and the parameter it is spelled like is named too, because no rule here tells the two \
+         apart: {failure}"
+    );
+    assert!(
+        failure.contains("read the quoted body"),
+        "…so the operator is pointed at the body rather than at a row to edit on a guess: \
+         {failure}"
+    );
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "…and it is still one request: an ambiguous spelling is not a reason to ladder"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…nor to remember a mechanism as absent"
+    );
+
+    // …and the **other** OpenAI wire's spelling of the same ambiguity. Chat
+    // Completions asks with `response_format`, which ends on `format` across an
+    // underscore rather than a dot — so a caveat derived from a path separator
+    // alone would be silent exactly where a bare `Invalid parameter: format` is
+    // most likely to be a service talking about its own parameter. The
+    // classification is the same as everywhere else in this test; what is read
+    // here is that the sentence names the parameter on this wire too.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        LOCAL,
+        Outcome::raw(
+            400,
+            json!({
+                "error": {
+                    "message": "Invalid parameter: format",
+                    "type": "invalid_request_error",
+                },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.review",
+        &[("goal", "ship it"), ("draft", "a draft")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`format` is a constraint keyword"),
+        "the keyword is read as this runtime's own repair on this wire as well: {failure}"
+    );
+    assert!(
+        failure.contains("`response_format`"),
+        "…and the caveat names *this* wire's parameter, which is spelled with the keyword across \
+         an underscore: {failure}"
+    );
+    assert!(
+        failure.contains("read the quoted body"),
+        "…so the operator is pointed at the body here too: {failure}"
+    );
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "…one request, on this wire too: nothing laddered over an ambiguous spelling"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and nothing was remembered as a mechanism this endpoint lacks"
+    );
+}
+
+/// The **forced-function** rung sends the same lowered schema, on the two wires
+/// whose forced row is not empty (PRD §9 resolved q55, ruling a).
+///
+/// The native rung is what the ruling was resolved from and what the run above
+/// proves; the other rung's row is a table entry like any other, and on the
+/// OpenAI wires it is a full one — `strict: true` on a function's `parameters`
+/// hands that schema to the same decoder `response_format` and `text.format`
+/// hand theirs to. Proven end to end rather than statically, because a
+/// forced-rung row is otherwise attested only by a mock check that never fires
+/// on a corpus whose forced-rung agents declare no bounds: a vacuous pass looks
+/// exactly like a correct one.
+///
+/// The Messages wire is deliberately absent: its forced row strips nothing, and
+/// `wire_lowering_agreement.rs` holds that empty row to the oracle's own.
+#[test]
+fn the_forced_function_rung_carries_the_lowered_schema_too() {
+    let answer = json!({
+        "headline": "three things",
+        "tallies": [
+            { "label": "one", "weight": 0.5 },
+            { "label": "two", "weight": 0.25 },
+        ],
+        "total": 2,
+    });
+    for (project, model, surface) in [
+        ("agent-openai", LOCAL, Surface::OpenAi),
+        ("server-tools", GPT5, Surface::Responses),
+    ] {
+        let provider = MockProvider::start().expect("a loopback port");
+        provider.personality(model, Personality::NativeRejected);
+        provider.enqueue(Script::new(model, Outcome::structured(answer.clone())));
+
+        let Some(run) = harness::invoke(
+            project,
+            "flow.tally",
+            &[("subject", "a short list")],
+            &provider,
+        ) else {
+            return;
+        };
+        run.succeeded();
+
+        let recorded = provider.requests();
+        assert_eq!(
+            recorded.len(),
+            2,
+            "on `{project}`: the refused native rung, then the forced function"
+        );
+        assert!(
+            recorded.iter().all(RecordedRequest::is_valid),
+            "on `{project}`, a request this decoder cannot compile — the lowering table for the \
+             forced rung is missing a row (PRD resolved q55): {:?}",
+            recorded
+                .iter()
+                .map(RecordedRequest::failures)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(recorded[0].unsupported, Some(OutputMechanism::Native));
+        let asked = recorded[1]
+            .structured_output
+            .as_ref()
+            .expect("the second rung pins a function carrying the schema");
+        assert_eq!(asked.mechanism(), OutputMechanism::ForcedTool);
+        assert_eq!(
+            mock_provider::lowering::carries_refused_keyword(
+                surface,
+                OutputMechanism::ForcedTool,
+                asked.schema()
+            ),
+            None,
+            "on `{project}`, the pinned function's `parameters` still carries a keyword this \
+             decoder refuses: {}",
+            asked.schema()
+        );
+        assert_eq!(
+            asked.schema()["properties"]["tallies"]["description"],
+            "What was found, one note per item. At most 3 items.",
+            "…and the bound it lost is still in the model's view (ruling b): {}",
+            asked.schema()
+        );
+        assert!(provider.snapshot().is_drained());
+    }
+}
+
+/// A **client tool's** own schema is lowered wherever its wire compiles it, and
+/// left whole where it does not (PRD §9 resolved q55, ruling a; grammar §3.5).
+///
+/// The schema an agent's `output:` rides on is not the only one a request
+/// carries. A `tool.…` `input:` may declare `min_length`, `minimum` or
+/// `max_items` too, and the Responses wire declares `strict` on every function
+/// it is handed — which is the promise that puts a schema through the
+/// structured-output compiler. So `tool.lookup`'s `min_length: 1` is a live 400
+/// there unless it is lowered like anything else, and this is the run that says
+/// so: the mock enforces the subset on any function declared `strict`
+/// (`WIRE-NOTES` (28)), so an unlowered tool is a refused request rather than a
+/// green suite.
+///
+/// Chat Completions is the control, and the contrast is the point of pairing
+/// them: a client tool goes out there with no `strict` at all, nothing compiles
+/// its schema, and the bound stays where the author wrote it. Lowering is per
+/// (wire, mechanism) and it does not spread.
+#[test]
+fn a_client_tools_schema_is_lowered_where_its_wire_declares_strict() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The turn that ends the loop: prose, no calls (grammar 5, D51).
+        Script::new(GPT5, Outcome::text("I have what I need.")),
+        Script::new(
+            GPT5,
+            Outcome::structured(json!({ "answer": "the docs say yes" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert!(
+        recorded.iter().all(RecordedRequest::is_valid),
+        "a tool schema this wire's `strict` decoder cannot compile is a 400 here, exactly as it \
+         is live: {:?}",
+        recorded
+            .iter()
+            .map(RecordedRequest::failures)
+            .collect::<Vec<_>>()
+    );
+    let declared = recorded[0].body()["tools"][0].clone();
+    assert_eq!(
+        declared["name"], "lookup",
+        "the agent's own tool leads this wire's `tools`: {}",
+        recorded[0].body_text
+    );
+    assert_eq!(
+        declared["strict"], true,
+        "…declared `strict`, which is what makes its schema the decoder's business: {}",
+        recorded[0].body_text
+    );
+    assert!(
+        declared["parameters"]["properties"]["query"]["minLength"].is_null(),
+        "…so the bound comes off the request: {}",
+        recorded[0].body_text
+    );
+    assert_eq!(
+        declared["parameters"]["properties"]["query"]["description"],
+        "What to look up. At least 1 character.",
+        "…and is folded into the description the model reads (ruling b): {}",
+        recorded[0].body_text
+    );
+    assert!(provider.snapshot().is_drained());
+
+    // …and the wire that declares no `strict` on a client tool sends the bound
+    // itself: nothing compiles it there, so nothing is taken off.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        Script::new(LOCAL, Outcome::text("found it")),
+        Script::new(
+            LOCAL,
+            Outcome::structured(json!({ "feedback": "a looked-up snippet" })),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-openai",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    run.succeeded();
+
+    let recorded = provider.requests();
+    assert!(recorded.iter().all(RecordedRequest::is_valid));
+    let declared = recorded[0].body()["tools"][0]["function"].clone();
+    assert_eq!(declared["name"], "lookup");
+    assert!(
+        declared["strict"].is_null(),
+        "a client tool carries no `strict` on this wire: {}",
+        recorded[0].body_text
+    );
+    assert_eq!(
+        declared["parameters"]["properties"]["query"]["minLength"],
+        json!(1),
+        "…so its bound rides the request as the author wrote it: {}",
+        recorded[0].body_text
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and a schema-keyword 400 drawn by **that** schema is the same loud failure,
+/// on a call that pinned nothing at all (PRD §9 resolved q55, ruling d).
+///
+/// The refusal ruling d is written about arrives on the pinned request, where the
+/// mechanism ladder is. A strict client tool's `parameters` reaches the same
+/// decoder on every call of the **tool loop**, and those calls pin nothing: the
+/// first request of `flow.respond` carries `tool.lookup` with `strict: true` and
+/// no `text.format` at all. A table missing a row there is the identical bug with
+/// the identical repair, so it has to read as one — otherwise which message an
+/// operator gets depends on which call of the loop the model happened to stop at.
+///
+/// The two hard guarantees are not at stake on this path and the assertions say
+/// so anyway: an unpinned call has no second rung, so one request is all there
+/// is, and nothing is remembered because only the pinned ladder records a
+/// refusal. What the diagnostic has to carry is the keyword, the provider's own
+/// body, and whose bug it is.
+#[test]
+fn a_schema_keyword_refusal_on_a_loop_call_names_the_tools_own_table() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::raw(
+            400,
+            json!({
+                "error": {
+                    "message": "Invalid schema for function 'lookup': 'pattern' is not permitted.",
+                    "type": "invalid_request_error",
+                    "param": "tools[0].parameters",
+                },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("pattern"),
+        "the keyword the endpoint named is what the diagnostic is about: {failure}"
+    );
+    assert!(
+        failure.contains("`parameters`"),
+        "…and it is a tool's schema rather than the pinned one, because this call pinned none: \
+         {failure}"
+    );
+    assert!(
+        failure.contains("`responses`/`forced_tool` lowering table"),
+        "…so the row named is the one a function's `parameters` is lowered through: {failure}"
+    );
+    assert!(
+        failure.contains("'pattern' is not permitted."),
+        "…with the provider's body quoted rather than paraphrased: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "one request: a call that pins nothing has no second rung to try, and a schema keyword is \
+         not a capability refusal on any path"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and the endpoint refused no mechanism: what it refused was a schema"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and on the two wires that lower **no** client tool, the same refusal names
+/// the projection rather than a row (PRD §9 resolved q55, ruling d over ruling
+/// a).
+///
+/// A tool's `parameters` is lowered on the one wire that promises `strict` over
+/// it. Messages sends a tool's `input_schema` whole and Chat Completions sends a
+/// function's `parameters` with no `strict` at all, so on those two the schema a
+/// gateway is complaining about went out exactly as the composition wrote it and
+/// **no** table row was consulted on the way. Naming the wire's `forced_tool`
+/// row there would name a repair that cannot work: that row is read for the
+/// pinned output tool, editing it changes nothing about this document, and the
+/// next run fails identically.
+///
+/// A conforming service cannot draw this — neither wire hands a tool's schema to
+/// a structured-output decoder — which is exactly why the sentence has to be
+/// right: the operator reading it is already looking at a service doing
+/// something the wire does not ask for, and a confident wrong instruction is
+/// what sends them to edit a table for an afternoon. The classification is the
+/// same as everywhere else in ruling d and the assertions say so: one request,
+/// no ladder, no memo.
+#[test]
+fn a_schema_keyword_refusal_on_a_wire_that_sends_a_tool_whole_names_no_row() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // `tool.lookup`'s `input:` carries `min_length: 1` (grammar §3.5), which
+    // reaches this wire as `minLength` inside the tool's `input_schema` — and a
+    // lagging gateway in front of the Messages API is free to refuse it there
+    // however little the API itself would.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::raw(
+            400,
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "tools.0.input_schema: 'minLength' is not supported.",
+                },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("minLength"),
+        "the keyword the endpoint named is what the diagnostic is about here too: {failure}"
+    );
+    assert!(
+        failure.contains("hands a client tool's schema to the endpoint whole"),
+        "…and what it says is that nothing lowered this document, which is the fact that decides \
+         the repair: {failure}"
+    );
+    assert!(
+        failure.contains("`messages`/`forced_tool` row governs the pinned output tool alone"),
+        "…so the row an operator would otherwise reach for is named as the wrong one rather than \
+         left to be guessed at: {failure}"
+    );
+    assert!(
+        !failure.contains("the repair is one row of `LOWERED_AWAY`"),
+        "…and the repair a row would be is not offered on a wire where no row saw this schema: \
+         {failure}"
+    );
+    assert!(
+        failure.contains("'minLength' is not supported."),
+        "…with the provider's body quoted rather than paraphrased: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "one request: a schema keyword is this runtime's own failure on every wire, and never a \
+         reason to ask the same endpoint a second way"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and nothing was remembered as a mechanism this endpoint lacks"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and on the **pinned** call the same refusal names the tool too, because a
+/// pinned request carries two schema documents (PRD §9 resolved q55, ruling d).
+///
+/// The ladder is on the pinned call, so that is where ruling d's diagnostic
+/// normally speaks — and it used to speak about one document only. But every
+/// composer puts the agent's own tools on the pinned request as well (the history
+/// it replays names them), so the 400 above is drawable **one call later**, by the
+/// same `tool.lookup` schema, against a request that also carries an output
+/// schema. Blaming the pinned schema's `(wire, mechanism)` row there names a table
+/// that never saw the offending document: an operator edits it, and the next run
+/// fails identically. Which sentence they read would then depend on which call of
+/// the agent the gateway happened to refuse — the dependency the test above exists
+/// to remove.
+///
+/// So the two candidate documents are named, each with the repair that governs
+/// *it*, and the operator is pointed at the path in the quoted body. The tool is
+/// named by name and only where its own schema declares the refused keyword: a
+/// request whose tools carry no such bound cannot have drawn the refusal with one,
+/// and a diagnostic that raised the possibility anyway would be a second wrong
+/// direction to walk in.
+///
+/// The classification is unchanged and the assertions say so: no ladder (the
+/// pinned call is one request, not two), and no memo.
+#[test]
+fn a_schema_keyword_refusal_on_a_pinned_call_names_the_tool_that_declares_it() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue_all([
+        // The turn that ends the loop: prose, no calls (grammar 5, D51) — so the
+        // next request is the pinned one, carrying `tool.lookup` beside the
+        // output schema.
+        Script::new(SONNET, Outcome::text("found it")),
+        Script::new(
+            SONNET,
+            Outcome::raw(
+                400,
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "tools.0.input_schema: 'minLength' is not supported.",
+                    },
+                }),
+            ),
+        ),
+    ]);
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("minLength"),
+        "the keyword the endpoint named is what the diagnostic is about: {failure}"
+    );
+    assert!(
+        failure.contains("`input_schema` of `lookup`"),
+        "…and the tool whose own schema declares it is named, in the document the `messages` wire \
+         spells it as: {failure}"
+    );
+    assert!(
+        failure.contains("no lowering table takes a keyword off a client tool's schema here"),
+        "…with the fact that decides that document's repair: {failure}"
+    );
+    assert!(
+        failure.contains("beside `loweredStrictTool`"),
+        "…so the repair a tool's schema has on this wire is offered beside the row's: {failure}"
+    );
+    assert!(
+        !failure.contains("lowering table should have stripped"),
+        "…and the one-document sentence, which names a row that never saw the tool's schema, is \
+         not what an operator is told to go and edit: {failure}"
+    );
+    assert!(
+        failure.contains("'minLength' is not supported."),
+        "…with the provider's body quoted rather than paraphrased: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        2,
+        "the loop call and the pinned one — and the pinned one is a single request: a schema \
+         keyword never ladders to the other rung"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and nothing was remembered as a mechanism this endpoint lacks"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and the endpoint's answer is quoted **whole**, past the cut every other
+/// quotation of a refusal takes (PRD §9 resolved q55, ruling d).
+///
+/// Ruling d's diagnostic leans on the body: it says the lowering table is wrong
+/// and leaves the evidence to the service's own words. That evidence is not one
+/// sentence. A wire refusing a schema reports every offending node in one answer
+/// — `crates/mock-provider`'s checker does, and its doc comment says why: a table
+/// missing a row usually shows up as several keywords at once — while
+/// `ProviderFailure`'s *message* cuts the body at 400 characters, which is the
+/// right length for a line in a trace and the wrong one for this. The cut falls
+/// mid-word in the middle of the evidence, and the keywords after it never reach
+/// the operator, who then pays a round trip per keyword.
+///
+/// Staged as the shape that draws it: four complaints in one answer, the last of
+/// them past the 400th character of the body as the wire serialises it — which is
+/// what the assertion measures, rather than the joined message, because the cut is
+/// taken over what arrives. `bounded-cycle`'s agents declare no tools, so this is
+/// the one-document sentence — what is read here is the quotation and nothing
+/// else.
+#[test]
+fn a_schema_keyword_refusal_quotes_the_endpoints_whole_answer() {
+    let complaint = |path: &str, keyword: &str| {
+        format!(
+            "output_config.format.schema.properties.{path}.{keyword}: '{keyword}' is not \
+             supported. The `output_config` format compiles a subset of JSON Schema and this \
+             keyword is not in it."
+        )
+    };
+    let last = complaint("notes.items", "maxLength");
+    let message = format!(
+        "{}\n{}\n{}\n{}",
+        complaint("notes", "maxItems"),
+        complaint("notes", "minItems"),
+        complaint("notes.items", "minLength"),
+        last
+    );
+    let answer = json!({
+        "type": "error",
+        "error": { "type": "invalid_request_error", "message": message },
+    });
+    let body = answer.to_string();
+    assert!(
+        body.find(&last).expect("the last complaint is in the body") > 400,
+        "the case only says anything if the last complaint starts past the message's cut: {body}"
+    );
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(
+        Script::new(SONNET, Outcome::raw(400, answer))
+            .times(3)
+            .matching("research writer"),
+    );
+
+    let Some(run) = harness::invoke(
+        "bounded-cycle",
+        "flow.review_loop",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains(&last),
+        "every keyword the endpoint named has to be readable off the failure, including the ones \
+         past the 400th character of its answer: {failure}"
+    );
+    assert!(
+        failure.contains("lowering table"),
+        "…and it is still this runtime's own repair rather than the operator's: {failure}"
+    );
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .all(|request| !request.was_unsupported()),
+        "…and a body this long is still not a mechanism refusal"
+    );
 }
 
 /// A loop answer is replayed as the model sent it, and an answer that carried

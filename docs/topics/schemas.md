@@ -2,8 +2,16 @@
 
 Schemas are the load-bearing construct. They are what makes routing decidable,
 fan-out bounded, edges serializable, and store ops checkable — and what a model
-is constrained by on the wire, so an agent's answer is parsed with the same
-document it was constrained by.
+is constrained by on the wire, so an agent's answer is parsed with the document
+it was constrained by, wherever the provider's decoder can compile it.
+
+Wherever it cannot, **the parse is the contract**: a structured-output decoder
+compiles a subset of JSON Schema, and the constraints outside that subset are
+taken off the request and written into the schema's own descriptions instead, so
+the model still reads "at most 20 items" even though nothing on the wire is
+enforcing it. Your answer is still checked against the whole schema — an
+overrunning answer fails the node rather than being trimmed. Which keywords that
+is per wire, and where to see it, is in `agent-compose docs models`.
 
 The type language is a closed subset of JSON Schema in a compact shorthand.
 Anything outside it (`anyOf`, `allOf`, `$ref`, `patternProperties`, `if`/`then`,

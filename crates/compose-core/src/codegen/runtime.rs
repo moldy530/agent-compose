@@ -32,16 +32,43 @@
 //! | id | where | which way | why it is left |
 //! |---|---|---|---|
 //! | `strict-is-refused-by-an-optional-property` | an agent's `output:` on the Chat Completions surface, when any object in it declares `optional:` | the request carries `strict: false`, so the decoder is **not** constrained by the schema its answer is then parsed with | OpenAI's structured-output decoder closes a schema only when every object in it lists every property in `required` and sets `additionalProperties: false`, all the way down (`crates/mock-provider/WIRE-NOTES.md` (13), which is also what the mock enforces); `optional:` (grammar 3.4) is exactly the construct that breaks the first, and a result schema refuses `default:` (grammar 3.9) so `optional:` is the only way in. The three ways out are all worse. Sending `strict: true` anyway is a 400 — the composition would not run at all. Rewriting the property to the `["string", "null"]`-and-required shape OpenAI documents would make the schema the model is constrained by different from the schema its answer is parsed with, which is the one property PRD 9.16 says must hold and the whole reason `withStructuredOutput` was refused. Refusing the composition at `build` would make a legal grammar unbuildable on three of grammar 12.1's six kinds over a construct the Messages API has no trouble with — `tool_choice` pins the tool and the schema goes on the wire whole. So the parse stays the contract: the emitted node function answers `<agent>Output.parse(…)` over [`super::schema`]'s Zod, which is the same schema at either `strict`, and an unconstrained model that misses it is a node error rather than a bad write. `a_nested_optional_property_costs_the_strict_decoder_and_not_the_parse` pins both halves |
+//! | `a-constraint-keyword-the-decoder-cannot-compile` | an agent's `output:` on **every** wire's native rung and on the forced-tool rung of the two OpenAI ones — **and a tool's `parameters`** on the Responses wire, the one surface that declares `strict` on each function it is handed (`loweredStrictTool`; a `tool.*`'s `input:`, a `flow.*` attached as a tool, a store's or a builtin's synthesized arguments alike) | the constraint is **stripped from the request** and folded into that schema node's `description`, so the decoder is not constrained by it and the model is only told about it | PRD §9 resolved q55, and the same doctrine one step out from the row above. A structured-output parameter is a schema *compiler* over a subset of JSON Schema: the Messages wire's `output_config` format compiles no array-length, numeric or string-length constraint, and OpenAI's `strict` decoder compiles none of those and no `uniqueItems`. Grammar D10 makes `max_items` REQUIRED on every result-schema array and §3.5 sends it as `maxItems`, so **every** real composition was a 400 on the rung resolved q53 prefers — and correctly not a laddering one, since the schema was never going to compile on the other rung either. The alternatives the ruling rejects: demoting every array-bearing schema to the forced tool abandons native-first for virtually every composition, and relaxing D10 gives up the bound `over:` dispatch is built on. So the wire is handed the lowering's image (`LOWERED_AWAY` in `js/runtime.ts`, one row per (wire, mechanism), edited when a vendor's subset moves — resolved q30's treadmill terms), each stripped keyword folded into the node's `description` so the model is still aimed at it, and the emitted Zod parse is unchanged and still the contract: an answer that overruns a stripped bound fails `<agent>Output.parse(…)` exactly as any schema-violating answer does, and is never truncated to fit. The delta between the two columns is exactly the table, proven document by document by `the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks` in `tests/generated_code_gates.rs`; the mock provider refuses an under-lowered schema on every enforced row, so an acceptance run is the other half of the proof. A **tool's** `parameters` takes the same projection, on the one wire that promises `strict` over it, and with one consequence the pinned schema does not have: the bound is enforced by `parseToolArguments` rather than by `<agent>Output.parse(…)`, so an argument that overruns it comes back to the model as a Decision D119 refusal and the tool loop turns again — a spent turn of `max_tool_iterations:` rather than a node error. `a_client_tools_schema_is_lowered_where_its_wire_declares_strict` pins which document went out |
 //!
-//! The row is reachable from ordinary grammar, which is why it is pinned rather
-//! than left to be discovered: `agent-openai`'s `flow.triage` is the shape, and
-//! the acceptance test named above asserts the `strict: false` on the recorded
-//! request *and* that the run still refuses an answer the schema does not admit.
+//! Both rows are reachable from ordinary grammar, which is why they are pinned
+//! rather than left to be discovered: `agent-openai`'s `flow.triage` is the
+//! first's shape, and the acceptance test named above asserts the `strict:
+//! false` on the recorded request *and* that the run still refuses an answer the
+//! schema does not admit. The second's shape is any `output:` with an array in
+//! it — `agent-anthropic`'s `agent.tallier`, `agent-openai`'s and
+//! `server-tools`' twins of it — and
+//! `an_array_bearing_output_rides_each_wires_native_rung_lowered` pins what
+//! reaches the wire, `an_answer_over_a_stripped_bound_fails_the_parse` pins that
+//! the bound still binds. Its **tool** half is any bounded `input:` on a tool an
+//! agent reaches over the Responses wire — `server-tools`' `tool.lookup` carries
+//! a `min_length:` — and
+//! `a_client_tools_schema_is_lowered_where_its_wire_declares_strict` pins it on
+//! both sides: lowered where that wire declares `strict`, and sent whole on a
+//! wire that declares none over it. That second side is also what the refusal's
+//! own sentence has to say on those two wires — a row named there would be a
+//! repair that changes nothing about the document that went out, which
+//! `a_schema_keyword_refusal_on_a_wire_that_sends_a_tool_whole_names_no_row`
+//! holds it to on a call that pinned nothing and
+//! `a_schema_keyword_refusal_on_a_pinned_call_names_the_tool_that_declares_it`
+//! on the call that carries **both** documents at once, where naming the pinned
+//! schema's row alone would depend on which call of the agent a gateway
+//! happened to refuse.
 
 use crate::ir::Ir;
 
 /// The runtime's source, carried in the compiler and emitted verbatim.
-const SOURCE: &str = include_str!("js/runtime.ts");
+///
+/// Public because one rule about it is decided outside this crate: the
+/// per-(wire, mechanism) lowering tables of PRD §9 resolved q55 are stated here
+/// and again in `mock-provider`'s `lowering` module, and
+/// `crates/agent-compose/tests/wire_lowering_agreement.rs` — the one test target
+/// that can see both crates — asserts the two are equal. Everything else about
+/// the file is read through [`module`].
+pub const SOURCE: &str = include_str!("js/runtime.ts");
 
 /// `src/runtime.ts`.
 #[must_use]
@@ -391,6 +418,72 @@ mod tests {
         assert!(
             refused < wrote,
             "the hard-link refusal runs after the write it is meant to prevent: {written}"
+        );
+    }
+
+    /// **Every** composer puts the *lowered* schema on the wire, and none of
+    /// them reaches the emitted one (PRD §9 resolved q55, ruling a).
+    ///
+    /// The projection is only a contract if it has no way around it. A composer
+    /// that read `request.pinned.schema` directly would send the schema whole —
+    /// on the Messages wire that is the 400 the ruling was written from, and on
+    /// the OpenAI wires it is a `strict` decoder refusing a keyword it does not
+    /// compile — and nothing else in this crate would notice: the goldens carry
+    /// the full schema in `deployment.ts` either way, because lowering happens
+    /// at request composition and not at codegen.
+    ///
+    /// So the rule is pinned as *both* halves, per composer: the lowered pin is
+    /// derived, and the raw one is not reachable inside the function. The
+    /// acceptance suite proves the behaviour against a mock that enforces each
+    /// subset; this is what fails first, with no toolchain, when a composer
+    /// stops projecting.
+    #[test]
+    fn every_wire_composes_its_structured_output_from_the_lowered_schema() {
+        for (composer, wire) in [
+            ("async function callMessages(", "messages"),
+            ("async function callChatCompletions(", "chat_completions"),
+            ("async function callResponses(", "responses"),
+        ] {
+            let body = function_body(composer);
+            assert!(
+                body.contains(&format!(
+                    "loweredPin(request.pinned, \"{wire}\", mechanism)"
+                )),
+                "`{composer}…` does not project its pinned schema through the `{wire}` lowering \
+                 table (PRD resolved q55): {body}"
+            );
+            assert!(
+                !body.contains("request.pinned.schema") && !body.contains("request.pinned!.schema"),
+                "`{composer}…` reaches the emitted schema directly, so a request can carry a \
+                 keyword this wire's decoder cannot compile: {body}"
+            );
+        }
+    }
+
+    /// The lowering tables carry the keyword grammar D10 makes unavoidable, and
+    /// the Messages forced-tool row is empty (PRD §9 resolved q55).
+    ///
+    /// Stated from the Rust side because the table is the whole of the ruling's
+    /// mechanics and the two things asserted here are the two that make it
+    /// *matter*: `maxItems` is on every result-schema array by grammar D10, and
+    /// the empty row is a claim about a rung that takes the schema whole rather
+    /// than an absence of one. `crates/agent-compose/tests/wire_lowering_agreement.rs`
+    /// holds the tables to the mock provider's enforced subsets, keyword by
+    /// keyword; this is what fails first if the table stops being a table.
+    #[test]
+    fn the_lowering_tables_are_where_the_ruling_puts_them() {
+        assert!(
+            SOURCE.contains("const ANTHROPIC_NATIVE_UNCOMPILED: readonly string[] = ["),
+            "the Messages wire's lowering table is gone"
+        );
+        assert!(
+            SOURCE.contains("const OPENAI_STRICT_UNCOMPILED: readonly string[] = ["),
+            "the OpenAI wires' lowering table is gone"
+        );
+        assert!(
+            SOURCE.contains("messages: { native: ANTHROPIC_NATIVE_UNCOMPILED, forced_tool: [] },"),
+            "the Messages forced-tool row is no longer the empty one: a schema rides that rung as \
+             a tool's `input_schema`, which the API takes whole (PRD resolved q55)"
         );
     }
 
