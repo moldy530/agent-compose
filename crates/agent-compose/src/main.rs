@@ -268,6 +268,20 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Human)]
         format: Format,
     },
+    /// Draw a spec's flows: one self-contained HTML page, or the graph document itself
+    Visualize {
+        /// Path to the spec entrypoint (conventionally `main.yml`)
+        path: PathBuf,
+        /// Draw one flow rather than every flow, as a typed address (`flow.<name>`)
+        #[arg(long, value_name = "ADDR")]
+        flow: Option<String>,
+        /// Where to write the page [default: ./graph.html]
+        #[arg(short = 'o', long = "output", value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// What to emit — the page, or the document the page renders
+        #[arg(long, value_enum, default_value_t = Artifact::Html)]
+        format: Artifact,
+    },
     /// Compile a spec to a TypeScript project (validates first; emits only when clean)
     Build {
         /// Path to the spec entrypoint (conventionally `main.yml`)
@@ -411,6 +425,22 @@ enum Format {
     Json,
 }
 
+/// What `visualize` emits.
+///
+/// The one `--format` in this command line that names an **artifact** rather
+/// than a report, and the vocabulary says so: `human`/`json` is a choice about
+/// who is reading the verdict, while `html`/`json` is a choice about what the
+/// command produces. `visualize` has no machine report to choose the shape of —
+/// its answer *is* the document — so its diagnostics are `validate`'s human
+/// block on stderr whichever of these is asked for (PRD resolved q56).
+#[derive(Clone, Copy, ValueEnum)]
+enum Artifact {
+    /// One self-contained page, written to a file.
+    Html,
+    /// The graph document, on stdout.
+    Json,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -424,6 +454,12 @@ fn main() -> ExitCode {
             after,
             format,
         } => plan_specs(&before, &after, format),
+        Command::Visualize {
+            path,
+            flow,
+            output,
+            format,
+        } => visualize(&path, flow.as_deref(), output.as_deref(), format),
         Command::Build {
             path,
             target,
@@ -650,6 +686,17 @@ fn warned(entrypoint: &Path, target: &str, diagnostics: &[compose_core::Diagnost
     if diagnostics.is_empty() {
         return;
     }
+    human_report(entrypoint, target, diagnostics);
+}
+
+/// `validate`'s human block, on stderr: the snippets, the verdict, and the line
+/// pointing at `explain`.
+///
+/// One renderer for every verb that prints diagnostics without answering with
+/// them — the `run`/`serve` that launch past a warning, and the `visualize`
+/// that refuses over an error. A second spelling of this block would be a
+/// second thing to keep in step with `report`.
+fn human_report(entrypoint: &Path, target: &str, diagnostics: &[compose_core::Diagnostic]) {
     let color = report::color_enabled();
     let root = entrypoint.parent().unwrap_or_else(|| Path::new(""));
     let mut stream = io::stderr().lock();
@@ -660,7 +707,7 @@ fn warned(entrypoint: &Path, target: &str, diagnostics: &[compose_core::Diagnost
                 &report::verdict(entrypoint, target, diagnostics, color),
             )
         })
-        .and_then(|()| write(&mut stream, &report::explain_hint(true)));
+        .and_then(|()| write(&mut stream, &report::explain_hint(!diagnostics.is_empty())));
 }
 
 /// Everything both commands do before they differ: resolve, check, and hand back
@@ -883,6 +930,138 @@ fn plan_specs(before: &Path, after: &Path, format: Format) -> ExitCode {
         Err(error) if departed(&error) => ExitCode::from(CLEAN),
         Err(error) => fail(&format!("cannot write the report: {error}")),
     }
+}
+
+/// Where `visualize` writes when nothing says otherwise.
+///
+/// The working directory rather than `build/<target>`: a page is something a
+/// person opens and pastes into a pull request, not a build artifact of the
+/// composition — nothing consumes it, and `build --check` must not find it
+/// (see `build::write`, PRD resolved q47).
+const GRAPH_ARTIFACT: &str = "graph.html";
+
+/// `agent-compose visualize`: the resolved graph, as a picture of itself.
+///
+/// Validation comes first and an **error** refuses the rendering, exactly as it
+/// refuses a `build`: a picture of a composition the compiler rejected would be
+/// a drawing of a graph that does not exist, and the refusal it deserves is the
+/// one `validate` already writes. A **warning** does not refuse it — the
+/// composition is one this compiler accepts — so the warnings are printed and
+/// the page is written.
+///
+/// Everything this verb can refuse on its own is a **usage error** (exit `2`):
+/// a `--flow` naming no flow, `-o` beside a format that writes to stdout, a
+/// path that cannot be written. Rendering adds no failure class of its own (PRD
+/// resolved q56), which is why nothing here reports a diagnostic.
+///
+/// It takes no `--target`, for `plan`'s reason: the question a picture answers
+/// is what this composition *is*, and the built-in `local` is what resolves
+/// without a deploy file at all (grammar 14).
+fn visualize(
+    entrypoint: &Path,
+    flow: Option<&str>,
+    output: Option<&Path>,
+    format: Artifact,
+) -> ExitCode {
+    if let Err(reason) = usable(entrypoint, "visualize") {
+        return fail(&reason);
+    }
+    // Refused before the composition is read: the two flags disagree about
+    // where the answer goes, and resolving a spec first would spend the work
+    // before saying so.
+    if matches!(format, Artifact::Json) && output.is_some() {
+        return fail(
+            "`--format json` writes the graph document to standard output, so it takes no `-o`: \
+             drop the flag and redirect instead, or ask for `--format html` to write a page",
+        );
+    }
+
+    let (diagnostics, ir) = analyse(entrypoint, DEFAULT_TARGET);
+    let Some(ir) = ir.filter(|_| !report::refuses(&diagnostics)) else {
+        human_report(entrypoint, DEFAULT_TARGET, &diagnostics);
+        return ExitCode::from(REPORTED);
+    };
+    warned(entrypoint, DEFAULT_TARGET, &diagnostics);
+
+    let document = match flow {
+        None => compose_core::graph(&ir),
+        Some(named) => {
+            let known = compose_core::graph::flows(&ir);
+            match compose_core::graph_of(&ir, named) {
+                Some(document) => document,
+                None => {
+                    return fail(&unknown(
+                        "a flow this composition declares",
+                        "flows",
+                        named,
+                        compose_core::graph::nearest_flow(&ir, named).as_deref(),
+                        &known.iter().map(String::as_str).collect::<Vec<_>>(),
+                    ));
+                }
+            }
+        }
+    };
+
+    let (flows, nodes, edges) = (
+        document.flows.len(),
+        document
+            .flows
+            .iter()
+            .map(|flow| flow.nodes.len())
+            .sum::<usize>(),
+        document
+            .flows
+            .iter()
+            .map(|flow| flow.edges.len())
+            .sum::<usize>(),
+    );
+
+    match format {
+        // The document is the answer, so it goes to stdout whole — the way
+        // `schema` prints the published schema (resolved q23).
+        Artifact::Json => match document.to_json() {
+            Ok(text) => emit_text(&text),
+            Err(error) => fail(&format!("cannot write the graph document as JSON: {error}")),
+        },
+        Artifact::Html => {
+            let page = match compose_core::graph::render(&document) {
+                Ok(page) => page,
+                Err(error) => return fail(&format!("cannot render the graph document: {error}")),
+            };
+            let path = output.unwrap_or_else(|| Path::new(GRAPH_ARTIFACT));
+            if let Err(reason) = write_artifact(path, &page) {
+                return fail(&reason);
+            }
+            let _ = write(
+                &mut io::stderr().lock(),
+                &format!(
+                    "wrote `{}`: {flows} flow(s), {nodes} node(s), {edges} edge(s)\n\nopen it in a \
+                     browser — it is one file and fetches nothing\n",
+                    path.display()
+                ),
+            );
+            ExitCode::from(CLEAN)
+        }
+    }
+}
+
+/// Write one artifact, making the directory it is named in.
+///
+/// A path whose parent does not exist is the one filesystem failure worth
+/// repairing rather than reporting: `-o build/reports/graph.html` is how
+/// somebody would write it, and a command that answered "no such directory" to
+/// that would be asking them to run `mkdir` and try again.
+fn write_artifact(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent.is_dir()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create `{}`: {error}", parent.display()))?;
+    }
+    std::fs::write(path, contents)
+        .map_err(|error| format!("cannot write `{}`: {error}", path.display()))
 }
 
 /// The project root a composition's spans are relative to: its entrypoint's own
