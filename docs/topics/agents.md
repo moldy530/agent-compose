@@ -87,10 +87,17 @@ Any other key is a compile error.
 
 `output:` is a result surface (`agent-compose docs schemas`): arrays inside it
 need `max_items`, and `default:` is illegal. At run time the model is
-**constrained** to this schema on the wire and its answer is **parsed** with the
-same schema — the two are the same document by construction, so an agent cannot
-honour its contract and still fail the parse. A nonconforming response is
-rejected before any edge is evaluated.
+**constrained** to this schema on the wire and its answer is **parsed** with it;
+a nonconforming response is rejected before any edge is evaluated.
+
+**The parse is the contract.** The two are not always the same document: a
+provider's structured-output decoder compiles a subset of JSON Schema, and the
+bounds it cannot compile — `max_items` among them, on most wires — come off the
+request and are written into that field's own `description` instead, so the
+model is asked for the bound rather than held to it. Your answer is still
+checked against the whole schema, so an over-long array fails the node rather
+than being trimmed. Which keywords, per wire, is in `agent-compose docs models`;
+`agent-compose docs schemas` states the posture.
 
 Enum-typed output fields are what edge guards route over and what exhaustiveness
 checking covers. If you want to branch on a decision, declare it as an `enum`.

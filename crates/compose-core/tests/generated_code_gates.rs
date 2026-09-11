@@ -314,6 +314,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use compose_core::ast::common::{Ident, Literal};
+use compose_core::ast::schema::{Number, ScalarKind, StringFormat, Surface};
+use compose_core::diag::{Position, SourceName, Span, Spanned};
+use compose_core::ir::schema::{
+    ArrayType, EnumType, Field, FieldMap, ObjectType, Scalar, TypeForm, TypeNode, UnionType,
+    UnionVariant,
+};
 use goldens::{GOLDENS, Golden, artifact, emitted, files_under, golden, goldens_root, repository};
 use serde_json::{Value, json};
 use toolchain::{bun, installed, required, runner, runs};
@@ -5031,6 +5038,15 @@ struct Projection {
     /// the dotted address of the node inside the lowered schema; an empty one is
     /// the root.
     described: &'static [(&'static str, &'static str)],
+    /// …and the same on the **Chat Completions native** row, which is the other
+    /// table.
+    ///
+    /// Both rows are read because the two tables are not the same list, and the
+    /// keyword that differs — `uniqueItems` — folds a sentence no Messages-row
+    /// expectation can ever see: on that wire it is left on the request, so the
+    /// row above pins the stripping of every *other* keyword and says nothing
+    /// about what replaces this one. Empty on a case that says nothing new here.
+    described_on_the_openai_table: &'static [(&'static str, &'static str)],
 }
 
 /// The corners of the projection, written out (PRD §9 resolved q55, rulings a
@@ -5040,9 +5056,10 @@ struct Projection {
 /// these answer "what does it *say*", which no golden pins because the sentence
 /// is the runtime's rather than the composition's. One case per thing that can
 /// be wrong independently: which keyword a table takes, how a pair of bounds
-/// reads as one phrase, where the sentence lands when the author wrote one and
-/// when they did not, how deep the walk goes, and the one keyword whose value
-/// can ask for nothing at all.
+/// reads as one phrase, the one keyword the two tables disagree about — read on
+/// both rows, since it is silent on the row the ruling was written from — where
+/// the sentence lands when the author wrote one and when they did not, how deep
+/// the walk goes, and the one keyword whose value can ask for nothing at all.
 fn projections() -> Vec<Projection> {
     vec![
         Projection {
@@ -5088,6 +5105,62 @@ fn projections() -> Vec<Projection> {
                     "Between 0 and 1.",
                 ),
             ],
+            described_on_the_openai_table: &[
+                // The same node on the table that also takes `uniqueItems`: one
+                // more clause, in the order the fold's rules are read.
+                (
+                    "properties.notes",
+                    "Side notes. Between 1 and 8 items; no duplicate items.",
+                ),
+                // …and the bounds both tables take read the same on either.
+                (
+                    "properties.notes.items.properties.body",
+                    "At most 200 characters.",
+                ),
+            ],
+        },
+        Projection {
+            label: "the keyword that tells the two tables apart",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        // Nothing but `unique_items: true`: the Messages table
+                        // leaves it on the wire and the OpenAI one takes it, so
+                        // this is the one node whose description differs between
+                        // the two rows *because of which table it is*.
+                        "sources": {
+                            "type": "array",
+                            "description": "Where it came from.",
+                            "uniqueItems": true,
+                            "items": { "type": "string" },
+                        },
+                        // …and beside a bound both tables take, so the clause
+                        // is pinned alone and in company.
+                        "seen": {
+                            "type": "array",
+                            "uniqueItems": true,
+                            "maxItems": 4,
+                            "items": { "type": "string" },
+                        },
+                    },
+                    "required": ["sources", "seen"],
+                    "additionalProperties": false,
+                })
+            },
+            described: &[
+                // Nothing was taken off `sources` here, so the author's words
+                // arrive as written and nothing is added to them.
+                ("properties.sources", "Where it came from."),
+                ("properties.seen", "At most 4 items."),
+            ],
+            described_on_the_openai_table: &[
+                (
+                    "properties.sources",
+                    "Where it came from. No duplicate items.",
+                ),
+                ("properties.seen", "At most 4 items; no duplicate items."),
+            ],
         },
         Projection {
             label: "an anyOf whose branches carry different families",
@@ -5118,6 +5191,8 @@ fn projections() -> Vec<Projection> {
                     "Greater than 0; a multiple of 5.",
                 ),
             ],
+            // Nothing here is in one table and not the other.
+            described_on_the_openai_table: &[],
         },
         Projection {
             label: "a discriminated union, the shape grammar 3.7 emits",
@@ -5170,6 +5245,7 @@ fn projections() -> Vec<Projection> {
                     "At least 1 character.",
                 ),
             ],
+            described_on_the_openai_table: &[],
         },
         Projection {
             label: "prose the author did not punctuate, and bounds of one",
@@ -5208,6 +5284,7 @@ fn projections() -> Vec<Projection> {
                 ("properties.title", "What to call it: At least 1 character."),
                 ("properties.labels", "Between 1 and 1 item."),
             ],
+            described_on_the_openai_table: &[],
         },
         Projection {
             label: "a value that is not a schema, and a bound that asks for nothing",
@@ -5230,6 +5307,11 @@ fn projections() -> Vec<Projection> {
                 })
             },
             described: &[],
+            // `uniqueItems: false` folds nothing on the table that *does* strip
+            // it either, which is what the `untouched` assertions below read
+            // off this same row — an expectation here could only name a
+            // description that must not exist.
+            described_on_the_openai_table: &[],
         },
     ]
 }
@@ -5247,7 +5329,7 @@ fn projections() -> Vec<Projection> {
 /// where it cannot.
 ///
 /// So this measures the delta, over every agent `output:` in the corpus and once
-/// per (wire, mechanism), and holds it to three things:
+/// per (wire, mechanism), and holds it to four things:
 ///
 ///   * **nothing else is removed** — a keyword gone from the wire schema is a
 ///     keyword in that row's table;
@@ -5256,7 +5338,17 @@ fn projections() -> Vec<Projection> {
 ///     and both are read without descriptions, which is what says the projection
 ///     is a *projection* rather than a rewrite;
 ///   * **every stripped bound is still said** — the node it came off carries a
-///     description that names it, after whatever the author wrote.
+///     description that names it, after whatever the author wrote;
+///   * **and every node that lost nothing says exactly what it said** — the
+///     equality above is blind to descriptions on purpose, so the one thing
+///     lowering is allowed to rewrite is pinned from both sides: appended to
+///     where a bound came off, and byte-identical everywhere else.
+///
+/// The sentences themselves are read on **two** rows rather than one. The tables
+/// are not the same list — `uniqueItems` is stripped by the OpenAI one and left
+/// on the wire by the Messages one — so the clause it folds is unreachable from
+/// the row the ruling was written from, and a wrong wording there would be a
+/// keyword proven stripped with nothing proven about what replaced it.
 ///
 /// The parse column needs no assertion here and gets none: the emitted Zod is
 /// what gate 6 already answered the corpus with, and lowering does not touch it —
@@ -5391,12 +5483,26 @@ fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
                         .is_some_and(|value| value.is_number() || value == &json!(true))
                 })
                 .collect();
-            if stripped.is_empty() {
-                continue;
-            }
             let at = value_at(wire_schema, &path).unwrap_or_else(|| {
                 panic!("`{label}`'s `{wire}`/`{mechanism}` schema lost the node at `{path}`")
             });
+            if stripped.is_empty() {
+                // A node that lost no bound folds no sentence, and the other
+                // half of ruling b is that the fold is an *append*: everywhere
+                // it does not fire, the author's own words reach the model
+                // exactly as they were written — and where they wrote none, the
+                // model is told nothing this composition did not say. The
+                // equality above cannot see this, because it reads both sides
+                // with every description taken off.
+                assert_eq!(
+                    at.get("description").and_then(Value::as_str),
+                    node.get("description").and_then(Value::as_str),
+                    "`{label}` at `{path}` lost nothing to `{wire}`/`{mechanism}`'s table and its \
+                     `description` changed anyway: lowering rewrites a description only where it \
+                     folds a stripped bound into one (PRD resolved q55, ruling b)"
+                );
+                continue;
+            }
             let said = at
                 .get("description")
                 .and_then(Value::as_str)
@@ -5432,27 +5538,44 @@ fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
         }
     }
 
-    // …and what the sentences actually read like, on the table the ruling was
-    // written from. The corpus above says the bound is named; these say it is
-    // named in English, and in one deterministic order.
+    // …and what the sentences actually read like, on both of the tables. The
+    // corpus above says the bound is named; these say it is named in English,
+    // and in one deterministic order. Both rows are read because the two tables
+    // are different lists: `uniqueItems` is stripped by one and left by the
+    // other, so the clause it folds is invisible from the Messages row alone.
     for case in &written {
-        let entry = lowered
-            .iter()
-            .find(|entry| {
-                entry["label"] == json!(case.label)
-                    && entry["wire"] == json!("messages")
-                    && entry["mechanism"] == json!("native")
-            })
-            .unwrap_or_else(|| panic!("`{}` was never projected", case.label));
-        for (path, expected) in case.described {
-            let node = value_at(&entry["schema"], path)
-                .unwrap_or_else(|| panic!("`{}` has no node at `{path}`", case.label));
-            assert_eq!(
-                node.get("description").and_then(Value::as_str),
-                Some(*expected),
-                "`{}` folded something else into `{path}` (PRD resolved q55, ruling b)",
-                case.label
-            );
+        for (wire, mechanism, expectations) in [
+            ("messages", "native", case.described),
+            (
+                "chat_completions",
+                "native",
+                case.described_on_the_openai_table,
+            ),
+        ] {
+            let entry = lowered
+                .iter()
+                .find(|entry| {
+                    entry["label"] == json!(case.label)
+                        && entry["wire"] == json!(wire)
+                        && entry["mechanism"] == json!(mechanism)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{}` was never projected onto `{wire}`/`{mechanism}`",
+                        case.label
+                    )
+                });
+            for (path, expected) in expectations {
+                let node = value_at(&entry["schema"], path)
+                    .unwrap_or_else(|| panic!("`{}` has no node at `{path}`", case.label));
+                assert_eq!(
+                    node.get("description").and_then(Value::as_str),
+                    Some(*expected),
+                    "`{}` folded something else into `{path}` on `{wire}`/`{mechanism}` (PRD \
+                     resolved q55, ruling b)",
+                    case.label
+                );
+            }
         }
     }
     // The one case whose whole point is that nothing moves.
@@ -5496,6 +5619,14 @@ fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
 /// A closed list rather than "every key in the document", because the question
 /// is about the *schema* vocabulary: a property named `minimum` inside
 /// `properties` is a field name, and the delta is measured over keywords.
+///
+/// It is written out rather than derived because it is not quite the column's
+/// own vocabulary: it carries `anyOf`, which this compiler never emits and a
+/// written case in [`projections`] does, and it leaves out `description`, which
+/// this compiler emits and lowering is *supposed* to change. What keeps it
+/// honest is [`the_refusal_vocabulary_covers_every_constraint_a_schema_can_carry`],
+/// which holds it to [`keywords_the_json_column_writes`] — so a keyword the
+/// compiler starts emitting is one this quantifier has to gain.
 const KEYWORDS_A_SCHEMA_CAN_CARRY: &[&str] = &[
     "type",
     "properties",
@@ -5521,29 +5652,213 @@ const KEYWORDS_A_SCHEMA_CAN_CARRY: &[&str] = &[
     "maxLength",
 ];
 
-/// …and the subset of those that **bound a value** rather than describe a shape,
-/// which is the vocabulary ruling d's recognizer reads (PRD §9 resolved q55).
+/// The keywords that describe a schema's **shape** rather than bound one of its
+/// values — the one hand-written half of the vocabulary ruling d's recognizer
+/// reads (PRD §9 resolved q55).
 ///
-/// A `type` or a `properties` in a 400 is a malformed request; a `maxItems` or a
-/// `pattern` in one is a constraint the decoder would not compile, which after
-/// lowering can only mean the runtime's table is missing a row. The two lists
-/// are stated separately because they answer different questions, and
-/// [`the_refusal_vocabulary_covers_every_constraint_a_schema_can_carry`] holds
-/// this one to being a subset of the one above.
-const CONSTRAINTS_A_SCHEMA_CAN_CARRY: &[&str] = &[
-    "format",
-    "pattern",
-    "uniqueItems",
-    "maxItems",
-    "minItems",
-    "minimum",
-    "maximum",
-    "exclusiveMinimum",
-    "exclusiveMaximum",
-    "multipleOf",
-    "minLength",
-    "maxLength",
+/// A `type` or a `properties` named in a 400 is a malformed request; a
+/// `maxItems` or a `pattern` in one is a constraint the decoder would not
+/// compile, which after lowering can only mean the runtime's table is missing a
+/// row. So [`constraints_a_schema_can_carry`] is everything the JSON column
+/// writes **minus this list**, and that direction is the point: a constraint
+/// keyword this compiler starts emitting joins the recognizer's vocabulary
+/// without anyone remembering to add it, and only a *shape* keyword — the rarer
+/// and safer kind — costs a line here, written deliberately.
+const SHAPE_KEYWORDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "oneOf",
+    "enum",
+    "const",
+    "default",
+    "description",
 ];
+
+/// …so the constraints are the rest of what the column writes, derived rather
+/// than restated beside the assertion that reads them.
+fn constraints_a_schema_can_carry() -> BTreeSet<String> {
+    let mut found = keywords_the_json_column_writes();
+    for keyword in SHAPE_KEYWORDS {
+        found.remove(*keyword);
+    }
+    found
+}
+
+/// Every keyword `codegen::schema`'s JSON column writes, asked of the column
+/// itself.
+///
+/// [`the_maximal_schema`] is one type node per form of grammar 3.2 with **every**
+/// optional key the IR carries populated, and every node in it is a struct
+/// literal with no `..rest`: a constraint field added to `ir::schema` fails to
+/// compile here until it is populated, and once it is, the keyword it lowers to
+/// turns up in this set. That is the link the vocabulary needs — the right-hand
+/// side of gate 23b is what the compiler emits, not a second list beside it.
+fn keywords_the_json_column_writes() -> BTreeSet<String> {
+    use compose_core::codegen::schema::{json_field_map, json_type_node};
+
+    let mut found = BTreeSet::new();
+    let mut forms: BTreeSet<&'static str> = BTreeSet::new();
+    for ty in the_maximal_schema() {
+        forms.insert(form_name(&ty.form));
+        schema_keywords(&json_type_node(&ty), &mut found);
+    }
+    assert_eq!(
+        forms.len(),
+        5,
+        "the maximal schema does not cover all five forms of grammar 3.2, so a keyword only one \
+         of them writes would be missing from this vocabulary: {forms:?}"
+    );
+    // The other entry point into the same column: a surface held as a field map
+    // rather than as a type node.
+    schema_keywords(&json_field_map(&maximal_field_map()), &mut found);
+    found
+}
+
+/// Which form of grammar 3.2 a node is, as an exhaustive match — so a sixth one
+/// is a compile error here rather than a form [`the_maximal_schema`] silently
+/// stops covering.
+fn form_name(form: &TypeForm) -> &'static str {
+    match form {
+        TypeForm::Scalar(_) => "scalar",
+        TypeForm::Enum(_) => "enum",
+        TypeForm::Object(_) => "object",
+        TypeForm::Array(_) => "array",
+        TypeForm::Union(_) => "union",
+    }
+}
+
+/// The keys of every **schema node** inside a document the JSON column wrote.
+///
+/// The recursion follows the three positions that column puts a subschema in —
+/// `properties`' values, `items`, and a union's `oneOf` — and stops at every
+/// other key, because every other key carries a *value*: an `enum`'s members, a
+/// `const`, a `default:`, and the names inside `properties` and `required` are
+/// data a composition declared, free to be spelled like a keyword. A fourth
+/// subschema position is still caught rather than missed: the keyword naming it
+/// is a key of the node holding it, so it lands in this set as a keyword nothing
+/// watches and fails the gate that reads it.
+fn schema_keywords(schema: &Value, found: &mut BTreeSet<String>) {
+    let Value::Object(map) = schema else {
+        return;
+    };
+    for (key, value) in map {
+        found.insert(key.clone());
+        match key.as_str() {
+            "items" => schema_keywords(value, found),
+            "oneOf" | "anyOf" => {
+                for member in value.as_array().into_iter().flatten() {
+                    schema_keywords(member, found);
+                }
+            }
+            "properties" => {
+                for (_, member) in value.as_object().into_iter().flatten() {
+                    schema_keywords(member, found);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// One type node per form of grammar 3.2, each carrying every optional key its
+/// IR node declares.
+///
+/// Not a *valid* composition and not meant to be: `min_length` beside `minimum`
+/// on one scalar is two constraints the validator would refuse together, and the
+/// question here is which keywords the JSON column can write, which it answers
+/// by writing them. Nothing parses, resolves or validates this — it goes
+/// straight into `json_type_node`.
+fn the_maximal_schema() -> Vec<TypeNode> {
+    vec![
+        maximal_scalar_node(),
+        node(TypeForm::Enum(EnumType {
+            variants: vec![spanned("first".to_string()), spanned("second".to_string())],
+            default: Some(spanned(Literal::String("first".to_string()))),
+        })),
+        node(TypeForm::Object(ObjectType {
+            properties: maximal_field_map(),
+            optional: vec![spanned(Ident::new("bounded"))],
+            default: Some(spanned(Literal::Mapping(Vec::new()))),
+        })),
+        node(TypeForm::Array(ArrayType {
+            items: Box::new(maximal_scalar_node()),
+            max_items: Some(8),
+            min_items: Some(1),
+            unique_items: Some(true),
+            default: Some(spanned(Literal::Sequence(Vec::new()))),
+        })),
+        node(TypeForm::Union(UnionType {
+            discriminator: spanned(Ident::new("kind")),
+            variants: vec![
+                UnionVariant {
+                    tag: spanned(Ident::new("one")),
+                    fields: maximal_field_map(),
+                },
+                UnionVariant {
+                    tag: spanned(Ident::new("two")),
+                    fields: maximal_field_map(),
+                },
+            ],
+        })),
+    ]
+}
+
+/// A scalar carrying all nine of grammar 3.3's constraint keys at once.
+fn maximal_scalar_node() -> TypeNode {
+    node(TypeForm::Scalar(Scalar {
+        kind: ScalarKind::String,
+        min_length: Some(1),
+        max_length: Some(200),
+        pattern: Some("^a+$".to_string()),
+        format: Some(StringFormat::Uuid),
+        minimum: Some(Number::Int(0)),
+        maximum: Some(Number::Int(10)),
+        exclusive_minimum: Some(Number::Int(0)),
+        exclusive_maximum: Some(Number::Float(10.5)),
+        multiple_of: Some(Number::Int(5)),
+        default: Some(spanned(Literal::String("a".to_string()))),
+    }))
+}
+
+/// …and a field map holding one, which is the other shape the column is entered
+/// at.
+fn maximal_field_map() -> FieldMap {
+    FieldMap {
+        surface: Surface::Result,
+        fields: vec![Field {
+            name: spanned(Ident::new("bounded")),
+            ty: maximal_scalar_node(),
+        }],
+        span: nowhere(),
+    }
+}
+
+/// A described type node around one form.
+fn node(form: TypeForm) -> TypeNode {
+    TypeNode {
+        description: Some(spanned("What the author wrote.".to_string())),
+        span: nowhere(),
+        form,
+    }
+}
+
+/// A value carrying [`nowhere`]'s span.
+fn spanned<T>(value: T) -> Spanned<T> {
+    Spanned::new(value, nowhere())
+}
+
+/// The span of a node nobody wrote, which a hand-built IR still needs one of.
+fn nowhere() -> Span {
+    Span::new(
+        SourceName::new("<the maximal schema>"),
+        0..0,
+        Position::new(1, 1),
+        Position::new(1, 1),
+    )
+}
 
 /// The keywords one `const NAME: readonly string[] = […]` of the emitted runtime
 /// names, read out of the TypeScript with its comments taken off.
@@ -5599,19 +5914,38 @@ fn quoted_on(line: &str) -> Vec<String> {
 /// cheap direction of being wrong — is therefore watched too, and that posture
 /// is only paid for while it is.
 ///
-/// So the emitted vocabulary is held to this file's own closed list of what
-/// `codegen::schema`'s JSON column can write, in both directions: a constraint
-/// this compiler starts emitting is one the recognizer must start watching for,
-/// and a keyword the recognizer watches that no schema can carry is a word it
-/// could only misread a refusal by.
+/// So the emitted vocabulary is held to what `codegen::schema`'s JSON column
+/// **actually writes**, in both directions: a constraint this compiler starts
+/// emitting is one the recognizer must start watching for, and a keyword the
+/// recognizer watches that no schema can carry is a word it could only misread a
+/// refusal by. The right-hand side is [`constraints_a_schema_can_carry`], swept
+/// out of the column over [`the_maximal_schema`] rather than restated here — a
+/// list beside the assertion would answer "yes" to a keyword neither side had
+/// heard of, which is the whole failure ruling d exists to close.
 #[test]
 fn the_refusal_vocabulary_covers_every_constraint_a_schema_can_carry() {
-    let carried: BTreeSet<&str> = KEYWORDS_A_SCHEMA_CAN_CARRY.iter().copied().collect();
-    for keyword in CONSTRAINTS_A_SCHEMA_CAN_CARRY {
+    // The shape half is hand-declared, so it is held to the column too: a
+    // keyword listed there that nothing emits is one this file has stopped
+    // subtracting anything for, and a keyword it drops silently becomes a
+    // constraint.
+    let writes = keywords_the_json_column_writes();
+    for keyword in SHAPE_KEYWORDS {
         assert!(
-            carried.contains(keyword),
-            "`{keyword}` is not a keyword this compiler's JSON column can write, so it cannot be \
-             a constraint one carries"
+            writes.contains(*keyword),
+            "`{keyword}` is declared a shape keyword and this compiler's JSON column does not \
+             write it, so `SHAPE_KEYWORDS` is subtracting a word from a vocabulary that never \
+             had it: {writes:?}"
+        );
+    }
+    // …and gate 23's quantifier is held to it as well, bar the one keyword
+    // lowering is supposed to change.
+    let carried: BTreeSet<&str> = KEYWORDS_A_SCHEMA_CAN_CARRY.iter().copied().collect();
+    for keyword in &writes {
+        assert!(
+            keyword == "description" || carried.contains(keyword.as_str()),
+            "this compiler's JSON column writes `{keyword}` and `KEYWORDS_A_SCHEMA_CAN_CARRY` \
+             does not name it, so gate 23's \"nothing else removed\" half does not quantify over \
+             it — a table could take it off the wire and nothing here would say so"
         );
     }
 
@@ -5623,10 +5957,7 @@ fn the_refusal_vocabulary_covers_every_constraint_a_schema_can_carry() {
     .into_iter()
     .flat_map(emitted_keywords)
     .collect();
-    let constraints: BTreeSet<String> = CONSTRAINTS_A_SCHEMA_CAN_CARRY
-        .iter()
-        .map(|keyword| (*keyword).to_string())
-        .collect();
+    let constraints = constraints_a_schema_can_carry();
     assert_eq!(
         watched,
         constraints,
