@@ -5476,6 +5476,94 @@ fn a_schema_keyword_refusal_on_a_loop_call_names_the_tools_own_table() {
     assert!(provider.snapshot().is_drained());
 }
 
+/// …and on the two wires that lower **no** client tool, the same refusal names
+/// the projection rather than a row (PRD §9 resolved q55, ruling d over ruling
+/// a).
+///
+/// A tool's `parameters` is lowered on the one wire that promises `strict` over
+/// it. Messages sends a tool's `input_schema` whole and Chat Completions sends a
+/// function's `parameters` with no `strict` at all, so on those two the schema a
+/// gateway is complaining about went out exactly as the composition wrote it and
+/// **no** table row was consulted on the way. Naming the wire's `forced_tool`
+/// row there would name a repair that cannot work: that row is read for the
+/// pinned output tool, editing it changes nothing about this document, and the
+/// next run fails identically.
+///
+/// A conforming service cannot draw this — neither wire hands a tool's schema to
+/// a structured-output decoder — which is exactly why the sentence has to be
+/// right: the operator reading it is already looking at a service doing
+/// something the wire does not ask for, and a confident wrong instruction is
+/// what sends them to edit a table for an afternoon. The classification is the
+/// same as everywhere else in ruling d and the assertions say so: one request,
+/// no ladder, no memo.
+#[test]
+fn a_schema_keyword_refusal_on_a_wire_that_sends_a_tool_whole_names_no_row() {
+    let provider = MockProvider::start().expect("a loopback port");
+    // `tool.lookup`'s `input:` carries `min_length: 1` (grammar §3.5), which
+    // reaches this wire as `minLength` inside the tool's `input_schema` — and a
+    // lagging gateway in front of the Messages API is free to refuse it there
+    // however little the API itself would.
+    provider.enqueue(Script::new(
+        SONNET,
+        Outcome::raw(
+            400,
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "tools.0.input_schema: 'minLength' is not supported.",
+                },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "agent-anthropic",
+        "flow.research",
+        &[("goal", "ship it")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("minLength"),
+        "the keyword the endpoint named is what the diagnostic is about here too: {failure}"
+    );
+    assert!(
+        failure.contains("hands a client tool's schema to the endpoint whole"),
+        "…and what it says is that nothing lowered this document, which is the fact that decides \
+         the repair: {failure}"
+    );
+    assert!(
+        failure.contains("`messages`/`forced_tool` row governs the pinned output tool alone"),
+        "…so the row an operator would otherwise reach for is named as the wrong one rather than \
+         left to be guessed at: {failure}"
+    );
+    assert!(
+        !failure.contains("the repair is one row of `LOWERED_AWAY`"),
+        "…and the repair a row would be is not offered on a wire where no row saw this schema: \
+         {failure}"
+    );
+    assert!(
+        failure.contains("'minLength' is not supported."),
+        "…with the provider's body quoted rather than paraphrased: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "one request: a schema keyword is this runtime's own failure on every wire, and never a \
+         reason to ask the same endpoint a second way"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and nothing was remembered as a mechanism this endpoint lacks"
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
 /// A loop answer is replayed as the model sent it, and an answer that carried
 /// nothing stops the node instead of becoming a turn no provider accepts.
 ///

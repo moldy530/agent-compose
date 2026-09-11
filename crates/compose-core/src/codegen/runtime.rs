@@ -48,7 +48,11 @@
 //! a `min_length:` — and
 //! `a_client_tools_schema_is_lowered_where_its_wire_declares_strict` pins it on
 //! both sides: lowered where that wire declares `strict`, and sent whole on a
-//! wire that declares none over it.
+//! wire that declares none over it. That second side is also what the refusal's
+//! own sentence has to say on those two wires — a row named there would be a
+//! repair that changes nothing about the document that went out, which
+//! `a_schema_keyword_refusal_on_a_wire_that_sends_a_tool_whole_names_no_row`
+//! holds it to.
 
 use crate::ir::Ir;
 

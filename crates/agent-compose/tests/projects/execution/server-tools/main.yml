@@ -523,7 +523,7 @@ agent.tallier:
   # incidental, and so the *description* each stripped bound folds into is one
   # an author wrote rather than one this fixture happens to leave empty.
   #
-  # The same agent is declared in `agent-openai` and `server-tools`, word for
+  # The same agent is declared in `agent-anthropic` and `agent-openai`, word for
   # word except its `model:`. Three wires, one schema: a projection that is
   # right on one of them and wrong on another is the failure the three fixtures
   # exist to separate.

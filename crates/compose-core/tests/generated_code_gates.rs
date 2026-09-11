@@ -262,14 +262,18 @@
 //!     keyword — nothing else removed, nothing else changed, every stripped
 //!     bound folded into its node's `description` where the model still reads
 //!     it. It also answers the projection's own corners over a written corpus
-//!     (nested objects, arrays of objects, `anyOf` branches, paired bounds, a
-//!     node with no description of its own, `uniqueItems: false`) and asks the
-//!     runner whether the function was deterministic and left its input alone,
-//!     which no JSON round trip could show. Its **`23b`** half is about the same
-//!     ruling's other side: the recognizer that refuses to ladder on a
-//!     schema-keyword 400 has to watch every constraint a schema can carry
-//!     rather than only the ones a table strips, because a keyword left on the
-//!     wire deliberately is exactly the one a refusal will name.
+//!     (nested objects, arrays of objects, an array of arrays, `anyOf` branches,
+//!     paired bounds, a node with no description of its own, `uniqueItems:
+//!     false`), holds **every** keyword of every table to ruling b over a probe
+//!     node per constraint — so a table that gains a keyword with no sentence
+//!     behind it fails here rather than silently dropping a bound out of the
+//!     model's view — and asks the runner whether the function was deterministic
+//!     and left its input alone, which no JSON round trip could show. Its
+//!     **`23b`** half is about the same ruling's other side: the recognizer that
+//!     refuses to ladder on a schema-keyword 400 has to watch every constraint a
+//!     schema can carry rather than only the ones a table strips, because a
+//!     keyword left on the wire deliberately is exactly the one a refusal will
+//!     name.
 //!
 //! # The toolchain fixture
 //!
@@ -5076,8 +5080,9 @@ struct Projection {
 /// reads as one phrase, the one keyword the two tables disagree about — read on
 /// both rows, since it is silent on the row the ruling was written from — where
 /// the sentence lands when the author wrote one and when they did not, how deep
-/// the walk goes, the one keyword whose value can ask for nothing at all, and a
-/// field **named** after a keyword a table strips.
+/// the walk goes, that two bounded arrays one inside the other fold onto two
+/// nodes rather than one, the one keyword whose value can ask for nothing at
+/// all, and a field **named** after a keyword a table strips.
 fn projections() -> Vec<Projection> {
     vec![
         Projection {
@@ -5179,6 +5184,44 @@ fn projections() -> Vec<Projection> {
                 ),
                 ("properties.seen", "At most 4 items; no duplicate items."),
             ],
+        },
+        Projection {
+            label: "an array of arrays, bounded at both depths",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        // Grammar D10 requires `max_items` on *every* array
+                        // inside a result schema, so an array of arrays is a
+                        // legal composition in which two folds must land on two
+                        // different nodes — the one nesting shape where a walk
+                        // that stopped one level down, or folded the inner
+                        // sentence onto the outer node, would still answer a
+                        // schema carrying no stripped keyword and pass every
+                        // structural assertion in this gate.
+                        "rows": {
+                            "type": "array",
+                            "description": "The grid.",
+                            "maxItems": 3,
+                            "items": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 2,
+                                "items": { "type": "string", "maxLength": 40 },
+                            },
+                        },
+                    },
+                    "required": ["rows"],
+                    "additionalProperties": false,
+                })
+            },
+            described: &[
+                ("properties.rows", "The grid. At most 3 items."),
+                ("properties.rows.items", "Between 1 and 2 items."),
+                ("properties.rows.items.items", "At most 40 characters."),
+            ],
+            // Nothing here is in one table and not the other.
+            described_on_the_openai_table: &[],
         },
         Projection {
             label: "an anyOf whose branches carry different families",
@@ -5369,6 +5412,83 @@ fn projections() -> Vec<Projection> {
     ]
 }
 
+/// The label of the corpus case that carries one node per constraint keyword.
+const EVERY_CONSTRAINT: &str = "one node per constraint a schema can carry";
+
+/// …and that case: a field per constraint [`constraints_a_schema_can_carry`]
+/// names, each one a node asking for that constraint and nothing else.
+///
+/// Written for the **tables** rather than for the shapes a composition happens
+/// to have, because those are two different quantifiers. The corpus above
+/// answers ruling b for every bound the goldens and the written cases carry; a
+/// table that gained a row for a keyword none of them declares would strip it
+/// from every request, fold nothing into any description, and leave this gate
+/// green — the constraint gone from the wire *and* from the model's view, which
+/// is the one outcome ruling b rules out. With a node per keyword, every row of
+/// every table is read against nodes carrying its own keywords, so no row can be
+/// proven vacuously.
+///
+/// Not a composition anything would validate, and it does not need to be: it
+/// goes straight into the runtime's projection, the way [`the_maximal_schema`]
+/// goes straight into the JSON column.
+fn a_node_per_constraint() -> Value {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for keyword in constraints_a_schema_can_carry() {
+        let asking = a_node_that_asks_for(&keyword).unwrap_or_else(|| {
+            panic!(
+                "`{keyword}` is a constraint this compiler's JSON column writes and nothing here \
+                 asks for it, so no lowering table could be held to ruling b over it: give it a \
+                 node in `a_node_that_asks_for`"
+            )
+        });
+        properties.insert(keyword.clone(), asking);
+        required.push(Value::String(keyword));
+    }
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties),
+        "required": Value::Array(required),
+        "additionalProperties": false,
+    })
+}
+
+/// One schema node that **asks for** `keyword`, written the way an author who
+/// meant it would write it.
+///
+/// One value per keyword rather than a sweep over the shapes a value can take,
+/// because a fold is allowed to read the value it is folding: `uniqueItems:
+/// false` is grammar 3.5's default written out and folds nothing on purpose, so
+/// a probe carrying a value nobody would write could only ask whether silence is
+/// silent. What the gate reads off these is the other direction — that a keyword
+/// a table strips while the author *did* mean it is a keyword some
+/// `FOLDED_CONSTRAINTS` rule speaks for.
+///
+/// `None` for a keyword this function has not heard of, which
+/// [`a_node_per_constraint`] turns into a failure rather than a skip: a
+/// constraint `codegen::schema` starts emitting needs its node here before any
+/// table can be held to ruling b over it.
+fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
+    let (kind, asked): (&str, Value) = match keyword {
+        "maxItems" | "minItems" => ("array", json!(2)),
+        "uniqueItems" => ("array", json!(true)),
+        "minLength" | "maxLength" => ("string", json!(3)),
+        "pattern" => ("string", json!("^a+$")),
+        "format" => ("string", json!("uuid")),
+        "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf" => {
+            ("number", json!(4))
+        }
+        _ => return None,
+    };
+    let mut node = serde_json::Map::new();
+    node.insert("type".to_string(), json!(kind));
+    if kind == "array" {
+        node.insert("items".to_string(), json!({ "type": "string" }));
+    }
+    node.insert(keyword.to_string(), asked);
+    Some(Value::Object(node))
+}
+
 /// Gate 23: the wire schema is the lowering's image of the schema the parse
 /// checks, and the delta is exactly the table (PRD §9 resolved q55, amending
 /// resolved q16).
@@ -5396,6 +5516,14 @@ fn projections() -> Vec<Projection> {
 ///     equality above is blind to descriptions on purpose, so the one thing
 ///     lowering is allowed to rewrite is pinned from both sides: appended to
 ///     where a bound came off, and byte-identical everywhere else.
+///
+/// Those four quantify over the schemas handed in, which leaves one way for a
+/// table to be wrong and nothing to say so: a row for a keyword no case in the
+/// corpus declares strips that keyword out of every request and folds nothing,
+/// and a constraint gone from the wire *and* from the model's view is precisely
+/// what ruling b forbids. So the corpus also carries [`a_node_per_constraint`] —
+/// a node per constraint a schema can carry — and every row is read against the
+/// nodes for its own keywords.
 ///
 /// Three claims about the projection *itself* are read by the runner rather than
 /// here, because each of them stops being observable the moment a schema is
@@ -5458,6 +5586,9 @@ fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
                 .iter()
                 .map(|case| json!({ "label": case.label, "schema": (case.schema)() })),
         )
+        .chain(std::iter::once(
+            json!({ "label": EVERY_CONSTRAINT, "schema": a_node_per_constraint() }),
+        ))
         .collect();
 
     let observed = lowered_by_the_runtime(&project, &handed);
@@ -5547,17 +5678,35 @@ fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
         );
         // And every stripped bound is still said, where the model reads it.
         for (path, node) in nodes(&full) {
-            // Keywords this row strips **that ask for something**. A
-            // `uniqueItems: false` is grammar 3.5's default written out — the
-            // absence of a constraint — and it is stripped like any other
-            // keyword the decoder cannot compile while folding no sentence,
-            // because "duplicates are allowed" is not a bound a model is being
-            // aimed at.
+            // Keywords this row strips **that ask for something**, read off the
+            // shape of the value. A bound's value is a scalar: a number, `true`,
+            // or a string — `pattern` and `format` are the two the tables leave
+            // on the wire today and the two most likely to move onto one. Two
+            // shapes are deliberately not bounds:
+            //
+            //   * `uniqueItems: false` is grammar 3.5's default written out —
+            //     the absence of a constraint — and it is stripped like any
+            //     other keyword the decoder cannot compile while folding no
+            //     sentence, because "duplicates are allowed" is not a bound a
+            //     model is being aimed at;
+            //   * an **object** is a field *name* spelled like a keyword rather
+            //     than a keyword: `output: { minimum: { type: integer } }` is a
+            //     legal composition (grammar 3.1) and this walk visits the
+            //     `properties` map holding it as a node of its own.
+            //
+            // Reading a **string** as a bound is the half that keeps this branch
+            // from certifying a silence: a table that gains `pattern` strips a
+            // string-valued keyword, and a filter that knew only numbers and
+            // `true` would drop that node into the `stripped.is_empty()` branch
+            // below — which asserts the description did *not* change, and would
+            // pass a constraint that had vanished from the model's view while
+            // claiming that was correct.
             let stripped: Vec<&&str> = table
                 .iter()
                 .filter(|keyword| {
-                    node.get(**keyword)
-                        .is_some_and(|value| value.is_number() || value == &json!(true))
+                    node.get(**keyword).is_some_and(|value| {
+                        value.is_number() || value.is_string() || value == &json!(true)
+                    })
                 })
                 .collect();
             let at = value_at(wire_schema, &path).unwrap_or_else(|| {
@@ -5588,7 +5737,9 @@ fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
                 said.ends_with('.'),
                 "`{label}` at `{path}` lost {stripped:?} on `{wire}`/`{mechanism}` and says \
                  nothing about it: a stripped bound is folded into that node's `description` so \
-                 the model is still aimed at it (PRD resolved q55, ruling b) — found {said:?}"
+                 the model is still aimed at it (PRD resolved q55, ruling b) — found {said:?}. A \
+                 keyword a table strips with no rule for it in `FOLDED_CONSTRAINTS` is a \
+                 constraint that left the wire and the description both"
             );
             if let Some(authored) = node.get("description").and_then(Value::as_str) {
                 assert!(
@@ -5655,6 +5806,59 @@ fn the_wire_schema_is_the_lowering_of_the_schema_the_parse_checks() {
             }
         }
     }
+    // …and ruling b's claim read off the **tables** themselves: every keyword
+    // every row strips folds a sentence into the node it came off.
+    //
+    // The assertions above quantify over the schemas that were handed in, which
+    // is not the same quantifier — a row for a keyword no case declares is
+    // proven by nothing at all, and the next edit to a table is exactly where
+    // that bites: the constraint would leave the wire, fold nothing, and be gone
+    // from the model's view with the whole suite green. [`a_node_per_constraint`]
+    // closes that by carrying a node for every constraint a schema can carry, so
+    // what is load bearing here is the **lookup**: a table keyword with no node
+    // of its own is a keyword the loop above proved nothing about, and it fails
+    // as a missing node rather than passing as an absence. The description read
+    // beside it is the same claim that loop makes, stated where the keyword and
+    // its row can be named in the failure.
+    let mut probed = 0;
+    for entry in lowered
+        .iter()
+        .filter(|entry| entry["label"] == json!(EVERY_CONSTRAINT))
+    {
+        probed += 1;
+        let wire = entry["wire"].as_str().expect("a wire");
+        let mechanism = entry["mechanism"].as_str().expect("a mechanism");
+        for keyword in tables[wire][mechanism]
+            .as_array()
+            .unwrap_or_else(|| panic!("the runtime declares no `{wire}`/`{mechanism}` table"))
+        {
+            let keyword = keyword.as_str().expect("a keyword is a string");
+            let at = format!("properties.{keyword}");
+            let node = value_at(&entry["schema"], &at).unwrap_or_else(|| {
+                panic!("the probe lost the node at `{at}` on `{wire}`/`{mechanism}`")
+            });
+            let said = node
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                !said.is_empty(),
+                "`{wire}`/`{mechanism}` strips `{keyword}` and folds nothing into the node it came \
+                 off, so a composition that wrote that bound loses it from the wire and from the \
+                 model's view alike (PRD resolved q55, ruling b). Every keyword a `LOWERED_AWAY` \
+                 row names needs a rule in `FOLDED_CONSTRAINTS`, in \
+                 `crates/compose-core/src/codegen/js/runtime.ts`, and a rule that says nothing for \
+                 a value asking for nothing — as `uniqueItems`'s does — is still a rule: {node}"
+            );
+        }
+    }
+    assert_eq!(
+        probed,
+        RUNGS.len(),
+        "the per-keyword case was not projected onto every rung, so some table's keywords are \
+         proven by nothing"
+    );
+
     // The one case whose whole point is that nothing moves.
     let untouched = lowered
         .iter()

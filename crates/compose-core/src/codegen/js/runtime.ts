@@ -3573,8 +3573,8 @@ function loweringIsWrong(
   return schemaRefused(
     `\`${model.address}\` asked \`${model.provider.address}\` for structured output through \`${MECHANISM_KEYS[wire][mechanism][0]}\` and the endpoint refused the schema itself, naming \`${keyword}\``,
     wire,
-    mechanism,
     keyword,
+    aRowIsMissing(wire, mechanism, keyword),
     refusal,
   );
 }
@@ -3595,9 +3595,11 @@ function loweringIsWrong(
  * call has no second rung to move to and records no refusal
  * ([`rememberRefusal`] is [`structuredAnswer`]'s alone), so ruling d's two hard
  * guarantees already held on this path. What this adds is the sentence that
- * makes the bug self-diagnosing, naming the row [`loweredStrictTool`] reads —
- * the wire's **forced-tool** row, because a function's `parameters` is what that
- * rung sends.
+ * makes the bug self-diagnosing — and **which** sentence is the one thing that
+ * is not the same on all three wires, because a tool's `parameters` is a
+ * document only one of them lowers ([`lowersAClientTool`]): on Responses the
+ * repair is the row [`loweredStrictTool`] reads, and on the other two there is
+ * no row to edit, because nothing there projected this schema at all.
  */
 function aToolSchemaIsWrong(
   wire: Wire,
@@ -3608,27 +3610,73 @@ function aToolSchemaIsWrong(
   return schemaRefused(
     `\`${model.address}\` offered \`${model.provider.address}\` a tool whose \`parameters\` the endpoint refused, naming \`${keyword}\``,
     wire,
-    "forced_tool",
     keyword,
+    lowersAClientTool(wire)
+      ? aRowIsMissing(wire, "forced_tool", keyword)
+      : nothingLoweredThisTool(wire, keyword),
     refusal,
   );
 }
 
 /**
+ * Whether this wire hands a **client tool's** `parameters` to the decoder that
+ * compiles a structured-output schema — which is the whole of what decides
+ * whether any lowering row governs a tool's schema (PRD §9 resolved q55, ruling
+ * a).
+ *
+ * One wire does. [`callResponses`] declares `strict` on each function it is
+ * handed and projects that function's `parameters` through
+ * [`loweredStrictTool`]. The other two do not: [`callChatCompletions`] sends a
+ * function's `parameters` with no `strict` over it, and [`callMessages`] sends a
+ * tool's `input_schema` whole — so on those two a client tool's schema reaches
+ * the endpoint exactly as the composition wrote it, and the forced-tool row they
+ * *do* have was read for the pinned output tool and nothing else.
+ *
+ * Read by [`aToolSchemaIsWrong`] alone: it is a statement about which repair a
+ * refusal deserves rather than a branch a request takes. A wire that starts
+ * declaring `strict` over the tools it is handed gains its line here beside the
+ * projection in its own composer.
+ */
+function lowersAClientTool(wire: Wire): boolean {
+  return wire === "responses";
+}
+
+/**
  * What both of ruling d's diagnostics say after the call they are about: whose
- * bug this is, which row of which table has it, and what is *not* in doubt.
+ * bug this is, what is *not* in doubt, and — in the `blame` its caller hands in
+ * — which document went out unlowered and what repairs it.
  */
 function schemaRefused(
   opening: string,
   wire: Wire,
-  mechanism: OutputMechanism,
   keyword: string,
+  blame: string,
   refusal: unknown,
 ): Error {
   return new Error(
-    `${opening}: ${describe(refusal)}. This is this runtime's own bug rather than a mechanism the endpoint lacks: \`${keyword}\` is a constraint keyword the \`${wire}\`/\`${mechanism}\` lowering table should have stripped before the request (PRD resolved q55), so nothing laddered and nothing was remembered. The emitted schema and its parse are unchanged; the repair is one row of \`LOWERED_AWAY\` in \`src/runtime.ts\`${alsoAParameterOfThisWire(wire, keyword)}`,
+    `${opening}: ${describe(refusal)}. This is this runtime's own bug rather than a mechanism the endpoint lacks: ${blame}${alsoAParameterOfThisWire(wire, keyword)}`,
     { cause: refusal },
   );
+}
+
+/** …the ordinary blame: a (wire, mechanism) row that should have named the keyword. */
+function aRowIsMissing(wire: Wire, mechanism: OutputMechanism, keyword: string): string {
+  return `\`${keyword}\` is a constraint keyword the \`${wire}\`/\`${mechanism}\` lowering table should have stripped before the request (PRD resolved q55), so nothing laddered and nothing was remembered. The emitted schema and its parse are unchanged; the repair is one row of \`LOWERED_AWAY\` in \`src/runtime.ts\``;
+}
+
+/**
+ * …and the blame on a wire that lowers **no** client tool ([`lowersAClientTool`]).
+ *
+ * Naming a row here would name the wrong repair: the `forced_tool` row of these
+ * two wires is read for the pinned output tool, and editing it would leave this
+ * tool's `parameters` exactly as they went out, so the next run would fail
+ * identically. A conforming service cannot draw this — neither wire hands a
+ * tool's schema to a structured-output decoder, which is why neither lowers one
+ * — so what the sentence has to do is say that, and point at the projection
+ * rather than at a table.
+ */
+function nothingLoweredThisTool(wire: Wire, keyword: string): string {
+  return `\`${keyword}\` is a constraint keyword, and no lowering table took it off this document: the \`${wire}\` wire declares no \`strict\` over a tool's \`parameters\` and hands a client tool's schema to the endpoint whole, so this schema went out as the composition wrote it and the \`${wire}\`/\`forced_tool\` row governs the pinned output tool alone (PRD resolved q55). Nothing laddered and nothing was remembered, and the emitted schema and its parse are unchanged; the repair is to lower a client tool's schema on this wire too, beside \`loweredStrictTool\` in \`src/runtime.ts\`, rather than to edit a row that never saw it`;
 }
 
 /**

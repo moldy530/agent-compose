@@ -434,9 +434,16 @@ const CODEGEN: &[Criterion] = &[
             // …and that second schema's own refusal, which arrives on a call
             // that pinned nothing: the same table row, the same repair, and so
             // the same diagnostic rather than a bare 400 whose wording depends
-            // on which call of the tool loop the model stopped at.
+            // on which call of the tool loop the model stopped at. The wires
+            // that lower no client tool at all are the second row: there the
+            // repair is *not* a table row, and a diagnostic naming one would
+            // send an operator to an edit that cannot change what went out.
             (
                 "a_schema_keyword_refusal_on_a_loop_call_names_the_tools_own_table",
+                Status::Live,
+            ),
+            (
+                "a_schema_keyword_refusal_on_a_wire_that_sends_a_tool_whole_names_no_row",
                 Status::Live,
             ),
             // The other three kinds this milestone executes, which are not the
