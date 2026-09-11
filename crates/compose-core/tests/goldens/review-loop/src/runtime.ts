@@ -491,14 +491,26 @@ export function parseToolArguments<T>(
   throw new ToolCallRefused(`${subject}: ${describeIssues(args, parsed.error?.issues ?? [])}`);
 }
 
-/** A provider answered something other than a completion. */
+/**
+ * A provider answered something other than a completion.
+ *
+ * The **message** carries the first 400 characters of the body, because it is
+ * read wherever a refusal is quoted at all — a spent route, a failed node, a
+ * trace — and those readers want a line rather than a page. The body itself is
+ * carried whole beside it, and one diagnostic quotes it that way
+ * ([`refusalInFull`]): a wire refusing a *schema* reports every offending node
+ * in one answer, so the 400th character falls in the middle of the evidence
+ * exactly where the evidence matters (PRD §9 resolved q55, ruling d).
+ */
 export class ProviderFailure extends Error {
+  readonly model: string;
   readonly status: number;
   readonly body: string;
 
   constructor(model: string, status: number, body: string) {
     super(`\`${model}\` answered ${status}: ${body.slice(0, 400)}`);
     this.name = "ProviderFailure";
+    this.model = model;
     this.status = status;
     this.body = body;
   }
@@ -2393,7 +2405,7 @@ async function structuredAnswer(
     // the call here — unladdered, unmemoized, with the endpoint's body quoted
     // (PRD §9 resolved q55, ruling d).
     const keyword = schemaKeywordRefusal(refused);
-    if (keyword !== undefined) throw loweringIsWrong(wire, model, first, keyword, refused);
+    if (keyword !== undefined) throw loweringIsWrong(wire, model, request, first, keyword, refused);
     if (!unsupportedMechanism(wire, first, refused)) throw refused;
     // The **loss**, recorded before the retry is sent: from here on, every call
     // of this pairing skips the rung this one just found is not there.
@@ -2403,7 +2415,7 @@ async function structuredAnswer(
     } catch (again) {
       const keywordAgain = schemaKeywordRefusal(again);
       if (keywordAgain !== undefined) {
-        throw loweringIsWrong(wire, model, second, keywordAgain, again);
+        throw loweringIsWrong(wire, model, request, second, keywordAgain, again);
       }
       if (!unsupportedMechanism(wire, second, again)) throw again;
       rememberRefusal(key, second);
@@ -3246,6 +3258,14 @@ const WORD_SHAPED_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
  * compiler does not emit is one line, and the cost of missing one it starts
  * emitting is a keyword that reaches the wire inside a subschema nothing looked
  * at.
+ *
+ * `crates/mock-provider/src/lowering.rs` walks the **same three lists** — the
+ * oracle has to look everywhere the projection lowers, or an under-lowered
+ * subschema is a keyword on the wire with nothing to report it — and
+ * `crates/agent-compose/tests/wire_lowering_agreement.rs` asserts the two are
+ * equal, exactly as it does for the keyword tables. The defensive rows are the
+ * reason that test is worth having: a position neither side exercises is a
+ * position that can drift quietly until the day this compiler emits one.
  */
 const SUBSCHEMA_KEYS: readonly string[] = [
   "items",
@@ -3505,10 +3525,22 @@ function foldedConstraints(node: Record<string, unknown>, stripped: readonly str
  * puts the bound. Everything a sentence can legitimately end on is left alone,
  * which keeps this as deterministic as the rest of the projection: the same
  * description and the same table produce the same bytes.
+ *
+ * A description that is **not a string** is unreachable from this grammar —
+ * `codegen::schema` writes that column as prose or not at all — and is rendered
+ * rather than dropped, because dropping it is the one thing this projection does
+ * not do anywhere else. Every other value it cannot read the way a schema would
+ * (an `enum` member spelled like a keyword, a field *named* `minimum`, a
+ * tuple-form `items`) survives untouched, and a node reaching the wire with the
+ * author's own value replaced by this runtime's sentence would be the projection
+ * editing data rather than constraints.
  */
 function appended(authored: unknown, folded: string): string {
-  if (typeof authored !== "string") return folded;
-  const words = authored.replace(/\s+$/u, "");
+  // …with the two spellings of "nothing was written here" read as the absence
+  // they are, rather than rendered as the words `null` and `undefined`.
+  if (authored === undefined || authored === null) return folded;
+  const written = typeof authored === "string" ? authored : bound(authored);
+  const words = written.replace(/\s+$/u, "");
   if (words === "") return folded;
   const stop = /[.!?:;…]$/u.test(words) ? "" : ".";
   return `${words}${stop} ${folded}`;
@@ -3558,10 +3590,10 @@ function namesSchemaKeyword(body: string, keyword: string): boolean {
  * Loud, and about **this runtime** rather than about the endpoint or the
  * composition, because that is what it is: the endpoint compiled everything it
  * was asked to compile except a keyword this projection should have taken off
- * the wire. The provider's own body is quoted whole
- * ([`ProviderFailure`] carries it in its message) so the missing row is readable
- * off the failure without a second run, and the repair is named — one line, in
- * this file.
+ * the wire. The provider's own body is quoted whole ([`refusalInFull`], past the
+ * cut [`ProviderFailure`]'s message takes) so every keyword the endpoint named
+ * is readable off the failure without a second run, and the repair is named —
+ * one line, in this file.
  *
  * A plain `Error`, so [`classify`] answers `undefined` and the route ladder does
  * with it exactly what it does with any other 400: fails the node rather than
@@ -3572,18 +3604,148 @@ function namesSchemaKeyword(body: string, keyword: string): boolean {
 function loweringIsWrong(
   wire: Wire,
   model: ModelBinding,
+  request: ModelRequest,
   mechanism: OutputMechanism,
   keyword: string,
   refusal: unknown,
 ): Error {
+  // …unless the request that drew it put a **second** schema document on the
+  // wire that declares the keyword too, which is what the agent's own tools are
+  // on every pinned call ([`alsoDeclaredByATool`]).
+  const tools = alsoDeclaredByATool(wire, request, keyword);
   return schemaRefused(
-    `\`${model.address}\` asked \`${model.provider.address}\` for structured output through \`${MECHANISM_KEYS[wire][mechanism][0]}\` and the endpoint refused the schema itself, naming \`${keyword}\``,
+    `\`${model.address}\` asked \`${model.provider.address}\` for structured output through \`${MECHANISM_KEYS[wire][mechanism][0]}\` and the endpoint refused a schema, naming \`${keyword}\``,
     wire,
     keyword,
-    aRowIsMissing(wire, mechanism, keyword),
+    tools.length === 0
+      ? aRowIsMissing(wire, mechanism, keyword)
+      : twoDocumentsDeclareIt(wire, mechanism, keyword, tools),
     refusal,
   );
 }
+
+/**
+ * The **client tools** on this pinned request whose own schema declares the
+ * refused keyword, on a wire where no row lowered them (PRD §9 resolved q55,
+ * ruling d).
+ *
+ * A pinned request carries two kinds of schema document, and only one of them is
+ * the pinned one: every composer puts the agent's declared tools on the pinned
+ * call as well, because the history it replays names them. So a 400 naming a
+ * constraint keyword may have been drawn by a tool's schema rather than by the
+ * pinned output schema — and on the two wires that hand a client tool's schema
+ * to the endpoint whole ([`lowersAClientTool`]), naming this (wire, mechanism)'s
+ * row as the repair would name a table that never saw that document, which is
+ * the misdirection [`nothingLoweredThisTool`] exists to prevent on the unpinned
+ * path.
+ *
+ * Answered **by name**, and only for the tools that actually declare the
+ * keyword: a request whose tools carry no such bound cannot have drawn this
+ * refusal with one, and a diagnostic that raised the possibility anyway would
+ * send an operator reading a `maxItems` refusal off to inspect a tool with no
+ * array in it. The keyword is looked for where the projection would have lowered
+ * it ([`declaresTheKeyword`]), so the two agree about what "this document carries
+ * it" means.
+ *
+ * Empty on the wire that *does* lower a client tool's schema: there a function's
+ * `parameters` went through this table too ([`loweredStrictTool`] reads the
+ * `forced_tool` row), and both of that wire's rows are one list — one decoder
+ * under three spellings — so the ordinary sentence names a row whose edit repairs
+ * either document. A wire whose two rows ever stopped being the same list would
+ * want naming here as well.
+ */
+function alsoDeclaredByATool(
+  wire: Wire,
+  request: ModelRequest,
+  keyword: string,
+): readonly string[] {
+  if (lowersAClientTool(wire)) return [];
+  return request.tools
+    .filter((tool) => sendsItsSchema(wire, tool) && declaresTheKeyword(tool.schema, keyword))
+    .map((tool) => tool.name);
+}
+
+/**
+ * Whether a tool's own schema **reaches the wire** at all.
+ *
+ * A provider-defined tool is declared to the Messages API as its type and its
+ * name and nothing else (grammar 6.1, PRD resolved q54 ruling d) — the schema is
+ * the provider's — so it is the one tool whose `input_schema` no endpoint can be
+ * complaining about. Every other client tool sends its schema on every wire.
+ */
+function sendsItsSchema(wire: Wire, tool: ToolSpec): boolean {
+  return wire !== "messages" || tool.providerType === undefined;
+}
+
+/**
+ * Whether any node of this schema declares `keyword`, walked exactly where
+ * [`lowerNode`] walks.
+ *
+ * The same positions and the same rule about names: a `properties` entry spelled
+ * `minimum` is a *field* and not a keyword, so this reads a map's members rather
+ * than its keys. A walk that answered anything else would describe a document
+ * differently from the projection that lowers it.
+ */
+function declaresTheKeyword(node: unknown, keyword: string): boolean {
+  if (typeof node !== "object" || node === null || Array.isArray(node)) return false;
+  const source = node as Record<string, unknown>;
+  if (Object.hasOwn(source, keyword)) return true;
+  return Object.entries(source).some(([key, value]) => {
+    if (SUBSCHEMA_KEYS.includes(key)) return declaresTheKeyword(value, keyword);
+    if (SUBSCHEMA_LIST_KEYS.includes(key)) {
+      return Array.isArray(value) && value.some((item) => declaresTheKeyword(item, keyword));
+    }
+    if (SUBSCHEMA_MAP_KEYS.includes(key)) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+      return Object.values(value as Record<string, unknown>).some((member) =>
+        declaresTheKeyword(member, keyword),
+      );
+    }
+    if (key === "additionalProperties") return declaresTheKeyword(value, keyword);
+    return false;
+  });
+}
+
+/**
+ * …the blame on a pinned call whose **tools** declare the keyword too
+ * ([`alsoDeclaredByATool`]).
+ *
+ * Two documents went out and the endpoint named a keyword both of them could
+ * have carried, so what this says is which two and what repairs each — rather
+ * than the one sentence the other branch can honestly say. Deciding between them
+ * here is not possible and not needed: the path a refusal is addressed at is
+ * vendor-specific (`tools.0.input_schema`, `output_config.format.schema`), and
+ * the whole body is quoted a clause earlier ([`refusalInFull`]), so the operator
+ * reads the path this runtime would have had to guess at.
+ *
+ * Both repairs are named for the same reason the unpinned path names one: a
+ * confident wrong instruction is what sends somebody to edit a table for an
+ * afternoon, and these two are not the same edit — one is a row of
+ * [`LOWERED_AWAY`], and the other is a projection this wire does not have.
+ */
+function twoDocumentsDeclareIt(
+  wire: Wire,
+  mechanism: OutputMechanism,
+  keyword: string,
+  tools: readonly string[],
+): string {
+  const named = tools.map((name) => `\`${name}\``).join(", ");
+  return `\`${keyword}\` is a constraint keyword, and this request put two schema documents on the wire that could have carried it: the pinned output schema, which the \`${wire}\`/\`${mechanism}\` lowering table projected before the request, and the \`${TOOL_SCHEMA_KEYS[wire]}\` of ${named}, which the \`${wire}\` wire hands to the endpoint whole — no lowering table takes a keyword off a client tool's schema here (PRD resolved q55). Nothing laddered and nothing was remembered, and the emitted schema and its parse are unchanged; the two repairs are not the same edit, so read the path the quoted body names before making one: a complaint about \`${MECHANISM_KEYS[wire][mechanism][0]}\` is one row of \`LOWERED_AWAY\` in \`src/runtime.ts\`, and a complaint about \`tools\` is a client tool's schema to lower on this wire too, beside \`loweredStrictTool\``;
+}
+
+/**
+ * What each wire calls the document a client tool's schema travels in.
+ *
+ * Read by the diagnostics that name that document, so a sentence about a tool's
+ * schema is addressed the way the wire an operator is looking at spells it: the
+ * Messages API takes a tool's `input_schema`, and both OpenAI surfaces take a
+ * function's `parameters`.
+ */
+const TOOL_SCHEMA_KEYS: Readonly<Record<Wire, string>> = {
+  messages: "input_schema",
+  chat_completions: "parameters",
+  responses: "parameters",
+};
 
 /**
  * …and the same failure drawn by a **client tool's** own `parameters`, on a call
@@ -3614,7 +3776,7 @@ function aToolSchemaIsWrong(
   refusal: unknown,
 ): Error {
   return schemaRefused(
-    `\`${model.address}\` offered \`${model.provider.address}\` a tool whose \`parameters\` the endpoint refused, naming \`${keyword}\``,
+    `\`${model.address}\` offered \`${model.provider.address}\` a tool whose \`${TOOL_SCHEMA_KEYS[wire]}\` the endpoint refused, naming \`${keyword}\``,
     wire,
     keyword,
     lowersAClientTool(wire)
@@ -3660,10 +3822,44 @@ function schemaRefused(
   refusal: unknown,
 ): Error {
   return new Error(
-    `${opening}: ${describe(refusal)}. This is this runtime's own bug rather than a mechanism the endpoint lacks: ${blame}${alsoAParameterOfThisWire(wire, keyword)}`,
+    `${opening}: ${refusalInFull(refusal)}. This is this runtime's own bug rather than a mechanism the endpoint lacks: ${blame}${alsoAParameterOfThisWire(wire, keyword)}`,
     { cause: refusal },
   );
 }
+
+/**
+ * The endpoint's answer as ruling d's diagnostics quote it: **whole**, where
+ * [`describe`] would read a [`ProviderFailure`]'s message and that message cuts
+ * the body at 400 characters.
+ *
+ * Load bearing here and nowhere else, because this is the one refusal whose
+ * evidence is the whole body. A wire refusing a schema reports **every**
+ * offending node rather than the first — `crates/mock-provider`'s checker does,
+ * and the surfaces it stands in for do — and a lowering table missing a row is
+ * exactly the shape that produces several complaints at once: one array bound,
+ * two string bounds, a numeric bound two levels down. The cut then falls
+ * mid-sentence and the second and third keywords never reach the operator, who
+ * pays a round trip per keyword instead of reading the set once. The prefix
+ * names only the **first** keyword [`SCHEMA_KEYWORDS`] matched, for the same
+ * reason, which is the other half of why the body has to arrive intact.
+ *
+ * Still bounded, at a cap ten times the message's rather than none at all: a
+ * body is whatever the service on the other end chose to send — a gateway
+ * answering a 400 with an HTML error page is an ordinary Tuesday — and this
+ * sentence is read in a terminal. What is cut says how much was cut.
+ */
+function refusalInFull(refusal: unknown): string {
+  if (!(refusal instanceof ProviderFailure)) return describe(refusal);
+  const whole = refusal.body;
+  const quoted =
+    whole.length <= QUOTED_BODY
+      ? whole
+      : `${whole.slice(0, QUOTED_BODY)}… (${whole.length - QUOTED_BODY} more characters)`;
+  return `${refusal.name}: \`${refusal.model}\` answered ${refusal.status}: ${quoted}`;
+}
+
+/** How much of a refused request's answer [`refusalInFull`] quotes. */
+const QUOTED_BODY = 4000;
 
 /** …the ordinary blame: a (wire, mechanism) row that should have named the keyword. */
 function aRowIsMissing(wire: Wire, mechanism: OutputMechanism, keyword: string): string {
@@ -3682,7 +3878,7 @@ function aRowIsMissing(wire: Wire, mechanism: OutputMechanism, keyword: string):
  * rather than at a table.
  */
 function nothingLoweredThisTool(wire: Wire, keyword: string): string {
-  return `\`${keyword}\` is a constraint keyword, and no lowering table took it off this document: the \`${wire}\` wire declares no \`strict\` over a tool's \`parameters\` and hands a client tool's schema to the endpoint whole, so this schema went out as the composition wrote it and the \`${wire}\`/\`forced_tool\` row governs the pinned output tool alone (PRD resolved q55). Nothing laddered and nothing was remembered, and the emitted schema and its parse are unchanged; the repair is to lower a client tool's schema on this wire too, beside \`loweredStrictTool\` in \`src/runtime.ts\`, rather than to edit a row that never saw it`;
+  return `\`${keyword}\` is a constraint keyword, and no lowering table took it off this document: the \`${wire}\` wire declares no \`strict\` over a tool's \`${TOOL_SCHEMA_KEYS[wire]}\` and hands a client tool's schema to the endpoint whole, so this schema went out as the composition wrote it and the \`${wire}\`/\`forced_tool\` row governs the pinned output tool alone (PRD resolved q55). Nothing laddered and nothing was remembered, and the emitted schema and its parse are unchanged; the repair is to lower a client tool's schema on this wire too, beside \`loweredStrictTool\` in \`src/runtime.ts\`, rather than to edit a row that never saw it`;
 }
 
 /**

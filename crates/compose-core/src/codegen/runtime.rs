@@ -52,7 +52,11 @@
 //! own sentence has to say on those two wires — a row named there would be a
 //! repair that changes nothing about the document that went out, which
 //! `a_schema_keyword_refusal_on_a_wire_that_sends_a_tool_whole_names_no_row`
-//! holds it to.
+//! holds it to on a call that pinned nothing and
+//! `a_schema_keyword_refusal_on_a_pinned_call_names_the_tool_that_declares_it`
+//! on the call that carries **both** documents at once, where naming the pinned
+//! schema's row alone would depend on which call of the agent a gateway
+//! happened to refuse.
 
 use crate::ir::Ir;
 

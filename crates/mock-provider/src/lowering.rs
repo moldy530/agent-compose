@@ -83,6 +83,49 @@ const OPENAI_STRICT: &[&str] = &[
 /// Nothing: the row for a mechanism whose decoder compiles whatever it is given.
 const ACCEPTS_EVERYTHING: &[&str] = &[];
 
+/// Where a subschema hides, by the shape of the position it hides in — the
+/// positions holding **one** subschema.
+///
+/// The same three lists the generated runtime's projection walks
+/// (`SUBSCHEMA_KEYS`, `SUBSCHEMA_LIST_KEYS`, `SUBSCHEMA_MAP_KEYS` in
+/// `crates/compose-core/src/codegen/js/runtime.ts`), and
+/// `crates/agent-compose/tests/wire_lowering_agreement.rs` asserts they are
+/// equal — for the reason it asserts the keyword tables are: a position the
+/// runtime lowers and this check does not look at is a keyword that reaches the
+/// wire with nothing to report it, and a position this looks at and the runtime
+/// does not lower is a refusal no projection can repair. Only `properties`,
+/// `items` and `oneOf` are reachable from grammar §3 today; the rest are here
+/// because the cost of listing one is a line and the cost of missing one is a
+/// silent disagreement between a projection and its oracle.
+///
+/// `additionalProperties` is in none of the three: it is a boolean on every
+/// object this compiler emits (grammar 3.4 closes them) and a subschema in JSON
+/// Schema at large, so both walks reach it only where it is one — a guard rather
+/// than a position, written out on both sides.
+pub const SUBSCHEMA_POSITIONS: &[&str] = &[
+    "items",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+    "propertyNames",
+    "additionalItems",
+    "unevaluatedItems",
+];
+
+/// …the positions holding a **list** of subschemas.
+pub const SUBSCHEMA_LIST_POSITIONS: &[&str] = &["oneOf", "anyOf", "allOf", "prefixItems"];
+
+/// …and the positions holding a **map** of names to subschemas.
+pub const SUBSCHEMA_MAP_POSITIONS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "dependentSchemas",
+    "$defs",
+    "definitions",
+];
+
 /// What each (surface, mechanism) **refuses**, one row at a time.
 ///
 /// Read by [`enforced`], and by the acceptance suite's equality test against the
@@ -246,47 +289,39 @@ fn walk(
         checker.fail(&address, message);
     }
 
-    // Every position a subschema hides in — the same set the generated
-    // runtime's projection walks, so a keyword cannot be lowered somewhere this
-    // check does not look, or looked for somewhere the projection does not lower.
+    // Every position a subschema hides in — read off the three lists rather
+    // than spelled out here, so that what this check looks at and what the
+    // generated runtime's projection lowers are one statement compared by
+    // `wire_lowering_agreement.rs` rather than two sets of match arms nothing
+    // holds together.
     for (key, member) in object {
-        match key.as_str() {
-            "items" | "contains" | "not" | "if" | "then" | "else" | "propertyNames"
-            | "additionalItems" | "unevaluatedItems" => {
-                context.push(key.clone());
+        let key = key.as_str();
+        if SUBSCHEMA_POSITIONS.contains(&key)
+            || (key == "additionalProperties" && member.is_object())
+        {
+            context.push(key.to_string());
+            walk(
+                checker, dialect, keywords, pointer, subject, context, member,
+            );
+            context.pop();
+        } else if SUBSCHEMA_LIST_POSITIONS.contains(&key) {
+            for (index, branch) in member.as_array().into_iter().flatten().enumerate() {
+                context.push(key.to_string());
+                context.push(index.to_string());
+                walk(
+                    checker, dialect, keywords, pointer, subject, context, branch,
+                );
+                context.truncate(context.len() - 2);
+            }
+        } else if SUBSCHEMA_MAP_POSITIONS.contains(&key) {
+            for (name, member) in member.as_object().into_iter().flatten() {
+                context.push(key.to_string());
+                context.push(name.clone());
                 walk(
                     checker, dialect, keywords, pointer, subject, context, member,
                 );
-                context.pop();
+                context.truncate(context.len() - 2);
             }
-            "oneOf" | "anyOf" | "allOf" | "prefixItems" => {
-                for (index, branch) in member.as_array().into_iter().flatten().enumerate() {
-                    context.push(key.clone());
-                    context.push(index.to_string());
-                    walk(
-                        checker, dialect, keywords, pointer, subject, context, branch,
-                    );
-                    context.truncate(context.len() - 2);
-                }
-            }
-            "properties" | "patternProperties" | "dependentSchemas" | "$defs" | "definitions" => {
-                for (name, member) in member.as_object().into_iter().flatten() {
-                    context.push(key.clone());
-                    context.push(name.clone());
-                    walk(
-                        checker, dialect, keywords, pointer, subject, context, member,
-                    );
-                    context.truncate(context.len() - 2);
-                }
-            }
-            "additionalProperties" if member.is_object() => {
-                context.push(key.clone());
-                walk(
-                    checker, dialect, keywords, pointer, subject, context, member,
-                );
-                context.pop();
-            }
-            _ => {}
         }
     }
 }

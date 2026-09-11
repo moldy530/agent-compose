@@ -446,6 +446,22 @@ const CODEGEN: &[Criterion] = &[
                 "a_schema_keyword_refusal_on_a_wire_that_sends_a_tool_whole_names_no_row",
                 Status::Live,
             ),
+            // …and the same refusal one call later, on the **pinned** request,
+            // which carries both documents at once: the repair named there has
+            // to be the one that governs the document the endpoint refused,
+            // rather than the pinned schema's row whichever schema drew it.
+            (
+                "a_schema_keyword_refusal_on_a_pinned_call_names_the_tool_that_declares_it",
+                Status::Live,
+            ),
+            // …and the evidence all of them lean on: a wire refusing a schema
+            // reports every offending node at once, so a diagnostic that quoted
+            // only as much of the body as a trace line wants would hide the
+            // second and third keywords behind a round trip each.
+            (
+                "a_schema_keyword_refusal_quotes_the_endpoints_whole_answer",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).

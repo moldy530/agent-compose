@@ -5335,8 +5335,24 @@ fn projections() -> Vec<Projection> {
                             "maxItems": 1,
                             "items": { "type": "string" },
                         },
+                        // …and a `description` that is not prose at all.
+                        // Unreachable from this grammar — `codegen::schema`
+                        // writes that column as a string or not at all — and it
+                        // is *preserved* rather than replaced by the folded
+                        // sentence, which is what this projection does with
+                        // every other value it cannot read the way a schema
+                        // would (an `enum` member spelled like a keyword, a
+                        // field named `minimum`). Dropping the author's own
+                        // value is the one shape of being wrong the rest of the
+                        // walk never takes.
+                        "shape": {
+                            "type": "array",
+                            "description": { "note": "an object" },
+                            "maxItems": 2,
+                            "items": { "type": "string" },
+                        },
                     },
-                    "required": ["notes", "title", "labels"],
+                    "required": ["notes", "title", "labels", "shape"],
                     "additionalProperties": false,
                 })
             },
@@ -5344,6 +5360,10 @@ fn projections() -> Vec<Projection> {
                 ("properties.notes", "Side notes. At most 4 items."),
                 ("properties.title", "What to call it: At least 1 character."),
                 ("properties.labels", "Between 1 and 1 item."),
+                (
+                    "properties.shape",
+                    "{\"note\":\"an object\"}. At most 2 items.",
+                ),
             ],
             described_on_the_openai_table: &[],
         },

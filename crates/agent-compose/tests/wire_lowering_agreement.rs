@@ -120,12 +120,21 @@ fn table_body(name: &str) -> String {
 ///
 /// The emitted runtime is formatted, so a top-level `const` opens on its own
 /// line and closes on a line that is exactly `};` — the same reading
-/// `codegen::runtime`'s own pins take of a function body.
+/// `codegen::runtime`'s own pins take of a function body. Except where the whole
+/// declaration **fits on its opening line**, which a short array does and the
+/// formatter then leaves alone: that line is its own body, and a reader that did
+/// not know it would run on into whatever declaration came next.
 fn declaration_body(opened: &str) -> String {
     let mut lines = SOURCE.lines().skip_while(|line| !line.starts_with(opened));
-    lines
+    let first = lines
         .next()
         .unwrap_or_else(|| panic!("the emitted runtime declares `{opened}…`"));
+    if let Some(inline) = first
+        .strip_prefix(opened)
+        .and_then(|rest| rest.strip_suffix("];").or_else(|| rest.strip_suffix("};")))
+    {
+        return inline.to_string();
+    }
     let mut held = String::new();
     for line in lines {
         if line == "};" || line == "];" {
@@ -188,6 +197,78 @@ fn what_the_runtime_strips_is_what_the_oracle_refuses() {
     assert_eq!(
         checked, 8,
         "one of the mock's (surface, mechanism) rows was never compared"
+    );
+}
+
+/// …and the two walks look in the same **places** (PRD §9 resolved q55, ruling
+/// a).
+///
+/// A lowering table is two halves: which keywords come off, and where a keyword
+/// can be. The first half is held equal above; without this the second is held to
+/// nothing, and the two files state it twice as well — `SUBSCHEMA_KEYS`,
+/// `SUBSCHEMA_LIST_KEYS` and `SUBSCHEMA_MAP_KEYS` in the emitted runtime, and
+/// `SUBSCHEMA_POSITIONS`, `SUBSCHEMA_LIST_POSITIONS` and `SUBSCHEMA_MAP_POSITIONS`
+/// in the mock's checker.
+///
+/// Both lists are mostly **defensive**: only `properties`, `items` and `oneOf`
+/// are reachable from grammar §3 today, so a row deleted from either side leaves
+/// the whole suite green — the corpus and the goldens never reach the others.
+/// That is exactly why it needs a test rather than the two prose comments that
+/// currently claim it: the defensive rows exist for the day this compiler starts
+/// emitting one of those positions, and on that day a drifted pair would be a
+/// keyword lowered where the oracle does not look (an under-lowered request
+/// nothing refuses) or refused where nothing lowers (a 400 no table edit
+/// repairs).
+///
+/// `additionalProperties` is in neither list on either side, and is walked by
+/// both only where it is an object rather than grammar 3.4's boolean — a guard
+/// written out in both files, which is why it is named here rather than compared.
+#[test]
+fn the_two_projections_walk_the_same_subschema_positions() {
+    for (emitted, enforced, shape) in [
+        (
+            "SUBSCHEMA_KEYS",
+            lowering::SUBSCHEMA_POSITIONS,
+            "one subschema",
+        ),
+        (
+            "SUBSCHEMA_LIST_KEYS",
+            lowering::SUBSCHEMA_LIST_POSITIONS,
+            "a list of subschemas",
+        ),
+        (
+            "SUBSCHEMA_MAP_KEYS",
+            lowering::SUBSCHEMA_MAP_POSITIONS,
+            "a map of names to subschemas",
+        ),
+    ] {
+        let walked = keywords_of(emitted);
+        let projection: BTreeSet<&str> = walked.iter().map(String::as_str).collect();
+        assert_eq!(
+            projection.len(),
+            walked.len(),
+            "the emitted `{emitted}` names a position twice: {walked:?}"
+        );
+        let oracle: BTreeSet<&str> = enforced.iter().copied().collect();
+        assert_eq!(
+            projection,
+            oracle,
+            "the emitted runtime's `{emitted}` and the mock provider's own list of positions \
+             holding {shape} have drifted apart. Lowered but not checked: {:?}. Checked but not \
+             lowered: {:?}. Both are one line per position — `{emitted}` in \
+             `crates/compose-core/src/codegen/js/runtime.ts` and its twin in \
+             `crates/mock-provider/src/lowering.rs` — and a position one side reaches is a \
+             position the other has to reach (PRD resolved q55)",
+            projection.difference(&oracle).collect::<Vec<_>>(),
+            oracle.difference(&projection).collect::<Vec<_>>(),
+        );
+    }
+    assert!(
+        !lowering::SUBSCHEMA_POSITIONS.contains(&"additionalProperties")
+            && !lowering::SUBSCHEMA_LIST_POSITIONS.contains(&"additionalProperties")
+            && !lowering::SUBSCHEMA_MAP_POSITIONS.contains(&"additionalProperties"),
+        "`additionalProperties` is a guard on both sides rather than a position — it is a boolean \
+         on every object grammar 3.4 closes, and is walked only where it is a subschema"
     );
 }
 

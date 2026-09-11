@@ -509,13 +509,19 @@ still fails over only on grammar 12.2's infrastructure conditions — which the
 double refusal below is not.
 
 The schema refusal worth spelling out is a 400 that names one of the **lowered
-keywords** above. After lowering it can only mean one thing: the runtime's own
-table is missing a row and sent a keyword this decoder cannot compile. So it
-fails the call loudly, with the endpoint's body quoted and the keyword named,
-rather than trying the other mechanism — laddering there would send the same
-schema again, be refused for the same reason, and leave a mechanism the endpoint
-does have remembered as absent. There is nothing to change in your composition
-when you see one; it is a bug report about the runtime.
+keywords** above. After lowering it can only mean one thing: the runtime sent a
+schema carrying a keyword this decoder cannot compile — a row missing from the
+table above, or a document no table lowers at all. So it fails the call loudly,
+with the endpoint's whole answer quoted and the keyword named, rather than trying
+the other mechanism — laddering there would send the same schema again, be
+refused for the same reason, and leave a mechanism the endpoint does have
+remembered as absent. The answer is quoted in full because a wire refusing a
+schema names *every* node it objected to, and because a request can carry more
+than one schema: the agent's output schema and the agent's own tools go out
+together, so the message names the documents the keyword could have come from and
+the repair each one has, and the path in the quoted body is what tells them
+apart. There is nothing to change in your composition when you see one; it is a
+bug report about the runtime.
 
 **Where to see it.** Each model call's trace record carries `outputMechanism` —
 `"native"` or `"forced_tool"` — on the one call per agent node that asks for the
