@@ -874,6 +874,17 @@ At runtime the model is constrained to the output schema (structured output);
 codegen emits the equivalent validation type and rejects nonconforming responses
 before any edge is evaluated.
 
+The two are not always the same document, and where they differ **the parse is
+the contract**: a provider's structured-output decoder compiles a subset of JSON
+Schema, and the constraint keywords it cannot compile — array bounds among them,
+on most wires — are taken off the request and folded into the affected node's
+`description` instead, so the model is *asked* for such a bound rather than held
+to it (PRD resolved q55, amending PRD 9.16). The emitted validation type always
+checks the whole schema, so an answer that overruns a bound the wire did not
+carry fails the node rather than being trimmed. Which keywords come off which
+wire is a runtime table, not a grammar rule: `agent-compose docs models` names
+them.
+
 ### 5.2 Prompts
 
 `prompt:` is literal text. There is **no interpolation**: dynamic content reaches

@@ -2241,7 +2241,22 @@ async function callDirect(
   // ladder is about the *pinned* call and nothing else, so a tool loop pays
   // nothing for it and reads `"native"` here only because the parameter has to
   // hold something the composers will not look at.
-  if (request.pinned === undefined) return await onWire(wire, model, request, "native", signal);
+  if (request.pinned === undefined) {
+    try {
+      return await onWire(wire, model, request, "native", signal);
+    } catch (refused) {
+      // …but a **schema keyword** can be refused here too, and it is this
+      // runtime's own bug here too (PRD §9 resolved q55, ruling d): a client
+      // tool's `parameters` rides the structured-output decoder wherever its
+      // wire declares `strict` on the tool ([`loweredStrictTool`]), so the row
+      // that can be missing a keyword is read on every call of the loop. There
+      // is no ladder and no memo on this path to keep it out of, which is why
+      // this is the diagnostic and nothing else.
+      const keyword = schemaKeywordRefusal(refused);
+      if (keyword === undefined) throw refused;
+      throw aToolSchemaIsWrong(wire, model, keyword, refused);
+    }
+  }
   return await structuredAnswer(wire, model, request, signal);
 }
 
@@ -3557,10 +3572,103 @@ function loweringIsWrong(
   keyword: string,
   refusal: unknown,
 ): Error {
+  return schemaRefused(
+    `\`${model.address}\` asked \`${model.provider.address}\` for structured output through \`${MECHANISM_KEYS[wire][mechanism][0]}\` and the endpoint refused the schema itself, naming \`${keyword}\``,
+    wire,
+    mechanism,
+    keyword,
+    refusal,
+  );
+}
+
+/**
+ * …and the same failure drawn by a **client tool's** own `parameters`, on a call
+ * that pinned nothing at all (ruling d, over ruling a's [`loweredStrictTool`]).
+ *
+ * `strict: true` on a function hands its `parameters` to the very decoder the
+ * native rung hands the pinned schema to, so the row that can be missing a
+ * keyword is read on every call a **tool loop** makes — and those calls are not
+ * [`structuredAnswer`]'s: they pin nothing, so the keyword refusal would
+ * otherwise reach the node as a bare 400 with nothing to say where the keyword
+ * came from or who should repair it. Which of the two messages an operator reads
+ * would then depend on which call of the loop the model happened to stop at.
+ *
+ * Nothing about the *behaviour* is new here, and that is the point: an unpinned
+ * call has no second rung to move to and records no refusal
+ * ([`rememberRefusal`] is [`structuredAnswer`]'s alone), so ruling d's two hard
+ * guarantees already held on this path. What this adds is the sentence that
+ * makes the bug self-diagnosing, naming the row [`loweredStrictTool`] reads —
+ * the wire's **forced-tool** row, because a function's `parameters` is what that
+ * rung sends.
+ */
+function aToolSchemaIsWrong(
+  wire: Wire,
+  model: ModelBinding,
+  keyword: string,
+  refusal: unknown,
+): Error {
+  return schemaRefused(
+    `\`${model.address}\` offered \`${model.provider.address}\` a tool whose \`parameters\` the endpoint refused, naming \`${keyword}\``,
+    wire,
+    "forced_tool",
+    keyword,
+    refusal,
+  );
+}
+
+/**
+ * What both of ruling d's diagnostics say after the call they are about: whose
+ * bug this is, which row of which table has it, and what is *not* in doubt.
+ */
+function schemaRefused(
+  opening: string,
+  wire: Wire,
+  mechanism: OutputMechanism,
+  keyword: string,
+  refusal: unknown,
+): Error {
   return new Error(
-    `\`${model.address}\` asked \`${model.provider.address}\` for structured output through \`${MECHANISM_KEYS[wire][mechanism][0]}\` and the endpoint refused the schema itself, naming \`${keyword}\`: ${describe(refusal)}. This is this runtime's own bug rather than a mechanism the endpoint lacks: \`${keyword}\` is a constraint keyword the \`${wire}\`/\`${mechanism}\` lowering table should have stripped before the request (PRD resolved q55), so nothing laddered and nothing was remembered. The emitted schema and its parse are unchanged; the repair is one row of \`LOWERED_AWAY\` in \`src/runtime.ts\``,
+    `${opening}: ${describe(refusal)}. This is this runtime's own bug rather than a mechanism the endpoint lacks: \`${keyword}\` is a constraint keyword the \`${wire}\`/\`${mechanism}\` lowering table should have stripped before the request (PRD resolved q55), so nothing laddered and nothing was remembered. The emitted schema and its parse are unchanged; the repair is one row of \`LOWERED_AWAY\` in \`src/runtime.ts\`${alsoAParameterOfThisWire(wire, keyword)}`,
     { cause: refusal },
   );
+}
+
+/**
+ * The one thing this diagnostic cannot be sure of, said on the wire where it is
+ * not sure.
+ *
+ * A schema keyword and a request parameter can be spelled the **same**: `format`
+ * is a JSON Schema keyword the tables leave on the wire
+ * ([`CONSTRAINTS_LEFT_ON_THE_WIRE`]) and also the tail of `text.format`, the
+ * Responses wire's own structured-output parameter — which a gateway that has
+ * never heard of that wire is free to refuse under its short name
+ * ([`MECHANISM_KEYS`] carries the short forms for exactly that reason).
+ * [`spelled`] keeps `text.format` and `response_format` out of the schema
+ * vocabulary, and [`WORD_SHAPED_SCHEMA_KEYWORDS`]' quoting rule keeps `Invalid
+ * format.` out of it, but a body that points at a bare `format` **as a
+ * parameter** is both readings at once and no rule here decides which: `Invalid
+ * schema …: 'format' is not permitted` and `Unrecognized request argument
+ * supplied: format` are one sentence apart.
+ *
+ * Tightening the recognizer is not the repair, and the cost model says why: the
+ * classification is right either way — neither reading ladders and neither is
+ * remembered, because nothing else in this file can read a constraint keyword as
+ * a capability statement — so the whole of the ambiguity is *which repair* to
+ * make. Demanding more of a word-shaped keyword would instead hand the other
+ * direction of being wrong a refusal that **is** about the schema
+ * (`output_config: minimum is not supported.`), which would ladder, be refused
+ * again, and memoize a mechanism as absent from an endpoint that has it — the
+ * failure ruling d exists to prevent. So the sentence names the second reading
+ * and the operator reads the quoted body, which is in front of them.
+ *
+ * Derived from [`MECHANISM_KEYS`] rather than listed, so a wire that gains a
+ * nested parameter gains the caveat with it, and every other wire says nothing.
+ */
+function alsoAParameterOfThisWire(wire: Wire, keyword: string): string {
+  const spellings = Object.values(MECHANISM_KEYS[wire]).flat();
+  const shared = spellings.find((key) => key === keyword || key.endsWith(`.${keyword}`));
+  if (shared === undefined) return "";
+  return `. One caveat, on this wire only: \`${shared}\` — a parameter this wire asks for structured output with — is spelled with \`${keyword}\` too, so a service refusing *that* under its short name words its 400 the same way: read the quoted body before editing a row`;
 }
 
 async function callMessages(

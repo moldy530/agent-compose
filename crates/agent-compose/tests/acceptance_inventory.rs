@@ -431,6 +431,14 @@ const CODEGEN: &[Criterion] = &[
                 "a_client_tools_schema_is_lowered_where_its_wire_declares_strict",
                 Status::Live,
             ),
+            // …and that second schema's own refusal, which arrives on a call
+            // that pinned nothing: the same table row, the same repair, and so
+            // the same diagnostic rather than a bare 400 whose wording depends
+            // on which call of the tool loop the model stopped at.
+            (
+                "a_schema_keyword_refusal_on_a_loop_call_names_the_tools_own_table",
+                Status::Live,
+            ),
             // The other three kinds this milestone executes, which are not the
             // model's: an inline `exec:`, an inline `http:`, and a `function:`
             // over a `tool.*` (grammar 8.2, 8.3, 8.4).

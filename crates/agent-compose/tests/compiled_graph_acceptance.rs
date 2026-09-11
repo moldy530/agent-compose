@@ -4947,6 +4947,15 @@ fn an_answer_over_a_stripped_bound_fails_the_parse() {
 /// the recognizer therefore watches every constraint keyword a schema can carry,
 /// not merely the ones some table strips.
 ///
+/// A third half, about what this diagnostic cannot know: `format` is a schema
+/// keyword *and* the tail of `text.format`, so on the Responses wire a refusal
+/// pointing at a bare `format` is either a decoder refusing the keyword or a
+/// gateway refusing the parameter under its short name. Both readings fail the
+/// call the same way, and the message names both — the alternative, holding a
+/// word-shaped keyword to more than quoting, would hand a schema complaint
+/// (`output_config: minimum is not supported.`) back to the ladder that memoizes
+/// a mechanism as absent from an endpoint that has it.
+///
 /// `bounded-cycle`'s `write` node declares `retry: { max: 2 }`, which is what
 /// makes the *memo* observable: three attempts, and each one has to start on the
 /// native rung again. A remembered refusal would show up as the second attempt
@@ -5074,6 +5083,62 @@ fn a_schema_keyword_refusal_fails_the_call_without_laddering_or_remembering() {
     assert!(
         recorded.iter().all(|request| !request.was_unsupported()),
         "…and nothing was recorded as a mechanism this endpoint lacks"
+    );
+
+    // …and the one keyword whose spelling is **also** a parameter's. `format` is
+    // a JSON Schema keyword and the tail of `text.format`, the Responses wire's
+    // own structured-output parameter, which a gateway that has never heard of
+    // that wire refuses under its short name — so a body pointing at a bare
+    // `format` is both readings at once and nothing here can decide it. The
+    // classification is the same either way (no ladder, no memo, the body
+    // quoted), so what the diagnostic owes an operator is the second reading
+    // named beside the first rather than a table row edited on a guess.
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::raw(
+            400,
+            json!({
+                "error": {
+                    "message": "Unrecognized request argument supplied: format",
+                    "type": "invalid_request_error",
+                },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.tally",
+        &[("subject", "a short list")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("`format` is a constraint keyword"),
+        "the keyword is read as this runtime's own repair, as every other one is: {failure}"
+    );
+    assert!(
+        failure.contains("`text.format`"),
+        "…and the parameter it is spelled like is named too, because no rule here tells the two \
+         apart: {failure}"
+    );
+    assert!(
+        failure.contains("read the quoted body"),
+        "…so the operator is pointed at the body rather than at a row to edit on a guess: \
+         {failure}"
+    );
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "…and it is still one request: an ambiguous spelling is not a reason to ladder"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…nor to remember a mechanism as absent"
     );
 }
 
@@ -5269,6 +5334,80 @@ fn a_client_tools_schema_is_lowered_where_its_wire_declares_strict() {
         json!(1),
         "…so its bound rides the request as the author wrote it: {}",
         recorded[0].body_text
+    );
+    assert!(provider.snapshot().is_drained());
+}
+
+/// …and a schema-keyword 400 drawn by **that** schema is the same loud failure,
+/// on a call that pinned nothing at all (PRD §9 resolved q55, ruling d).
+///
+/// The refusal ruling d is written about arrives on the pinned request, where the
+/// mechanism ladder is. A strict client tool's `parameters` reaches the same
+/// decoder on every call of the **tool loop**, and those calls pin nothing: the
+/// first request of `flow.respond` carries `tool.lookup` with `strict: true` and
+/// no `text.format` at all. A table missing a row there is the identical bug with
+/// the identical repair, so it has to read as one — otherwise which message an
+/// operator gets depends on which call of the loop the model happened to stop at.
+///
+/// The two hard guarantees are not at stake on this path and the assertions say
+/// so anyway: an unpinned call has no second rung, so one request is all there
+/// is, and nothing is remembered because only the pinned ladder records a
+/// refusal. What the diagnostic has to carry is the keyword, the provider's own
+/// body, and whose bug it is.
+#[test]
+fn a_schema_keyword_refusal_on_a_loop_call_names_the_tools_own_table() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        GPT5,
+        Outcome::raw(
+            400,
+            json!({
+                "error": {
+                    "message": "Invalid schema for function 'lookup': 'pattern' is not permitted.",
+                    "type": "invalid_request_error",
+                    "param": "tools[0].parameters",
+                },
+            }),
+        ),
+    ));
+
+    let Some(run) = harness::invoke(
+        "server-tools",
+        "flow.respond",
+        &[("question", "does it?")],
+        &provider,
+    ) else {
+        return;
+    };
+    let failure = run.failed();
+    assert!(
+        failure.contains("pattern"),
+        "the keyword the endpoint named is what the diagnostic is about: {failure}"
+    );
+    assert!(
+        failure.contains("`parameters`"),
+        "…and it is a tool's schema rather than the pinned one, because this call pinned none: \
+         {failure}"
+    );
+    assert!(
+        failure.contains("`responses`/`forced_tool` lowering table"),
+        "…so the row named is the one a function's `parameters` is lowered through: {failure}"
+    );
+    assert!(
+        failure.contains("'pattern' is not permitted."),
+        "…with the provider's body quoted rather than paraphrased: {failure}"
+    );
+
+    let recorded = provider.requests();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "one request: a call that pins nothing has no second rung to try, and a schema keyword is \
+         not a capability refusal on any path"
+    );
+    assert!(
+        recorded.iter().all(|request| !request.was_unsupported()),
+        "…and the endpoint refused no mechanism: what it refused was a schema"
     );
     assert!(provider.snapshot().is_drained());
 }

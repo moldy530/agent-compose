@@ -5005,13 +5005,30 @@ fn what_the_structured_output_mechanism_would_be_handed() {
 }
 
 /// Whether a JSON Schema writes this keyword anywhere inside it.
+///
+/// As a **keyword**: a field named after one is a name, and a schema declaring
+/// `output: { minimum: { type: integer } }` does not write `minimum` at all
+/// ([`NAMED_SUBSCHEMA_MAPS`], and [`without`] for the same reading).
 fn mentions(schema: &Value, keyword: &str) -> bool {
     match schema {
-        Value::Object(map) => {
-            map.contains_key(keyword) || map.values().any(|value| mentions(value, keyword))
-        }
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            key == keyword
+                || if NAMED_SUBSCHEMA_MAPS.contains(&key.as_str()) {
+                    members_mention(value, keyword)
+                } else {
+                    mentions(value, keyword)
+                }
+        }),
         Value::Array(items) => items.iter().any(|item| mentions(item, keyword)),
         _ => false,
+    }
+}
+
+/// …inside one `properties`-shaped map, reading its keys as the names they are.
+fn members_mention(members: &Value, keyword: &str) -> bool {
+    match members {
+        Value::Object(map) => map.values().any(|member| mentions(member, keyword)),
+        other => mentions(other, keyword),
     }
 }
 
@@ -5059,7 +5076,8 @@ struct Projection {
 /// reads as one phrase, the one keyword the two tables disagree about — read on
 /// both rows, since it is silent on the row the ruling was written from — where
 /// the sentence lands when the author wrote one and when they did not, how deep
-/// the walk goes, and the one keyword whose value can ask for nothing at all.
+/// the walk goes, the one keyword whose value can ask for nothing at all, and a
+/// field **named** after a keyword a table strips.
 fn projections() -> Vec<Projection> {
     vec![
         Projection {
@@ -5311,6 +5329,41 @@ fn projections() -> Vec<Projection> {
             // it either, which is what the `untouched` assertions below read
             // off this same row — an expectation here could only name a
             // description that must not exist.
+            described_on_the_openai_table: &[],
+        },
+        Projection {
+            label: "fields named after the keywords a table strips",
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        // `minimum` and `maximum` are ordinary lowercase
+                        // identifiers, so both are legal field names (grammar
+                        // 3.1) *and* rows of every table. The projection walks
+                        // `properties` as a name→subschema map and never reads a
+                        // name as a keyword — this case is what says so, on both
+                        // sides of the gate: a reference implementation that
+                        // filtered map keys blindly would delete the field and
+                        // report the runtime as having changed something else.
+                        "minimum": { "type": "integer", "minimum": 0, "maximum": 10 },
+                        "maximum": {
+                            "type": "array",
+                            "description": "How many at most.",
+                            "maxItems": 3,
+                            "items": { "type": "string" },
+                        },
+                    },
+                    "required": ["minimum", "maximum"],
+                    "additionalProperties": false,
+                })
+            },
+            described: &[
+                // The field keeps its name and loses its bounds, which is the
+                // whole of the distinction.
+                ("properties.minimum", "Between 0 and 10."),
+                ("properties.maximum", "How many at most. At most 3 items."),
+            ],
+            // Nothing here is in one table and not the other.
             described_on_the_openai_table: &[],
         },
     ]
@@ -5997,21 +6050,64 @@ fn lowered_by_the_runtime(project: &Path, cases: &[Value]) -> Value {
     serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object")
 }
 
+/// The positions inside a JSON Schema whose value is a map from **names** to
+/// subschemas, where a key is a field's name rather than a keyword.
+///
+/// The runtime's own walk is written over the same list (`SUBSCHEMA_MAP_KEYS`),
+/// and the reason both need it is the one a keyword-shaped field name makes:
+/// `minimum` and `maximum` are ordinary lowercase identifiers, so
+/// `output: { minimum: { type: integer, minimum: 0 } }` is a legal composition
+/// whose emitted schema carries `properties.minimum`. A walk that filtered map
+/// keys blindly would delete the *field* and report the projection — which walks
+/// names as names and is right — as having changed something else.
+const NAMED_SUBSCHEMA_MAPS: &[&str] = &[
+    "properties",
+    "patternProperties",
+    "dependentSchemas",
+    "$defs",
+    "definitions",
+];
+
 /// A schema with `keywords` taken out of every node — the Rust side's own
 /// reading of what lowering removes, so the projection is compared against a
 /// second implementation rather than against itself.
+///
+/// Keywords only: a name inside a [`NAMED_SUBSCHEMA_MAPS`] position is a field's,
+/// and survives however it is spelled.
 fn without(schema: &Value, keywords: &[&str]) -> Value {
     match schema {
         Value::Object(map) => Value::Object(
             map.iter()
                 .filter(|(key, _)| !keywords.contains(&key.as_str()))
-                .map(|(key, value)| (key.clone(), without(value, keywords)))
+                .map(|(key, value)| {
+                    let kept = if NAMED_SUBSCHEMA_MAPS.contains(&key.as_str()) {
+                        members_without(value, keywords)
+                    } else {
+                        without(value, keywords)
+                    };
+                    (key.clone(), kept)
+                })
                 .collect(),
         ),
         Value::Array(items) => {
             Value::Array(items.iter().map(|item| without(item, keywords)).collect())
         }
         other => other.clone(),
+    }
+}
+
+/// …one `properties`-shaped map, whose keys are names and whose values are
+/// schemas ([`NAMED_SUBSCHEMA_MAPS`]).
+fn members_without(members: &Value, keywords: &[&str]) -> Value {
+    match members {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(name, member)| (name.clone(), without(member, keywords)))
+                .collect(),
+        ),
+        // Not a map at all, which no schema this compiler emits writes here: read
+        // as an ordinary value rather than assumed away.
+        other => without(other, keywords),
     }
 }
 
