@@ -816,28 +816,39 @@ fn agent_tools(ir: &Ir, agent: &Agent) -> Vec<ToolView> {
     held
 }
 
+/// One declared `tool.*`, as the wire carries it.
+///
+/// `name` is the name the **model** calls it by, which is the definition's local
+/// name in every case but one: a `builtin:` binding goes out as a
+/// provider-defined tool type, and each of those carries a name the provider
+/// dictates whatever the definition key says — `tool.checkout` binding
+/// `builtin: files` is `str_replace_based_edit_tool` on the wire (grammar 6.1,
+/// PRD resolved q54 ruling d). That is the rule
+/// [`crate::check::bindings::wire_name`] enforces collisions on and the one the
+/// emitter writes into each tool descriptor, so a document that spelled the
+/// definition key here would name a tool no trace record ever carries.
 fn tool_view(address: &str, tool: &Tool) -> ToolView {
-    let (binding, detail) = match &tool.implementation {
-        ToolImplementation::Exec { exec } => ("exec", Some(exec_line(exec))),
-        ToolImplementation::Http { http } => ("http", Some(http_line(http))),
-        ToolImplementation::Function { function } => {
-            ("function", Some(function.name.value.as_str().to_string()))
-        }
-        ToolImplementation::Module { module } => ("module", Some(module.path.value.clone())),
+    let local = address.split_once('.').map_or(address, |(_, local)| local);
+    let (name, binding, detail) = match &tool.implementation {
+        ToolImplementation::Exec { exec } => (local, "exec", Some(exec_line(exec))),
+        ToolImplementation::Http { http } => (local, "http", Some(http_line(http))),
+        ToolImplementation::Function { function } => (
+            local,
+            "function",
+            Some(function.name.value.as_str().to_string()),
+        ),
+        ToolImplementation::Module { module } => (local, "module", Some(module.path.value.clone())),
         ToolImplementation::Builtin { builtin } => (
+            builtin.builtin.value.as_str(),
             "builtin",
             Some(format!(
-                "{}, on the wire as `{}`",
-                builtin.builtin.value.address(),
-                builtin.builtin.value.as_str()
+                "{}, under the name its provider dictates",
+                builtin.builtin.value.address()
             )),
         ),
     };
     ToolView {
-        name: address
-            .split_once('.')
-            .map_or(address, |(_, local)| local)
-            .to_string(),
+        name: name.to_string(),
         source: ToolSource::Tool,
         address: Some(address.to_string()),
         binding: Some(binding.to_string()),
@@ -1144,8 +1155,14 @@ fn map_view(ir: &Ir, flow: &Flow, id: &str, map: &Map) -> MapView {
         dispatch: dispatch.to_string(),
         route_by,
         on_item_error: map.on_item_error.as_ref().map(item_error_view),
-        join: "the map node's outgoing edges fire once every dispatched instance has completed or \
-               been resolved by `on_item_error`"
+        // Grammar 8.6 rule 6's three ways an instance leaves the barrier, all
+        // three of them: a `detach: true` route is resolved *at dispatch*
+        // (Decision D94), and a sentence that named only the first two would
+        // describe this node as waiting on dispatches the join never observes —
+        // which is the one fact `detach:` exists to express and the hardest one
+        // to see in the YAML.
+        join: "the map node's outgoing edges fire once every dispatched instance has completed, \
+               been resolved by `on_item_error`, or been detached"
             .to_string(),
         routes: routes(ir, flow, id, map)
             .into_iter()

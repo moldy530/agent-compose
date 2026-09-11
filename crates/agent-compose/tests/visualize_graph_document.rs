@@ -299,6 +299,22 @@ fn the_maps_downstream_edge_is_the_join_barrier() {
             .count(),
         1
     );
+
+    // The sentence beside it names every way an instance leaves that barrier —
+    // grammar §8.6 rule 6 has three, and the third is the one no reader can see
+    // in the YAML: a `detach: true` route is resolved *at dispatch* (D94), so a
+    // sentence naming only the first two would describe the downstream node as
+    // waiting on dispatches the join never observes.
+    let join = node(&triage, "dispatch")["map"]["join"]
+        .as_str()
+        .expect("a join sentence")
+        .to_string();
+    for way in ["completed", "on_item_error", "detached"] {
+        assert!(
+            join.contains(way),
+            "the join sentence names `{way}`: {join}"
+        );
+    }
 }
 
 /// `agent.triage`'s wire carries the tool its attached store synthesized.
@@ -339,6 +355,42 @@ fn an_attached_store_shows_up_as_the_tool_it_synthesizes() {
             .expect("a prompt")
             .starts_with("You triage incoming bug reports."),
         "the prompt is carried verbatim"
+    );
+}
+
+/// A `tool.*` bound to a built-in is named by the **wire**, not by its key.
+///
+/// `tool.checkout` binds `builtin: files`, and a built-in goes out as the
+/// provider's own tool type under the name that type dictates —
+/// `str_replace_based_edit_tool`, whatever the definition key says (grammar
+/// §6.1, PRD resolved q54 ruling d). That is the name
+/// `check::bindings::wire_name` compares collisions on and the name the emitted
+/// project sends, so a document that carried `checkout` here would name a tool
+/// no trace record ever holds, and would omit the one every tool-call record on
+/// this agent does.
+#[test]
+fn a_builtin_bound_as_a_tool_is_named_by_the_wire() {
+    let document = document();
+    let triage = flow(&document, "flow.triage");
+    let agent = node(&triage, "dispatch/auto_fixable")["agent"].clone();
+
+    assert_eq!(agent["address"], "agent.fixer");
+    let tools = agent["tools"].as_array().expect("a tools array");
+    assert_eq!(tools.len(), 1, "one attached tool: {tools:?}");
+    assert_eq!(tools[0]["name"], "str_replace_based_edit_tool");
+    assert_eq!(
+        tools[0]["address"], "tool.checkout",
+        "the definition it was attached by, which is the half the name drops"
+    );
+    assert_eq!(tools[0]["source"], "tool");
+    assert_eq!(tools[0]["binding"], "builtin");
+    assert!(
+        tools[0]["detail"]
+            .as_str()
+            .expect("a detail line")
+            .starts_with("builtin.files"),
+        "and the built-in behind it: {:?}",
+        tools[0]["detail"]
     );
 }
 

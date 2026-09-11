@@ -15,7 +15,7 @@
   --line: #d9e0dd; --edge: #8d9e99;
   --accent: #0e7d6b; --accent-soft: #0e7d6b22;
   --warn: #b04a3e;
-  --k-agent: #6d4fc9; --k-function: #a06e1f; --k-exec: #8a6a2a; --k-http: #2f6dbb;
+  --k-agent: #6d4fc9; --k-function: #a06e1f; --k-exec: #59741a; --k-http: #2f6dbb;
   --k-human: #ba4a70; --k-store: #3a8a4e; --k-flow: #0e7d6b; --k-map: #7a8a85;
   --chip: #ffffff;
   --shadow: 0 1px 3px rgba(20, 35, 30, .10), 0 4px 14px rgba(20, 35, 30, .06);
@@ -27,7 +27,7 @@
     --line: #2a3330; --edge: #55635f;
     --accent: #3fbfa5; --accent-soft: #3fbfa52a;
     --warn: #d97a6c;
-    --k-agent: #a48ae8; --k-function: #d9a44a; --k-exec: #c9973f; --k-http: #6ba3e8;
+    --k-agent: #a48ae8; --k-function: #d9a44a; --k-exec: #aac95a; --k-http: #6ba3e8;
     --k-human: #e08aa5; --k-store: #6fc287; --k-flow: #3fbfa5; --k-map: #8ca09a;
     --chip: #1a211f;
     --shadow: 0 1px 3px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
@@ -39,7 +39,7 @@
   --line: #2a3330; --edge: #55635f;
   --accent: #3fbfa5; --accent-soft: #3fbfa52a;
   --warn: #d97a6c;
-  --k-agent: #a48ae8; --k-function: #d9a44a; --k-exec: #c9973f; --k-http: #6ba3e8;
+  --k-agent: #a48ae8; --k-function: #d9a44a; --k-exec: #aac95a; --k-http: #6ba3e8;
   --k-human: #e08aa5; --k-store: #6fc287; --k-flow: #3fbfa5; --k-map: #8ca09a;
   --chip: #1a211f;
   --shadow: 0 1px 3px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
@@ -213,7 +213,11 @@ path.edge.barrier { stroke-dasharray: 2 4; stroke-width: 1.2; }
 </header>
 <main>
   <div id="canvas">
-    <svg id="svg" role="img" aria-label="Flow graph">
+    <!-- `group`, not `img`: the node groups inside this element are focusable
+         buttons, and `img` makes an element's subtree presentational — an
+         assistive technology would stop exposing the very controls Enter
+         selects. -->
+    <svg id="svg" role="group" aria-label="Flow graph">
       <defs>
         <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
           <path d="M0,0 L10,5 L0,10 z" fill="var(--edge)"></path>
@@ -393,7 +397,6 @@ function clearOffsets(flow) {
  * Rendering
  * ------------------------------------------------------------------------- */
 const NS = "http://www.w3.org/2000/svg";
-const svg = document.getElementById("svg");
 const view = document.getElementById("view");
 const pane = document.getElementById("pane");
 const canvas = document.getElementById("canvas");
@@ -902,9 +905,13 @@ function select(id) {
  * Pan and zoom
  * ------------------------------------------------------------------------- */
 let panning = null;
+/* Whether the last press was a pan rather than a click, which is what tells a
+   background click from the end of a drag. */
+let panned = false;
 canvas.addEventListener("pointerdown", event => {
+  panned = false;
   if (event.target.closest(".node") || event.target.closest("button")) return;
-  panning = { x: event.clientX, y: event.clientY, tx: tf.x, ty: tf.y };
+  panning = { x: event.clientX, y: event.clientY, tx: tf.x, ty: tf.y, moved: false };
   canvas.classList.add("dragging");
   try { canvas.setPointerCapture(event.pointerId); } catch (e) { /* still pans */ }
 });
@@ -912,9 +919,16 @@ canvas.addEventListener("pointermove", event => {
   if (!panning) return;
   tf.x = panning.tx + event.clientX - panning.x;
   tf.y = panning.ty + event.clientY - panning.y;
+  if (Math.abs(event.clientX - panning.x) + Math.abs(event.clientY - panning.y) > 3) {
+    panning.moved = true;
+  }
   applyTransform();
 });
-canvas.addEventListener("pointerup", () => { panning = null; canvas.classList.remove("dragging"); });
+canvas.addEventListener("pointerup", () => {
+  panned = panning !== null && panning.moved;
+  panning = null;
+  canvas.classList.remove("dragging");
+});
 canvas.addEventListener("pointercancel", () => { panning = null; canvas.classList.remove("dragging"); });
 canvas.addEventListener("wheel", event => {
   event.preventDefault();
@@ -926,7 +940,16 @@ canvas.addEventListener("wheel", event => {
   tf.k = k;
   applyTransform();
 }, { passive: false });
-svg.addEventListener("click", event => { if (!event.target.closest(".node")) showFlow(); });
+/* A click of the background returns the pane to the flow overview. Bound on the
+   canvas rather than on the `<svg>` inside it: a pan sets pointer capture on
+   the canvas, and a captured pointer's `click` is dispatched to the capture
+   element, so a listener one level below it would never be reached. The end of
+   a pan is not a click on the background, and neither is a press on a control. */
+canvas.addEventListener("click", event => {
+  if (panned) { panned = false; return; }
+  if (event.target.closest(".node") || event.target.closest("button")) return;
+  showFlow();
+});
 
 document.getElementById("zoom-in").addEventListener("click", () => {
   tf.k = Math.min(2.5, tf.k * 1.2); applyTransform();

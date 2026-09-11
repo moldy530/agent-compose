@@ -89,7 +89,7 @@
             "item_binding": "step",
             "max_concurrency": 4,
             "dispatch": "homogeneous",
-            "join": "the map node's outgoing edges fire once every dispatched instance has completed or been resolved by `on_item_error`",
+            "join": "the map node's outgoing edges fire once every dispatched instance has completed, been resolved by `on_item_error`, or been detached",
             "routes": [
               {
                 "node": "work/(item)",

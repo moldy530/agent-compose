@@ -323,7 +323,7 @@ reachability, and both of them are drawn.
 | `label` | string | when the class has one | The chip a canvas draws: the guard's CEL on a conditional edge, `else` on a default one, the variant on a map route, `on_error: fallback`, `on_timeout (24h)`. An unconditional declared edge has none. |
 | `when` | string | `"conditional"` | The CEL guard, as written (grammar §7.3). |
 | `max_iterations` | integer | when the edge declares one | The cycle bound a guarded back-edge carries (grammar §7.4, Decision D90). |
-| `join_barrier` | boolean | when true | Present only where it is `true`: this edge leaves a `map` node, and PRD 5.6 makes the downstream edge the barrier — it fires when every dispatched instance has completed or been resolved by `on_item_error`. |
+| `join_barrier` | boolean | when true | Present only where it is `true`: this edge leaves a `map` node, and PRD 5.6 makes the downstream edge the barrier — it fires when every dispatched instance has completed, been resolved by `on_item_error`, or been detached (grammar §8.6 rule 6). A `detach: true` route is resolved *at dispatch*, so the barrier never waits on it (Decision D94). |
 
 `class` is one of:
 

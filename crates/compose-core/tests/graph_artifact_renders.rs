@@ -268,6 +268,18 @@ fn panes(project: &str) -> &'static [Pane] {
                 node: "dispatch/(default)",
                 facts: &["tool.dead_letter", "the catch-all route", "duplicate"],
             },
+            // A built-in bound as a `tool.*`: the pane lists it under the name
+            // the **model** calls it by, which the definition key does not spell
+            // (PRD resolved q54 ruling d).
+            Pane {
+                flow: "flow.triage",
+                node: "dispatch/auto_fixable",
+                facts: &[
+                    "agent.fixer",
+                    "str_replace_based_edit_tool",
+                    "builtin.files",
+                ],
+            },
             // The fallback target, and an `${ENV}` reference left as written.
             Pane {
                 flow: "flow.triage",

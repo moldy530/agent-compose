@@ -461,7 +461,7 @@
                 "level": "node"
               }
             },
-            "join": "the map node's outgoing edges fire once every dispatched instance has completed or been resolved by `on_item_error`",
+            "join": "the map node's outgoing edges fire once every dispatched instance has completed, been resolved by `on_item_error`, or been detached",
             "routes": [
               {
                 "node": "dispatch/auto_fixable",
@@ -627,12 +627,12 @@
             },
             "tools": [
               {
-                "name": "checkout",
+                "name": "str_replace_based_edit_tool",
                 "source": "tool",
                 "address": "tool.checkout",
                 "binding": "builtin",
                 "description": "View and edit files in the repository checkout under review. Paths are relative to the checkout root, and a path that resolves outside it is refused.",
-                "detail": "builtin.files, on the wire as `str_replace_based_edit_tool`"
+                "detail": "builtin.files, under the name its provider dictates"
               }
             ],
             "prompt": "You write minimal unified diffs. Read the file, fix exactly the described\ndefect in it, and change nothing else.\n"
