@@ -28,7 +28,9 @@
 //! layout code are embedded on resolved q23's terms — nothing is looked up at
 //! run time. [`render`] is the one place that is enforced in code, and
 //! `crates/compose-core/tests/graph_artifact_is_self_contained.rs` is where it
-//! is enforced over the bytes.
+//! is enforced over the bytes;
+//! `crates/compose-core/tests/graph_artifact_renders.rs` is where the page's own
+//! code is run.
 //!
 //! # What it never carries
 //!

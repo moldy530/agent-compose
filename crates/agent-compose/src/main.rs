@@ -1,6 +1,6 @@
 //! `agent-compose` — the compiler's command line.
 //!
-//! The verbs fall into two groups. Seven act on a composition; the rest teach
+//! The verbs fall into two groups. Eight act on a composition; the rest teach
 //! the reader about compositions in general and are described at the bottom of
 //! this header. The first is the product's core loop (PRD §7 M0):
 //!
@@ -42,6 +42,27 @@
 //! ([`compose_core::plan`]); what lives here is the two entrypoints, the choice
 //! of format, and the exit code.
 //!
+//! The fourth answers with a **picture** rather than a report (PRD resolved
+//! q56):
+//!
+//! ```text
+//! agent-compose visualize <path> [--flow <addr>] [-o <path>] [--format html|json]
+//! ```
+//!
+//! It validates first and emits only when clean, exactly as `build` does, and
+//! writes one self-contained HTML file — every node, every edge an execution
+//! could take, and each node's resolved configuration — that performs no
+//! external fetch of any kind. `--format json` prints the **graph document** the
+//! page renders instead, which is a public surface with a `graph_version` of its
+//! own (`docs/graph.md`). Both halves are `compose-core`'s
+//! ([`compose_core::graph`]); what lives here is the argument surface, the file,
+//! and three usage errors — rendering introduces no failure class of its own, so
+//! its diagnostics are `validate`'s, printed through the same renderer.
+//!
+//! It is the one verb whose `--format` names an **artifact** rather than a
+//! report, and it takes no `--target`, for `plan`'s reason: the question a
+//! picture answers is what this composition *is*.
+//!
 //! The last three are invocation (PRD 5.11):
 //!
 //! ```text
@@ -63,7 +84,7 @@
 //! reference has a value (PRD §9.15) and the pinned dependency set is installed
 //! where the project can resolve it.
 //!
-//! The seventh takes no spec at all, and is the other half of a distributed
+//! The eighth takes no spec at all, and is the other half of a distributed
 //! deployment (`docs/distributed.md`, PRD 5.10):
 //!
 //! ```text
@@ -139,7 +160,7 @@
 //! |---|---|
 //! | `0` | clean: nothing was reported, or a `plan` was produced |
 //! | `1` | diagnostics were reported, `build --check` found drift, a `run` produced no answer, a `plan`'s spec did not resolve, or a discovery verb found something already there and would not replace it |
-//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
+//! | `2` | the command could not run: bad usage, an unreadable entrypoint, an output directory that could not be written, a `visualize --flow` naming no flow, a missing environment variable or one carrying a value the command does not take (`AGENT_COMPOSE_INTERACTIVE`, grammar 8.7), an uninstalled dependency set, or no JavaScript runtime to launch |
 //! | `3` | a `run` with nobody to ask stopped at a `human` pause (grammar 8.7, PRD 5.11) |
 //!
 //! `plan` reads the first two differently from every other verb, and the
@@ -1002,20 +1023,6 @@ fn visualize(
         }
     };
 
-    let (flows, nodes, edges) = (
-        document.flows.len(),
-        document
-            .flows
-            .iter()
-            .map(|flow| flow.nodes.len())
-            .sum::<usize>(),
-        document
-            .flows
-            .iter()
-            .map(|flow| flow.edges.len())
-            .sum::<usize>(),
-    );
-
     match format {
         // The document is the answer, so it goes to stdout whole — the way
         // `schema` prints the published schema (resolved q23).
@@ -1032,17 +1039,32 @@ fn visualize(
             if let Err(reason) = write_artifact(path, &page) {
                 return fail(&reason);
             }
+            // What it drew, counted: the one thing a reader cannot tell from the
+            // file's existence is whether it drew the flow they meant.
+            let nodes: usize = document.flows.iter().map(|flow| flow.nodes.len()).sum();
+            let edges: usize = document.flows.iter().map(|flow| flow.edges.len()).sum();
             let _ = write(
                 &mut io::stderr().lock(),
                 &format!(
-                    "wrote `{}`: {flows} flow(s), {nodes} node(s), {edges} edge(s)\n\nopen it in a \
-                     browser — it is one file and fetches nothing\n",
-                    path.display()
+                    "wrote `{}`: {}, {}, {}\n\nopen it in a browser — it is one file and fetches \
+                     nothing\n",
+                    path.display(),
+                    counted(document.flows.len(), "flow", "flows"),
+                    counted(nodes, "node", "nodes"),
+                    counted(edges, "edge", "edges"),
                 ),
             );
             ExitCode::from(CLEAN)
         }
     }
+}
+
+/// `1 flow`, `2 flows` — both spellings taken rather than one suffixed, for the
+/// reason [`unknown`] takes both: English does not pluralize by suffix
+/// reliably, and a verdict reading "1 flows" is a verdict somebody stopped
+/// proofreading.
+fn counted(how_many: usize, one: &str, many: &str) -> String {
+    format!("{how_many} {}", if how_many == 1 { one } else { many })
 }
 
 /// Write one artifact, making the directory it is named in.

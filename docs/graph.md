@@ -195,7 +195,7 @@ Four small records the rest of the document is built from.
 | `binding` | string | on every node but the two pseudo-nodes, and on a `human` node only when it declares a `timeout:` | The one line the node is read by under its id: a typed address, an inline block's command or request line, a store op, or a map's `over:`. Written for a person (§9.1). |
 | `description` | string | when the node or the definition it names declares one | The node's own `description:`, or the definition's where the node declares none. |
 | `input` | [input](#51-input-bindings) | when the node declares `input:` | The node's bindings (grammar §8.0). |
-| `writes` | array of [writes](#4-schemas-and-bindings) | when the node declares `writes:`, possibly empty | The write remap, in declaration order. |
+| `writes` | array of [writes](#4-schemas-and-bindings) | when the node remaps at least one output field | The write remap, in declaration order. |
 | `policy` | [policy](#52-policy) | on every node of the flow; absent on the pseudo-nodes and on satellites | Grammar §9.3's chain, resolved. A satellite carries none because the dispatch has no policy of its own: what governs it is the map's `on_item_error` and the map node's own `policy` (grammar §8.6 rules 9, 10). |
 | `schemas` | [schemas](#53-schemas) | when the node has at least one of the two | What the node is handed and what it answers with. Absent on the pseudo-nodes, and on a `map`, which declares no surface of its own. |
 | `agent` | [agent](#8-agents) | `agent` nodes, and satellites whose target is an `agent.*` | The resolved agent: model, tools, prompt. |
@@ -274,7 +274,7 @@ always present; the rest follow the same rule.
 | `scope` | `"execution"` \| `"session"` \| `"global"` | always | Its lifetime (Decision D35). |
 | `op` | string | always | The operation this node performs (grammar §11.4). |
 | `backend` | string | when the store declares one | The abstract alias the active target resolves (grammar §11.3). |
-| `params` | array of [bindings](#4-schemas-and-bindings) | always, possibly empty | The operation's parameters in grammar §11.4's own order, with a `value:`/`filter:`/`metadata:` field map flattened to dotted names. |
+| `params` | array of [bindings](#4-schemas-and-bindings) | when the operation carries at least one parameter, which grammar §11.4 makes every one of them do | The operation's parameters in §11.4's own order, with a `value:`/`filter:`/`metadata:` field map flattened to dotted names. |
 
 ### 5.6 A subflow instantiation
 
@@ -363,7 +363,7 @@ of it.
 | `node` | string | always | The satellite's id on this canvas — the `to` of the `map_route` edge. |
 | `variant` | string | named routes only | The discriminator variant this route serves. |
 | `default` | boolean | always | Whether this is the `default:` route. |
-| `covers` | array of strings | routed maps, possibly absent | Which union variants this route's target is **narrowed** to: its own tag, or, for `default:`, every variant no named route claims (grammar §8.6 rule 4, Decision D30). Absent on a homogeneous map, whose item type is not a union, and on a `default:` that catches nothing left over. |
+| `covers` | array of strings | when the route narrows at least one variant | Which union variants this route's target is **narrowed** to: its own tag, or, for `default:`, every variant no named route claims (grammar §8.6 rule 4, Decision D30). Absent on a homogeneous map, whose item type is not a union, and on a `default:` that catches nothing left over. |
 | `target` | string | always | The dispatch target's typed address: `agent.*`, `tool.*`, or `flow.*`. |
 | `max_concurrency` | integer | when the route declares one | This route's own bound, at most the map's. |
 | `input` | [input](#51-input-bindings) | when the route declares `input:` | Per-item bindings; absent means the whole item. |
@@ -379,7 +379,7 @@ of it.
 | `map` | string | always | The map node's id. |
 | `variant` | string | named routes only | The variant this satellite serves. |
 | `default` | boolean | always | Whether it is the `default:` route's target. |
-| `covers` | array of strings | routed maps, possibly absent | The variants it is narrowed to — the same set `RouteView.covers` carries. |
+| `covers` | array of strings | when the route narrows at least one variant | The variants it is narrowed to — the same set `RouteView.covers` carries. |
 | `max_concurrency` | integer | when the route declares one | This route's own bound. |
 | `detach` | boolean | when the route declares it | Fire-and-forget dispatch. |
 
@@ -448,9 +448,10 @@ At a given `graph_version`, a reader MAY rely on:
   produces, and where a cell does not, the key is present only with something in
   it;
 * the vocabularies of the closed enumerations: `GraphNode.kind`,
-  `GraphEdge.class`, `InputView.form`, `SchemaView.source`, `PolicyView`'s
-  `level`, `OnErrorView.strategy`, `ItemErrorView.strategy`, `MapView.dispatch`,
-  `ModelView.form`, `ToolView.source`, `ToolView.binding`, `StoreView.kind`,
+  `GraphEdge.class`, `SchemaView.source`, `ToolView.source` and `RetryView.level`
+  — which `TimeoutView.level` and `OnErrorView.level` share — plus
+  `InputView.form`, `OnErrorView.strategy`, `ItemErrorView.strategy`,
+  `MapView.dispatch`, `ModelView.form`, `ToolView.binding`, `StoreView.kind`,
   `StoreView.scope`, `SubflowView.context`, `TriggerView.type` and
   `WriteView.reduce`;
 * the orders this document fixes — `flows` by address, a flow's `nodes` in
@@ -509,12 +510,13 @@ document embedded in the page — because they are one document.
 
 ### 9.4 How the two are held together
 
-The version number alone is a promise; three tests make it a checkable one:
+The version number alone is a promise; five tests make it a checkable one:
 
 * `crates/compose-core/tests/graph_format_inventory.rs` reads this document and
-  the emitted one and fails when their top-level fields differ, and when a
-  record type declared in `src/graph/document.rs` is not named here.
-  Documentation cannot rot behind the code.
+  the emitted one and fails when their top-level fields differ, when a record
+  type declared in `crates/compose-core/src/graph/document.rs` is not named
+  here, and when a member of one of §9.1's closed vocabularies is not written
+  out. Documentation cannot rot behind the code.
 * `crates/agent-compose/tests/visualize_graph_document.rs` asserts the semantic
   inventory over `examples/triage-fanout`: the conditional edges with their CEL,
   the `on_error:` fallback, the `on_timeout:` transfer, all three map routes
@@ -522,6 +524,15 @@ The version number alone is a promise; three tests make it a checkable one:
 * `crates/compose-core/tests/graph_artifact_goldens.rs` commits the emitted
   bytes for two example projects, so a change to the document or to the template
   is a reviewable diff rather than a discovery made by a reader (PRD §9.15).
+* `crates/compose-core/tests/graph_artifact_is_self_contained.rs` holds the
+  emitted page to fetching nothing — which is a promise about the artifact
+  rather than about this format, and the one that would break silently.
+* `crates/compose-core/tests/graph_artifact_renders.rs` **runs** the page's own
+  code against a DOM stub, over every node of every flow of three projects —
+  one of them written to leave every optional array out. It is what makes the
+  presence rules above checkable from the renderer's side: a page that indexed
+  a key this format is allowed to omit throws on the compositions that omit it,
+  and every other test here would stay green.
 
 ---
 

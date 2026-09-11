@@ -1,0 +1,309 @@
+{
+  "graph_version": 1,
+  "entrypoint": "main.yml",
+  "target": "local",
+  "spec_version": "0.1",
+  "flows": [
+    {
+      "address": "flow.bare",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "notes",
+          "type": "array<string> (max_items 30)"
+        }
+      ],
+      "triggers": [],
+      "nodes": [
+        {
+          "id": "start",
+          "kind": "start"
+        },
+        {
+          "id": "end",
+          "kind": "end"
+        },
+        {
+          "id": "plan",
+          "kind": "agent",
+          "binding": "agent.planner",
+          "input": {
+            "form": "scalar",
+            "value": "'the goal'"
+          },
+          "policy": {
+            "on_error": {
+              "strategy": "fail",
+              "level": "built_in"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "string_input",
+              "fields": []
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "steps",
+                  "type": "array<string> (max_items 30)"
+                }
+              ]
+            }
+          },
+          "agent": {
+            "address": "agent.planner",
+            "model": {
+              "address": "model.plain",
+              "form": "direct",
+              "id": "some-model",
+              "provider": {
+                "address": "provider.p",
+                "kind": "anthropic",
+                "config": [
+                  {
+                    "name": "api_key",
+                    "value": "${ANTHROPIC_API_KEY}"
+                  }
+                ]
+              }
+            },
+            "tools": [],
+            "prompt": "Plan the work."
+          }
+        },
+        {
+          "id": "work",
+          "kind": "map",
+          "binding": "over plan.output.steps",
+          "policy": {
+            "on_error": {
+              "strategy": "fail",
+              "level": "built_in"
+            }
+          },
+          "map": {
+            "over": "plan.output.steps",
+            "max_items": 30,
+            "item_binding": "step",
+            "max_concurrency": 4,
+            "dispatch": "homogeneous",
+            "join": "the map node's outgoing edges fire once every dispatched instance has completed or been resolved by `on_item_error`",
+            "routes": [
+              {
+                "node": "work/item",
+                "default": false,
+                "target": "agent.worker",
+                "input": {
+                  "form": "scalar",
+                  "value": "step"
+                },
+                "writes": [
+                  {
+                    "field": "note",
+                    "channel": "notes",
+                    "reduce": "append"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "work/item",
+          "kind": "agent",
+          "binding": "agent.worker",
+          "input": {
+            "form": "scalar",
+            "value": "step"
+          },
+          "writes": [
+            {
+              "field": "note",
+              "channel": "notes",
+              "reduce": "append"
+            }
+          ],
+          "schemas": {
+            "input": {
+              "source": "string_input",
+              "fields": []
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "note",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "agent": {
+            "address": "agent.worker",
+            "model": {
+              "address": "model.plain",
+              "form": "direct",
+              "id": "some-model",
+              "provider": {
+                "address": "provider.p",
+                "kind": "anthropic",
+                "config": [
+                  {
+                    "name": "api_key",
+                    "value": "${ANTHROPIC_API_KEY}"
+                  }
+                ]
+              }
+            },
+            "tools": [],
+            "prompt": "Do one step."
+          },
+          "dispatch": {
+            "map": "work",
+            "default": false
+          }
+        },
+        {
+          "id": "tidy",
+          "kind": "exec",
+          "binding": "tidy-up",
+          "policy": {
+            "on_error": {
+              "strategy": "fail",
+              "level": "built_in"
+            }
+          },
+          "schemas": {
+            "output": {
+              "source": "kind_default",
+              "fields": [
+                {
+                  "name": "exit_code",
+                  "type": "integer"
+                },
+                {
+                  "name": "stdout",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "exec": {
+            "command": "tidy-up"
+          }
+        },
+        {
+          "id": "ping",
+          "kind": "http",
+          "binding": "POST https://${PING_HOST}/v1/ping",
+          "policy": {
+            "on_error": {
+              "strategy": "fail",
+              "level": "built_in"
+            }
+          },
+          "schemas": {
+            "output": {
+              "source": "kind_default",
+              "fields": [
+                {
+                  "name": "status",
+                  "type": "integer"
+                },
+                {
+                  "name": "body",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "http": {
+            "method": "POST",
+            "url": "https://${PING_HOST}/v1/ping"
+          }
+        },
+        {
+          "id": "sign_off",
+          "kind": "human",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "count",
+                "expression": "size(state.notes)"
+              }
+            ]
+          },
+          "policy": {
+            "on_error": {
+              "strategy": "fail",
+              "level": "built_in"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "count",
+                  "type": "integer"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "ok",
+                  "type": "boolean"
+                }
+              ]
+            }
+          },
+          "human": {}
+        }
+      ],
+      "edges": [
+        {
+          "from": "start",
+          "to": "plan",
+          "class": "unconditional"
+        },
+        {
+          "from": "plan",
+          "to": "work",
+          "class": "unconditional"
+        },
+        {
+          "from": "work",
+          "to": "tidy",
+          "class": "unconditional",
+          "join_barrier": true
+        },
+        {
+          "from": "tidy",
+          "to": "ping",
+          "class": "unconditional"
+        },
+        {
+          "from": "ping",
+          "to": "sign_off",
+          "class": "unconditional"
+        },
+        {
+          "from": "sign_off",
+          "to": "end",
+          "class": "unconditional"
+        },
+        {
+          "from": "work",
+          "to": "work/item",
+          "class": "map_route",
+          "label": "each item"
+        }
+      ]
+    }
+  ]
+}
