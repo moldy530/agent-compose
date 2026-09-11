@@ -99,6 +99,7 @@ not on your `PATH`.
 agent-compose init hello          # one commented main.yml that already validates
 agent-compose validate hello/main.yml
 agent-compose docs                # the topic index — the binary teaches its grammar
+agent-compose visualize hello/main.yml    # one HTML page of the graph, fetching nothing
 agent-compose build hello/main.yml
 agent-compose run hello/main.yml flow.summarize --input document="some text"
 ```

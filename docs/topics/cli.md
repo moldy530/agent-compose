@@ -1,11 +1,12 @@
 # cli
 
-One static binary. Seven verbs act on a composition; five teach you about
+One static binary. Eight verbs act on a composition; five teach you about
 compositions in general and take no spec at all.
 
 ```
 agent-compose validate <path> [--target <name>] [--format human|json]
 agent-compose plan <before> <after> [--format human|json]
+agent-compose visualize <path> [--flow <addr>] [-o <path>] [--format html|json]
 agent-compose build <path> [--target <name>] [--out <dir>] [--check] [--format human|json]
 agent-compose run <path> <flow> [--input k=v]... [--session <key>]
                                 [--target <name>] [--out <dir>] [--format human|json]
@@ -61,6 +62,44 @@ that does not **resolve** has no artifact to compare, and that is exit `1`.
 `plan` takes no `--target`: the question it answers is what changed in the
 composition. `docs/plan.md` is normative for the document it writes, and is what
 a consumer pins `plan_version` on.
+
+## `visualize`
+
+Draws the composition's flows — one tab per flow, one node per node, one
+labelled edge per routing decision an execution could take — as a **single HTML
+file that fetches nothing**. No CDN, no webfonts, no network at all: it opens on
+a machine that has none, and it is one file to attach to a pull request.
+
+```sh
+agent-compose visualize main.yml               # writes ./graph.html
+agent-compose visualize main.yml -o docs/graph.html
+agent-compose visualize main.yml --flow flow.triage
+```
+
+Click a node for its resolved configuration: the model it reaches and through
+which provider, every tool on its wire — the ones an attached store synthesizes
+included — its declared schemas, its input bindings, what it writes, its prompt,
+and its `retry`/`timeout`/`on_error` **with the level each one resolved from**.
+Drag a node to rearrange it; the arrangement is remembered by that browser and
+nothing else, and *Reset layout* puts it back. A `flow:` node links to its own
+flow's tab rather than expanding inline — the module boundary is real, so the
+picture keeps it.
+
+It validates first and emits only when clean, exactly as `build` does, printing
+the same diagnostic block. Nothing it can refuse is a new failure class: a
+`--flow` naming no flow, an unwritable path and `-o` beside `--format json` are
+usage errors, and exit `2`.
+
+`--format json` prints the **graph document** — the JSON the page renders — to
+stdout instead, so `-o` is refused beside it. That document is a public surface
+with a `graph_version` of its own, and `docs/graph.md` is normative for it.
+
+The one `--format` here that names an artifact rather than a report: `visualize`
+has no machine report to shape, because its answer *is* the document. Its
+diagnostics are `validate`'s, on stderr, whichever format is asked for. It takes
+no `--target` either, for the reason `plan` does not: the question a picture
+answers is what this composition is, and the built-in `local` needs no deploy
+file.
 
 ## `build`
 
@@ -301,4 +340,4 @@ requires no deploy file at all. See `agent-compose docs targets`.
 Provider credentials reach a run the same way: an `${ENV}` reference in the spec
 is resolved from the process environment at start, never at build.
 
-Normative source: `docs/plan.md`, `docs/trace.md`, `docs/durability.md`, `docs/grammar.md` §8.7, §14
+Normative source: `docs/plan.md`, `docs/graph.md`, `docs/trace.md`, `docs/durability.md`, `docs/grammar.md` §8.7, §14

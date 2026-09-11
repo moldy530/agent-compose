@@ -45,6 +45,10 @@ compiled project.
    moved in the components, the topology, the interfaces, and the validation.
    Use it before and after a non-trivial edit, and put its output in a PR
    description rather than asking a reviewer to diff router logic.
+   `agent-compose visualize main.yml` writes a single self-contained HTML page
+   of the graph — every node, every edge an execution could take, and each
+   node's resolved configuration — which is the other half of that review, and
+   the fastest way to see what a flow you did not write actually does.
 7. **Compile and run.** `agent-compose build main.yml` emits the TypeScript
    project; `agent-compose run main.yml flow.<name> --input k=v` builds and
    runs one flow; `agent-compose serve main.yml` starts the app for `http`
@@ -56,6 +60,7 @@ compiled project.
 |---|---|
 | `validate <path>` | parse, resolve imports, run every static check. **The loop.** |
 | `plan <before> <after>` | diff two specs: components, topology, interfaces, validation |
+| `visualize <path>` | draw the flows as one self-contained HTML page; `--flow`, `-o`, `--format html\|json` |
 | `build <path>` | emit the TypeScript project; `--check` reports drift instead of writing |
 | `run <path> <flow>` | build, then run one flow; `--input k=v`, `--session <key>` |
 | `resume <path> <execution>` | build, then carry on a journaled execution — replaying its recorded effects rather than re-issuing them |
@@ -68,7 +73,10 @@ compiled project.
 | `skill [--agent <name>] [--global]` | print this document, or install it; `--global` installs under `$HOME` |
 
 Add `--format json` to any verb that reports — `validate`, `plan`, `build`,
-`run`, `resume`, `serve` — when a script is reading the output. Add
+`run`, `resume`, `serve` — when a script is reading the output. `visualize`'s
+`--format` is the odd one out: it names the **artifact** (`html` or `json`, the
+page or the document the page renders) rather than the shape of a report, and
+its diagnostics are `validate`'s either way. Add
 `--target <name>` to the five verbs that resolve a composition against an
 environment — `validate`, `build`, `run`, `resume`, `serve` — to select a
 `deploy/<name>.yml`; the built-in `local` target needs no deploy file and is
