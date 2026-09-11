@@ -29,6 +29,7 @@ mod toolchain;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use compose_core::graph;
 use compose_core::resolve;
@@ -358,10 +359,18 @@ fn exercise(project: &str, storage: &str) -> String {
     let Some(mut bun) = toolchain::bun_command() else {
         return String::new();
     };
+    // Keyed by the *call*, not by the project: the tests of this file run on
+    // parallel threads of one process and two of them exercise
+    // `examples/triage-fanout`, so a name built from the pid and the project
+    // alone would have them writing and deleting one `harness.js` — a race whose
+    // symptom is bun failing to resolve a module and the assertion below blaming
+    // the template.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
     let directory = std::env::temp_dir().join(format!(
-        "agent-compose-graph-render-{}-{}",
+        "agent-compose-graph-render-{}-{}-{}",
         std::process::id(),
-        project.replace('/', "-")
+        project.replace('/', "-"),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = fs::remove_dir_all(&directory);
     fs::create_dir_all(&directory).expect("a scratch directory");

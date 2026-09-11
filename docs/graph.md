@@ -199,8 +199,8 @@ Four small records the rest of the document is built from.
 | `kind` | see below | always | Which kind this node is. |
 | `binding` | string | on every node but the two pseudo-nodes, and on a `human` node only when it declares a `timeout:` | The one line the node is read by under its id: a typed address, an inline block's command or request line, a store op, or a map's `over:`. Written for a person (§9.1). |
 | `description` | string | when the node or the definition it names declares one | The node's own `description:`, or the definition's where the node declares none. |
-| `input` | [input](#51-input-bindings) | when the node declares `input:` | The node's bindings (grammar §8.0). |
-| `writes` | array of [writes](#4-schemas-and-bindings) | when the node remaps at least one output field | The write remap, in declaration order. |
+| `input` | [input](#51-input-bindings) | when the node, or on a satellite the route that dispatches it, declares `input:` | The node's bindings (grammar §8.0). |
+| `writes` | array of [writes](#4-schemas-and-bindings) | when the node, or on a satellite the route that dispatches it, remaps at least one output field | The write remap, in declaration order. |
 | `policy` | [policy](#52-policy) | on every node of the flow; absent on the pseudo-nodes and on satellites | Grammar §9.3's chain, resolved. A satellite carries none because the dispatch has no policy of its own: what governs it is the map's `on_item_error` and the map node's own `policy` (grammar §8.6 rules 9, 10). |
 | `schemas` | [schemas](#53-schemas) | when the node has at least one of the two | What the node is handed and what it answers with. Absent on the pseudo-nodes, and on a `map`, which declares no surface of its own. |
 | `agent` | [agent](#8-agents) | `agent` nodes, and satellites whose target is an `agent.*` | The resolved agent: model, tools, prompt. |

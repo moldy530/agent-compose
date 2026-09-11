@@ -1010,6 +1010,18 @@ fn visualize(
             let known = compose_core::graph::flows(&ir);
             match compose_core::graph_of(&ir, named) {
                 Some(document) => document,
+                // A composition of definitions and no `flow.*` is one the
+                // validator accepts, and it is the one shape whose vocabulary is
+                // empty. [`unknown`] would answer it with a sentence that stops
+                // after "The flows are: " — a list of nothing, and no repair
+                // (PRD G3), so the empty case says what is missing instead.
+                None if known.is_empty() => {
+                    return fail(&format!(
+                        "`{named}` cannot be drawn: this composition declares no flows at all. \
+                         Drop `--flow` to draw it as it stands, or add a `flow.*` definition to \
+                         have something to narrow to",
+                    ));
+                }
                 None => {
                     return fail(&unknown(
                         "a flow this composition declares",

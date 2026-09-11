@@ -46,6 +46,20 @@ fn scratch(purpose: &str) -> PathBuf {
     path
 }
 
+/// Copy a directory tree, the way `plan_completeness.rs` plants a composition.
+fn copy(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("can create a directory");
+    for entry in fs::read_dir(from).expect("the source directory is readable") {
+        let entry = entry.expect("a directory entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("a file type").is_dir() {
+            copy(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).expect("can copy a file");
+        }
+    }
+}
+
 /// `visualize`, run from the repository root.
 fn visualize(arguments: &[&str]) -> Output {
     run_in(&repo_root(), arguments)
@@ -122,16 +136,26 @@ fn both_examples_render_to_one_self_contained_file() {
 /// composition: `build --check` compares the emitted file list, and a page that
 /// landed inside `--out` would be drift the next `build` refuses over (PRD
 /// resolved q47).
+///
+/// The spec is **planted** rather than read where it lives, because the other
+/// half of the claim — that nothing was written beside it — has to be asserted
+/// against a directory no one else writes into. The repository root is the one
+/// place this test may not look: it is where README.md and the `cli` topic tell
+/// a reader to run `agent-compose visualize hello/main.yml`, so a `graph.html`
+/// sitting there is a contributor having followed the documentation, not a bug
+/// in the verb.
 #[test]
 fn the_default_path_is_graph_html_in_the_working_directory() {
+    let elsewhere = scratch("default-spec");
+    copy(&repo_root().join("examples/review-loop"), &elsewhere);
     let here = scratch("default");
-    let spec = repo_root().join("examples/review-loop/main.yml");
+    let spec = elsewhere.join("main.yml");
     let output = run_in(&here, &[spec.to_str().expect("a UTF-8 path")]);
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(here.join("graph.html").is_file(), "{}", stderr(&output));
     assert!(
-        !repo_root().join("graph.html").exists(),
-        "the default path is relative to the working directory"
+        !elsewhere.join("graph.html").exists(),
+        "the default path is relative to the working directory, not the spec's own"
     );
 }
 
@@ -250,6 +274,66 @@ fn an_unknown_flow_is_refused_with_the_vocabulary() {
             "the refusal does not carry `{expected}`: {reported}"
         );
     }
+}
+
+/// …and where the vocabulary is **empty**, it says so rather than trailing off.
+///
+/// A composition of `provider.*` and `model.*` definitions and no `flow.*` is
+/// one the validator accepts, and it is the only spec that can reach the
+/// refusal above with nothing to list — where the general phrasing would end at
+/// "The flows are: " and name no repair, which PRD G3 does not allow. The bare
+/// run afterwards is the repair being checked: dropping `--flow` really does
+/// answer, rather than being advice into another refusal.
+#[test]
+fn a_composition_with_no_flows_is_refused_with_what_is_missing() {
+    let home = scratch("flowless");
+    let entrypoint = home.join("main.yml");
+    fs::write(
+        &entrypoint,
+        r#"version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.smart:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+"#,
+    )
+    .expect("the entrypoint is writable");
+    let spec = entrypoint;
+    let spec = spec.to_str().expect("a UTF-8 path");
+
+    let output = run_in(&home, &[spec, "--flow", "flow.x", "--format", "json"]);
+    assert_eq!(code(&output), 2, "{}", stderr(&output));
+    assert_eq!(stdout(&output), "", "nothing was produced");
+    let reported = stderr(&output);
+    for expected in [
+        "`flow.x` cannot be drawn",
+        "declares no flows at all",
+        "Drop `--flow`",
+    ] {
+        assert!(
+            reported.contains(expected),
+            "the refusal does not carry `{expected}`: {reported}"
+        );
+    }
+    assert!(
+        !reported.contains("The flows are:"),
+        "and it does not trail off into an empty list: {reported}"
+    );
+
+    let drawn = run_in(&home, &[spec, "--format", "json"]);
+    assert_eq!(code(&drawn), 0, "{}", stderr(&drawn));
+    let document: serde_json::Value =
+        serde_json::from_str(stdout(&drawn)).expect("stdout is one JSON document");
+    assert_eq!(document["graph_version"], 1);
+    assert_eq!(
+        document["flows"].as_array().expect("a flows array").len(),
+        0,
+        "the composition it drew is the one that has nothing to draw"
+    );
 }
 
 /// A composition the validator refuses is refused here, **in the same words**.
