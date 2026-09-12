@@ -16,9 +16,16 @@
 //!
 //! So this file runs the page under Bun, against a DOM stub sized to what the
 //! template touches, and exercises the paths a reader takes: render every flow,
-//! select every node, walk back to the flow overview, and do it again with
-//! `localStorage` throwing on every access, which is what a private window and a
-//! browser with site data blocked both look like.
+//! select every node, click the pane's close and its jump to a subgraph's own
+//! canvas, walk back to the flow overview, and do it again with `localStorage`
+//! throwing on every access, which is what a private window and a browser with
+//! site data blocked both look like.
+//!
+//! It is also the one test that reads the page's **geometry**. The dashed
+//! container a fan-out is drawn in is an axis-aligned box over a map and the
+//! instances it dispatches, and a node that is neither, drawn inside it, reads as
+//! one of them — a misreading no other test here can see, because the document is
+//! correct and says nothing about where anything is drawn.
 //!
 //! CLAUDE.md's *Validation strategy* is why it is a test rather than a look:
 //! "CI green" has to mean "actually done", and for an HTML artifact that means
@@ -31,7 +38,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use compose_core::graph;
+use compose_core::graph::{self, GraphDocument, NodeKind};
 use compose_core::resolve;
 
 fn repository() -> PathBuf {
@@ -42,15 +49,44 @@ fn repository() -> PathBuf {
         .to_path_buf()
 }
 
-/// The page one example project renders to.
-fn page(project: &str) -> String {
-    let resolution = resolve(repository().join(project).join("main.yml"));
-    let ir = resolution.ir.expect("the example resolves");
+/// The graph document one composition resolves to, by the path of its
+/// entrypoint.
+fn document_at(entrypoint: &Path) -> GraphDocument {
+    let resolution = resolve(entrypoint);
+    let ir = resolution.ir.unwrap_or_else(|| {
+        panic!(
+            "`{}` does not resolve: {:#?}",
+            entrypoint.display(),
+            resolution.diagnostics
+        )
+    });
     assert!(
         compose_core::check(&ir).is_empty(),
-        "`{project}` does not validate"
+        "`{}` does not validate",
+        entrypoint.display()
     );
-    graph::render(&graph::graph(&ir)).expect("the document renders")
+    graph::graph(&ir)
+}
+
+/// The graph document one project in this repository renders from.
+fn document(project: &str) -> GraphDocument {
+    document_at(&repository().join(project).join("main.yml"))
+}
+
+/// The page one example project renders to.
+fn page(project: &str) -> String {
+    graph::render(&document(project)).expect("the document renders")
+}
+
+/// How many fan-outs a document draws a dashed container around — what the
+/// harness's geometry check has to have looked at.
+fn containers(document: &GraphDocument) -> usize {
+    document
+        .flows
+        .iter()
+        .flat_map(|flow| &flow.nodes)
+        .filter(|node| node.kind == NodeKind::Map)
+        .count()
 }
 
 /// The script the page carries, lifted out of its one `<script>` element.
@@ -82,6 +118,8 @@ function element(name) {
     clientHeight: 800,
     firstChild: null,
     classes: new Set(),
+    listeners: {},
+    found: {},
     setAttribute(key, value) {
       if (value === undefined || value === null) throw new Error(name + ": " + key + " is " + value);
       this.attributes[key] = String(value);
@@ -94,9 +132,41 @@ function element(name) {
       this.firstChild = this.children.length ? this.children[0] : null;
       return child;
     },
-    addEventListener() {},
+    addEventListener(type, listener) {
+      (this.listeners[type] = this.listeners[type] || []).push(listener);
+    },
+    /* What the harness clicks with: the listeners the page itself bound, fired
+       in the order it bound them. */
+    fire(type, event) {
+      const held = this.listeners[type] || [];
+      if (!held.length) throw new Error(this.tagName + " has no `" + type + "` listener");
+      held.forEach(listener => listener(event || { target: { closest: () => null } }));
+    },
     setPointerCapture() {},
-    querySelector() { return null; },
+    /* The pane's content is a **string** in this stub — the template writes it
+       with `innerHTML` and never builds its children — so the two selectors the
+       template reaches into that content with are answered from the string. Each
+       answer is a stand-in cached against the content it was found in, so the
+       template and the harness hold the *same* element: the handler the page
+       bound to it is the handler a click fires. Without that the close button
+       and the subgraph jump are reached by nothing. */
+    querySelector(selector) {
+      const key = selector + "\n" + this.innerHTML;
+      if (key in this.found) return this.found[key];
+      let answer = null;
+      if (selector === ".pane-close") {
+        if (this.innerHTML.indexOf('class="pane-close"') >= 0) answer = element("button");
+      } else if (selector === "[data-jump]:not([disabled])") {
+        const match = /data-jump="([^"]*)"([^>]*)>/.exec(this.innerHTML);
+        if (match && match[2].indexOf("disabled") < 0) {
+          answer = element("button");
+          answer.setAttribute("data-jump", match[1]);
+        }
+      } else {
+        throw new Error("the stub has no element selector `" + selector + "`");
+      }
+      return (this.found[key] = answer);
+    },
     querySelectorAll() { return []; },
     getBBox() { return { x: 0, y: 0, width: 240, height: 18 }; },
     getBoundingClientRect() { return { left: 0, top: 0, width: 1200, height: 800 }; },
@@ -163,20 +233,74 @@ globalThis.localStorage = {
 /// named nodes, and resolved facts a reader must be able to find in their
 /// panes. A key that stops arriving fails here instead of shipping.
 const EXERCISE: &str = r#"
-let panes = 0;
+/* The one check here that reads the page's **geometry**.
+ *
+ * The dashed container is an axis-aligned box over a map and the instances it
+ * dispatches, and a node that is neither, drawn inside it, reads as one of them
+ * — the exact misreading PRD resolved q56 puts the container there to prevent.
+ * The document is no help: it is correct, and it says nothing about where
+ * anything is drawn. So the box the page sized is measured against every node
+ * the page placed. */
+function containersHoldOnlyTheirOwn(flow) {
+  mapEls.forEach(entry => {
+    const x = +entry.rect.getAttribute("x"), y = +entry.rect.getAttribute("y");
+    const box = {
+      x0: x, y0: y,
+      x1: x + +entry.rect.getAttribute("width"),
+      y1: y + +entry.rect.getAttribute("height")
+    };
+    flow.nodes.forEach(node => {
+      if (entry.members.indexOf(node.id) >= 0) return;
+      const held = current.byId[node.id];
+      if (held.x < box.x1 && held.x + held.w > box.x0 &&
+          held.y < box.y1 && held.y + held.h > box.y0) {
+        throw new Error("`" + node.id + "` is drawn inside the fan-out container `" +
+          entry.text.textContent + "` of `" + flow.address + "`, and is none of " +
+          entry.members.join(", "));
+      }
+    });
+    boxes += 1;
+  });
+}
+
+let panes = 0, boxes = 0, closes = 0, jumps = 0;
 for (const flow of DOC.flows) {
   renderFlow(flow.address);
+  containersHoldOnlyTheirOwn(flow);
   for (const node of flow.nodes) {
     select(node.id);
     if (pane.innerHTML.length < 40) {
       throw new Error("the pane is empty for `" + flow.address + "`.`" + node.id + "`");
     }
     panes += 1;
+    // The pane's own two controls, clicked rather than read: the close that
+    // walks back to the flow overview, and the jump a `flow:` node carries to
+    // its own canvas — the one navigation PRD resolved q56 names.
+    const jump = pane.querySelector("[data-jump]:not([disabled])");
+    if (jump) {
+      const target = jump.getAttribute("data-jump");
+      jump.fire("click");
+      if (!current.flow || current.flow.address !== target) {
+        throw new Error("the jump on `" + node.id + "` did not open `" + target + "`");
+      }
+      jumps += 1;
+      renderFlow(flow.address);
+      select(node.id);
+    }
+    const close = pane.querySelector(".pane-close");
+    if (close) {
+      close.fire("click");
+      if (current.selected !== null) {
+        throw new Error("closing `" + node.id + "`'s pane left it selected");
+      }
+      closes += 1;
+    }
     showFlow();
   }
   // The controls a reader reaches for, and the one that discards a layout.
   document.getElementById("zoom-in").attributes;
   fit();
+  resetLayout();
 }
 if (panes < 3) throw new Error("the harness selected nothing");
 
@@ -195,6 +319,9 @@ for (const held of FACTS) {
 }
 console.log("panes=" + panes);
 console.log("facts=" + facts);
+console.log("boxes=" + boxes);
+console.log("closes=" + closes);
+console.log("jumps=" + jumps);
 "#;
 
 /// One pane, and resolved facts a reader must find in it.
@@ -327,12 +454,16 @@ fn panes(project: &str) -> &'static [Pane] {
         "crates/compose-core/tests/projects/omitted-graph-keys" => &[
             // The shapes nothing is declared on: a homogeneous fan-out, a
             // policy resolved at the built-in, and a wait with no budget.
+            //
+            // `each item` is what a homogeneous map's one route is called in
+            // both places a reader meets it — the satellite's badge and this
+            // row — so the two are one name rather than two.
             Pane {
                 flow: "flow.bare",
                 node: "work",
                 facts: &[
                     "homogeneous",
-                    "every item",
+                    "each item",
                     "→ agent.worker",
                     "fail  (built_in)",
                 ],
@@ -346,6 +477,39 @@ fn panes(project: &str) -> &'static [Pane] {
                 flow: "flow.bare",
                 node: "sign_off",
                 facts: &["unbounded"],
+            },
+        ],
+        "crates/compose-core/tests/projects/every-schema-form" => &[
+            // The two halves of `ToolView.source` no other project here
+            // attaches. `docs/graph.md` §9.1 makes that field a closed
+            // vocabulary a reader may switch on, and the pane is where each
+            // value becomes a word somebody reads: a `flow.*` used as a tool
+            // (PRD resolved q19) and a `builtin.*` attached by the `tools:`
+            // shorthand (PRD resolved q54) — the second distinguishable from the
+            // same built-in bound as a `tool.*` only by what bounded it.
+            Pane {
+                flow: "flow.shape",
+                node: "shape",
+                facts: &[
+                    "condense",
+                    "class=\"tag\">flow</span>",
+                    "a flow instantiated once per model tool call",
+                    "str_replace_based_edit_tool",
+                    "class=\"tag\">builtin · builtin</span>",
+                    "attached by the `tools:` shorthand, under its default bounds",
+                    // …beside the same shell bound as a `tool.*`, which is the
+                    // row that says what the shorthand's bounds are not.
+                    "builtin.bash, under the name its provider dictates",
+                ],
+            },
+            Pane {
+                flow: "flow.shape",
+                node: "spread/(item)",
+                facts: &[
+                    "bash",
+                    "class=\"tag\">builtin · builtin</span>",
+                    "attached by the `tools:` shorthand, under its default bounds",
+                ],
             },
         ],
         _ => &[],
@@ -366,34 +530,38 @@ fn facts_of(project: &str) -> String {
     held
 }
 
-/// Run one page's script under Bun with `storage`, and answer what it printed.
-fn exercise(project: &str, storage: &str) -> String {
-    let Some(mut bun) = toolchain::bun_command() else {
-        return String::new();
-    };
-    // Keyed by the *call*, not by the project: the tests of this file run on
-    // parallel threads of one process and two of them exercise
-    // `examples/triage-fanout`, so a name built from the pid and the project
-    // alone would have them writing and deleting one `harness.js` — a race whose
-    // symptom is bun failing to resolve a module and the assertion below blaming
-    // the template.
+/// A scratch directory of this file's own, named for the *call* rather than for
+/// what it runs.
+///
+/// The tests here run on parallel threads of one process and two of them
+/// exercise `examples/triage-fanout`, so a name built from the pid and the
+/// project alone would have them writing and deleting one `harness.js` — a race
+/// whose symptom is bun failing to resolve a module and an assertion blaming the
+/// template.
+fn scratch(label: &str) -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let directory = std::env::temp_dir().join(format!(
         "agent-compose-graph-render-{}-{}-{}",
         std::process::id(),
-        project.replace('/', "-"),
+        label.replace('/', "-"),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = fs::remove_dir_all(&directory);
     fs::create_dir_all(&directory).expect("a scratch directory");
+    directory
+}
+
+/// Run one page's script under Bun with `storage` and `epilogue`, and answer
+/// what it printed.
+fn run(label: &str, page: &str, storage: &str, epilogue: &str) -> String {
+    let Some(mut bun) = toolchain::bun_command() else {
+        return String::new();
+    };
+    let directory = scratch(label);
     let harness = directory.join("harness.js");
     fs::write(
         &harness,
-        format!(
-            "{DOM}\n{storage}\n{}\n{}\n{EXERCISE}\n",
-            script(&page(project)),
-            facts_of(project)
-        ),
+        format!("{DOM}\n{storage}\n{}\n{epilogue}\n", script(page)),
     )
     .expect("the harness is writable");
 
@@ -401,11 +569,21 @@ fn exercise(project: &str, storage: &str) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         output.status.success(),
-        "`{project}`'s page threw:\n{}\n{stdout}",
+        "`{label}`'s page threw:\n{}\n{stdout}",
         String::from_utf8_lossy(&output.stderr)
     );
     let _ = fs::remove_dir_all(&directory);
     stdout
+}
+
+/// Walk one project's page the way a reader does.
+fn exercise(project: &str, storage: &str) -> String {
+    run(
+        project,
+        &page(project),
+        storage,
+        &format!("{}\n{EXERCISE}", facts_of(project)),
+    )
 }
 
 /// One count the harness printed.
@@ -418,19 +596,23 @@ fn counted(printed: &str, what: &str) -> usize {
         .expect("a count")
 }
 
-/// Every node of every flow opens a detail pane without throwing, and the panes
-/// a reader reads carry the facts the compiler resolved.
+/// Every node of every flow opens a detail pane without throwing, every pane's
+/// own controls work, no fan-out container holds a node it does not dispatch,
+/// and the panes a reader reads carry the facts the compiler resolved.
 ///
-/// The third project is the one that matters most and is a fixture rather than
-/// an example: `omitted-graph-keys` is written to leave every optional array
-/// **out**, which is the shape both worked examples happen never to produce and
-/// the shape this whole file exists for.
+/// The two fixtures matter more than the examples. `omitted-graph-keys` is
+/// written to leave every optional array **out**, which is the shape both worked
+/// examples happen never to produce and the shape this whole file exists for;
+/// `every-schema-form` is the only project here that attaches a `flow.*` as a
+/// tool and a `builtin.*` by the `tools:` shorthand, which are two of the four
+/// values `docs/graph.md` §9.1 makes `ToolView.source` out of.
 #[test]
 fn every_node_of_every_flow_opens_its_pane() {
     for project in [
         "examples/triage-fanout",
         "examples/review-loop",
         "crates/compose-core/tests/projects/omitted-graph-keys",
+        "crates/compose-core/tests/projects/every-schema-form",
     ] {
         let printed = exercise(project, STORAGE_WORKS);
         if printed.is_empty() {
@@ -451,7 +633,98 @@ fn every_node_of_every_flow_opens_its_pane() {
             facts, expected,
             "`{project}`'s harness checked {facts} facts of {expected}"
         );
+        // Every fan-out the document declares is a container the geometry check
+        // measured — the count is what catches the check quietly looking at
+        // nothing, which is how a geometric invariant rots.
+        assert_eq!(
+            counted(&printed, "boxes="),
+            containers(&document(project)),
+            "`{project}`'s containers were not all measured"
+        );
+        // Every pane a node opens carries the close button, so the walk cannot
+        // have clicked none of them.
+        assert!(
+            counted(&printed, "closes=") > 0,
+            "`{project}`'s panes were never closed"
+        );
     }
+}
+
+/// The subgraph jump: a `flow:` node's pane opens that flow's own canvas.
+///
+/// PRD resolved q56 names this one by name — a `flow:` node links to its flow's
+/// tab, never expanding inline — and `examples/triage-fanout` is the project
+/// here with a subgraph to click. The walk above fires it wherever it finds one;
+/// this is what insists it was found.
+#[test]
+fn a_subgraph_pane_opens_the_flow_it_instantiates() {
+    let printed = exercise("examples/triage-fanout", STORAGE_WORKS);
+    if printed.is_empty() {
+        return;
+    }
+    assert!(
+        counted(&printed, "jumps=") > 0,
+        "`enrich`'s pane offered no jump to `flow.enrich`: {printed}"
+    );
+}
+
+/// A page emitted for a composition with **no flows** answers its controls.
+///
+/// A composition of `provider.*` and `model.*` definitions and no `flow.*`
+/// validates clean, so `visualize` emits a page for it — one with no flow to
+/// land on, an empty canvas, and the same background and the same "Reset layout"
+/// every other page has. Both of those read the flow on screen, and there is
+/// none.
+#[test]
+fn a_page_with_no_flows_answers_its_background_and_its_reset() {
+    let directory = scratch("flowless");
+    let entrypoint = directory.join("main.yml");
+    fs::write(
+        &entrypoint,
+        r#"version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.smart:
+  provider: provider.anthropic
+  id: claude-sonnet-4-6
+"#,
+    )
+    .expect("the entrypoint is writable");
+    let document = document_at(&entrypoint);
+    assert!(
+        document.flows.is_empty(),
+        "the fixture is the composition with nothing to draw"
+    );
+    let page = graph::render(&document).expect("the document renders");
+    let _ = fs::remove_dir_all(&directory);
+
+    let printed = run(
+        "flowless",
+        &page,
+        STORAGE_WORKS,
+        r#"
+if (current.flow !== null) throw new Error("there is no flow to have landed on");
+// A click on the canvas background, which every page answers by walking the
+// pane back to the flow overview, and the control that discards a layout.
+canvas.fire("click");
+resetLayout();
+if (pane.innerHTML.indexOf("declares no flows") < 0) {
+  throw new Error("the pane does not say what is missing:\n" + pane.innerHTML);
+}
+console.log("answered=2");
+"#,
+    );
+    if printed.is_empty() {
+        return;
+    }
+    assert_eq!(
+        counted(&printed, "answered="),
+        2,
+        "both controls answered: {printed}"
+    );
 }
 
 /// …and again with `localStorage` refusing every call.

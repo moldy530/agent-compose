@@ -558,10 +558,11 @@ The version number alone is a promise; six tests make it a checkable one:
   composition rather than instead of it, and `agent-compose validate` is what
   points at a line.
 * **Layout.** Positions are the renderer's, computed from the topology by the
-  embedded template — layered longest-path with barycenter ordering — and a
-  viewer's own rearrangement lives in that viewer's browser. Nothing about where
-  a node sits is in this document, which is what lets the emitted page be
-  golden-tested while remaining draggable.
+  embedded template — layered longest-path with barycenter ordering, and then a
+  pass that pushes any node a fan-out's dashed container would enclose but does
+  not dispatch clear of it — and a viewer's own rearrangement lives in that
+  viewer's browser. Nothing about where a node sits is in this document, which is
+  what lets the emitted page be golden-tested while remaining draggable.
 * **Resolved environment.** No `${ENV}` reference is substituted, here or
   anywhere upstream (PRD 5.9, resolved q15).
 * **Anything a run did.** This is a picture of a composition, not of an

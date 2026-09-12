@@ -278,6 +278,10 @@ const LEGEND = [
  * rearrangement stays client-side.
  * ------------------------------------------------------------------------- */
 const NODE_W = 190, NODE_H = 56, PILL_W = 84, PILL_H = 30, X_GAP = 250, Y_GAP = 94;
+/* What the dashed fan-out container pads its members by — room at the top for
+   its caption — and the least space a node pushed clear of one keeps from it. */
+const BOX_PAD = { left: 18, top: 30, right: 18, bottom: 14 };
+const CLEAR = 20;
 
 /* A cycle has no layering, so the back edges come out first: an edge that
    returns to a node still open on the depth-first stack is the one closing a
@@ -300,6 +304,71 @@ function backEdges(flow, byId) {
   if (state.start === 0) visit("start");
   flow.nodes.forEach(n => { if (state[n.id] === 0) visit(n.id); });
   return back;
+}
+
+/* The nodes one dashed container holds: a map, and the instances it dispatches. */
+function mapMembers(flow, id) {
+  return flow.edges.filter(e => e.class === "map_route" && e.from === id).map(e => e.to).concat([id]);
+}
+/* The rectangle that container is drawn as, in layout coordinates. */
+function boxRect(members, byId) {
+  const held = members.map(id => byId[id]).filter(Boolean);
+  if (!held.length) return null;
+  return {
+    x0: Math.min.apply(null, held.map(n => n.x)) - BOX_PAD.left,
+    y0: Math.min.apply(null, held.map(n => n.y)) - BOX_PAD.top,
+    x1: Math.max.apply(null, held.map(n => n.x + n.w)) + BOX_PAD.right,
+    y1: Math.max.apply(null, held.map(n => n.y + n.h)) + BOX_PAD.bottom
+  };
+}
+
+/* Move one node to `y`, taking with it anything it would otherwise land on.
+   Everything is pushed the way the first node went, so each node a shove reaches
+   ends up strictly past the one that pushed it and the cascade cannot come back
+   around. */
+function shove(nodes, node, y) {
+  if (y === node.y) return;
+  const down = y > node.y;
+  node.y = y;
+  nodes.forEach(other => {
+    if (other === node) return;
+    if (other.x >= node.x + node.w || other.x + other.w <= node.x) return;
+    if (other.y >= node.y + node.h + CLEAR || other.y + other.h + CLEAR <= node.y) return;
+    shove(nodes, other, down ? node.y + node.h + CLEAR : node.y - CLEAR - other.h);
+  });
+}
+
+/* Keep the dashed containers honest.
+   A container is an axis-aligned box over a map and its instances, and nothing
+   in the layering keeps a node that is neither out of it: in
+   `examples/triage-fanout` the `announce` branch — concurrent with the fan-out
+   rather than dispatched by it (grammar 7.6.1) — lands squarely inside one. A
+   reader would read it as one of the instances, which is the misreading the
+   container exists to prevent, so a stranger that lands in one is pushed clear
+   of it and whatever it then meets is pushed the same way. */
+function clearContainers(flow, nodes, byId) {
+  const groups = flow.nodes.filter(n => n.kind === "map").map(n => mapMembers(flow, n.id));
+  if (!groups.length) return;
+  /* Bounded rather than "until nothing moves": a shove can move a member of
+     another container, which resizes that one, and the budget is what keeps a
+     composition nobody anticipated from hanging the page instead of drawing one
+     slightly loose box. */
+  for (let pass = 0; pass < nodes.length + 1; pass++) {
+    let moved = false;
+    groups.forEach(members => {
+      const box = boxRect(members, byId);
+      if (!box) return;
+      nodes.forEach(node => {
+        if (members.indexOf(node.id) >= 0) return;
+        if (node.x >= box.x1 || node.x + node.w <= box.x0) return;
+        if (node.y >= box.y1 || node.y + node.h <= box.y0) return;
+        const up = node.y + node.h / 2 < (box.y0 + box.y1) / 2;
+        shove(nodes, node, up ? box.y0 - CLEAR - node.h : box.y1 + CLEAR);
+        moved = true;
+      });
+    });
+    if (!moved) break;
+  }
 }
 
 function layout(flow) {
@@ -362,12 +431,15 @@ function layout(flow) {
       const pill = n.kind === "start" || n.kind === "end";
       n.w = pill ? PILL_W : NODE_W;
       n.h = pill ? PILL_H : NODE_H;
-      n.bx = at * X_GAP;
-      n.by = i * Y_GAP - height / 2;
-      n.x = n.bx;
-      n.y = n.by;
+      n.x = at * X_GAP;
+      n.y = i * Y_GAP - height / 2;
     });
   });
+  clearContainers(flow, nodes, byId);
+  /* What the repair answers is the computed layout, so it is the *base* every
+     offset in `localStorage` is measured from — a viewer's rearrangement of a
+     node is theirs, and moving out of a container is not. */
+  nodes.forEach(n => { n.bx = n.x; n.by = n.y; });
   return { nodes: nodes, byId: byId };
 }
 
@@ -433,23 +505,17 @@ function geometry(edge) {
   };
 }
 
-/* The dashed container around a map and the satellites it dispatches. */
-function mapMembers(flow, id) {
-  return flow.edges.filter(e => e.class === "map_route" && e.from === id).map(e => e.to).concat([id]);
-}
+/* The dashed container around a map and the satellites it dispatches, drawn from
+   the same rectangle `clearContainers` cleared of everything else. */
 function sizeBox(entry) {
-  const held = entry.members.map(id => current.byId[id]).filter(Boolean);
-  if (!held.length) return;
-  const x0 = Math.min.apply(null, held.map(n => n.x)) - 18;
-  const y0 = Math.min.apply(null, held.map(n => n.y)) - 30;
-  const x1 = Math.max.apply(null, held.map(n => n.x + n.w)) + 18;
-  const y1 = Math.max.apply(null, held.map(n => n.y + n.h)) + 14;
-  entry.rect.setAttribute("x", x0);
-  entry.rect.setAttribute("y", y0);
-  entry.rect.setAttribute("width", x1 - x0);
-  entry.rect.setAttribute("height", y1 - y0);
-  entry.text.setAttribute("x", x0 + 12);
-  entry.text.setAttribute("y", y0 + 16);
+  const box = boxRect(entry.members, current.byId);
+  if (!box) return;
+  entry.rect.setAttribute("x", box.x0);
+  entry.rect.setAttribute("y", box.y0);
+  entry.rect.setAttribute("width", box.x1 - box.x0);
+  entry.rect.setAttribute("height", box.y1 - box.y0);
+  entry.text.setAttribute("x", box.x0 + 12);
+  entry.text.setAttribute("y", box.y0 + 16);
 }
 function refresh(id) {
   edgeEls.forEach(held => {
@@ -491,11 +557,12 @@ function clip(text, at) {
   return text.length > at ? text.slice(0, at - 1) + "…" : text;
 }
 
-/* What a satellite's route is called: its variant, `default` for the catch-all,
-   and `each item` for a homogeneous map, which routes by nothing and whose
-   single dispatch is neither. */
-function routeName(dispatch) {
-  return dispatch.variant || (dispatch.default ? "default" : "each item");
+/* What a route is called — read off the route itself or off the satellite it
+   dispatches, which carry the same two keys: its variant, `default` for the
+   catch-all, and `each item` for a homogeneous map, which routes by nothing and
+   whose single dispatch is neither. */
+function routeName(route) {
+  return route.variant || (route.default ? "default" : "each item");
 }
 
 function renderFlow(address) {
@@ -715,6 +782,17 @@ function showFlow() {
   current.selected = null;
   const nodes = document.querySelectorAll(".node");
   for (let i = 0; i < nodes.length; i++) nodes[i].classList.remove("selected");
+  /* A composition of `provider.*` and `model.*` definitions and no `flow.*` is
+     one the validator accepts, so it is one this page is emitted for — with no
+     flow to land on, and so nothing for the pane to be *about*. It still has a
+     background to click. */
+  if (!flow) {
+    pane.innerHTML = '<p class="pane-sub">This composition declares no flows.</p>' +
+      '<footer class="pane-foot">agent-compose visualize · ' + esc(DOC.entrypoint) +
+      " · target " + esc(DOC.target) + " · graph_version " + esc(DOC.graph_version) +
+      "</footer>";
+    return;
+  }
   pane.innerHTML =
     '<div class="pane-kind" style="color:var(--k-flow)">FLOW</div>' +
     '<div class="pane-addr">' + esc(flow.address) + "</div>" +
@@ -837,8 +915,10 @@ function select(id) {
             : "")]]
         : []));
     html += '<p class="pane-sub">' + esc(map.join) + "</p>";
+    /* Through `routeName`, so a route and the satellite it dispatches are called
+       the same thing in the two places a reader meets them. */
     html += "<h3>Routes</h3>" + list(map.routes).map(route =>
-      '<div class="row"><code>' + esc(route.variant || (route.default ? "default" : "every item")) +
+      '<div class="row"><code>' + esc(routeName(route)) +
       '</code><span class="note">→ ' + esc(route.target) +
       (list(route.covers).length ? " · narrowed to " + esc(list(route.covers).join(", ")) : "") +
       (route.max_concurrency ? " · ≤ " + esc(route.max_concurrency) + " concurrent" : "") +
@@ -958,10 +1038,15 @@ document.getElementById("zoom-out").addEventListener("click", () => {
   tf.k = Math.max(0.15, tf.k / 1.2); applyTransform();
 });
 document.getElementById("fit").addEventListener("click", fit);
-document.getElementById("reset").addEventListener("click", () => {
+/* Discard this browser's rearrangement of the flow on screen, and draw the
+   computed layout again. Named rather than inline so the control has nothing to
+   do when there is no flow on screen at all. */
+function resetLayout() {
+  if (!current.flow) return;
   clearOffsets(current.flow.address);
   renderFlow(current.flow.address);
-});
+}
+document.getElementById("reset").addEventListener("click", resetLayout);
 window.addEventListener("resize", fit);
 
 /* ---------------------------------------------------------------------------
@@ -1007,7 +1092,7 @@ function landing() {
 }
 
 if (DOC.flows.length) renderFlow(landing().address);
-else pane.innerHTML = '<p class="pane-sub">This composition declares no flows.</p>';
+else showFlow();
 </script>
 </body>
 </html>
