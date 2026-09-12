@@ -28,6 +28,47 @@
 use serde::Serialize;
 use serde_json::Value;
 
+/// Declares one of this document's **closed vocabularies**: the enumeration, and
+/// the `ALL` list every bind over it reads, out of one declaration.
+///
+/// `docs/graph.md` §9.1 makes a reader entitled to the members of each of these
+/// enumerations and §9.3 makes adding one a version bump, which are promises
+/// about a list that has to be *in* that document — so
+/// `crates/compose-core/tests/graph_format_inventory.rs` checks every member is
+/// written out there, and the two vocabularies the canvas *draws* with,
+/// [`NodeKind`] and [`EdgeClass`], are additionally held to the page's own `KIND`
+/// and `EDGE` tables (`the_pages_kind_table_names_every_kind_and_badges_it_the_same`,
+/// `the_pages_edge_table_names_every_class`).
+/// A bind like that is worth exactly as much as the list it runs over: a
+/// hand-kept one goes stale the moment a variant is added beside it, and every
+/// test over it keeps passing while the documentation and the page have never
+/// heard of the new member. Generating the list from the same declaration is
+/// what makes it the enumeration rather than a second inventory of it — the
+/// shape resolved q23 gives `explain`, where an exhaustive `match` over
+/// `DiagnosticCode` makes a new failure class fail to compile until it has an
+/// explanation.
+macro_rules! vocabulary {
+    (
+        $(#[$enumeration:meta])*
+        pub enum $name:ident {
+            $($(#[$member:meta])* $variant:ident),+ $(,)?
+        }
+    ) => {
+        $(#[$enumeration])*
+        pub enum $name {
+            $($(#[$member])* $variant),+
+        }
+
+        impl $name {
+            /// Every member, in declaration order.
+            ///
+            /// Written by the declaration above rather than beside it, so a
+            /// member cannot be absent from it.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
 /// The shape of the document this module emits.
 ///
 /// Independent of [`IR_VERSION`](crate::ir::IR_VERSION), of
@@ -133,17 +174,19 @@ pub struct SchemaView {
     pub fields: Vec<FieldView>,
 }
 
-/// Where a [`SchemaView`]'s shape comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SchemaSource {
-    /// The composition declares it.
-    Declared,
-    /// The construct's kind supplies it (grammar 8.2, 8.3).
-    KindDefault,
-    /// An agent that declares no `input:` takes one unnamed string
-    /// (grammar 5.3), so there are no fields to name.
-    StringInput,
+vocabulary! {
+    /// Where a [`SchemaView`]'s shape comes from.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum SchemaSource {
+        /// The composition declares it.
+        Declared,
+        /// The construct's kind supplies it (grammar 8.2, 8.3).
+        KindDefault,
+        /// An agent that declares no `input:` takes one unnamed string
+        /// (grammar 5.3), so there are no fields to name.
+        StringInput,
+    }
 }
 
 /// One declared trigger, as the flow it targets sees it.
@@ -236,35 +279,37 @@ pub struct GraphNode {
     pub dispatch: Option<DispatchView>,
 }
 
-/// Which kind of node this is (grammar 7.1, PRD 5.5), plus the two pseudo-nodes
-/// every flow's edges name.
-///
-/// Every kind renders distinguishably, which is the content requirement PRD
-/// resolved q56 states: a reader must be able to tell an agent from a tool from
-/// a store operation without opening the spec.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeKind {
-    /// The `start` pseudo-node.
-    Start,
-    /// The `end` pseudo-node.
-    End,
-    /// `agent: agent.*`.
-    Agent,
-    /// `function: tool.*` — the graph-invoked use of a tool definition.
-    Function,
-    /// `exec: { … }`.
-    Exec,
-    /// `http: { … }`.
-    Http,
-    /// `human: { … }`.
-    Human,
-    /// `store: store.*`.
-    Store,
-    /// `flow: flow.*` — a subgraph instantiation.
-    Flow,
-    /// `map: { … }` — a fan-out.
-    Map,
+vocabulary! {
+    /// Which kind of node this is (grammar 7.1, PRD 5.5), plus the two
+    /// pseudo-nodes every flow's edges name.
+    ///
+    /// Every kind renders distinguishably, which is the content requirement PRD
+    /// resolved q56 states: a reader must be able to tell an agent from a tool
+    /// from a store operation without opening the spec.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum NodeKind {
+        /// The `start` pseudo-node.
+        Start,
+        /// The `end` pseudo-node.
+        End,
+        /// `agent: agent.*`.
+        Agent,
+        /// `function: tool.*` — the graph-invoked use of a tool definition.
+        Function,
+        /// `exec: { … }`.
+        Exec,
+        /// `http: { … }`.
+        Http,
+        /// `human: { … }`.
+        Human,
+        /// `store: store.*`.
+        Store,
+        /// `flow: flow.*` — a subgraph instantiation.
+        Flow,
+        /// `map: { … }` — a fan-out.
+        Map,
+    }
 }
 
 impl NodeKind {
@@ -396,22 +441,25 @@ pub struct OnErrorView {
     pub level: PolicyLevel,
 }
 
-/// Which level of grammar 9.3's chain a resolved field came from.
-///
-/// The chain's fourth outcome — *exempt*, a `human` node's `timeout:` and
-/// `retry:`, which resolve at no level at all (Decision D102) — is not a member
-/// here: it never accompanies a value, and this document writes it as the key's
-/// **absence** rather than as a level (`docs/graph.md` §5.2). A member a
-/// document can never carry is a branch a consumer writes and never reaches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PolicyLevel {
-    /// Level 2: the node's own key.
-    Node,
-    /// Level 3: the composition's `defaults:`.
-    Defaults,
-    /// Level 4: the built-in.
-    BuiltIn,
+vocabulary! {
+    /// Which level of grammar 9.3's chain a resolved field came from.
+    ///
+    /// The chain's fourth outcome — *exempt*, a `human` node's `timeout:` and
+    /// `retry:`, which resolve at no level at all (Decision D102) — is not a
+    /// member here: it never accompanies a value, and this document writes it as
+    /// the key's **absence** rather than as a level (`docs/graph.md` §5.2). A
+    /// member a document can never carry is a branch a consumer writes and never
+    /// reaches.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PolicyLevel {
+        /// Level 2: the node's own key.
+        Node,
+        /// Level 3: the composition's `defaults:`.
+        Defaults,
+        /// Level 4: the built-in.
+        BuiltIn,
+    }
 }
 
 /// An `agent:` node's resolved configuration.
@@ -518,18 +566,20 @@ pub struct ToolView {
     pub detail: Option<String>,
 }
 
-/// Where a [`ToolView`] came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolSource {
-    /// A `tool.*` in the agent's `tools:` list.
-    Tool,
-    /// A `flow.*` in the same list, used as a tool (PRD resolved q19).
-    Flow,
-    /// A `builtin.*` shorthand entry (grammar 5.5, PRD resolved q54).
-    Builtin,
-    /// Synthesized from an attached store (grammar 11.5, PRD 5.8).
-    Store,
+vocabulary! {
+    /// Where a [`ToolView`] came from.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ToolSource {
+        /// A `tool.*` in the agent's `tools:` list.
+        Tool,
+        /// A `flow.*` in the same list, used as a tool (PRD resolved q19).
+        Flow,
+        /// A `builtin.*` shorthand entry (grammar 5.5, PRD resolved q54).
+        Builtin,
+        /// Synthesized from an attached store (grammar 11.5, PRD 5.8).
+        Store,
+    }
 }
 
 /// An inline `exec:` block, or the one a tool binds.
@@ -755,63 +805,55 @@ pub struct GraphEdge {
     pub join_barrier: bool,
 }
 
-/// Which kind of transfer an edge is.
-///
-/// Every routing decision an execution could take is one of these, which is the
-/// promise the canvas makes: what you see is every path the validator proved
-/// (PRD resolved q56).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EdgeClass {
-    /// A declared edge with no `when:` and no `else:` — it always fires.
-    Unconditional,
-    /// A declared edge carrying a CEL `when:` guard (grammar 7.3).
-    Conditional,
-    /// A declared edge marked `else: true` — taken iff no guarded sibling was
-    /// (grammar 7.3 rule 4).
-    Default,
-    /// A `map`'s dispatch to one of its routes (grammar 8.6).
-    MapRoute,
-    /// `on_error: { fallback: … }` — control transfers instead of this node's
-    /// own edges being evaluated (grammar 9.2, 7.8).
-    ErrorFallback,
-    /// `human.on_timeout:` — control transfers when the wait runs out
-    /// (grammar 8.7, 7.8).
-    Timeout,
+vocabulary! {
+    /// Which kind of transfer an edge is.
+    ///
+    /// Every routing decision an execution could take is one of these, which is
+    /// the promise the canvas makes: what you see is every path the validator
+    /// proved (PRD resolved q56).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum EdgeClass {
+        /// A declared edge with no `when:` and no `else:` — it always fires.
+        Unconditional,
+        /// A declared edge carrying a CEL `when:` guard (grammar 7.3).
+        Conditional,
+        /// A declared edge marked `else: true` — taken iff no guarded sibling was
+        /// (grammar 7.3 rule 4).
+        Default,
+        /// A `map`'s dispatch to one of its routes (grammar 8.6).
+        MapRoute,
+        /// `on_error: { fallback: … }` — control transfers instead of this node's
+        /// own edges being evaluated (grammar 9.2, 7.8).
+        ErrorFallback,
+        /// `human.on_timeout:` — control transfers when the wait runs out
+        /// (grammar 8.7, 7.8).
+        Timeout,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every kind of the document.
-    const KINDS: [NodeKind; 10] = [
-        NodeKind::Start,
-        NodeKind::End,
-        NodeKind::Agent,
-        NodeKind::Function,
-        NodeKind::Exec,
-        NodeKind::Http,
-        NodeKind::Human,
-        NodeKind::Store,
-        NodeKind::Flow,
-        NodeKind::Map,
-    ];
-
     /// Every kind has a badge, and no two share one: the badge is how a reader
     /// tells the kinds apart on the canvas, which is the content requirement
     /// PRD resolved q56 states.
+    ///
+    /// Over [`NodeKind::ALL`], which the declaration of the enumeration writes —
+    /// so a kind added to it is a kind this runs over rather than one a list
+    /// beside the enumeration never heard of.
     #[test]
     fn every_node_kind_has_its_own_badge() {
         let mut seen = std::collections::BTreeSet::new();
-        for kind in KINDS {
+        for kind in NodeKind::ALL {
             assert!(
                 seen.insert(kind.badge()),
                 "`{}` is two kinds' badge",
                 kind.badge()
             );
         }
-        assert_eq!(seen.len(), KINDS.len());
+        assert_eq!(seen.len(), NodeKind::ALL.len());
     }
 
     /// …and the page's own table names exactly those kinds, with those badges.
@@ -824,10 +866,14 @@ mod tests {
     /// collapsed into one is precisely the distinguishability PRD resolved q56
     /// requires, and nothing else would notice, so the two sides are bound
     /// here: adding a variant fails this test until the page learns to draw it.
+    ///
+    /// Which it does because the list it runs over is [`NodeKind::ALL`],
+    /// generated by the enumeration's own declaration. A hand-kept list here
+    /// would have made this test pass on exactly the change it exists to catch.
     #[test]
     fn the_pages_kind_table_names_every_kind_and_badges_it_the_same() {
         let table = kind_table();
-        let mut expected: Vec<(String, String)> = KINDS
+        let mut expected: Vec<(String, String)> = NodeKind::ALL
             .iter()
             .map(|kind| (member(kind), kind.badge().to_string()))
             .collect();
@@ -864,10 +910,47 @@ mod tests {
             .collect()
     }
 
-    /// The serde name of one kind — what the document actually carries, and
-    /// what the page indexes its table by.
-    fn member(kind: &NodeKind) -> String {
-        serde_json::to_value(kind)
+    /// …and the page's `EDGE` table names every class, for the same reason.
+    ///
+    /// `EDGE[edge.class]` supplies the arrowhead the canvas draws and the chip
+    /// the detail pane names the transfer by, and it falls back to
+    /// `EDGE.unconditional` — so a class the table had never heard of would be
+    /// drawn as a plain solid edge with nothing said about it, which is a routing
+    /// decision rendered as if it were unconditional. Bound over
+    /// [`EdgeClass::ALL`], so adding a class fails this test until the page draws
+    /// it.
+    #[test]
+    fn the_pages_edge_table_names_every_class() {
+        let mut expected: Vec<String> = EdgeClass::ALL.iter().map(member).collect();
+        expected.sort();
+        let mut found = table_keys("const EDGE = {");
+        found.sort();
+        assert_eq!(
+            found, expected,
+            "`template.html`'s `EDGE` table and `EdgeClass` disagree. The canvas reads \
+             `EDGE[edge.class]`, so a class missing there is drawn as an unconditional edge"
+        );
+    }
+
+    /// The keys of one of the page's object literals.
+    fn table_keys(opening: &str) -> Vec<String> {
+        let template = crate::graph::TEMPLATE;
+        let from = template
+            .find(opening)
+            .unwrap_or_else(|| panic!("the page carries its `{opening}` table"));
+        let rest = &template[from + opening.len()..];
+        let to = rest.find("};").expect("the table is closed");
+        rest[..to]
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .map(|(key, _)| key.trim().to_string())
+            .collect()
+    }
+
+    /// The serde name of one enumeration member — what the document actually
+    /// carries, and what the page indexes its tables by.
+    fn member<T: Serialize>(value: &T) -> String {
+        serde_json::to_value(value)
             .expect("a unit variant serializes")
             .as_str()
             .expect("as a string")

@@ -24,8 +24,12 @@
 //! **(c) Every closed vocabulary is written out.** §9.1 makes a reader entitled
 //! to the members of each enumeration, and §9.3 makes adding one a version bump
 //! — both of which are promises about a list that has to be *in* the document.
-//! The members are read out of the compiler by serializing them, so the list
-//! here is not a second inventory that could disagree with the first.
+//! The members are read out of the compiler: each vocabulary's `ALL` is written
+//! by the declaration of the enumeration itself (see the `vocabulary!` macro in
+//! `src/graph/document.rs`), so a member cannot be missing from the list this
+//! runs over. A list kept by hand beside the enumeration would have made this
+//! test pass on exactly the change it exists to catch — a new member, documented
+//! nowhere, and §9.3's bump never asked for.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -147,79 +151,23 @@ fn every_record_type_is_specified() {
 
 /// (c) Every member of every closed vocabulary is written out.
 ///
-/// Read by serializing the members rather than by listing them here, so the two
-/// sides cannot disagree: a variant added to the compiler fails this test until
-/// somebody writes it down and decides whether §9.3's bump is owed.
+/// Read out of the enumerations rather than listed here: every `ALL` below is
+/// written by the same declaration as the enumeration it belongs to, so a
+/// variant added to the compiler is a variant this test demands `docs/graph.md`
+/// name — and somebody has to decide whether §9.3's bump is owed before it
+/// ships. The page's own side of that bind is in `src/graph/document.rs`, where
+/// `NodeKind::ALL` is held to the template's `KIND` table and `EdgeClass::ALL` to
+/// its `EDGE` table.
 #[test]
 fn every_closed_vocabulary_is_written_out() {
     let specification = specification();
-    let mut vocabularies: Vec<(&str, Vec<String>)> = Vec::new();
-    vocabularies.push((
-        "GraphNode.kind",
-        [
-            NodeKind::Start,
-            NodeKind::End,
-            NodeKind::Agent,
-            NodeKind::Function,
-            NodeKind::Exec,
-            NodeKind::Http,
-            NodeKind::Human,
-            NodeKind::Store,
-            NodeKind::Flow,
-            NodeKind::Map,
-        ]
-        .iter()
-        .map(member)
-        .collect(),
-    ));
-    vocabularies.push((
-        "GraphEdge.class",
-        [
-            EdgeClass::Unconditional,
-            EdgeClass::Conditional,
-            EdgeClass::Default,
-            EdgeClass::MapRoute,
-            EdgeClass::ErrorFallback,
-            EdgeClass::Timeout,
-        ]
-        .iter()
-        .map(member)
-        .collect(),
-    ));
-    vocabularies.push((
-        "SchemaView.source",
-        [
-            SchemaSource::Declared,
-            SchemaSource::KindDefault,
-            SchemaSource::StringInput,
-        ]
-        .iter()
-        .map(member)
-        .collect(),
-    ));
-    vocabularies.push((
-        "RetryView.level",
-        [
-            PolicyLevel::Node,
-            PolicyLevel::Defaults,
-            PolicyLevel::BuiltIn,
-        ]
-        .iter()
-        .map(member)
-        .collect(),
-    ));
-    vocabularies.push((
-        "ToolView.source",
-        [
-            ToolSource::Tool,
-            ToolSource::Flow,
-            ToolSource::Builtin,
-            ToolSource::Store,
-        ]
-        .iter()
-        .map(member)
-        .collect(),
-    ));
+    let vocabularies: Vec<(&str, Vec<String>)> = vec![
+        ("GraphNode.kind", members(NodeKind::ALL)),
+        ("GraphEdge.class", members(EdgeClass::ALL)),
+        ("SchemaView.source", members(SchemaSource::ALL)),
+        ("RetryView.level", members(PolicyLevel::ALL)),
+        ("ToolView.source", members(ToolSource::ALL)),
+    ];
 
     for (vocabulary, members) in vocabularies {
         assert!(
@@ -239,14 +187,18 @@ fn every_closed_vocabulary_is_written_out() {
     }
 }
 
-/// The serde name of one enumeration member — what the document actually
+/// The serde names of one vocabulary's members — what the document actually
 /// carries.
-fn member<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .expect("a unit variant serializes")
-        .as_str()
-        .expect("as a string")
-        .to_string()
+fn members<T: serde::Serialize>(all: &[T]) -> Vec<String> {
+    all.iter()
+        .map(|value| {
+            serde_json::to_value(value)
+                .expect("a unit variant serializes")
+                .as_str()
+                .expect("as a string")
+                .to_string()
+        })
+        .collect()
 }
 
 /// The document's own version and the constant the compiler writes agree.

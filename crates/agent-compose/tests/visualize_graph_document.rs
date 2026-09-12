@@ -270,7 +270,10 @@ fn the_map_draws_every_route_and_narrows_the_default() {
         let drawn = edges(&triage, "dispatch", id);
         assert_eq!(drawn.len(), 1, "`{id}` is dispatched by one edge");
         assert_eq!(drawn[0]["class"], "map_route");
-        let expected = route["variant"].as_str().unwrap_or("default");
+        // The catch-all's chip takes the parentheses its satellite id takes, so
+        // it cannot read identically to the chip on a route whose variant is
+        // tagged `default` (grammar §3.8 allows that tag).
+        let expected = route["variant"].as_str().unwrap_or("(default)");
         assert_eq!(drawn[0]["label"], expected);
         assert_eq!(node(&triage, id)["dispatch"]["map"], "dispatch");
     }

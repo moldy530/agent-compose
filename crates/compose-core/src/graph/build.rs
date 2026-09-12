@@ -1315,7 +1315,13 @@ fn edges(ir: &Ir, flow: &Flow) -> Vec<GraphEdge> {
             for route in routes(ir, flow, id, map) {
                 let label = match (&route.variant, route.default) {
                     (Some(variant), _) => variant.clone(),
-                    (None, true) => "default".to_string(),
+                    // `(default)` rather than `default`, for the reason the
+                    // satellite's own id takes the parentheses: `default` is a
+                    // legal variant tag, so a chip spelled like one would read
+                    // identically to the chip on the route that variant's tag
+                    // declares — two edges leaving one map under one label, and
+                    // no way to tell which is the catch-all.
+                    (None, true) => "(default)".to_string(),
                     (None, false) => "each item".to_string(),
                 };
                 held.push(GraphEdge {

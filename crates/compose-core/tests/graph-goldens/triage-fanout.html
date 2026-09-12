@@ -1571,7 +1571,7 @@ const DOC = {
           "from": "dispatch",
           "to": "dispatch/(default)",
           "class": "map_route",
-          "label": "default"
+          "label": "(default)"
         },
         {
           "from": "announce",
@@ -1609,6 +1609,25 @@ const LEGEND = [
   ["agent", "agent"], ["function", "tool"], ["exec", "exec"], ["http", "http"],
   ["human", "human"], ["store", "store"], ["flow", "subgraph"], ["map", "map"]
 ];
+
+/* ---------------------------------------------------------------------------
+ * Edge classes
+ *
+ * `marker` is the arrowhead the canvas draws on a class; `chip` is how the
+ * detail pane names the transfer. `docs/graph.md` §6 closes this vocabulary and
+ * `the_pages_edge_table_names_every_class` holds this table to it, for the
+ * reason KIND above is held to `NodeKind`: a class this table had never heard of
+ * would arrive as a plain solid edge the pane says nothing about, which is a
+ * routing decision drawn as if it were an unconditional one.
+ * ------------------------------------------------------------------------- */
+const EDGE = {
+  unconditional:  { marker: "arrow",        chip: () => "" },
+  conditional:    { marker: "arrow-accent", chip: e => '<span class="cel">when ' + esc(e.when) + "</span>" },
+  default:        { marker: "arrow-accent", chip: () => '<span class="cel">else</span>' },
+  map_route:      { marker: "arrow",        chip: e => '<span class="note">route ' + esc(e.label) + "</span>" },
+  error_fallback: { marker: "arrow-warn",   chip: e => '<span class="warn">' + esc(e.label) + "</span>" },
+  timeout:        { marker: "arrow-warn",   chip: e => '<span class="warn">' + esc(e.label) + "</span>" }
+};
 
 /* ---------------------------------------------------------------------------
  * Layout: longest-path layering, barycenter ordering, left to right.
@@ -1855,9 +1874,7 @@ function applyTransform() {
   view.setAttribute("transform", "translate(" + tf.x + "," + tf.y + ") scale(" + tf.k + ")");
 }
 function marker(edge) {
-  if (edge.class === "conditional" || edge.class === "default") return "url(#arrow-accent)";
-  if (edge.class === "error_fallback" || edge.class === "timeout") return "url(#arrow-warn)";
-  return "url(#arrow)";
+  return "url(#" + (EDGE[edge.class] || EDGE.unconditional).marker + ")";
 }
 function edgeClass(edge) {
   return "edge " + edge.class + (edge.join_barrier ? " barrier" : "");
@@ -2274,13 +2291,7 @@ function select(id) {
   const outbound = flow.edges.filter(e => e.from === id);
   const edgeRow = (edge, direction) => {
     const other = direction === "in" ? edge.from : edge.to;
-    let tag = "";
-    if (edge.class === "conditional") tag = '<span class="cel">when ' + esc(edge.when) + "</span>";
-    else if (edge.class === "default") tag = '<span class="cel">else</span>';
-    else if (edge.class === "map_route") tag = '<span class="note">route ' + esc(edge.label) + "</span>";
-    else if (edge.class === "error_fallback" || edge.class === "timeout") {
-      tag = '<span class="warn">' + esc(edge.label) + "</span>";
-    }
+    let tag = (EDGE[edge.class] || EDGE.unconditional).chip(edge);
     if (edge.join_barrier) tag += ' <span class="note">join barrier</span>';
     if (edge.max_iterations) tag += ' <span class="note">max_iterations ' + esc(edge.max_iterations) + "</span>";
     return '<div class="edgeline"><span class="dir">' + (direction === "in" ? "←" : "→") +

@@ -206,6 +206,23 @@ fn a_variant_tagged_default_and_the_catch_all_get_separate_satellites() {
         "the variant tagged `default` and the `default:` route are two satellites"
     );
 
+    // And the chips the canvas draws on the two dispatches read differently.
+    // The satellite ids disambiguate the node boxes and `covers` disambiguates
+    // the pane, but an edge carries only its label: two chips reading `default`
+    // leaving one map would leave a reader unable to tell which edge is the
+    // catch-all from the drawing alone.
+    let chips: Vec<Option<&str>> = flow
+        .edges
+        .iter()
+        .filter(|edge| edge.class == EdgeClass::MapRoute && edge.from == "work")
+        .map(|edge| edge.label.as_deref())
+        .collect();
+    assert_eq!(
+        chips,
+        vec![Some("default"), Some("other"), Some("(default)")],
+        "the variant's chip and the catch-all's are distinguishable"
+    );
+
     let catch_all = flow
         .nodes
         .iter()

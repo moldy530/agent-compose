@@ -336,6 +336,51 @@ model.smart:
     );
 }
 
+/// A **warning** does not refuse a drawing: the page is written, the document is
+/// printed, and the exit code is `0`.
+///
+/// The severity's whole meaning, at the verb where "the report was not clean" is
+/// a tempting place to stop — `tests/build_cli.rs`'s
+/// `a_warning_does_not_refuse_an_emission` pins the clause for `build`, and this
+/// is `visualize`'s half of it. `unknown-server-tool` is what makes it
+/// load-bearing (grammar 12.1, Decision D122, PRD resolved q30): a provider
+/// declaring a server tool this release predates is a composition the compiler
+/// cannot fully check and must not refuse. Both formats are checked, because the
+/// warnings are printed before the two diverge — a refusal widened from
+/// `report::refuses` to "the report said anything" would take them both.
+#[test]
+fn a_warning_does_not_refuse_a_drawing() {
+    let spec = "crates/agent-compose/tests/projects/one-unverifiable-server-tool/main.yml";
+    let out = scratch("warned").join("graph.html");
+    let output = visualize(&[spec, "-o", out.to_str().expect("a UTF-8 scratch path")]);
+    assert_eq!(
+        code(&output),
+        0,
+        "a warning is not a refusal: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("warning[unknown-server-tool]"),
+        "the warning is still reported: {}",
+        stderr(&output)
+    );
+    assert!(out.is_file(), "the page was written: {}", stderr(&output));
+
+    let printed = visualize(&[spec, "--format", "json"]);
+    assert_eq!(code(&printed), 0, "{}", stderr(&printed));
+    assert!(
+        stderr(&printed).contains("warning[unknown-server-tool]"),
+        "…on the other format too: {}",
+        stderr(&printed)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(stdout(&printed)).expect("stdout is one JSON document");
+    assert_eq!(
+        document["graph_version"], 1,
+        "and the warning stayed off stdout"
+    );
+}
+
 /// A composition the validator refuses is refused here, **in the same words**.
 ///
 /// Not "a similar report": the same bytes on the same stream, because both go

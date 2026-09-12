@@ -1309,7 +1309,7 @@
           "from": "dispatch",
           "to": "dispatch/(default)",
           "class": "map_route",
-          "label": "default"
+          "label": "(default)"
         },
         {
           "from": "announce",
