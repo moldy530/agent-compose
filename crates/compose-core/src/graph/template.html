@@ -91,6 +91,7 @@ svg { display: block; width: 100%; height: 100%; }
   position: absolute; right: 12px; bottom: 12px; font-size: 11.5px; color: var(--faint);
   background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px;
 }
+.narrow-only { display: none; }
 
 aside {
   width: 380px; flex: none; border-left: 1px solid var(--line); background: var(--surface);
@@ -187,7 +188,11 @@ path.edge.barrier { stroke-dasharray: 2 4; stroke-width: 1.2; }
 
 @media (max-width: 760px) {
   header { padding: 8px 12px; gap: 8px; }
-  .legend, .hint { display: none; }
+  .legend, .wide-only { display: none; }
+  .narrow-only { display: inline; }
+  /* Above the zoom controls rather than beside them: at this width the two
+     would share the bottom of the canvas. */
+  .hint { bottom: 50px; }
   /* The pane becomes a sheet BELOW the canvas rather than an overlay over it.
      An overlay would cover the drawing this file exists to show and there would
      be nothing to dismiss it to: the pane is always populated — an empty
@@ -237,7 +242,14 @@ path.edge.barrier { stroke-dasharray: 2 4; stroke-width: 1.2; }
       <button id="fit" class="wide">Fit</button>
       <button id="reset" class="wide" title="Discard this browser's node rearrangement and restore the computed layout">Reset layout</button>
     </div>
-    <div class="hint">drag the canvas to pan &middot; drag a node to rearrange &middot; scroll to zoom &middot; click a node</div>
+    <!-- Two spellings of the same hint. The short one is for phone width, where
+         the hint matters most and there is no room for the long one: `fit` has a
+         zoom floor, so a real graph is wider than the viewport there and panning
+         is the only way to reach the rest of it — and a touch pointer has no
+         wheel, so what zooms is the two buttons beside it. -->
+    <div class="hint">drag<span class="wide-only"> the canvas</span> to pan &middot;
+      <span class="wide-only">drag a node to rearrange &middot; scroll to zoom &middot; click a node</span>
+      <span class="narrow-only">+ &minus; to zoom</span></div>
   </div>
   <aside id="pane" aria-live="polite"></aside>
 </main>
@@ -282,6 +294,19 @@ const NODE_W = 190, NODE_H = 56, PILL_W = 84, PILL_H = 30, X_GAP = 250, Y_GAP = 
    its caption — and the least space a node pushed clear of one keeps from it. */
 const BOX_PAD = { left: 18, top: 30, right: 18, bottom: 14 };
 const CLEAR = 20;
+
+/* What an edge's chip measures, without asking the browser for it.
+   The chips are set in a monospace face at 10.5px, so an upper bound on one's
+   width follows from its character count — which is what keeps where a chip
+   lands as deterministic as the layout it lands on. `CHIP_BASE` is how far the
+   text's baseline sits below the box's middle, so the box the placement reasons
+   about is the box a reader sees. */
+const CHIP_EM = 6.5, CHIP_PAD = 12, CHIP_H = 21, CHIP_BASE = 3.5, CHIP_CLEAR = 5;
+/* Where a chip is allowed to sit: out along its own edge from the middle, and
+   then stepped off the edge into the channel between two rows of nodes. Walked
+   in this order, so the chip that can stay on its line does. */
+const CHIP_T = [0.5, 0.42, 0.58, 0.34, 0.66, 0.25, 0.75, 0.15, 0.85];
+const CHIP_DY = [0, -Y_GAP / 2, Y_GAP / 2, -Y_GAP, Y_GAP, -1.5 * Y_GAP, 1.5 * Y_GAP];
 
 /* A cycle has no layering, so the back edges come out first: an edge that
    returns to a node still open on the depth-first stack is the one closing a
@@ -450,7 +475,23 @@ function layout(flow) {
  * is a convenience: every access is guarded, and the page renders exactly the
  * same without it.
  * ------------------------------------------------------------------------- */
-function storeKey(flow) { return "agent-compose:graph:" + DOC.entrypoint + ":" + flow; }
+/* What distinguishes one composition's keys from another's.
+   Not `entrypoint` on its own: the grammar's own convention makes it `main.yml`
+   in very nearly every composition, and a browser gives every page read off the
+   local filesystem one storage bucket — so two unrelated `graph.html` files, each
+   with a `flow.triage` and a `classify` in it, would read each other's
+   rearrangements. The digest is over the document, so it is the same for the same
+   composition on every machine and different the moment anything about the graph
+   is. */
+function digest(text) {
+  let held = 5381;
+  for (let i = 0; i < text.length; i++) held = ((held * 33) ^ text.charCodeAt(i)) >>> 0;
+  return held.toString(36);
+}
+const DOC_KEY = digest(JSON.stringify(DOC));
+function storeKey(flow) {
+  return "agent-compose:graph:" + DOC.entrypoint + ":" + DOC_KEY + ":" + flow;
+}
 function loadOffsets(flow) {
   try { return JSON.parse(localStorage.getItem(storeKey(flow))) || {}; } catch (e) { return {}; }
 }
@@ -497,12 +538,91 @@ function geometry(edge) {
   const a = current.byId[edge.from], b = current.byId[edge.to];
   const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2;
   const bend = Math.max(40, Math.abs(x2 - x1) / 2);
+  const curve = [x1, y1, x1 + bend, y1, x2 - bend, y2, x2, y2];
   return {
-    d: "M " + x1 + " " + y1 + " C " + (x1 + bend) + " " + y1 + ", " +
-       (x2 - bend) + " " + y2 + ", " + x2 + " " + y2,
-    mx: (x1 + x2) / 2,
-    my: (y1 + y2) / 2 - 2
+    d: "M " + x1 + " " + y1 + " C " + curve[2] + " " + curve[3] + ", " +
+       curve[4] + " " + curve[5] + ", " + x2 + " " + y2,
+    curve: curve
   };
+}
+/* A point on the cubic `geometry` draws, so a chip offered a place on its edge is
+   offered a place on the curve a reader follows rather than on the straight line
+   between its endpoints. */
+function along(curve, t) {
+  const u = 1 - t, w = [u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t];
+  return {
+    x: w[0] * curve[0] + w[1] * curve[2] + w[2] * curve[4] + w[3] * curve[6],
+    y: w[0] * curve[1] + w[1] * curve[3] + w[2] * curve[5] + w[3] * curve[7]
+  };
+}
+function overlaps(a, b) {
+  return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+}
+
+/* What one chip's text says, which is also what its width is read off.
+   Clipped, because a chip is a cue on the canvas and the pane carries the
+   expression whole. */
+function chipText(edge) {
+  return clip(edge.label, 42) + (edge.max_iterations ? " ×" + edge.max_iterations : "");
+}
+
+/* Where one chip goes.
+ *
+ * A chip is opaque, and has to be: a routing decision read through a node box is
+ * not read, and every decision an execution could take is supposed to be legible
+ * on the canvas (PRD resolved q56). So it cannot simply be drawn at the middle of
+ * its edge — the corridor between two layers is `X_GAP - NODE_W` wide and a CEL
+ * expression is several times that, so in `examples/triage-fanout` the two guards
+ * leaving `approve`, the `on_timeout` beside them and the node `escalate` they
+ * all point past would land in one pile.
+ *
+ * Each chip takes the first candidate clear of every node and of every chip
+ * already placed. Clearing the nodes is the hard requirement and clearing the
+ * other chips the soft one, so a candidate that only manages the first is
+ * remembered and used if nothing manages both. */
+function chipBox(held, nodes, chips) {
+  const half = held.width / 2, tall = CHIP_H / 2;
+  let loose = null, last = null;
+  for (const dy of CHIP_DY) {
+    for (const t of CHIP_T) {
+      const at = along(held.curve, t);
+      const box = {
+        x0: at.x - half, y0: at.y + dy - tall,
+        x1: at.x + half, y1: at.y + dy + tall
+      };
+      last = box;
+      if (nodes.some(other => overlaps(box, other))) continue;
+      if (!chips.some(other => overlaps(box, other))) return box;
+      if (!loose) loose = box;
+    }
+  }
+  /* A composition that leaves nowhere clear gets the furthest candidate off the
+     edge rather than the middle of the crowd. */
+  return loose || last;
+}
+
+/* Every chip on the canvas, placed against the nodes as they currently sit —
+   which is why a drag re-runs the whole pass rather than moving the chips it
+   touched: a node dragged across the canvas frees the place one chip was pushed
+   out of and takes the place another was using. */
+function placeLabels() {
+  const nodes = [];
+  for (const id in current.byId) {
+    const node = current.byId[id];
+    nodes.push({
+      x0: node.x - CHIP_CLEAR, y0: node.y - CHIP_CLEAR,
+      x1: node.x + node.w + CHIP_CLEAR, y1: node.y + node.h + CHIP_CLEAR
+    });
+  }
+  const chips = [];
+  edgeEls.forEach(held => {
+    if (!held.label) return;
+    const box = chipBox(held, nodes, chips);
+    held.box = box;
+    held.label.setAttribute("transform", "translate(" + ((box.x0 + box.x1) / 2) +
+      "," + ((box.y0 + box.y1) / 2 + CHIP_BASE) + ")");
+    chips.push(box);
+  });
 }
 
 /* The dashed container around a map and the satellites it dispatches, drawn from
@@ -521,11 +641,10 @@ function refresh(id) {
   edgeEls.forEach(held => {
     if (held.edge.from !== id && held.edge.to !== id) return;
     const geo = geometry(held.edge);
+    held.curve = geo.curve;
     held.path.setAttribute("d", geo.d);
-    if (held.label) {
-      held.label.setAttribute("transform", "translate(" + geo.mx + "," + (geo.my + held.dy) + ")");
-    }
   });
+  placeLabels();
   mapEls.forEach(entry => { if (entry.members.indexOf(id) >= 0) sizeBox(entry); });
 }
 
@@ -580,9 +699,10 @@ function renderFlow(address) {
   mapEls = [];
 
   /* Four layers, painted in this order: the fan-out containers, the edges, the
-     nodes, and the edge labels LAST — a chip drawn under a node box is a
-     routing decision a reader cannot read, and every decision an execution
-     could take is supposed to be legible on the canvas (PRD resolved q56). */
+     nodes, and the edge labels LAST — `placeLabels` keeps a chip off the nodes,
+     and where a composition leaves it nowhere clear the chip is the thing that
+     stays readable, because a routing decision read through a node box is not
+     read (PRD resolved q56). */
   const mapLayer = el("g", {}, view);
   const edgeLayer = el("g", {}, view);
   const nodeLayer = el("g", {}, view);
@@ -604,42 +724,31 @@ function renderFlow(address) {
     sizeBox(entry);
   });
 
-  /* Two edges can join the same pair of nodes — a guarded edge and the
-     `on_timeout:` transfer beside it, an `else:` and an `on_error:` fallback —
-     and they share a midpoint, so their chips would land on top of each other.
-     Each pair's chips are fanned apart by the edge's index within the pair. */
-  const parallel = {};
-  flow.edges.forEach(edge => {
-    const key = edge.from + " " + edge.to;
-    parallel[key] = (parallel[key] || 0) + 1;
-  });
-  const placed = {};
-
   flow.edges.forEach(edge => {
     if (!current.byId[edge.from] || !current.byId[edge.to]) return;
-    const key = edge.from + " " + edge.to;
-    const at = placed[key] = (placed[key] || 0) + 1;
-    const dy = (at - 1 - (parallel[key] - 1) / 2) * 17;
     const geo = geometry(edge);
     const path = el("path", {
       d: geo.d, class: edgeClass(edge), "marker-end": marker(edge)
     }, edgeLayer);
-    let label = null;
+    let label = null, width = 0;
     if (edge.label) {
-      label = el("g", {
-        class: "elabel " + edge.class,
-        transform: "translate(" + geo.mx + "," + (geo.my + dy) + ")"
-      }, labelLayer);
+      label = el("g", { class: "elabel " + edge.class }, labelLayer);
       const text = el("text", { x: 0, y: 0, "text-anchor": "middle" }, label);
-      text.textContent = clip(edge.label, 42) + (edge.max_iterations ? " ×" + edge.max_iterations : "");
+      text.textContent = chipText(edge);
+      width = text.textContent.length * CHIP_EM + CHIP_PAD;
       const box = text.getBBox();
       const chip = el("rect", {
         x: box.x - 6, y: box.y - 3, width: box.width + 12, height: box.height + 6, rx: 4
       });
       label.insertBefore(chip, text);
     }
-    edgeEls.push({ edge: edge, path: path, label: label, dy: dy });
+    edgeEls.push({
+      edge: edge, path: path, label: label, curve: geo.curve, width: width, box: null
+    });
   });
+  /* Once, with every node where the layout and this browser's own rearrangement
+     left it — a chip's place depends on all of them. */
+  placeLabels();
 
   laid.nodes.forEach(node => {
     const kind = KIND[node.kind] || KIND.map;

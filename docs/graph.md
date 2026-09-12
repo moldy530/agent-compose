@@ -543,11 +543,13 @@ The version number alone is a promise; six tests make it a checkable one:
   emitted page to fetching nothing — which is a promise about the artifact
   rather than about this format, and the one that would break silently.
 * `crates/compose-core/tests/graph_artifact_renders.rs` **runs** the page's own
-  code against a DOM stub, over every node of every flow of three projects —
-  one of them written to leave every optional array out. It is what makes the
+  code against a DOM stub, over every node of every flow of four projects — one
+  of them written to leave every optional array out. It is what makes the
   presence rules above checkable from the renderer's side: a page that indexed
   a key this format is allowed to omit throws on the compositions that omit it,
-  and every other test here would stay green.
+  and every other test here would stay green. It is also where the page's
+  geometry is checked: that no fan-out container encloses a node it does not
+  dispatch, and that no edge's chip is drawn over a node box.
 
 ---
 
@@ -558,11 +560,13 @@ The version number alone is a promise; six tests make it a checkable one:
   composition rather than instead of it, and `agent-compose validate` is what
   points at a line.
 * **Layout.** Positions are the renderer's, computed from the topology by the
-  embedded template — layered longest-path with barycenter ordering, and then a
-  pass that pushes any node a fan-out's dashed container would enclose but does
-  not dispatch clear of it — and a viewer's own rearrangement lives in that
-  viewer's browser. Nothing about where a node sits is in this document, which is
-  what lets the emitted page be golden-tested while remaining draggable.
+  embedded template — layered longest-path with barycenter ordering, then a pass
+  that pushes any node a fan-out's dashed container would enclose but does not
+  dispatch clear of it, then a pass that puts each edge's chip at the first place
+  along its own edge, and then off it, that clears every node box — and a viewer's
+  own rearrangement lives in that viewer's browser. Nothing about where a node or
+  a chip sits is in this document, which is what lets the emitted page be
+  golden-tested while remaining draggable.
 * **Resolved environment.** No `${ENV}` reference is substituted, here or
   anywhere upstream (PRD 5.9, resolved q15).
 * **Anything a run did.** This is a picture of a composition, not of an

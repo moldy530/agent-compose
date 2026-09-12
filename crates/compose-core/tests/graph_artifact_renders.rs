@@ -17,15 +17,18 @@
 //! So this file runs the page under Bun, against a DOM stub sized to what the
 //! template touches, and exercises the paths a reader takes: render every flow,
 //! select every node, click the pane's close and its jump to a subgraph's own
-//! canvas, walk back to the flow overview, and do it again with `localStorage`
-//! throwing on every access, which is what a private window and a browser with
-//! site data blocked both look like.
+//! canvas, walk back to the flow overview, drag a node and drop it, and do it
+//! again with `localStorage` throwing on every access, which is what a private
+//! window and a browser with site data blocked both look like.
 //!
-//! It is also the one test that reads the page's **geometry**. The dashed
-//! container a fan-out is drawn in is an axis-aligned box over a map and the
-//! instances it dispatches, and a node that is neither, drawn inside it, reads as
-//! one of them — a misreading no other test here can see, because the document is
-//! correct and says nothing about where anything is drawn.
+//! It is also the one test that reads the page's **geometry**, which it does
+//! twice. The dashed container a fan-out is drawn in is an axis-aligned box over
+//! a map and the instances it dispatches, and a node that is neither, drawn
+//! inside it, reads as one of them. A chip is opaque and the corridor between two
+//! layers is narrower than a CEL expression, so a chip drawn at the middle of its
+//! edge covers the nodes at both ends of it. Neither misreading is visible to any
+//! other test here, because the document is correct and says nothing about where
+//! anything is drawn.
 //!
 //! CLAUDE.md's *Validation strategy* is why it is a test rather than a look:
 //! "CI green" has to mean "actually done", and for an HTML artifact that means
@@ -86,6 +89,32 @@ fn containers(document: &GraphDocument) -> usize {
         .iter()
         .flat_map(|flow| &flow.nodes)
         .filter(|node| node.kind == NodeKind::Map)
+        .count()
+}
+
+/// How many chips a document puts on its canvases — what the harness's chip
+/// check has to have measured.
+fn labels(document: &GraphDocument) -> usize {
+    document
+        .flows
+        .iter()
+        .flat_map(|flow| &flow.edges)
+        .filter(|edge| edge.label.is_some())
+        .count()
+}
+
+/// How many flows have a node a pointer can be put on, which is the drag the
+/// harness walks once per flow. `start` and `end` are drawn as pills and carry no
+/// configuration, so a flow of nothing else is a flow with nothing to drag.
+fn draggable_flows(document: &GraphDocument) -> usize {
+    document
+        .flows
+        .iter()
+        .filter(|flow| {
+            flow.nodes
+                .iter()
+                .any(|node| node.kind != NodeKind::Start && node.kind != NodeKind::End)
+        })
         .count()
 }
 
@@ -263,10 +292,101 @@ function containersHoldOnlyTheirOwn(flow) {
   });
 }
 
-let panes = 0, boxes = 0, closes = 0, jumps = 0;
+/* The second geometry check, and the one a reader meets first.
+ *
+ * A chip is opaque. The corridor between two layers is narrower than a CEL
+ * expression, so a chip drawn at the middle of its edge covers both the node it
+ * leaves and the node it points at — `escalate` reading as `calate` under three
+ * routing chips. The document cannot see it: it carries the label and says
+ * nothing about where it lands. So every chip the page placed is measured
+ * against every node the page placed. */
+function chipsClearTheNodes(flow) {
+  edgeEls.forEach(held => {
+    if (!held.label) return;
+    if (!held.box) {
+      throw new Error("`" + held.edge.from + "` → `" + held.edge.to + "` has an unplaced chip");
+    }
+    flow.nodes.forEach(node => {
+      const at = current.byId[node.id];
+      if (held.box.x0 < at.x + at.w && held.box.x1 > at.x &&
+          held.box.y0 < at.y + at.h && held.box.y1 > at.y) {
+        throw new Error("the chip `" + held.edge.label + "` on `" + held.edge.from +
+          "` → `" + held.edge.to + "` is drawn over the node `" + node.id +
+          "` of `" + flow.address + "`");
+      }
+    });
+    chips += 1;
+  });
+}
+
+/* Whether this browser keeps anything at all — the same walk runs with
+   `localStorage` refusing every call, and what was kept can only be asserted
+   where something could be. */
+const STORAGE_OK = (() => {
+  try {
+    localStorage.setItem("agent-compose:probe", "1");
+    localStorage.removeItem("agent-compose:probe");
+    return true;
+  } catch (e) { return false; }
+})();
+
+/* Drag, which nothing else here reaches.
+ *
+ * `select` is called directly everywhere above, so the pointer handlers the page
+ * binds to its node groups run nowhere: the movement threshold that tells a drag
+ * from a click, the live edge and container refresh, and the page's one
+ * `localStorage` **write** — the one guard of the three that a private window
+ * turns into an uncaught exception on every drop. */
+function dragsAndClicks(flow) {
+  const subject = flow.nodes.filter(n => n.kind !== "start" && n.kind !== "end")[0];
+  if (!subject) return;
+  const groupFor = id => {
+    const held = document.querySelectorAll(".node")
+      .filter(group => group.getAttribute("data-id") === id);
+    return held[held.length - 1];
+  };
+  const event = (x, y) => ({ clientX: x, clientY: y, pointerId: 1, stopPropagation() {} });
+  const node = current.byId[subject.id];
+  const was = { x: node.x, y: node.y };
+  const group = groupFor(subject.id);
+  group.fire("pointerdown", event(100, 100));
+  group.fire("pointermove", event(130, 150));
+  group.fire("pointerup", event(130, 150));
+  if (Math.abs(node.x - was.x - 30 / tf.k) > 0.01 || Math.abs(node.y - was.y - 50 / tf.k) > 0.01) {
+    throw new Error("`" + subject.id + "` did not follow the pointer");
+  }
+  if (group.getAttribute("transform") !== "translate(" + node.x + "," + node.y + ")") {
+    throw new Error("`" + subject.id + "`'s group was not moved with it");
+  }
+  if (STORAGE_OK) {
+    const kept = JSON.parse(localStorage.getItem(storeKey(flow.address)) || "{}");
+    const offset = kept[subject.id];
+    if (!offset || offset[0] !== Math.round(node.x - node.bx)) {
+      throw new Error("the drop of `" + subject.id + "` was not kept: " +
+        localStorage.getItem(storeKey(flow.address)));
+    }
+    // …and the next render puts the node back where the reader left it.
+    renderFlow(flow.address);
+    if (Math.abs(current.byId[subject.id].x - node.bx - offset[0]) > 0.01) {
+      throw new Error("`" + subject.id + "` did not come back where it was dropped");
+    }
+  }
+  // A press that does not move is a click, and a click opens the node's pane.
+  showFlow();
+  const again = groupFor(subject.id);
+  again.fire("pointerdown", event(10, 10));
+  again.fire("pointerup", event(10, 10));
+  if (current.selected !== subject.id) {
+    throw new Error("a click on `" + subject.id + "` did not select it");
+  }
+  drags += 1;
+}
+
+let panes = 0, boxes = 0, closes = 0, jumps = 0, chips = 0, drags = 0;
 for (const flow of DOC.flows) {
   renderFlow(flow.address);
   containersHoldOnlyTheirOwn(flow);
+  chipsClearTheNodes(flow);
   for (const node of flow.nodes) {
     select(node.id);
     if (pane.innerHTML.length < 40) {
@@ -297,6 +417,8 @@ for (const flow of DOC.flows) {
     }
     showFlow();
   }
+  // The pointer on a node: a drag that is kept, and a press that is a click.
+  dragsAndClicks(flow);
   // The controls a reader reaches for, and the one that discards a layout.
   document.getElementById("zoom-in").attributes;
   fit();
@@ -322,6 +444,8 @@ console.log("facts=" + facts);
 console.log("boxes=" + boxes);
 console.log("closes=" + closes);
 console.log("jumps=" + jumps);
+console.log("chips=" + chips);
+console.log("drags=" + drags);
 "#;
 
 /// One pane, and resolved facts a reader must find in it.
@@ -647,6 +771,20 @@ fn every_node_of_every_flow_opens_its_pane() {
             counted(&printed, "closes=") > 0,
             "`{project}`'s panes were never closed"
         );
+        // Every chip the document puts on a canvas was measured against the
+        // nodes — the count is what catches the check looking at a page whose
+        // labels stopped being placed at all.
+        assert_eq!(
+            counted(&printed, "chips="),
+            labels(&document(project)),
+            "`{project}`'s chips were not all measured"
+        );
+        // …and every flow with something to drag was dragged.
+        assert_eq!(
+            counted(&printed, "drags="),
+            draggable_flows(&document(project)),
+            "`{project}`'s nodes were not all dragged"
+        );
     }
 }
 
@@ -734,6 +872,11 @@ console.log("answered=2");
 /// and a `file://` page under a strict policy are all ways a reader arrives with
 /// it gone. A guard that was written and not exercised is a guard that is one
 /// refactor from being dropped.
+///
+/// All three accesses are reached: the read `renderFlow` opens with, the removal
+/// "Reset layout" makes, and — because the walk drags a node in every flow — the
+/// **write** a drop makes, which is the one a reader provokes most often and the
+/// one whose unguarded form throws on every drag rather than once on load.
 #[test]
 fn the_page_renders_where_storage_refuses_every_call() {
     let printed = exercise("examples/triage-fanout", STORAGE_REFUSES);
@@ -743,5 +886,10 @@ fn the_page_renders_where_storage_refuses_every_call() {
     assert!(
         counted(&printed, "panes=") >= 3,
         "the page still opened its panes: {printed}"
+    );
+    assert_eq!(
+        counted(&printed, "drags="),
+        draggable_flows(&document("examples/triage-fanout")),
+        "every flow's drop ran against storage that refuses it: {printed}"
     );
 }
