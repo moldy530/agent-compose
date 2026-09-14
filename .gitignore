@@ -17,6 +17,12 @@
 /crates/compose-core/tests/toolchain/projects/
 /crates/compose-core/tests/toolchain/node-fallback/
 
+# Where `agent-compose visualize` writes with no `-o`: the working directory,
+# which for anyone following README.md or `docs` topic `cli` is this one. A
+# picture is something a person opens, not a build artifact of the composition
+# (PRD resolved q56), so it belongs to whoever drew it rather than to the tree.
+/graph.html
+
 # `insta`'s pending snapshots: a failed comparison writes the value it saw
 # beside the committed one, for `cargo insta review` to accept or reject. The
 # accepted file is what is committed; the pending one is a working note.

@@ -44,6 +44,11 @@
 //! reviewable as a change rather than as a rewritten router (PRD §2, §7 M2).
 //! `docs/plan.md` is the normative account of the document it produces.
 //!
+//! One pass reads the artifact and answers with a **picture** of it:
+//! [`graph`](graph()) derives the versioned graph document PRD resolved q56
+//! specifies, and [`graph::render`] puts it inside the embedded template as one
+//! self-contained HTML file. `docs/graph.md` is normative for that document.
+//!
 //! Everything the parser reports is decidable from a single file, and
 //! everything the resolver reports is decidable from names, files, and
 //! addresses. Everything [`check`] reports needs the whole artifact: its
@@ -70,6 +75,7 @@ pub mod check;
 pub mod codegen;
 pub mod diag;
 pub mod docs;
+pub mod graph;
 pub mod ir;
 pub mod parse;
 pub mod plan;
@@ -83,6 +89,7 @@ pub use codegen::authored::Authored;
 pub use codegen::diagnostics as target_diagnostics;
 pub use codegen::{COMPILER_VERSION, GeneratedFile, GeneratedProject, emit};
 pub use diag::{Diagnostic, DiagnosticCode, Diagnostics, Severity, Span, Spanned};
+pub use graph::{GRAPH_VERSION, GraphDocument, graph, graph_of};
 pub use ir::{IR_VERSION, Ir};
 pub use parse::{ParsedFile, parse_file, parse_str};
 pub use plan::{Composition, PLAN_VERSION, Plan, plan};

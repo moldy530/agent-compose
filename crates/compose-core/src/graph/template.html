@@ -1,0 +1,1218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-compose graph</title>
+<style>
+/* Tokens on bare :root are the light palette; the two blocks under it redefine
+   only what changes. This file opens on somebody else's machine, so the theme
+   is the viewer's — prefers-color-scheme — with a data-theme hook for a reader
+   who forces one. */
+:root {
+  --bg: #f6f8f7; --surface: #ffffff; --surface2: #eef2f0;
+  --ink: #1a2321; --muted: #5c6b67; --faint: #8ca09a;
+  --line: #d9e0dd; --edge: #8d9e99;
+  --accent: #0e7d6b; --accent-soft: #0e7d6b22;
+  --warn: #b04a3e;
+  --k-agent: #6d4fc9; --k-function: #a06e1f; --k-exec: #59741a; --k-http: #2f6dbb;
+  --k-human: #ba4a70; --k-store: #3a8a4e; --k-flow: #0e7d6b; --k-map: #7a8a85;
+  --chip: #ffffff;
+  --shadow: 0 1px 3px rgba(20, 35, 30, .10), 0 4px 14px rgba(20, 35, 30, .06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #101514; --surface: #1a211f; --surface2: #222b28;
+    --ink: #e4eae8; --muted: #93a5a0; --faint: #6b7c77;
+    --line: #2a3330; --edge: #55635f;
+    --accent: #3fbfa5; --accent-soft: #3fbfa52a;
+    --warn: #d97a6c;
+    --k-agent: #a48ae8; --k-function: #d9a44a; --k-exec: #aac95a; --k-http: #6ba3e8;
+    --k-human: #e08aa5; --k-store: #6fc287; --k-flow: #3fbfa5; --k-map: #8ca09a;
+    --chip: #1a211f;
+    --shadow: 0 1px 3px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #101514; --surface: #1a211f; --surface2: #222b28;
+  --ink: #e4eae8; --muted: #93a5a0; --faint: #6b7c77;
+  --line: #2a3330; --edge: #55635f;
+  --accent: #3fbfa5; --accent-soft: #3fbfa52a;
+  --warn: #d97a6c;
+  --k-agent: #a48ae8; --k-function: #d9a44a; --k-exec: #aac95a; --k-http: #6ba3e8;
+  --k-human: #e08aa5; --k-store: #6fc287; --k-flow: #3fbfa5; --k-map: #8ca09a;
+  --chip: #1a211f;
+  --shadow: 0 1px 3px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+header {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 9px 16px; border-bottom: 1px solid var(--line); background: var(--surface);
+}
+header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+header h1 .cmd {
+  color: var(--muted); font-weight: 400; font-size: 12.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.tab {
+  border: 1px solid var(--line); background: none; color: var(--muted); border-radius: 6px;
+  font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 4px 10px; cursor: pointer;
+}
+.tab[aria-selected="true"] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+.tab:focus-visible, button:focus-visible, .node:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.legend { display: flex; gap: 11px; flex-wrap: wrap; margin-left: auto; font-size: 11.5px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+
+main { flex: 1; display: flex; min-height: 0; position: relative; }
+#canvas { flex: 1; min-width: 0; position: relative; cursor: grab; touch-action: none; }
+#canvas.dragging { cursor: grabbing; }
+svg { display: block; width: 100%; height: 100%; }
+
+.controls { position: absolute; left: 12px; bottom: 12px; display: flex; gap: 6px; flex-wrap: wrap; }
+.controls button {
+  min-width: 30px; height: 30px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--ink); cursor: pointer; font-size: 14px;
+  box-shadow: var(--shadow); padding: 0 9px;
+}
+.controls button.wide { font-size: 12px; }
+.hint {
+  position: absolute; right: 12px; bottom: 12px; font-size: 11.5px; color: var(--faint);
+  background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px;
+}
+.narrow-only { display: none; }
+
+aside {
+  width: 380px; flex: none; border-left: 1px solid var(--line); background: var(--surface);
+  overflow-y: auto; padding: 16px 18px 28px;
+}
+.pane-kind { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
+.pane-addr {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 16px; font-weight: 500; margin: 2px 0; overflow-wrap: anywhere;
+}
+.pane-sub { color: var(--muted); font-size: 12.5px; margin: 0 0 10px; overflow-wrap: anywhere; }
+.pane-close {
+  float: right; border: none; background: none; color: var(--muted); font-size: 18px;
+  cursor: pointer; padding: 2px 7px; border-radius: 5px; line-height: 1;
+}
+.pane-close:hover { background: var(--surface2); }
+aside p.desc { margin: 8px 0 4px; }
+aside h3 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint);
+  margin: 18px 0 6px; font-weight: 600;
+}
+.kv { display: grid; grid-template-columns: minmax(92px, auto) 1fr; gap: 3px 14px; font-size: 12.5px; margin: 0; }
+.kv dt { color: var(--muted); margin: 0; overflow-wrap: anywhere; }
+.kv dd {
+  margin: 0; font-size: 12px; overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+pre.block {
+  background: var(--surface2); border: 1px solid var(--line); border-radius: 7px;
+  font: 11.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 9px 11px; margin: 4px 0; overflow-x: auto; color: var(--ink);
+}
+.row {
+  display: flex; align-items: baseline; gap: 8px; padding: 6px 0;
+  border-top: 1px solid var(--line); font-size: 12.5px; flex-wrap: wrap;
+}
+.row:first-of-type { border-top: none; }
+.row code { font-size: 12px; overflow-wrap: anywhere; }
+.row .note { color: var(--muted); font-size: 11.5px; }
+.row .tag {
+  border: 1px solid var(--line); border-radius: 4px; padding: 0 5px;
+  font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+}
+details.prompt summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
+.edgeline {
+  font-size: 12px; padding: 4px 0; border-top: 1px solid var(--line);
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+}
+.edgeline:first-of-type { border-top: none; }
+.edgeline .dir { color: var(--faint); flex: none; width: 20px; }
+.cel { color: var(--accent); }
+.warn { color: var(--warn); }
+footer.pane-foot {
+  margin-top: 22px; font-size: 11px; color: var(--faint);
+  border-top: 1px solid var(--line); padding-top: 10px; overflow-wrap: anywhere;
+}
+.jump {
+  border: 1px solid var(--accent); background: var(--accent-soft); color: var(--accent);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer;
+  font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.jump[disabled] { border-color: var(--line); background: none; color: var(--faint); cursor: default; }
+
+.node { cursor: pointer; }
+.node rect.body { fill: var(--surface); stroke: var(--line); stroke-width: 1; }
+.node:hover rect.body { stroke: var(--muted); }
+.node.selected rect.body { stroke: var(--accent); stroke-width: 1.7; }
+.node text { user-select: none; pointer-events: none; }
+.node .name {
+  font: 500 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: var(--ink);
+}
+.node .kind { font: 600 9px system-ui, sans-serif; letter-spacing: .09em; }
+.node .bind {
+  font: 400 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: var(--muted);
+}
+.pill { fill: var(--surface2); stroke: var(--line); }
+.pill-label {
+  font: 600 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: var(--muted);
+}
+path.edge { fill: none; stroke: var(--edge); stroke-width: 1.4; }
+path.edge.conditional, path.edge.default { stroke: var(--accent); }
+path.edge.error_fallback, path.edge.timeout { stroke: var(--warn); stroke-dasharray: 5 4; }
+path.edge.barrier { stroke-dasharray: 2 4; stroke-width: 1.2; }
+.elabel rect { fill: var(--chip); stroke: var(--line); }
+.elabel.conditional rect, .elabel.default rect { stroke: var(--accent); }
+.elabel.error_fallback rect, .elabel.timeout rect { stroke: var(--warn); }
+.elabel text {
+  font: 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: var(--muted);
+}
+.elabel.conditional text, .elabel.default text { fill: var(--accent); }
+.elabel.error_fallback text, .elabel.timeout text { fill: var(--warn); }
+.mapbox rect { fill: none; stroke: var(--faint); stroke-dasharray: 6 5; }
+.mapbox text { font: 600 10px system-ui, sans-serif; fill: var(--faint); letter-spacing: .07em; }
+
+@media (max-width: 760px) {
+  header { padding: 8px 12px; gap: 8px; }
+  .legend, .wide-only { display: none; }
+  .narrow-only { display: inline; }
+  /* Above the zoom controls rather than beside them: at this width the two
+     would share the bottom of the canvas. */
+  .hint { bottom: 50px; }
+  /* The pane becomes a sheet BELOW the canvas rather than an overlay over it.
+     An overlay would cover the drawing this file exists to show and there would
+     be nothing to dismiss it to: the pane is always populated — an empty
+     selection renders the flow overview — so it has no empty state to fall
+     back on. Stacking keeps both reachable at any width. */
+  main { flex-direction: column; }
+  #canvas { min-height: 0; }
+  aside {
+    width: auto; height: 46%; flex: none; padding: 12px 14px 20px;
+    border-left: none; border-top: 1px solid var(--line);
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .node rect.body { transition: stroke .12s; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">agent-compose <span class="cmd" id="subtitle"></span></h1>
+  <div class="tabs" role="tablist" id="tabs"></div>
+  <div class="legend" id="legend"></div>
+</header>
+<main>
+  <div id="canvas">
+    <!-- `group`, not `img`: the node groups inside this element are focusable
+         buttons, and `img` makes an element's subtree presentational — an
+         assistive technology would stop exposing the very controls Enter
+         selects. -->
+    <svg id="svg" role="group" aria-label="Flow graph">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--edge)"></path>
+        </marker>
+        <marker id="arrow-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"></path>
+        </marker>
+        <marker id="arrow-warn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--warn)"></path>
+        </marker>
+      </defs>
+      <g id="view"></g>
+    </svg>
+    <div class="controls">
+      <button id="zoom-in" aria-label="Zoom in">+</button>
+      <button id="zoom-out" aria-label="Zoom out">&#8722;</button>
+      <button id="fit" class="wide">Fit</button>
+      <button id="reset" class="wide" title="Discard this browser's node rearrangement and restore the computed layout">Reset layout</button>
+    </div>
+    <!-- Two spellings of the same hint. The short one is for phone width, where
+         the hint matters most and there is no room for the long one: `fit` has a
+         zoom floor, so a real graph is wider than the viewport there and panning
+         is the only way to reach the rest of it — and a touch pointer has no
+         wheel, so what zooms is the two buttons beside it. -->
+    <div class="hint">drag<span class="wide-only"> the canvas</span> to pan &middot;
+      <span class="wide-only">drag a node to rearrange &middot; scroll to zoom &middot; click a node</span>
+      <span class="narrow-only">+ &minus; to zoom</span></div>
+  </div>
+  <aside id="pane" aria-live="polite"></aside>
+</main>
+<script>
+"use strict";
+
+/* The graph document `agent-compose visualize` emits from the resolved IR.
+   `docs/graph.md` is normative for its shape; `graph_version` is what a reader
+   pins. Every `<` in it is written as its JSON escape, so nothing a
+   composition carries can close this element early. */
+const DOC = /*{{GRAPH_DOCUMENT}}*/;
+
+/* ---------------------------------------------------------------------------
+ * Kinds
+ * ------------------------------------------------------------------------- */
+const KIND = {
+  start:    { color: "var(--k-map)",      label: "START" },
+  end:      { color: "var(--k-map)",      label: "END" },
+  agent:    { color: "var(--k-agent)",    label: "AGENT" },
+  function: { color: "var(--k-function)", label: "TOOL" },
+  exec:     { color: "var(--k-exec)",     label: "EXEC" },
+  http:     { color: "var(--k-http)",     label: "HTTP" },
+  human:    { color: "var(--k-human)",    label: "HUMAN" },
+  store:    { color: "var(--k-store)",    label: "STORE" },
+  flow:     { color: "var(--k-flow)",     label: "SUBGRAPH" },
+  map:      { color: "var(--k-map)",      label: "MAP" }
+};
+const LEGEND = [
+  ["agent", "agent"], ["function", "tool"], ["exec", "exec"], ["http", "http"],
+  ["human", "human"], ["store", "store"], ["flow", "subgraph"], ["map", "map"]
+];
+
+/* ---------------------------------------------------------------------------
+ * Edge classes
+ *
+ * `marker` is the arrowhead the canvas draws on a class; `chip` is how the
+ * detail pane names the transfer. `docs/graph.md` §6 closes this vocabulary and
+ * `the_pages_edge_table_names_every_class` holds this table to it, for the
+ * reason KIND above is held to `NodeKind`: a class this table had never heard of
+ * would arrive as a plain solid edge the pane says nothing about, which is a
+ * routing decision drawn as if it were an unconditional one.
+ * ------------------------------------------------------------------------- */
+const EDGE = {
+  unconditional:  { marker: "arrow",        chip: () => "" },
+  conditional:    { marker: "arrow-accent", chip: e => '<span class="cel">when ' + esc(e.when) + "</span>" },
+  default:        { marker: "arrow-accent", chip: () => '<span class="cel">else</span>' },
+  map_route:      { marker: "arrow",        chip: e => '<span class="note">route ' + esc(e.label) + "</span>" },
+  error_fallback: { marker: "arrow-warn",   chip: e => '<span class="warn">' + esc(e.label) + "</span>" },
+  timeout:        { marker: "arrow-warn",   chip: e => '<span class="warn">' + esc(e.label) + "</span>" }
+};
+
+/* ---------------------------------------------------------------------------
+ * Layout: longest-path layering, barycenter ordering, left to right.
+ *
+ * Deterministic — the same document lays out the same way in every browser —
+ * which is what lets the emitted file be golden-tested while a viewer's own
+ * rearrangement stays client-side.
+ * ------------------------------------------------------------------------- */
+const NODE_W = 190, NODE_H = 56, PILL_W = 84, PILL_H = 30, X_GAP = 250, Y_GAP = 94;
+/* What the dashed fan-out container pads its members by — room at the top for
+   its caption — and the least space a node pushed clear of one keeps from it. */
+const BOX_PAD = { left: 18, top: 30, right: 18, bottom: 14 };
+const CLEAR = 20;
+
+/* What an edge's chip measures, without asking the browser for it.
+   The chips are set in a monospace face at 10.5px, so an upper bound on one's
+   width follows from its character count — which is what keeps where a chip
+   lands as deterministic as the layout it lands on. `CHIP_BASE` is how far the
+   text's baseline sits below the box's middle, so the box the placement reasons
+   about is the box a reader sees. */
+const CHIP_EM = 6.5, CHIP_PAD = 12, CHIP_H = 21, CHIP_BASE = 3.5, CHIP_CLEAR = 5;
+/* Where a chip is allowed to sit: out along its own edge from the middle, and
+   then stepped off the edge into the channel between two rows of nodes. Walked
+   in this order, so the chip that can stay on its line does. */
+const CHIP_T = [0.5, 0.42, 0.58, 0.34, 0.66, 0.25, 0.75, 0.15, 0.85];
+const CHIP_DY = [0, -Y_GAP / 2, Y_GAP / 2, -Y_GAP, Y_GAP, -1.5 * Y_GAP, 1.5 * Y_GAP];
+
+/* A cycle has no layering, so the back edges come out first: an edge that
+   returns to a node still open on the depth-first stack is the one closing a
+   loop (grammar 7.4's bounded cycles), and layering ignores it. */
+function backEdges(flow, byId) {
+  const out = {};
+  flow.nodes.forEach(n => { out[n.id] = []; });
+  flow.edges.forEach((e, i) => { if (out[e.from] && byId[e.to]) out[e.from].push(i); });
+  const state = {}, back = new Set();
+  flow.nodes.forEach(n => { state[n.id] = 0; });
+  const visit = id => {
+    state[id] = 1;
+    for (const i of out[id]) {
+      const to = flow.edges[i].to;
+      if (state[to] === 1) back.add(i);
+      else if (state[to] === 0) visit(to);
+    }
+    state[id] = 2;
+  };
+  if (state.start === 0) visit("start");
+  flow.nodes.forEach(n => { if (state[n.id] === 0) visit(n.id); });
+  return back;
+}
+
+/* The nodes one dashed container holds: a map, and the instances it dispatches. */
+function mapMembers(flow, id) {
+  return flow.edges.filter(e => e.class === "map_route" && e.from === id).map(e => e.to).concat([id]);
+}
+/* The rectangle that container is drawn as, in layout coordinates. */
+function boxRect(members, byId) {
+  const held = members.map(id => byId[id]).filter(Boolean);
+  if (!held.length) return null;
+  return {
+    x0: Math.min.apply(null, held.map(n => n.x)) - BOX_PAD.left,
+    y0: Math.min.apply(null, held.map(n => n.y)) - BOX_PAD.top,
+    x1: Math.max.apply(null, held.map(n => n.x + n.w)) + BOX_PAD.right,
+    y1: Math.max.apply(null, held.map(n => n.y + n.h)) + BOX_PAD.bottom
+  };
+}
+
+/* Move one node to `y`, taking with it anything it would otherwise land on.
+   Everything is pushed the way the first node went, so each node a shove reaches
+   ends up strictly past the one that pushed it and the cascade cannot come back
+   around. */
+function shove(nodes, node, y) {
+  if (y === node.y) return;
+  const down = y > node.y;
+  node.y = y;
+  nodes.forEach(other => {
+    if (other === node) return;
+    if (other.x >= node.x + node.w || other.x + other.w <= node.x) return;
+    if (other.y >= node.y + node.h + CLEAR || other.y + other.h + CLEAR <= node.y) return;
+    shove(nodes, other, down ? node.y + node.h + CLEAR : node.y - CLEAR - other.h);
+  });
+}
+
+/* Keep the dashed containers honest.
+   A container is an axis-aligned box over a map and its instances, and nothing
+   in the layering keeps a node that is neither out of it: in
+   `examples/triage-fanout` the `announce` branch — concurrent with the fan-out
+   rather than dispatched by it (grammar 7.6.1) — lands squarely inside one. A
+   reader would read it as one of the instances, which is the misreading the
+   container exists to prevent, so a stranger that lands in one is pushed clear
+   of it and whatever it then meets is pushed the same way. */
+function clearContainers(flow, nodes, byId) {
+  const groups = flow.nodes.filter(n => n.kind === "map").map(n => mapMembers(flow, n.id));
+  if (!groups.length) return;
+  /* Bounded rather than "until nothing moves": a shove can move a member of
+     another container, which resizes that one, and the budget is what keeps a
+     composition nobody anticipated from hanging the page instead of drawing one
+     slightly loose box. */
+  for (let pass = 0; pass < nodes.length + 1; pass++) {
+    let moved = false;
+    groups.forEach(members => {
+      const box = boxRect(members, byId);
+      if (!box) return;
+      nodes.forEach(node => {
+        if (members.indexOf(node.id) >= 0) return;
+        if (node.x >= box.x1 || node.x + node.w <= box.x0) return;
+        if (node.y >= box.y1 || node.y + node.h <= box.y0) return;
+        const up = node.y + node.h / 2 < (box.y0 + box.y1) / 2;
+        shove(nodes, node, up ? box.y0 - CLEAR - node.h : box.y1 + CLEAR);
+        moved = true;
+      });
+    });
+    if (!moved) break;
+  }
+}
+
+function layout(flow) {
+  const nodes = flow.nodes.map(n => Object.assign({}, n));
+  const byId = {};
+  nodes.forEach(n => { byId[n.id] = n; });
+  const back = backEdges(flow, byId);
+  const forward = flow.edges
+    .map((e, i) => ({ e, i }))
+    .filter(({ e, i }) => !back.has(i) && byId[e.from] && byId[e.to] && e.from !== e.to);
+
+  /* A map's satellites sit one layer right of it, so the map's own successors
+     have to clear them: an edge leaving a map that dispatches spans two. */
+  const dispatching = new Set();
+  flow.edges.forEach(e => { if (e.class === "map_route") dispatching.add(e.from); });
+  const span = e => (e.class !== "map_route" && dispatching.has(e.from) ? 2 : 1);
+
+  nodes.forEach(n => { n.layer = 0; });
+  for (let pass = 0; pass < nodes.length + 1; pass++) {
+    let moved = false;
+    for (const { e } of forward) {
+      const want = byId[e.from].layer + span(e);
+      if (byId[e.to].layer < want) { byId[e.to].layer = want; moved = true; }
+    }
+    if (!moved) break;
+  }
+  if (byId.end) {
+    const others = nodes.filter(n => n.id !== "end").map(n => n.layer);
+    byId.end.layer = (others.length ? Math.max.apply(null, others) : 0) + 1;
+  }
+
+  const layers = [];
+  nodes.forEach(n => { (layers[n.layer] = layers[n.layer] || []).push(n); });
+  for (let i = 0; i < layers.length; i++) layers[i] = layers[i] || [];
+
+  const ins = {}, outs = {};
+  nodes.forEach(n => { ins[n.id] = []; outs[n.id] = []; });
+  forward.forEach(({ e }) => { outs[e.from].push(e.to); ins[e.to].push(e.from); });
+
+  layers.forEach(layer => layer.forEach((n, i) => { n.ord = i; }));
+  for (let sweep = 0; sweep < 4; sweep++) {
+    const forwards = sweep % 2 === 0;
+    const order = forwards ? layers : layers.slice().reverse();
+    order.forEach(layer => {
+      layer.forEach(n => {
+        const refs = (forwards ? ins : outs)[n.id].map(id => byId[id].ord);
+        n.bc = refs.length ? refs.reduce((a, b) => a + b, 0) / refs.length : n.ord;
+      });
+      /* Ties keep the order the document declared them in, which is the
+         composition's own — so the picture does not reshuffle on a re-render. */
+      layer.forEach((n, i) => { n.tie = i; });
+      layer.sort((a, b) => (a.bc - b.bc) || (a.tie - b.tie));
+      layer.forEach((n, i) => { n.ord = i; });
+    });
+  }
+
+  layers.forEach((layer, at) => {
+    const height = (layer.length - 1) * Y_GAP;
+    layer.forEach((n, i) => {
+      const pill = n.kind === "start" || n.kind === "end";
+      n.w = pill ? PILL_W : NODE_W;
+      n.h = pill ? PILL_H : NODE_H;
+      n.x = at * X_GAP;
+      n.y = i * Y_GAP - height / 2;
+    });
+  });
+  clearContainers(flow, nodes, byId);
+  /* What the repair answers is the computed layout, so it is the *base* every
+     offset in `localStorage` is measured from — a viewer's rearrangement of a
+     node is theirs, and moving out of a container is not. */
+  nodes.forEach(n => { n.bx = n.x; n.by = n.y; });
+  return { nodes: nodes, byId: byId };
+}
+
+/* ---------------------------------------------------------------------------
+ * Per-viewer rearrangement.
+ *
+ * Offsets from the computed layout, kept in this browser and nowhere else. It
+ * is a convenience: every access is guarded, and the page renders exactly the
+ * same without it.
+ * ------------------------------------------------------------------------- */
+/* What distinguishes one composition's keys from another's.
+   Not `entrypoint` on its own: the grammar's own convention makes it `main.yml`
+   in very nearly every composition, and a browser gives every page read off the
+   local filesystem one storage bucket — so two unrelated `graph.html` files, each
+   with a `flow.triage` and a `classify` in it, would read each other's
+   rearrangements. The digest is over the document, so it is the same for the same
+   composition on every machine and different the moment anything about the graph
+   is. */
+function digest(text) {
+  let held = 5381;
+  for (let i = 0; i < text.length; i++) held = ((held * 33) ^ text.charCodeAt(i)) >>> 0;
+  return held.toString(36);
+}
+const DOC_KEY = digest(JSON.stringify(DOC));
+function storeKey(flow) {
+  return "agent-compose:graph:" + DOC.entrypoint + ":" + DOC_KEY + ":" + flow;
+}
+function loadOffsets(flow) {
+  try { return JSON.parse(localStorage.getItem(storeKey(flow))) || {}; } catch (e) { return {}; }
+}
+function saveOffset(node) {
+  try {
+    const held = loadOffsets(current.flow.address);
+    held[node.id] = [Math.round(node.x - node.bx), Math.round(node.y - node.by)];
+    localStorage.setItem(storeKey(current.flow.address), JSON.stringify(held));
+  } catch (e) { /* a browser that refuses storage still renders the graph */ }
+}
+function clearOffsets(flow) {
+  try { localStorage.removeItem(storeKey(flow)); } catch (e) { /* as above */ }
+}
+
+/* ---------------------------------------------------------------------------
+ * Rendering
+ * ------------------------------------------------------------------------- */
+const NS = "http://www.w3.org/2000/svg";
+const view = document.getElementById("view");
+const pane = document.getElementById("pane");
+const canvas = document.getElementById("canvas");
+let current = { flow: null, byId: {}, selected: null };
+let edgeEls = [], mapEls = [];
+let tf = { x: 60, y: 0, k: 1 };
+
+function el(name, attrs, parent) {
+  const held = document.createElementNS(NS, name);
+  for (const key in attrs) held.setAttribute(key, attrs[key]);
+  if (parent) parent.appendChild(held);
+  return held;
+}
+function applyTransform() {
+  view.setAttribute("transform", "translate(" + tf.x + "," + tf.y + ") scale(" + tf.k + ")");
+}
+function marker(edge) {
+  return "url(#" + (EDGE[edge.class] || EDGE.unconditional).marker + ")";
+}
+function edgeClass(edge) {
+  return "edge " + edge.class + (edge.join_barrier ? " barrier" : "");
+}
+function geometry(edge) {
+  const a = current.byId[edge.from], b = current.byId[edge.to];
+  const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2;
+  const bend = Math.max(40, Math.abs(x2 - x1) / 2);
+  const curve = [x1, y1, x1 + bend, y1, x2 - bend, y2, x2, y2];
+  return {
+    d: "M " + x1 + " " + y1 + " C " + curve[2] + " " + curve[3] + ", " +
+       curve[4] + " " + curve[5] + ", " + x2 + " " + y2,
+    curve: curve
+  };
+}
+/* A point on the cubic `geometry` draws, so a chip offered a place on its edge is
+   offered a place on the curve a reader follows rather than on the straight line
+   between its endpoints. */
+function along(curve, t) {
+  const u = 1 - t, w = [u * u * u, 3 * u * u * t, 3 * u * t * t, t * t * t];
+  return {
+    x: w[0] * curve[0] + w[1] * curve[2] + w[2] * curve[4] + w[3] * curve[6],
+    y: w[0] * curve[1] + w[1] * curve[3] + w[2] * curve[5] + w[3] * curve[7]
+  };
+}
+function overlaps(a, b) {
+  return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+}
+
+/* What one chip's text says, which is also what its width is read off.
+   Clipped, because a chip is a cue on the canvas and the pane carries the
+   expression whole. */
+function chipText(edge) {
+  return clip(edge.label, 42) + (edge.max_iterations ? " ×" + edge.max_iterations : "");
+}
+
+/* Where one chip goes.
+ *
+ * A chip is opaque, and has to be: a routing decision read through a node box is
+ * not read, and every decision an execution could take is supposed to be legible
+ * on the canvas (PRD resolved q56). So it cannot simply be drawn at the middle of
+ * its edge — the corridor between two layers is `X_GAP - NODE_W` wide and a CEL
+ * expression is several times that, so in `examples/triage-fanout` the two guards
+ * leaving `approve`, the `on_timeout` beside them and the node `escalate` they
+ * all point past would land in one pile.
+ *
+ * Each chip takes the first candidate clear of every node and of every chip
+ * already placed. Clearing the nodes is the hard requirement and clearing the
+ * other chips the soft one, so a candidate that only manages the first is
+ * remembered and used if nothing manages both. */
+function chipBox(held, nodes, chips) {
+  const half = held.width / 2, tall = CHIP_H / 2;
+  let loose = null, last = null;
+  for (const dy of CHIP_DY) {
+    for (const t of CHIP_T) {
+      const at = along(held.curve, t);
+      const box = {
+        x0: at.x - half, y0: at.y + dy - tall,
+        x1: at.x + half, y1: at.y + dy + tall
+      };
+      last = box;
+      if (nodes.some(other => overlaps(box, other))) continue;
+      if (!chips.some(other => overlaps(box, other))) return box;
+      if (!loose) loose = box;
+    }
+  }
+  /* A composition that leaves nowhere clear gets the furthest candidate off the
+     edge rather than the middle of the crowd. */
+  return loose || last;
+}
+
+/* Every chip on the canvas, placed against the nodes as they currently sit —
+   which is why a drag re-runs the whole pass rather than moving the chips it
+   touched: a node dragged across the canvas frees the place one chip was pushed
+   out of and takes the place another was using. */
+function placeLabels() {
+  const nodes = [];
+  for (const id in current.byId) {
+    const node = current.byId[id];
+    nodes.push({
+      x0: node.x - CHIP_CLEAR, y0: node.y - CHIP_CLEAR,
+      x1: node.x + node.w + CHIP_CLEAR, y1: node.y + node.h + CHIP_CLEAR
+    });
+  }
+  const chips = [];
+  edgeEls.forEach(held => {
+    if (!held.label) return;
+    const box = chipBox(held, nodes, chips);
+    held.box = box;
+    held.label.setAttribute("transform", "translate(" + ((box.x0 + box.x1) / 2) +
+      "," + ((box.y0 + box.y1) / 2 + CHIP_BASE) + ")");
+    chips.push(box);
+  });
+}
+
+/* The dashed container around a map and the satellites it dispatches, drawn from
+   the same rectangle `clearContainers` cleared of everything else. */
+function sizeBox(entry) {
+  const box = boxRect(entry.members, current.byId);
+  if (!box) return;
+  entry.rect.setAttribute("x", box.x0);
+  entry.rect.setAttribute("y", box.y0);
+  entry.rect.setAttribute("width", box.x1 - box.x0);
+  entry.rect.setAttribute("height", box.y1 - box.y0);
+  entry.text.setAttribute("x", box.x0 + 12);
+  entry.text.setAttribute("y", box.y0 + 16);
+}
+function refresh(id) {
+  edgeEls.forEach(held => {
+    if (held.edge.from !== id && held.edge.to !== id) return;
+    const geo = geometry(held.edge);
+    held.curve = geo.curve;
+    held.path.setAttribute("d", geo.d);
+  });
+  placeLabels();
+  mapEls.forEach(entry => { if (entry.members.indexOf(id) >= 0) sizeBox(entry); });
+}
+
+function draggable(group, node) {
+  let start = null;
+  group.addEventListener("pointerdown", event => {
+    event.stopPropagation();
+    start = { px: event.clientX, py: event.clientY, nx: node.x, ny: node.y, moved: false };
+    try { group.setPointerCapture(event.pointerId); } catch (e) { /* not captured, still drags */ }
+  });
+  group.addEventListener("pointermove", event => {
+    if (!start) return;
+    if (!start.moved && Math.abs(event.clientX - start.px) + Math.abs(event.clientY - start.py) < 4) return;
+    start.moved = true;
+    node.x = start.nx + (event.clientX - start.px) / tf.k;
+    node.y = start.ny + (event.clientY - start.py) / tf.k;
+    group.setAttribute("transform", "translate(" + node.x + "," + node.y + ")");
+    refresh(node.id);
+  });
+  group.addEventListener("pointerup", () => {
+    if (start && start.moved) saveOffset(node);
+    else if (start) select(node.id);
+    start = null;
+  });
+  group.addEventListener("pointercancel", () => { start = null; });
+}
+
+function clip(text, at) {
+  return text.length > at ? text.slice(0, at - 1) + "…" : text;
+}
+
+/* What a route is called — read off the route itself or off the satellite it
+   dispatches, which carry the same two keys: its variant, `default` for the
+   catch-all, and `each item` for a homogeneous map, which routes by nothing and
+   whose single dispatch is neither. */
+function routeName(route) {
+  return route.variant || (route.default ? "default" : "each item");
+}
+
+function renderFlow(address) {
+  const flow = DOC.flows.filter(held => held.address === address)[0];
+  if (!flow) return;
+  const laid = layout(flow);
+  current = { flow: flow, byId: laid.byId, selected: null };
+  const offsets = loadOffsets(address);
+  laid.nodes.forEach(n => {
+    const held = offsets[n.id];
+    if (held && held.length === 2) { n.x = n.bx + held[0]; n.y = n.by + held[1]; }
+  });
+  while (view.firstChild) view.removeChild(view.firstChild);
+  edgeEls = [];
+  mapEls = [];
+
+  /* Four layers, painted in this order: the fan-out containers, the edges, the
+     nodes, and the edge labels LAST — `placeLabels` keeps a chip off the nodes,
+     and where a composition leaves it nowhere clear the chip is the thing that
+     stays readable, because a routing decision read through a node box is not
+     read (PRD resolved q56). */
+  const mapLayer = el("g", {}, view);
+  const edgeLayer = el("g", {}, view);
+  const nodeLayer = el("g", {}, view);
+  const labelLayer = el("g", {}, view);
+
+  flow.nodes.filter(n => n.kind === "map").forEach(n => {
+    const group = el("g", { class: "mapbox" }, mapLayer);
+    const entry = {
+      members: mapMembers(flow, n.id),
+      rect: el("rect", { rx: 12 }, group),
+      text: el("text", {}, group)
+    };
+    const held = n.map || {};
+    entry.text.textContent =
+      "MAP · over " + held.over +
+      " · " + (held.route_by ? "route_by " + held.route_by : "one target") +
+      " · ≤ " + held.max_concurrency + " concurrent";
+    mapEls.push(entry);
+    sizeBox(entry);
+  });
+
+  flow.edges.forEach(edge => {
+    if (!current.byId[edge.from] || !current.byId[edge.to]) return;
+    const geo = geometry(edge);
+    const path = el("path", {
+      d: geo.d, class: edgeClass(edge), "marker-end": marker(edge)
+    }, edgeLayer);
+    let label = null, width = 0;
+    if (edge.label) {
+      label = el("g", { class: "elabel " + edge.class }, labelLayer);
+      const text = el("text", { x: 0, y: 0, "text-anchor": "middle" }, label);
+      text.textContent = chipText(edge);
+      width = text.textContent.length * CHIP_EM + CHIP_PAD;
+      const box = text.getBBox();
+      const chip = el("rect", {
+        x: box.x - 6, y: box.y - 3, width: box.width + 12, height: box.height + 6, rx: 4
+      });
+      label.insertBefore(chip, text);
+    }
+    edgeEls.push({
+      edge: edge, path: path, label: label, curve: geo.curve, width: width, box: null
+    });
+  });
+  /* Once, with every node where the layout and this browser's own rearrangement
+     left it — a chip's place depends on all of them. */
+  placeLabels();
+
+  laid.nodes.forEach(node => {
+    const kind = KIND[node.kind] || KIND.map;
+    const group = el("g", {
+      class: "node",
+      transform: "translate(" + node.x + "," + node.y + ")",
+      tabindex: 0,
+      role: "button",
+      "data-id": node.id,
+      "aria-label": kind.label + " " + node.id
+    }, nodeLayer);
+    if (node.kind === "start" || node.kind === "end") {
+      el("rect", { class: "pill", width: node.w, height: node.h, rx: node.h / 2 }, group);
+      const text = el("text", {
+        class: "pill-label", x: node.w / 2, y: node.h / 2 + 4, "text-anchor": "middle"
+      }, group);
+      text.textContent = node.id;
+    } else {
+      el("rect", { class: "body", width: node.w, height: node.h, rx: 8 }, group);
+      el("rect", { width: 4, height: node.h, rx: 2, fill: kind.color }, group);
+      const badge = el("text", { class: "kind", x: 14, y: 18, fill: kind.color }, group);
+      const route = node.dispatch ? "  ·  " + routeName(node.dispatch) : "";
+      badge.textContent = kind.label + route;
+      const name = el("text", { class: "name", x: 14, y: 35 }, group);
+      name.textContent = clip(node.id, 26);
+      if (node.binding) {
+        const bind = el("text", { class: "bind", x: 14, y: 48 }, group);
+        bind.textContent = clip(node.binding, 28);
+      }
+    }
+    group.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(node.id); }
+    });
+    draggable(group, node);
+  });
+
+  const tabs = document.querySelectorAll(".tab[data-flow]");
+  for (let i = 0; i < tabs.length; i++) {
+    tabs[i].setAttribute("aria-selected", tabs[i].getAttribute("data-flow") === address ? "true" : "false");
+  }
+  showFlow();
+  fit();
+}
+
+function fit() {
+  let box;
+  try { box = view.getBBox(); } catch (e) { return; }
+  if (!box.width || !box.height) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const k = Math.max(0.28, Math.min(1.15, (w - 70) / box.width, (h - 70) / box.height));
+  tf = {
+    k: k,
+    x: box.width * k <= w - 70 ? (w - box.width * k) / 2 - box.x * k : 35 - box.x * k,
+    y: (h - box.height * k) / 2 - box.y * k
+  };
+  applyTransform();
+}
+
+/* ---------------------------------------------------------------------------
+ * The detail pane
+ * ------------------------------------------------------------------------- */
+function esc(text) {
+  return String(text === undefined || text === null ? "" : text)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+/* `docs/graph.md` omits an array rather than writing an empty one — there, an
+   absent key and an empty value are two different facts — so every array this
+   page reads comes through here. A renderer that indexed a key the document is
+   allowed to leave out would throw on the first composition that leaves it out,
+   which is most of them. */
+function list(held) { return held || []; }
+function pairs(entries) {
+  if (!entries || !entries.length) return "";
+  return '<dl class="kv">' + entries.map(held =>
+    "<dt>" + esc(held[0]) + "</dt><dd>" + esc(held[1]) + "</dd>").join("") + "</dl>";
+}
+function bindings(held) {
+  return pairs(list(held).map(entry => [entry.name, entry.expression]));
+}
+function schema(held) {
+  if (!held) return "";
+  if (held.source === "string_input") {
+    return '<p class="pane-sub">one unnamed string (the agent declares no <code>input:</code>)</p>';
+  }
+  const note = held.source === "kind_default" ? '<p class="pane-sub">supplied by the node kind</p>' : "";
+  if (!list(held.fields).length) return note + '<p class="pane-sub">no fields</p>';
+  return note + list(held.fields).map(field =>
+    '<div class="row"><code>' + esc(field.name) + "</code><span class=\"note\">" +
+    esc(field.type) + (field.description ? " — " + esc(field.description) : "") +
+    "</span></div>").join("");
+}
+function policyRows(policy) {
+  if (!policy) return "";
+  const rows = [];
+  if (policy.timeout) rows.push(["timeout", policy.timeout.value + "  (" + policy.timeout.level + ")"]);
+  if (policy.retry) {
+    const retry = policy.retry;
+    let text = "max " + retry.max + ", backoff " + retry.backoff;
+    if (retry.multiplier) text += ", ×" + retry.multiplier;
+    if (retry.max_backoff) text += ", cap " + retry.max_backoff;
+    if (retry.jitter === false) text += ", no jitter";
+    rows.push(["retry", text + "  (" + retry.level + ")"]);
+  }
+  const onError = policy.on_error;
+  rows.push(["on_error", onError.strategy + (onError.target ? " → " + onError.target : "") +
+    "  (" + onError.level + ")"]);
+  return pairs(rows);
+}
+function modelRows(model) {
+  if (!model) return "";
+  if (model.form === "route") {
+    const conditions = list(model.route_on);
+    return '<div class="row"><code>' + esc(model.address) + '</code><span class="tag">route</span>' +
+      (conditions.length ? '<span class="note">on ' + esc(conditions.join(", ")) + "</span>" : "") +
+      "</div>" + list(model.route).map(member =>
+        '<div class="row"><code>↳ ' + esc(member.address) + "</code><span class=\"note\">" +
+        esc(member.id || "") + (member.provider ? " · " + esc(member.provider.address) : "") +
+        "</span></div>").join("");
+  }
+  const rows = [["address", model.address], ["id", model.id]];
+  if (model.provider) {
+    rows.push(["provider", model.provider.address + " (" + model.provider.kind + ")"]);
+    list(model.provider.config).forEach(entry => rows.push(["provider." + entry.name, entry.value]));
+    const served = list(model.provider.server_tools);
+    if (served.length) rows.push(["server_tools", served.join(", ")]);
+  }
+  list(model.settings).forEach(entry =>
+    rows.push(["settings." + entry.name, JSON.stringify(entry.value)]));
+  return pairs(rows);
+}
+function toolRows(tools) {
+  return list(tools).map(tool =>
+    '<div class="row"><code>' + esc(tool.name) + '</code><span class="tag">' +
+    esc(tool.source) + (tool.binding ? " · " + esc(tool.binding) : "") + "</span>" +
+    '<span class="note">' + esc(tool.detail || tool.description || "") + "</span></div>").join("");
+}
+
+function showFlow() {
+  const flow = current.flow;
+  current.selected = null;
+  const nodes = document.querySelectorAll(".node");
+  for (let i = 0; i < nodes.length; i++) nodes[i].classList.remove("selected");
+  /* A composition of `provider.*` and `model.*` definitions and no `flow.*` is
+     one the validator accepts, so it is one this page is emitted for — with no
+     flow to land on, and so nothing for the pane to be *about*. It still has a
+     background to click. */
+  if (!flow) {
+    pane.innerHTML = '<p class="pane-sub">This composition declares no flows.</p>' +
+      '<footer class="pane-foot">agent-compose visualize · ' + esc(DOC.entrypoint) +
+      " · target " + esc(DOC.target) + " · graph_version " + esc(DOC.graph_version) +
+      "</footer>";
+    return;
+  }
+  pane.innerHTML =
+    '<div class="pane-kind" style="color:var(--k-flow)">FLOW</div>' +
+    '<div class="pane-addr">' + esc(flow.address) + "</div>" +
+    (flow.description ? '<p class="desc">' + esc(flow.description) + "</p>" : "") +
+    "<h3>Inputs</h3>" + (list(flow.inputs).length
+      ? schema({ source: "declared", fields: flow.inputs })
+      : '<p class="pane-sub">none</p>') +
+    "<h3>Outputs</h3>" + (list(flow.outputs).length
+      ? schema({ source: "declared", fields: flow.outputs })
+      : '<p class="pane-sub">none</p>') +
+    (list(flow.triggers).length
+      ? "<h3>Triggers targeting this flow</h3>" + list(flow.triggers).map(trigger =>
+        '<div class="row"><code>' + esc(trigger.name) + '</code><span class="tag">' +
+        esc(trigger.type) + '</span><span class="note">' + esc(trigger.summary) +
+        (trigger.session_key ? " · session_key " + esc(trigger.session_key) : "") +
+        "</span></div>").join("")
+      : "") +
+    "<h3>Reading the canvas</h3>" +
+    '<p class="pane-sub">Solid edges fire unconditionally. A teal chip is a CEL ' +
+    '<code>when:</code> guard, or an <code>else:</code> default. A dashed red edge is a ' +
+    'control transfer — an <code>on_error:</code> fallback, or a <code>human</code> ' +
+    'wait running out. A dotted edge leaving a map is its join barrier: it fires once every ' +
+    'dispatched instance has resolved. The dashed container is the fan-out itself.</p>' +
+    '<footer class="pane-foot">agent-compose visualize · ' + esc(DOC.entrypoint) +
+    " · target " + esc(DOC.target) + " · graph_version " + esc(DOC.graph_version) +
+    "</footer>";
+  pane.scrollTop = 0;
+}
+
+function select(id) {
+  const node = current.byId[id];
+  if (!node) return;
+  if (node.kind === "start" || node.kind === "end") { showFlow(); return; }
+  current.selected = id;
+  const nodes = document.querySelectorAll(".node");
+  for (let i = 0; i < nodes.length; i++) {
+    nodes[i].classList.toggle("selected", nodes[i].getAttribute("data-id") === id);
+  }
+  const kind = KIND[node.kind] || KIND.map;
+  const flow = current.flow;
+  const inbound = flow.edges.filter(e => e.to === id);
+  const outbound = flow.edges.filter(e => e.from === id);
+  const edgeRow = (edge, direction) => {
+    const other = direction === "in" ? edge.from : edge.to;
+    let tag = (EDGE[edge.class] || EDGE.unconditional).chip(edge);
+    if (edge.join_barrier) tag += ' <span class="note">join barrier</span>';
+    if (edge.max_iterations) tag += ' <span class="note">max_iterations ' + esc(edge.max_iterations) + "</span>";
+    return '<div class="edgeline"><span class="dir">' + (direction === "in" ? "←" : "→") +
+      "</span><code>" + esc(other) + "</code>" + tag + "</div>";
+  };
+
+  let html =
+    '<button class="pane-close" aria-label="Back to the flow overview" title="Back to the flow overview">&times;</button>' +
+    '<div class="pane-kind" style="color:' + kind.color + '">' + esc(kind.label) +
+    (node.dispatch ? " · route " + esc(routeName(node.dispatch)) : "") + "</div>" +
+    '<div class="pane-addr">' + esc(node.id) + "</div>" +
+    (node.binding ? '<div class="pane-sub mono">' + esc(node.binding) + "</div>" : "") +
+    (node.description ? '<p class="desc">' + esc(node.description) + "</p>" : "");
+
+  if (node.agent) {
+    const tools = list(node.agent.tools), stores = list(node.agent.stores);
+    html += "<h3>Model</h3>" + modelRows(node.agent.model);
+    if (tools.length) html += "<h3>Tools</h3>" + toolRows(tools);
+    if (stores.length) {
+      html += "<h3>Stores</h3>" + stores.map(store =>
+        '<div class="row"><code>' + esc(store) + "</code></div>").join("");
+    }
+    if (node.agent.max_tool_iterations) {
+      html += pairs([["max_tool_iterations", node.agent.max_tool_iterations]]);
+    }
+  }
+  if (node.tool) html += "<h3>Tool</h3>" + toolRows([node.tool]);
+  if (node.exec) {
+    const args = list(node.exec.args), statuses = list(node.exec.expect_exit);
+    html += "<h3>Command</h3>" + pairs([["command", node.exec.command]]
+      .concat(args.length ? [["args", args.join(" ")]] : [])
+      .concat(node.exec.cwd ? [["cwd", node.exec.cwd]] : [])
+      .concat(statuses.length ? [["expect_exit", statuses.join(", ")]] : [])
+      .concat(list(node.exec.env).map(entry => ["env." + entry.name, entry.expression])));
+  }
+  if (node.http) {
+    const statuses = list(node.http.expect_status);
+    html += "<h3>Request</h3>" + pairs([["method", node.http.method], ["url", node.http.url]]
+      .concat(statuses.length ? [["expect_status", statuses.join(", ")]] : [])
+      .concat(list(node.http.headers).map(entry => ["header." + entry.name, entry.expression]))
+      .concat(list(node.http.query).map(entry => ["query." + entry.name, entry.expression]))
+      .concat(list(node.http.body).map(entry => ["body." + entry.name, entry.expression])));
+  }
+  if (node.store) {
+    html += "<h3>Store operation</h3>" + pairs([
+      ["store", node.store.address], ["kind", node.store.kind],
+      ["scope", node.store.scope], ["op", node.store.op]
+    ].concat(node.store.backend ? [["backend", node.store.backend]] : [])
+      .concat(list(node.store.params).map(entry => [entry.name, entry.expression])));
+  }
+  if (node.human) {
+    html += "<h3>Wait</h3>" + pairs(
+      (node.human.timeout ? [["timeout", node.human.timeout]] : [["timeout", "unbounded"]])
+        .concat(node.human.on_timeout ? [["on_timeout", "→ " + node.human.on_timeout]] : []));
+  }
+  if (node.map) {
+    const map = node.map;
+    html += "<h3>Fan-out</h3>" + pairs([
+      ["over", map.over],
+      ["max_items", map.max_items === undefined ? "—" : map.max_items],
+      ["as", map.item_binding],
+      ["max_concurrency", map.max_concurrency],
+      ["dispatch", map.dispatch]
+    ].concat(map.route_by ? [["route_by", map.route_by]] : [])
+      .concat(map.on_item_error
+        ? [["on_item_error", map.on_item_error.strategy +
+          (map.on_item_error.retry
+            ? " (max " + map.on_item_error.retry.max + ", backoff " + map.on_item_error.retry.backoff + ")"
+            : "")]]
+        : []));
+    html += '<p class="pane-sub">' + esc(map.join) + "</p>";
+    /* Through `routeName`, so a route and the satellite it dispatches are called
+       the same thing in the two places a reader meets them. */
+    html += "<h3>Routes</h3>" + list(map.routes).map(route =>
+      '<div class="row"><code>' + esc(routeName(route)) +
+      '</code><span class="note">→ ' + esc(route.target) +
+      (list(route.covers).length ? " · narrowed to " + esc(list(route.covers).join(", ")) : "") +
+      (route.max_concurrency ? " · ≤ " + esc(route.max_concurrency) + " concurrent" : "") +
+      (route.detach === true ? " · detached" : "") +
+      "</span></div>").join("");
+  }
+  if (node.dispatch) {
+    const covers = list(node.dispatch.covers);
+    html += "<h3>Dispatched by</h3>" + pairs([["map", node.dispatch.map]]
+      .concat(node.dispatch.variant ? [["variant", node.dispatch.variant]] : [])
+      .concat(node.dispatch.default ? [["default", "the catch-all route"]] : [])
+      .concat(covers.length ? [["narrowed to", covers.join(", ")]] : [])
+      .concat(node.dispatch.max_concurrency ? [["max_concurrency", node.dispatch.max_concurrency]] : [])
+      .concat(node.dispatch.detach === true ? [["detach", "true"]] : []));
+  }
+  if (node.input) {
+    html += "<h3>Input bindings</h3>" + (node.input.form === "scalar"
+      ? pairs([["(unnamed)", node.input.value]])
+      : bindings(node.input.bindings));
+  }
+  if (node.schemas && node.schemas.input) html += "<h3>Input schema</h3>" + schema(node.schemas.input);
+  if (node.schemas && node.schemas.output) html += "<h3>Output schema</h3>" + schema(node.schemas.output);
+  if (list(node.writes).length) {
+    html += "<h3>Writes</h3>" + pairs(list(node.writes).map(write =>
+      [write.field, "→ state." + write.channel + (write.reduce ? "  (reduce " + write.reduce + ")" : "")]));
+  }
+  if (node.policy) html += "<h3>Policy</h3>" + policyRows(node.policy);
+  if (node.subflow && node.subflow.policy) {
+    const held = node.subflow.policy;
+    html += "<h3>Policy inside the instance</h3>" + pairs(
+      (held.timeout ? [["timeout", held.timeout]] : [])
+        .concat(held.on_error ? [["on_error", held.on_error]] : [])
+        .concat(held.retry ? [["retry", "max " + held.retry.max + ", backoff " + held.retry.backoff]] : []));
+  }
+  if (node.agent && node.agent.prompt) {
+    html += '<h3>Prompt</h3><details class="prompt"><summary>show prompt</summary>' +
+      '<pre class="block" style="white-space:pre-wrap">' + esc(node.agent.prompt) + "</pre></details>";
+  }
+  html += "<h3>Edges</h3>" +
+    (inbound.length + outbound.length
+      ? inbound.map(e => edgeRow(e, "in")).join("") + outbound.map(e => edgeRow(e, "out")).join("")
+      : '<p class="pane-sub">none</p>');
+  if (node.subflow) {
+    const known = DOC.flows.some(held => held.address === node.subflow.address);
+    html += "<h3>Subgraph</h3>" +
+      (node.subflow.context ? pairs([["context", node.subflow.context]]) : "") +
+      '<div class="row"><button class="jump" data-jump="' + esc(node.subflow.address) + '"' +
+      (known ? "" : " disabled") + ">open " + esc(node.subflow.address) + " →</button>" +
+      (known ? "" : '<span class="note">not in this document — re-run without --flow</span>') +
+      "</div>";
+  }
+  html += '<footer class="pane-foot">agent-compose visualize · ' + esc(DOC.entrypoint) +
+    " · " + esc(current.flow.address) + "</footer>";
+  pane.innerHTML = html;
+
+  const close = pane.querySelector(".pane-close");
+  if (close) close.addEventListener("click", showFlow);
+  const jump = pane.querySelector("[data-jump]:not([disabled])");
+  if (jump) jump.addEventListener("click", () => renderFlow(jump.getAttribute("data-jump")));
+  pane.scrollTop = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Pan and zoom
+ * ------------------------------------------------------------------------- */
+let panning = null;
+/* Whether the last press was a pan rather than a click, which is what tells a
+   background click from the end of a drag. */
+let panned = false;
+canvas.addEventListener("pointerdown", event => {
+  panned = false;
+  if (event.target.closest(".node") || event.target.closest("button")) return;
+  panning = { x: event.clientX, y: event.clientY, tx: tf.x, ty: tf.y, moved: false };
+  canvas.classList.add("dragging");
+  try { canvas.setPointerCapture(event.pointerId); } catch (e) { /* still pans */ }
+});
+canvas.addEventListener("pointermove", event => {
+  if (!panning) return;
+  tf.x = panning.tx + event.clientX - panning.x;
+  tf.y = panning.ty + event.clientY - panning.y;
+  if (Math.abs(event.clientX - panning.x) + Math.abs(event.clientY - panning.y) > 3) {
+    panning.moved = true;
+  }
+  applyTransform();
+});
+canvas.addEventListener("pointerup", () => {
+  panned = panning !== null && panning.moved;
+  panning = null;
+  canvas.classList.remove("dragging");
+});
+canvas.addEventListener("pointercancel", () => { panning = null; canvas.classList.remove("dragging"); });
+canvas.addEventListener("wheel", event => {
+  event.preventDefault();
+  const box = canvas.getBoundingClientRect();
+  const mx = event.clientX - box.left, my = event.clientY - box.top;
+  const k = Math.min(2.5, Math.max(0.15, tf.k * (event.deltaY < 0 ? 1.12 : 0.89)));
+  tf.x = mx - (mx - tf.x) * k / tf.k;
+  tf.y = my - (my - tf.y) * k / tf.k;
+  tf.k = k;
+  applyTransform();
+}, { passive: false });
+/* A click of the background returns the pane to the flow overview. Bound on the
+   canvas rather than on the `<svg>` inside it: a pan sets pointer capture on
+   the canvas, and a captured pointer's `click` is dispatched to the capture
+   element, so a listener one level below it would never be reached. The end of
+   a pan is not a click on the background, and neither is a press on a control. */
+canvas.addEventListener("click", event => {
+  if (panned) { panned = false; return; }
+  if (event.target.closest(".node") || event.target.closest("button")) return;
+  showFlow();
+});
+
+document.getElementById("zoom-in").addEventListener("click", () => {
+  tf.k = Math.min(2.5, tf.k * 1.2); applyTransform();
+});
+document.getElementById("zoom-out").addEventListener("click", () => {
+  tf.k = Math.max(0.15, tf.k / 1.2); applyTransform();
+});
+document.getElementById("fit").addEventListener("click", fit);
+/* Discard this browser's rearrangement of the flow on screen, and draw the
+   computed layout again. Named rather than inline so the control has nothing to
+   do when there is no flow on screen at all. */
+function resetLayout() {
+  if (!current.flow) return;
+  clearOffsets(current.flow.address);
+  renderFlow(current.flow.address);
+}
+document.getElementById("reset").addEventListener("click", resetLayout);
+window.addEventListener("resize", fit);
+
+/* ---------------------------------------------------------------------------
+ * Header
+ * ------------------------------------------------------------------------- */
+document.title = "agent-compose · " + DOC.entrypoint;
+document.getElementById("subtitle").textContent =
+  "· " + DOC.entrypoint + " · target " + DOC.target;
+const tabs = document.getElementById("tabs");
+DOC.flows.forEach(flow => {
+  const button = document.createElement("button");
+  button.className = "tab";
+  button.setAttribute("role", "tab");
+  button.setAttribute("data-flow", flow.address);
+  button.textContent = flow.address;
+  button.addEventListener("click", () => renderFlow(flow.address));
+  tabs.appendChild(button);
+});
+const legend = document.getElementById("legend");
+LEGEND.forEach(entry => {
+  const span = document.createElement("span");
+  const swatch = document.createElement("i");
+  swatch.style.background = KIND[entry[0]].color;
+  span.appendChild(swatch);
+  span.appendChild(document.createTextNode(entry[1]));
+  legend.appendChild(span);
+});
+
+/* The flow a reader lands on.
+   `flows` is in address order (`docs/graph.md` §9.1), which is a fixed order
+   rather than an interesting one: a three-node subflow sorting first would be
+   the picture somebody pastes into a pull request. An execution arrives through
+   a trigger, so the flow the most triggers target is the composition's subject;
+   size breaks a tie, and the document's own order breaks that. Deterministic
+   either way — every reader of one file lands on the same tab. */
+function landing() {
+  return DOC.flows.reduce((best, flow) => {
+    const held = list(flow.triggers).length, mine = list(best.triggers).length;
+    if (held > mine) return flow;
+    if (held === mine && flow.nodes.length > best.nodes.length) return flow;
+    return best;
+  }, DOC.flows[0]);
+}
+
+if (DOC.flows.length) renderFlow(landing().address);
+else showFlow();
+</script>
+</body>
+</html>

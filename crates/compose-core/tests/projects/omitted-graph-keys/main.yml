@@ -1,0 +1,112 @@
+# A composition written to leave keys OUT.
+#
+# `docs/graph.md` omits an array rather than writing an empty one — an absent
+# key and an empty value are two different facts there (§9.1) — so the shapes
+# the renderer has to survive are the ones nothing is declared on. Neither
+# worked example reaches them: both declare `settings:` on every model, tools on
+# every agent, and a *routed* fan-out whose routes all carry a `covers` list.
+#
+# What this reaches, one omission per construct:
+#
+#   * a **homogeneous** map — one target, no `route_by:`, so its single route
+#     carries no `variant` and no `covers` at all;
+#   * a model with no `settings:`, behind a provider with one connection key;
+#   * an agent with no `tools:`, no `stores:` and no `max_tool_iterations:`;
+#   * an agent with no `input:`, which takes one unnamed string instead
+#     (grammar 5.3) — the `string_input` schema source;
+#   * an inline `exec:` with no `args:`, no `cwd:`, no `env:` and no
+#     `expect_exit:`, and no `output:` either, so its result schema is the kind
+#     default;
+#   * an inline `http:` with no `headers:`, no `query:` and no `expect_status:`;
+#   * a `human` node with no `timeout:` and so no `on_timeout:` — an unbounded
+#     wait, which is the one `human` node with no control-transfer edge;
+#   * a flow with no `inputs:` and no `description:`;
+#   * a composition with no `defaults:`, so every policy resolves to the
+#     built-in.
+#
+# It is a fixture rather than an example: nothing here is written to be read as
+# a composition anybody would deploy.
+version: "0.1"
+
+state:
+  notes:
+    type: array
+    max_items: 30
+    items: { type: string }
+    reduce: append
+
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.plain:
+  provider: provider.p
+  id: some-model
+
+agent.planner:
+  model: model.plain
+  prompt: Plan the work.
+  output:
+    steps:
+      type: array
+      max_items: 30
+      items: { type: string }
+
+# No `input:`, so this agent takes one unnamed string (grammar 5.3).
+agent.worker:
+  model: model.plain
+  prompt: Do one step.
+  output:
+    note: { type: string }
+
+flow.bare:
+  outputs:
+    notes:
+      type: array
+      max_items: 30
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'the goal'"
+
+    # Homogeneous fan-out: one target for every item, so the route carries no
+    # variant and narrows nothing.
+    work:
+      map:
+        over: plan.output.steps
+        as: step
+        node: agent.worker
+        max_concurrency: 4
+        input: "step"
+        writes:
+          note: notes
+
+    # An inline `exec:` with nothing but its command.
+    tidy:
+      exec:
+        command: tidy-up
+
+    # An inline `http:` with nothing but its method and url.
+    ping:
+      http:
+        method: POST
+        url: "https://${PING_HOST}/v1/ping"
+
+    # A wait with no budget, and so no `on_timeout:` route.
+    sign_off:
+      human:
+        input:
+          count: { type: integer }
+        output:
+          ok: { type: boolean }
+      input:
+        count: "size(state.notes)"
+
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: tidy }
+    - { from: tidy, to: ping }
+    - { from: ping, to: sign_off }
+    - { from: sign_off, to: end }

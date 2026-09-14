@@ -1,0 +1,325 @@
+{
+  "graph_version": 1,
+  "entrypoint": "main.yml",
+  "target": "local",
+  "spec_version": "0.1",
+  "flows": [
+    {
+      "address": "flow.review_loop",
+      "description": "Draft a document and revise it until the reviewer approves.",
+      "inputs": [
+        {
+          "name": "goal",
+          "type": "string (min_length 1)",
+          "description": "What the finished draft must accomplish."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "draft",
+          "type": "string",
+          "description": "The approved draft, read from the `draft` state channel."
+        }
+      ],
+      "triggers": [
+        {
+          "name": "cli",
+          "type": "manual",
+          "summary": "invoked from the CLI or the SDK"
+        },
+        {
+          "name": "on_request",
+          "type": "http",
+          "summary": "POST /review · respond async",
+          "session_key": "payload.headers['x-session-id']",
+          "input": [
+            {
+              "name": "goal",
+              "expression": "payload.body.goal"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start",
+          "kind": "start"
+        },
+        {
+          "id": "end",
+          "kind": "end"
+        },
+        {
+          "id": "write",
+          "kind": "agent",
+          "binding": "agent.researcher",
+          "description": "Writes and revises a draft until it satisfies the goal.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "goal",
+                "expression": "input.goal"
+              },
+              {
+                "name": "feedback",
+                "expression": "state.feedback"
+              }
+            ]
+          },
+          "policy": {
+            "retry": {
+              "max": 2,
+              "backoff": "5s",
+              "level": "node"
+            },
+            "timeout": {
+              "value": "120s",
+              "level": "defaults"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "goal",
+                  "type": "string",
+                  "description": "What the draft must accomplish."
+                },
+                {
+                  "name": "feedback",
+                  "type": "string (default \"\")",
+                  "description": "Reviewer feedback from the previous pass; empty on the first pass."
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "draft",
+                  "type": "string (min_length 1)",
+                  "description": "The complete draft, in Markdown."
+                }
+              ]
+            }
+          },
+          "agent": {
+            "address": "agent.researcher",
+            "model": {
+              "address": "model.default",
+              "form": "route",
+              "route": [
+                {
+                  "address": "model.smart",
+                  "form": "direct",
+                  "id": "claude-sonnet-4-6",
+                  "provider": {
+                    "address": "provider.anthropic",
+                    "kind": "anthropic",
+                    "config": [
+                      {
+                        "name": "api_key",
+                        "value": "${ANTHROPIC_API_KEY}"
+                      }
+                    ]
+                  },
+                  "settings": [
+                    {
+                      "name": "max_tokens",
+                      "value": 8000
+                    },
+                    {
+                      "name": "thinking",
+                      "value": {
+                        "budget_tokens": 4000
+                      }
+                    }
+                  ]
+                },
+                {
+                  "address": "model.fast",
+                  "form": "direct",
+                  "id": "claude-haiku-4-5",
+                  "provider": {
+                    "address": "provider.anthropic",
+                    "kind": "anthropic",
+                    "config": [
+                      {
+                        "name": "api_key",
+                        "value": "${ANTHROPIC_API_KEY}"
+                      }
+                    ]
+                  },
+                  "settings": [
+                    {
+                      "name": "temperature",
+                      "value": 0.2
+                    }
+                  ]
+                }
+              ],
+              "route_on": [
+                "rate_limit",
+                "overloaded",
+                "timeout"
+              ]
+            },
+            "tools": [
+              {
+                "name": "web_search",
+                "source": "tool",
+                "address": "tool.web_search",
+                "binding": "http",
+                "description": "Search the public web and return ranked result snippets.",
+                "detail": "GET https://${SEARCH_HOST}/v1/search"
+              }
+            ],
+            "prompt": "You are a research writer. Produce a single self-contained draft that\nsatisfies the goal.\n\nIf feedback from a previous review is present, treat every point in it as a\nrequired change and rewrite the draft accordingly. Never return an unchanged\ndraft when feedback is present.\n"
+          }
+        },
+        {
+          "id": "review",
+          "kind": "agent",
+          "binding": "agent.reviewer",
+          "description": "Reviews a draft against the goal and returns a routable verdict.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "goal",
+                "expression": "input.goal"
+              },
+              {
+                "name": "draft",
+                "expression": "state.draft"
+              }
+            ]
+          },
+          "policy": {
+            "timeout": {
+              "value": "90s",
+              "level": "node"
+            },
+            "on_error": {
+              "strategy": "fallback",
+              "target": "end",
+              "level": "node"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "goal",
+                  "type": "string",
+                  "description": "What the draft must accomplish."
+                },
+                {
+                  "name": "draft",
+                  "type": "string",
+                  "description": "The draft under review."
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "verdict",
+                  "type": "enum [approve, revise]",
+                  "description": "approve ends the loop; revise sends the draft back to the writer."
+                },
+                {
+                  "name": "feedback",
+                  "type": "string",
+                  "description": "Required changes, empty when approving."
+                }
+              ]
+            }
+          },
+          "agent": {
+            "address": "agent.reviewer",
+            "model": {
+              "address": "model.smart",
+              "form": "direct",
+              "id": "claude-sonnet-4-6",
+              "provider": {
+                "address": "provider.anthropic",
+                "kind": "anthropic",
+                "config": [
+                  {
+                    "name": "api_key",
+                    "value": "${ANTHROPIC_API_KEY}"
+                  }
+                ]
+              },
+              "settings": [
+                {
+                  "name": "max_tokens",
+                  "value": 8000
+                },
+                {
+                  "name": "thinking",
+                  "value": {
+                    "budget_tokens": 4000
+                  }
+                }
+              ]
+            },
+            "tools": [
+              {
+                "name": "web_search",
+                "source": "tool",
+                "address": "tool.web_search",
+                "binding": "http",
+                "description": "Search the public web and return ranked result snippets.",
+                "detail": "GET https://${SEARCH_HOST}/v1/search"
+              }
+            ],
+            "prompt": "You are a meticulous technical reviewer.\n\nApprove only when the draft fully satisfies the goal, is internally\nconsistent, and contains no unsupported claims. Otherwise ask for a\nrevision and list every required change explicitly.\n",
+            "max_tool_iterations": 4
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "start",
+          "to": "write",
+          "class": "unconditional"
+        },
+        {
+          "from": "write",
+          "to": "review",
+          "class": "unconditional"
+        },
+        {
+          "from": "review",
+          "to": "write",
+          "class": "conditional",
+          "label": "review.output.verdict == 'revise'",
+          "when": "review.output.verdict == 'revise'",
+          "max_iterations": 3
+        },
+        {
+          "from": "review",
+          "to": "end",
+          "class": "default",
+          "label": "else"
+        },
+        {
+          "from": "review",
+          "to": "end",
+          "class": "error_fallback",
+          "label": "on_error: fallback"
+        }
+      ]
+    }
+  ]
+}

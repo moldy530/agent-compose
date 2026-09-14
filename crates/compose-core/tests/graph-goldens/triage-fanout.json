@@ -1,0 +1,1329 @@
+{
+  "graph_version": 1,
+  "entrypoint": "main.yml",
+  "target": "local",
+  "spec_version": "0.1",
+  "flows": [
+    {
+      "address": "flow.enrich",
+      "description": "Normalize a raw bug report through the triage service.",
+      "inputs": [
+        {
+          "name": "report",
+          "type": "string"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "report_normalized",
+          "type": "string"
+        }
+      ],
+      "triggers": [],
+      "nodes": [
+        {
+          "id": "start",
+          "kind": "start"
+        },
+        {
+          "id": "end",
+          "kind": "end"
+        },
+        {
+          "id": "fetch",
+          "kind": "http",
+          "binding": "POST https://${TRIAGE_HOST}/v1/normalize",
+          "policy": {
+            "retry": {
+              "max": 2,
+              "backoff": "1s",
+              "multiplier": 3.0,
+              "max_backoff": "20s",
+              "level": "node"
+            },
+            "timeout": {
+              "value": "15s",
+              "level": "node"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "report_normalized",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "http": {
+            "method": "POST",
+            "url": "https://${TRIAGE_HOST}/v1/normalize",
+            "headers": [
+              {
+                "name": "authorization",
+                "expression": "Bearer ${TRIAGE_TOKEN}"
+              }
+            ],
+            "body": [
+              {
+                "name": "report",
+                "expression": "input.report"
+              }
+            ],
+            "expect_status": [
+              200
+            ]
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "start",
+          "to": "fetch",
+          "class": "unconditional"
+        },
+        {
+          "from": "fetch",
+          "to": "end",
+          "class": "unconditional"
+        }
+      ]
+    },
+    {
+      "address": "flow.triage",
+      "description": "Triage a bug report, fan out fixes, and get a human sign-off.",
+      "inputs": [
+        {
+          "name": "report",
+          "type": "string (min_length 1)",
+          "description": "The raw bug report."
+        },
+        {
+          "name": "pattern",
+          "type": "string",
+          "description": "Repository search pattern used to ground the triage agent."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "summary",
+          "type": "string"
+        },
+        {
+          "name": "patches",
+          "type": "array<string> (max_items 200)"
+        }
+      ],
+      "triggers": [
+        {
+          "name": "cli",
+          "type": "manual",
+          "summary": "invoked from the CLI or the SDK",
+          "session_key": "payload.session"
+        },
+        {
+          "name": "ingest",
+          "type": "event",
+          "summary": "source bug_reports · reserved in v0",
+          "session_key": "payload.body.project",
+          "input": [
+            {
+              "name": "report",
+              "expression": "payload.body.text"
+            },
+            {
+              "name": "pattern",
+              "expression": "payload.body.pattern"
+            }
+          ]
+        },
+        {
+          "name": "nightly",
+          "type": "schedule",
+          "summary": "cron 0 3 * * * (UTC) · reserved in v0",
+          "session_key": "'nightly'",
+          "input": [
+            {
+              "name": "report",
+              "expression": "'nightly sweep'"
+            },
+            {
+              "name": "pattern",
+              "expression": "'TODO|FIXME'"
+            }
+          ]
+        },
+        {
+          "name": "on_report",
+          "type": "http",
+          "summary": "POST /reports · respond async",
+          "session_key": "payload.body.project",
+          "input": [
+            {
+              "name": "report",
+              "expression": "payload.body.report"
+            },
+            {
+              "name": "pattern",
+              "expression": "payload.body.pattern"
+            }
+          ]
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start",
+          "kind": "start"
+        },
+        {
+          "id": "end",
+          "kind": "end"
+        },
+        {
+          "id": "enrich",
+          "kind": "flow",
+          "binding": "flow.enrich",
+          "description": "Normalize a raw bug report through the triage service.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "report",
+                "expression": "input.report"
+              }
+            ]
+          },
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "90s",
+              "level": "defaults"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "report",
+                  "type": "string"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "report_normalized",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "subflow": {
+            "address": "flow.enrich",
+            "context": "isolated",
+            "policy": {
+              "timeout": "30s",
+              "on_error": "fail"
+            }
+          }
+        },
+        {
+          "id": "scan",
+          "kind": "function",
+          "binding": "tool.repo_grep",
+          "description": "Search the repository for a pattern and return matching lines.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "pattern",
+                "expression": "input.pattern"
+              },
+              {
+                "name": "max_matches",
+                "expression": "25"
+              }
+            ]
+          },
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "90s",
+              "level": "defaults"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "pattern",
+                  "type": "string (min_length 1)",
+                  "description": "An RE2 regular expression."
+                },
+                {
+                  "name": "max_matches",
+                  "type": "integer (minimum 1, maximum 200, default 50)"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "matches",
+                  "type": "array<string> (max_items 200)",
+                  "description": "Matching lines, formatted as path:line:text."
+                }
+              ]
+            }
+          },
+          "exec": {
+            "command": "repo-grep",
+            "args": [
+              "--format",
+              "json"
+            ],
+            "cwd": "${REPO_ROOT}",
+            "env": [
+              {
+                "name": "RIPGREP_CONFIG_PATH",
+                "expression": "${RG_CONFIG_PATH}"
+              }
+            ]
+          },
+          "tool": {
+            "name": "repo_grep",
+            "source": "tool",
+            "address": "tool.repo_grep",
+            "binding": "exec",
+            "description": "Search the repository for a pattern and return matching lines.",
+            "detail": "repo-grep --format json"
+          }
+        },
+        {
+          "id": "classify",
+          "kind": "agent",
+          "binding": "agent.triage",
+          "description": "Classifies bug-report findings into routable variants.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "report",
+                "expression": "state.report_normalized"
+              },
+              {
+                "name": "matches",
+                "expression": "state.matches"
+              }
+            ]
+          },
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "90s",
+              "level": "defaults"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "report",
+                  "type": "string",
+                  "description": "The raw bug report."
+                },
+                {
+                  "name": "matches",
+                  "type": "array<string>",
+                  "description": "Grep hits from the repository, for grounding."
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "findings",
+                  "type": "array<union on kind [auto_fixable, needs_human, duplicate]> (max_items 50)",
+                  "description": "Every distinct defect, tagged for routing."
+                }
+              ]
+            }
+          },
+          "agent": {
+            "address": "agent.triage",
+            "model": {
+              "address": "model.smart",
+              "form": "direct",
+              "id": "claude-sonnet-4-6",
+              "provider": {
+                "address": "provider.anthropic",
+                "kind": "anthropic",
+                "config": [
+                  {
+                    "name": "api_key",
+                    "value": "${ANTHROPIC_API_KEY}"
+                  }
+                ],
+                "server_tools": [
+                  "web_search_20250305"
+                ]
+              },
+              "settings": [
+                {
+                  "name": "max_tokens",
+                  "value": 8000
+                }
+              ]
+            },
+            "tools": [
+              {
+                "name": "docs_search",
+                "source": "store",
+                "address": "store.docs",
+                "op": "search",
+                "description": "Project documentation, chunked, for grounding triage decisions.",
+                "detail": "synthesized from store.docs (vector, agent_access: read)"
+              }
+            ],
+            "stores": [
+              "store.docs"
+            ],
+            "prompt": "You triage incoming bug reports.\n\nEmit one finding per distinct defect. Tag a finding `auto_fixable` only when\nthe fix is mechanical and local to one file. Tag it `needs_human` when it\nrequires judgement, and `duplicate` when the report restates a finding you\nhave already emitted in this run.\n"
+          }
+        },
+        {
+          "id": "dispatch",
+          "kind": "map",
+          "binding": "over classify.output.findings",
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "90s",
+              "level": "defaults"
+            },
+            "on_error": {
+              "strategy": "skip",
+              "level": "node"
+            }
+          },
+          "map": {
+            "over": "classify.output.findings",
+            "max_items": 50,
+            "item_binding": "finding",
+            "max_concurrency": 8,
+            "dispatch": "routed",
+            "route_by": "kind",
+            "on_item_error": {
+              "strategy": "retry",
+              "retry": {
+                "max": 2,
+                "backoff": "2s",
+                "level": "node"
+              }
+            },
+            "join": "the map node's outgoing edges fire once every dispatched instance has completed, been resolved by `on_item_error`, or been detached",
+            "routes": [
+              {
+                "node": "dispatch/auto_fixable",
+                "variant": "auto_fixable",
+                "default": false,
+                "covers": [
+                  "auto_fixable"
+                ],
+                "target": "agent.fixer",
+                "max_concurrency": 4,
+                "input": {
+                  "form": "fields",
+                  "bindings": [
+                    {
+                      "name": "file",
+                      "expression": "finding.file"
+                    },
+                    {
+                      "name": "patch_hint",
+                      "expression": "finding.patch_hint"
+                    }
+                  ]
+                },
+                "writes": [
+                  {
+                    "field": "patch",
+                    "channel": "patches",
+                    "reduce": "append"
+                  }
+                ]
+              },
+              {
+                "node": "dispatch/needs_human",
+                "variant": "needs_human",
+                "default": false,
+                "covers": [
+                  "needs_human"
+                ],
+                "target": "tool.review_queue",
+                "input": {
+                  "form": "fields",
+                  "bindings": [
+                    {
+                      "name": "summary",
+                      "expression": "finding.summary"
+                    },
+                    {
+                      "name": "severity",
+                      "expression": "finding.severity"
+                    }
+                  ]
+                }
+              },
+              {
+                "node": "dispatch/(default)",
+                "default": true,
+                "covers": [
+                  "duplicate"
+                ],
+                "target": "tool.dead_letter",
+                "input": {
+                  "form": "fields",
+                  "bindings": [
+                    {
+                      "name": "kind",
+                      "expression": "finding.kind"
+                    },
+                    {
+                      "name": "payload",
+                      "expression": "finding.of"
+                    }
+                  ]
+                },
+                "detach": false
+              }
+            ]
+          }
+        },
+        {
+          "id": "dispatch/auto_fixable",
+          "kind": "agent",
+          "binding": "agent.fixer",
+          "description": "Produces a patch for one mechanically fixable finding.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "file",
+                "expression": "finding.file"
+              },
+              {
+                "name": "patch_hint",
+                "expression": "finding.patch_hint"
+              }
+            ]
+          },
+          "writes": [
+            {
+              "field": "patch",
+              "channel": "patches",
+              "reduce": "append"
+            }
+          ],
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "file",
+                  "type": "string"
+                },
+                {
+                  "name": "patch_hint",
+                  "type": "string"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "patch",
+                  "type": "string",
+                  "description": "A unified diff."
+                },
+                {
+                  "name": "explanation",
+                  "type": "string",
+                  "description": "One sentence describing the change."
+                }
+              ]
+            }
+          },
+          "agent": {
+            "address": "agent.fixer",
+            "model": {
+              "address": "model.fast",
+              "form": "direct",
+              "id": "claude-haiku-4-5",
+              "provider": {
+                "address": "provider.anthropic",
+                "kind": "anthropic",
+                "config": [
+                  {
+                    "name": "api_key",
+                    "value": "${ANTHROPIC_API_KEY}"
+                  }
+                ],
+                "server_tools": [
+                  "web_search_20250305"
+                ]
+              },
+              "settings": [
+                {
+                  "name": "max_tokens",
+                  "value": 2000
+                },
+                {
+                  "name": "temperature",
+                  "value": 0.1
+                }
+              ]
+            },
+            "tools": [
+              {
+                "name": "str_replace_based_edit_tool",
+                "source": "tool",
+                "address": "tool.checkout",
+                "binding": "builtin",
+                "description": "View and edit files in the repository checkout under review. Paths are relative to the checkout root, and a path that resolves outside it is refused.",
+                "detail": "builtin.files, under the name its provider dictates"
+              }
+            ],
+            "prompt": "You write minimal unified diffs. Read the file, fix exactly the described\ndefect in it, and change nothing else.\n"
+          },
+          "dispatch": {
+            "map": "dispatch",
+            "variant": "auto_fixable",
+            "default": false,
+            "covers": [
+              "auto_fixable"
+            ],
+            "max_concurrency": 4
+          }
+        },
+        {
+          "id": "dispatch/needs_human",
+          "kind": "function",
+          "binding": "tool.review_queue",
+          "description": "Enqueue a finding for manual review and return the ticket id.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "summary",
+                "expression": "finding.summary"
+              },
+              {
+                "name": "severity",
+                "expression": "finding.severity"
+              }
+            ]
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "summary",
+                  "type": "string"
+                },
+                {
+                  "name": "severity",
+                  "type": "enum [low, high, critical]"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "ticket_id",
+                  "type": "string"
+                },
+                {
+                  "name": "queued",
+                  "type": "boolean"
+                }
+              ]
+            }
+          },
+          "http": {
+            "method": "POST",
+            "url": "https://${QUEUE_HOST}/v1/tickets",
+            "headers": [
+              {
+                "name": "authorization",
+                "expression": "Bearer ${QUEUE_TOKEN}"
+              }
+            ],
+            "body": [
+              {
+                "name": "summary",
+                "expression": "input.summary"
+              },
+              {
+                "name": "severity",
+                "expression": "input.severity"
+              }
+            ],
+            "expect_status": [
+              201
+            ]
+          },
+          "tool": {
+            "name": "review_queue",
+            "source": "tool",
+            "address": "tool.review_queue",
+            "binding": "http",
+            "description": "Enqueue a finding for manual review and return the ticket id.",
+            "detail": "POST https://${QUEUE_HOST}/v1/tickets"
+          },
+          "dispatch": {
+            "map": "dispatch",
+            "variant": "needs_human",
+            "default": false,
+            "covers": [
+              "needs_human"
+            ]
+          }
+        },
+        {
+          "id": "dispatch/(default)",
+          "kind": "function",
+          "binding": "tool.dead_letter",
+          "description": "Record an unroutable finding for later inspection.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "kind",
+                "expression": "finding.kind"
+              },
+              {
+                "name": "payload",
+                "expression": "finding.of"
+              }
+            ]
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "kind",
+                  "type": "string"
+                },
+                {
+                  "name": "payload",
+                  "type": "string"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "accepted",
+                  "type": "boolean"
+                }
+              ]
+            }
+          },
+          "http": {
+            "method": "POST",
+            "url": "https://${QUEUE_HOST}/v1/dead-letter",
+            "headers": [
+              {
+                "name": "authorization",
+                "expression": "Bearer ${QUEUE_TOKEN}"
+              }
+            ],
+            "body": [
+              {
+                "name": "kind",
+                "expression": "input.kind"
+              },
+              {
+                "name": "payload",
+                "expression": "input.payload"
+              }
+            ]
+          },
+          "tool": {
+            "name": "dead_letter",
+            "source": "tool",
+            "address": "tool.dead_letter",
+            "binding": "http",
+            "description": "Record an unroutable finding for later inspection.",
+            "detail": "POST https://${QUEUE_HOST}/v1/dead-letter"
+          },
+          "dispatch": {
+            "map": "dispatch",
+            "default": true,
+            "covers": [
+              "duplicate"
+            ],
+            "detach": false
+          }
+        },
+        {
+          "id": "announce",
+          "kind": "http",
+          "binding": "POST https://${QUEUE_HOST}/v1/triage-started",
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "10s",
+              "level": "node"
+            },
+            "on_error": {
+              "strategy": "fallback",
+              "target": "announce_failed",
+              "level": "node"
+            }
+          },
+          "schemas": {
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "status",
+                  "type": "integer"
+                }
+              ]
+            }
+          },
+          "http": {
+            "method": "POST",
+            "url": "https://${QUEUE_HOST}/v1/triage-started",
+            "headers": [
+              {
+                "name": "authorization",
+                "expression": "Bearer ${QUEUE_TOKEN}"
+              }
+            ],
+            "body": [
+              {
+                "name": "report",
+                "expression": "state.report_normalized"
+              }
+            ]
+          }
+        },
+        {
+          "id": "announce_failed",
+          "kind": "exec",
+          "binding": "${OPS_BIN}/log-event --kind=announce-failed --env=${DEPLOY_ENV}",
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "90s",
+              "level": "defaults"
+            },
+            "on_error": {
+              "strategy": "skip",
+              "level": "node"
+            }
+          },
+          "schemas": {
+            "output": {
+              "source": "kind_default",
+              "fields": [
+                {
+                  "name": "exit_code",
+                  "type": "integer"
+                },
+                {
+                  "name": "stdout",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "exec": {
+            "command": "${OPS_BIN}/log-event",
+            "args": [
+              "--kind=announce-failed",
+              "--env=${DEPLOY_ENV}"
+            ]
+          }
+        },
+        {
+          "id": "verify",
+          "kind": "exec",
+          "binding": "run-checks --fast",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "patches",
+                "expression": "state.patches"
+              }
+            ]
+          },
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "5m",
+              "level": "node"
+            },
+            "on_error": {
+              "strategy": "skip",
+              "level": "node"
+            }
+          },
+          "schemas": {
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "exit_code",
+                  "type": "integer"
+                },
+                {
+                  "name": "stdout",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "exec": {
+            "command": "run-checks",
+            "args": [
+              "--fast"
+            ],
+            "cwd": "${REPO_ROOT}",
+            "env": [
+              {
+                "name": "CI",
+                "expression": "true"
+              }
+            ],
+            "expect_exit": [
+              0,
+              1
+            ]
+          }
+        },
+        {
+          "id": "summarize",
+          "kind": "agent",
+          "binding": "agent.summarizer",
+          "description": "Summarizes a completed triage run for a human reviewer.",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "report",
+                "expression": "state.report_normalized"
+              },
+              {
+                "name": "patches",
+                "expression": "state.patches"
+              }
+            ]
+          },
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "90s",
+              "level": "defaults"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "report",
+                  "type": "string"
+                },
+                {
+                  "name": "patches",
+                  "type": "array<string>"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "summary",
+                  "type": "string (min_length 1)",
+                  "description": "The run summary shown to the human reviewer."
+                }
+              ]
+            }
+          },
+          "agent": {
+            "address": "agent.summarizer",
+            "model": {
+              "address": "model.fast",
+              "form": "direct",
+              "id": "claude-haiku-4-5",
+              "provider": {
+                "address": "provider.anthropic",
+                "kind": "anthropic",
+                "config": [
+                  {
+                    "name": "api_key",
+                    "value": "${ANTHROPIC_API_KEY}"
+                  }
+                ],
+                "server_tools": [
+                  "web_search_20250305"
+                ]
+              },
+              "settings": [
+                {
+                  "name": "max_tokens",
+                  "value": 2000
+                },
+                {
+                  "name": "temperature",
+                  "value": 0.1
+                }
+              ]
+            },
+            "tools": [],
+            "prompt": "Summarize the triage run in at most five sentences: what was fixed\nautomatically, what needs a human, and any risk you noticed.\n"
+          }
+        },
+        {
+          "id": "remember",
+          "kind": "store",
+          "binding": "store.triage_memory · set",
+          "description": "What this session has already triaged.",
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "2s",
+              "level": "defaults"
+            },
+            "timeout": {
+              "value": "90s",
+              "level": "defaults"
+            },
+            "on_error": {
+              "strategy": "skip",
+              "level": "node"
+            }
+          },
+          "schemas": {
+            "output": {
+              "source": "kind_default",
+              "fields": [
+                {
+                  "name": "key",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "store": {
+            "address": "store.triage_memory",
+            "kind": "kv",
+            "scope": "session",
+            "op": "set",
+            "params": [
+              {
+                "name": "key",
+                "expression": "execution.session_key"
+              },
+              {
+                "name": "value.last_report",
+                "expression": "input.report"
+              },
+              {
+                "name": "value.patch_count",
+                "expression": "size(state.patches)"
+              }
+            ]
+          }
+        },
+        {
+          "id": "approve",
+          "kind": "human",
+          "binding": "waits 24h",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "summary",
+                "expression": "state.summary"
+              },
+              {
+                "name": "patch_count",
+                "expression": "size(state.patches)"
+              }
+            ]
+          },
+          "writes": [
+            {
+              "field": "decision",
+              "channel": "human_decision"
+            }
+          ],
+          "policy": {
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "summary",
+                  "type": "string"
+                },
+                {
+                  "name": "patch_count",
+                  "type": "integer"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "decision",
+                  "type": "enum [approve, reject]"
+                },
+                {
+                  "name": "note",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "human": {
+            "timeout": "24h",
+            "on_timeout": "escalate"
+          }
+        },
+        {
+          "id": "escalate",
+          "kind": "http",
+          "binding": "POST https://${QUEUE_HOST}/v1/escalations",
+          "policy": {
+            "retry": {
+              "max": 3,
+              "backoff": "1s",
+              "level": "node"
+            },
+            "timeout": {
+              "value": "10s",
+              "level": "node"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "status",
+                  "type": "integer"
+                }
+              ]
+            }
+          },
+          "http": {
+            "method": "POST",
+            "url": "https://${QUEUE_HOST}/v1/escalations",
+            "headers": [
+              {
+                "name": "authorization",
+                "expression": "Bearer ${QUEUE_TOKEN}"
+              }
+            ],
+            "body": [
+              {
+                "name": "summary",
+                "expression": "state.summary"
+              }
+            ]
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "start",
+          "to": "enrich",
+          "class": "unconditional"
+        },
+        {
+          "from": "enrich",
+          "to": "scan",
+          "class": "unconditional"
+        },
+        {
+          "from": "scan",
+          "to": "classify",
+          "class": "unconditional"
+        },
+        {
+          "from": "classify",
+          "to": "dispatch",
+          "class": "unconditional"
+        },
+        {
+          "from": "classify",
+          "to": "announce",
+          "class": "unconditional"
+        },
+        {
+          "from": "dispatch",
+          "to": "verify",
+          "class": "unconditional",
+          "join_barrier": true
+        },
+        {
+          "from": "announce",
+          "to": "verify",
+          "class": "unconditional"
+        },
+        {
+          "from": "announce_failed",
+          "to": "end",
+          "class": "unconditional"
+        },
+        {
+          "from": "verify",
+          "to": "summarize",
+          "class": "unconditional"
+        },
+        {
+          "from": "summarize",
+          "to": "remember",
+          "class": "unconditional"
+        },
+        {
+          "from": "remember",
+          "to": "approve",
+          "class": "unconditional"
+        },
+        {
+          "from": "approve",
+          "to": "end",
+          "class": "conditional",
+          "label": "approve.output.decision == 'approve'",
+          "when": "approve.output.decision == 'approve'"
+        },
+        {
+          "from": "approve",
+          "to": "escalate",
+          "class": "conditional",
+          "label": "approve.output.decision == 'reject'",
+          "when": "approve.output.decision == 'reject'"
+        },
+        {
+          "from": "escalate",
+          "to": "end",
+          "class": "unconditional"
+        },
+        {
+          "from": "dispatch",
+          "to": "dispatch/auto_fixable",
+          "class": "map_route",
+          "label": "auto_fixable"
+        },
+        {
+          "from": "dispatch",
+          "to": "dispatch/needs_human",
+          "class": "map_route",
+          "label": "needs_human"
+        },
+        {
+          "from": "dispatch",
+          "to": "dispatch/(default)",
+          "class": "map_route",
+          "label": "(default)"
+        },
+        {
+          "from": "announce",
+          "to": "announce_failed",
+          "class": "error_fallback",
+          "label": "on_error: fallback"
+        },
+        {
+          "from": "approve",
+          "to": "escalate",
+          "class": "timeout",
+          "label": "on_timeout (24h)"
+        }
+      ]
+    }
+  ]
+}

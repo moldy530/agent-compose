@@ -1,0 +1,122 @@
+# A composition whose union declares a variant tagged `default`.
+#
+# A variant tag is an identifier (grammar 3.8), so `default` is a legal one —
+# and `default:` is a SIBLING key of `routes:` rather than a member of it
+# (grammar 8.6), so a routed map can have both a route for the variant tagged
+# `default` and a catch-all `default:` route. Each dispatch target becomes a
+# satellite on the canvas, and the two satellites are distinct nodes.
+#
+# It is a fixture rather than an example: nothing here is written to be read as
+# a composition anybody would deploy. What it exists for is
+# `docs/graph.md` §9.1's uniqueness invariant — `id` is unique within a flow,
+# and a `map_route` edge's `to` is the `node` of one of that map's routes — over
+# the one shape that can spell two satellites the same way.
+version: "0.1"
+
+state:
+  notes:
+    type: array
+    max_items: 30
+    items: { type: string }
+    reduce: append
+
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.plain:
+  provider: provider.p
+  id: some-model
+
+agent.planner:
+  model: model.plain
+  prompt: Plan the work.
+  input:
+    goal: { type: string }
+  output:
+    steps:
+      description: Every step, tagged for routing.
+      type: array
+      max_items: 30
+      items:
+        discriminator: kind
+        variants:
+          # The tag that collides with the catch-all's own spelling.
+          default:
+            a: { type: string }
+          other:
+            b: { type: string }
+          third:
+            c: { type: string }
+
+agent.worker:
+  model: model.plain
+  prompt: Do one step.
+  input:
+    a: { type: string }
+  output:
+    note: { type: string }
+
+agent.second:
+  model: model.plain
+  prompt: Do another.
+  input:
+    b: { type: string }
+  output:
+    note: { type: string }
+
+agent.third:
+  model: model.plain
+  prompt: Do what is left.
+  input:
+    c: { type: string }
+  output:
+    note: { type: string }
+
+flow.bare:
+  inputs:
+    goal: { type: string }
+  outputs:
+    notes:
+      type: array
+      max_items: 30
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input:
+        goal: "input.goal"
+
+    work:
+      map:
+        over: plan.output.steps
+        as: step
+        route_by: kind
+        max_concurrency: 4
+        routes:
+          # The route for the variant whose tag is `default`.
+          default:
+            node: agent.worker
+            input:
+              a: "step.a"
+            writes:
+              note: notes
+          other:
+            node: agent.second
+            input:
+              b: "step.b"
+            writes:
+              note: notes
+        # The catch-all, narrowed to `third` — the one variant no named route
+        # claims (grammar 8.6 rule 4).
+        default:
+          node: agent.third
+          input:
+            c: "step.c"
+          writes:
+            note: notes
+
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }
