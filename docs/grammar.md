@@ -3227,7 +3227,11 @@ sandbox configuration, MCP servers and agent definitions that put a tool or a
 whole loop within reach of a run whose `allow_tools:` never mentioned it, hooks
 and permission handlers that move the decision somewhere else, a fallback model
 where [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)
-stops the connection — and each of those is dropped too. So is every option that
+stops the connection — and each of those is dropped too. So is the option that
+says **which executable the harness itself is**, or what its language runtime
+loads before it: a key there does not widen one bound, it replaces or re-arms the
+program that enforces all of them, so every statement above it would be made
+about something else. So is every option that
 **resumes a previous session**, for a different reason: harness-native resume is
 a named exclusion (below), not a bound. The dropped set is per harness and
 audited against the SDK release this compiler pins, so a vendor's new option

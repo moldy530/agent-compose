@@ -112,24 +112,7 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
       // CLI it spawns, which is exactly the scrubbed child PRD resolved q54
       // ruling b asks for (Decision D139).
       const codex = new Codex({ env: { ...run.env } });
-      const options: ThreadOptions = {
-        model: run.model,
-        workingDirectory: run.workspace,
-        sandboxMode: CODEX_SANDBOX[run.access],
-        ...passthrough(run, CODEX_SETTINGS, CODEX_RESERVED),
-      };
-      const effort = settingText(run.modelSettings["reasoning_effort"]);
-      if (effort !== undefined) {
-        options.modelReasoningEffort = effort as ThreadOptions["modelReasoningEffort"];
-      }
-      const network = settingFlag(run.settings["network_access"]);
-      if (network !== undefined) options.networkAccessEnabled = network;
-      const search = settingText(run.settings["web_search"]);
-      if (search !== undefined) options.webSearchMode = search as ThreadOptions["webSearchMode"];
-      const skipGit = settingFlag(run.settings["skip_git_repo_check"]);
-      if (skipGit !== undefined) options.skipGitRepoCheck = skipGit;
-
-      const thread = codex.startThread(options);
+      const thread = codex.startThread(codexOptions(run));
       const streamed = await thread.runStreamed(codexTurn(run), {
         outputSchema: { ...run.schema },
         signal: run.signal,
@@ -202,6 +185,38 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
     })();
   },
 };
+
+/**
+ * The `ThreadOptions` one `codex` run is made of — the config map of grammar
+ * 8.9, as one value (see [`CODEX_DRIVER`]).
+ *
+ * **Exported for the reason [`scriptedDriver`] is**, and the same reason
+ * [`ccOptions`] is under the other harness: this object is where `workspace:`
+ * and `access:` become this harness's own containment primitive, and none of it
+ * is visible from a run's answer or from the events the driver yields. The
+ * bound worth a test most of all is the [`CODEX_RESERVED`] drop, which is a
+ * *subtraction* — what a `settings:` key did **not** put here — and a
+ * subtraction can only be read off the object itself.
+ */
+export function codexOptions(run: runtime.HarnessRun): ThreadOptions {
+  const options: ThreadOptions = {
+    model: run.model,
+    workingDirectory: run.workspace,
+    sandboxMode: CODEX_SANDBOX[run.access],
+    ...passthrough(run, CODEX_SETTINGS, CODEX_RESERVED),
+  };
+  const effort = settingText(run.modelSettings["reasoning_effort"]);
+  if (effort !== undefined) {
+    options.modelReasoningEffort = effort as ThreadOptions["modelReasoningEffort"];
+  }
+  const network = settingFlag(run.settings["network_access"]);
+  if (network !== undefined) options.networkAccessEnabled = network;
+  const search = settingText(run.settings["web_search"]);
+  if (search !== undefined) options.webSearchMode = search as ThreadOptions["webSearchMode"];
+  const skipGit = settingFlag(run.settings["skip_git_repo_check"]);
+  if (skipGit !== undefined) options.skipGitRepoCheck = skipGit;
+  return options;
+}
 
 /**
  * The turn one run sends: the node's instructions, the list it offers the

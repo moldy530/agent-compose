@@ -72,6 +72,15 @@ pub(crate) fn check(ctx: &mut Ctx) {
 /// The repair is the same one that rule gives: name the version the project
 /// already holds, or drop the pin. The manifest carries one version of a package
 /// and the artifact ships no lockfile to reconcile two.
+///
+/// **One pin is one finding, however many harnesses hold the package.**
+/// `@modelcontextprotocol/sdk` is pinned by `cc` *and* by `codex` — the two SDKs
+/// share a peer — so a composition binding both would otherwise report one
+/// mistake twice, with one span, one message and two harness names in the help.
+/// A form the target cannot take is one mistake (`check/bindings.rs`), so the
+/// harnesses that hold the package are gathered into the help of a single
+/// refusal instead: which of them brought it is context for the repair, not a
+/// second complaint about it.
 fn harness_pins_agree(ctx: &mut Ctx) {
     let bound = crate::codegen::harness::bound(ctx.ir);
     if bound.is_empty() {
@@ -81,31 +90,46 @@ fn harness_pins_agree(ctx: &mut Ctx) {
     for (address, module) in bindings(ctx.ir) {
         for dependency in &module.dependencies {
             let package = dependency.package.value.as_str();
+            // Every bound harness that brings this package, and the version they
+            // bring it at — one version, because `codegen::project` refuses to
+            // emit a manifest for two and a gate holds the table to it
+            // (`runtime_and_harness_pins`).
+            let mut holders: Vec<&'static str> = Vec::new();
+            let mut pinned: Option<&'static str> = None;
             for harness in &bound {
-                let Some((_, pinned)) = crate::codegen::harness::pins_of(*harness)
+                let Some((_, held)) = crate::codegen::harness::pins_of(*harness)
                     .iter()
                     .find(|(held, _)| *held == package)
                 else {
                     continue;
                 };
-                if *pinned == dependency.version.value {
-                    continue;
-                }
-                refusals.push(
-                    Diagnostic::error(
-                        DiagnosticCode::InvalidDependency,
-                        dependency.version.span.clone(),
-                        format!(
-                            "`{address}` pins `{package}` to `{}`, which this project already holds at `{pinned}`",
-                            dependency.version.value
-                        ),
-                    )
-                    .with_help(format!(
-                        "a `coder:` node binding `harness: {}` pins `{package}` at `{pinned}`, and the generated `package.json` holds one version of it (grammar 8.9, PRD resolved q57)",
-                        harness.as_str()
-                    )),
-                );
+                holders.push(harness.as_str());
+                pinned = Some(held);
             }
+            let Some(pinned) = pinned else {
+                continue;
+            };
+            if pinned == dependency.version.value {
+                continue;
+            }
+            let binding = holders
+                .iter()
+                .map(|name| format!("`harness: {name}`"))
+                .collect::<Vec<String>>()
+                .join(" or ");
+            refusals.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidDependency,
+                    dependency.version.span.clone(),
+                    format!(
+                        "`{address}` pins `{package}` to `{}`, which this project already holds at `{pinned}`",
+                        dependency.version.value
+                    ),
+                )
+                .with_help(format!(
+                    "a `coder:` node binding {binding} pins `{package}` at `{pinned}`, and the generated `package.json` holds one version of it (grammar 8.9, PRD resolved q57)"
+                )),
+            );
         }
     }
     for refusal in refusals {

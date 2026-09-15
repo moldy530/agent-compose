@@ -1,0 +1,88 @@
+# rule: a `module:` dependency agrees with the packages a bound `harness:` pins, and one pin is one refusal however many harnesses hold it (grammar 6.1, 8.9, Decision D133, PRD resolved q57)
+# code: invalid-dependency
+# message: `tool.sign` pins `@modelcontextprotocol/sdk` to `1.29.0`, which this project already holds at `1.30.0`
+# at: main.yml:48:36
+# help: a `coder:` node binding `harness: cc` or `harness: codex` pins `@modelcontextprotocol/sdk` at `1.30.0`, and the generated `package.json` holds one version of it (grammar 8.9, PRD resolved q57)
+#
+# `parse::binding` refuses a pin that contradicts the runtime's own set, and that
+# check reads a constant: every project holds the same LangGraph. A harness SDK's
+# packages are not a constant — they are declared only where some `coder:` node
+# binds that harness — so whether `@modelcontextprotocol/sdk` is already held is
+# a question about the whole composition, which is why the rule is in the
+# validator rather than in the parser.
+#
+# **And why the pin below is the one to write the fixture with.** Both v1
+# harnesses bring it: the Agent SDK's types import MCP types and the Codex SDK's
+# `index.d.ts` does too, so `cc` and `codex` each pin `@modelcontextprotocol/sdk`
+# at `1.30.0`. This composition binds both — which is the case a rule that looped
+# over the bound harnesses reported twice, one span and one message and two
+# helps, for one mistake an author makes once. The `# count:` this fixture does
+# not override is the assertion: exactly one diagnostic.
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+provider.openai:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+
+model.reviewer:
+  provider: provider.openai
+  id: gpt-5-codex
+
+tool.sign:
+  description: Sign a payload.
+  input:
+    payload: { type: string }
+  output:
+    signature: { type: string }
+  module:
+    path: ./src/tools/sign.ts
+    dependencies:
+      "@modelcontextprotocol/sdk": "1.29.0"
+
+state:
+  summary: { type: string, default: "" }
+  verdict: { type: string, default: "" }
+
+flow.main:
+  outputs:
+    verdict: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: ${REPO_ROOT}
+        access: workspace_write
+        prompt: Make the change.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+
+    review:
+      coder:
+        harness: codex
+        model: model.reviewer
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: Read the tree and report.
+        input:
+          summary: { type: string }
+        output:
+          verdict: { type: string }
+      input:
+        summary: "state.summary"
+      writes: { verdict: verdict }
+
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: review }
+    - { from: review, to: end }

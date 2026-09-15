@@ -516,7 +516,7 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
-        rule: "the `module:` bindings of a composition agree: one file per tool, one version per package (6.1, D132, D133)",
+        rule: "the `module:` bindings of a composition agree: one file per tool, one version per package — including the packages a bound `harness:` brings (6.1, 8.9, D132, D133)",
         pass: "check/modules.rs",
         codes: &["invalid-module-path", "invalid-dependency"],
         evidence: Evidence::Fixture,

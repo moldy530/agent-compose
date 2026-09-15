@@ -45,7 +45,14 @@ const CC_SETTINGS: readonly string[] = [
  *    hooks, agents and skills together; `hooks`, `permissionPrompts` and
  *    `permissionPromptToolName` each move or silence the decision `canUseTool`
  *    makes; and `fallbackModel` is the failover ladder D141 stops at the
- *    boundary. The `resume` family — `resume`, `continue`, `forkSession`,
+ *    boundary. The **process-spawn family** — `pathToClaudeCodeExecutable`,
+ *    `executable` and `executableArgs` — contains *every* bound at once and for
+ *    the worst reason: those three choose which program runs and what the
+ *    runtime loads before it, so a key among them replaces or re-arms the very
+ *    harness that is supposed to be enforcing `tools`, `canUseTool` and
+ *    `permissionMode`. An adapter never assigns them — it wants the SDK's own
+ *    executable — which is exactly why a list read off the driver could not
+ *    hold them. The `resume` family — `resume`, `continue`, `forkSession`,
  *    `sessionId`, `resumeSessionAt`, `resumeDropsTurn` — is dropped for PRD
  *    resolved q57 ruling b's reason rather than for containment: harness-native
  *    resume is a **named exclusion**, because a machine-local session store is
@@ -77,12 +84,15 @@ const CC_RESERVED: readonly string[] = [
   "agent",
   "agents",
   "continue",
+  "executable",
+  "executableArgs",
   "extraArgs",
   "fallbackModel",
   "forkSession",
   "hooks",
   "managedSettings",
   "mcpServers",
+  "pathToClaudeCodeExecutable",
   "permissionPromptToolName",
   "permissionPrompts",
   "plugins",
@@ -179,7 +189,6 @@ const CC_DRIVER: runtime.HarnessDriver = {
   enforcesTools: true,
   run(run: runtime.HarnessRun): AsyncIterable<runtime.HarnessEvent> {
     return (async function* driven(): AsyncGenerator<runtime.HarnessEvent> {
-      const controller = controllerFor(run.signal);
       // What the permission callback refused, drained into the stream between
       // messages: `canUseTool` answers the SDK rather than this generator, so a
       // queue is how a denial becomes a tool event in the order it happened.
@@ -194,68 +203,9 @@ const CC_DRIVER: runtime.HarnessDriver = {
       // `completed` and `failed` describe a call that executed).
       const refused = new Set<string>();
 
-      const options: Options = {
-        cwd: run.workspace,
-        systemPrompt: { type: "preset", preset: "claude_code", append: run.instructions },
-        model: run.model,
-        permissionMode: CC_PERMISSION[run.access],
-        abortController: controller,
-        env: { ...run.env },
-        outputFormat: { type: "json_schema", schema: { ...run.schema } },
-        ...passthrough(run, CC_SETTINGS, CC_RESERVED),
-      };
-      if (run.access === "full_access") options.allowDangerouslySkipPermissions = true;
-      // Plan mode's body, replaced by what this node asked for: the mode's
-      // default body is a code-implementation workflow, and a `read_only` node
-      // is a run that reads and reports (see [`CC_PERMISSION`]).
-      if (run.access === "read_only") options.planModeInstructions = run.instructions;
-      // The one `model.*` setting this harness has a place for: the `anthropic`
-      // plugin's `thinking: { budget_tokens: … }` is the SDK's
-      // `maxThinkingTokens` (Decision D141).
-      const thinking = run.modelSettings["thinking"];
-      const budgetTokens =
-        typeof thinking === "object" && thinking !== null
-          ? settingNumber((thinking as Record<string, unknown>)["budget_tokens"])
-          : undefined;
-      if (budgetTokens !== undefined) options.maxThinkingTokens = budgetTokens;
-      const maxTurns = settingNumber(run.settings["max_turns"]);
-      if (maxTurns !== undefined) options.maxTurns = maxTurns;
-      const budget = settingNumber(run.settings["max_budget_usd"]);
-      if (budget !== undefined) options.maxBudgetUsd = budget;
-      const forward = settingFlag(run.settings["forward_subagent_text"]);
-      if (forward !== undefined) options.forwardSubagentText = forward;
-      const disallowed = settingList(run.settings["disallowed_tools"]);
-      if (disallowed !== undefined) options.disallowedTools = disallowed;
-      const allowed = run.allowTools;
-      if (allowed !== undefined) {
-        // The bound itself: a tool outside the list is not in the set the loop
-        // can reach, which is true under every one of the three `access:`
-        // presets — `bypassPermissions` included.
-        options.tools = [...allowed];
-        options.allowedTools = [...allowed];
-        options.canUseTool = (name, _input, ask) => {
-          if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
-          const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;
-          // The call this denial answers, remembered by its id: the SDK hands
-          // the model the denial as the `tool_result` for that `tool_use`, and
-          // one call is one tool event.
-          refused.add(ask.toolUseID);
-          refusals.push({
-            source: { type: "agent-compose.permission_denied", tool: name, message },
-            // A denial inside a **subagent** is that subagent's, and the
-            // envelope carries the top level only — the same depth rule
-            // [`ccEvents`] reads off `parent_tool_use_id`, read here off the
-            // sub-agent id the SDK passes the callback (PRD resolved q57
-            // ruling a).
-            ...(ask.agentID === undefined
-              ? { tap: { kind: "tool" as const, name, outcome: "refused" as const, error: message } }
-              : {}),
-          });
-          return Promise.resolve({ behavior: "deny" as const, message });
-        };
-      }
+      const config = ccOptions(run, refusals, refused);
 
-      for await (const message of query({ prompt: run.input, options })) {
+      for await (const message of query({ prompt: run.input, options: config })) {
         while (refusals.length > 0) yield refusals.shift() as runtime.HarnessEvent;
         yield* ccEvents(message, calls, refused);
       }
@@ -263,6 +213,93 @@ const CC_DRIVER: runtime.HarnessDriver = {
     })();
   },
 };
+
+/**
+ * The `Options` one `cc` run is made of — the config map of grammar 8.9, as one
+ * value (see [`CC_DRIVER`]).
+ *
+ * **Exported for the reason [`scriptedDriver`] is**: what this object holds is
+ * the whole of the node's containment, and none of it is visible from a run's
+ * answer or from the events a driver yields. A test that could only drive the
+ * seam could say nothing about the bound at all — and the bound that matters
+ * most, the [`CC_RESERVED`] drop, is a *subtraction*: it is what a settings key
+ * did **not** put here. So the options are built by a function a test can call
+ * and then read, against a `run` whose `settings` spell every bound this node
+ * states, rather than assembled inline where only the vendor's SDK ever sees
+ * them.
+ *
+ * `refusals` and `refused` are the driver's own two queues, handed in because
+ * the permission callback below writes to both: a denial is an event the
+ * generator drains between messages, and an id the `tool_result` that answers
+ * it is told apart by.
+ */
+export function ccOptions(
+  run: runtime.HarnessRun,
+  refusals: runtime.HarnessEvent[],
+  refused: Set<string>,
+): Options {
+  const options: Options = {
+    cwd: run.workspace,
+    systemPrompt: { type: "preset", preset: "claude_code", append: run.instructions },
+    model: run.model,
+    permissionMode: CC_PERMISSION[run.access],
+    abortController: controllerFor(run.signal),
+    env: { ...run.env },
+    outputFormat: { type: "json_schema", schema: { ...run.schema } },
+    ...passthrough(run, CC_SETTINGS, CC_RESERVED),
+  };
+  if (run.access === "full_access") options.allowDangerouslySkipPermissions = true;
+  // Plan mode's body, replaced by what this node asked for: the mode's
+  // default body is a code-implementation workflow, and a `read_only` node
+  // is a run that reads and reports (see [`CC_PERMISSION`]).
+  if (run.access === "read_only") options.planModeInstructions = run.instructions;
+  // The one `model.*` setting this harness has a place for: the `anthropic`
+  // plugin's `thinking: { budget_tokens: … }` is the SDK's
+  // `maxThinkingTokens` (Decision D141).
+  const thinking = run.modelSettings["thinking"];
+  const budgetTokens =
+    typeof thinking === "object" && thinking !== null
+      ? settingNumber((thinking as Record<string, unknown>)["budget_tokens"])
+      : undefined;
+  if (budgetTokens !== undefined) options.maxThinkingTokens = budgetTokens;
+  const maxTurns = settingNumber(run.settings["max_turns"]);
+  if (maxTurns !== undefined) options.maxTurns = maxTurns;
+  const budget = settingNumber(run.settings["max_budget_usd"]);
+  if (budget !== undefined) options.maxBudgetUsd = budget;
+  const forward = settingFlag(run.settings["forward_subagent_text"]);
+  if (forward !== undefined) options.forwardSubagentText = forward;
+  const disallowed = settingList(run.settings["disallowed_tools"]);
+  if (disallowed !== undefined) options.disallowedTools = disallowed;
+  const allowed = run.allowTools;
+  if (allowed !== undefined) {
+    // The bound itself: a tool outside the list is not in the set the loop
+    // can reach, which is true under every one of the three `access:`
+    // presets — `bypassPermissions` included.
+    options.tools = [...allowed];
+    options.allowedTools = [...allowed];
+    options.canUseTool = (name, _input, ask) => {
+      if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
+      const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;
+      // The call this denial answers, remembered by its id: the SDK hands
+      // the model the denial as the `tool_result` for that `tool_use`, and
+      // one call is one tool event.
+      refused.add(ask.toolUseID);
+      refusals.push({
+        source: { type: "agent-compose.permission_denied", tool: name, message },
+        // A denial inside a **subagent** is that subagent's, and the
+        // envelope carries the top level only — the same depth rule
+        // [`ccEvents`] reads off `parent_tool_use_id`, read here off the
+        // sub-agent id the SDK passes the callback (PRD resolved q57
+        // ruling a).
+        ...(ask.agentID === undefined
+          ? { tap: { kind: "tool" as const, name, outcome: "refused" as const, error: message } }
+          : {}),
+      });
+      return Promise.resolve({ behavior: "deny" as const, message });
+    };
+  }
+  return options;
+}
 
 /** One SDK message, as the events the tap reads (see [`CC_DRIVER`]). */
 function* ccEvents(

@@ -381,6 +381,94 @@ mod tests {
         }
     }
 
+    /// …and the option family that reaches furthest of all: **what program the
+    /// harness is, and what its runtime loads before it, are not a `settings:`
+    /// key's to choose** (grammar 8.9, PRD resolved q57 ruling c).
+    ///
+    /// Written out by name for [`roots_beside_the_workspace_are_dropped_under_every_harness`]'s
+    /// reason, one turn sharper. Every other reserved name is a bound *inside*
+    /// the run — a root, a mode, a tool set — and the two audits above can at
+    /// least argue about it from the driver. This family is the run's own
+    /// executable: `pathToClaudeCodeExecutable` is which binary is spawned,
+    /// `executable` is the JavaScript runtime that spawns it, and
+    /// `executableArgs` is what that runtime is handed first (`--import` among
+    /// them). A key here does not widen a bound — it replaces or re-arms the
+    /// program that *enforces* every bound, so `options.tools`,
+    /// `options.canUseTool` and `permissionMode` would be asked of something
+    /// else entirely while `enforcesTools`, the graph document's
+    /// `tools_enforced` and grammar 8.9 all went on saying the list holds.
+    ///
+    /// Neither audit above can see it slip, which is why it is a sentence of
+    /// its own: an adapter never *assigns* these — it wants the SDK's own
+    /// executable — so a list read off the driver can never require them, and a
+    /// hand-written inventory that forgot them agrees with a driver that never
+    /// mentioned them. That is the two-halves-of-one-omission failure
+    /// [`a_reserved_list_is_audited_against_the_pinned_option_surface`]'s own
+    /// doc comment warns about, so this is the half that does not depend on
+    /// either.
+    #[test]
+    fn what_program_a_harness_run_is_cannot_be_chosen_by_a_settings_key() {
+        // Per harness, the options of its pinned SDK that choose the program a
+        // run is or what its runtime loads first. A vendor's names, so they are
+        // written where the reason for them is; a harness whose SDK has none —
+        // `codex` spawns its own CLI and takes no such option in
+        // `ThreadOptions` — carries an empty row and says so.
+        const SPAWN: &[(Harness, &[&str])] = &[
+            (
+                Harness::Cc,
+                &["pathToClaudeCodeExecutable", "executable", "executableArgs"],
+            ),
+            (Harness::Codex, &[]),
+        ];
+
+        for harness in Harness::ALL
+            .iter()
+            .copied()
+            .filter(|held| held.ships_in_v1())
+        {
+            let (source, curated, reserved) = driver_source(harness);
+            let name = harness.as_str();
+            let (_, spawn) = SPAWN
+                .iter()
+                .find(|(held, _)| *held == harness)
+                .expect("every harness that ships names its SDK's process-spawn options");
+            let held = quoted_list(source, reserved);
+            for option in *spawn {
+                assert!(
+                    held.contains(*option),
+                    "`{reserved}` does not hold `{option}`, so a `settings:` key on a \
+                     `harness: {name}` node chooses what program the run is — and `tools`, \
+                     `canUseTool` and `permissionMode` would then bound a program the \
+                     composition never named (grammar 8.9, PRD resolved q57 ruling c)"
+                );
+                assert!(
+                    !quoted_list(source, curated).contains(*option),
+                    "`{curated}` holds `{option}`, which is not a harness option to check but \
+                     the harness itself"
+                );
+            }
+        }
+
+        // …and `codex`'s empty row above is true for a reason worth holding:
+        // that SDK's spawn surface is on its **client** (`codexPathOverride`,
+        // and the `--config` overrides beside it) rather than on a thread's
+        // options, so a `settings:` key cannot reach it — the driver builds that
+        // object from a literal and `passthrough` feeds the thread alone. The
+        // day it were built from `run.settings`, the row would silently stop
+        // being empty.
+        let (codex, _, _) = driver_source(Harness::Codex);
+        let constructed = codex
+            .split_once("new Codex(")
+            .expect("the `codex` driver constructs its client")
+            .1;
+        let constructed = &constructed[..constructed.find(';').unwrap_or(constructed.len())];
+        assert!(
+            !constructed.contains("run.settings") && !constructed.contains("passthrough"),
+            "the `codex` client is built from the node's `settings:`, so a key spelling \
+             `codexPathOverride` would choose what program the run is (grammar 8.9)"
+        );
+    }
+
     /// A `cc` run keeps the **harness's own** system prompt and appends the
     /// node's `prompt:` to it (grammar 8.9, PRD resolved q57).
     ///
@@ -473,6 +561,8 @@ mod tests {
                     "continue",
                     "cwd",
                     "env",
+                    "executable",
+                    "executableArgs",
                     "extraArgs",
                     "fallbackModel",
                     "forkSession",
@@ -482,6 +572,7 @@ mod tests {
                     "mcpServers",
                     "model",
                     "outputFormat",
+                    "pathToClaudeCodeExecutable",
                     "permissionMode",
                     "permissionPromptToolName",
                     "permissionPrompts",

@@ -8,13 +8,18 @@
 // hands in a script and everything above the seam — the config map, the journal,
 // the stream tap, the output gate — is the code a deployment really ships.
 //
-// Twelve claims, and each is invisible from outside a run:
+// Thirteen claims, and each is invisible from outside a run:
 //
 //   * **the config map** — `workspace:` resolves its `${ENV}` at the call and an
 //     empty one is refused; the environment is **scrubbed** to the declared
 //     variables and `inherit_env: true` is the opt-in; the allowlist and the
 //     access preset arrive as written. A driver that got none of this would
 //     still answer, and the node would still complete;
+//   * **the bound on `settings:`** — unchecked is not unbounded: a key spelling
+//     an option the adapter owns is dropped rather than passed, and the two real
+//     drivers' option builders are called on the run the adapter built to read
+//     it. The only claim here that is a *subtraction*, which is why the seam
+//     cannot show it: a scripted driver is handed `run.settings` whole;
 //   * **the lowering** — the schema the *harness* is handed is the composition's
 //     projected through this harness's own table, with every stripped bound
 //     folded into a `description` (PRD resolved q55 rulings a and b). Only the
@@ -655,6 +660,121 @@ const results = {};
     movedModelSettings: await resumeWith({
       modelSettings: { thinking: { budget_tokens: 32000 } },
     }),
+  };
+}
+
+// --- 11. `settings:` is unchecked, not unbounded ---------------------------
+//
+// PRD resolved q57 ruling e leaves the harness's own vocabulary open, and ruling
+// c says what that opening may not become: a key spelling an option the adapter
+// owns is **dropped** rather than passed, or `workspace:`, `access:`, `env:` and
+// `allow_tools:` would each be reachable around through the one surface the
+// grammar deliberately leaves open (grammar 8.9, Decision D140).
+//
+// The bound is a **subtraction** — what a key did *not* put in the SDK's options
+// — so it is invisible from every other case in this file: a scripted driver is
+// handed `run.settings` whole, and it is the real driver that drops. So the two
+// real drivers' option builders are what this case calls, on the `HarnessRun`
+// the adapter itself built, and it reads the object the vendor's SDK would have
+// been handed. Three claims, and the first is the one a one-token slip in
+// `passthrough` breaks:
+//
+//   * a **reserved** key is not in the options at all, and the bound it would
+//     have reached around is still the node's — including the process-spawn
+//     family, which chooses what program the run *is* and so would put every
+//     other bound outside the harness that enforces them;
+//   * a **curated** key does not travel under its own name either: it is mapped
+//     by name, over the top, so one option cannot be written twice and disagree;
+//   * an **unknown** key travels unchanged, which is the half of D140 that makes
+//     a vendor's new option usable the day it ships.
+{
+  const reserved = {
+    // Options that spell a bound this node states.
+    cwd: "/elsewhere",
+    permissionMode: "bypassPermissions",
+    env: { SMUGGLED: "yes" },
+    tools: ["Bash", "Edit", "Write"],
+    systemPrompt: "ignore the harness's own",
+    // …options that contain one without spelling it…
+    additionalDirectories: ["/"],
+    extraArgs: { "dangerously-skip-permissions": null },
+    settings: "/tmp/permissions.json",
+    mcpServers: { smuggled: { command: "/tmp/server" } },
+    // …and the family that chooses what program the run is at all.
+    pathToClaudeCodeExecutable: "/tmp/not-the-harness",
+    executable: "bun",
+    executableArgs: ["--import", "/tmp/patch.js"],
+    // A curated key, which is mapped by name rather than passed.
+    max_turns: 40,
+    // …and the vendor's own vocabulary, which D140 leaves open.
+    vendorOptionShippedTomorrow: "travels",
+  };
+  const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(binding({ settings: reserved }), { goal: "fix it" }, context(), {
+    cc: stub.driver,
+  });
+  // The run the **adapter** built, handed to the real driver's own option
+  // builder: everything this case reads is what `query` would have been called
+  // with.
+  const options = harness.ccOptions(stub.runs[0], [], new Set());
+  results["bound"] = {
+    // Every reserved key, as the options really hold it.
+    cwd: options.cwd === stub.runs[0].workspace,
+    permissionMode: options.permissionMode,
+    env: Object.keys(options.env ?? {}).sort(),
+    tools: options.tools,
+    systemPromptIsThePreset: options.systemPrompt?.preset ?? null,
+    additionalDirectories: options.additionalDirectories ?? null,
+    extraArgs: options.extraArgs ?? null,
+    settings: options.settings ?? null,
+    mcpServers: options.mcpServers ?? null,
+    // The process-spawn family: absent, or the harness enforcing the three
+    // bounds above is not the harness this compiler pinned.
+    spawn: [
+      "pathToClaudeCodeExecutable",
+      "executable",
+      "executableArgs",
+    ].filter((key) => Object.hasOwn(options, key)),
+    // The curated key is mapped by name and does not also travel as written.
+    maxTurns: options.maxTurns,
+    curatedTravelled: Object.hasOwn(options, "max_turns"),
+    // …and the unknown one does.
+    unknown: options["vendorOptionShippedTomorrow"] ?? null,
+  };
+
+  // The same three claims under the other harness, whose option surface is its
+  // own: a bound stated per harness is a bound each harness holds (PRD resolved
+  // q57 ruling c).
+  const codexStub = harness.scriptedDriver("codex", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(
+    binding({
+      harness: "codex",
+      access: "read_only",
+      modelId: "gpt-5-codex",
+      settings: {
+        workingDirectory: "/elsewhere",
+        sandboxMode: "danger-full-access",
+        approvalPolicy: "never",
+        additionalDirectories: ["/"],
+        model: "some-other-model",
+        network_access: false,
+        vendorOptionShippedTomorrow: "travels",
+      },
+    }),
+    { goal: "fix it" },
+    context(),
+    { codex: codexStub.driver },
+  );
+  const thread = harness.codexOptions(codexStub.runs[0]);
+  results["codexBound"] = {
+    workingDirectory: thread.workingDirectory === codexStub.runs[0].workspace,
+    sandboxMode: thread.sandboxMode,
+    approvalPolicy: thread.approvalPolicy ?? null,
+    additionalDirectories: thread.additionalDirectories ?? null,
+    model: thread.model,
+    networkAccessEnabled: thread.networkAccessEnabled,
+    curatedTravelled: Object.hasOwn(thread, "network_access"),
+    unknown: thread["vendorOptionShippedTomorrow"] ?? null,
   };
 }
 

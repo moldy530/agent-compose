@@ -13520,12 +13520,15 @@ export async function runNode(
     // indirection PRD §9.20 promises is always there (`docs/trace.md` §7.3,
     // §9).
     const called = models ?? (modelCalls.length === 0 ? undefined : settled(modelCalls));
-    // A harness run that failed leaves its record on the error rather than in
-    // the collector, because the collector is written by the adapter *after* a
-    // run answered ([`runCoder`]) — so the one run a reader most wants would
-    // otherwise be the one missing. [`harnessRecordOf`] is where it is read back
-    // off the chain, and it is appended rather than substituted: a node whose
-    // first attempt answered and whose second failed made both runs.
+    // A harness run that failed leaves its record in **both** places:
+    // [`runCoder`] pushes it into the collector and carries it out on the
+    // failure, so the one run a reader most wants is reported whichever of the
+    // two survived — a `retry:` ladder's earlier attempt reaches here through
+    // the collector alone, and a run this node ended on reaches here through the
+    // error even where no collector was passed. [`harnessRecordOf`] is where it
+    // is read back off the chain, and the two are reconciled **by identity**: the
+    // record is dropped from the collected set and appended last, so a record on
+    // both is filed once and the run that ended the node is the last of them.
     const failedRun = harnessRecordOf(error);
     const ran =
       failedRun === undefined
@@ -13688,8 +13691,9 @@ export async function runNode(
     // for the same reason and off the same kind of collector (PRD §9.20).
     if (toolDispatched.length > 0) toolDispatches = [...toolDispatched];
     // And every harness run, with the one that ended the node read off the
-    // error: [`runCoder`] records a run in the collector only once it answered,
-    // so a failed run's record rides out on [`HarnessRunFailed`] instead.
+    // error as well: [`runCoder`] files a failed run's record in the collector
+    // *and* carries it out on [`HarnessRunFailed`], so the two are reconciled
+    // here by identity and one attempt files one record (`docs/trace.md` §7.6).
     const failedRun = harnessRecordOf(error);
     const ran =
       failedRun === undefined

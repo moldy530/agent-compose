@@ -5560,13 +5560,20 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 /// a parameter, and `src/harness.ts` emits a scripted driver into every project,
 /// so everything *above* the seam is exercised as the code a deployment ships.
 ///
-/// Twelve claims, and not one of them is visible from a run's answer:
+/// Thirteen claims, and not one of them is visible from a run's answer:
 ///
 ///  * **the config map** — the workspace resolves its `${ENV}` at the call and an
 ///    empty one is refused *as written*; the environment is scrubbed to the
 ///    declared variables, with `inherit_env: true` as the opt-in; the access
 ///    preset, the allowlist and the model settings arrive as the composition
 ///    wrote them;
+///  * **the containment bound on `settings:`** — and it is the one claim that is
+///    a *subtraction*, so the seam cannot show it: a scripted driver is handed
+///    `run.settings` whole and it is the real driver that drops. Each driver's
+///    own option builder is called on the run the adapter built, and the object
+///    the vendor's SDK would have been handed holds the node's `workspace:`,
+///    `access:`, `env:` and `allow_tools:` — not a `settings:` key spelling any
+///    of them, and not one naming the executable that would have enforced them;
 ///  * **the lowering** — the schema the harness is handed is the composition's
 ///    projected through this harness's own table, with the stripped bound folded
 ///    into a `description`, while the binding's own schema is untouched (PRD
@@ -6233,6 +6240,129 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
              effect promises it will not do"
         );
     }
+
+    // --- `settings:` is unchecked, not unbounded (grammar 8.9, D140) -------
+    //
+    // The containment bound of PRD resolved q57 ruling c, read off the object
+    // the vendor's SDK would have been handed. It is the one claim in this gate
+    // that is a **subtraction** — what a settings key did not put there — so no
+    // amount of driving the seam can see it: a scripted driver is handed
+    // `run.settings` whole, and dropping is what the *real* driver does. The
+    // runner therefore calls each driver's own option builder on the
+    // `HarnessRun` the adapter built, which is why those two functions are
+    // exported at all.
+    let bound = &answer["bound"];
+    assert_eq!(
+        bound["cwd"],
+        json!(true),
+        "`settings: {{ cwd: … }}` moved the run out of the node's `workspace:`"
+    );
+    assert_eq!(
+        bound["permissionMode"],
+        json!("acceptEdits"),
+        "`settings: {{ permissionMode: … }}` replaced what `access:` states — \
+         `bypassPermissions` is the preset that asks for no containment at all"
+    );
+    assert_eq!(
+        bound["env"],
+        json!(["PATH", "TOKEN"]),
+        "`settings: {{ env: … }}` reached past the scrub, which is q54 ruling b's \
+         declared-variables-only posture (Decision D139)"
+    );
+    assert_eq!(
+        bound["tools"],
+        json!(["Bash", "Read"]),
+        "`settings: {{ tools: … }}` widened the set the loop can reach, which is \
+         the option `enforcesTools` rests on"
+    );
+    assert_eq!(
+        bound["systemPromptIsThePreset"],
+        json!("claude_code"),
+        "`settings: {{ systemPrompt: … }}` replaced the harness's own instructions \
+         with a bare string, which is the preset PRD resolved q57 makes this a \
+         kind for"
+    );
+    for key in [
+        "additionalDirectories",
+        "extraArgs",
+        "settings",
+        "mcpServers",
+    ] {
+        assert_eq!(
+            bound[key],
+            json!(null),
+            "`settings: {{ {key}: … }}` reached the SDK — a root, a CLI flag, a \
+             permission file or a tool server outside everything this node states"
+        );
+    }
+    assert_eq!(
+        bound["spawn"],
+        json!([]),
+        "a `settings:` key chose what program the run is: `options.tools`, \
+         `options.canUseTool` and `permissionMode` would then bound an \
+         executable the composition never named, while `enforcesTools` and the \
+         graph document's `tools_enforced` went on saying the list holds \
+         (grammar 8.9, PRD resolved q57 ruling c)"
+    );
+    assert_eq!(
+        bound["maxTurns"],
+        json!(40),
+        "the curated key is mapped by name, which is the tier D140 checks strictly"
+    );
+    assert_eq!(
+        bound["curatedTravelled"],
+        json!(false),
+        "…and does not also travel as written, or one option would be written \
+         twice and the two could disagree"
+    );
+    assert_eq!(
+        bound["unknown"],
+        json!("travels"),
+        "an option this release cannot speak for did not travel, which is the \
+         treadmill PRD resolved q30 refused (ruling e)"
+    );
+
+    let codex = &answer["codexBound"];
+    assert_eq!(
+        codex["workingDirectory"],
+        json!(true),
+        "`settings: {{ workingDirectory: … }}` moved a `codex` run out of the \
+         node's `workspace:`"
+    );
+    assert_eq!(
+        codex["sandboxMode"],
+        json!("read-only"),
+        "`settings: {{ sandboxMode: … }}` replaced the preset `access:` states, \
+         which on this harness is the whole of what bounds a run"
+    );
+    assert_eq!(
+        codex["approvalPolicy"],
+        json!(null),
+        "`settings: {{ approvalPolicy: … }}` reached the thread — the per-call \
+         approval tier PRD resolved q57 ruling c says this release does not adopt"
+    );
+    assert_eq!(
+        codex["additionalDirectories"],
+        json!(null),
+        "roots beside `workspace:` reached a `codex` thread, so `access:` means \
+         one thing under one harness and another under the other"
+    );
+    assert_eq!(
+        codex["model"],
+        json!("gpt-5-codex"),
+        "`settings: {{ model: … }}` replaced the id the registry address resolved to"
+    );
+    assert_eq!(
+        codex["networkAccessEnabled"],
+        json!(false),
+        "the curated key is mapped by name on this harness too"
+    );
+    assert_eq!(codex["curatedTravelled"], json!(false));
+    assert_eq!(
+        codex["unknown"],
+        json!("travels"),
+        "the vendor's own vocabulary is what `settings:` buys (ruling e)"
+    );
 }
 
 /// Gate 23: the wire schema is the lowering's image of the schema the parse
