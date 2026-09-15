@@ -711,6 +711,23 @@ impl References {
                             NodeKind::Http { http } => {
                                 references.http(http, &format!("{address}.node.{id}.http"));
                             }
+                            // A coder node's `workspace:` is grammar 4.3 class 2
+                            // like an `exec:`'s `cwd:`, and its `env:` is that
+                            // block's `env:` exactly — which is PRD resolved
+                            // q54 ruling b applied one construct along
+                            // (Decision D139). Filed under the **node**, the
+                            // way an inline `exec:` node's are, because the
+                            // node is where the whole component is declared:
+                            // there is no definition address to file them
+                            // under.
+                            NodeKind::Coder { coder } => {
+                                references.text(
+                                    &coder.workspace.value,
+                                    &format!("{address}.node.{id}.workspace"),
+                                );
+                                references
+                                    .entries_of(&coder.env, &format!("{address}.node.{id}.env"));
+                            }
                             NodeKind::Agent { .. }
                             | NodeKind::Function { .. }
                             | NodeKind::Flow { .. }

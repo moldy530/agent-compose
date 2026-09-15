@@ -78,6 +78,7 @@
 
 pub(crate) mod bindings;
 pub(crate) mod channels;
+pub(crate) mod coder;
 pub(crate) mod components;
 pub(crate) mod convergence;
 pub(crate) mod cycles;
@@ -166,6 +167,7 @@ fn flow_definition<'a>(ctx: &mut Ctx<'a>, address: &'a str, flow: &'a Flow) {
             NodeKind::Store { store, params, .. } => {
                 stores::store_node(ctx, &cx, node, store, params);
             }
+            NodeKind::Coder { coder } => coder::coder_node(ctx, &cx, node, coder),
             NodeKind::Http { http } => bindings::inline_http(ctx, &cx, node, http),
             _ => {}
         }
@@ -382,6 +384,7 @@ impl<'a> Ctx<'a> {
             NodeKind::Flow { flow, .. } => {
                 self.flow(&flow.value).map(|f| Cow::Borrowed(&f.outputs))
             }
+            NodeKind::Coder { coder } => Some(Cow::Borrowed(&coder.output)),
             NodeKind::Human { human } => Some(Cow::Borrowed(&human.output)),
             NodeKind::Exec { exec } => Some(exec.output.as_ref().map_or_else(
                 || Cow::Owned(model::exec_default_output(&exec.span)),
@@ -424,6 +427,13 @@ impl<'a> Ctx<'a> {
                             .map_or(InputContract::Empty, InputContract::Fields)
                     })
             }
+            // A coder node's two input forms are an agent's exactly: a declared
+            // field map, or the string-in default a scalar `input:` binds
+            // (grammar 8.9, 5.3, Decision D137).
+            NodeKind::Coder { coder } => coder
+                .input
+                .as_ref()
+                .map_or(InputContract::StringIn, InputContract::Fields),
             NodeKind::Human { human } => InputContract::Fields(&human.input),
             NodeKind::Exec { .. } | NodeKind::Http { .. } => InputContract::AdHoc,
             NodeKind::Map { .. } | NodeKind::Store { .. } => InputContract::Unknown,

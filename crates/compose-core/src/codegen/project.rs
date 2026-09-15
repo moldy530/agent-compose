@@ -183,6 +183,22 @@ pub const PACKAGE_NAME: &str = "agent-compose-generated";
 /// tool asked for.
 #[must_use]
 pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
+    // The harness SDKs, pinned per harness some `coder:` node binds (PRD
+    // resolved q57, and see [`super::harness::HARNESS_PINS`]). Between [`PINS`]
+    // and the declared set, and not inside either: they are the runtime's own
+    // rather than a composition's declaration, but a composition that binds no
+    // harness declares none of them — which is what makes "emit only the drivers
+    // a composition uses" true of the manifest as well as of the module.
+    let mut harness: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for bound in super::harness::bound(ir) {
+        for (package, version) in super::harness::pins_of(bound) {
+            let held = harness.insert((*package).to_string(), (*version).to_string());
+            assert!(
+                held.is_none_or(|held| held == *version),
+                "two harnesses pin `{package}` at two versions"
+            );
+        }
+    }
     let mut declared: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (address, module) in crate::check::modules::bindings(ir) {
@@ -194,6 +210,7 @@ pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
                 .chain(DEV_PINS)
                 .find(|(pinned, _)| *pinned == package)
                 .map(|(_, version)| (*version).to_string())
+                .or_else(|| harness.get(package).cloned())
                 .or_else(|| declared.get(package).cloned());
             if let Some(held) = held {
                 assert!(
@@ -208,6 +225,7 @@ pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
     }
     PINS.iter()
         .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+        .chain(harness)
         .chain(declared)
         .collect()
 }

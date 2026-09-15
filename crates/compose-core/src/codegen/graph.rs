@@ -118,19 +118,20 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated};
+use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated, Literal};
 use crate::ast::definition::{Builtin, ProviderKind};
-use crate::ast::flow::FlowContext;
+use crate::ast::flow::{FlowContext, Harness, WorkspaceAccess};
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
 // validator applies, and two readings of one rule is how they come to disagree.
 use crate::check::cycles::counted;
 use crate::check::graph::Graph as CheckedGraph;
+use crate::diag::Spanned;
 use crate::ir::Ir;
 use crate::ir::binding::{Bindings, Exec, Http, Module, NodeInput, Writes};
 use crate::ir::definition::{Agent, DefinitionBody, Model, Tool};
 use crate::ir::flow::{
-    Edge, Flow, ItemError, Map, MapDispatch, Node, NodeKind, ToolImplementation,
+    Coder, Edge, Flow, ItemError, Map, MapDispatch, Node, NodeKind, ToolImplementation,
 };
 use crate::ir::policy::Policy;
 use crate::ir::schema::{Field, FieldMap, TypeForm, TypeNode};
@@ -181,6 +182,9 @@ pub fn declare(names: &mut Names, ir: &Ir) {
                     }
                     if matches!(node.kind, NodeKind::Human { .. }) {
                         names.declare(&format!("{address}.node.{id}.human"));
+                    }
+                    if matches!(node.kind, NodeKind::Coder { .. }) {
+                        names.declare(&format!("{address}.node.{id}.coder"));
                     }
                 }
             }
@@ -243,6 +247,13 @@ pub fn module(ir: &Ir, names: &Names) -> super::GeneratedFile {
 
     contents.push_str("\nimport { END, START, StateGraph } from \"@langchain/langgraph\";\n");
     contents.push_str("\nimport * as mesh from \"./mesh.ts\";\n");
+    // The driver seam, and only where a node reaches it: `./harness.ts` is
+    // emitted for every composition, and importing it from one with no `coder:`
+    // node would load a module whose whole purpose is the SDKs that composition
+    // does not pin (grammar 8.9, PRD resolved q57, and see [`super::harness`]).
+    if !super::harness::bound(ir).is_empty() {
+        contents.push_str("import * as harness from \"./harness.ts\";\n");
+    }
     contents.push_str("import * as runtime from \"./runtime.ts\";\n");
     contents.push_str("import * as stores from \"./stores.ts\";\n");
     // The seam, and only where there is one to reach: `./modules.ts` is emitted
@@ -1481,6 +1492,12 @@ fn flow(
             ));
         }
 
+        if let NodeKind::Coder { coder } = &node.kind {
+            text.push_str(&coder_descriptor(
+                ir, names, address, node, coder, surfaces, imported,
+            ));
+        }
+
         text.push('\n');
         text.push_str(&names::doc(
             "",
@@ -1696,6 +1713,11 @@ const START_ROUTER: &str = "$start";
 fn describe_kind(kind: &NodeKind) -> String {
     match kind {
         NodeKind::Agent { agent } => format!("`{}` (grammar 8.1)", agent.value),
+        NodeKind::Coder { coder } => format!(
+            "one `harness: {}` run on `{}` (grammar 8.9)",
+            coder.harness.value.as_str(),
+            coder.model.value
+        ),
         NodeKind::Exec { .. } => "an inline subprocess (grammar 8.2)".to_string(),
         NodeKind::Http { .. } => "an inline request (grammar 8.3)".to_string(),
         NodeKind::Function { function } => format!("`{}` (grammar 8.4)", function.value),
@@ -1841,6 +1863,19 @@ fn input_builder(
                 Some(fields) => field_map_input(ir, address, node, fields, &reader),
             }
         }
+        // A coder node's two input forms are an agent's exactly, and the block
+        // declares them in the node rather than in a definition (grammar 8.9,
+        // 5.3, Decision D137).
+        NodeKind::Coder { coder } => match &coder.input {
+            None => match &node.input {
+                Some(NodeInput::Scalar { value }) => format!(
+                    "  input: (roots) => runtime.toJson(runtime.evaluate({}, roots)),\n",
+                    names::string(value.value.as_str())
+                ),
+                _ => "  input: () => \"\",\n".to_string(),
+            },
+            Some(fields) => field_map_input(ir, address, node, fields, &reader),
+        },
         NodeKind::Function { function } => {
             let declared = surface_fields(surfaces, &format!("{}.input", function.value));
             field_map_input(ir, address, node, declared.as_ref(), &reader)
@@ -2309,6 +2344,15 @@ fn activity(
             "  run: async (input, context, view) =>\n    runtime.runHuman({}, input, context, view),\n",
             names.value(&format!("{address}.node.{id}.human"))
         ),
+        // **The adapter, not the SDK.** `runtime.runCoder` journals the run,
+        // taps its stream and gates its answer; `harness.DRIVERS` is the seam it
+        // reaches the vendor's SDK through, handed in rather than imported so
+        // `src/runtime.ts` stays byte-identical in a project with no coder node
+        // (grammar 8.9, PRD resolved q57).
+        NodeKind::Coder { .. } => format!(
+            "  run: async (input, context) =>\n    runtime.runCoder({}, input, context, harness.DRIVERS),\n",
+            names.value(&format!("{address}.node.{id}.coder"))
+        ),
         // The result is **not** parsed against the emitted Zod for the derived
         // row. That schema describes a shape this compiler's own runtime builds
         // rather than a contract with something outside the process, and the one
@@ -2396,6 +2440,213 @@ fn human_descriptor(
     ));
     text.push_str("};\n");
     text
+}
+
+/// One coder node's harness run, as a `runtime.HarnessBinding` (grammar 8.9,
+/// PRD resolved q57).
+///
+/// The **config map**: everything the composition declared, lowered once here so
+/// that the adapter at run time has nothing left to derive. Three of its entries
+/// are worth reading twice.
+///
+/// `modelId` and `modelSettings` are the whole of what a `model.*` contributes
+/// (Decision D141). The address is carried beside them for the trace, and the
+/// *connection* — the provider, its credentials, a route's ladder — is not here
+/// at all, because it does not reach inside a run: the harness owns its client.
+/// The settings that do cross are the ones [`harness_model_settings`] names, and
+/// the filter runs here rather than in the runtime so a reader of `src/graph.ts`
+/// sees the settings that really travel.
+///
+/// `schema` is the declared `output:` **unlowered**. The adapter projects it
+/// through this harness's own table before the run and parses the answer against
+/// the full document, which is PRD resolved q55's amendment to q16 stated once
+/// in the one place both columns are visible.
+///
+/// `result` is the emitted Zod for that same surface — the output gate.
+///
+fn coder_descriptor(
+    ir: &Ir,
+    names: &Names,
+    address: &str,
+    node: &Node,
+    coder: &Coder,
+    surfaces: &[schema::Surface<'_>],
+    imported: &mut Vec<String>,
+) -> String {
+    let id = node.id.value.as_str();
+    let site = format!("{address}.node.{id}");
+    let output = surface_fields(surfaces, &format!("{site}.output"));
+    let parse = names.value(&format!("{site}.output")).to_string();
+    imported.push(parse.clone());
+
+    let harness = coder.harness.value;
+    let mut text = String::from("\n");
+    text.push_str(&names::doc(
+        "",
+        &[format!(
+            "`{address}` node `{id}` — the harness run it is: the config map, the workspace \
+             it is contained by, and the schema its answer is gated against (grammar 8.9, PRD \
+             resolved q57)."
+        )],
+    ));
+    text.push_str(&format!(
+        "const {}: runtime.HarnessBinding = {{\n",
+        names.value(&format!("{site}.coder"))
+    ));
+    text.push_str(&format!("  node: {},\n", names::string(&site)));
+    text.push_str(&format!(
+        "  harness: {},\n",
+        names::string(harness.as_str())
+    ));
+    text.push_str(&format!(
+        "  model: {},\n",
+        names::string(&coder.model.value.to_string())
+    ));
+    let resolved = direct_model(ir, &coder.model.value.to_string());
+    text.push_str(&format!(
+        "  modelId: {},\n",
+        names::string(resolved.map_or("", |model| model.id.value.as_str()))
+    ));
+    let crossing: Vec<(&String, &Spanned<Literal>)> = resolved
+        .map(|model| {
+            model
+                .settings
+                .iter()
+                .filter(|(key, _)| harness_model_settings(harness).contains(&key.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if crossing.is_empty() {
+        text.push_str("  modelSettings: {},\n");
+    } else {
+        text.push_str("  modelSettings: {\n");
+        for (key, value) in crossing {
+            text.push_str(&format!(
+                "    {}: {},\n",
+                names::string(key),
+                names::literal(&value.value)
+            ));
+        }
+        text.push_str("  },\n");
+    }
+    text.push_str(&format!(
+        "  prompt: {},\n",
+        names::string(&coder.prompt.value)
+    ));
+    text.push_str(&format!(
+        "  workspace: {},\n",
+        interpolation(&coder.workspace.value, &format!("{site}.workspace"))
+    ));
+    text.push_str(&format!(
+        "  access: {},\n",
+        names::string(
+            coder
+                .access
+                .unwrap_or(WorkspaceAccess::WorkspaceWrite)
+                .as_str()
+        )
+    ));
+    if !coder.allow_tools.is_empty() {
+        text.push_str("  allowTools: [");
+        for (index, name) in coder.allow_tools.iter().enumerate() {
+            if index > 0 {
+                text.push_str(", ");
+            }
+            text.push_str(&names::string(&name.value));
+        }
+        text.push_str("],\n");
+    }
+    if coder.env.is_empty() {
+        text.push_str("  env: [],\n");
+    } else {
+        text.push_str("  env: [\n");
+        for entry in &coder.env {
+            text.push_str(&format!(
+                "    {{ name: {}, value: {} }},\n",
+                names::string(&entry.name.value),
+                interpolation(
+                    &entry.value.value,
+                    &format!("{site}.env.{}", entry.name.value)
+                )
+            ));
+        }
+        text.push_str("  ],\n");
+    }
+    if coder.inherit_env == Some(true) {
+        text.push_str("  inheritEnv: true,\n");
+    }
+    if coder.settings.is_empty() {
+        text.push_str("  settings: {},\n");
+    } else {
+        text.push_str("  settings: {\n");
+        for setting in &coder.settings {
+            text.push_str(&format!(
+                "    {}: {},\n",
+                names::string(&setting.key.value),
+                names::literal(&setting.value.value)
+            ));
+        }
+        text.push_str("  },\n");
+    }
+    text.push_str(&format!(
+        "  schema: {},\n",
+        json_literal(&schema::json_field_map(output.as_ref()), "  ")
+    ));
+    text.push_str(&format!("  result: {parse},\n"));
+    text.push_str("};\n");
+    text
+}
+
+/// The direct `model.*` a coder node resolves to (Decision D141).
+///
+/// A **direct** binding only: `check::model` refuses a route on a coder node,
+/// because a failover ladder does not reach inside a harness run and taking the
+/// first member would be a declared policy silently dropped. `None` here is an
+/// address that did not resolve, which the resolver has already reported.
+fn direct_model<'ir>(
+    ir: &'ir Ir,
+    address: &str,
+) -> Option<&'ir crate::ir::definition::DirectModel> {
+    match &ir.definitions.get(address)?.body {
+        DefinitionBody::Model(Model::Direct(direct)) => Some(direct),
+        _ => None,
+    }
+}
+
+/// The `settings:` keys of a `model.*` each harness has a place for
+/// (Decision D141, PRD resolved q57 ruling d).
+///
+/// The Rust half of a table the emitted runtime declares too
+/// (`HARNESS_MODEL_SETTINGS` in `src/runtime.ts`): the filter runs here, at
+/// build time, and the runtime's copy is what a driver reads when it spells the
+/// key its own SDK takes. `the_harness_model_settings_table_is_one_table` holds
+/// the two together, because a filter and a driver disagreeing about which keys
+/// cross would drop a setting with nothing failing.
+///
+/// Deliberately **small**, and grounded on both sides: an entry has to be a key
+/// the provider plugin behind that harness's models really publishes
+/// (`check::providers`) *and* an option that harness's SDK really takes. Grammar
+/// 12.2's `settings:` is otherwise a provider *connection's* vocabulary — a
+/// temperature, a token cap, a `stop` sequence — and a harness owns its own
+/// client, so most of it has nothing on the other side of this boundary to be
+/// applied to.
+///
+/// So the two rows differ, and the difference is the vendors':
+///
+///  * `cc` takes `thinking:`, whose `budget_tokens` is the Agent SDK's
+///    `maxThinkingTokens`. It is the `anthropic` plugin's key, which is the
+///    plugin a `cc` node's model resolves through.
+///  * `codex` takes `reasoning_effort:`, which is the Codex SDK's
+///    `modelReasoningEffort` and the `openai` plugin's key.
+///
+/// The two reserved harnesses never reach codegen — `validate` refuses them —
+/// and take nothing, which is the answer that claims least.
+pub(super) const fn harness_model_settings(harness: Harness) -> &'static [&'static str] {
+    match harness {
+        Harness::Cc => &["thinking"],
+        Harness::Codex => &["reasoning_effort"],
+        Harness::DeepAgents | Harness::Native => &[],
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4380,9 +4631,10 @@ fn output_path(ir: &Ir, address: &str, node: &Node) -> Option<String> {
         NodeKind::Agent { agent } => Some(format!("{}.output", agent.value)),
         NodeKind::Function { function } => Some(format!("{}.output", function.value)),
         NodeKind::Flow { flow, .. } => Some(format!("{}.outputs", flow.value)),
-        NodeKind::Exec { .. } | NodeKind::Http { .. } | NodeKind::Human { .. } => {
-            Some(format!("{address}.node.{id}.output"))
-        }
+        NodeKind::Coder { .. }
+        | NodeKind::Exec { .. }
+        | NodeKind::Http { .. }
+        | NodeKind::Human { .. } => Some(format!("{address}.node.{id}.output")),
         NodeKind::Store { store, .. } => ir
             .definitions
             .contains_key(&store.value.to_string())

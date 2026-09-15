@@ -328,6 +328,9 @@ fn node(source: &ast_flow::Node) -> Option<ir::flow::Node> {
         ast_flow::NodeKind::Agent(address) => ir::flow::NodeKind::Agent {
             agent: address.clone(),
         },
+        ast_flow::NodeKind::Coder(block) => ir::flow::NodeKind::Coder {
+            coder: coder(block)?,
+        },
         ast_flow::NodeKind::Exec(block) => ir::flow::NodeKind::Exec { exec: exec(block)? },
         ast_flow::NodeKind::Http(block) => ir::flow::NodeKind::Http { http: http(block)? },
         ast_flow::NodeKind::Function(address) => ir::flow::NodeKind::Function {
@@ -363,6 +366,47 @@ fn node(source: &ast_flow::Node) -> Option<ir::flow::Node> {
         description: source.description.clone(),
         span: source.span.clone(),
         kind,
+    })
+}
+
+/// Lower a `coder:` block (grammar 8.9, Decision D136).
+///
+/// Four keys are lowered the way every other optional-with-a-default key in
+/// this artifact is: `access:`, `inherit_env:` and `input:` keep their absence,
+/// because the IR materializes no default (see [`super`]), and `settings:`
+/// becomes a list in **declaration order** — a set of settings read by name,
+/// with the whole entry's span so a diagnostic about one underlines the key and
+/// its value together.
+fn coder(source: &ast_flow::CoderBlock) -> Option<ir::flow::Coder> {
+    Some(ir::flow::Coder {
+        harness: source.harness.clone()?,
+        model: source.model.clone()?,
+        workspace: source.workspace.clone()?,
+        access: source.access.as_ref().map(|access| access.value),
+        prompt: source.prompt.clone()?,
+        input: optional(source.input.as_ref(), field_map)?,
+        output: field_map(source.output.as_ref()?)?,
+        allow_tools: source.allow_tools.clone(),
+        env: source.env.iter().map(interpolated_entry).collect(),
+        inherit_env: source.inherit_env.as_ref().map(|inherit| inherit.value),
+        settings: source
+            .settings
+            .as_ref()
+            .map(|settings| {
+                settings
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let (key, value) = literal_entry(entry);
+                        ir::flow::CoderSetting {
+                            key: Spanned::new(key, entry.key.span.clone()),
+                            value,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        span: source.span.clone(),
     })
 }
 

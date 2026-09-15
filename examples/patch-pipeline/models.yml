@@ -1,0 +1,21 @@
+# Behavior layer (PRD 5.9), read by a coder node exactly as an agent node reads
+# it: the address is what the composition names, and the adapter maps it down to
+# the provider-native id in harness config.
+#
+# One key of each block crosses the boundary and the rest does not, which is the
+# exemption grammar 12.2 states where PRD 5.9 promises failover: `thinking:` is
+# the Agent SDK's thinking budget, `reasoning_effort:` is the Codex SDK's, and
+# `max_tokens:` configures a provider *connection* that a harness never opens.
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+  settings:
+    thinking:
+      budget_tokens: 8000
+    max_tokens: 16000
+
+model.reviewer:
+  provider: provider.openai
+  id: gpt-5-codex
+  settings:
+    reasoning_effort: medium

@@ -56,6 +56,61 @@ pub(crate) fn bindings(ir: &Ir) -> Vec<(&str, &Module)> {
 pub(crate) fn check(ctx: &mut Ctx) {
     one_file_one_tool(ctx);
     dependencies_agree(ctx);
+    harness_pins_agree(ctx);
+}
+
+/// A `module:` dependency may not contradict a harness SDK this composition
+/// pins (grammar 6.1, 8.9, PRD resolved q49, q57).
+///
+/// `parse::binding` already refuses a pin that contradicts the generated
+/// project's own set, and that check reads a **constant**: the runtime's pins
+/// are the same in every project. A harness SDK's are not — they are pinned only
+/// where some `coder:` node binds that harness — so whether a given package is
+/// already held is a question about the whole composition, which is what puts
+/// this rule here beside the one about two tools disagreeing.
+///
+/// The repair is the same one that rule gives: name the version the project
+/// already holds, or drop the pin. The manifest carries one version of a package
+/// and the artifact ships no lockfile to reconcile two.
+fn harness_pins_agree(ctx: &mut Ctx) {
+    let bound = crate::codegen::harness::bound(ctx.ir);
+    if bound.is_empty() {
+        return;
+    }
+    let mut refusals: Vec<Diagnostic> = Vec::new();
+    for (address, module) in bindings(ctx.ir) {
+        for dependency in &module.dependencies {
+            let package = dependency.package.value.as_str();
+            for harness in &bound {
+                let Some((_, pinned)) = crate::codegen::harness::pins_of(*harness)
+                    .iter()
+                    .find(|(held, _)| *held == package)
+                else {
+                    continue;
+                };
+                if *pinned == dependency.version.value {
+                    continue;
+                }
+                refusals.push(
+                    Diagnostic::error(
+                        DiagnosticCode::InvalidDependency,
+                        dependency.version.span.clone(),
+                        format!(
+                            "`{address}` pins `{package}` to `{}`, which this project already holds at `{pinned}`",
+                            dependency.version.value
+                        ),
+                    )
+                    .with_help(format!(
+                        "a `coder:` node binding `harness: {}` pins `{package}` at `{pinned}`, and the generated `package.json` holds one version of it (grammar 8.9, PRD resolved q57)",
+                        harness.as_str()
+                    )),
+                );
+            }
+        }
+    }
+    for refusal in refusals {
+        ctx.push(refusal);
+    }
 }
 
 /// One authored file implements one tool (grammar 6.1).

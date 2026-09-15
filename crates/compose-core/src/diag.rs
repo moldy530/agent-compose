@@ -451,6 +451,21 @@ pub enum DiagnosticCode {
     /// which member served the call (grammar 12.2, Decision D122).
     MismatchedServerTools,
 
+    // --- coder nodes (grammar 8.9) ----------------------------------------
+    /// A `coder:` node binds a harness this release **reserves** rather than
+    /// lowers: `deepagents` or `native` (grammar 8.9, PRD resolved q57). Its own
+    /// class rather than an [`UnknownVariant`](Self::UnknownVariant), which is
+    /// what a misspelling gets: the name is one the grammar has, and what is
+    /// absent is a driver rather than a spelling, so the repair is a choice
+    /// between the two harnesses v1 ships rather than a correction.
+    UnsupportedHarness,
+    /// **Warning.** A `coder:` node's `settings:` names a key the harness's
+    /// curated table does not have, so nothing about its value could be verified
+    /// — it travels to the SDK verbatim (grammar 8.9, Decision D140). The same
+    /// two-tier posture, and the same warning shape, as
+    /// [`UnknownServerTool`](Self::UnknownServerTool).
+    UnknownHarnessSetting,
+
     // --- graph analyses (grammar 7.4–7.8, 8.6, 13.3) ----------------------
     /// A node has a pass on which its branch takes no outgoing edge: it has
     /// none at all, it declares `on_error: skip` with every edge guarded, or a
@@ -579,6 +594,8 @@ impl DiagnosticCode {
         Self::UnknownServerTool,
         Self::UnknownServerToolField,
         Self::MismatchedServerTools,
+        Self::UnsupportedHarness,
+        Self::UnknownHarnessSetting,
         Self::DeadEnd,
         Self::UnboundedCycle,
         Self::UnbalancedConvergence,
@@ -654,6 +671,8 @@ impl DiagnosticCode {
             Self::UnknownServerTool => "unknown-server-tool",
             Self::UnknownServerToolField => "unknown-server-tool-field",
             Self::MismatchedServerTools => "mismatched-server-tools",
+            Self::UnsupportedHarness => "unsupported-harness",
+            Self::UnknownHarnessSetting => "unknown-harness-setting",
             Self::DeadEnd => "dead-end",
             Self::UnboundedCycle => "unbounded-cycle",
             Self::UnbalancedConvergence => "unbalanced-convergence",

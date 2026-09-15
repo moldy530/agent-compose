@@ -232,4 +232,4 @@ Every common node key is legal. Where the output goes is
 `agent-compose docs state`; what `retry:`/`timeout:`/`on_error:` resolve to is
 `agent-compose docs policies`.
 
-Normative source: `docs/grammar.md` §5, §5.1–5.4, §8.1
+Normative source: `docs/grammar.md` §5, §5.1–5.4, §8.1, §8.9

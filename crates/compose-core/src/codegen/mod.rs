@@ -75,6 +75,12 @@
 //! builds, which is what keeps a golden diff about the composition rather than
 //! about the machinery beside it. The rest are the composition, lowered.
 //!
+//! `src/harness.ts` is the one that is *nearly* a constant and deliberately is
+//! not (PRD resolved q57): it carries a driver per harness some `coder:` node
+//! binds and nothing for the ones none does, so a project with no coder node
+//! imports no harness SDK — which is what keeps `package.json`'s pins and this
+//! module's imports the same set (see [`harness`]).
+//!
 //! `src/artifact.ts` is emitted **last and over the rest**, because what it
 //! carries is a hash of them (`docs/distributed.md` §4, and see [`artifact`]).
 //!
@@ -185,6 +191,7 @@ pub mod delivery;
 pub mod deployment;
 pub mod env;
 pub mod graph;
+pub mod harness;
 pub mod journal;
 pub mod mesh;
 pub mod modules;
@@ -235,6 +242,7 @@ pub const EMITTED_PATHS: &[&str] = &[
     "src/deployment.ts",
     "src/env.ts",
     "src/graph.ts",
+    "src/harness.ts",
     "src/index.ts",
     "src/journal.ts",
     "src/mesh.ts",
@@ -432,6 +440,7 @@ pub fn emit(ir: &Ir, authored: &authored::Authored) -> GeneratedProject {
         schema::module(ir, &names),
         state::module(ir, &names),
         graph::module(ir, &names),
+        harness::module(ir),
         trigger::module(ir),
         serve::module(ir),
         cli::module(ir),

@@ -46,13 +46,14 @@ use std::collections::BTreeMap;
 
 use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, EnvRef, PathStep};
 use crate::ast::definition::{AgentAccess, StoreKind};
+use crate::ast::flow::{Harness, WorkspaceAccess};
 use crate::check::model;
 use crate::codegen::policy::{self, Level, Strategy};
 use crate::ir::binding::{Bindings, Exec, Http, InterpolatedEntry, NodeInput, Writes};
 use crate::ir::definition::{Agent, DefinitionBody, Model, Provider, Store, Tool};
 use crate::ir::flow::{
-    Flow, Human, ItemError, Map, MapDispatch, MapRoute, Node, NodeKind as IrNodeKind, StoreParams,
-    StoreValue, ToolImplementation,
+    Coder, Flow, Human, ItemError, Map, MapDispatch, MapRoute, Node, NodeKind as IrNodeKind,
+    StoreParams, StoreValue, ToolImplementation,
 };
 use crate::ir::policy::Retry;
 use crate::ir::schema::{FieldMap, TypeForm, TypeNode};
@@ -60,7 +61,7 @@ use crate::ir::trigger::TriggerKind;
 use crate::ir::{Ir, Section};
 
 use super::document::{
-    AgentView, BindingView, DispatchView, EdgeClass, ExecView, FlowGraph, GRAPH_VERSION,
+    AgentView, BindingView, CoderView, DispatchView, EdgeClass, ExecView, FlowGraph, GRAPH_VERSION,
     GraphDocument, GraphEdge, GraphNode, HttpView, HumanView, InputView, InstancePolicyView,
     ItemErrorView, MapView, ModelView, NodeKind, OnErrorView, PolicyLevel, PolicyView,
     ProviderView, RetryView, RouteView, SchemaSource, SchemaView, SchemasView, SettingView,
@@ -144,6 +145,7 @@ fn pseudo(id: &str, kind: NodeKind) -> GraphNode {
         policy: None,
         schemas: None,
         agent: None,
+        coder: None,
         exec: None,
         http: None,
         tool: None,
@@ -182,6 +184,7 @@ fn graph_node(ir: &Ir, flow: &Flow, node: &Node) -> GraphNode {
         IrNodeKind::Agent { agent } => {
             held.agent = agent_view(ir, &agent.value);
         }
+        IrNodeKind::Coder { coder } => held.coder = Some(coder_view(ir, coder)),
         IrNodeKind::Exec { exec } => held.exec = Some(exec_view(exec)),
         IrNodeKind::Http { http } => held.http = Some(http_view(http)),
         IrNodeKind::Function { function } => {
@@ -300,6 +303,7 @@ fn satellite(ir: &Ir, map: &str, route: &Route<'_>) -> GraphNode {
 const fn kind_of(kind: &IrNodeKind) -> NodeKind {
     match kind {
         IrNodeKind::Agent { .. } => NodeKind::Agent,
+        IrNodeKind::Coder { .. } => NodeKind::Coder,
         IrNodeKind::Exec { .. } => NodeKind::Exec,
         IrNodeKind::Http { .. } => NodeKind::Http,
         IrNodeKind::Function { .. } => NodeKind::Function,
@@ -330,6 +334,15 @@ fn binding_of(node: &Node) -> Option<String> {
         IrNodeKind::Http { http } => Some(http_line(http)),
         IrNodeKind::Store { store, op, .. } => Some(format!("{} · {}", store.value, op.as_str())),
         IrNodeKind::Map { map } => Some(format!("over {}", map.over.value.as_str())),
+        // The harness is the line a coder node is read by: the model is in the
+        // detail pane like every other node's, and what distinguishes two coder
+        // nodes at a glance is which agent loop runs them (PRD resolved q57
+        // ruling f).
+        IrNodeKind::Coder { coder } => Some(format!(
+            "{} · {}",
+            coder.harness.value.as_str(),
+            coder.model.value
+        )),
         // A `human` node's badge already says what it is; what a reader cannot
         // see from the shape is how long it waits.
         IrNodeKind::Human { human } => human
@@ -606,6 +619,59 @@ fn store_params(params: &StoreParams) -> Vec<BindingView> {
 // ---------------------------------------------------------------------------
 // Agents: model resolution and the tool surface
 // ---------------------------------------------------------------------------
+
+/// One coder node's harness run, with the two defaults materialized.
+///
+/// `access:` and `inherit_env:` are written out even where the node omits them,
+/// which is this document answering a question rather than leaving it (§1): both
+/// are **containment** claims, and a reader of a picture should not have to know
+/// which way the grammar's default falls to read how far a harness may reach.
+///
+/// `tools_enforced` is not in the composition at all — it is a property of the
+/// harness, and PRD resolved q57 ruling c is what makes it belong here: the two
+/// harnesses do not enforce an allowlist the same way, and a document that drew
+/// both lists identically would be asserting a bound one of them does not hold.
+fn coder_view(ir: &Ir, coder: &Coder) -> CoderView {
+    CoderView {
+        harness: coder.harness.value.as_str().to_string(),
+        model: model_view(ir, &coder.model.value.to_string(), 0),
+        workspace: coder.workspace.value.as_str().to_string(),
+        access: coder
+            .access
+            .unwrap_or(WorkspaceAccess::WorkspaceWrite)
+            .as_str()
+            .to_string(),
+        prompt: coder.prompt.value.clone(),
+        allow_tools: coder
+            .allow_tools
+            .iter()
+            .map(|name| name.value.clone())
+            .collect(),
+        tools_enforced: enforces_tool_allowlist(coder.harness.value),
+        env: interpolated_views(&coder.env),
+        inherit_env: coder.inherit_env.unwrap_or(false),
+        settings: coder
+            .settings
+            .iter()
+            .map(|setting| SettingView {
+                name: setting.key.value.clone(),
+                value: summary::literal_json(&setting.value.value),
+            })
+            .collect(),
+    }
+}
+
+/// Whether a harness enforces the node's `allow_tools:` **inside its own loop**
+/// (grammar 8.9, PRD resolved q57 ruling c).
+///
+/// `cc` does, through the Agent SDK's per-call permission callback; `codex`
+/// bounds at the sandbox boundary only, per-call approval being the tier of
+/// their app server this release does not adopt. The two reserved harnesses
+/// never reach here — `validate` refuses them — and answer `false`, which is
+/// the claim that asserts least.
+const fn enforces_tool_allowlist(harness: Harness) -> bool {
+    matches!(harness, Harness::Cc)
+}
 
 fn agent_view(ir: &Ir, address: &Address) -> Option<AgentView> {
     let address = address.to_string();
@@ -927,6 +993,19 @@ fn input_schema(ir: &Ir, node: &Node) -> Option<SchemaView> {
             source: SchemaSource::Declared,
             fields: summary::fields(&human.input),
         }),
+        // A coder node's two input forms are an agent's, so they reach this
+        // document the same way: a declared field map, or the string-in default
+        // written as the source that names it (grammar 8.9, 5.3).
+        IrNodeKind::Coder { coder } => Some(match &coder.input {
+            Some(input) => SchemaView {
+                source: SchemaSource::Declared,
+                fields: summary::fields(input),
+            },
+            None => SchemaView {
+                source: SchemaSource::StringInput,
+                fields: Vec::new(),
+            },
+        }),
         _ => None,
     }
 }
@@ -1006,6 +1085,7 @@ fn output_schema(ir: &Ir, node: &Node) -> Option<(SchemaSource, FieldMap)> {
             }
             _ => None,
         },
+        IrNodeKind::Coder { coder } => Some((SchemaSource::Declared, coder.output.clone())),
         IrNodeKind::Human { human } => Some((SchemaSource::Declared, human.output.clone())),
         IrNodeKind::Store { store, op, params } => {
             let declared = store_of(ir, &store.value.to_string())?;

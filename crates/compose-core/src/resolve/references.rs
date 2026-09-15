@@ -246,6 +246,15 @@ impl Cx<'_, '_> {
     fn node(&mut self, node: &Node) {
         match &node.kind {
             NodeKind::Agent(agent) => self.address(agent, &[Namespace::Agent]),
+            // A coder node names its model exactly as an agent definition does,
+            // and resolving it here is what makes a `model.*` that does not
+            // exist a diagnostic at the node rather than a driver configured
+            // with a name nothing defines (grammar 8.9, Decision D141).
+            NodeKind::Coder(coder) => {
+                if let Some(model) = coder.model.as_ref() {
+                    self.address(model, &[Namespace::Model]);
+                }
+            }
             NodeKind::Function(tool) => self.address(tool, &[Namespace::Tool]),
             NodeKind::Flow(flow) => self.address(&flow.flow, &[Namespace::Flow]),
             NodeKind::Store(store) => self.address(&store.store, &[Namespace::Store]),

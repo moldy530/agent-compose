@@ -1540,6 +1540,7 @@ exactly one **kind key** plus common keys:
 | Kind key | Value | Config | §  |
 |---|---|---|---|
 | `agent` | `agent.*` ref | node-level keys | 8.1 |
+| `coder` | inline block | in-block | 8.9 |
 | `exec` | inline block | in-block | 8.2 |
 | `http` | inline block | in-block | 8.3 |
 | `function` | `tool.*` ref | node-level `input` = args | 8.4 |
@@ -1555,7 +1556,7 @@ node.
 
 | Key | Type | Notes |
 |---|---|---|
-| `input` | map field→CEL, or scalar CEL where §8.0 allows it | input bindings; §8.0 (the scalar form on `agent:`/`exec:` only, D88) |
+| `input` | map field→CEL, or scalar CEL where §8.0 allows it | input bindings; §8.0 (the scalar form on `agent:`/`coder:`/`exec:` only, D88) |
 | `writes` | map output-field→channel | write remap (PRD 5.7) |
 | `retry` | block | §9.1 |
 | `timeout` | duration | §9.2 |
@@ -2240,8 +2241,8 @@ is in the same flow or behind a module boundary
 (Decision [D15](#d15-node-level-input-is-the-one-binding-mechanism), Decision
 [D68](#d68-flow-node-bindings-are-total-nothing-falls-through-a-module-boundary)).
 
-*In-flow targets* — `agent:`, `exec:`, `http:`, `function:`, and `human:` nodes,
-whose target is invoked inside this flow's own scope:
+*In-flow targets* — `agent:`, `coder:`, `exec:`, `http:`, `function:`, and
+`human:` nodes, whose target is invoked inside this flow's own scope:
 
 1. an explicit `input:` binding for that field, if present;
 2. otherwise the state channel of the same name (§10);
@@ -2303,6 +2304,7 @@ only where a single unnamed value has a defined destination (Decision
 | Position | Scalar `input:` |
 |---|---|
 | `agent:` node | legal **iff** the agent is string-in — it declares no `input:` (§5.3, [D14](#d14-string-in-agents-bind-with-a-scalar-input-at-the-node)) |
+| `coder:` node | legal **iff** the block declares no `input:` — the same string-in rule, one construct along (§8.9, [D137](#d137-a-coder-node-declares-its-prompt-and-both-surfaces-in-its-own-block)) |
 | `exec:` node | legal — the value is passed on the child's stdin (§6.1, §8.2) |
 | `map` per-item `input:`, and a route's | legal **iff** the dispatch target is a string-in agent (§8.6 rule 12, [D75](#d75-map-dispatch-bindings-take-both-input-forms)) |
 | `http:`, `function:`, `flow:`, `human:` nodes | **ILLEGAL** |
@@ -2982,6 +2984,220 @@ performs no write on that pass and `prefs` keeps what it held; a guard wanting
 to know reads `load_prefs.output.found`, because reading the absent `value`
 fails the execution (§11.4, §4.1, Decision
 [D110](#d110-an-absent-value-fails-the-read-and-an-absent-output-field-writes-nothing)).
+
+### 8.9 `coder`
+
+One run of a **coding-agent harness**, as one node (PRD resolved q57).
+
+An `agent:` node is one LLM call with a bounded tool loop this runtime drives
+(§5). A `coder:` node is the other thing: the vendor's *own* agent loop — its
+tool shapes, its context management, its permission surface — run to completion
+inside one node, with its answer parsed against a schema this composition
+declares. The reason it is a **kind** and not a bundle of `builtin.*` tools is
+that provider harnesses are co-trained with their models, and that quality
+cannot be reassembled from parts.
+
+```yaml
+implement:
+  coder:
+    harness: cc
+    model: model.implementer
+    workspace: "${REPO_ROOT}"
+    access: workspace_write
+    prompt: |
+      Make the smallest change that satisfies the goal, run the tests,
+      and report what you touched.
+    input:
+      goal:     { type: string }
+      feedback: { type: string }
+    output:
+      summary: { type: string }
+      touched: { type: array, max_items: 50, items: { type: string } }
+    allow_tools: [Bash, Edit, Read, Write]
+    env:
+      PATH: "/usr/bin:/bin"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+    settings:
+      max_turns: 60
+  input:
+    goal:     "input.goal"
+    feedback: "state.feedback"
+  writes: { summary: summary }
+  retry: { max: 1, backoff: 30s }
+  timeout: 20m
+```
+
+| Key | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `harness` | enum `cc codex deepagents native` | **yes** | — | which harness runs it; the last two are RESERVED (§15) |
+| `model` | `model.*` ref | **yes** | — | the registry address, exactly as an agent node spells it (§12.2); a **route** is refused ([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)) |
+| `workspace` | string (non-empty, interpolable) | **yes** | — | the root this run works inside; §4.3 class 2 |
+| `access` | enum `read_only workspace_write full_access` | no | `workspace_write` | the containment preset ([D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)) |
+| `prompt` | string (non-empty) | **yes** | — | the run's instructions; literal text, no templating ([D13](#d13-prompt-is-required-and-literal)) |
+| `input` | field map (input surface) | no | string-in | §5.3's rule, one construct along |
+| `output` | field map (result surface, §3.5) | **yes** | — | MUST have ≥ 1 property; the output gate parses it in full |
+| `allow_tools` | array of non-empty, distinct strings | no | the harness's own set | the harness's tool names; what enforces it differs per harness (below) |
+| `env` | map env-var-name → string (interpolable) | no | `{}` | exactly the `exec:` shape (§6.1) |
+| `inherit_env` | boolean | no | `false` | the explicit opt-in to inheriting this process's environment |
+| `settings` | open object | no | `{}` | harness config, checked in two tiers ([D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers)) |
+
+Additional keys are a compile error. All the **common node keys** are legal and
+mean what they always mean: `input:` binds the declared surface (§8.0),
+`writes:` remaps the output (§8.0), and the whole §9.1 chain —
+`retry:`/`timeout:`/`on_error:` — wraps the **whole run**
+([D142](#d142-the-policy-chain-wraps-a-whole-harness-run-and-harness-native-resume-is-excluded)).
+
+**The harness is a binding, not grammar.** A composition never names an SDK
+type: swap `harness: cc` for `harness: codex` and every other key means the same
+thing. That is what makes a later harness a member of the enum rather than a new
+construct, and it is why `deepagents` and `native` are **spelled** — a
+composition written against one is refused by name and by scope (§15,
+`unsupported-harness`), rather than being answered with a suggestion as a
+misspelling would be.
+
+**The surfaces live in the block**, as a `human:` node's do (§8.7), because a
+coder node has no definition of its own to carry them: it *is* the whole
+component, declared where it is used. `input:` follows §5.3 exactly — declare it
+and the node's `input:` binds it field by field; omit it and the run is
+**string-in**, bound at the node with the scalar form
+([D88](#d88-the-scalar-input-form-is-legal-only-where-an-unnamed-value-has-a-destination)).
+`output:` is **required**, at one property or more, because structured output on
+every node is what routing reads and what makes edges serializable (PRD 5.2) —
+and because a harness run with no declared answer would be a node whose result
+nothing could check.
+
+#### What bounds a run
+
+**`workspace:` is required**, unlike a built-in's (§6.1), and there is no
+default. A built-in works in a directory this runtime makes for the execution; a
+coder node works on a checkout somebody already has, so a defaulted root would
+be a bound nobody wrote. It is interpolable for the built-in's reason — which
+directory a graph may work in is a property of the machine — and
+`workspace: ""`, or a `${VAR}` that resolves empty, is refused: an empty path is
+the directory the runtime happened to be started in.
+
+**`access:` selects the harness's own containment primitive**, and the mapping is
+the adapter's rather than the author's:
+
+| `access:` | `codex` | `cc` |
+|---|---|---|
+| `read_only` | the `read-only` sandbox | the permission mode that executes no tool |
+| `workspace_write` | the `workspace-write` sandbox | the mode that accepts edits under the working directory |
+| `full_access` | the `danger-full-access` sandbox | the mode that bypasses permission checks |
+
+**`allow_tools:` is enforced by one harness and offered to the other**, and this
+document states the asymmetry rather than implying the two are equivalent:
+
+* **`cc` enforces it in-loop.** Every tool call the harness makes goes through
+  the Agent SDK's per-call permission callback, and a call outside the list is
+  denied with a message the model reads. The denial is recorded as a `"refused"`
+  tool event in the trace ([`docs/trace.md`](trace.md) §7.6).
+* **`codex` bounds at the sandbox only.** Its per-call approval tier belongs to
+  an app server this release does not adopt, so the list is what the harness is
+  *offered* and the sandbox preset is what holds. `agent-compose plan` says which
+  of the two a node is, and so does the graph document's `tools_enforced`
+  ([`docs/graph.md`](graph.md) §5.8).
+
+**`env:` is PRD resolved q54 ruling b, verbatim.** The harness and everything it
+forks run with a **scrubbed** environment holding only the declared variables,
+which is what keeps a placement's environment manifest the whole answer to what a
+machine is asked for; `inherit_env: true` is the explicit opt-in for the machines
+where inheriting is the point. A harness's own credential is an `${ENV}`
+reference in this map like every other secret (§4.3).
+
+**And what does not bound it.** §5.5's built-in tools are bounded by their
+workspace and their timeout because *this runtime* implements them. A harness
+implements its own, so **none of those bounds apply inside a run**: the trust
+statement of
+[D135](#d135-a-builtin-binding-hands-the-model-the-program-and-says-so) — the
+model authors the program — extends one step to *the harness authors and runs
+the program inside its own tool surface*, and what is left of this compiler's
+say is the workspace, the access preset, the environment, and the node's own
+deadline. A model holding `builtin.bash` holds arbitrary code execution on that
+host; a coder node holds it too, through a loop this compiler does not drive.
+That is the trade the kind exists to make, and it is stated here rather than
+discovered.
+
+#### The model, and what stops at the boundary
+
+`model:` is the registry address (§12.2), and the adapter resolves it to two
+things: the provider-native **id**, and the small subset of that model's
+`settings:` the harness has a place for — `thinking:` for `cc`, whose
+`budget_tokens` is its thinking budget, and `reasoning_effort:` for `codex`.
+
+Everything else about the connection stops here. `provider.*`'s `base_url:`, its
+headers and its credential; a **route**'s failover ladder; and the
+structured-output mechanism ladder the runtime discovers per endpoint — none of
+them reaches inside a run, because the harness owns its client, its auth and its
+own internal retries. §12.2 states the exemption where the failover promise is
+made, and `model:` naming a route is a compile error rather than a ladder
+silently reduced to its first member
+([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)).
+
+**Structured output rides the harness's own mechanism** — a JSON-Schema output
+format on `cc`, an output schema on `codex` — under the lowering discipline PRD
+resolved q55 fixes: the schema the harness is handed is this composition's
+projected through a table **per harness**, with every stripped bound folded into
+that node's `description`, and the answer is parsed against the **full**
+declared schema. An answer that fails the gate fails the node, where
+`retry:`/`on_error:` decide the run exactly as they do for an agent whose answer
+missed its contract (§5.1, §9.2).
+
+#### `settings:`, in two tiers
+
+Harness config is the vendor's vocabulary, so it is an open object — the second
+in the logical layer, and the first since
+[D40](#d40-settings-is-the-only-open-object-in-the-logical-layer) — checked the
+way a provider's `server_tools:` are
+([D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers)):
+
+* a key the harness's **curated table** knows is checked **strictly** — the wrong
+  kind of value, a number outside a stated range, a word outside a closed set are
+  each an error naming the repair;
+* anything the table cannot speak for is a **warning** (`unknown-harness-setting`)
+  naming exactly what could not be verified, and travels to the SDK unchanged.
+
+The second half is the point: a harness option the vendor ships tomorrow must be
+usable the day it ships, and a gating table is the support treadmill PRD resolved
+q30 refused. `agent-compose explain unknown-harness-setting` names the keys each
+table holds.
+
+#### What a run records, and what happens when one is interrupted
+
+A harness run is **one journaled effect**
+([`docs/durability.md`](durability.md) §3.9): the replayable answer is the
+validated structured output, and the private payload is the run's whole event
+stream — every turn, tool call and reasoning item the SDK yielded. A resumed
+execution consumes the answer and **the harness never runs again**. A crash
+mid-run recorded nothing, so it is an attempt failure like any other and the
+node's `retry:` re-runs the whole run.
+
+**Harness-native resume is a named exclusion**, not a foreclosure. Both SDKs can
+resume their own sessions, and that state is machine-local — the session stores
+each vendor keeps — so depending on it would break the invariant that the journal
+is the complete hub state (`docs/durability.md` §12). Those stores are debugging
+backstops.
+
+The trace carries a `HarnessRecord` per run ([`docs/trace.md`](trace.md) §7.6):
+the harness and its pinned SDK version, the run's **top-level** turns with their
+usage, its top-level tool events, a cost rollup, and a harness-tagged extension
+field for what one harness reports and the other has no shape for. A harness that
+runs subagents of its own keeps their transcripts in the journal payload and out
+of the envelope.
+
+#### A missing harness
+
+The SDK a `coder:` node needs is pinned in the generated `package.json` and
+installed with the rest of a project's dependencies. A host that cannot reach it
+is an **execution failure naming the requirement**, never a compile error: which
+machine has which SDK installed is a property of the machine, and it is the same
+posture §5.5 takes for a host with no `bash` on `PATH`.
+
+**Placement.** A coder node is not a placeable member — `placements:` binds
+components, and a coder node is declared in a flow rather than defined (§14.1) —
+so it runs where its flow runs, and the environment it declares belongs to that
+process's manifest
+([`docs/distributed.md`](distributed.md) §9.1).
 
 ---
 
@@ -3980,8 +4196,10 @@ model.default:
 
 Rules (PRD 5.9):
 
-- `settings:` is the one **open** object in the logical layer: known keys are
-  typed for editors (`temperature`, `top_p`, `top_k`, `max_tokens`, `stop`,
+- `settings:` is an **open** object — one of the two in the logical layer, the
+  other being a `coder:` node's harness config (§8.9,
+  [D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers)).
+  Known keys are typed for editors (`temperature`, `top_p`, `top_k`, `max_tokens`, `stop`,
   `seed`, `thinking`, `reasoning_effort`, `parallel_tool_calls`), and
   plugin-specific keys are accepted here and checked by the compiler against the
   provider plugin's schema. `thinking:` on an OpenAI provider is a compile error
@@ -3995,6 +4213,19 @@ Rules (PRD 5.9):
   capability-equivalent, so failover cannot silently break structured output.
   Failover conditions are infrastructure conditions only; content-based routing
   is out of scope — that is what graph edges are for.
+
+**One position is exempt from every promise on this page, and it is stated here
+rather than only where it is written.** A `coder:` node's `model:` (§8.9) is a
+registry address and nothing more: the adapter reads the **id** off it, plus the
+small settings subset the bound harness has a place for, and hands those to the
+harness. The *connection* does not cross — `provider.*`'s `base_url:`, its
+`headers:` and its credential are this runtime's client's, and a harness opens
+its own — and neither does a **route**: failover is a property of the caller that
+issues a request, and a harness issues its own and retries them itself. So a
+`route:` at that position is a compile error rather than a ladder quietly
+reduced to its first member, and what re-runs a failed harness run is the node's
+own `retry:` (§9.1, PRD resolved q57 ruling d, Decision
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)).
 
 ---
 
@@ -4863,6 +5094,19 @@ its runtime effect is a documented no-op (PRD 5.10, 5.11).
 | `event_sources` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: schedule` | parsed + validated, no-op | M3 |
 | `triggers.<t>.type: event` | parsed + validated, no-op | M3 |
+| `coder.harness: deepagents` | parsed, then **refused** (§8.9) | a resolved question |
+| `coder.harness: native` | parsed, then **refused** (§8.9) | a resolved question |
+
+**The two harness names are the one row that is refused rather than a no-op**,
+and the difference is what a no-op would mean here. A reserved *trigger* that
+does nothing fires nothing, and a composition declaring one runs the rest of
+itself correctly; a reserved *harness* that did nothing would be a node in the
+middle of a flow with no answer to give, so every edge below it would be
+unreachable and the flow would be a lie. They are in the grammar all the same,
+for the reason every reserved construct is: a name the enum does not have is a
+typo and gets a suggestion, while a name it has and does not lower is a **scope**
+statement and gets `unsupported-harness`, which names the two this release
+lowers (PRD resolved q57).
 
 **Three constructs have left this list, and each left it a different way.**
 
@@ -8155,6 +8399,201 @@ holding `exec:` tools does — so a placed agent runs model-authored commands on
 worker, which is what those placements are for. *PRD 5.5, 5.12, resolved q41,
 q45, q54, G3.*
 
+### D136. `kind: coder` is a node kind, and `harness:` is a binding
+
+**PRD-extending** — see this appendix's preamble.
+
+`coder:` is the ninth node kind (§7.1, §8.9), and it runs a whole coding-agent
+harness as one node. `harness:` selects which, out of a **closed** enum: `cc` and
+`codex` are lowered in v1, `deepagents` and `native` are reserved and refused
+(§15, `unsupported-harness`).
+
+**Rationale**: a kind rather than a bundle of `builtin.*` tools, because provider
+harnesses are co-trained with their models — the vendor's agent loop, its tool
+shapes and its context management are what the model was post-trained against —
+and that quality cannot be reassembled from parts an author wires together.
+[D135](#d135-a-builtin-binding-hands-the-model-the-program-and-says-so)'s
+built-ins are this runtime's own loop reaching a shell; this is somebody else's
+loop, entire.
+
+**Why `harness:` is a binding and not grammar.** The spec must never name an SDK
+type. Every other key of the block means the same thing whichever harness serves
+it, so a composition reads identically under both and a later harness is a member
+of an enum rather than a new construct — which is the same shape `provider.kind`
+gives a connection and `builtin:` gives a built-in.
+
+**Why the reserved names are spelled.** A name the enum does not have is a typo
+and is answered with a suggestion; a name it has and does not lower is a
+statement about this release's scope and is answered by naming the scope. Leaving
+`deepagents` out of the grammar would have collapsed the two into one message.
+The set grows by a resolved question rather than by a release adding a name, the
+rule §5.5's built-in set is already under. **Status**: ratified — PRD resolved
+q57. *PRD 5.5, 5.12, resolved q57.*
+
+### D137. A coder node declares its prompt and both surfaces in its own block
+
+**PRD-extending** — see this appendix's preamble.
+
+`prompt:`, `input:` and `output:` live **inside** the `coder:` block (§8.9).
+`prompt:` is required and literal, `output:` is required at one property or more,
+and `input:` is optional: declared, the node's own `input:` binds it field by
+field; omitted, the run is string-in and takes the scalar binding
+[D88](#d88-the-scalar-input-form-is-legal-only-where-an-unnamed-value-has-a-destination)
+admits.
+
+**Rationale**: the block is the *whole component*. An `agent:` node names a
+definition that carries its prompt and its schemas; a coder node has no
+definition to name, so the same three keys sit where the node is — which is
+exactly the shape a `human:` node already takes
+([D52](#d52-human-node-shape)). Writing a `coder.*` definition namespace instead
+was the alternative, and it buys reuse nobody asked for: a harness run is
+configured by *its workspace*, and two nodes sharing one definition would be two
+runs in two checkouts sharing one prompt, which is a rename away from being two
+nodes.
+
+The three keys keep §5's rules rather than inventing near-copies:
+[D13](#d13-prompt-is-required-and-literal)'s literal prompt, §5.1's non-empty
+result surface, and §5.3's string-in default. A harness run that declared no
+`output:` would be a node whose answer nothing could check, which PRD 5.2 makes
+unwritable everywhere else. **Status**: ratified — PRD resolved q57. *PRD 5.2,
+5.5, resolved q57.*
+
+### D138. A coder node's containment is a workspace, an access preset, and a tool list one harness enforces
+
+**PRD-extending** — see this appendix's preamble.
+
+`workspace:` is **required** and non-empty; `access:` takes `read_only`,
+`workspace_write` or `full_access` and defaults to `workspace_write`;
+`allow_tools:` is an optional list of the harness's own tool names, distinct and
+non-empty (§8.9).
+
+**Rationale, workspace**: a built-in defaults its workspace to a directory this
+runtime makes per execution (§6.1), and that default is sound because the
+built-in has nowhere else to be. A coder node works on a checkout somebody
+already has, so a defaulted root would be a bound nobody wrote — and containment
+is the whole of what this compiler still says about a run. Interpolable for the
+built-in's reason, and refused empty for it too.
+
+**Rationale, access**: each harness has a containment primitive of its own —
+`codex` has sandbox presets, the Agent SDK has a permission mode plus a working
+directory — and they are close enough to one vocabulary that a translation is
+checkable. The three names are `codex`'s own shape, because that is the harness
+whose primitive is *named*; a vocabulary invented here would be a mapping nobody
+could verify against anything.
+
+**Rationale, the asymmetry**: `cc` enforces `allow_tools:` inside its own loop,
+per call, through the Agent SDK's permission callback. `codex` bounds at the
+sandbox boundary only — its per-call approval tier belongs to an app server this
+release does not adopt. The two are **not** equivalent and §8.9 says so, the
+`plan` report says so, and the graph document carries it as a field
+(`docs/graph.md` §5.8) rather than leaving a reader to infer it. Refusing
+`allow_tools:` on a `codex` node was the alternative and is worse: the list is
+still what the harness is offered, and refusing it would push authors to write
+the offer nowhere at all. **Status**: ratified — PRD resolved q57 ruling c.
+*PRD 5.5, resolved q54, q57.*
+
+### D139. A coder node's `env:` is q54's, verbatim
+
+**PRD-extending** — see this appendix's preamble.
+
+`env:` is the `exec:` block's `env:` exactly (§6.1) and `inherit_env:` defaults
+to `false`: a harness and everything it forks run with a **scrubbed**
+environment holding only the declared variables, and inheriting this process's is
+an explicit opt-in.
+
+**Rationale**: it is PRD resolved q54 ruling b applied one construct along, and
+the reason is the same one. A placement's environment manifest is computed
+statically by walking what the composition declares
+(`docs/distributed.md` §9.1), and a child that inherited whatever the host
+happened to hold would make that manifest a lower bound rather than the answer. A
+harness's own credential is therefore an `${ENV}` reference in this map like
+every other secret (§4.3), which is what puts it on the manifest of the process
+that runs the node and on no other. **Status**: ratified — PRD resolved q57.
+*PRD resolved q41, q54, q57.*
+
+### D140. Harness `settings:` is a second open object, checked in two tiers
+
+**PRD-extending** — see this appendix's preamble.
+
+`settings:` inside a `coder:` block is an **open** object holding the harness's
+own configuration, checked the way a provider's `server_tools:` are
+([D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers)): a key
+the harness's curated table knows is checked strictly, and anything else is a
+warning (`unknown-harness-setting`) naming what could not be verified, travelling
+to the SDK unchanged.
+
+**This amends [D40](#d40-settings-is-the-only-open-object-in-the-logical-layer)**,
+which said `settings:` was *the* one open object in the logical layer. It is now
+one of two, and the second is here. The amendment is narrow: D40's rationale —
+that the editor schema cannot know a plugin's keys, so it types the common ones
+and permits the rest — is the same argument one level along, with a harness SDK
+in the place of a provider plugin. Nothing else about D40 moves; a model's
+`settings:` is still checked against the provider plugin's published schema, and
+unknown keys are still errors everywhere else
+([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
+
+**Rationale**: the governing constraint is PRD resolved q30's — *no manual
+support treadmill*. A harness option the vendor ships tomorrow has to be usable
+the day it ships, so a table that **gated** would be the treadmill q30 refused,
+and no table at all would make a misspelled `max_turns` a silent no-op that costs
+a run its bound. The two tiers are the same trade q30 struck, with the warning as
+the honest half. **Status**: ratified — PRD resolved q57 ruling e. *PRD 5.9,
+resolved q30, q57; §8.9.*
+
+### D141. A coder node's `model:` is a registry address, and the connection stops at the boundary
+
+**PRD-extending** — see this appendix's preamble.
+
+`model:` on a `coder:` node is a `model.*` address spelled exactly as an agent
+node spells it (§12.2). The adapter resolves it to the provider-native **id**
+plus the settings subset the bound harness accepts — `thinking:` for `cc`,
+`reasoning_effort:` for `codex` — and nothing else crosses. A `model:` naming a
+**route** is a compile error.
+
+**Rationale**: the harness owns its client, its auth and its internal retries, so
+there is nothing on the other side of this boundary for a `base_url:`, a header,
+a credential or a failover ladder to be applied to. Taking a route's first member
+is the shape this refusal exists to prevent: a composition would declare a
+failover policy, read as though it had one, and have none — the class of silent
+disagreement this compiler exists to make unwritable. What re-runs a failed
+harness run is the node's `retry:` (§9.1), which is a ladder over whole runs
+rather than over requests.
+
+The **address** is still what the composition names, which is what keeps PRD
+5.9's promise intact: swapping the model a coder node runs is a one-line edit in
+`models.yml`, exactly as it is for an agent. §12.2 states the exemption where the
+failover promise is made, so a reader meets it there rather than only here.
+**Status**: ratified — PRD resolved q57 ruling d. *PRD 5.9, resolved q53, q57;
+§8.9, §12.2.*
+
+### D142. The policy chain wraps a whole harness run, and harness-native resume is excluded
+
+**PRD-extending** — see this appendix's preamble.
+
+§9.1's chain — `retry:`, `timeout:`, `on_error:` — applies to a `coder:` node at
+every level and bounds the **whole run**. A harness run is one journaled effect
+(`docs/durability.md` §3.9): a resume consumes the recorded answer and the
+harness never runs again, and a crash mid-run recorded nothing, so the next
+attempt re-runs the run from its start.
+
+**Rationale**: a harness run is an activity like any other from §9's point of
+view — effectful, bounded, and retryable at the node — which is what makes the
+chain apply with no carve-out to remember. The alternative would have been an
+exemption like the one [D102](#d102-a-human-node-resolves-no-timeout-and-no-retry-at-any-level)
+gives a `human` node, and it does not fit: a `human` node's wait is somebody
+else's clock, while a harness run is this process's own work and a deadline over
+it means exactly what a deadline means anywhere else.
+
+**Harness-native resume is a named exclusion, not a foreclosure.** Both SDKs can
+resume their own sessions, and both keep that state in a machine-local session
+store. Depending on it would break the invariant that the journal is the complete
+hub state (PRD resolved q44, `docs/durability.md` §12) and would break resolved
+q42's redispatch, where a worker is handed a node's journaled effect history and
+replays to the frontier — a local store on the wrong machine is no history at
+all. The stores are debugging backstops, and a partial run's cost is the accepted
+price of that invariant. **Status**: ratified — PRD resolved q57 ruling b.
+*PRD 5.11, resolved q26–q29, q42, q44, q57; §9.1, §9.3.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -8394,6 +8833,18 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
 # <bindings> = field map, or a bare CEL scalar where D88 allows one (marked)
 { agent: agent.<a>,  input: <bindings>, writes: {...}, retry/timeout/on_error }
                      # scalar input: only for a string-in agent
+{ coder: { harness: cc|codex,          # deepagents|native are RESERVED (15)
+           model: model.<m>,           # direct only — never a route (D141)
+           workspace: <interpolable>,  # required; no default (D138)
+           access?: read_only|workspace_write|full_access,
+           prompt: <text>,             # literal, like an agent's (D13)
+           input?: <field map>,        # omitted = string-in (5.3)
+           output: <field map>,        # required, >= 1 property
+           allow_tools?: [<name>, ...],# cc enforces in-loop; codex does not
+           env?: {...}, inherit_env?: <bool>,
+           settings?: {...} },         # open, two tiers (D140)
+                     input: <bindings>, writes: {...}, retry/timeout/on_error }
+                     # scalar input: only where the block declares no input:
 { function: tool.<t>, input: <field map>, writes: {...} }
 { flow: flow.<f>,    input: <field map>, writes: {...}, context: isolated|inherit,
                      policy: {...},                    # for the nodes inside —
