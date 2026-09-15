@@ -1228,8 +1228,9 @@
               "$ref": "#/$defs/agentOutputFieldMap"
             },
             "allow_tools": {
-              "description": "The harness's own tool names this run may use. What enforces the list differs per harness and this grammar states the asymmetry rather than implying equivalence: `cc` enforces it in-loop, per call, while `codex` bounds at its sandbox only (Decision D138).",
+              "description": "The harness's own tool names this run may use. What enforces the list differs per harness and this grammar states the asymmetry rather than implying equivalence: `cc` enforces it in-loop, per call, while `codex` bounds at its sandbox only (Decision D138). Written EMPTY it is refused: omitting the key is how a run takes the harness's own default set, so `[]` would be a second spelling of the widest surface there is - written by somebody who meant the narrowest (grammar 8.9).",
               "type": "array",
+              "minItems": 1,
               "uniqueItems": true,
               "items": { "type": "string", "minLength": 1 }
             },

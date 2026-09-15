@@ -1,0 +1,29 @@
+# rule: `allow_tools: []` is refused; omitting the key is how a run takes the
+# rule: harness's own default set (grammar 8.9, D138)
+# code: invalid-value
+# message: `allow_tools` of the `coder` block of node `build` must list at least one tool
+# at: 25:22
+# help: omitting `allow_tools:` is how a run takes the harness's own default set; `[]` is that same default rather than a denial, and a run that may call no tools at all is an `agent:` node (grammar 8.9)
+#
+# The containment key whose emptiest value would otherwise be its most
+# permissive: an omitted list is the harness's whole default set, an empty list
+# is emitted as an omitted one, and the author who writes `[]` means the
+# opposite of what they would get. `input: {}` is refused for the same reason
+# one construct along.
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+        allow_tools: []
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

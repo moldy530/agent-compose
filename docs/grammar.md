@@ -3036,7 +3036,7 @@ implement:
 | `prompt` | string (non-empty) | **yes** | — | the run's instructions; literal text, no templating ([D13](#d13-prompt-is-required-and-literal)) |
 | `input` | field map (input surface) | no | string-in | §5.3's rule, one construct along |
 | `output` | field map (result surface, §3.5) | **yes** | — | MUST have ≥ 1 property; the output gate parses it in full |
-| `allow_tools` | array of non-empty, distinct strings | no | the harness's own set | the harness's tool names; what enforces it differs per harness (below) |
+| `allow_tools` | non-empty array of non-empty, distinct strings | no | the harness's own set | the harness's tool names; what enforces it differs per harness (below) |
 | `env` | map env-var-name → string (interpolable) | no | `{}` | exactly the `exec:` shape (§6.1) |
 | `inherit_env` | boolean | no | `false` | the explicit opt-in to inheriting this process's environment |
 | `settings` | open object | no | `{}` | harness config, checked in two tiers ([D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers)) |
@@ -3097,6 +3097,13 @@ document states the asymmetry rather than implying the two are equivalent:
   *offered* and the sandbox preset is what holds. `agent-compose plan` says which
   of the two a node is, and so does the graph document's `tools_enforced`
   ([`docs/graph.md`](graph.md) §5.8).
+
+**`allow_tools: []` is refused.** Omitting the key is how a run takes the
+harness's own default set, so an empty list is a second spelling of the *widest*
+surface there is — and an author writes it meaning the narrowest. The two are
+indistinguishable everywhere downstream, so the grammar refuses the spelling
+instead of choosing a meaning for it ([D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)).
+A run that may call no tools at all is an `agent:` node (§5), not a harness run.
 
 **`env:` is PRD resolved q54 ruling b, verbatim.** The harness and everything it
 forks run with a **scrubbed** environment holding only the declared variables,
@@ -8476,8 +8483,8 @@ unwritable everywhere else. **Status**: ratified — PRD resolved q57. *PRD 5.2,
 
 `workspace:` is **required** and non-empty; `access:` takes `read_only`,
 `workspace_write` or `full_access` and defaults to `workspace_write`;
-`allow_tools:` is an optional list of the harness's own tool names, distinct and
-non-empty (§8.9).
+`allow_tools:` is an optional list of the harness's own tool names — each entry
+non-empty, all of them distinct, and the list itself never written empty (§8.9).
 
 **Rationale, workspace**: a built-in defaults its workspace to a directory this
 runtime makes per execution (§6.1), and that default is sound because the
@@ -8501,7 +8508,17 @@ release does not adopt. The two are **not** equivalent and §8.9 says so, the
 (`docs/graph.md` §5.8) rather than leaving a reader to infer it. Refusing
 `allow_tools:` on a `codex` node was the alternative and is worse: the list is
 still what the harness is offered, and refusing it would push authors to write
-the offer nowhere at all. **Status**: ratified — PRD resolved q57 ruling c.
+the offer nowhere at all.
+
+**Rationale, the empty list**: `allow_tools: []` is a **compile error**, for the
+reason `input: {}` is one (§5.3) and an empty `workspace:` is one. Omitting the
+key is the whole of how a run takes the harness's own default set, so an empty
+sequence is a second spelling of the widest surface there is — written by
+somebody who meant the narrowest. Nothing downstream could tell the two apart,
+and a containment key whose emptiest value is its most permissive is the one
+shape this decision exists to refuse. The list is not how a run is given *no*
+tools: a harness run that may call nothing is an `agent:` node (§5), and the
+diagnostic says so. **Status**: ratified — PRD resolved q57 ruling c.
 *PRD 5.5, resolved q54, q57.*
 
 ### D139. A coder node's `env:` is q54's, verbatim

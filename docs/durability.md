@@ -189,7 +189,7 @@ A surface added to `src/runtime.ts` that calls the world and is not journaled is
 a replay that issues it twice — and it is not one of the nine, contains no
 `journaled(` and no `.claim(`, and is in no table, so nothing else in the
 repository would notice. So every call to the world in every emitted constant
-module is required to sit in a declaration the eight transitively reach.
+module is required to sit in a declaration the nine transitively reach.
 
 What counts as a call to the world is **derived rather than listed**, because a
 list of spellings is only as complete as the last person to extend it: `spawn(`
@@ -793,7 +793,8 @@ An effect's journal key is
   id, which is a column of its own. A node's activity uses the node's own path;
   a `map` dispatch uses the dispatch's, `<node>/<traversal>/<index>`; anything
   inside a `flow:` node or a flow-as-tool call uses that instance's.
-* `<kind>` is one of `model`, `tool`, `store`, `human` (§3).
+* `<kind>` is one of `model`, `tool`, `store`, `human`, `harness` — §3's five,
+  and the whole vocabulary a key can carry.
 * `<ordinal>` counts effects of that kind at that site, from `0`.
 
 `#` separates the two halves because it appears in neither: a node id is an

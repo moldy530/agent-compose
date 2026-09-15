@@ -1037,13 +1037,38 @@ fn coder_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<CoderBlock> {
 /// a non-empty string and that no name is written twice, which is the same pair
 /// of rules every other list of names in this grammar is held to. Which harness
 /// *enforces* the list is the asymmetry grammar 8.9 states out loud.
+///
+/// **`allow_tools: []` is refused**, for the reason `input: {}` is (§5.3) and
+/// `workspace: ""` is (D138): omitting the key is the whole of how a run takes
+/// the harness's own default set, so an empty sequence is a second spelling of
+/// it that reads like the opposite. Nothing downstream could tell the two
+/// apart — the emitted binding omits an empty list, and an omitted list is the
+/// default set — so an author who wrote `[]` meaning "call nothing" would get
+/// the widest surface the harness has. A run that may call no tools is an
+/// `agent:` node rather than a harness run, which is the answer this refusal
+/// points at.
 fn allow_tools(fields: &mut Fields<'_>, context: &str, cx: &mut Cx) -> Vec<Spanned<String>> {
     let Some(node) = fields.take("allow_tools") else {
         return Vec::new();
     };
+    let span = node.span.clone();
     let Some(items) = expect_sequence(node, &format!("`allow_tools` of {context}"), cx) else {
         return Vec::new();
     };
+    if items.is_empty() {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                span,
+                format!("`allow_tools` of {context} must list at least one tool"),
+            )
+            .with_help(
+                "omitting `allow_tools:` is how a run takes the harness's own default set; `[]` \
+                 is that same default rather than a denial, and a run that may call no tools at \
+                 all is an `agent:` node (grammar 8.9)",
+            ),
+        );
+    }
     let mut names: Vec<Spanned<String>> = Vec::new();
     for item in items {
         let Some(name) = lexical::non_empty_text(item, "an `allow_tools` entry", cx) else {

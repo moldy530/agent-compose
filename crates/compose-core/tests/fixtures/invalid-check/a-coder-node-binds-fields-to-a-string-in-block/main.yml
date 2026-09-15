@@ -1,0 +1,38 @@
+# rule: a coder node that declares no `input:` takes one unnamed string, so the
+# rule: node cannot bind fields by name (grammar 8.9, 5.3, D137, D88)
+# code: type-mismatch
+# message: node `build` binds input fields by name, but its `coder:` block is string-in
+# at: main.yml:35:9
+# help: a `coder:` block that declares no `input:` takes a single unnamed string: bind it with the scalar form, `input: "<CEL>"` (grammar 8.9, Decisions D137, D88)
+#
+# The other half of the form pairing, and it names the same construct: the block
+# is where `input:` would have been declared, and naming an agent here would
+# point at a definition this composition does not have.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

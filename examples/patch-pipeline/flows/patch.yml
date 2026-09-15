@@ -80,6 +80,15 @@ flow.patch:
         output:
           verdict: { enum: [approve, revise] }
           feedback: { type: string }
+        # Scrubbed here too, and this is the half that is easy to forget: the
+        # provider connection in `providers.yml` does not reach inside a run, so
+        # `model.reviewer` resolving through `provider.openai` gives this harness
+        # no credential at all. A harness reads its auth from the environment the
+        # node declares, like every other secret (grammar 8.9, PRD resolved q57
+        # ruling c/d).
+        env:
+          PATH: /usr/bin:/bin
+          OPENAI_API_KEY: ${OPENAI_API_KEY}
         settings:
           web_search: disabled
           network_access: false

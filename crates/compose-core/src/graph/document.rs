@@ -744,8 +744,12 @@ pub struct CoderView {
     /// is: `false` is the containment claim, and a reader should not have to
     /// know it is the default to read it.
     pub inherit_env: bool,
-    /// `settings:` sorted by key — the harness config, exactly as a model's
-    /// `settings:` reach this document.
+    /// `settings:` in **declaration order** — the harness config, each value
+    /// reaching JSON as JSON exactly as a model's `settings:` do. The *order*
+    /// is not a model's: a model's settings reach the IR through a keyed map
+    /// and come out sorted, a coder node's are held as written, and
+    /// `docs/graph.md` §9.1 fixes this one with the node's other two lists
+    /// (`env`, `allow_tools`) rather than leaving a consumer to infer it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub settings: Vec<SettingView>,
 }

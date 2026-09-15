@@ -330,7 +330,7 @@ be hiding the one fact a reader most needs.
 | `tools_enforced` | boolean | always | Whether this harness enforces `allow_tools` **inside its own loop** rather than bounding at its sandbox alone. It is a fact about the *harness* and is in no composition, which is why it is here: two nodes with identical lists are not under identical bounds, and PRD resolved q57 ruling c makes stating that this document's job. |
 | `env` | array of [bindings](#4-schemas-and-bindings) | when the node declares any | `env:`, in declaration order, values as written. Absent means a wholly scrubbed child environment. |
 | `inherit_env` | boolean | always | `inherit_env:`, with the default materialized for `access`'s reason: `false` is the containment claim. |
-| `settings` | array of [settings](#8-agents) | when the node declares any | The harness config by key, reaching JSON as JSON — the same treatment a model's `settings:` get. |
+| `settings` | array of [settings](#8-agents) | when the node declares any | The harness config **in declaration order**, each value reaching JSON as JSON — the same treatment a model's `settings:` get, in a different order: a model's reach this document sorted by key, and this block's are held as written (§9.1). |
 
 ---
 
@@ -495,8 +495,9 @@ At a given `graph_version`, a reader MAY rely on:
 * the orders this document fixes — `flows` by address, a flow's `nodes` in
   declaration order with each satellite after its map, `edges` as §6 states,
   `routes` with `default:` last, a model's `route` in failover order, a
-  provider's `config` and a model's `settings` by key, and every field map in
-  declaration order;
+  provider's `config` and a model's `settings` by key, a coder node's
+  `settings`, `env` and `allow_tools` in declaration order, and every field map
+  in declaration order;
 * that `id` is unique within a flow, that every `from` and `to` names a node the
   same flow's `nodes` array holds, and that a `map_route` edge's `to` is the
   `node` of one of that map's `routes`.

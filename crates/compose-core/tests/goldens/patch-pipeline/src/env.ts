@@ -38,6 +38,7 @@ export const environmentReferences: readonly EnvironmentReference[] = [
   {
     name: "OPENAI_API_KEY",
     sites: [
+      "flow.patch.node.review.env.OPENAI_API_KEY",
       "provider.openai.api_key",
     ],
   },

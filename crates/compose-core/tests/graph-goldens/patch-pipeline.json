@@ -256,6 +256,16 @@
             "access": "read_only",
             "prompt": "You are reviewing a change somebody else just made in this repository.\nRead the working tree, decide whether it satisfies the goal, and say\nwhat would have to change if it does not.\n",
             "tools_enforced": false,
+            "env": [
+              {
+                "name": "PATH",
+                "expression": "/usr/bin:/bin"
+              },
+              {
+                "name": "OPENAI_API_KEY",
+                "expression": "${OPENAI_API_KEY}"
+              }
+            ],
             "inherit_env": false,
             "settings": [
               {

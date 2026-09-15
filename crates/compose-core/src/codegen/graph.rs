@@ -2546,6 +2546,11 @@ fn coder_descriptor(
                 .as_str()
         )
     ));
+    // Omitted where the node declared none, which is the harness's own default
+    // set — and the *only* way this key is absent, because `allow_tools: []` is
+    // refused at the parser (`parse::flow::allow_tools`). An empty list that
+    // reached here would be emitted as an absent one and read as "every tool the
+    // harness has", so the two spellings are kept from ever meeting.
     if !coder.allow_tools.is_empty() {
         text.push_str("  allowTools: [");
         for (index, name) in coder.allow_tools.iter().enumerate() {
@@ -2618,10 +2623,11 @@ fn direct_model<'ir>(
 ///
 /// The Rust half of a table the emitted runtime declares too
 /// (`HARNESS_MODEL_SETTINGS` in `src/runtime.ts`): the filter runs here, at
-/// build time, and the runtime's copy is what a driver reads when it spells the
-/// key its own SDK takes. `the_harness_model_settings_table_is_one_table` holds
-/// the two together, because a filter and a driver disagreeing about which keys
-/// cross would drop a setting with nothing failing.
+/// build time, and the runtime's copy declares the same list where a reader of
+/// the artifact meets it — beside the drivers that spell those keys out for
+/// their own SDKs. `the_harness_model_settings_table_is_one_table` holds all
+/// three together, because a filter, a declaration and a driver disagreeing
+/// about which keys cross would drop a setting with nothing failing.
 ///
 /// Deliberately **small**, and grounded on both sides: an entry has to be a key
 /// the provider plugin behind that harness's models really publishes
@@ -6328,6 +6334,93 @@ flow.f:
             declaration(&emitted, "flowFNodeEachMap:").contains("input: (roots) => ({\n      }),"),
             "…and so does a `map` dispatch onto the same flow, which is the \
              position that already answered:\n{emitted}"
+        );
+    }
+
+    /// **The two harness/model-settings tables are one table.**
+    ///
+    /// [`harness_model_settings`] decides at build time which of a `model.*`'s
+    /// `settings:` keys cross into a harness's config;
+    /// `HARNESS_MODEL_SETTINGS` in `src/runtime.ts` is the same list declared
+    /// for the drivers that read those keys back out of
+    /// `HarnessRun.modelSettings`. Two hand-maintained copies of one document
+    /// drift in silence — a key added to one row and not the other is a setting
+    /// an author declared and nothing applies, with every test still green — so
+    /// this is what holds them together.
+    ///
+    /// Read in **three** directions, because a key that crosses has to appear
+    /// in three places:
+    ///
+    ///  1. every key the filter lets cross is in the emitted table's row;
+    ///  2. the emitted row holds no key the filter would drop — the direction a
+    ///     reader of `src/runtime.ts` would be misled by, since that file is
+    ///     what documents the boundary to somebody reading the artifact;
+    ///  3. each key is really read by that harness's driver, which is the whole
+    ///     reason either table exists.
+    #[test]
+    fn the_harness_model_settings_table_is_one_table() {
+        let runtime = include_str!("js/runtime.ts");
+        let table = runtime
+            .split_once("export const HARNESS_MODEL_SETTINGS")
+            .expect("`src/runtime.ts` declares the runtime half of this table")
+            .1;
+        let table = &table[..table
+            .find("\n};")
+            .expect("…and declares it as one object literal")];
+
+        for (harness, name, driver, module) in [
+            (
+                Harness::Cc,
+                "cc",
+                include_str!("js/harness-cc.ts"),
+                "src/harness-cc.ts",
+            ),
+            (
+                Harness::Codex,
+                "codex",
+                include_str!("js/harness-codex.ts"),
+                "src/harness-codex.ts",
+            ),
+        ] {
+            let row = table
+                .split_once(&format!("\n  {name}: ["))
+                .unwrap_or_else(|| panic!("the emitted table has no `{name}` row"))
+                .1;
+            let row = &row[..row.find(']').expect("…closed on its own line")];
+            let emitted: Vec<&str> = row
+                .split(',')
+                .map(|piece| piece.trim().trim_matches('"'))
+                .filter(|piece| !piece.is_empty())
+                .collect();
+            assert_eq!(
+                emitted,
+                harness_model_settings(harness),
+                "`HARNESS_MODEL_SETTINGS.{name}` in `src/runtime.ts` and \
+                 `harness_model_settings({harness:?})` are two copies of one table and have \
+                 parted company: a key in one and not the other is a `settings:` this compiler \
+                 filters on one rule and the runtime documents under another"
+            );
+            for key in harness_model_settings(harness) {
+                assert!(
+                    driver.contains(&format!("run.modelSettings[\"{key}\"]")),
+                    "`{key}` crosses into a `{name}` run and `{module}` never reads it, so the \
+                     setting is filtered in, carried through, and applied to nothing"
+                );
+            }
+        }
+
+        // The two reserved harnesses take nothing, which is the answer that
+        // claims least — and the emitted table does not name them at all,
+        // because `validate` refuses a composition that binds one.
+        for reserved in [Harness::DeepAgents, Harness::Native] {
+            assert!(
+                harness_model_settings(reserved).is_empty(),
+                "a reserved harness has no SDK to take a setting"
+            );
+        }
+        assert!(
+            !table.contains("deepagents:") && !table.contains("native:"),
+            "the emitted table names a harness this release lowers no driver for"
         );
     }
 }
