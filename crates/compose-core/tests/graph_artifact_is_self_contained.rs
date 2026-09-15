@@ -247,7 +247,7 @@ fn the_compositions_own_urls_are_in_the_document_and_not_in_the_template() {
         );
     }
     assert!(
-        page.document.contains("\"graph_version\": 1"),
+        page.document.contains("\"graph_version\": 2"),
         "the document half is the document"
     );
 }

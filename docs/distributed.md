@@ -1476,7 +1476,16 @@ Which gives, concretely:
   exists to catch;
 - a variable reachable in two processes belongs to both. Two placed agents
   attaching one unplaced tool is the ordinary case, and the tool's secrets go to
-  both placements.
+  both placements;
+- a variable a **`coder:` node** declares — its `workspace:`, and every value of
+  its `env:` (grammar §8.9, PRD resolved q57) — belongs to the **hub's**
+  manifest, and to no placement's. A coder node is declared in a flow rather
+  than defined, and §14.1's `members:` binds *components*, so there is nothing
+  for a placement to claim: the node runs where its flow runs, which is the hub.
+  It is filed under the node's own address rather than a definition's for the
+  same reason. Should a later release make one placeable, this bullet is where
+  the rule moves, and the walk above needs no other edit — a coder node's
+  references enter the closure exactly as a `builtin:` tool's do.
 
 **One of a tool's `${ENV}` references is declared rather than walked, and the
 closure does not care.** A `module:` binding names hand-written TypeScript

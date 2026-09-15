@@ -1034,7 +1034,7 @@ mod tests {
         };
         let json = document.to_json().expect("the document serializes");
         assert!(
-            json.starts_with("{\n  \"graph_version\": 1,"),
+            json.starts_with("{\n  \"graph_version\": 2,"),
             "the document opens with its version: {json}"
         );
         assert!(json.ends_with("}\n"), "and ends with a newline");

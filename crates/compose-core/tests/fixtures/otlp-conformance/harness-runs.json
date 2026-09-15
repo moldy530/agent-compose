@@ -1,0 +1,784 @@
+{
+  "name": "harness-runs",
+  "about": "A `coder:` node's harness runs, as child spans under their entry (`docs/trace.md` §7.6, §12.5, PRD resolved q57). Two runs on one entry, which is what a `retry:` ladder leaves behind: the first failed and carries its turns, its tool events and the error that ended it, and the second answered. Between them they reach every optional field of the record — usage per turn on one harness and a cost rollup in money on the other, the three-member tool vocabulary, the harness-tagged extras, and a `replayed` run a resume consumed out of the journal.",
+  "context": {
+    "target": "local",
+    "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000c0",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T15:00:00.000Z",
+    "endedAt": "2026-09-01T15:04:00.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "flow": "flow.patch",
+    "execution_id": "exec_harness",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.patch",
+        "node": "implement",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 2,
+        "writes": [
+          "summary"
+        ],
+        "harness": [
+          {
+            "harness": "cc",
+            "sdk": "@anthropic-ai/claude-agent-sdk@0.3.272",
+            "model": "model.implementer",
+            "modelId": "claude-sonnet-4-5",
+            "outcome": "failed",
+            "turns": [
+              {
+                "index": 0
+              },
+              {
+                "index": 1
+              }
+            ],
+            "toolCalls": [
+              {
+                "name": "Read",
+                "outcome": "completed"
+              },
+              {
+                "name": "Write",
+                "outcome": "failed",
+                "error": "read-only file system"
+              },
+              {
+                "name": "WebFetch",
+                "outcome": "refused",
+                "error": "`flow.patch.node.implement` allows `Bash`, `Read`, and `WebFetch` is not one of them"
+              }
+            ],
+            "cost": {
+              "turns": 2,
+              "inputTokens": 4100,
+              "outputTokens": 620,
+              "usd": 0.0412
+            },
+            "extra": {
+              "subtype": "error_during_execution",
+              "stopReason": null
+            },
+            "error": "HarnessRunFailed: the sandbox refused to start"
+          },
+          {
+            "harness": "cc",
+            "sdk": "@anthropic-ai/claude-agent-sdk@0.3.272",
+            "model": "model.implementer",
+            "modelId": "claude-sonnet-4-5",
+            "outcome": "completed",
+            "turns": [
+              {
+                "index": 0
+              }
+            ],
+            "toolCalls": [
+              {
+                "name": "Edit",
+                "outcome": "completed"
+              }
+            ],
+            "cost": {
+              "turns": 1,
+              "inputTokens": 1800,
+              "outputTokens": 240,
+              "usd": 0.019
+            },
+            "extra": {
+              "subtype": "success",
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "step": 2,
+        "flow": "flow.patch",
+        "node": "review",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [
+          "feedback"
+        ],
+        "harness": [
+          {
+            "harness": "codex",
+            "sdk": "@openai/codex-sdk@0.154.0",
+            "model": "model.reviewer",
+            "modelId": "gpt-5-codex",
+            "outcome": "completed",
+            "turns": [
+              {
+                "index": 0,
+                "usage": {
+                  "inputTokens": 900,
+                  "cachedInputTokens": 128,
+                  "outputTokens": 310,
+                  "reasoningTokens": 96
+                }
+              }
+            ],
+            "toolCalls": [
+              {
+                "name": "command_execution",
+                "outcome": "completed"
+              }
+            ],
+            "cost": {
+              "turns": 1,
+              "inputTokens": 900,
+              "outputTokens": 310
+            },
+            "extra": {
+              "cachedInputTokens": 128,
+              "cacheWriteInputTokens": 0
+            },
+            "replayed": true
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.patch"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "local"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:00000000000000000000000000000000000000000000000000000000000000c0"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "local"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "534b8dbb6f33b79b028cc3cd846f896d",
+                "spanId": "3d904d624a6b5465",
+                "name": "flow.patch",
+                "kind": 1,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275040000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_harness"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.patch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "534b8dbb6f33b79b028cc3cd846f896d",
+                "spanId": "d037e40c1801faad",
+                "parentSpanId": "3d904d624a6b5465",
+                "name": "implement",
+                "kind": 1,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275040000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_harness/implement/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.patch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "implement"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "summary"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "534b8dbb6f33b79b028cc3cd846f896d",
+                "spanId": "f6b822dab860b39a",
+                "parentSpanId": "d037e40c1801faad",
+                "name": "cc",
+                "kind": 3,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275040000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.harness",
+                    "value": {
+                      "stringValue": "cc"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.sdk",
+                    "value": {
+                      "stringValue": "@anthropic-ai/claude-agent-sdk@0.3.272"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.implementer"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.model_id",
+                    "value": {
+                      "stringValue": "claude-sonnet-4-5"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.outcome",
+                    "value": {
+                      "stringValue": "failed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.turns",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.input_tokens",
+                    "value": {
+                      "intValue": "4100"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.output_tokens",
+                    "value": {
+                      "intValue": "620"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.cost_usd",
+                    "value": {
+                      "doubleValue": 0.0412
+                    }
+                  },
+                  {
+                    "key": "agentcompose.error",
+                    "value": {
+                      "stringValue": "HarnessRunFailed: the sandbox refused to start"
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "turn",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.harness.turn",
+                        "value": {
+                          "intValue": "0"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "turn",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.harness.turn",
+                        "value": {
+                          "intValue": "1"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "Read"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "completed"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "Write"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "failed"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.error",
+                        "value": {
+                          "stringValue": "read-only file system"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "WebFetch"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "refused"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.error",
+                        "value": {
+                          "stringValue": "`flow.patch.node.implement` allows `Bash`, `Read`, and `WebFetch` is not one of them"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 2,
+                  "message": "HarnessRunFailed: the sandbox refused to start"
+                }
+              },
+              {
+                "traceId": "534b8dbb6f33b79b028cc3cd846f896d",
+                "spanId": "b014650c9b4282c7",
+                "parentSpanId": "d037e40c1801faad",
+                "name": "cc",
+                "kind": 3,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275040000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.harness",
+                    "value": {
+                      "stringValue": "cc"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.sdk",
+                    "value": {
+                      "stringValue": "@anthropic-ai/claude-agent-sdk@0.3.272"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.implementer"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.model_id",
+                    "value": {
+                      "stringValue": "claude-sonnet-4-5"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.turns",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.input_tokens",
+                    "value": {
+                      "intValue": "1800"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.output_tokens",
+                    "value": {
+                      "intValue": "240"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.cost_usd",
+                    "value": {
+                      "doubleValue": 0.019
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "turn",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.harness.turn",
+                        "value": {
+                          "intValue": "0"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "Edit"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "completed"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "534b8dbb6f33b79b028cc3cd846f896d",
+                "spanId": "ac271f99139fea12",
+                "parentSpanId": "3d904d624a6b5465",
+                "name": "review",
+                "kind": 1,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275040000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_harness/review/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.patch"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "review"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "2"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "feedback"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "534b8dbb6f33b79b028cc3cd846f896d",
+                "spanId": "2236e35d0d3b70f1",
+                "parentSpanId": "ac271f99139fea12",
+                "name": "codex",
+                "kind": 3,
+                "startTimeUnixNano": "1788274800000000000",
+                "endTimeUnixNano": "1788275040000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.harness",
+                    "value": {
+                      "stringValue": "codex"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.sdk",
+                    "value": {
+                      "stringValue": "@openai/codex-sdk@0.154.0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.reviewer"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.model_id",
+                    "value": {
+                      "stringValue": "gpt-5-codex"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.turns",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.input_tokens",
+                    "value": {
+                      "intValue": "900"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.output_tokens",
+                    "value": {
+                      "intValue": "310"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.harness.replayed",
+                    "value": {
+                      "stringValue": "true"
+                    }
+                  }
+                ],
+                "events": [
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "turn",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.harness.turn",
+                        "value": {
+                          "intValue": "0"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.harness.input_tokens",
+                        "value": {
+                          "intValue": "900"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.harness.cached_input_tokens",
+                        "value": {
+                          "intValue": "128"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.harness.output_tokens",
+                        "value": {
+                          "intValue": "310"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.harness.reasoning_tokens",
+                        "value": {
+                          "intValue": "96"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "timeUnixNano": "1788274800000000000",
+                    "name": "tool_call",
+                    "attributes": [
+                      {
+                        "key": "agentcompose.tool.name",
+                        "value": {
+                          "stringValue": "command_execution"
+                        }
+                      },
+                      {
+                        "key": "agentcompose.tool.outcome",
+                        "value": {
+                          "stringValue": "completed"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

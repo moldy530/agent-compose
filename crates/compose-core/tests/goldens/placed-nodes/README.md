@@ -32,6 +32,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
+| `src/harness.ts` | the coding-harness drivers a `coder:` node reaches its SDK through, one per harness this composition binds, plus a scripted driver for tests. The one generated module whose *imports* depend on the composition (grammar 8.9) |
 | `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
 | `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
 | `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |

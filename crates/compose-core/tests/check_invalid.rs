@@ -93,6 +93,8 @@ const CHECK_CODES: &[&str] = &[
     "invalid-module-path",
     "invalid-dependency",
     "io-error",
+    "unsupported-harness",
+    "unknown-harness-setting",
 ];
 
 struct Anchor {

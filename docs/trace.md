@@ -277,6 +277,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` abandoned its instance mid-flight, which leaves no trace to carry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). Never empty: a node that performed none carries no key. See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). Never empty: a node that made none carries no key. See §7. |
+| `harness` | array of [harness runs](#76-a-harness-run) | `coder` nodes that started a run | Every coding-harness run this node execution made (grammar §8.9, PRD resolved q57). A coder node makes **one run per attempt**, so what an entry carries across a `retry:` ladder is one record per attempt, in the order they were made — the same set rule `models` is under, and for the same reason: a run that failed on the first attempt really ran. Never empty: a node that started none carries no key, which is the one coder entry with no run behind it — a node whose *input* could not be built, exactly as that leaves `inner` off a `flow:` node. A node that is not a `coder` node never carries it. See §7.6. |
 | `human` | [a pause](#34-a-human-nodes-pause) | `human` nodes that began a wait | What the wait did: when it began, how long it had, and how it ended (grammar §8.7). On every entry of a `human` node that got as far as pausing, which is all three ways one ends — an answer, an expiry, and a run that ended holding it — told apart *inside* the record rather than by its absence. The key is absent on the one `human` entry with no wait behind it: a node whose *input* could not be built, which fails the execution before the activity runs (`attempts: 0`), exactly as it leaves `inner` off a `flow:` node. A node that is not a `human` node never carries it. **What the human answered is not in it**, and that is a rule of this format rather than an omission — see §11. |
 | `error` | string | `"skipped"`, `"failed"` | What went wrong, as `<error name>: <message>` — the failure's class and its text, in that one shape on **every** entry that carries the field, whether the node aborted the run, took a `fallback:`, or had its failure absorbed by `on_error: skip`. On both of those outcomes without exception — including both shapes of `"failed"`, the one that ended the run and the one that took a `fallback:` — and never on `"completed"`: an outcome says what became of a failure, not whether there was one to describe (§3.2). Written for a person: §10.1 makes the text something a reader must not parse, and it can quote what the other side of an activity answered — §11.1 is what it may and may not hold. |
 | `fallback` | string | when a declared control transfer replaced this node's own edges | The node id control went to instead, and there are two keys that declare one: `on_error: { fallback: … }` after a failure (grammar §9.2), and a `human` node's `on_timeout:` after its wait ran out (grammar §8.7, which gives it §9.2's targets). `"__end__"` for the terminal pseudo-node. Read `human` to tell the two apart on an entry that could be either. |
@@ -840,6 +841,108 @@ nothing recorded before is recorded differently, and §11's exclusions are
 untouched — the mechanism is a fact about the *request's* shape, not about the
 prompt, the answer, or anything a provider was told.
 
+### 7.6 A harness run
+
+`HarnessRecord`, on `TraceEntry.harness`. A `coder:` node (grammar §8.9) runs a
+whole coding-agent harness as one node, and this is what that run leaves behind.
+
+**A record type of its own rather than a model call with more fields on it**, and
+that is half the reason it exists: [§7.3](#73-tool-calls)'s claim that an agent's
+tool loop is *the one place* a compiled graph does work a model asked for
+survives untouched, because a harness run is not an agent's tool loop and does
+not pretend to be one. The other half is that the two harnesses report
+differently — one an estimated cost in money, the other tokens per turn — and one
+shape should not lie about which.
+
+**The envelope carries top-level turns and tool events only.** A harness that
+runs subagents of its own yields their turns and their tool calls too, and those
+stay in the durability journal's private payload with every other tool's answer
+(`docs/durability.md` §3.9, §8, PRD resolved q50). What a reader gets here is the
+shape of the run, not its transcript.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `harness` | `HarnessName` — `"cc"` \| `"codex"` | always | Which harness ran it: the `harness:` keyword the composition wrote (grammar §8.9). A closed vocabulary, and the two reserved names of grammar §15 are **not** members — `validate` refuses a composition that binds one, so no run under one exists to record. |
+| `sdk` | string | always | The SDK package this compiler release reached it through and the version it pinned, as `<package>@<version>`. It is what joins a trace to the `package.json` of the project that produced it. |
+| `model` | string | always | The `model.*` the composition named (grammar §12.2). |
+| `modelId` | string | always | The provider-native model id that address resolved to, which is what the harness was actually handed (grammar §8.9, Decision D141). |
+| `outcome` | `"completed"` \| `"failed"` | always | Whether the run produced an answer this node went on with. `"completed"` means the answer also passed the node's `output:` gate; a run whose answer the gate refused is `"failed"`, because what the node got was not an answer it could use. There is no third member: a harness's own refusals are inside its loop and are `toolCalls` entries, not outcomes of the run. |
+| `turns` | array of [turns](#761-a-turn), possibly empty | always | The run's **top-level** turns, in the order the harness took them. Empty on a run that failed before its first turn — a harness that could not start. |
+| `toolCalls` | array of [tool events](#763-a-tool-event) | when the run made any | Its top-level tool events, in the order it made them. Never empty: a run that called nothing carries no key. |
+| `cost` | [a rollup](#764-what-a-run-cost) | always | What the run cost, as far as this harness reports it. |
+| `extra` | object | when this harness reports something the other has no shape for | Harness-native extras, read **under `harness`**: its keys are that harness's own vocabulary and this format fixes none of them. It is the deliberate escape hatch PRD resolved q57 ruling a asks for — the alternative was a fixed row that would have to invent a value for whichever harness did not supply one. A reader that does not know a key ignores it, which is what §10.1 already requires. |
+| `replayed` | `true` | on a run a resume consumed out of the journal | The run happened in an **earlier** generation of this execution and this one consumed its recorded answer rather than running the harness again (`docs/durability.md` §3.9, §9). Present only when true, so its absence is a run this process performed. |
+| `error` | string | `"failed"` | What ended the run, in §3's `<error name>: <message>` shape: the harness reported a fatal error, it produced no structured output at all, or its answer failed the node's `output:` gate. Written for a person — §10.1 makes the text something a reader must not parse. |
+
+#### 7.6.1 A turn
+
+`HarnessTurn`, on `HarnessRecord.turns`.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `index` | integer | always | Its ordinal in the run, counting from `0`. |
+| `usage` | [usage](#762-what-a-turn-used) | when the harness reports usage per turn | What this turn used. A harness that reports usage for the **run** rather than per turn carries no key here, and its totals are in `cost` instead. |
+
+#### 7.6.2 What a turn used
+
+`HarnessUsage`, on `HarnessTurn.usage`.
+
+Every field is optional, and that is the shape rather than an oversight: the two
+harnesses count different things, and a row that promised all four would have to
+report zero for a counter its harness never kept.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `inputTokens` | integer | when the harness reports it | Input tokens this turn consumed. |
+| `cachedInputTokens` | integer | when the harness reports it | How many of those were served from its prompt cache. |
+| `outputTokens` | integer | when the harness reports it | Output tokens this turn produced. |
+| `reasoningTokens` | integer | when the harness reports it | How many of the output tokens were reasoning. |
+
+#### 7.6.3 A tool event
+
+`HarnessToolCall`, on `HarnessRecord.toolCalls`. [§7.3](#73-tool-calls)'s record,
+narrowed to what a harness reports.
+
+The **same three-member vocabulary**, meaning the same three things. What is not
+here is §7.3's other four fields, and each absence is [§11](#11-what-is-not-part-of-this-format)'s
+rule rather than an omission: no `target`, because the tool is the harness's
+rather than a component of this composition; no `instance`, because nothing a
+harness calls is a flow of this graph; no `result`, because a tool's answer is
+the one thing §11 keeps out at every surface; and no `program`, because
+[§7.4](#74-what-a-built-in-ran)'s carve-out is for the two built-ins *this*
+runtime implements, whose bounds this compiler states — a harness's commands are
+in the journal payload with the rest of its stream.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `name` | string | always | The tool the harness called, spelled as the harness spells it. It is that vendor's vocabulary, not this grammar's, so a reader joins it to the harness's own documentation rather than to the composition. |
+| `outcome` | `"completed"` \| `"refused"` \| `"failed"` | always | What the harness's loop did with the call. `"completed"` handed its model the tool's result; `"refused"` is the harness's own permission surface declining the call, which is what a node's `allow_tools:` produces on the harness that enforces it in-loop (grammar §8.9); `"failed"` is the call's execution failing. A refusal did **not** end the run — the harness's loop went on, exactly as an agent's does after a refusal (§7.3). |
+| `error` | string | `"refused"`, `"failed"` | What went wrong, written for a person. On a `"refused"` call it is the sentence the harness's model was handed back. |
+
+#### 7.6.4 What a run cost
+
+`HarnessCost`, on `HarnessRecord.cost`.
+
+A rollup with optional members rather than a fixed row, because the harnesses
+report differently and PRD resolved q57 ruling a asks the record not to lie about
+it: one reports an estimated total in money and run-level token usage, the other
+reports tokens per turn and no money at all.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `turns` | integer | always | How many top-level turns the run took — `turns.length`, carried here so a reader summing cost across a trace need not walk the array. |
+| `inputTokens` | integer | when the harness reports tokens | Input tokens over the whole run. |
+| `outputTokens` | integer | when the harness reports tokens | Output tokens over the whole run. |
+| `usd` | number | when the harness estimates a cost | What the harness itself estimated the run cost, in US dollars. An **estimate the harness made**, not a billing statement and not a figure this runtime computed. |
+
+**This is an addition rather than a change.** A new record type reachable from an
+existing one, and a new field on §3's entry, are both compatible under
+[§10.2](#102-what-is-a-compatible-change) — a reader written against the current
+`trace_version` sees a key it does not recognize and ignores it, which is what
+§10.1 already requires of it. No version bump, and nothing that was recorded
+before is recorded differently: a composition with no `coder:` node produces
+byte-identical traces.
+
 ---
 
 ## 8. Nesting, instance paths, and idempotency keys
@@ -1355,6 +1458,8 @@ run. A reader should treat all of it as untrusted:
 | `TraceEntry.error` | the failure the node's own activity raised — for an `http:` binding, the rejected response body truncated to 200 characters; for an `exec:` binding, the child's stderr; and on any surface parsed against a declared schema (PRD 5.2), an excerpt of the offending value at the failing path, truncated to 120 characters — a model's own answer, or a decoded `http:`/`exec:` payload that a non-2xx rule accepted and a schema did not. The arguments a **model** sent a tool reach this field one way only, since grammar D119: an agent node that spent `max_tool_iterations` says which refusal it was still holding, and that refusal is the excerpt |
 | `DispatchRecord.error` | the same text, raised by one dispatched item (§5). Under `on_item_error: skip` this is the **only** field it reaches: the run survives, so no entry carries an `error` for it — and, on the other carrier, raised inside the subflow a model's tool call ran |
 | `ToolCallRecord.error` | the same text, from the tool a model called (§7.3). On a `"failed"` call, the tool's execution failing: a `tool.*`'s refused response or child stderr, a store op's failure, or one raised inside a flow-as-tool call's instance. On a `"refused"` one it is this runtime's own sentence rather than the other side's — the tool, the field and the constraint, with an excerpt of the **arguments** the model sent, at whichever of the three surfaces refused them (grammar D119) |
+| `HarnessRecord.error` | what ended a coding-harness run (§7.6): the harness's own fatal-error text, or — when the run's answer failed the node's `output:` gate — this runtime's schema refusal with an excerpt of the offending value, under the same 120-character cap every other parse refusal is under. The harness's text is the *vendor's* rather than this process's, and a harness that quotes what a command printed puts that echo here |
+| `HarnessToolCall.error` | what one tool event of a harness run reported (§7.6.3). On a `"failed"` event it is the harness's own account of the failure; on a `"refused"` one it is the sentence the harness's permission surface handed its model, which for a node's `allow_tools:` is composed by this runtime and names the list |
 | `TraceDocument.error` | the same text, when that failure is what stopped the run |
 | `Refusal.detail` | what a provider answered: a status and a response body, truncated, or the socket failure that came back instead. Never the request, so the key it was signed with is not in it |
 | `BuiltinProgram.command`, `BuiltinProgram.path` | the **program the model wrote** for a built-in tool, carried verbatim and capped at 1000 characters each: the `bash` command's text, and the `files` path as the model asked for it (§7.4). Not what a system answered but what the model chose, so it is the one text here that is adversarial by construction wherever a model read something it should not have — a `command` is shell source and a `path` is arbitrary bytes, and neither is a name this runtime composed. `BuiltinProgram.change` beside them is this runtime's own sentence about an edit (`replaced one occurrence at line 12`) and carries nothing of the file |
@@ -1616,17 +1721,25 @@ or a row promising one nothing sets.
 | `agentcompose.routing.targets` | entry | the same decision's `targets`, repeated as a string array, because "which way did it go" is the question a collector filters on |
 | `agentcompose.dispatch.carrier` | dispatch | `map` for a record on `dispatches`, `tool` for one on `toolDispatches` |
 | `agentcompose.dispatch.index`, `agentcompose.dispatch.target`, `agentcompose.dispatch.outcome`, `agentcompose.dispatch.route`, `agentcompose.dispatch.variant`, `agentcompose.attempts` | dispatch | the record's own fields |
-| `agentcompose.model` | model call | the `model.*` the agent asked for |
+| `agentcompose.model` | model call, harness run | the `model.*` the agent asked for; on a harness run, the one its adapter mapped down (§7.6) |
 | `agentcompose.model.served_by`, `agentcompose.model.fallback`, `agentcompose.model.failovers` | model call | which member answered, its ordinal in the route, and how many refused on the way |
 | `agentcompose.model.output_mechanism` | model call | §7.5's `outputMechanism` — which of the wire's two ways of asking for an object answered. On the one call per agent node that asked for one, and on no other, so most model spans carry no such attribute |
 | `agentcompose.model.member`, `agentcompose.model.condition`, `agentcompose.model.detail` | failover and refusal events | the refusing member, the `route_on:` condition, and what it said |
-| `agentcompose.tool.name`, `agentcompose.tool.target`, `agentcompose.tool.outcome` | tool-call event | the call's own fields |
+| `agentcompose.tool.name`, `agentcompose.tool.target`, `agentcompose.tool.outcome` | tool-call event | the call's own fields. A **harness** run's tool events are the same three attributes, less `target`: the tool is the harness's rather than a component of this composition (§7.6.3) |
+| `agentcompose.harness` | harness run | which harness ran it (§7.6) |
+| `agentcompose.harness.sdk`, `agentcompose.harness.model_id`, `agentcompose.harness.outcome` | harness run | the record's own fields — the SDK and version this release pinned, the provider-native id the harness was handed, and how the run ended |
+| `agentcompose.harness.turns`, `agentcompose.harness.input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.cost_usd` | harness run | the run's cost rollup (§7.6.4). The token attributes are present only where that harness reports tokens and the money one only where it estimates a cost, which is the rollup's own presence rule read onto the span |
+| `agentcompose.harness.replayed` | harness run | present as `"true"` on a run a resume consumed out of the journal rather than performed, and absent otherwise (§7.6). An operator comparing two deployments needs to know which spans describe work a process did |
+| `agentcompose.harness.turn`, `agentcompose.harness.input_tokens`, `agentcompose.harness.cached_input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.reasoning_tokens` | turn event | the turn's ordinal, and whatever usage that harness reported for it (§7.6.2) |
 | `agentcompose.store`, `agentcompose.store.op`, `agentcompose.store.effect`, `agentcompose.store.via`, `agentcompose.store.scope`, `agentcompose.store.key`, `agentcompose.store.deduped` | store event | the store record's own fields |
 | `agentcompose.human.expires_at`, `agentcompose.human.settled` | the two pause events | the pause's budget and how it ended |
 
 **What is deliberately not exported.** §11's exclusions hold automatically —
 the mapping's input is the envelope, which never held them — and the mapping adds
-no attribute that reaches around it. Two fields the envelope *does* carry are
+no attribute that reaches around it. A harness run's **subagent transcripts** are
+the sharpest case and cost this mapping nothing: they are journal payload and
+were never in the envelope to export (§7.6, `docs/durability.md` §3.9). Two
+fields the envelope *does* carry are
 still left out, and the reason is the same one §11 gives: `StoreRecord.answer`
 and `ToolCallRecord.result` are payloads, and shipping them to a third-party
 collector is a wider disclosure than a trace file read by the deployment's own

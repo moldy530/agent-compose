@@ -636,6 +636,40 @@ fn panes(project: &str) -> &'static [Pane] {
                 ],
             },
         ],
+        "examples/patch-pipeline" => &[
+            // The coder node's own pane: the harness named, the containment
+            // preset, and the **enforcement asymmetry** — which is a fact about
+            // the harness that is in no composition, so the pane is the only
+            // place a reader meets it (`docs/graph.md` §5.8, PRD resolved q57
+            // ruling c). The model resolves through to its provider here as it
+            // does on an agent node, which is the other half of D141: the
+            // address is the composition's, and what crosses is the id.
+            Pane {
+                flow: "flow.patch",
+                node: "implement",
+                facts: &[
+                    "cc",
+                    "workspace_write",
+                    "(enforced in-loop)",
+                    "model.implementer",
+                    "claude-sonnet-4-5",
+                    "provider.anthropic (anthropic)",
+                ],
+            },
+            // …and the node beside it, which is the same picture with both
+            // answers different: a second harness, a read-only preset, and a
+            // list the sandbox bounds rather than the loop.
+            Pane {
+                flow: "flow.patch",
+                node: "review",
+                facts: &[
+                    "codex",
+                    "read_only",
+                    "gpt-5-codex",
+                    "provider.openai (openai)",
+                ],
+            },
+        ],
         _ => &[],
     }
 }
@@ -729,7 +763,9 @@ fn counted(printed: &str, what: &str) -> usize {
 /// examples happen never to produce and the shape this whole file exists for;
 /// `every-schema-form` is the only project here that attaches a `flow.*` as a
 /// tool and a `builtin.*` by the `tools:` shorthand, which are two of the four
-/// values `docs/graph.md` §9.1 makes `ToolView.source` out of.
+/// values `docs/graph.md` §9.1 makes `ToolView.source` out of; and
+/// `patch-pipeline` is the only one with a `coder:` node, whose pane is the only
+/// place a reader is told which harness enforces its own tool list.
 #[test]
 fn every_node_of_every_flow_opens_its_pane() {
     for project in [
@@ -737,6 +773,7 @@ fn every_node_of_every_flow_opens_its_pane() {
         "examples/review-loop",
         "crates/compose-core/tests/projects/omitted-graph-keys",
         "crates/compose-core/tests/projects/every-schema-form",
+        "examples/patch-pipeline",
     ] {
         let printed = exercise(project, STORAGE_WORKS);
         if printed.is_empty() {

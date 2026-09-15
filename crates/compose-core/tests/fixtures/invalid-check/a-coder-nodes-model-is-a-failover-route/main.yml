@@ -1,0 +1,44 @@
+# rule: a `coder:` node's `model:` is a direct binding, because a failover
+# rule: ladder does not reach inside a harness run (grammar 8.9, 12.2, D141)
+# code: invalid-value
+# message: `model.either` is a failover route, and `flow.main` node `build` runs a harness
+# at: main.yml:36:16
+# label: main.yml:25:1 `model.either` is defined here, with 2 members
+# help: the provider connection does not reach inside a harness run: the harness owns its client, its auth and its own retries, and this compiler's `retry:` wraps whole runs. A route here would be a failover policy with nothing to apply it to, so bind a direct `model.*` and let the node's `retry:` be the ladder (grammar 8.9, 12.2, PRD resolved q57 ruling d)
+#
+# Not decidable in one file: what the node writes is a `model.*` address like
+# any other, and whether that definition is direct or a route is written
+# somewhere else. Taking the route's first member is the answer this refusal
+# exists to prevent — a composition would declare a failover policy, read as
+# though it had one, and have none, because the harness opens its own client and
+# retries its own requests.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+model.fast:
+  provider: provider.p
+  id: claude-haiku-4-5
+model.either:
+  route: [model.smart, model.fast]
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.either
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

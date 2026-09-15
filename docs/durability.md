@@ -35,8 +35,9 @@ project a given compiler release builds — like `src/runtime.ts` and
 1. [The journal is not the trace](#1-the-journal-is-not-the-trace)
 2. [Where it lives, and what a crash can leave](#2-where-it-lives-and-what-a-crash-can-leave)
 3. [What is recorded](#3-what-is-recorded) — including
-   [callback deliveries](#37-a-callback-delivery) and
-   [placement dispatches](#38-a-placement-dispatch)
+   [callback deliveries](#37-a-callback-delivery),
+   [placement dispatches](#38-a-placement-dispatch) and
+   [coding-harness runs](#39-a-coding-harness-run)
 4. [Keys](#4-keys)
 5. [Replay, and the frontier](#5-replay-and-the-frontier)
 6. [Recovery: `serve` and `resume`](#6-recovery-serve-and-resume)
@@ -157,7 +158,7 @@ Every effect, and completeness is the invariant: **an effect that is not
 journaled is one a replay re-executes.** A reader verifies it the way the
 implementation enforces it — by finding the call sites. Every effect goes
 through `journaled(…)` or `EffectRecorder.claim(…)` in the emitted sources, and
-there are exactly eight of them, in four kinds:
+there are exactly nine of them, in five kinds:
 
 | kind | site in the emitted project | what the record holds |
 |---|---|---|
@@ -165,6 +166,7 @@ there are exactly eight of them, in four kinds:
 | `tool` | `runExec`, `runBuiltin`, `runHttp`, `callFunction`, `callModule` in `src/runtime.ts` | §3.2 |
 | `store` | `runStoreOp` in `src/stores.ts` | §3.3 |
 | `human` | `runHuman` in `src/runtime.ts` | §3.4 |
+| `harness` | `runCoder` in `src/runtime.ts` | §3.9 |
 
 Three constructs record nothing of their own, and need none: a `flow:` node, a
 `map` dispatch, and a flow-as-tool call are *instantiations*, not effects. What
@@ -177,14 +179,14 @@ That inventory is held **mechanically**, and by two tests in
 `crates/compose-core/src/codegen/journal.rs` that read it from opposite ends.
 
 `every_effect_site_reaches_the_journal_and_the_document_names_them_all` reads it
-from the seams: each of the eight functions above is read out of the emitted
+from the seams: each of the nine functions above is read out of the emitted
 modules, and the test fails when one does not reach the journal, when this table
-does not name it, or when a ninth site exists that this table does not.
+does not name it, or when a tenth site exists that this table does not.
 
 `nothing_in_the_emitted_runtime_calls_the_world_except_under_a_journaled_seam`
 reads it from the **primitives**, which is the direction the first cannot see.
 A surface added to `src/runtime.ts` that calls the world and is not journaled is
-a replay that issues it twice — and it is not one of the eight, contains no
+a replay that issues it twice — and it is not one of the nine, contains no
 `journaled(` and no `.claim(`, and is in no table, so nothing else in the
 repository would notice. So every call to the world in every emitted constant
 module is required to sit in a declaration the eight transitively reach.
@@ -727,6 +729,57 @@ mesh (`docs/distributed.md` §3.3, §8). `effectsUnder` is the one read the wire
 adds beside them: every effect at or inside one instance path, which is the
 `effect_history` a redispatched node replays to the frontier before going live.
 
+### 3.9 A coding-harness run
+
+One record per run a `coder:` node made (`docs/grammar.md` §8.9, PRD resolved
+q57). **One effect per run**, not one per turn and not one per tool call the
+harness made inside it: what the graph asked for is an answer, and what it gets
+back is the boundary of somebody else's agent loop.
+
+The record holds three things, and the split between them is the whole of this
+section:
+
+| part | what it is | who reads it |
+|---|---|---|
+| the **answer** | the run's structured output, already through the node's `output:` gate | a replay, which consumes it and does not run the harness again |
+| the **record** | the trace's account of the run — its harness and pinned SDK, its top-level turns and tool events, its cost rollup (`docs/trace.md` §7.6) | a resumed generation, which writes a fresh trace document whole (§9) and would otherwise report a run that never happened |
+| the **payload** | the run's whole event stream: every turn, tool call, reasoning item and subagent transcript the SDK yielded | nothing, in a normal run. It is the private half §8 is about |
+
+**The payload is where a harness's transcript lives, and where it stays.** It is
+the largest private thing this journal holds, and it is the reason `docs/trace.md`
+§7.6 draws its envelope at top-level turns and tool events: a harness that runs
+subagents yields their whole conversations, and those belong here beside a
+model's completions rather than in a document a run hands out.
+
+**A crash mid-run recorded nothing.** The slot is claimed when the run starts and
+written when it ends, so a process that died in between left no record at all —
+which makes the next attempt an ordinary attempt: the node's `retry:` re-runs the
+harness from its start, and a resume that reaches the node with no record
+performs the effect. The cost is real and is the accepted one: whatever the run
+had done to the workspace before the crash stays done, and the second run meets
+it. That is the same statement §3.2 makes about a subprocess that wrote a file
+before its host died, one agent loop larger.
+
+**Harness-native resume is a named exclusion** (PRD resolved q57 ruling b). Both
+v1 harnesses can resume their *own* sessions from a store each vendor keeps, and
+this runtime does not use one. Two invariants forbid it and both are §12's
+subject rather than a preference: the journal is the complete hub state
+(PRD resolved q44 invariant 1), so a recovery that depended on a directory
+beside it would be recoverable only on the machine that crashed; and
+`docs/distributed.md`'s redispatch hands a worker a node's journaled effect
+history and expects it to replay to the frontier, which a session store on
+another host cannot answer. The vendors' stores are debugging backstops.
+
+**What the request identity holds**, which is what §7 compares on a resume: the
+node, the harness, the `model.*` and the id it resolved to, the run's
+instructions and its rendered input, the workspace **as the author wrote it**,
+the access preset, the tool allowlist, and the harness `settings:`. The resolved
+environment is deliberately absent — those are the values `docs/trace.md` §11.1
+keeps out of every artifact this project writes, and the workspace goes in
+unresolved for the same reason. Editing a coder node's prompt therefore diverges
+a resume, which is the answer §7 gives everywhere: the recorded answer is an
+answer to a question this build is no longer asking.
+
 ## 4. Keys
 
 An effect's journal key is
@@ -1101,6 +1154,9 @@ project's stores.** It holds, by construction:
 
 * model completions in full;
 * what a model sent a tool, and what the tool answered;
+* the **whole event stream of every coding-harness run** (§3.9) — its turns, its
+  tool calls, its reasoning items and the transcripts of any subagents it ran,
+  which is the largest single payload this journal holds;
 * what a store read and what it wrote;
 * **what a person answered a `human` node**;
 * the **body of every callback delivery** (§3.7), which is the status route's

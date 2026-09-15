@@ -36,7 +36,7 @@ use serde_json::Value;
 
 use crate::diag::{Diagnostic, Diagnostics};
 use crate::ir::definition::DefinitionBody;
-use crate::ir::flow::{Flow, ToolImplementation};
+use crate::ir::flow::{Flow, Node, NodeKind, ToolImplementation};
 use crate::ir::{Definition, Ir};
 
 use super::Composition;
@@ -323,6 +323,37 @@ fn granted(change: ChangeKind, body: &DefinitionBody) -> Vec<FieldChange> {
     }]
 }
 
+/// What a node that arrived or left **binds**, where what it binds is a
+/// coding-agent harness (`docs/plan.md` §3, PRD resolved q57 ruling c).
+///
+/// [`granted`]'s counterpart one construct along, and here for a sharper version
+/// of its reason. A `builtin:` binding hands the *program* to the model, inside
+/// this runtime's own tool surface and under the bounds this compiler states; a
+/// `coder:` node hands the program **and the loop** to a harness, inside the
+/// harness's tool surface, where none of §5.5's bounds apply. That is the widest
+/// capability this grammar grants, and a plan that printed `+ flow.patch.build`
+/// and nothing else would read exactly like a `function:` node arriving.
+///
+/// One field, and it is the same one for the same reason: *which capability
+/// arrived*. The bounds a coder node carries — its `workspace:`, its `access:`,
+/// its `allow_tools:` — are contents, and §3's rule that an arrival is not
+/// expanded into its contents holds here as it holds everywhere else.
+fn harness_granted(change: ChangeKind, node: &Node) -> Vec<FieldChange> {
+    let NodeKind::Coder { coder } = &node.kind else {
+        return Vec::new();
+    };
+    let named = Value::String(coder.harness.value.as_str().to_string());
+    let (before, after) = match change {
+        ChangeKind::Added => (None, Some(named)),
+        _ => (Some(named), None),
+    };
+    vec![FieldChange {
+        path: "coder.harness".to_string(),
+        before,
+        after,
+    }]
+}
+
 const fn kind(body: &DefinitionBody) -> ComponentKind {
     match body {
         DefinitionBody::Agent(_) => ComponentKind::Agent,
@@ -493,7 +524,7 @@ fn graph(found: &mut Vec<TopologyChange>, address: &str, before: &Flow, after: &
                 site,
                 address: at,
                 flow: Some(address.to_string()),
-                fields: Vec::new(),
+                fields: harness_granted(ChangeKind::Added, new),
                 span: new.span.clone(),
             }),
             (Some(old), None) => found.push(TopologyChange {
@@ -501,7 +532,7 @@ fn graph(found: &mut Vec<TopologyChange>, address: &str, before: &Flow, after: &
                 site,
                 address: at,
                 flow: Some(address.to_string()),
-                fields: Vec::new(),
+                fields: harness_granted(ChangeKind::Removed, old),
                 span: old.span.clone(),
             }),
             (None, None) => {}

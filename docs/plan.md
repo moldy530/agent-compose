@@ -169,15 +169,30 @@ per node it declares would bury the two edges that moved in the flow beside it.
 For the same reason, §5 and §6 report only on subjects present in both specs —
 what a new component contains is not a diff, it is the spec.
 
-**One exception**, and it is about a capability rather than about contents: a
-`tool.*` that arrived or left carrying a `builtin:` binding reports the field
+**Two exceptions**, and both are about a *capability* rather than about
+contents.
+
+A `tool.*` that arrived or left carrying a `builtin:` binding reports the field
 `builtin`, holding the name it binds (`"bash"` or `"files"`). Every other
 implementation fixes a program the composition chose; that one hands the program
 to the **model**, which is the widest capability the grammar grants
 (`docs/grammar.md` §5.5, PRD resolved q54), and a plan that printed
 `+ tool.sandbox` and nothing else would read exactly like any other tool
-arriving. It stays one field: what a built-in's own bounds are — its
-`workspace:`, its `timeout:` — is contents, and is not expanded.
+arriving.
+
+A **node** that arrived or left carrying a `coder:` block reports the field
+`coder.harness`, holding the harness it binds (`"cc"` or `"codex"`). It is the
+same statement one step further out, and a sharper one: a built-in hands the
+program to a model inside *this runtime's* tool surface, under bounds this
+compiler states, while a coder node hands the program **and the loop** to a
+harness inside the harness's own tool surface, where none of §5.5's bounds apply
+(`docs/grammar.md` §8.9, PRD resolved q57 ruling c). A plan that printed
+`+ flow.patch.build` and nothing else would read exactly like a `function:` node
+arriving.
+
+Both stay **one field**: what a built-in's bounds are — its `workspace:`, its
+`timeout:` — and what a coder node's are — its `workspace:`, its `access:`, its
+`allow_tools:` — is contents, and an arrival is not expanded into its contents.
 
 `FieldChange` is one field of one subject:
 
@@ -797,8 +812,9 @@ document is the same thing at the top level.
 Comparing something that was not compared before — a field of a definition that
 this version delegates nowhere and therefore never reported — is also compatible.
 It produces records of a shape a reader already parses. §3's `builtin` field on
-an arriving or departing `tool.*` is that: no key, no vocabulary and no address
-spelling moved, and a reader that skipped `fields` on an addition still skips it.
+an arriving or departing `tool.*` is that, and so is its `coder.harness` field on
+an arriving or departing node: no key, no vocabulary and no address spelling
+moved, and a reader that skipped `fields` on an addition still skips it.
 
 Improving a `message`, which is a diagnostic's own text and is free to get
 better; §7 makes the pair `code`/`message` the identity of a finding *within one

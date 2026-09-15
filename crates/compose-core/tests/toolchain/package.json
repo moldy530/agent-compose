@@ -17,6 +17,12 @@
     "the gate that keeps `npm install` + `node src/index.ts` a checked promise",
     "rather than a sentence in a README.",
     "",
+    "The four harness SDK packages are `compose_core::codegen::harness::HARNESS_PINS`,",
+    "which a generated `package.json` declares only where some `coder:` node binds",
+    "that harness (PRD resolved q57). One install still serves every golden: the",
+    "shared tree is the union, and a golden that binds no harness simply never",
+    "imports them.",
+    "",
     "After a pin moves, regenerate BOTH — `bun install` and",
     "`npm install --package-lock-only` — and commit them; a `--frozen-lockfile`",
     "install fails rather than resolving something the last one did not."
@@ -30,7 +36,11 @@
     "@langchain/core": "1.2.8",
     "zod": "4.4.3",
     "fastify": "5.12.0",
-    "node-sqlite3-wasm": "0.8.60"
+    "node-sqlite3-wasm": "0.8.60",
+    "@anthropic-ai/claude-agent-sdk": "0.3.272",
+    "@anthropic-ai/sdk": "0.126.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@openai/codex-sdk": "0.154.0"
   },
   "devDependencies": {
     "@types/node": "22.20.1",

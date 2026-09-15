@@ -1148,10 +1148,11 @@
     },
 
     "node": {
-      "description": "A flow node: exactly one kind key (agent, exec, http, function, flow, map, human, store) plus bindings and policy. Grammar 8 / PRD 5.5, 5.8.",
+      "description": "A flow node: exactly one kind key (agent, coder, exec, http, function, flow, map, human, store) plus bindings and policy. Grammar 8 / PRD 5.5, 5.8.",
       "type": "object",
       "oneOf": [
         { "description": "An agent node.", "required": ["agent"] },
+        { "description": "A coder node.", "required": ["coder"] },
         { "description": "An inline exec node.", "required": ["exec"] },
         { "description": "An inline http node.", "required": ["http"] },
         { "description": "A function node.", "required": ["function"] },
@@ -1162,6 +1163,7 @@
       ],
       "allOf": [
         { "if": { "required": ["agent"] }, "then": { "$ref": "#/$defs/agentNode" } },
+        { "if": { "required": ["coder"] }, "then": { "$ref": "#/$defs/coderNode" } },
         { "if": { "required": ["exec"] }, "then": { "$ref": "#/$defs/execNode" } },
         { "if": { "required": ["http"] }, "then": { "$ref": "#/$defs/httpNode" } },
         { "if": { "required": ["function"] }, "then": { "$ref": "#/$defs/functionNode" } },
@@ -1181,6 +1183,80 @@
         "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
         "retry": { "$ref": "#/$defs/retry" },
         "timeout": { "description": "Wall-clock bound on this node.", "$ref": "#/$defs/duration" },
+        "on_error": { "$ref": "#/$defs/onError" },
+        "description": { "description": "Node documentation.", "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "coderNode": {
+      "description": "One run of a coding-agent harness, as one node. The harness is a binding, so every other key means the same thing whichever one serves it. Grammar 8.9 / PRD resolved q57.",
+      "type": "object",
+      "required": ["coder"],
+      "properties": {
+        "coder": {
+          "description": "The whole component: which harness runs it, what contains it, its prompt and surfaces, and the harness's own config. A coder node has no definition to carry these, so they sit in the block - the shape a `human:` node already takes (Decision D137).",
+          "type": "object",
+          "required": ["harness", "model", "workspace", "prompt", "output"],
+          "properties": {
+            "harness": {
+              "description": "Which harness runs it. `deepagents` and `native` are RESERVED: they parse and carry into the IR, and `validate` refuses them naming this release's scope rather than answering them as a misspelling (grammar 15, Decision D136).",
+              "enum": ["cc", "codex", "deepagents", "native"]
+            },
+            "model": {
+              "description": "The registry address, exactly as an agent node spells it. Whether it resolves to a direct binding rather than a failover route is another file's fact, so `validate` decides it (Decision D141).",
+              "$ref": "#/$defs/modelRef"
+            },
+            "workspace": {
+              "description": "The root this run works inside. Required, and there is no default: a coder node works on a checkout somebody already has, so a defaulted root would be a bound nobody wrote. Interpolable (grammar 4.3 class 2, Decision D138).",
+              "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
+            },
+            "access": {
+              "description": "The containment preset, mapped down to each harness's own primitive - a codex sandbox, an Agent SDK permission mode. Absent means `workspace_write` (Decision D138).",
+              "enum": ["read_only", "workspace_write", "full_access"]
+            },
+            "prompt": {
+              "description": "The run's instructions. Literal text with no templating, exactly as an agent's prompt is (Decision D13).",
+              "type": "string",
+              "minLength": 1
+            },
+            "input": {
+              "description": "The declared input surface. Omitting it is how a coder node takes a single unnamed string, which the node then binds with the scalar `input:` form (grammar 5.3, Decisions D88, D137).",
+              "$ref": "#/$defs/fieldMap"
+            },
+            "output": {
+              "description": "What the harness answers with, and what the output gate parses in full. Required, at one property or more: structured output on every node is what routing reads (PRD 5.2). This is a RESULT surface, so every array inside it declares `max_items` and `default:` is illegal (grammar 3.5, 3.6).",
+              "$ref": "#/$defs/agentOutputFieldMap"
+            },
+            "allow_tools": {
+              "description": "The harness's own tool names this run may use. What enforces the list differs per harness and this grammar states the asymmetry rather than implying equivalence: `cc` enforces it in-loop, per call, while `codex` bounds at its sandbox only (Decision D138).",
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "env": {
+              "description": "The environment the harness and everything it forks run with: exactly the `exec:` shape, and scrubbed to these variables alone unless `inherit_env` says otherwise (grammar 4.3, Decision D139).",
+              "type": "object",
+              "propertyNames": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
+            },
+            "inherit_env": {
+              "description": "Whether the run also sees this process's own environment, with `env` layered over it. Absent means `false`, which is what keeps a placement's environment manifest the whole answer (Decision D139).",
+              "type": "boolean"
+            },
+            "settings": {
+              "description": "Harness config, in the vendor's own vocabulary. The second open object in the logical layer: the compiler checks the keys its per-harness curated table knows and carries anything else with a warning, so an option the vendor ships tomorrow is usable the day it ships (Decision D140, amending D40).",
+              "type": "object"
+            }
+          },
+          "additionalProperties": false
+        },
+        "input": {
+          "description": "Input bindings. The scalar form is legal exactly where `coder.input` is absent, which is the string-in default - a cross-key rule `validate` decides (Decisions D88, D137).",
+          "$ref": "#/$defs/inputBindings"
+        },
+        "writes": { "description": "Write remap.", "$ref": "#/$defs/writes" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "description": "Wall-clock bound on this node, which for a coder node bounds the whole harness run (Decision D142).", "$ref": "#/$defs/duration" },
         "on_error": { "$ref": "#/$defs/onError" },
         "description": { "description": "Node documentation.", "type": "string" }
       },

@@ -915,6 +915,21 @@ const REDUCTIONS: &[Reduction] = &[
         }"#,
     },
     Reduction {
+        // Two `last_wins`-by-default channels, both `string` with a `""` default:
+        // a coder node writes its result the way every other node does, and the
+        // state model has nothing to say about which kind wrote it.
+        golden: "patch-pipeline",
+        writes: r#"[
+            { "summary": "first pass", "feedback": "tighten it" },
+            { "summary": "second pass" }
+        ]"#,
+        expected: r#"{
+            "summary": "second pass",
+            "feedback": "tighten it",
+            "messages": []
+        }"#,
+    },
+    Reduction {
         golden: "review-loop",
         writes: r#"[
             { "draft": "first" },
@@ -5509,6 +5524,318 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
     Some(Value::Object(node))
 }
 
+/// Gate 24: what one harness run does — the emitted adapter, driven over a
+/// scripted driver (grammar 8.9, PRD resolved q57).
+///
+/// The one gate whose subject is a node kind the acceptance suite **cannot**
+/// reach. A harness SDK speaks its own wire, so the mock provider — deliberately
+/// — never sees it and there is no endpoint to point a compiled graph at. What
+/// there is instead is the seam: `runtime.runCoder` takes the driver registry as
+/// a parameter, and `src/harness.ts` emits a scripted driver into every project,
+/// so everything *above* the seam is exercised as the code a deployment ships.
+///
+/// Nine claims, and not one of them is visible from a run's answer:
+///
+///  * **the config map** — the workspace resolves its `${ENV}` at the call and an
+///    empty one is refused *as written*; the environment is scrubbed to the
+///    declared variables, with `inherit_env: true` as the opt-in; the access
+///    preset, the allowlist and the model settings arrive as the composition
+///    wrote them;
+///  * **the lowering** — the schema the harness is handed is the composition's
+///    projected through this harness's own table, with the stripped bound folded
+///    into a `description`, while the binding's own schema is untouched (PRD
+///    resolved q55 rulings a and b);
+///  * **the gate** — and the ruling's other side: the answer is parsed against
+///    the **full** declared schema, so one that overruns a bound the harness
+///    never saw fails the node (ruling c);
+///  * **the envelope's depth** — an event a driver taps nothing off reaches the
+///    journal's payload and not the trace, which is where a harness's subagent
+///    transcripts go (ruling a);
+///  * **the record** — turns with usage, tool events in the three-outcome
+///    vocabulary, the cost rollup, and the `sdk@version` the manifest pinned;
+///  * **one effect per run** — journaled once, whatever happened inside it;
+///  * **replay** — a resumed generation consumes the recorded answer, the driver
+///    is not run again, and the record says `replayed: true`;
+///  * **a failed run still reports** — a run that produced no answer, and one
+///    whose harness reported a fatal error, each leave a record carried out on
+///    the failure, because an activity that throws returns no answer;
+///  * **a missing driver** — a harness with no driver is an execution failure
+///    naming the requirement, which is the q54 bash-absent posture.
+#[test]
+fn a_harness_run_is_contained_journaled_and_recorded() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("patch-pipeline"), root, "coder");
+    let scratch = root.join("projects").join("coder").join("scratch");
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).expect("the scratch area is writable");
+
+    let output = runner("coder-runs.mjs")
+        .arg(&project)
+        .arg(&scratch)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the coder runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+    the_harness_run_stayed_inside_its_bounds(&answer);
+}
+
+/// What `coder-runs.mjs` has to come back with.
+fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
+    // --- The config map (grammar 8.9, Decisions D138, D139) ----------------
+    let map = &answer["configMap"];
+    assert_eq!(map["runs"], json!(1), "one run, once");
+    assert_eq!(
+        map["workspace"],
+        json!(true),
+        "the `${{ENV}}` workspace resolved"
+    );
+    assert_eq!(map["access"], json!("workspace_write"));
+    assert_eq!(map["allowTools"], json!(["Bash", "Read"]));
+    // **Scrubbed**: exactly the declared names, and a variable this process
+    // holds is not among them (PRD resolved q54 ruling b).
+    assert_eq!(map["env"], json!(["PATH", "TOKEN"]));
+    assert_eq!(map["token"], json!("shh"), "a declared `${{ENV}}` resolved");
+    assert_eq!(map["leaked"], json!(false), "the child inherited nothing");
+    assert_eq!(map["inheritEnv"], json!(false));
+    // The user turn is the node's input rendered exactly as an agent's is.
+    assert_eq!(map["input"], json!("{\"goal\":\"fix it\"}"));
+    assert_eq!(map["instructions"], json!("Fix the failing test."));
+    // The model reaches the harness as an **id** plus the settings subset it
+    // accepts, and nothing of the connection (Decision D141).
+    assert_eq!(map["model"], json!("claude-sonnet-4-5"));
+    assert_eq!(
+        map["modelSettings"],
+        json!({ "thinking": { "budget_tokens": 8000 } })
+    );
+
+    // --- The lowering (PRD resolved q55, rulings a and b) ------------------
+    let lowering = &answer["lowering"];
+    assert_eq!(
+        lowering["hasMaxItems"],
+        json!(false),
+        "the bound came off the schema the harness was handed"
+    );
+    assert_eq!(lowering["hasMinLength"], json!(false));
+    assert_eq!(
+        lowering["description"],
+        json!("At most 2 items."),
+        "…and was folded into a description the model still reads (ruling b)"
+    );
+    assert_eq!(lowering["itemsDescription"], json!("At least 1 character."));
+    assert_eq!(
+        lowering["bindingKeepsMaxItems"],
+        json!(true),
+        "the projection is **pure**: the emitted schema is what the gate parses"
+    );
+    // Each harness validator has a table of its own, and they differ.
+    assert_eq!(
+        lowering["away"],
+        json!([
+            "exclusiveMaximum",
+            "exclusiveMinimum",
+            "maxItems",
+            "maxLength",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minimum",
+            "multipleOf"
+        ])
+    );
+    assert_eq!(
+        lowering["codexAway"],
+        json!([
+            "exclusiveMaximum",
+            "exclusiveMinimum",
+            "maxItems",
+            "maxLength",
+            "maximum",
+            "minItems",
+            "minLength",
+            "minimum",
+            "multipleOf",
+            "uniqueItems"
+        ]),
+        "the two tables are not one table"
+    );
+
+    // --- The record (`docs/trace.md` §7.6, PRD resolved q57 ruling a) ------
+    let record = &answer["record"];
+    assert_eq!(
+        record["output"],
+        json!({ "summary": "done", "touched": ["a.ts"] })
+    );
+    assert_eq!(record["harness"], json!("cc"));
+    assert_eq!(
+        record["sdk"],
+        json!("agent-compose:scripted/cc@0"),
+        "the record names the driver and the version it reports"
+    );
+    assert_eq!(record["model"], json!("model.implementer"));
+    assert_eq!(record["modelId"], json!("claude-sonnet-4-5"));
+    assert_eq!(record["outcome"], json!("completed"));
+    assert_eq!(
+        record["turns"],
+        json!([{ "index": 0, "usage": { "inputTokens": 120, "outputTokens": 40 } }]),
+        "one top-level turn, and the subagent's is not one"
+    );
+    assert_eq!(record["turnCount"], json!(1));
+    // All three members of the vocabulary are reachable, which is what makes it
+    // a vocabulary rather than two members and a spare.
+    assert_eq!(
+        record["toolCalls"],
+        json!([
+            { "name": "Read", "outcome": "completed" },
+            { "name": "Write", "outcome": "failed", "error": "read-only file system" },
+            { "name": "Bash", "outcome": "refused", "error": "not in `allow_tools`" }
+        ])
+    );
+    assert_eq!(
+        record["cost"],
+        json!({ "turns": 1, "inputTokens": 120, "outputTokens": 40, "usd": 0.0125 })
+    );
+    assert_eq!(
+        record["extra"],
+        json!({ "subtype": "success", "stopReason": "end_turn" }),
+        "what this harness reports that the other has no shape for"
+    );
+    assert_eq!(record["replayed"], json!(null), "a live run says nothing");
+    assert_eq!(
+        record["collected"],
+        json!(1),
+        "the node's collector holds it"
+    );
+
+    // --- The gate (PRD resolved q55 ruling c) ------------------------------
+    let gate = &answer["gate"];
+    assert_eq!(gate["threw"], json!(true));
+    assert_eq!(gate["name"], json!("HarnessRunFailed"));
+    assert_eq!(
+        gate["sentMaxItems"],
+        json!(false),
+        "the harness was asked without the bound…"
+    );
+    assert_eq!(
+        gate["recordOutcome"],
+        json!("failed"),
+        "…and its answer was held to it all the same"
+    );
+    assert_eq!(
+        gate["recordTurns"],
+        json!(1),
+        "the run that failed still ran"
+    );
+    assert_eq!(gate["recordToolCalls"], json!(3));
+    assert_eq!(
+        gate["collected"],
+        json!(0),
+        "a refused answer is not a run the collector holds; the failure carries it"
+    );
+
+    // --- The two other ways a run ends ------------------------------------
+    let missing = &answer["noAnswer"];
+    assert_eq!(missing["name"], json!("HarnessRunFailed"));
+    assert_eq!(missing["saysWhat"], json!(true));
+    assert_eq!(missing["recordOutcome"], json!("failed"));
+
+    let fatal = &answer["fatal"];
+    assert_eq!(fatal["name"], json!("HarnessRunFailed"));
+    assert_eq!(
+        fatal["quotes"],
+        json!(true),
+        "the harness's own words reach the message"
+    );
+    assert_eq!(fatal["recordOutcome"], json!("failed"));
+    assert_eq!(
+        fatal["recordError"],
+        json!("HarnessFailed: the sandbox refused to start")
+    );
+
+    // --- A missing harness runtime (the q54 bash-absent posture) ----------
+    let absent = &answer["missingDriver"];
+    assert_eq!(absent["name"], json!("HarnessUnavailable"));
+    assert_eq!(absent["namesTheHarness"], json!(true));
+    assert_eq!(
+        absent["namesTheRequirement"],
+        json!(true),
+        "an execution failure names what the host is missing"
+    );
+
+    // --- A workspace that resolved empty ----------------------------------
+    let empty = &answer["emptyWorkspace"];
+    assert_eq!(empty["threw"], json!(true));
+    assert_eq!(
+        empty["asWritten"],
+        json!(true),
+        "quoted as the author wrote it, never as it resolved (`docs/trace.md` §11.1)"
+    );
+    assert_eq!(
+        empty["ranTheDriver"],
+        json!(false),
+        "a bound nobody wrote stops the run before it starts"
+    );
+
+    // --- `inherit_env: true` is the opt-in --------------------------------
+    let inherited = &answer["inherited"];
+    assert_eq!(inherited["inheritEnv"], json!(true));
+    assert_eq!(inherited["sawThisProcess"], json!(true));
+    assert_eq!(
+        inherited["token"],
+        json!("shh"),
+        "the declared entries still layer over what was inherited"
+    );
+
+    // --- One effect per run, and a replay that consumes it ----------------
+    let held = &answer["journal"];
+    assert_eq!(
+        held["effects"],
+        json!(1),
+        "one journaled effect per run, whatever the run did inside it"
+    );
+    assert_eq!(held["kind"], json!("harness"));
+    assert_eq!(
+        held["key"],
+        json!("flow.patch/implement/0#harness/0"),
+        "the key is `docs/durability.md` §4's, with this format's own kind in it"
+    );
+    assert_eq!(
+        held["keptOutput"],
+        json!({ "summary": "journaled", "touched": ["one.ts"] })
+    );
+    assert_eq!(held["keptRecordOutcome"], json!("completed"));
+    // The **private payload**: every event the SDK yielded, subagent included.
+    assert_eq!(held["streamLength"], json!(8));
+    assert_eq!(
+        held["streamHasSubagent"],
+        json!(true),
+        "the journal holds the nested transcript…"
+    );
+    assert_eq!(
+        held["envelopeToolCalls"],
+        json!(3),
+        "…and the trace envelope carries top-level events only"
+    );
+    assert_eq!(
+        held["replayedOutput"],
+        json!({ "summary": "journaled", "touched": ["one.ts"] }),
+        "a resume consumes the recorded answer"
+    );
+    assert_eq!(
+        held["replayedDriverRuns"],
+        json!(0),
+        "…and the harness never runs a second time"
+    );
+    assert_eq!(held["replayedFlag"], json!(true));
+    assert_eq!(held["liveFlag"], json!(null));
+}
+
 /// Gate 23: the wire schema is the lowering's image of the schema the parse
 /// checks, and the delta is exactly the table (PRD §9 resolved q55, amending
 /// resolved q16).
@@ -6436,8 +6763,15 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     let text = fs::read_to_string(&path).expect("the toolchain fixture is readable");
     let manifest: Value = serde_json::from_str(&text).expect("the fixture is JSON");
 
+    // The **union** on the dependency side: [`PINS`] is what every emitted
+    // project declares, and a harness SDK is what one declares where some
+    // `coder:` node binds it (PRD resolved q57). One shared install still serves
+    // the whole corpus — a golden that binds no harness never imports them — and
+    // the `patch-pipeline` golden, which binds both, is type-checked against
+    // exactly these versions by gate 1.
+    let runtime_and_harness = runtime_and_harness_pins();
     for (section, pins) in [
-        ("dependencies", compose_core::codegen::project::PINS),
+        ("dependencies", runtime_and_harness.as_slice()),
         ("devDependencies", compose_core::codegen::project::DEV_PINS),
     ] {
         let block = manifest[section]
@@ -6464,7 +6798,7 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
         .expect("the Bun lockfile is committed");
     let declared = &lock;
     for (section, pins) in [
-        ("dependencies", compose_core::codegen::project::PINS),
+        ("dependencies", runtime_and_harness.as_slice()),
         ("devDependencies", compose_core::codegen::project::DEV_PINS),
     ] {
         for (package, version) in pins {
@@ -6492,7 +6826,7 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     let lock: Value = serde_json::from_str(&lock).expect("the lockfile is JSON");
     let root = &lock["packages"][""];
     for (section, pins) in [
-        ("dependencies", compose_core::codegen::project::PINS),
+        ("dependencies", runtime_and_harness.as_slice()),
         ("devDependencies", compose_core::codegen::project::DEV_PINS),
     ] {
         for (package, version) in pins {
@@ -6504,6 +6838,32 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
             );
         }
     }
+}
+
+/// Every package a generated project can declare under `dependencies`: the
+/// runtime's own pins, plus every harness SDK a `coder:` node can bind.
+///
+/// Two lists rather than one in the emitter, because a composition declares the
+/// second set only where it binds a harness — and one list here, because the
+/// toolchain fixture installs the union once and every golden resolves against
+/// it (PRD resolved q57, `codegen::harness`).
+fn runtime_and_harness_pins() -> Vec<(&'static str, &'static str)> {
+    let mut held: Vec<(&'static str, &'static str)> = compose_core::codegen::project::PINS.to_vec();
+    for (harness, pins) in compose_core::codegen::harness::HARNESS_PINS {
+        for (package, version) in *pins {
+            if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {
+                assert_eq!(
+                    already,
+                    version,
+                    "`{}` pins `{package}` at a version another list already holds",
+                    harness.as_str()
+                );
+                continue;
+            }
+            held.push((*package, *version));
+        }
+    }
+    held
 }
 
 /// Gate 13: the Node fallback, installed with npm and run under Node.
@@ -6970,9 +7330,11 @@ const UNPORTABLE: &[Unportable] = &[
 /// `store:` branch nothing in the corpus exercises fails here too.
 ///
 /// The import check is a **whitelist**: relative, a `node:` builtin, or a package
-/// `compose_core::codegen::project::PINS` names. A blacklist would only ever
-/// catch what somebody had already thought of, and the interesting failure is the
-/// dependency nobody has added yet.
+/// the emitter can pin — `compose_core::codegen::project::PINS`, plus the
+/// harness SDKs of `codegen::harness::HARNESS_PINS`, which a project declares
+/// exactly where a `coder:` node binds that harness (see [`pinned`]). A
+/// blacklist would only ever catch what somebody had already thought of, and the
+/// interesting failure is the dependency nobody has added yet.
 #[test]
 fn no_emitted_module_reaches_for_an_api_the_fallback_runtime_lacks() {
     let mut modules = 0usize;
@@ -7012,9 +7374,10 @@ fn no_emitted_module_reaches_for_an_api_the_fallback_runtime_lacks() {
                 assert!(
                     portable(&specifier),
                     "`{}/{}` imports `{specifier}`, which is neither relative, a `node:` \
-                     builtin, nor one of the packages the manifest pins. A generated project \
-                     installs exactly `PINS` + `DEV_PINS` under any of three installers, so an \
-                     import outside that set does not resolve in a reader's directory at all.",
+                     builtin, nor one of the packages the manifest can pin. A generated project \
+                     installs exactly `PINS` + `DEV_PINS` + the harness SDKs its own `coder:` \
+                     nodes bind, under any of three installers, so an import outside that set \
+                     does not resolve in a reader's directory at all.",
                     golden.directory,
                     file.path,
                 );
@@ -7077,7 +7440,14 @@ fn portable(specifier: &str) -> bool {
 /// specifiers that have to be *installed* to resolve, as opposed to the ones a
 /// runtime answers on its own.
 fn pinned(specifier: &str) -> bool {
-    compose_core::codegen::project::PINS
+    // The **union** again, for the reason the toolchain fixture installs one: a
+    // harness SDK is pinned only where a `coder:` node binds that harness (PRD
+    // resolved q57), so a scan reading `PINS` alone would refuse `src/harness.ts`
+    // for importing a package the very project it is in declares. What the
+    // whitelist is about is "does this resolve in a reader's directory", and a
+    // harness pin is in that reader's `package.json` exactly when the module
+    // importing it was emitted.
+    runtime_and_harness_pins()
         .iter()
         .chain(compose_core::codegen::project::DEV_PINS)
         .any(|(package, _)| specifier == *package || specifier.starts_with(&format!("{package}/")))

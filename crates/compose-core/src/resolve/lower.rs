@@ -389,6 +389,10 @@ fn coder(source: &ast_flow::CoderBlock) -> Option<ir::flow::Coder> {
         allow_tools: source.allow_tools.clone(),
         env: source.env.iter().map(interpolated_entry).collect(),
         inherit_env: source.inherit_env.as_ref().map(|inherit| inherit.value),
+        // The key and the value keep their **own** spans rather than the joined
+        // one a model's settings take: a coder setting is checked strictly
+        // (Decision D140), and a refusal about a value underlines the value with
+        // the key beside it as a label — which needs the two apart.
         settings: source
             .settings
             .as_ref()
@@ -396,12 +400,9 @@ fn coder(source: &ast_flow::CoderBlock) -> Option<ir::flow::Coder> {
                 settings
                     .entries
                     .iter()
-                    .map(|entry| {
-                        let (key, value) = literal_entry(entry);
-                        ir::flow::CoderSetting {
-                            key: Spanned::new(key, entry.key.span.clone()),
-                            value,
-                        }
+                    .map(|entry| ir::flow::CoderSetting {
+                        key: entry.key.clone(),
+                        value: entry.value.clone(),
                     })
                     .collect()
             })

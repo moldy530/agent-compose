@@ -1,6 +1,6 @@
 # rule: a node that declares no kind key is one mistake, not one more per key the kind it left out would have taken (grammar 7.1)
 # code: missing-key
-# message: node `load` declares no kind key: a node carries exactly one of `agent`, `exec`, `http`, `function`, `flow`, `map`, `human`, `store`
+# message: node `load` declares no kind key: a node carries exactly one of `agent`, `coder`, `exec`, `http`, `function`, `flow`, `map`, `human`, `store`
 # at: 14:7
 # help: the kind key selects what the node does and what config it takes
 flow.demo:

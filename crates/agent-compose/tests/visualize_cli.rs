@@ -118,7 +118,7 @@ fn both_examples_render_to_one_self_contained_file() {
             "it is an HTML document"
         );
         assert!(
-            page.contains("\"graph_version\": 1"),
+            page.contains("\"graph_version\": 2"),
             "it embeds the graph document"
         );
         assert!(
@@ -192,7 +192,7 @@ fn the_json_format_prints_the_document_to_stdout() {
 
     let document: serde_json::Value =
         serde_json::from_str(stdout(&output)).expect("stdout is one JSON document");
-    assert_eq!(document["graph_version"], 1);
+    assert_eq!(document["graph_version"], 2);
     assert_eq!(document["entrypoint"], "main.yml");
     assert_eq!(document["target"], "local");
     let flows = document["flows"].as_array().expect("a flows array");
@@ -328,7 +328,7 @@ model.smart:
     assert_eq!(code(&drawn), 0, "{}", stderr(&drawn));
     let document: serde_json::Value =
         serde_json::from_str(stdout(&drawn)).expect("stdout is one JSON document");
-    assert_eq!(document["graph_version"], 1);
+    assert_eq!(document["graph_version"], 2);
     assert_eq!(
         document["flows"].as_array().expect("a flows array").len(),
         0,
@@ -376,7 +376,7 @@ fn a_warning_does_not_refuse_a_drawing() {
     let document: serde_json::Value =
         serde_json::from_str(stdout(&printed)).expect("stdout is one JSON document");
     assert_eq!(
-        document["graph_version"], 1,
+        document["graph_version"], 2,
         "and the warning stayed off stdout"
     );
 }
