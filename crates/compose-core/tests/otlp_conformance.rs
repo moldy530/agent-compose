@@ -456,20 +456,6 @@ fn every_expectation_is_a_well_formed_export() {
     }
 }
 
-/// **The uniqueness above is asked of data that could break it.**
-///
-/// `every_expectation_is_a_well_formed_export` refuses two spans of one id, which
-/// is worth nothing if no fixture can produce two. The shape that can is the one
-/// §8 builds on purpose: a repeated attempt at one effect **reuses its instance
-/// path**, so a retried `flow:` node files two `inner` instances at one path and a
-/// retried tool loop files two dispatch records at one idempotency key. Derive a
-/// span id from the bare path and the two siblings still differ — they carry
-/// their own position — while everything *beneath* them collides, which a
-/// collector renders as one span with two parents.
-///
-/// So this insists the corpus holds that shape: two spans at one instance path,
-/// each with children of its own. It is the guard on the guard, and without it a
-/// fixture deleted in good faith would silently disarm §12.2.
 /// The corpus holds a **harness run**, and holds one of each shape the record
 /// has two of (`docs/trace.md` §7.6, PRD resolved q57).
 ///
@@ -542,6 +528,20 @@ fn the_corpus_holds_a_harness_run_of_each_shape() {
     assert!(per_turn_usage, "no fixture carries usage reported per turn");
 }
 
+/// **The uniqueness above is asked of data that could break it.**
+///
+/// `every_expectation_is_a_well_formed_export` refuses two spans of one id, which
+/// is worth nothing if no fixture can produce two. The shape that can is the one
+/// §8 builds on purpose: a repeated attempt at one effect **reuses its instance
+/// path**, so a retried `flow:` node files two `inner` instances at one path and a
+/// retried tool loop files two dispatch records at one idempotency key. Derive a
+/// span id from the bare path and the two siblings still differ — they carry
+/// their own position — while everything *beneath* them collides, which a
+/// collector renders as one span with two parents.
+///
+/// So this insists the corpus holds that shape: two spans at one instance path,
+/// each with children of its own. It is the guard on the guard, and without it a
+/// fixture deleted in good faith would silently disarm §12.2.
 #[test]
 fn the_corpus_holds_two_spans_at_one_instance_path_with_children() {
     let mut found: Vec<String> = Vec::new();

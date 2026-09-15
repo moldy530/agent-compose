@@ -1185,6 +1185,53 @@ placements:\n  mac:\n    members: [agent.outer]\n",
         );
     }
 
+    /// **A `coder:` node's variables follow the flow that holds it**, which is
+    /// the hub *and* every placement whose components reach that flow (§9.1).
+    ///
+    /// The bullet §9.1 gives coder nodes said "the hub's, and no placement's",
+    /// on the reasoning that `members:` binds components and a coder node is not
+    /// one. The reasoning is right about `members:` and wrong about the answer:
+    /// a coder node's references are filed under its **flow's** address, so the
+    /// executes-in closure carries them wherever that flow runs — and §14.1 rule
+    /// 4 runs an attached flow's instance inside its agent's own loop, on the
+    /// worker. An operator who read the old bullet would provision the hub only,
+    /// and the worker would be refused at the join (§9.2) over a variable the
+    /// manifest names and the machine does not hold.
+    ///
+    /// So both halves are asserted, the way the two above are: the placement's,
+    /// because that is the manifest §9.2 checks; and the hub's, because a flow
+    /// is startable there whatever else reaches it (Decision D64).
+    #[test]
+    fn a_coder_nodes_workspace_and_env_follow_the_flow_that_holds_it() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: anthropic\n  api_key: ${VENDOR_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+flow.patch:\n  description: Patch one thing.\n  inputs:\n    goal: { type: string }\n  outputs: {}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.smart\n        workspace: ${CODER_REPO_ROOT}\n        prompt: Do the work.\n        output:\n          summary: { type: string }\n        env:\n          CODER_SECRET: ${CODER_SECRET}\n      input: \"input.goal\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: end }\n\
+agent.signer:\n  model: model.smart\n  prompt: Ask for a patch.\n  tools: [flow.patch]\n  input: { goal: { type: string } }\n  output: { verdict: { type: string } }\n\
+flow.release:\n  inputs:\n    goal: { type: string }\n  outputs: {}\n  nodes:\n    sign:\n      agent: agent.signer\n      input:\n        goal: \"input.goal\"\n  edges:\n    - { from: start, to: sign }\n    - { from: sign, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.signer]\n",
+        );
+
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Placement("mac".to_string())),
+            ["CODER_REPO_ROOT", "CODER_SECRET", "VENDOR_KEY"],
+            "the worker runs the agent, and grammar §14.1 rule 4 starts the flow it attaches — \
+             coder node and all — inside that agent's own loop"
+        );
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Hub),
+            ["CODER_REPO_ROOT", "CODER_SECRET", "MESH_TOKEN"],
+            "…and `agent-compose run main.yml flow.patch` starts the same flow on the hub, which \
+             is why the placement **adds** rather than moves (Decision D64). `VENDOR_KEY` is \
+             absent because the provider *connection* does not reach inside a harness run: the \
+             harness owns its client and reads its auth from the node's own `env:` (PRD resolved \
+             q57 ruling d)"
+        );
+    }
+
     /// The rule that is unconditional is unconditional in both directions.
     ///
     /// An unplaced `tool.*` a `function:` node names is the hub's (§9.1),

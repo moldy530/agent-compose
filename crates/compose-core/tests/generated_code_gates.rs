@@ -5534,7 +5534,7 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 /// a parameter, and `src/harness.ts` emits a scripted driver into every project,
 /// so everything *above* the seam is exercised as the code a deployment ships.
 ///
-/// Ten claims, and not one of them is visible from a run's answer:
+/// Eleven claims, and not one of them is visible from a run's answer:
 ///
 ///  * **the config map** — the workspace resolves its `${ENV}` at the call and an
 ///    empty one is refused *as written*; the environment is scrubbed to the
@@ -5556,6 +5556,11 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 ///  * **one effect per run** — journaled once, whatever happened inside it;
 ///  * **replay** — a resumed generation consumes the recorded answer, the driver
 ///    is not run again, and the record says `replayed: true`;
+///  * **the request identity** — which is the whole binding, because replay does
+///    not re-gate: a narrowed `output:`, a moved `env:` reference, the scrub
+///    turned off or a different model setting each diverge the resume instead of
+///    handing the graph an answer under a binding the composition no longer has
+///    (`docs/durability.md` §3.9);
 ///  * **a failed run still reports** — a run that produced no answer, and one
 ///    whose harness reported a fatal error, each leave a record carried out on
 ///    the failure, because an activity that throws returns no answer;
@@ -5859,6 +5864,54 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
     );
     assert_eq!(held["replayedFlag"], json!(true));
     assert_eq!(held["liveFlag"], json!(null));
+
+    // --- The request identity (`docs/durability.md` §3.9) ------------------
+    //
+    // The arm above is exactly why this one matters: a resume returns the held
+    // answer and never reaches the output gate, so a binding the composition has
+    // since edited diverges here or nowhere. Each case is one edit resumed
+    // against the record written under the unedited binding.
+    let identity = &answer["identity"];
+    assert_eq!(
+        identity["untouched"],
+        json!({
+            "diverged": false,
+            "output": { "summary": "recorded", "touched": ["one.ts"] },
+            "ranTheDriver": false,
+        }),
+        "the unedited binding replays clean, which is what makes the cases below about the edit"
+    );
+    for (case, what) in [
+        (
+            "narrowedOutput",
+            "a narrowed `output:` — the recorded answer carries a property the contract no longer \
+             has, and replay does not re-gate",
+        ),
+        (
+            "movedEnv",
+            "an `env:` entry pointed at a different variable — what the run was handed changed",
+        ),
+        (
+            "inheritedNow",
+            "`inherit_env: true` — the scrub turned off is the widest edit `env:` has",
+        ),
+        (
+            "movedModelSettings",
+            "a different thinking budget, which is a different run (Decision D141)",
+        ),
+    ] {
+        assert_eq!(
+            identity[case]["diverged"],
+            json!(true),
+            "{case} did not diverge the resume: {what}"
+        );
+        assert_eq!(
+            identity[case]["ranTheDriver"],
+            json!(false),
+            "{case} re-ran the harness instead of diverging, which is the one thing a journaled \
+             effect promises it will not do"
+        );
+    }
 }
 
 /// Gate 23: the wire schema is the lowering's image of the schema the parse

@@ -665,6 +665,13 @@ fn panes(project: &str) -> &'static [Pane] {
                 facts: &[
                     "codex",
                     "read_only",
+                    // The other arm of the template's enforcement ternary, and
+                    // the only place a viewer is ever told an allowlist is
+                    // **not** a bound. A corpus with no `tools_enforced: false`
+                    // node carrying a non-empty list leaves this branch dead,
+                    // which is the one reading PRD resolved q57 ruling c exists
+                    // to put in front of somebody.
+                    "(sandbox bound only)",
                     "gpt-5-codex",
                     "provider.openai (openai)",
                 ],

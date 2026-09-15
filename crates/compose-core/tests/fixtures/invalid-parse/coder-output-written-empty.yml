@@ -1,0 +1,25 @@
+# rule: a `coder:` node's `output:` declares at least one property (grammar 8.9, PRD 5.2)
+# code: invalid-value
+# message: `output` of the `coder` block of node `build` must declare at least one property
+# at: 21:17
+# help: structured output on every node is what routing reads and what the output gate parses the harness's answer against (grammar 8.9, PRD 5.2)
+#
+# `output:` is required on a coder node, and an empty map is the spelling that
+# satisfies the key while declaring no contract at all — which would leave the
+# output gate nothing to parse the harness's answer against and routing nothing
+# to read.
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        output: {}
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

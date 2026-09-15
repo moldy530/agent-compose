@@ -1,0 +1,26 @@
+# rule: a `coder:` node's `input:` declares at least one field (grammar 8.9, 5.3)
+# code: invalid-value
+# message: `input` of the `coder` block of node `build` must declare at least one field
+# at: 20:16
+# help: omitting `input:` is how a coder node takes a single unnamed string; `{}` is neither contract (grammar 8.9, 5.3)
+#
+# An agent's rule read one construct along: omitting the key is how a node takes
+# a single unnamed string, so `{}` is a third thing that is neither of the two
+# contracts — a field map with no fields in it.
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        input: {}
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

@@ -347,3 +347,102 @@ fn check_shape(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Harness, table};
+
+    /// The names one emitted `<HARNESS>_SETTINGS` array lists, in order.
+    fn emitted(module: &str, declaration: &str) -> Vec<String> {
+        let array = module
+            .split_once(&format!("const {declaration}: readonly string[] = ["))
+            .unwrap_or_else(|| panic!("the emitted module declares `{declaration}`"))
+            .1;
+        let array = &array[..array.find("];").expect("…and closes the array it opened")];
+        array
+            .split(',')
+            .map(|piece| piece.trim().trim_matches('"').to_string())
+            .filter(|piece| !piece.is_empty())
+            .collect()
+    }
+
+    /// **The two curated `settings:` tables are one table.**
+    ///
+    /// [`CC_SETTINGS`](super::CC_SETTINGS) and
+    /// [`CODEX_SETTINGS`](super::CODEX_SETTINGS) here are the keys `validate`
+    /// checks strictly (Decision D140's first tier). `CC_SETTINGS` and
+    /// `CODEX_SETTINGS` in `src/harness-cc.ts` and `src/harness-codex.ts` are
+    /// those same two lists declared again for the runtime, where `passthrough`
+    /// reads them to hold a curated key back from the SDK because the driver
+    /// beside it maps that key by name. Two hand-maintained copies of one
+    /// document drift in silence — the argument
+    /// `the_harness_model_settings_table_is_one_table` in `src/codegen/graph.rs`
+    /// is written under, put on the other pair.
+    ///
+    /// Read in **three** directions, because a curated key has to be in three
+    /// places and a lapse in any one of them is silent:
+    ///
+    ///  1. every key this compiler checks strictly is in the emitted list. Drop
+    ///     it there and `passthrough` stops holding the key back, so the value
+    ///     travels to the SDK *beside* the option the driver already set from
+    ///     it — two spellings of one option, which is the collision the curated
+    ///     list exists to prevent.
+    ///  2. the emitted list holds no key this compiler does not check. That is
+    ///     the direction which makes `validate` **lie**: a key the runtime
+    ///     treats as curated and this table never learned earns
+    ///     `unknown-harness-setting` — "its value is unverified" — while the
+    ///     driver reads it and applies it all the same.
+    ///  3. each key is really read by that harness's driver, which is the whole
+    ///     reason either list exists: a key checked strictly here, filtered out
+    ///     of the passthrough there, and mapped by nobody is a setting
+    ///     `validate` verifies and the run then silently drops.
+    #[test]
+    fn the_curated_settings_table_is_one_table() {
+        for (harness, declaration, driver, module) in [
+            (
+                Harness::Cc,
+                "CC_SETTINGS",
+                include_str!("../codegen/js/harness-cc.ts"),
+                "src/harness-cc.ts",
+            ),
+            (
+                Harness::Codex,
+                "CODEX_SETTINGS",
+                include_str!("../codegen/js/harness-codex.ts"),
+                "src/harness-codex.ts",
+            ),
+        ] {
+            let checked: Vec<String> = table(harness)
+                .iter()
+                .map(|(key, _)| (*key).to_string())
+                .collect();
+            assert_eq!(
+                emitted(driver, declaration),
+                checked,
+                "`{declaration}` in `{module}` and `{declaration}` in `src/check/coder.rs` are \
+                 two copies of one table and have parted company: a key in one and not the other \
+                 is either a setting `validate` checks and the passthrough duplicates, or one it \
+                 warns is unverified while the driver applies it"
+            );
+            for key in &checked {
+                assert!(
+                    driver.contains(&format!("run.settings[\"{key}\"]")),
+                    "`{key}` is a curated `harness: {}` setting and `{module}` never reads it, so \
+                     the value is checked strictly, filtered out of the passthrough, and applied \
+                     to nothing",
+                    harness.as_str()
+                );
+            }
+        }
+
+        // A reserved harness has no driver and no curated table, which is the
+        // answer that claims least: `validate` refuses the composition before a
+        // settings key of one is ever read.
+        for reserved in [Harness::DeepAgents, Harness::Native] {
+            assert!(
+                table(reserved).is_empty(),
+                "a reserved harness has no SDK to take a setting"
+            );
+        }
+    }
+}

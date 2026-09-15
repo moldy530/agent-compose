@@ -8334,21 +8334,37 @@ export async function runCoder(
   // What identifies this effect to a resume. The **request** rather than the
   // stream: `docs/durability.md` §4 keys an effect by its site and its ordinal
   // and keeps the request so a divergence can say what changed, and a run's
-  // identity is the configuration it was started with. The resolved environment
-  // is deliberately not in it — those are the values `docs/trace.md` §11.1 keeps
-  // out of every artifact this project writes, and the workspace goes in as
-  // written for the same reason.
+  // identity is the configuration it was started with.
+  //
+  // **The whole binding**, which is [`runExec`]'s word and its argument one
+  // agent loop larger: an `env:` entry, an `inherit_env:`, a model setting the
+  // harness takes and the `output:` schema all change what this call is and what
+  // its answer means. The schema is the sharpest of them, because replay does
+  // not re-gate: a resume that finds this slot returns the held answer and never
+  // reaches [`performHarnessRun`], where `parseResult` lives — so a narrowed
+  // `output:` left out of this identity would hand the graph an answer the
+  // node's current contract refuses, with no `ReplayDivergence` to say so.
+  //
+  // The **resolved** environment is deliberately not in it: those are the values
+  // `docs/trace.md` §11.1 keeps out of every artifact this project writes. What
+  // goes in is what the composition *wrote* — `${SECRET}`, not the secret —
+  // which is `asWritten`, the same form the workspace takes and the same form an
+  // `exec:` binding's `env:` has always been journaled in.
   const request = {
     node: binding.node,
     harness: binding.harness,
     model: binding.model,
     modelId: binding.modelId,
+    modelSettings: binding.modelSettings,
     instructions: binding.prompt,
     input: run.input,
     workspace: asWritten(binding.workspace),
     access: binding.access,
     ...(binding.allowTools === undefined ? {} : { allowTools: binding.allowTools }),
+    env: binding.env.map((entry) => ({ name: entry.name, value: asWritten(entry.value) })),
+    inheritEnv: binding.inheritEnv === true,
     settings: binding.settings,
+    schema: binding.schema,
   };
 
   // Whether the journal already held this effect, read at the moment the slot

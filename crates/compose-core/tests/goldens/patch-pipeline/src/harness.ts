@@ -204,10 +204,10 @@ const CC_SETTINGS: readonly string[] = [
  *
  * Each one is a bound some other part of the node already states: `workspace:`
  * is `cwd`, `access:` is `permissionMode` and the flag beside it, `env:` is
- * `env`, `output:` is `outputFormat`, `allow_tools:` is the allowlist and the
- * callback that enforces it, `timeout:` is the abort controller, and `model:`
- * is the model and the one thinking budget Decision D141 maps into it. A
- * composition that spelled one of them here would be reaching around the
+ * `env`, `output:` is `outputFormat`, `allow_tools:` is the available tool set,
+ * the allowlist and the callback over them, `timeout:` is the abort controller,
+ * and `model:` is the model and the one thinking budget Decision D141 maps into
+ * it. A composition that spelled one of them here would be reaching around the
  * construct that states it, through the surface this grammar deliberately
  * leaves open — so these are dropped rather than passed.
  */
@@ -223,6 +223,7 @@ const CC_RESERVED: readonly string[] = [
   "outputFormat",
   "permissionMode",
   "systemPrompt",
+  "tools",
 ];
 
 /**
@@ -258,11 +259,22 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
  *
  * # What enforces the allowlist
  *
- * `canUseTool`, per call, inside the loop. `allowedTools` is set beside it
- * because it is what the SDK offers the model in the first place, and the
- * callback is what makes the list a **bound** rather than an offer: a call
- * outside it is denied with a message the model reads, and the denial is taped
- * as a `"refused"` tool event so the trace says the bound bit.
+ * **Two options, because one of them has a hole.** `tools` is the SDK's own
+ * "base set of available built-in tools", so a list written there is a tool set
+ * the model is never offered — a bound that holds whatever the permission mode
+ * is. `canUseTool` denies, per call, anything outside the list that reached the
+ * loop anyway, and tapes the denial as a `"refused"` tool event so the trace
+ * says the bound bit; `allowedTools` auto-allows the ones inside it so a bounded
+ * run is not also a prompting one.
+ *
+ * The hole is `access: full_access`, and it is why `tools` carries the bound
+ * rather than the callback: that preset is `permissionMode: "bypassPermissions"`,
+ * which the SDK documents as bypassing **all** permission checks — so
+ * `canUseTool` does not run, and a node whose `enforcesTools` says its list is
+ * enforced would be asserting a bound nothing held (grammar 8.9, PRD resolved
+ * q57 ruling c). Narrowing the available set is the answer the SDK's own
+ * documentation gives for `allowedTools`: "to restrict which tools are
+ * available, use the `tools` option instead".
  *
  * # What is asked for, and what is parsed
  *
@@ -317,6 +329,10 @@ const CC_DRIVER: runtime.HarnessDriver = {
       if (disallowed !== undefined) options.disallowedTools = disallowed;
       const allowed = run.allowTools;
       if (allowed !== undefined) {
+        // The bound itself: a tool outside the list is not in the set the loop
+        // can reach, which is true under every one of the three `access:`
+        // presets — `bypassPermissions` included.
+        options.tools = [...allowed];
         options.allowedTools = [...allowed];
         options.canUseTool = (name: string) => {
           if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });

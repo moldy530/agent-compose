@@ -2185,3 +2185,67 @@ flow.f:
 "#,
     );
 }
+
+/// **All three `access:` presets, on both harnesses, including `full_access`.**
+///
+/// The worked example takes `workspace_write` and `read_only` because those are
+/// the two a sensible pipeline wants; `full_access` is the preset with no
+/// composition behind it anywhere in this repository, and it is the one whose
+/// lowering is most load-bearing — it is the node that asks for the *least*
+/// containment, so it is where an adapter bound that quietly stops applying does
+/// the most damage (grammar 8.9, PRD resolved q57 ruling c). A preset nothing
+/// writes is a preset nothing compiles.
+///
+/// Three other legal shapes ride along, each one a key the example corpus never
+/// takes: `inherit_env: true` — q54 ruling b's explicit opt-in, and the only way
+/// a run sees the process's own environment — an `allow_tools:` list on a
+/// `full_access` node, which is the pairing whose bound the `cc` driver has to
+/// hold without a permission callback to lean on, and a coder node with neither
+/// `input:` nor `allow_tools:` at all.
+#[test]
+fn a_coder_node_takes_every_containment_preset() {
+    accepts(
+        "coder-access-presets",
+        r#"
+flow.f:
+  outputs: {}
+  nodes:
+    wide:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: ${ROOT}
+        access: full_access
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+        allow_tools: [Bash, Read]
+        inherit_env: true
+      input: "'go'"
+    narrow:
+      coder:
+        harness: codex
+        model: model.m
+        workspace: ${ROOT}
+        access: read_only
+        prompt: Read the work.
+        output:
+          verdict: { enum: [approve, revise] }
+      input: "'go'"
+    middle:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: ${ROOT}
+        prompt: Take the default preset.
+        output:
+          note: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: wide }
+    - { from: wide, to: narrow }
+    - { from: narrow, to: middle }
+    - { from: middle, to: end }
+"#,
+    );
+}

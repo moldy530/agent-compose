@@ -733,8 +733,9 @@ pub struct CoderView {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allow_tools: Vec<String>,
     /// Whether this harness enforces `allow_tools` inside its own loop.
-    /// `cc` does, through its per-call permission callback; `codex` bounds at
-    /// the sandbox only (grammar 8.9, PRD resolved q57 ruling c).
+    /// `cc` does, by narrowing the tool set its loop is offered and denying the
+    /// rest at its per-call permission callback; `codex` bounds at the sandbox
+    /// only (grammar 8.9, PRD resolved q57 ruling c).
     pub tools_enforced: bool,
     /// `env:` — the declared environment, in declaration order. Absent where
     /// the node declares none, which is a wholly scrubbed child environment.

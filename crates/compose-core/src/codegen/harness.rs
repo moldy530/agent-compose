@@ -403,4 +403,169 @@ mod tests {
             );
         }
     }
+
+    /// **A driver that says it enforces `allow_tools:` narrows what its loop can
+    /// reach, rather than resting on a callback an `access:` preset lifts.**
+    ///
+    /// Four surfaces carry that claim: `HarnessDriver.enforcesTools` in the
+    /// artifact, the graph document's `tools_enforced` (`docs/graph.md` §5.8),
+    /// the `plan` report, and `docs/grammar.md` 8.9. PRD resolved q57 ruling c
+    /// makes stating the asymmetry this compiler's job — which is worth nothing
+    /// while the enforcing side does not enforce.
+    ///
+    /// The shape that nearly broke it is worth naming, because the next driver
+    /// can repeat it: `access: full_access` lowers to the Agent SDK's
+    /// `bypassPermissions`, which that SDK documents as bypassing **all**
+    /// permission checks, so a run under that preset never reaches `canUseTool`.
+    /// An allowlist enforced by the callback alone would be a bound four
+    /// surfaces assert and the one node asking for the least containment does
+    /// not hold. The answer is the SDK's own — "to restrict which tools are
+    /// available, use the `tools` option instead" — so the list is also the
+    /// **available set**, which no permission mode widens.
+    ///
+    /// Read in three directions:
+    ///
+    ///  1. the claim in the artifact is the claim on the page: a driver's
+    ///     `enforcesTools` and the graph document's `tools_enforced` for the
+    ///     same harness are one answer, not two constants that agreed once;
+    ///  2. a harness that claims it sets the option that fixes the **available**
+    ///     set from `run.allowTools`, which is the layer `access:` cannot reach;
+    ///  3. every option it sets from the list is on that driver's reserved list,
+    ///     so an unverified `settings:` key cannot hand the bound back.
+    #[test]
+    fn a_driver_that_enforces_the_allowlist_narrows_the_tools_it_offers() {
+        // The SDK option that fixes what a loop may reach at all, per harness
+        // that claims enforcement. A vendor's name, so it is written where the
+        // reason for it is.
+        const AVAILABLE_SET: &[(Harness, &str)] = &[(Harness::Cc, "tools")];
+
+        for harness in Harness::ALL.iter().copied().filter(|h| h.ships_in_v1()) {
+            let (source, _, reserved) = driver_source(harness);
+            let name = harness.as_str();
+            let claims = declared_enforcement(source);
+            assert_eq!(
+                claims,
+                documented_enforcement(harness),
+                "`{name}`'s driver says `enforcesTools: {claims}` and the graph document says \
+                 otherwise — `tools_enforced` is what an author reads, and a run is what holds"
+            );
+            let set = from_allow_tools(source);
+            for option in &set {
+                assert!(
+                    quoted_list(source, reserved).contains(option),
+                    "`{name}`'s driver sets `{option}` from `allow_tools:` and `{reserved}` does \
+                     not hold it — a `settings:` key spelling `{option}` would widen the bound"
+                );
+            }
+            let Some((_, available)) = AVAILABLE_SET.iter().find(|(held, _)| *held == harness)
+            else {
+                assert!(
+                    !claims,
+                    "`{name}` claims to enforce `allow_tools:` and this test does not know which \
+                     of its SDK's options fixes the available tool set — a claim nothing checks \
+                     is how the `full_access` hole opened"
+                );
+                continue;
+            };
+            assert!(
+                claims,
+                "`{name}` is listed as enforcing and does not say so"
+            );
+            assert!(
+                set.contains(*available),
+                "`{name}`'s driver does not set `{available}` from `run.allowTools`, so the only \
+                 thing narrowing its tools is its permission callback — which \
+                 `access: full_access` bypasses outright (grammar 8.9, PRD resolved q57 ruling c)"
+            );
+        }
+    }
+
+    /// What one driver constant declares for `enforcesTools`.
+    fn declared_enforcement(source: &str) -> bool {
+        let rest = source
+            .split_once("enforcesTools: ")
+            .expect("every driver declares whether it enforces the allowlist")
+            .1;
+        let value = &rest[..rest.find(',').expect("…as one field of the object")];
+        value
+            .trim()
+            .parse()
+            .expect("…and declares it as a literal boolean")
+    }
+
+    /// …and what the graph document says about the same harness, which is the
+    /// surface an author reads (`docs/graph.md` §5.8).
+    fn documented_enforcement(harness: Harness) -> bool {
+        let ir = ir_of(&format!(
+            "version: \"0.1\"
+provider.p:
+  kind: anthropic
+  api_key: ${{K}}
+model.m:
+  provider: provider.p
+  id: some-model
+flow.f:
+  outputs: {{}}
+  nodes:
+    build:
+      coder:
+        harness: {}
+        model: model.m
+        workspace: /srv/checkout
+        access: full_access
+        prompt: Do the work.
+        output:
+          summary: {{ type: string }}
+        allow_tools: [Read]
+      input: \"'go'\"
+  edges:
+    - {{ from: start, to: build }}
+    - {{ from: build, to: end }}
+",
+            harness.as_str()
+        ));
+        crate::graph(&ir)
+            .flows
+            .iter()
+            .flat_map(|flow| &flow.nodes)
+            .find_map(|node| node.coder.as_ref())
+            .expect("the composition has a coder node")
+            .tools_enforced
+    }
+
+    /// The option keys one driver sets from the node's `allow_tools:`.
+    ///
+    /// The same two shapes [`adapter_owned`] reads, narrowed to the ones whose
+    /// value comes from `run.allowTools` — directly, or through the local
+    /// `const` a driver binds it to first.
+    fn from_allow_tools(source: &str) -> BTreeSet<String> {
+        let mut bound: BTreeSet<&str> = BTreeSet::new();
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("const ")
+                && let Some((held, value)) = rest.split_once(" = ")
+                && value.contains("run.allowTools")
+            {
+                bound.insert(held);
+            }
+            let Some(at) = line.find("options.") else {
+                continue;
+            };
+            let Some((key, value)) = line[at + "options.".len()..].split_once(" = ") else {
+                continue;
+            };
+            if key.is_empty() || !key.chars().all(|held| held.is_ascii_alphanumeric()) {
+                continue;
+            }
+            let from_list = value.contains("run.allowTools")
+                || value
+                    .split(|held: char| !held.is_ascii_alphanumeric() && held != '_')
+                    .any(|word| bound.contains(word));
+            if from_list {
+                set.insert(key.to_string());
+            }
+        }
+        set
+    }
 }

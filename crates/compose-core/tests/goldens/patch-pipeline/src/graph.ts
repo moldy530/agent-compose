@@ -206,6 +206,7 @@ const flowPatchNodeReviewCoder: runtime.HarnessBinding = {
   prompt: "You are reviewing a change somebody else just made in this repository.\nRead the working tree, decide whether it satisfies the goal, and say\nwhat would have to change if it does not.\n",
   workspace: [{ env: "REPO_ROOT", site: "flow.patch.node.review.workspace" }],
   access: "read_only",
+  allowTools: ["command_execution"],
   env: [
     { name: "PATH", value: ["/usr/bin:/bin"] },
     { name: "OPENAI_API_KEY", value: [{ env: "OPENAI_API_KEY", site: "flow.patch.node.review.env.OPENAI_API_KEY" }] },

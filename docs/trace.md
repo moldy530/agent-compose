@@ -1571,15 +1571,25 @@ array, in the walk order §12.1 fixes.
 | the **execution** | the root span. Named for the flow (`flow.review_loop`), and parented by the caller's span where §12.3 gives it one |
 | each **entry**, at every depth | a span under whatever ran it: the root for a top-level entry, the enclosing entry's span for one under `inner`, the dispatch's span for one under a dispatch record. Named for the node id |
 | each **dispatch record**, on `dispatches` and on `toolDispatches` alike | a span under its entry's, named for the record's `target` |
-| each **model call** | a span under its entry's, named for the `model.*` the agent asked for. `kind` is `3` (client) — the one thing a node does that leaves the process — and every other span is `1` (internal) |
+| each **model call** | a span under its entry's, named for the `model.*` the agent asked for. `kind` is `3` (client) — the call leaves the process for another service |
+| each **harness run** on a `coder:` node (§7.6) | a span under its entry's, named for the harness (`cc`, `codex`). `kind` is `3` (client) for the model call's reason read one loop out: the run *is* somebody else's agent loop, and every model call inside it was made by them. It is a span of its own rather than a model span with more attributes, because a collector that summed the two would be summing calls this graph made with calls it did not |
 | each **store record**, and a `human` node's **pause** | a span **event** on the entry's span, not a span |
 | each **tool call** on a model call, and each **failover** or **refusal** | a span event on the model call's span |
+| each **top-level turn** of a harness run, and each of its **tool events** | a span event on the harness run's span. The depth is the envelope's (§7.6): a harness's subagent transcripts are journal payload and reach no delivery surface |
 | a **flow-as-tool** join | a span **link** from the model-call span to the dispatch span that answered it (§12.2) |
+
+Those two rows are the only `kind: 3` spans this exporter emits, and they are the
+two things a node does that leave the process. **Every other span is `1`
+(internal).**
 
 Nothing else becomes a span. `attempts` is a **count** in this format rather than
 a record per attempt (§3), so it travels as the `agentcompose.attempts` attribute
 on the span whose record carries it; there is no per-attempt span, because there
-is no per-attempt record to make one from.
+is no per-attempt record to make one from. A `coder:` node under `retry:` is the
+case a reader will reach for: its `harness` array carries one record per attempt
+that started a run (§7.6), so that node's entry span has one child span per
+attempt — which is a span per *record*, exactly as this table says, and not a
+span per attempt.
 
 ### 12.2 Identity: trace ids, span ids and links
 
@@ -1592,16 +1602,18 @@ retry and what lets the conformance corpus pin exact output.
   outright by the caller's trace id where §12.3 applies.
 * **`spanId`** — 8 bytes, 16 lowercase hex: SHA-256 over `agent-compose/span/v1`,
   the execution id, the span's **kind word** (`execution`, `entry`, `dispatch`,
-  `model`) and its **key**, newline-separated, truncated to the first 8 bytes.
-  The kind word is in the hash so that an entry and a dispatch at one instance
-  path cannot collide.
+  `model`, `harness`) and its **key**, newline-separated, truncated to the first
+  8 bytes. The kind word is in the hash so that an entry and a dispatch at one
+  instance path cannot collide — and so that a model call and a harness run at
+  one position on one entry cannot either.
 * The **key** is a *path through the document*, not the instance path: each step
   names the record and appends its **position** in the array that held it, and
   every step is built on its parent's key rather than on the instance path. So an
   entry's key is `<key of whatever ran it>/<node>/<traversal>#<index among its
   siblings>`, a dispatch record's is `<entry key>/<map|tool>/<idempotency
   key>#<index on that carrier>`, a model call's is `<entry key>/model/<index>`,
-  and the root's is the execution id. The position is load-bearing rather than
+  a harness run's is `<entry key>/harness/<index>`, and the root's is the
+  execution id. The position is load-bearing rather than
   decorative — §8's derivation deliberately gives two attempts of a retried
   `flow:` node the same instance path, and two spans of one id would be one span
   to a collector — and it is **inherited** for the same reason: two same-path
@@ -1692,6 +1704,7 @@ way.
 | entry | `outcome: "completed"` | `"failed"`, with the entry's `error` as the message | `"skipped"` — its `error` says what was absorbed, and it is on the attributes |
 | dispatch | `outcome: "completed"` | `"failed"`, with the record's `error` as the message | `"skipped"` and `"detached"` |
 | model call | any call a member answered | a call `refused` ended, with `<member>: <detail>` as the message | — |
+| harness run | `outcome: "completed"` | `"failed"`, with the record's `error` as the message where it has one | — |
 
 ### 12.5 Attributes
 

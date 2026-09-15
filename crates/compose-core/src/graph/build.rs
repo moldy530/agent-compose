@@ -664,7 +664,8 @@ fn coder_view(ir: &Ir, coder: &Coder) -> CoderView {
 /// Whether a harness enforces the node's `allow_tools:` **inside its own loop**
 /// (grammar 8.9, PRD resolved q57 ruling c).
 ///
-/// `cc` does, through the Agent SDK's per-call permission callback; `codex`
+/// `cc` does, by making the list the tool set the SDK offers its loop at all and
+/// denying anything outside it at the per-call permission callback; `codex`
 /// bounds at the sandbox boundary only, per-call approval being the tier of
 /// their app server this release does not adopt. The two reserved harnesses
 /// never reach here — `validate` refuses them — and answer `false`, which is

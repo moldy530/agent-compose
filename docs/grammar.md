@@ -3088,10 +3088,16 @@ the adapter's rather than the author's:
 **`allow_tools:` is enforced by one harness and offered to the other**, and this
 document states the asymmetry rather than implying the two are equivalent:
 
-* **`cc` enforces it in-loop.** Every tool call the harness makes goes through
-  the Agent SDK's per-call permission callback, and a call outside the list is
-  denied with a message the model reads. The denial is recorded as a `"refused"`
-  tool event in the trace ([`docs/trace.md`](trace.md) §7.6).
+* **`cc` enforces it in-loop**, in two layers, because one of them has a hole.
+  The list is the **tool set the Agent SDK makes available** to the run at all,
+  so a tool outside it is one the harness is never offered; and a call outside it
+  that reaches the loop anyway goes through the SDK's per-call permission
+  callback and is denied with a message the model reads. The denial is recorded
+  as a `"refused"` tool event in the trace ([`docs/trace.md`](trace.md) §7.6).
+  The available set is the load-bearing layer, and the reason is `access:`: the
+  `full_access` preset is the SDK's mode that bypasses **every** permission
+  check, so a bound resting on the callback alone would not hold on the one node
+  that asked for the least containment.
 * **`codex` bounds at the sandbox only.** Its per-call approval tier belongs to
   an app server this release does not adopt, so the list is what the harness is
   *offered* and the sandbox preset is what holds. `agent-compose plan` says which
@@ -8500,10 +8506,15 @@ checkable. The three names are `codex`'s own shape, because that is the harness
 whose primitive is *named*; a vocabulary invented here would be a mapping nobody
 could verify against anything.
 
-**Rationale, the asymmetry**: `cc` enforces `allow_tools:` inside its own loop,
-per call, through the Agent SDK's permission callback. `codex` bounds at the
-sandbox boundary only — its per-call approval tier belongs to an app server this
-release does not adopt. The two are **not** equivalent and §8.9 says so, the
+**Rationale, the asymmetry**: `cc` enforces `allow_tools:` inside its own loop —
+as the set of tools the Agent SDK makes available to the run, and per call
+through that SDK's permission callback over the top. Both layers, deliberately:
+the callback alone would lapse exactly where containment is loosest, because
+`access: full_access` is the permission mode that bypasses every permission
+check, and a bound that a preset can switch off is not one this document should
+be claiming. `codex` bounds at the sandbox boundary only — its per-call approval
+tier belongs to an app server this release does not adopt. The two are **not**
+equivalent and §8.9 says so, the
 `plan` report says so, and the graph document carries it as a field
 (`docs/graph.md` §5.8) rather than leaving a reader to infer it. Refusing
 `allow_tools:` on a `codex` node was the alternative and is worse: the list is

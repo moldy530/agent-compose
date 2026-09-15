@@ -771,14 +771,29 @@ history and expects it to replay to the frontier, which a session store on
 another host cannot answer. The vendors' stores are debugging backstops.
 
 **What the request identity holds**, which is what §7 compares on a resume: the
-node, the harness, the `model.*` and the id it resolved to, the run's
-instructions and its rendered input, the workspace **as the author wrote it**,
-the access preset, the tool allowlist, and the harness `settings:`. The resolved
-environment is deliberately absent — those are the values `docs/trace.md` §11.1
-keeps out of every artifact this project writes, and the workspace goes in
-unresolved for the same reason. Editing a coder node's prompt therefore diverges
-a resume, which is the answer §7 gives everywhere: the recorded answer is an
-answer to a question this build is no longer asking.
+**whole binding**, as §3.2 means that word about an `exec:` call. The node, the
+harness, the `model.*`, the id it resolved to and the model `settings:` that
+crossed into the harness; the run's instructions and its rendered input; the
+workspace **as the author wrote it**; the access preset, the tool allowlist, the
+declared `env:` — names and values **as written** — and whether the run inherits
+the process environment; the harness `settings:`; and the node's `output:` schema.
+
+The **resolved** environment is deliberately absent: those are the values
+`docs/trace.md` §11.1 keeps out of every artifact this project writes, and the
+workspace and the `env:` values go in unresolved for the same reason. What is
+recorded is `${OPENAI_API_KEY}`, never what it resolved to — so one composition
+derives one identity whatever machine it runs on, which is also why an execution
+journaled on one host is not reported as divergent on another.
+
+The `output:` schema is in the list for a reason worth stating on its own: **a
+replay does not re-gate the answer.** A resume that finds this slot returns the
+recorded output and never performs the run, so the gate that parses a harness's
+answer against the node's contract does not execute. Were the schema left out,
+narrowing `output:` and resuming would hand the graph an answer the current
+contract refuses, silently and with no divergence. Editing a coder node's
+prompt, its `env:`, or its `output:` therefore diverges a resume, which is the
+answer §7 gives everywhere: the recorded answer is an answer to a question this
+build is no longer asking.
 
 ## 4. Keys
 

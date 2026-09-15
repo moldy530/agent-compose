@@ -35,6 +35,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use compose_core::ast::flow::{Harness, WorkspaceAccess};
 use compose_core::graph::{EdgeClass, NodeKind, PolicyLevel, SchemaSource, ToolSource};
 use compose_core::resolve;
 
@@ -158,6 +159,17 @@ fn every_record_type_is_specified() {
 /// ships. The page's own side of that bind is in `src/graph/document.rs`, where
 /// `NodeKind::ALL` is held to the template's `KIND` table and `EdgeClass::ALL` to
 /// its `EDGE` table.
+///
+/// **Two of them are not typed vocabularies on the view.** `CoderView.harness`
+/// and `CoderView.access` are `String` fields, filled from `Harness::as_str()`
+/// and `WorkspaceAccess::as_str()` — but §9.1 names them among the closed
+/// enumerations a reader may rely on all the same, so their members are read out
+/// of the *grammar's* enumerations rather than off the view's type. The harness
+/// list is filtered to what this release lowers: a reserved harness is a member
+/// of the grammar's enum and never of a document, because `validate` refuses a
+/// composition that binds one — so the day one of them ships, `ships_in_v1`
+/// turns over, this test demands the document name it, and §9.3's bump is owed
+/// before it can.
 #[test]
 fn every_closed_vocabulary_is_written_out() {
     let specification = specification();
@@ -167,6 +179,23 @@ fn every_closed_vocabulary_is_written_out() {
         ("SchemaView.source", members(SchemaSource::ALL)),
         ("RetryView.level", members(PolicyLevel::ALL)),
         ("ToolView.source", members(ToolSource::ALL)),
+        (
+            "CoderView.harness",
+            Harness::ALL
+                .iter()
+                .copied()
+                .filter(|harness| harness.ships_in_v1())
+                .map(|harness| harness.as_str().to_string())
+                .collect(),
+        ),
+        (
+            "CoderView.access",
+            WorkspaceAccess::ALL
+                .iter()
+                .copied()
+                .map(|access| access.as_str().to_string())
+                .collect(),
+        ),
     ];
 
     for (vocabulary, members) in vocabularies {

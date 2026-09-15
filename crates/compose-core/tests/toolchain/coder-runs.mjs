@@ -8,7 +8,7 @@
 // hands in a script and everything above the seam — the config map, the journal,
 // the stream tap, the output gate — is the code a deployment really ships.
 //
-// Ten claims, and each is invisible from outside a run:
+// Eleven claims, and each is invisible from outside a run:
 //
 //   * **the config map** — `workspace:` resolves its `${ENV}` at the call and an
 //     empty one is refused; the environment is **scrubbed** to the declared
@@ -31,6 +31,10 @@
 //   * **one effect per run** — journaled once, whatever the run did inside;
 //   * **replay** — a resumed generation consumes the recorded answer, the driver
 //     is **not** run again, and the record says `replayed: true`;
+//   * **the request identity** — and because replay does not re-gate, the whole
+//     binding is in it: a narrowed `output:`, a moved `env:` reference, the
+//     scrub turned off or a different model setting each diverge the resume
+//     rather than handing the graph an answer to a question it stopped asking;
 //   * **a failed run still reports** — a driver that throws leaves a record with
 //     the turns it took, carried out on the failure, because an activity that
 //     throws returns no answer;
@@ -448,6 +452,103 @@ const results = {};
     replayedDriverRuns: second.runs.length,
     replayedFlag: replayed.harness[0].replayed ?? null,
     liveFlag: written.harness[0].replayed ?? null,
+  };
+}
+
+// --- 10. The request identity is the whole binding -------------------------
+//
+// `docs/durability.md` §3.9, and the reason it has to be the whole binding is
+// section 9 above: **a replay does not re-gate.** The held answer is returned
+// and `performHarnessRun` — where the `output:` gate lives — never runs, so a
+// binding the composition has since edited either diverges on the request
+// identity or does not diverge at all, and the graph goes on with an answer to a
+// question this build stopped asking.
+//
+// Each case is one edit, resumed against a journal written under the unedited
+// binding. The control comes first: the same binding replays clean, so a
+// divergence below is the edit rather than a request that never matched.
+{
+  process.env["AGENT_COMPOSE_DATA"] = path.join(scratch, "identity");
+  process.env["CODER_WORKSPACE"] = workspace;
+  // Set, and set to the **same** value the entry it replaces resolves to: what
+  // this case is about is the reference the composition wrote, so a divergence
+  // that came from the resolved value changing would prove the opposite of the
+  // claim (`docs/trace.md` §11.1 keeps resolved values out of the identity).
+  process.env["CODER_TOKEN_V2"] = process.env["CODER_TOKEN"];
+  const held = await journal.openJournal();
+  const site = "flow.patch/implement/0";
+  const answer = { summary: "recorded", touched: ["one.ts"] };
+
+  journal.openSession("exec_identity", held, false);
+  const live = harness.scriptedDriver("cc", script(answer));
+  await runtime.runCoder(
+    binding(),
+    { goal: "fix it" },
+    context({
+      execution: { id: "exec_identity" },
+      effects: journal.recorderFor("exec_identity", site),
+    }),
+    { cc: live.driver },
+  );
+  journal.closeSession("exec_identity");
+
+  /** Resume the recorded effect under `overrides`, and say how it went. */
+  const resumeWith = async (overrides) => {
+    journal.openSession("exec_identity", held, true);
+    const stub = harness.scriptedDriver("cc", script({ summary: "SHOULD NOT RUN", touched: [] }));
+    let failure;
+    let output;
+    try {
+      const replayed = await runtime.runCoder(
+        binding(overrides),
+        { goal: "fix it" },
+        context({
+          execution: { id: "exec_identity" },
+          effects: journal.recorderFor("exec_identity", site),
+        }),
+        { cc: stub.driver },
+      );
+      output = replayed.output;
+    } catch (error) {
+      failure = error;
+    }
+    journal.closeSession("exec_identity");
+    return {
+      diverged: runtime.divergenceOf(failure) !== undefined,
+      output: output ?? null,
+      ranTheDriver: stub.runs.length > 0,
+    };
+  };
+
+  results["identity"] = {
+    untouched: await resumeWith({}),
+    // The narrowed `output:`: `touched` is gone from the contract, and the
+    // recorded answer carries it. Nothing downstream would notice — the gate is
+    // behind the replay arm — so this is the divergence or nothing.
+    narrowedOutput: await resumeWith({
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { summary: { type: "string" } },
+        required: ["summary"],
+      },
+    }),
+    // An `env:` entry pointed at a different variable. The **name written**
+    // changes what the run was handed; the resolved value is not in the identity
+    // and never will be (`docs/trace.md` §11.1).
+    movedEnv: await resumeWith({
+      env: [
+        { name: "PATH", value: ["/usr/bin:/bin"] },
+        { name: "TOKEN", value: [{ env: "CODER_TOKEN_V2", site: "…env.TOKEN" }] },
+      ],
+    }),
+    // The scrub turned off, which is the widest edit `env:` has.
+    inheritedNow: await resumeWith({ inheritEnv: true }),
+    // A model setting the harness takes: a different thinking budget is a
+    // different run (Decision D141).
+    movedModelSettings: await resumeWith({
+      modelSettings: { thinking: { budget_tokens: 32000 } },
+    }),
   };
 }
 

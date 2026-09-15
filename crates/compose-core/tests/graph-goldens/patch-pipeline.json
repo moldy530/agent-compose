@@ -255,6 +255,9 @@
             "workspace": "${REPO_ROOT}",
             "access": "read_only",
             "prompt": "You are reviewing a change somebody else just made in this repository.\nRead the working tree, decide whether it satisfies the goal, and say\nwhat would have to change if it does not.\n",
+            "allow_tools": [
+              "command_execution"
+            ],
             "tools_enforced": false,
             "env": [
               {
