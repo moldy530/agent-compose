@@ -17,14 +17,27 @@ const CODEX_SETTINGS: readonly string[] = [
  * key therefore never reaches (see [`passthrough`]).
  *
  * Each one is a bound some other part of the node already states: `workspace:`
- * is `workingDirectory`, `access:` is `sandboxMode`, and `model:` is the model
- * and the one reasoning setting Decision D141 maps into it. A composition that
- * spelled one of them here would be reaching around the construct that states
- * it, through the surface this grammar deliberately leaves open — so these are
- * dropped rather than passed. The environment is not on the list because it is
- * not a thread option at all: it is handed to the `Codex` constructor below.
+ * is `workingDirectory`, `access:` is `sandboxMode` and the approval policy
+ * beside it, and `model:` is the model and the one reasoning setting Decision
+ * D141 maps into it. A composition that spelled one of them here would be
+ * reaching around the construct that states it, through the surface this
+ * grammar deliberately leaves open — so these are dropped rather than passed.
+ * The environment is not on the list because it is not a thread option at all:
+ * it is handed to the `Codex` constructor below.
+ *
+ * `approvalPolicy` is the one that is not a second spelling of a key: it is the
+ * **per-call approval tier** PRD resolved q57 ruling c says this release does
+ * not adopt, and a run that escalated out of its sandbox to an approver nothing
+ * answers for would be `access:` saying one thing and the run doing another.
+ * The thread's other options are the vendor's own vocabulary and travel
+ * unchanged, which is Decision D140's whole point.
+ *
+ * The list is audited against the pinned SDK's own `ThreadOptions`, which is
+ * what `a_reserved_list_is_audited_against_the_pinned_option_surface`
+ * (`codegen/harness.rs`) holds it to.
  */
 const CODEX_RESERVED: readonly string[] = [
+  "approvalPolicy",
   "model",
   "modelReasoningEffort",
   "sandboxMode",
@@ -58,11 +71,17 @@ const CODEX_SANDBOX: Readonly<Record<runtime.WorkspaceAccess, SandboxMode>> = {
  *
  * # What bounds a run, and what does not
  *
- * The **sandbox**, and nothing else. `allowTools` is carried into the run and is
- * not enforced here: the Codex SDK's per-call approval tier is their app
- * server's, which this release does not adopt, so `enforcesTools` is `false` and
- * `docs/grammar.md` 8.9 states the asymmetry where an author writes the list.
- * The `codex` half of PRD resolved q57 ruling c is this constant.
+ * The **sandbox**, and nothing else. The Codex SDK's per-call approval tier is
+ * their app server's, which this release does not adopt, so `enforcesTools` is
+ * `false` and `docs/grammar.md` 8.9 states the asymmetry where an author writes
+ * the list. The `codex` half of PRD resolved q57 ruling c is this constant.
+ *
+ * `allow_tools:` is therefore what the harness is **offered**, and offering it
+ * is something a driver has to do rather than something that happens: a thread
+ * has no tool-set option to put it in, so the list reaches the run the one way
+ * anything reaches it — as a line of the instructions the turn carries
+ * ([`codexTurn`]). A list that reached nothing at all would make grammar 8.9's
+ * `offered` a word for a key with no effect.
  *
  * # What is asked for, and what is parsed
  *
@@ -102,7 +121,7 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
       if (directories !== undefined) options.additionalDirectories = directories;
 
       const thread = codex.startThread(options);
-      const streamed = await thread.runStreamed(`${run.instructions}\n\n${run.input}`, {
+      const streamed = await thread.runStreamed(codexTurn(run), {
         outputSchema: { ...run.schema },
         signal: run.signal,
       });
@@ -174,6 +193,28 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
     })();
   },
 };
+
+/**
+ * The turn one run sends: the node's instructions, the list it offers the
+ * harness where it wrote one, and the bound input (see [`CODEX_DRIVER`]).
+ *
+ * The instructions lead, the way they do under the other harness, and the
+ * vendor's own base instructions are untouched beneath them — a thread keeps
+ * the agent loop it was post-trained with, which is why this is a kind at all
+ * (PRD resolved q57).
+ *
+ * The offered list is stated as what it is: this harness bounds at the sandbox,
+ * so the sentence is an instruction the model reads and not a bound. `cc` puts
+ * the same list somewhere that holds; `docs/grammar.md` 8.9 and the graph
+ * document's `tools_enforced` are where the asymmetry is written down.
+ */
+function codexTurn(run: runtime.HarnessRun): string {
+  const offered =
+    run.allowTools === undefined
+      ? ""
+      : `\n\nThe tools this run is offered: ${run.allowTools.join(", ")}. Use no others.`;
+  return `${run.instructions}${offered}\n\n${run.input}`;
+}
 
 /**
  * One completed thread item, as a tool event — or `undefined` where the item is

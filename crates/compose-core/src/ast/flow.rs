@@ -164,6 +164,13 @@ impl Harness {
 /// exactly this shape, and the Agent SDK has a permission surface these three
 /// select a setting of. The names are this grammar's own — a spec never spells a
 /// vendor's — and the mapping is the adapter's.
+///
+/// The sentence each variant carries is what a preset *means*; **what holds it
+/// is stated per harness and never implied equivalent** (PRD resolved q57 ruling
+/// c). The two statements are the tables in `docs/grammar.md` §8.9 and the two
+/// drivers' own `CC_PERMISSION`/`CODEX_SANDBOX`, and they differ in kind: one
+/// harness holds `ReadOnly` at the operating system and the other holds it with
+/// a permission mode. An author reading only this enum has read half of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WorkspaceAccess {
     /// Read the workspace; write nothing.

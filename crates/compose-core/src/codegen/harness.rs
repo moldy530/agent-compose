@@ -297,6 +297,182 @@ mod tests {
         }
     }
 
+    /// …and the other direction, which the one above cannot see: the reserved
+    /// list is an **inventory of the pinned SDK's option surface**, re-opened
+    /// by the pin (grammar 8.9, Decision D140).
+    ///
+    /// [`a_settings_key_cannot_reach_an_option_the_adapter_owns`] reads the
+    /// list off the driver, and that reading has a floor: an option the driver
+    /// never *assigns* is one it can never require. The options that reach
+    /// furthest are exactly those — an Agent SDK run takes `extraArgs`, which
+    /// is any CLI flag there is, `settings` and `settingSources`, which are
+    /// permission rules, `mcpServers` and `agents`, which are tools and loops
+    /// outside `allow_tools:`, and the `resume` family PRD resolved q57 ruling
+    /// b excludes by name — and a driver that assigns none of them would leave
+    /// every one of them passable. So the list is written out here as well,
+    /// against the version it was read against: a vendor's new option arrives
+    /// with a version bump, so the bump is what fails this test and re-opens
+    /// the audit rather than quietly widening the surface.
+    #[test]
+    fn a_reserved_list_is_audited_against_the_pinned_option_surface() {
+        for harness in Harness::ALL.iter().filter(|held| held.ships_in_v1()) {
+            let (source, _, reserved) = driver_source(*harness);
+            let (audited, expected) = audited_surface(*harness);
+            let name = harness.as_str();
+            assert_eq!(
+                version_of(*harness),
+                audited,
+                "`{name}`'s SDK is pinned at {} and `{reserved}` was audited against {audited}: \
+                 read the release's own options, add every one that reaches around \
+                 `workspace:`, `access:`, `env:`, `output:`, `prompt:`, `allow_tools:`, \
+                 `timeout:` or `model:`, and move this version up (grammar 8.9)",
+                version_of(*harness)
+            );
+            let held: Vec<String> = quoted_list(source, reserved).into_iter().collect();
+            let want: Vec<String> = expected.iter().map(|held| (*held).to_string()).collect();
+            assert_eq!(
+                held, want,
+                "`{reserved}` is not the audited inventory of {audited}'s option surface"
+            );
+        }
+    }
+
+    /// A `cc` run keeps the **harness's own** system prompt and appends the
+    /// node's `prompt:` to it (grammar 8.9, PRD resolved q57).
+    ///
+    /// The SDK reads a bare string there as a *custom* prompt and replaces the
+    /// preset with it, and the preset is the vendor's own agent instructions —
+    /// the thing PRD resolved q57 gives as the reason this is a kind rather
+    /// than a bundle of parts, and the thing `codex` keeps for free because its
+    /// instructions ride the turn. A composition's `prompt:` reads the same
+    /// under both harnesses only if this mapping does.
+    ///
+    /// Pinned on the emitted source rather than on a run, because what it is
+    /// about is the option the SDK is handed: the scripted driver a runtime
+    /// test drives stands in for the SDK and never sees it.
+    #[test]
+    fn a_cc_run_appends_the_nodes_prompt_to_the_harnesss_own() {
+        assert!(
+            CC.contains(
+                "systemPrompt: { type: \"preset\", preset: \"claude_code\", append: run.instructions }"
+            ),
+            "the `cc` driver does not ask for the harness's own system prompt with the node's \
+             `prompt:` appended"
+        );
+        assert!(
+            !CC.contains("systemPrompt: run.instructions"),
+            "the `cc` driver hands the SDK a bare `systemPrompt`, which replaces the preset the \
+             model was post-trained against (grammar 8.9)"
+        );
+    }
+
+    /// A call the `cc` permission callback denied is **one** tool event
+    /// (`docs/trace.md` §7.6.3).
+    ///
+    /// The denial is taped `refused` where it happens, and the SDK then hands
+    /// the model that same denial as the `tool_result` answering the
+    /// `tool_use`. Taping that too would put a second event in the record for
+    /// one call, under an outcome that describes a call which ran — `completed`
+    /// is "handed its model the tool's result" and `failed` is an execution
+    /// that failed, and a refusal is neither. Correlating them needs the id, so
+    /// the id is what is pinned here.
+    #[test]
+    fn a_cc_call_the_allowlist_denied_is_one_tool_event() {
+        assert!(
+            CC.contains("refused.add(ask.toolUseID);"),
+            "the `cc` permission callback does not remember which call it denied, so nothing \
+             downstream can tell the denial's own `tool_result` from a tool's answer"
+        );
+        assert!(
+            CC.contains("if (refused.delete(block.tool_use_id)) {"),
+            "the `cc` driver tapes a `tool_result` for a call it already taped as `refused`"
+        );
+    }
+
+    /// `allow_tools:` on a `codex` node reaches the run (grammar 8.9, Decision
+    /// D138).
+    ///
+    /// This harness bounds at the sandbox, so the list is what it is *offered*
+    /// — and offering is something the driver does. A `ThreadOptions` has no
+    /// tool-set field, so the one place a list can reach the harness is the
+    /// turn; a driver that put it nowhere would make D138's own argument for
+    /// accepting the key on this harness ("the list is still what the harness
+    /// is offered") an argument for a key with no effect at all.
+    #[test]
+    fn a_codex_run_is_offered_the_list_that_does_not_bound_it() {
+        assert!(
+            CODEX.contains("runStreamed(codexTurn(run)"),
+            "the `codex` driver does not build its turn through `codexTurn`"
+        );
+        assert!(
+            CODEX.contains("run.allowTools.join(\", \")"),
+            "`codexTurn` does not name the offered tools, so `allow_tools:` reaches nothing on a \
+             `codex` node"
+        );
+    }
+
+    /// The SDK release one driver's reserved list was read against, and the
+    /// list itself, sorted as [`quoted_list`] returns it.
+    fn audited_surface(harness: Harness) -> (&'static str, &'static [&'static str]) {
+        match harness {
+            // `@anthropic-ai/claude-agent-sdk`'s `Options`.
+            Harness::Cc => (
+                "0.3.272",
+                &[
+                    "abortController",
+                    "additionalDirectories",
+                    "agent",
+                    "agents",
+                    "allowDangerouslySkipPermissions",
+                    "allowedTools",
+                    "canUseTool",
+                    "continue",
+                    "cwd",
+                    "env",
+                    "extraArgs",
+                    "fallbackModel",
+                    "forkSession",
+                    "hooks",
+                    "managedSettings",
+                    "maxThinkingTokens",
+                    "mcpServers",
+                    "model",
+                    "outputFormat",
+                    "permissionMode",
+                    "permissionPromptToolName",
+                    "permissionPrompts",
+                    "planModeInstructions",
+                    "plugins",
+                    "resume",
+                    "resumeDropsTurn",
+                    "resumeSessionAt",
+                    "sandbox",
+                    "sessionId",
+                    "settingSources",
+                    "settings",
+                    "systemPrompt",
+                    "thinking",
+                    "toolAliases",
+                    "tools",
+                ],
+            ),
+            // `@openai/codex-sdk`'s `ThreadOptions`, which is closed and small:
+            // four of its eleven fields are a bound this node states, and the
+            // rest are the vendor's own vocabulary D140 leaves open.
+            Harness::Codex => (
+                "0.154.0",
+                &[
+                    "approvalPolicy",
+                    "model",
+                    "modelReasoningEffort",
+                    "sandboxMode",
+                    "workingDirectory",
+                ],
+            ),
+            Harness::DeepAgents | Harness::Native => ("", &[]),
+        }
+    }
+
     /// The source of one harness's driver, and the names of the two lists the
     /// emitted `passthrough` reads.
     fn driver_source(harness: Harness) -> (&'static str, &'static str, &'static str) {

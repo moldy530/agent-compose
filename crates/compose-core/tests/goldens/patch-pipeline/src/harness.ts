@@ -202,16 +202,46 @@ const CC_SETTINGS: readonly string[] = [
  * The keys of `query`'s options the **adapter** owns, and which a `settings:`
  * key therefore never reaches (see [`passthrough`]).
  *
- * Each one is a bound some other part of the node already states: `workspace:`
- * is `cwd`, `access:` is `permissionMode` and the flag beside it, `env:` is
- * `env`, `output:` is `outputFormat`, `allow_tools:` is the available tool set,
- * the allowlist and the callback over them, `timeout:` is the abort controller,
- * and `model:` is the model and the one thinking budget Decision D141 maps into
- * it. A composition that spelled one of them here would be reaching around the
+ * A composition that spelled one of these would be reaching around the
  * construct that states it, through the surface this grammar deliberately
- * leaves open — so these are dropped rather than passed.
+ * leaves open — so they are dropped rather than passed. Two kinds of name are
+ * on the list, and the second kind is why it is a list rather than a reading of
+ * what the driver below assigns:
+ *
+ *  * an option that **spells** a bound another key states. `workspace:` is
+ *    `cwd`, `access:` is `permissionMode`, the plan-mode body beside it and the
+ *    flag `bypassPermissions` requires, `env:` is `env`, `output:` is
+ *    `outputFormat`, `prompt:` is `systemPrompt`, `allow_tools:` is the
+ *    available tool set, the allowlist and the callback over them, `timeout:`
+ *    is the abort controller, and `model:` is the model and the one thinking
+ *    budget Decision D141 maps into it (`thinking` is here for that last
+ *    reason: the SDK documents it as taking precedence over the
+ *    `maxThinkingTokens` D141 writes);
+ *  * an option that **contains** one without spelling it, which a driver never
+ *    assigns and a list keyed off the driver could therefore never hold.
+ *    `extraArgs` is an arbitrary CLI flag — `dangerously-skip-permissions` and
+ *    `add-dir` among them — so it is every bound at once. `settings`,
+ *    `managedSettings` and `settingSources` carry permission rules;
+ *    `additionalDirectories` carries roots beside `workspace:`; `sandbox`
+ *    carries containment; `mcpServers`, `agents`, `agent` and `toolAliases`
+ *    each put a tool or a whole loop outside `allow_tools:` within reach —
+ *    `agent` also carrying its own model and prompt — and `plugins` carries
+ *    hooks, agents and skills together; `hooks`, `permissionPrompts` and
+ *    `permissionPromptToolName` each move or silence the decision `canUseTool`
+ *    makes; and `fallbackModel` is the failover ladder D141 stops at the
+ *    boundary. The `resume` family — `resume`, `continue`, `forkSession`,
+ *    `sessionId`, `resumeSessionAt`, `resumeDropsTurn` — is dropped for PRD
+ *    resolved q57 ruling b's reason rather than for containment: harness-native
+ *    resume is a **named exclusion**, because a machine-local session store is
+ *    not the journal.
+ *
+ * The list is audited against the option surface of the pinned SDK, which is
+ * what `a_reserved_list_is_audited_against_the_pinned_option_surface`
+ * (`codegen/harness.rs`) holds it to: a version bump is where a new
+ * reach-around arrives, so the pin is what re-opens the audit.
  */
 const CC_RESERVED: readonly string[] = [
+  // Options that spell a bound another key states.
   "abortController",
   "allowDangerouslySkipPermissions",
   "allowedTools",
@@ -222,19 +252,51 @@ const CC_RESERVED: readonly string[] = [
   "model",
   "outputFormat",
   "permissionMode",
+  "planModeInstructions",
   "systemPrompt",
+  "thinking",
   "tools",
+  // …and options that contain one without spelling it.
+  "additionalDirectories",
+  "agent",
+  "agents",
+  "continue",
+  "extraArgs",
+  "fallbackModel",
+  "forkSession",
+  "hooks",
+  "managedSettings",
+  "mcpServers",
+  "permissionPromptToolName",
+  "permissionPrompts",
+  "plugins",
+  "resume",
+  "resumeDropsTurn",
+  "resumeSessionAt",
+  "sandbox",
+  "sessionId",
+  "settingSources",
+  "settings",
+  "toolAliases",
 ];
 
 /**
  * How `access:` reaches the Agent SDK (grammar 8.9, Decision D138).
  *
  * The SDK's containment primitive is a permission *mode* plus a working
- * directory, so the preset selects the mode and `cwd` carries the root:
+ * directory, so the preset selects the mode and `cwd` carries the root. Which
+ * primitive a preset lands on is **stated per harness and never implied
+ * equivalent** (PRD resolved q57 ruling c): what `access:` means is the same
+ * sentence under both harnesses, and what enforces it is each harness's own:
  *
- *  * `read_only` → `plan`, which the SDK documents as planning mode with no
- *    execution of tools — the strongest read-only statement its own surface
- *    makes;
+ *  * `read_only` → `plan`, the mode whose system reminder the CLI wraps in its
+ *    **read-only enforcement** preamble: the tree is readable and nothing under
+ *    it is written. It is the one containment statement the SDK's own surface
+ *    makes without a tool taxonomy this adapter would have had to invent, and
+ *    the node's own instructions replace the mode's default
+ *    code-implementation workflow body (`planModeInstructions`) so the run is
+ *    asked for what the node asked for rather than for a plan to implement
+ *    something;
  *  * `workspace_write` → `acceptEdits`, which auto-accepts edits under the
  *    working directory and still asks about everything else;
  *  * `full_access` → `bypassPermissions`, with the flag the SDK requires beside
@@ -276,6 +338,17 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
  * documentation gives for `allowedTools`: "to restrict which tools are
  * available, use the `tools` option instead".
  *
+ * # Whose system prompt a run has
+ *
+ * The harness's, with the node's `prompt:` **appended** to it
+ * (`{ type: "preset", preset: "claude_code", append }`). A bare string there is
+ * the SDK's custom-prompt form and *replaces* the preset — and the preset is
+ * the vendor's own agent instructions, which is half of what PRD resolved q57
+ * makes this a kind for: the loop, the tool shapes and the prompt the model was
+ * post-trained against are the thing that cannot be reassembled from parts. So
+ * the node's prompt is what it reads like in the grammar — instructions *for*
+ * the harness — rather than a replacement of the harness.
+ *
  * # What is asked for, and what is parsed
  *
  * `outputFormat: { type: "json_schema" }` carrying the schema the adapter
@@ -298,10 +371,16 @@ const CC_DRIVER: runtime.HarnessDriver = {
       // The name each top-level `tool_use` went out under, so the `tool_result`
       // that answers it can be taped under the same name.
       const calls = new Map<string, string>();
+      // The `tool_use` ids the callback below denied. A denial is taped once,
+      // from the callback; the `tool_result` the SDK then hands the model is
+      // that same denial travelling back, and taping it again would claim two
+      // tool events where the run made one (`docs/trace.md` 7.6.3, whose
+      // `completed` and `failed` describe a call that executed).
+      const refused = new Set<string>();
 
       const options: Options = {
         cwd: run.workspace,
-        systemPrompt: run.instructions,
+        systemPrompt: { type: "preset", preset: "claude_code", append: run.instructions },
         model: run.model,
         permissionMode: CC_PERMISSION[run.access],
         abortController: controller,
@@ -310,6 +389,10 @@ const CC_DRIVER: runtime.HarnessDriver = {
         ...passthrough(run, CC_SETTINGS, CC_RESERVED),
       };
       if (run.access === "full_access") options.allowDangerouslySkipPermissions = true;
+      // Plan mode's body, replaced by what this node asked for: the mode's
+      // default body is a code-implementation workflow, and a `read_only` node
+      // is a run that reads and reports (see [`CC_PERMISSION`]).
+      if (run.access === "read_only") options.planModeInstructions = run.instructions;
       // The one `model.*` setting this harness has a place for: the `anthropic`
       // plugin's `thinking: { budget_tokens: … }` is the SDK's
       // `maxThinkingTokens` (Decision D141).
@@ -334,12 +417,23 @@ const CC_DRIVER: runtime.HarnessDriver = {
         // presets — `bypassPermissions` included.
         options.tools = [...allowed];
         options.allowedTools = [...allowed];
-        options.canUseTool = (name: string) => {
+        options.canUseTool = (name, _input, ask) => {
           if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
           const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;
+          // The call this denial answers, remembered by its id: the SDK hands
+          // the model the denial as the `tool_result` for that `tool_use`, and
+          // one call is one tool event.
+          refused.add(ask.toolUseID);
           refusals.push({
             source: { type: "agent-compose.permission_denied", tool: name, message },
-            tap: { kind: "tool", name, outcome: "refused", error: message },
+            // A denial inside a **subagent** is that subagent's, and the
+            // envelope carries the top level only — the same depth rule
+            // [`ccEvents`] reads off `parent_tool_use_id`, read here off the
+            // sub-agent id the SDK passes the callback (PRD resolved q57
+            // ruling a).
+            ...(ask.agentID === undefined
+              ? { tap: { kind: "tool" as const, name, outcome: "refused" as const, error: message } }
+              : {}),
           });
           return Promise.resolve({ behavior: "deny" as const, message });
         };
@@ -347,7 +441,7 @@ const CC_DRIVER: runtime.HarnessDriver = {
 
       for await (const message of query({ prompt: run.input, options })) {
         while (refusals.length > 0) yield refusals.shift() as runtime.HarnessEvent;
-        yield* ccEvents(message, calls);
+        yield* ccEvents(message, calls, refused);
       }
       while (refusals.length > 0) yield refusals.shift() as runtime.HarnessEvent;
     })();
@@ -358,6 +452,7 @@ const CC_DRIVER: runtime.HarnessDriver = {
 function* ccEvents(
   message: SDKMessage,
   calls: Map<string, string>,
+  refused: Set<string>,
 ): Generator<runtime.HarnessEvent> {
   // A message from inside a subagent is payload and nothing else — the depth
   // rule PRD resolved q57 ruling a fixes, read off the one field that carries
@@ -383,6 +478,15 @@ function* ccEvents(
       if (block.type !== "tool_result") continue;
       const name = calls.get(block.tool_use_id);
       if (name === undefined) continue;
+      // A call the permission callback denied was taped `refused` there, and
+      // this result is that denial on its way to the model rather than a second
+      // event: the call never executed, so neither `completed` nor `failed`
+      // describes it (`docs/trace.md` 7.6.3). The message still reaches the
+      // journal's payload above, untapped, like every other result.
+      if (refused.delete(block.tool_use_id)) {
+        calls.delete(block.tool_use_id);
+        continue;
+      }
       const failed = block.is_error === true;
       yield {
         source: { type: "agent-compose.tool_result", tool: name, is_error: failed },
@@ -454,14 +558,27 @@ const CODEX_SETTINGS: readonly string[] = [
  * key therefore never reaches (see [`passthrough`]).
  *
  * Each one is a bound some other part of the node already states: `workspace:`
- * is `workingDirectory`, `access:` is `sandboxMode`, and `model:` is the model
- * and the one reasoning setting Decision D141 maps into it. A composition that
- * spelled one of them here would be reaching around the construct that states
- * it, through the surface this grammar deliberately leaves open — so these are
- * dropped rather than passed. The environment is not on the list because it is
- * not a thread option at all: it is handed to the `Codex` constructor below.
+ * is `workingDirectory`, `access:` is `sandboxMode` and the approval policy
+ * beside it, and `model:` is the model and the one reasoning setting Decision
+ * D141 maps into it. A composition that spelled one of them here would be
+ * reaching around the construct that states it, through the surface this
+ * grammar deliberately leaves open — so these are dropped rather than passed.
+ * The environment is not on the list because it is not a thread option at all:
+ * it is handed to the `Codex` constructor below.
+ *
+ * `approvalPolicy` is the one that is not a second spelling of a key: it is the
+ * **per-call approval tier** PRD resolved q57 ruling c says this release does
+ * not adopt, and a run that escalated out of its sandbox to an approver nothing
+ * answers for would be `access:` saying one thing and the run doing another.
+ * The thread's other options are the vendor's own vocabulary and travel
+ * unchanged, which is Decision D140's whole point.
+ *
+ * The list is audited against the pinned SDK's own `ThreadOptions`, which is
+ * what `a_reserved_list_is_audited_against_the_pinned_option_surface`
+ * (`codegen/harness.rs`) holds it to.
  */
 const CODEX_RESERVED: readonly string[] = [
+  "approvalPolicy",
   "model",
   "modelReasoningEffort",
   "sandboxMode",
@@ -495,11 +612,17 @@ const CODEX_SANDBOX: Readonly<Record<runtime.WorkspaceAccess, SandboxMode>> = {
  *
  * # What bounds a run, and what does not
  *
- * The **sandbox**, and nothing else. `allowTools` is carried into the run and is
- * not enforced here: the Codex SDK's per-call approval tier is their app
- * server's, which this release does not adopt, so `enforcesTools` is `false` and
- * `docs/grammar.md` 8.9 states the asymmetry where an author writes the list.
- * The `codex` half of PRD resolved q57 ruling c is this constant.
+ * The **sandbox**, and nothing else. The Codex SDK's per-call approval tier is
+ * their app server's, which this release does not adopt, so `enforcesTools` is
+ * `false` and `docs/grammar.md` 8.9 states the asymmetry where an author writes
+ * the list. The `codex` half of PRD resolved q57 ruling c is this constant.
+ *
+ * `allow_tools:` is therefore what the harness is **offered**, and offering it
+ * is something a driver has to do rather than something that happens: a thread
+ * has no tool-set option to put it in, so the list reaches the run the one way
+ * anything reaches it — as a line of the instructions the turn carries
+ * ([`codexTurn`]). A list that reached nothing at all would make grammar 8.9's
+ * `offered` a word for a key with no effect.
  *
  * # What is asked for, and what is parsed
  *
@@ -539,7 +662,7 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
       if (directories !== undefined) options.additionalDirectories = directories;
 
       const thread = codex.startThread(options);
-      const streamed = await thread.runStreamed(`${run.instructions}\n\n${run.input}`, {
+      const streamed = await thread.runStreamed(codexTurn(run), {
         outputSchema: { ...run.schema },
         signal: run.signal,
       });
@@ -611,6 +734,28 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
     })();
   },
 };
+
+/**
+ * The turn one run sends: the node's instructions, the list it offers the
+ * harness where it wrote one, and the bound input (see [`CODEX_DRIVER`]).
+ *
+ * The instructions lead, the way they do under the other harness, and the
+ * vendor's own base instructions are untouched beneath them — a thread keeps
+ * the agent loop it was post-trained with, which is why this is a kind at all
+ * (PRD resolved q57).
+ *
+ * The offered list is stated as what it is: this harness bounds at the sandbox,
+ * so the sentence is an instruction the model reads and not a bound. `cc` puts
+ * the same list somewhere that holds; `docs/grammar.md` 8.9 and the graph
+ * document's `tools_enforced` are where the asymmetry is written down.
+ */
+function codexTurn(run: runtime.HarnessRun): string {
+  const offered =
+    run.allowTools === undefined
+      ? ""
+      : `\n\nThe tools this run is offered: ${run.allowTools.join(", ")}. Use no others.`;
+  return `${run.instructions}${offered}\n\n${run.input}`;
+}
 
 /**
  * One completed thread item, as a tool event — or `undefined` where the item is

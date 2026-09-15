@@ -19,10 +19,22 @@ configuration, and it suggests the near miss when there is one.
 
 **With one bound: unchecked is not unbounded.** A key that spells an option the
 generated adapter owns is dropped rather than passed — the working directory, the
-permission mode or sandbox preset, the environment, the output schema, the tool
-allowlist, the abort signal, the model. Those are what `workspace:`, `access:`,
-`env:`, `output:`, `allow_tools:`, `timeout:` and `model:` say, and `settings:`
-is not a second way to say them.
+permission mode or sandbox preset, the environment, the output schema, the system
+prompt, the tool allowlist, the abort signal, the model. Those are what
+`workspace:`, `access:`, `env:`, `output:`, `prompt:`, `allow_tools:`,
+`timeout:` and `model:` say, and `settings:` is not a second way to say them.
+
+Nor does an option have to *spell* a bound to reach around one, so the dropped
+set is wider than that list. A harness SDK ships options that **contain** the
+bounds: extra command-line arguments, a settings file or object of permission
+rules, roots beside the working directory, sandbox configuration, MCP servers
+and agent definitions that put a tool — or a whole loop — within reach of a run
+whose `allow_tools:` never named it, hooks and permission handlers that move the
+decision elsewhere, a fallback model where the connection was supposed to stop.
+Those are dropped too, and so is every option that resumes a previous session,
+for the other reason: harness-native resume is a named exclusion, because a
+machine-local session store is not the journal. The dropped set is per harness
+and audited against the SDK release this compiler pins.
 
 ## A spec that triggers it
 

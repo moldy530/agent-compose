@@ -2519,7 +2519,14 @@ const CASES: &[Case] = &[
 
 /// Copy the base composition into `into`, then apply the edits.
 fn planted(into: &Path, edits: &[Edit]) {
-    copy(&repository().join(BASE), into);
+    planted_from(BASE, into, edits);
+}
+
+/// …and the same over any composition of the tree, for the one property whose
+/// construct [`BASE`] does not hold (see
+/// [`a_coder_node_arriving_says_which_harness_it_binds`]).
+fn planted_from(base: &str, into: &Path, edits: &[Edit]) {
+    copy(&repository().join(base), into);
     for (file, from, to) in edits {
         let path = into.join(file);
         let text = fs::read_to_string(&path).expect("a file of the base composition is readable");
@@ -2713,6 +2720,94 @@ fn a_configured_builtin_arriving_says_what_it_binds() {
         said.iter()
             .any(|(path, before)| *path == "builtin" && before.contains("bash")),
         "a capability leaving is as much of a plan as one arriving: {said:?}"
+    );
+}
+
+/// A **coder node** arriving says which harness it binds, and so does one
+/// leaving (`docs/plan.md` §3, PRD resolved q57 ruling c).
+///
+/// [`a_configured_builtin_arriving_says_what_it_binds`] one construct along,
+/// and for a sharper version of its reason. A `builtin:` binding hands the
+/// model a program inside this runtime's tool surface; a `coder:` node hands a
+/// harness the program *and the loop*, inside the harness's own tool surface,
+/// where none of §5.5's bounds apply. That is the widest capability this
+/// grammar grants, so `+ flow.patch.implement` alone — which is what a plan
+/// prints for a `function:` node arriving — is not a plan for it.
+///
+/// The edit is a **rename**, which is one node leaving and another arriving in
+/// a single comparison, so both directions are read off one plan. The base is
+/// `examples/patch-pipeline` rather than [`BASE`]: the corpus above is the
+/// widest composition in the tree and it has no coder node in it, which is the
+/// same reason the built-in pair plants its own.
+#[test]
+fn a_coder_node_arriving_says_which_harness_it_binds() {
+    const RENAMED: &[Edit] = &[
+        (
+            "flows/patch.yml",
+            "    implement:\n      coder:",
+            "    build:\n      coder:",
+        ),
+        (
+            "flows/patch.yml",
+            "{ from: start, to: implement }",
+            "{ from: start, to: build }",
+        ),
+        (
+            "flows/patch.yml",
+            "{ from: implement, to: review }",
+            "{ from: build, to: review }",
+        ),
+        ("flows/patch.yml", "      to: implement", "      to: build"),
+    ];
+    let before = scratch("coder-harness-before");
+    let after = scratch("coder-harness-after");
+    planted_from("examples/patch-pipeline", &before, RENAMED);
+    planted_from("examples/patch-pipeline", &after, &[]);
+    let old = artifact(&before.join("main.yml")).expect("the renamed side resolves");
+    let new = artifact(&after.join("main.yml")).expect("the example resolves");
+    let _ = fs::remove_dir_all(&before);
+    let _ = fs::remove_dir_all(&after);
+
+    let plan = plan(
+        Composition {
+            entrypoint: "before/main.yml",
+            ir: &old,
+            resolution: &[],
+        },
+        Composition {
+            entrypoint: "after/main.yml",
+            ir: &new,
+            resolution: &[],
+        },
+    );
+    let said = |address: &str, take: fn(&FieldChange) -> &Option<Value>| {
+        let change = plan
+            .topology
+            .iter()
+            .find(|change| change.address == address)
+            .unwrap_or_else(|| panic!("`{address}` is a node change of this plan"));
+        change
+            .fields
+            .iter()
+            .map(|field| (field.path.clone(), format!("{:?}", take(field))))
+            .collect::<Vec<_>>()
+    };
+
+    let arrived = said("flow.patch.implement", |field| &field.after);
+    assert!(
+        arrived
+            .iter()
+            .any(|(path, after)| path == "coder.harness" && after.contains("cc")),
+        "a coder node arrived and the plan does not say which harness it binds, so it reads \
+         like any other node arriving: {arrived:?}"
+    );
+    // …and the same node leaving, on the other side of the same plan: a
+    // capability leaving is as much of a plan as one arriving.
+    let left = said("flow.patch.build", |field| &field.before);
+    assert!(
+        left.iter()
+            .any(|(path, before)| path == "coder.harness" && before.contains("cc")),
+        "a coder node left and the plan does not say which harness it bound: {left:?}"
     );
 }
 

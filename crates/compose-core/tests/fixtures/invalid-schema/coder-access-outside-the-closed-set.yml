@@ -1,0 +1,20 @@
+# rule: `access:` is one of three containment presets, each mapped down to a harness's own primitive - a word outside the set names a containment no harness states (grammar 8.9 / D138)
+# at: /flow.patch/nodes/review/coder/access
+# via: /$defs/coderNode/properties/coder/properties/access/enum
+flow.patch:
+  outputs:
+    verdict: { type: string }
+  nodes:
+    review:
+      coder:
+        harness: codex
+        model: model.reviewer
+        workspace: "${REPO_ROOT}"
+        access: sandboxed
+        prompt: Read the working tree and say whether it satisfies the goal.
+        output:
+          verdict: { enum: [approve, revise] }
+      writes: { verdict: verdict }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

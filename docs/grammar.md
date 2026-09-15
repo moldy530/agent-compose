@@ -3055,6 +3055,22 @@ composition written against one is refused by name and by scope (§15,
 `unsupported-harness`), rather than being answered with a suggestion as a
 misspelling would be.
 
+What a key *means* is the same sentence under both harnesses; **what carries it
+is each harness's own primitive, stated per harness and never implied
+equivalent** (PRD resolved q57 ruling c). The two tables below are where those
+statements are, and the difference they record is real: `access: read_only` is
+"read the workspace, write nothing" either way, and one harness holds that with
+a sandbox while the other holds it with a permission mode. Read the row for the
+harness you bound before you rely on it.
+
+**`prompt:` is instructions *for* the harness, added to its own.** Under `codex`
+it leads the turn, above the bound `input:`; under `cc` it is appended to the
+harness's own system prompt rather than replacing it. Both keep the vendor's
+agent instructions in place, which is the thing a coder node exists to get: the
+loop, the tool shapes and the prompt a model was post-trained against cannot be
+reassembled from parts, and a node whose `prompt:` replaced them would be an
+`agent:` node with a bigger tool surface.
+
 **The surfaces live in the block**, as a `human:` node's do (§8.7), because a
 coder node has no definition of its own to carry them: it *is* the whole
 component, declared where it is used. `input:` follows §5.3 exactly — declare it
@@ -3081,9 +3097,18 @@ the adapter's rather than the author's:
 
 | `access:` | `codex` | `cc` |
 |---|---|---|
-| `read_only` | the `read-only` sandbox | the permission mode that executes no tool |
+| `read_only` | the `read-only` sandbox | the permission mode the CLI enforces as read-only, with the node's `prompt:` as its body |
 | `workspace_write` | the `workspace-write` sandbox | the mode that accepts edits under the working directory |
 | `full_access` | the `danger-full-access` sandbox | the mode that bypasses permission checks |
+
+The `read_only` row is the one worth reading twice, because the two primitives
+are furthest apart there. `codex` holds it at the operating system: the tree is
+readable, commands run, and a write fails. `cc` holds it with the permission
+mode whose system reminder the CLI wraps in a read-only enforcement preamble,
+and that mode carries a workflow body of its own — so the adapter replaces that
+body with the node's `prompt:`, and a `read_only` run under this harness is
+asked for what the node asked for rather than for a plan to implement
+something.
 
 **`allow_tools:` is enforced by one harness and offered to the other**, and this
 document states the asymmetry rather than implying the two are equivalent:
@@ -3100,9 +3125,12 @@ document states the asymmetry rather than implying the two are equivalent:
   that asked for the least containment.
 * **`codex` bounds at the sandbox only.** Its per-call approval tier belongs to
   an app server this release does not adopt, so the list is what the harness is
-  *offered* and the sandbox preset is what holds. `agent-compose plan` says which
-  of the two a node is, and so does the graph document's `tools_enforced`
-  ([`docs/graph.md`](graph.md) §5.8).
+  *offered* and the sandbox preset is what holds. Offered is literal: a thread
+  has no tool-set option to put a list in, so the adapter names the list in the
+  instructions the run is given — the model reads which tools this node offers
+  it, and nothing stops it reaching for another one but the sandbox.
+  `agent-compose plan` says which of the two a node is, and so does the graph
+  document's `tools_enforced` ([`docs/graph.md`](graph.md) §5.8).
 
 **`allow_tools: []` is refused.** Omitting the key is how a run takes the
 harness's own default set, so an empty list is a second spelling of the *widest*
@@ -3178,14 +3206,29 @@ table holds.
 **Unchecked is not unbounded.** What `settings:` buys is the vendor's *other*
 options, never the ones this node already states: the generated adapter **drops**
 an unverified key that spells an SDK option it owns — the working directory, the
-permission mode or sandbox preset, the environment, the output schema, the tool
-allowlist and its callback, the abort signal, the model and the one model setting
+permission mode or sandbox preset, the environment, the output schema, the
+system prompt, the tool allowlist and its callback, the abort signal, the model
+and the one model setting
 [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)
-maps into it. Those are `workspace:`, `access:`, `env:`, `output:`,
+maps into it. Those are `workspace:`, `access:`, `env:`, `output:`, `prompt:`,
 `allow_tools:`, `timeout:` and `model:` respectively, and a key here cannot
 reach around the construct that states them. The curated keys of the tier above
 are mapped by name over the top for the same reason: two spellings of one option
 must not disagree about which wins.
+
+An option does not have to *spell* a bound to reach around it, and the dropped
+set is the wider one. A harness SDK ships options that **contain** the bounds
+rather than naming them — extra command-line arguments, a settings file or
+object carrying permission rules, additional roots beside the working directory,
+sandbox configuration, MCP servers and agent definitions that put a tool or a
+whole loop within reach of a run whose `allow_tools:` never mentioned it, hooks
+and permission handlers that move the decision somewhere else, a fallback model
+where [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)
+stops the connection — and each of those is dropped too. So is every option that
+**resumes a previous session**, for a different reason: harness-native resume is
+a named exclusion (below), not a bound. The dropped set is per harness and
+audited against the SDK release this compiler pins, so a vendor's new option
+arrives with the pin rather than behind it.
 
 #### What a run records, and what happens when one is interrupted
 

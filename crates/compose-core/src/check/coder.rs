@@ -23,10 +23,12 @@
 //! * **the harness config is checked in two tiers.** Decision D140 holds
 //!   `settings:` on resolved q30's terms: the keys the curated table knows are
 //!   checked strictly, and everything else is a warning naming what could not be
-//!   verified and travels to the SDK unchanged. The table is per harness, so the
-//!   check needs the `harness:` value beside the key — which the parser has, but
-//!   the *tables* belong beside the refusals they produce rather than scattered
-//!   through the reader.
+//!   verified and travels to the SDK unchanged — except the keys the *adapter*
+//!   owns, which are dropped instead, because unchecked was never meant to mean
+//!   unbounded. The warning says which of the two happened. Both lists are per
+//!   harness, so the check needs the `harness:` value beside the key — which the
+//!   parser has, but the *tables* belong beside the refusals they produce rather
+//!   than scattered through the reader.
 //!
 //! **What is deliberately not checked here** is the enforcement asymmetry of
 //! ruling c. `allow_tools:` on a `codex` node is not a mistake — the list is
@@ -98,6 +100,53 @@ const CODEX_SETTINGS: &[(&str, Shape)] = &[
     ("skip_git_repo_check", Shape::Flag),
     ("additional_directories", Shape::Names),
 ];
+
+/// The keys one harness's **adapter owns**, read off the driver that owns them
+/// (grammar 8.9, Decision D140).
+///
+/// The reserved list lives in the emitted driver, because that is where it is
+/// applied: `passthrough` drops these rather than handing them to the SDK. It
+/// is read here rather than copied here for the reason
+/// [`the_curated_settings_table_is_one_table`] states about the other list —
+/// two hand-maintained copies of one document drift in silence — and it is read
+/// at all so the warning can say which half of Decision D140 a key landed in.
+/// A key that is dropped and a key that travels are two different things to be
+/// told, and an author who is told the wrong one debugs a run for an option
+/// that never reached it.
+fn reserved(harness: Harness) -> &'static [String] {
+    static CC: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        names_of(include_str!("../codegen/js/harness-cc.ts"), "CC_RESERVED")
+    });
+    static CODEX: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        names_of(
+            include_str!("../codegen/js/harness-codex.ts"),
+            "CODEX_RESERVED",
+        )
+    });
+    match harness {
+        Harness::Cc => &CC,
+        Harness::Codex => &CODEX,
+        // …and a reserved harness has no driver to read one off, which is the
+        // same answer [`table`] gives one key along.
+        Harness::DeepAgents | Harness::Native => &[],
+    }
+}
+
+/// The strings of one `readonly string[]` in a driver's source.
+fn names_of(source: &str, declaration: &str) -> Vec<String> {
+    let opened = format!("const {declaration}: readonly string[] = [");
+    let Some((_, rest)) = source.split_once(&opened) else {
+        return Vec::new();
+    };
+    let Some((body, _)) = rest.split_once("];") else {
+        return Vec::new();
+    };
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
 
 /// One harness's curated table.
 const fn table(harness: Harness) -> &'static [(&'static str, Shape)] {
@@ -200,6 +249,12 @@ fn settings(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
         let key = setting.key.value.as_str();
         let Some((_, shape)) = known.iter().find(|(name, _)| *name == key) else {
             let names: Vec<&str> = known.iter().map(|(name, _)| *name).collect();
+            // Which half of D140 the key landed in. An **owned** option is
+            // dropped by the adapter rather than passed, so telling its author
+            // that it travels unchanged would send them looking for an option
+            // the SDK never saw — and the reason it is dropped is the one worth
+            // reading: the bound it would have reached around.
+            let owned = reserved(harness).iter().any(|name| name == key);
             ctx.push(
                 Diagnostic::warning(
                     DiagnosticCode::UnknownHarnessSetting,
@@ -211,7 +266,14 @@ fn settings(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
                     ),
                 )
                 .with_label(coder.harness.span.clone(), "the harness is bound here")
-                .with_optional_help(
+                .with_optional_help(if owned {
+                    Some(format!(
+                        "`{key}` is an option the generated adapter owns, so it is dropped rather \
+                         than passed: what it would reach around is what `workspace:`, `access:`, \
+                         `env:`, `output:`, `prompt:`, `allow_tools:`, `timeout:` and `model:` \
+                         state, and the bound is the node's (grammar 8.9, Decision D140)"
+                    ))
+                } else {
                     suggest(key, &names)
                         .map(|name| format!("did you mean `{name}`?"))
                         .or_else(|| {
@@ -221,8 +283,8 @@ fn settings(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
                                  checks are {} (grammar 8.9, Decision D140)",
                                 list(&names)
                             ))
-                        }),
-                ),
+                        })
+                }),
             );
             continue;
         };
@@ -350,7 +412,40 @@ fn check_shape(
 
 #[cfg(test)]
 mod tests {
-    use super::{Harness, table};
+    use super::{Harness, reserved, table};
+
+    /// The **reserved** list a warning reads is the one the adapter applies.
+    ///
+    /// [`reserved`](super::reserved) parses the driver's own declaration rather
+    /// than restating it, so what can go wrong is the parse: a list read as
+    /// empty would make every dropped key claim it travelled to the SDK, which
+    /// is the one thing the reading exists to prevent. Two of the options that
+    /// reach furthest are named here, plus the closed harness's own, so a parse
+    /// that silently found nothing fails.
+    #[test]
+    fn a_warning_reads_the_reserved_list_the_adapter_applies() {
+        let cc = reserved(Harness::Cc);
+        for option in ["cwd", "extraArgs", "settings", "resume"] {
+            assert!(
+                cc.iter().any(|held| held == option),
+                "`CC_RESERVED` is read without `{option}`, so a `settings:` key spelling it would \
+                 be warned about as one that travels to the SDK"
+            );
+        }
+        let codex = reserved(Harness::Codex);
+        for option in ["sandboxMode", "workingDirectory", "approvalPolicy"] {
+            assert!(
+                codex.iter().any(|held| held == option),
+                "`CODEX_RESERVED` is read without `{option}`"
+            );
+        }
+        for held in [Harness::DeepAgents, Harness::Native] {
+            assert!(
+                reserved(held).is_empty(),
+                "a reserved harness has no driver to read a list off"
+            );
+        }
+    }
 
     /// The names one emitted `<HARNESS>_SETTINGS` array lists, in order.
     fn emitted(module: &str, declaration: &str) -> Vec<String> {

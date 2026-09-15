@@ -263,7 +263,11 @@ implement:
 
 **`harness:` is a binding.** Swap `cc` for `codex` and every other key means the
 same thing — that is the point of it, and it is why a later harness is a name in
-an enum rather than new grammar. `deepagents` and `native` are reserved and
+an enum rather than new grammar. What *carries* a key is the harness's own
+primitive, though, and the grammar states those per harness rather than implying
+they are equivalent: `access: read_only` is a sandbox under one and a permission
+mode under the other, and `prompt:` joins the harness's own instructions rather
+than replacing them either way. `deepagents` and `native` are reserved and
 refused today; `agent-compose explain unsupported-harness` is the whole story.
 
 **Read the containment paragraph before you write one.** What bounds a harness
@@ -272,8 +276,9 @@ node's own `timeout:` — and nothing else. The built-in tools above are bounded
 because *this* runtime implements them; a harness implements its own, so a coder
 node hands both the program and the loop to somebody else's agent inside their
 tool surface. `allow_tools:` is enforced per call by `cc` and is only *offered*
-to `codex`, which bounds at its sandbox; a `plan` report and a `visualize`
-canvas both say which of the two a node is.
+to `codex` — named in the run's instructions, with the sandbox as the thing that
+actually holds; a `plan` report and a `visualize` canvas both say which of the
+two a node is.
 
 **One run is one journaled effect.** A resume consumes the recorded answer and
 the harness never runs twice; a crash mid-run is an attempt failure and the
