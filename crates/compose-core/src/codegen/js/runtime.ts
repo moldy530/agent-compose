@@ -8355,15 +8355,30 @@ export async function runCoder(
   // is claimed and before anything could be performed — which is what the
   // `inspect` hook is for, and the only place the answer is knowable.
   let replayed = false;
-  const journaledRun = await journaled(
-    context.effects,
-    "harness",
-    request,
-    async () => await performHarnessRun(binding, driver, run),
-    (slot) => {
-      replayed = slot.held !== undefined;
-    },
-  );
+  let journaledRun: JournaledHarnessRun;
+  try {
+    journaledRun = await journaled(
+      context.effects,
+      "harness",
+      request,
+      async () => await performHarnessRun(binding, driver, run),
+      (slot) => {
+        replayed = slot.held !== undefined;
+      },
+    );
+  } catch (error) {
+    // **A failed run is a run this node made**, and on a `retry:` ladder it is
+    // one a *later, successful* attempt would otherwise erase: the answer only
+    // ever carries the attempt it came out of, so a node that failed once and
+    // then answered would report a trace in which the first run never happened.
+    // The collector is what holds the whole set ([`RunContext.harnessRuns`]), so
+    // the record goes in here as well as riding out on the failure — which is
+    // the path that reports the run that ended the node. [`runNode`] reconciles
+    // the two **by identity**, so a record on both is filed once.
+    const ran = harnessRecordOf(error);
+    if (ran !== undefined) context.harnessRuns?.push(ran);
+    throw error;
+  }
   // A record a resume consumed out of the journal says so, which is the one
   // field of it that is about *this* generation rather than about the run: the
   // resumed execution writes a fresh trace document whole, and a reader of one

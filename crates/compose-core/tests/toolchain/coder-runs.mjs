@@ -8,7 +8,7 @@
 // hands in a script and everything above the seam — the config map, the journal,
 // the stream tap, the output gate — is the code a deployment really ships.
 //
-// Nine claims, and each is invisible from outside a run:
+// Ten claims, and each is invisible from outside a run:
 //
 //   * **the config map** — `workspace:` resolves its `${ENV}` at the call and an
 //     empty one is refused; the environment is **scrubbed** to the declared
@@ -35,7 +35,9 @@
 //     the turns it took, carried out on the failure, because an activity that
 //     throws returns no answer;
 //   * **a missing driver** — a harness with no driver in the registry is an
-//     execution failure naming the requirement, never a silent skip.
+//     execution failure naming the requirement, never a silent skip;
+//   * **a `retry:` ladder** — every attempt's run is on the node's entry, so a
+//     later attempt answering does not erase the one that failed.
 //
 // Usage: node coder-runs.mjs <generated project directory> <scratch dir>
 // Output: one JSON object, read by `generated_code_gates.rs`.
@@ -250,8 +252,10 @@ const results = {};
     recordOutcome: record?.outcome ?? null,
     recordTurns: record?.turns.length ?? null,
     recordToolCalls: record?.toolCalls?.length ?? null,
-    // …and the collector stayed empty: `runCoder` files a run once it answered.
+    // …and the collector holds it all the same: a `retry:` ladder's later,
+    // successful attempt must not erase the attempt that failed.
     collected: held.harnessRuns.length,
+    collectedOutcome: held.harnessRuns[0]?.outcome ?? null,
     // The harness was asked without the bound and the answer was held to it.
     sentMaxItems: Object.hasOwn(stub.runs[0].schema.properties.touched, "maxItems"),
   };
@@ -355,7 +359,40 @@ const results = {};
   };
 }
 
-// --- 8. One journaled effect, and a replay that consumes it ----------------
+// --- 8. A `retry:` ladder: every attempt's run is on the entry ------------
+{
+  // One node execution, two attempts: `runActivity` hands every attempt the
+  // same context, so the collector is what makes the first run survive the
+  // second answering (`docs/trace.md` §7.6, PRD resolved q57).
+  const held = context();
+  const failing = harness.scriptedDriver("cc", [
+    { source: { type: "assistant" }, tap: { kind: "turn" } },
+    { source: { type: "error" }, tap: { kind: "error", message: "the workspace was busy" } },
+  ]);
+  let first;
+  try {
+    await runtime.runCoder(binding(), { goal: "fix it" }, held, { cc: failing.driver });
+  } catch (error) {
+    first = error;
+  }
+  const answering = harness.scriptedDriver("cc", script({ summary: "second", touched: [] }));
+  const answer = await runtime.runCoder(binding(), { goal: "fix it" }, held, {
+    cc: answering.driver,
+  });
+  results["ladder"] = {
+    firstThrew: first !== undefined,
+    // Both runs, in the order they were made.
+    collected: held.harnessRuns.map((run) => run.outcome),
+    // …and the answer carries only the attempt it came out of, which is why the
+    // collector has to exist.
+    answered: answer.harness.map((run) => run.outcome),
+    // The failed run's record rides out on the failure too, and it is the same
+    // object — `runNode` reconciles the two by identity.
+    sameObject: runtime.harnessRecordOf(first) === held.harnessRuns[0],
+  };
+}
+
+// --- 9. One journaled effect, and a replay that consumes it ----------------
 {
   process.env["AGENT_COMPOSE_DATA"] = path.join(scratch, "data");
   const held = await journal.openJournal();

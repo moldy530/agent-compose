@@ -5534,7 +5534,7 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 /// a parameter, and `src/harness.ts` emits a scripted driver into every project,
 /// so everything *above* the seam is exercised as the code a deployment ships.
 ///
-/// Nine claims, and not one of them is visible from a run's answer:
+/// Ten claims, and not one of them is visible from a run's answer:
 ///
 ///  * **the config map** — the workspace resolves its `${ENV}` at the call and an
 ///    empty one is refused *as written*; the environment is scrubbed to the
@@ -5560,7 +5560,10 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 ///    whose harness reported a fatal error, each leave a record carried out on
 ///    the failure, because an activity that throws returns no answer;
 ///  * **a missing driver** — a harness with no driver is an execution failure
-///    naming the requirement, which is the q54 bash-absent posture.
+///    naming the requirement, which is the q54 bash-absent posture;
+///  * **a `retry:` ladder** — every attempt's run reaches the node's entry, in
+///    the order they were made, because the answer can only carry the attempt it
+///    came out of.
 #[test]
 fn a_harness_run_is_contained_journaled_and_recorded() {
     let Some(root) = installed() else {
@@ -5735,9 +5738,10 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
     assert_eq!(gate["recordToolCalls"], json!(3));
     assert_eq!(
         gate["collected"],
-        json!(0),
-        "a refused answer is not a run the collector holds; the failure carries it"
+        json!(1),
+        "a failed run is a run this node made, and the collector holds it"
     );
+    assert_eq!(gate["collectedOutcome"], json!("failed"));
 
     // --- The two other ways a run ends ------------------------------------
     let missing = &answer["noAnswer"];
@@ -5790,6 +5794,27 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         inherited["token"],
         json!("shh"),
         "the declared entries still layer over what was inherited"
+    );
+
+    // --- A `retry:` ladder reports every attempt's run ---------------------
+    let ladder = &answer["ladder"];
+    assert_eq!(ladder["firstThrew"], json!(true));
+    assert_eq!(
+        ladder["collected"],
+        json!(["failed", "completed"]),
+        "both attempts' runs, in the order they were made — a later attempt \
+         answering must not erase the one that failed"
+    );
+    assert_eq!(
+        ladder["answered"],
+        json!(["completed"]),
+        "…while the answer carries only the attempt it came out of, which is why \
+         the collector exists"
+    );
+    assert_eq!(
+        ladder["sameObject"],
+        json!(true),
+        "the failed run is one record on two routes, reconciled by identity"
     );
 
     // --- One effect per run, and a replay that consumes it ----------------
