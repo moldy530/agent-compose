@@ -181,9 +181,24 @@ releases; the one message-shaped field you may match on is an edge decision's
 Adding a field, adding a record type, and improving message text are compatible
 changes made without a version bump.
 
+## A harness run
+
+A `coder:` node runs somebody else's agent loop (`agent-compose docs agents`),
+and what the trace carries of one is a record of its own on the entry's
+`harness`: which harness and which pinned SDK, the run's **top-level** turns with
+whatever usage that harness reports, its top-level tool events in the same
+three-outcome vocabulary a tool call uses, and a cost rollup — money where the
+harness estimates one, tokens where it counts them.
+
+Depth is the rule worth knowing: a harness that runs subagents of its own keeps
+their transcripts in the run's journal record and out of the trace. So is
+`replayed`, which marks a run a resume consumed out of the journal rather than
+performed — one record per attempt is what a `retry:` ladder leaves behind, and
+that field is how you tell which of them this process actually ran.
+
 ## What is not in a trace
 
-Secrets are not, and neither is what a human answered at a pause. Those are
-rules of the format rather than omissions.
+Secrets are not, and neither is what a human answered at a pause, nor a
+harness's own transcript. Those are rules of the format rather than omissions.
 
 Normative source: `docs/trace.md`

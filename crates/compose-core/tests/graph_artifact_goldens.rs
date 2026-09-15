@@ -79,6 +79,15 @@ const GOLDENS: &[Golden] = &[
         document: "omitted-graph-keys.json",
         page: None,
     },
+    // The `coder:` kind, and the one record whose most important field is in no
+    // composition: `tools_enforced` is a fact about the *harness*, so a diff is
+    // the only place a change to which harness enforces what is reviewable
+    // (`docs/graph.md` §5.8, PRD resolved q57 ruling c).
+    Golden {
+        project: "examples/patch-pipeline",
+        document: "patch-pipeline.json",
+        page: None,
+    },
 ];
 
 fn repository() -> PathBuf {

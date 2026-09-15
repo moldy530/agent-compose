@@ -1,0 +1,307 @@
+{
+  "graph_version": 2,
+  "entrypoint": "main.yml",
+  "target": "local",
+  "spec_version": "0.1",
+  "flows": [
+    {
+      "address": "flow.patch",
+      "description": "Implement a change with one coding agent and review it with another.",
+      "inputs": [
+        {
+          "name": "goal",
+          "type": "string (min_length 1)",
+          "description": "What the change has to accomplish."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "summary",
+          "type": "string",
+          "description": "What the last implementing run says it changed."
+        }
+      ],
+      "triggers": [
+        {
+          "name": "cli",
+          "type": "manual",
+          "summary": "invoked from the CLI or the SDK"
+        }
+      ],
+      "nodes": [
+        {
+          "id": "start",
+          "kind": "start"
+        },
+        {
+          "id": "end",
+          "kind": "end"
+        },
+        {
+          "id": "implement",
+          "kind": "coder",
+          "binding": "cc · model.implementer",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "goal",
+                "expression": "input.goal"
+              },
+              {
+                "name": "feedback",
+                "expression": "state.feedback"
+              }
+            ]
+          },
+          "writes": [
+            {
+              "field": "summary",
+              "channel": "summary"
+            }
+          ],
+          "policy": {
+            "retry": {
+              "max": 1,
+              "backoff": "30s",
+              "level": "node"
+            },
+            "timeout": {
+              "value": "20m",
+              "level": "node"
+            },
+            "on_error": {
+              "strategy": "fail",
+              "level": "defaults"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "goal",
+                  "type": "string"
+                },
+                {
+                  "name": "feedback",
+                  "type": "string"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "summary",
+                  "type": "string"
+                },
+                {
+                  "name": "touched",
+                  "type": "array<string> (max_items 50)"
+                }
+              ]
+            }
+          },
+          "coder": {
+            "harness": "cc",
+            "model": {
+              "address": "model.implementer",
+              "form": "direct",
+              "id": "claude-sonnet-4-5",
+              "provider": {
+                "address": "provider.anthropic",
+                "kind": "anthropic",
+                "config": [
+                  {
+                    "name": "api_key",
+                    "value": "${ANTHROPIC_API_KEY}"
+                  }
+                ]
+              },
+              "settings": [
+                {
+                  "name": "max_tokens",
+                  "value": 16000
+                },
+                {
+                  "name": "thinking",
+                  "value": {
+                    "budget_tokens": 8000
+                  }
+                }
+              ]
+            },
+            "workspace": "${REPO_ROOT}",
+            "access": "workspace_write",
+            "prompt": "You are implementing one change in a repository you have been given.\nMake the smallest change that satisfies the goal, run the test suite,\nand report what you touched.\n",
+            "allow_tools": [
+              "Bash",
+              "Edit",
+              "Glob",
+              "Grep",
+              "Read",
+              "Write"
+            ],
+            "tools_enforced": true,
+            "env": [
+              {
+                "name": "PATH",
+                "expression": "/usr/bin:/bin"
+              },
+              {
+                "name": "ANTHROPIC_API_KEY",
+                "expression": "${ANTHROPIC_API_KEY}"
+              }
+            ],
+            "inherit_env": false,
+            "settings": [
+              {
+                "name": "max_turns",
+                "value": 60
+              },
+              {
+                "name": "max_budget_usd",
+                "value": 5
+              }
+            ]
+          }
+        },
+        {
+          "id": "review",
+          "kind": "coder",
+          "binding": "codex · model.reviewer",
+          "input": {
+            "form": "fields",
+            "bindings": [
+              {
+                "name": "goal",
+                "expression": "input.goal"
+              },
+              {
+                "name": "summary",
+                "expression": "state.summary"
+              }
+            ]
+          },
+          "writes": [
+            {
+              "field": "feedback",
+              "channel": "feedback"
+            }
+          ],
+          "policy": {
+            "timeout": {
+              "value": "10m",
+              "level": "node"
+            },
+            "on_error": {
+              "strategy": "fallback",
+              "target": "end",
+              "level": "node"
+            }
+          },
+          "schemas": {
+            "input": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "goal",
+                  "type": "string"
+                },
+                {
+                  "name": "summary",
+                  "type": "string"
+                }
+              ]
+            },
+            "output": {
+              "source": "declared",
+              "fields": [
+                {
+                  "name": "verdict",
+                  "type": "enum [approve, revise]"
+                },
+                {
+                  "name": "feedback",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "coder": {
+            "harness": "codex",
+            "model": {
+              "address": "model.reviewer",
+              "form": "direct",
+              "id": "gpt-5-codex",
+              "provider": {
+                "address": "provider.openai",
+                "kind": "openai",
+                "config": [
+                  {
+                    "name": "api_key",
+                    "value": "${OPENAI_API_KEY}"
+                  }
+                ]
+              },
+              "settings": [
+                {
+                  "name": "reasoning_effort",
+                  "value": "medium"
+                }
+              ]
+            },
+            "workspace": "${REPO_ROOT}",
+            "access": "read_only",
+            "prompt": "You are reviewing a change somebody else just made in this repository.\nRead the working tree, decide whether it satisfies the goal, and say\nwhat would have to change if it does not.\n",
+            "tools_enforced": false,
+            "inherit_env": false,
+            "settings": [
+              {
+                "name": "web_search",
+                "value": "disabled"
+              },
+              {
+                "name": "network_access",
+                "value": false
+              }
+            ]
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "start",
+          "to": "implement",
+          "class": "unconditional"
+        },
+        {
+          "from": "implement",
+          "to": "review",
+          "class": "unconditional"
+        },
+        {
+          "from": "review",
+          "to": "implement",
+          "class": "conditional",
+          "label": "review.output.verdict == 'revise'",
+          "when": "review.output.verdict == 'revise'",
+          "max_iterations": 2
+        },
+        {
+          "from": "review",
+          "to": "end",
+          "class": "default",
+          "label": "else"
+        },
+        {
+          "from": "review",
+          "to": "end",
+          "class": "error_fallback",
+          "label": "on_error: fallback"
+        }
+      ]
+    }
+  ]
+}

@@ -272,8 +272,8 @@ node's own `timeout:` — and nothing else. The built-in tools above are bounded
 because *this* runtime implements them; a harness implements its own, so a coder
 node hands both the program and the loop to somebody else's agent inside their
 tool surface. `allow_tools:` is enforced per call by `cc` and is only *offered*
-to `codex`, which bounds at its sandbox; `agent-compose plan` and
-`agent-compose visualize` both say which of the two a node is.
+to `codex`, which bounds at its sandbox; a `plan` report and a `visualize`
+canvas both say which of the two a node is.
 
 **One run is one journaled effect.** A resume consumes the recorded answer and
 the harness never runs twice; a crash mid-run is an attempt failure and the
