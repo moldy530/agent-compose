@@ -123,14 +123,25 @@ export function scriptedDriver(
  * it. The keys this compiler *does* know are mapped by name in each driver
  * below, over the top, so a curated key and an unknown one spelling the same SDK
  * option cannot disagree about which wins.
+ *
+ * **`reserved` is the containment bound, and it is not a curated-table
+ * question.** A settings key spelling an option the *adapter* owns — the
+ * working directory, the permission mode or sandbox preset, the environment,
+ * the schema, the abort signal — would be a composition reaching around
+ * `workspace:`, `access:` and `env:` through the one surface this grammar
+ * deliberately leaves open (grammar 8.9, Decision D140). Those keys are dropped
+ * rather than passed, because "unchecked" was never meant to mean
+ * "unbounded": what `settings:` buys is the vendor's *other* options, and the
+ * bounds are the node's.
  */
 function passthrough(
   run: runtime.HarnessRun,
   curated: readonly string[],
+  reserved: readonly string[],
 ): Record<string, unknown> {
   const held: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(run.settings)) {
-    if (curated.includes(key)) continue;
+    if (curated.includes(key) || reserved.includes(key)) continue;
     held[key] = value;
   }
   return held;
@@ -185,6 +196,33 @@ const CC_SETTINGS: readonly string[] = [
   "max_budget_usd",
   "forward_subagent_text",
   "disallowed_tools",
+];
+
+/**
+ * The keys of `query`'s options the **adapter** owns, and which a `settings:`
+ * key therefore never reaches (see [`passthrough`]).
+ *
+ * Each one is a bound some other part of the node already states: `workspace:`
+ * is `cwd`, `access:` is `permissionMode` and the flag beside it, `env:` is
+ * `env`, `output:` is `outputFormat`, `allow_tools:` is the allowlist and the
+ * callback that enforces it, `timeout:` is the abort controller, and `model:`
+ * is the model and the one thinking budget Decision D141 maps into it. A
+ * composition that spelled one of them here would be reaching around the
+ * construct that states it, through the surface this grammar deliberately
+ * leaves open — so these are dropped rather than passed.
+ */
+const CC_RESERVED: readonly string[] = [
+  "abortController",
+  "allowDangerouslySkipPermissions",
+  "allowedTools",
+  "canUseTool",
+  "cwd",
+  "env",
+  "maxThinkingTokens",
+  "model",
+  "outputFormat",
+  "permissionMode",
+  "systemPrompt",
 ];
 
 /**
@@ -257,7 +295,7 @@ const CC_DRIVER: runtime.HarnessDriver = {
         abortController: controller,
         env: { ...run.env },
         outputFormat: { type: "json_schema", schema: { ...run.schema } },
-        ...passthrough(run, CC_SETTINGS),
+        ...passthrough(run, CC_SETTINGS, CC_RESERVED),
       };
       if (run.access === "full_access") options.allowDangerouslySkipPermissions = true;
       // The one `model.*` setting this harness has a place for: the `anthropic`
@@ -396,6 +434,25 @@ const CODEX_SETTINGS: readonly string[] = [
 ];
 
 /**
+ * The keys of a thread's options the **adapter** owns, and which a `settings:`
+ * key therefore never reaches (see [`passthrough`]).
+ *
+ * Each one is a bound some other part of the node already states: `workspace:`
+ * is `workingDirectory`, `access:` is `sandboxMode`, and `model:` is the model
+ * and the one reasoning setting Decision D141 maps into it. A composition that
+ * spelled one of them here would be reaching around the construct that states
+ * it, through the surface this grammar deliberately leaves open — so these are
+ * dropped rather than passed. The environment is not on the list because it is
+ * not a thread option at all: it is handed to the `Codex` constructor below.
+ */
+const CODEX_RESERVED: readonly string[] = [
+  "model",
+  "modelReasoningEffort",
+  "sandboxMode",
+  "workingDirectory",
+];
+
+/**
  * How `access:` reaches the Codex SDK (grammar 8.9, Decision D138).
  *
  * One-to-one with its own sandbox presets, which is why this grammar's three
@@ -450,7 +507,7 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
         model: run.model,
         workingDirectory: run.workspace,
         sandboxMode: CODEX_SANDBOX[run.access],
-        ...passthrough(run, CODEX_SETTINGS),
+        ...passthrough(run, CODEX_SETTINGS, CODEX_RESERVED),
       };
       const effort = settingText(run.modelSettings["reasoning_effort"]);
       if (effort !== undefined) {

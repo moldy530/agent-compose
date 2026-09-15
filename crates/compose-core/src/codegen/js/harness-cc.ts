@@ -15,6 +15,33 @@ const CC_SETTINGS: readonly string[] = [
 ];
 
 /**
+ * The keys of `query`'s options the **adapter** owns, and which a `settings:`
+ * key therefore never reaches (see [`passthrough`]).
+ *
+ * Each one is a bound some other part of the node already states: `workspace:`
+ * is `cwd`, `access:` is `permissionMode` and the flag beside it, `env:` is
+ * `env`, `output:` is `outputFormat`, `allow_tools:` is the allowlist and the
+ * callback that enforces it, `timeout:` is the abort controller, and `model:`
+ * is the model and the one thinking budget Decision D141 maps into it. A
+ * composition that spelled one of them here would be reaching around the
+ * construct that states it, through the surface this grammar deliberately
+ * leaves open — so these are dropped rather than passed.
+ */
+const CC_RESERVED: readonly string[] = [
+  "abortController",
+  "allowDangerouslySkipPermissions",
+  "allowedTools",
+  "canUseTool",
+  "cwd",
+  "env",
+  "maxThinkingTokens",
+  "model",
+  "outputFormat",
+  "permissionMode",
+  "systemPrompt",
+];
+
+/**
  * How `access:` reaches the Agent SDK (grammar 8.9, Decision D138).
  *
  * The SDK's containment primitive is a permission *mode* plus a working
@@ -84,7 +111,7 @@ const CC_DRIVER: runtime.HarnessDriver = {
         abortController: controller,
         env: { ...run.env },
         outputFormat: { type: "json_schema", schema: { ...run.schema } },
-        ...passthrough(run, CC_SETTINGS),
+        ...passthrough(run, CC_SETTINGS, CC_RESERVED),
       };
       if (run.access === "full_access") options.allowDangerouslySkipPermissions = true;
       // The one `model.*` setting this harness has a place for: the `anthropic`

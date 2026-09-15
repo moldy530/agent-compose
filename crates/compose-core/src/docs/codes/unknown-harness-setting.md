@@ -17,6 +17,13 @@ one compiler release later. The warning is the honest half of the bargain — it
 names exactly what could not be verified, so a typo does not look like working
 configuration, and it suggests the near miss when there is one.
 
+**With one bound: unchecked is not unbounded.** A key that spells an option the
+generated adapter owns is dropped rather than passed — the working directory, the
+permission mode or sandbox preset, the environment, the output schema, the tool
+allowlist, the abort signal, the model. Those are what `workspace:`, `access:`,
+`env:`, `output:`, `allow_tools:`, `timeout:` and `model:` say, and `settings:`
+is not a second way to say them.
+
 ## A spec that triggers it
 
 ```yaml triggers

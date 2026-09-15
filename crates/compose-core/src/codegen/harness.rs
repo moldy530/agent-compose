@@ -255,6 +255,131 @@ mod tests {
         );
     }
 
+    /// Every SDK option a driver sets from the **node's own bounds** is on that
+    /// driver's reserved list, so `settings:` cannot reach around one.
+    ///
+    /// Decision D140 leaves `settings:` open on purpose — a harness option the
+    /// vendor ships tomorrow has to be usable the day it ships — and the
+    /// unverified keys therefore travel to the SDK unchanged. The bound on that
+    /// is the reserved list: a key spelling the working directory, the
+    /// permission mode or sandbox preset, the environment, the output schema,
+    /// the tool allowlist, the abort signal or the model is dropped, because
+    /// each of those is what `workspace:`, `access:`, `env:`, `output:`,
+    /// `allow_tools:`, `timeout:` and `model:` say.
+    ///
+    /// A hand-written list goes stale the first time a driver learns a new
+    /// option, and *stale* here means the one open surface silently becomes the
+    /// way around a closed one — `access: read_only` with a `settings:` key
+    /// spelling the SDK's own permission field would run unbounded, and no
+    /// check in this compiler would have an opinion. So the list is checked
+    /// against the driver rather than trusted: every option assigned from
+    /// anything but `run.settings` has to be reserved, which makes a new
+    /// adapter-owned option a failing test rather than a hole.
+    #[test]
+    fn a_settings_key_cannot_reach_an_option_the_adapter_owns() {
+        for harness in Harness::ALL.iter().filter(|held| held.ships_in_v1()) {
+            let (source, curated, reserved) = driver_source(*harness);
+            let name = harness.as_str();
+            assert!(
+                source.contains(&format!("passthrough(run, {curated}, {reserved})")),
+                "`{name}`'s driver does not hand `passthrough` its reserved list"
+            );
+            let held = quoted_list(source, reserved);
+            assert!(!held.is_empty(), "`{name}`'s reserved list is empty");
+            for option in adapter_owned(source) {
+                assert!(
+                    held.contains(&option),
+                    "`{name}`'s driver sets `{option}` from the node's own bounds, and \
+                     `{reserved}` does not hold it — an unverified `settings:` key spelling \
+                     `{option}` would override it (grammar 8.9, Decision D140)"
+                );
+            }
+        }
+    }
+
+    /// The source of one harness's driver, and the names of the two lists the
+    /// emitted `passthrough` reads.
+    fn driver_source(harness: Harness) -> (&'static str, &'static str, &'static str) {
+        match harness {
+            Harness::Cc => (CC, "CC_SETTINGS", "CC_RESERVED"),
+            Harness::Codex => (CODEX, "CODEX_SETTINGS", "CODEX_RESERVED"),
+            Harness::DeepAgents | Harness::Native => ("", "", ""),
+        }
+    }
+
+    /// The strings of one `readonly string[]` constant.
+    fn quoted_list(source: &str, name: &str) -> BTreeSet<String> {
+        let opened = format!("const {name}: readonly string[] = [");
+        let Some(start) = source.find(&opened) else {
+            return BTreeSet::new();
+        };
+        let rest = &source[start + opened.len()..];
+        let body = rest.split_once("];").map_or(rest, |(body, _)| body);
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The SDK options one driver sets from something other than `run.settings`.
+    ///
+    /// Two shapes, because the drivers write both: a key of the options object
+    /// literal (everything before the `...passthrough` spread), and a later
+    /// `options.<key> = <value>` whose value does not come from a settings key.
+    /// The second needs the local `const`s tracked, since a curated setting
+    /// reaches its option through one.
+    fn adapter_owned(source: &str) -> BTreeSet<String> {
+        let mut from_settings: BTreeSet<&str> = BTreeSet::new();
+        let mut owned: BTreeSet<String> = BTreeSet::new();
+        let mut literal = false;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("const options") {
+                literal = true;
+                continue;
+            }
+            if literal {
+                if trimmed.starts_with("...passthrough(") {
+                    literal = false;
+                    continue;
+                }
+                if let Some((key, _)) = trimmed.split_once(':')
+                    && !key.is_empty()
+                    && key.chars().all(|held| held.is_ascii_alphanumeric())
+                {
+                    owned.insert(key.to_string());
+                }
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("const ") {
+                if let Some((bound, value)) = rest.split_once(" = ")
+                    && value.contains("run.settings")
+                {
+                    from_settings.insert(bound);
+                }
+                continue;
+            }
+            let Some(at) = line.find("options.") else {
+                continue;
+            };
+            let Some((key, value)) = line[at + "options.".len()..].split_once(" = ") else {
+                continue;
+            };
+            if key.is_empty() || !key.chars().all(|held| held.is_ascii_alphanumeric()) {
+                continue;
+            }
+            let settings_derived = value.contains("run.settings")
+                || value
+                    .split(|held: char| !held.is_ascii_alphanumeric() && held != '_')
+                    .any(|word| from_settings.contains(word));
+            if !settings_derived {
+                owned.insert(key.to_string());
+            }
+        }
+        owned
+    }
+
     /// The version a driver reports is the version the manifest pins.
     ///
     /// Two surfaces read one table: `package.json` declares the pin, and the

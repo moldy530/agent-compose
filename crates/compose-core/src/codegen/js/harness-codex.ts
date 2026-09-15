@@ -13,6 +13,25 @@ const CODEX_SETTINGS: readonly string[] = [
 ];
 
 /**
+ * The keys of a thread's options the **adapter** owns, and which a `settings:`
+ * key therefore never reaches (see [`passthrough`]).
+ *
+ * Each one is a bound some other part of the node already states: `workspace:`
+ * is `workingDirectory`, `access:` is `sandboxMode`, and `model:` is the model
+ * and the one reasoning setting Decision D141 maps into it. A composition that
+ * spelled one of them here would be reaching around the construct that states
+ * it, through the surface this grammar deliberately leaves open — so these are
+ * dropped rather than passed. The environment is not on the list because it is
+ * not a thread option at all: it is handed to the `Codex` constructor below.
+ */
+const CODEX_RESERVED: readonly string[] = [
+  "model",
+  "modelReasoningEffort",
+  "sandboxMode",
+  "workingDirectory",
+];
+
+/**
  * How `access:` reaches the Codex SDK (grammar 8.9, Decision D138).
  *
  * One-to-one with its own sandbox presets, which is why this grammar's three
@@ -67,7 +86,7 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
         model: run.model,
         workingDirectory: run.workspace,
         sandboxMode: CODEX_SANDBOX[run.access],
-        ...passthrough(run, CODEX_SETTINGS),
+        ...passthrough(run, CODEX_SETTINGS, CODEX_RESERVED),
       };
       const effort = settingText(run.modelSettings["reasoning_effort"]);
       if (effort !== undefined) {

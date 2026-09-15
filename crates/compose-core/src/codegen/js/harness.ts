@@ -103,14 +103,25 @@ export function scriptedDriver(
  * it. The keys this compiler *does* know are mapped by name in each driver
  * below, over the top, so a curated key and an unknown one spelling the same SDK
  * option cannot disagree about which wins.
+ *
+ * **`reserved` is the containment bound, and it is not a curated-table
+ * question.** A settings key spelling an option the *adapter* owns — the
+ * working directory, the permission mode or sandbox preset, the environment,
+ * the schema, the abort signal — would be a composition reaching around
+ * `workspace:`, `access:` and `env:` through the one surface this grammar
+ * deliberately leaves open (grammar 8.9, Decision D140). Those keys are dropped
+ * rather than passed, because "unchecked" was never meant to mean
+ * "unbounded": what `settings:` buys is the vendor's *other* options, and the
+ * bounds are the node's.
  */
 function passthrough(
   run: runtime.HarnessRun,
   curated: readonly string[],
+  reserved: readonly string[],
 ): Record<string, unknown> {
   const held: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(run.settings)) {
-    if (curated.includes(key)) continue;
+    if (curated.includes(key) || reserved.includes(key)) continue;
     held[key] = value;
   }
   return held;

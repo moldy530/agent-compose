@@ -3162,6 +3162,18 @@ usable the day it ships, and a gating table is the support treadmill PRD resolve
 q30 refused. `agent-compose explain unknown-harness-setting` names the keys each
 table holds.
 
+**Unchecked is not unbounded.** What `settings:` buys is the vendor's *other*
+options, never the ones this node already states: the generated adapter **drops**
+an unverified key that spells an SDK option it owns — the working directory, the
+permission mode or sandbox preset, the environment, the output schema, the tool
+allowlist and its callback, the abort signal, the model and the one model setting
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)
+maps into it. Those are `workspace:`, `access:`, `env:`, `output:`,
+`allow_tools:`, `timeout:` and `model:` respectively, and a key here cannot
+reach around the construct that states them. The curated keys of the tier above
+are mapped by name over the top for the same reason: two spellings of one option
+must not disagree about which wins.
+
 #### What a run records, and what happens when one is interrupted
 
 A harness run is **one journaled effect**
@@ -8537,7 +8549,22 @@ support treadmill*. A harness option the vendor ships tomorrow has to be usable
 the day it ships, so a table that **gated** would be the treadmill q30 refused,
 and no table at all would make a misspelled `max_turns` a silent no-op that costs
 a run its bound. The two tiers are the same trade q30 struck, with the warning as
-the honest half. **Status**: ratified — PRD resolved q57 ruling e. *PRD 5.9,
+the honest half.
+
+**Open is not unbounded, and that is not a third tier.** An unverified key that
+spells an SDK option the generated adapter owns — the working directory, the
+permission mode or sandbox preset, the environment, the output schema, the tool
+allowlist, the abort signal, the model — is **dropped** rather than passed,
+because every one of them is a bound the node states somewhere a reader and
+`validate` can both see it (`workspace:`, `access:`, `env:`, `output:`,
+`allow_tools:`, `timeout:`, `model:`). Passing them would make `settings:` a
+second way to say those things and the only one no check covers, which turns the
+one deliberately open surface into the way around all the closed ones. The
+dropped set is the adapter's own key list rather than a grammar enum: it is not a
+statement about which options exist, it is the statement that this construct's
+bounds are not up for renegotiation from inside it.
+
+**Status**: ratified — PRD resolved q57 ruling e. *PRD 5.9,
 resolved q30, q57; §8.9.*
 
 ### D141. A coder node's `model:` is a registry address, and the connection stops at the boundary
