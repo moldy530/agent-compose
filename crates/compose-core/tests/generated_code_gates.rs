@@ -2,7 +2,7 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Twenty-three gates. The first four are in increasing strength, each one
+//! Twenty-five gates. The first four are in increasing strength, each one
 //! existing because the one above it passes on code the one below it catches;
 //! the fifth is about a construct whose guarantees are only observable from
 //! inside the runtime; the next two are about the schemas rather than the graph;
@@ -17,8 +17,10 @@
 //! about a `human` pause — the board a run holds one on, the terminal it answers
 //! one at, and the process's own standard input that terminal really is; the
 //! twenty-second is about the two built-in tools a model drives, read from
-//! inside one call of them; and the last is back to the schemas, about the one
-//! place the two columns are *not* equal and what bounds that gap:
+//! inside one call of them; the twenty-third is back to the schemas, about the
+//! one place the two columns are *not* equal and what bounds that gap; and the
+//! last two are about a node kind the acceptance suite cannot reach at all —
+//! one run of a coding harness, and then a whole graph of them:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -274,6 +276,30 @@
 //!     schema can carry rather than only the ones a table strips, because a
 //!     keyword left on the wire deliberately is exactly the one a refusal will
 //!     name.
+//! 24. **One coding-harness run** — `runtime.runCoder` over the scripted driver
+//!     `src/harness.ts` emits, out of `coder-runs.mjs`. The one gate whose
+//!     subject the acceptance suite cannot reach: a harness SDK speaks its own
+//!     wire, so the mock provider — deliberately — never sees it and there is no
+//!     endpoint to point a compiled graph at (PRD resolved q57). Twelve claims,
+//!     none of them visible from a run's answer: the config map (a resolved
+//!     `${ENV}` workspace, an empty one refused, a scrubbed environment and its
+//!     opt-in), the schema lowering and the gate that parses the full document
+//!     back, the envelope's depth, the record's own fields, one journaled effect
+//!     per run, a replay that consumes the answer without running the harness
+//!     again, a **failed** run that replays whole — record, payload and the same
+//!     message — the request identity being the whole binding, the three ways a
+//!     run fails, a missing driver, and a `retry:` ladder whose every attempt
+//!     reaches the node's entry.
+//! 25. **A whole graph of them** — the same golden's `runFlow`, out of
+//!     `coder-graph.mjs`, with `registerHarnessDriver` standing the scripted
+//!     driver in for the vendor's SDK. Gate 24 stops at the adapter; everything
+//!     around a coder node — the entry a node wrapper assembles, the policy
+//!     chain over a failed run, the `writes:` that lands an answer in state, and
+//!     the guard that routes on `review.output.verdict` — runs only when a graph
+//!     does. Two runs: the bounded cycle, where each run's record is on its own
+//!     node's entry and the flow answers what the last implementing run wrote,
+//!     and the `on_error: { fallback: end }`, where the failed run's record
+//!     reaches the entry through the error it rode out on.
 //!
 //! # The toolchain fixture
 //!
@@ -5534,7 +5560,7 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 /// a parameter, and `src/harness.ts` emits a scripted driver into every project,
 /// so everything *above* the seam is exercised as the code a deployment ships.
 ///
-/// Eleven claims, and not one of them is visible from a run's answer:
+/// Twelve claims, and not one of them is visible from a run's answer:
 ///
 ///  * **the config map** — the workspace resolves its `${ENV}` at the call and an
 ///    empty one is refused *as written*; the environment is scrubbed to the
@@ -5555,7 +5581,12 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 ///    vocabulary, the cost rollup, and the `sdk@version` the manifest pinned;
 ///  * **one effect per run** — journaled once, whatever happened inside it;
 ///  * **replay** — a resumed generation consumes the recorded answer, the driver
-///    is not run again, and the record says `replayed: true`;
+///    is not run again, and the record it files is the record the run left, told
+///    apart from a live one by nothing (`docs/durability.md` §9);
+///  * **a failed run replays whole** — the failure is journaled with its record
+///    and its payload, so a resume raises the same failure word for word and
+///    files the same record: §7.6's one record per *attempt* has to survive a
+///    resume as well as a `retry:` ladder;
 ///  * **the request identity** — which is the whole binding, because replay does
 ///    not re-gate: a narrowed `output:`, a moved `env:` reference, the scrub
 ///    turned off or a different model setting each diverge the resume instead of
@@ -5592,6 +5623,213 @@ fn a_harness_run_is_contained_journaled_and_recorded() {
     let answer: Value =
         serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
     the_harness_run_stayed_inside_its_bounds(&answer);
+}
+
+/// Gate 25: a **compiled graph** that carries coder nodes, run (grammar 8.9,
+/// PRD resolved q57).
+///
+/// Gate 24 drives `runtime.runCoder`, which is the adapter and nothing above it.
+/// Everything *around* a coder node is a different body of code and none of it
+/// runs until a graph does: the node wrapper that assembles the trace entry, the
+/// policy chain that decides what a failed run does, the `writes:` that lands an
+/// answer in state, and the routers that read `<node>.output.<field>` off one.
+/// A record that never reached an entry, a `writes:` that landed nothing and a
+/// guard that read the wrong object would each pass gate 24 whole.
+///
+/// So this runs the `patch-pipeline` golden's own `runFlow` — off `src/index.ts`,
+/// through `src/graph.ts`'s emitted bindings — with `registerHarnessDriver`
+/// standing the scripted driver in for the vendor's SDK, which is the seam PRD
+/// resolved q57 means by "a scripted stub driver is the test surface". Two runs,
+/// for the two endings a node wrapper has:
+///
+///  * **the cycle** — `implement` answers, `review` says `revise`, the back edge
+///    runs `implement` again and the second `review` approves. Every run's
+///    record is on its node's entry, the `writes:` land in state, the edge guard
+///    routes on `review.output.verdict`, and the flow's `outputs:` are what the
+///    last implementing run said;
+///  * **the fallback** — `review`'s run fails and its `on_error: { fallback:
+///    end }` routes the graph out through the target it names, with the failed
+///    run's record on that entry. It is the one path where a record and an entry
+///    meet through the **error** rather than through the answer: the record
+///    rides out on `HarnessRunFailed` and `runNode` reconciles it against the
+///    node's collector by identity.
+///
+/// What it does **not** reach is a `retry:` ladder through a real graph, and the
+/// reason is the composition rather than the seam: `implement`'s `backoff: 30s`
+/// is what a coding agent's retry really looks like, and a gate is not a place
+/// to sleep for it. Gate 24's ladder case drives the two attempts against one
+/// `RunContext`, which is exactly what `runActivity` hands a node.
+#[test]
+fn a_compiled_graphs_coder_nodes_record_route_and_write() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("patch-pipeline"), root, "coder-graph");
+    let scratch = root.join("projects").join("coder-graph").join("scratch");
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).expect("the scratch area is writable");
+
+    let output = runner("coder-graph.mjs")
+        .arg(&project)
+        .arg(&scratch)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the coder graph runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    // --- The cycle --------------------------------------------------------
+    let cycle = &answer["cycle"];
+    assert_eq!(
+        cycle["entries"],
+        json!([
+            {
+                "node": "implement",
+                "outcome": "completed",
+                "attempts": 1,
+                "harness": [{
+                    "harness": "cc",
+                    "outcome": "completed",
+                    "sdk": "agent-compose:scripted/cc@0",
+                    "model": "model.implementer",
+                    "modelId": "claude-sonnet-4-5",
+                    "turns": 1,
+                    "toolCalls": 1
+                }],
+                "targets": ["review"],
+                "fallback": null
+            },
+            {
+                "node": "review",
+                "outcome": "completed",
+                "attempts": 1,
+                "harness": [{
+                    "harness": "codex",
+                    "outcome": "completed",
+                    "sdk": "agent-compose:scripted/codex@0",
+                    "model": "model.reviewer",
+                    "modelId": "gpt-5-codex",
+                    "turns": 1,
+                    "toolCalls": 1
+                }],
+                "targets": ["implement"],
+                "fallback": null
+            },
+            {
+                "node": "implement",
+                "outcome": "completed",
+                "attempts": 1,
+                "harness": [{
+                    "harness": "cc",
+                    "outcome": "completed",
+                    "sdk": "agent-compose:scripted/cc@0",
+                    "model": "model.implementer",
+                    "modelId": "claude-sonnet-4-5",
+                    "turns": 1,
+                    "toolCalls": 1
+                }],
+                "targets": ["review"],
+                "fallback": null
+            },
+            {
+                "node": "review",
+                "outcome": "completed",
+                "attempts": 1,
+                "harness": [{
+                    "harness": "codex",
+                    "outcome": "completed",
+                    "sdk": "agent-compose:scripted/codex@0",
+                    "model": "model.reviewer",
+                    "modelId": "gpt-5-codex",
+                    "turns": 1,
+                    "toolCalls": 1
+                }],
+                "targets": ["__end__"],
+                "fallback": null
+            }
+        ]),
+        "every run's record is on its own node's entry, and the `revise` verdict \
+         is what took the back edge (grammar 7.4, `docs/trace.md` §7.6)"
+    );
+    assert_eq!(
+        cycle["outputs"],
+        json!({ "summary": "pass 2" }),
+        "the coder node's `writes:` landed in state, and the flow's `outputs:` \
+         are the last implementing run's answer"
+    );
+    assert_eq!(
+        cycle["secondInputCarriesFeedback"],
+        json!(true),
+        "the review's `writes:` reached the next implementing run through the \
+         node's `input:`"
+    );
+    // The two containment presets arrive as the composition wrote them, read off
+    // the runs the graph itself made (grammar 8.9, Decision D138).
+    assert_eq!(cycle["implementerAccess"], json!("workspace_write"));
+    assert_eq!(cycle["reviewerAccess"], json!("read_only"));
+    assert_eq!(
+        cycle["workspaces"].as_array().map(Vec::len),
+        Some(1),
+        "both nodes resolved the one `${{REPO_ROOT}}` the composition wrote"
+    );
+
+    // --- The fallback ------------------------------------------------------
+    let fallback = &answer["fallback"];
+    assert_eq!(
+        fallback["reviewRuns"],
+        json!(1),
+        "the run was made, and failed"
+    );
+    assert_eq!(
+        fallback["entries"],
+        json!([
+            {
+                "node": "implement",
+                "outcome": "completed",
+                "attempts": 1,
+                "harness": [{
+                    "harness": "cc",
+                    "outcome": "completed",
+                    "sdk": "agent-compose:scripted/cc@0",
+                    "model": "model.implementer",
+                    "modelId": "claude-sonnet-4-5",
+                    "turns": 1,
+                    "toolCalls": 1
+                }],
+                "targets": ["review"],
+                "fallback": null
+            },
+            {
+                "node": "review",
+                "outcome": "failed",
+                "attempts": 1,
+                "harness": [{
+                    "harness": "codex",
+                    "outcome": "failed",
+                    "sdk": "agent-compose:scripted/codex@0",
+                    "model": "model.reviewer",
+                    "modelId": "gpt-5-codex",
+                    "turns": 1,
+                    "toolCalls": 0,
+                    "error": "HarnessFailed: the sandbox refused to start"
+                }],
+                "targets": null,
+                "fallback": "__end__"
+            }
+        ]),
+        "a failed run's record reaches the entry of the node that took the \
+         `fallback:`, carried out on the failure (grammar 9.2, `docs/trace.md` §7.6)"
+    );
+    assert_eq!(
+        fallback["outputs"],
+        json!({ "summary": "pass 3" }),
+        "the fallback routed to `end`, so what the implementing run wrote is \
+         what the flow answers"
+    );
 }
 
 /// What `coder-runs.mjs` has to come back with.
@@ -5714,7 +5952,6 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         json!({ "subtype": "success", "stopReason": "end_turn" }),
         "what this harness reports that the other has no shape for"
     );
-    assert_eq!(record["replayed"], json!(null), "a live run says nothing");
     assert_eq!(
         record["collected"],
         json!(1),
@@ -5862,8 +6099,92 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         json!(0),
         "…and the harness never runs a second time"
     );
-    assert_eq!(held["replayedFlag"], json!(true));
-    assert_eq!(held["liveFlag"], json!(null));
+    // **A replayed record is not marked as one.** `docs/durability.md` §9 decides
+    // that for every record type at once — a resumed generation's document
+    // answers what the *execution* did — so the two generations file one record,
+    // equal field for field, and a reader who needs the other question reads the
+    // journal.
+    assert_eq!(
+        held["replayedRecord"], held["liveRecord"],
+        "a resumed generation's record is the record the run left, marked with \
+         nothing (`docs/durability.md` §9)"
+    );
+
+    // --- A failed run replays whole (`docs/trace.md` §7.6) -----------------
+    //
+    // The half a `retry:` ladder needs from a resume. A journal that kept only a
+    // failure's name and message would replay a bare error, and the record of a
+    // run that really happened would be missing from the resumed generation's
+    // fresh trace — so the entry would read `attempts: 2` with one run under it,
+    // and §7.6's "one record per attempt … a run that failed on the first
+    // attempt really ran" would hold only on the generation that ran.
+    let failed = &answer["failedReplay"];
+    assert_eq!(
+        failed["effects"],
+        json!(1),
+        "one effect, whichever way it ended"
+    );
+    assert_eq!(
+        failed["outcomeKind"],
+        json!("value"),
+        "a failed run is kept as a value, because an error outcome holds a name \
+         and a message and could not carry the record"
+    );
+    assert_eq!(
+        failed["keptOk"],
+        json!(false),
+        "…and the value says it failed"
+    );
+    assert_eq!(failed["keptRecordOutcome"], json!("failed"));
+    assert_eq!(
+        failed["streamLength"],
+        json!(3),
+        "the failed run's payload is journaled beside its record"
+    );
+    assert_eq!(
+        failed["ranAgain"],
+        json!(0),
+        "the resume raised the recorded failure and never ran the harness"
+    );
+    assert_eq!(failed["liveName"], json!("HarnessRunFailed"));
+    assert_eq!(
+        failed["replayedName"],
+        json!("HarnessRunFailed"),
+        "…as the same class, not as a bare `Error`"
+    );
+    assert_eq!(
+        failed["sameMessage"],
+        json!(true),
+        "…and word for word, which is what `replayedFailure` promises every \
+         other effect"
+    );
+    assert_eq!(
+        failed["namesTheNode"],
+        json!(true),
+        "the message quotes the node's own address (PRD G3)"
+    );
+    assert_eq!(
+        failed["replayedRecord"],
+        json!({
+            "outcome": "failed",
+            "turns": 1,
+            "toolCalls": 1,
+            "error": "HarnessFailed: the workspace was busy",
+            "sdk": "agent-compose:scripted/cc@0"
+        }),
+        "the resumed generation files the record the run really left"
+    );
+    assert_eq!(failed["sameRecord"], json!(true));
+    assert_eq!(
+        failed["liveCollected"],
+        json!(["failed"]),
+        "the node's collector holds it on the generation that ran…"
+    );
+    assert_eq!(
+        failed["replayedCollected"],
+        json!(["failed"]),
+        "…and on the one that resumed"
+    );
 
     // --- The request identity (`docs/durability.md` §3.9) ------------------
     //

@@ -98,7 +98,6 @@ const CODEX_SETTINGS: &[(&str, Shape)] = &[
     ("network_access", Shape::Flag),
     ("web_search", Shape::Enum(&["disabled", "cached", "live"])),
     ("skip_git_repo_check", Shape::Flag),
-    ("additional_directories", Shape::Names),
 ];
 
 /// The keys one harness's **adapter owns**, read off the driver that owns them

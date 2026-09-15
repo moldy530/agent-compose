@@ -3182,7 +3182,10 @@ projected through a table **per harness**, with every stripped bound folded into
 that node's `description`, and the answer is parsed against the **full**
 declared schema. An answer that fails the gate fails the node, where
 `retry:`/`on_error:` decide the run exactly as they do for an agent whose answer
-missed its contract (§5.1, §9.2).
+missed its contract (§5.1, §9.2). **Which of the two mechanisms answered is not
+a field of the trace's record**, unlike the wire mechanism an agent's call
+records: a harness's is fixed by the harness and the SDK release this compiler
+pins, so naming those names it ([`docs/trace.md`](trace.md) §7.6).
 
 #### `settings:`, in two tiers
 

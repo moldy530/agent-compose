@@ -8,7 +8,7 @@
 // hands in a script and everything above the seam — the config map, the journal,
 // the stream tap, the output gate — is the code a deployment really ships.
 //
-// Eleven claims, and each is invisible from outside a run:
+// Twelve claims, and each is invisible from outside a run:
 //
 //   * **the config map** — `workspace:` resolves its `${ENV}` at the call and an
 //     empty one is refused; the environment is **scrubbed** to the declared
@@ -30,7 +30,12 @@
 //     vocabulary, the cost rollup and the `sdk@version` the manifest pinned;
 //   * **one effect per run** — journaled once, whatever the run did inside;
 //   * **replay** — a resumed generation consumes the recorded answer, the driver
-//     is **not** run again, and the record says `replayed: true`;
+//     is **not** run again, and the record it files is the record the run left,
+//     told apart from a live one by nothing (`docs/durability.md` §9);
+//   * **a failed run replays whole** — the failure is journaled with its record
+//     and its payload, so a resume raises the same failure, word for word, and
+//     files the same record: `docs/trace.md` §7.6's one record per *attempt*
+//     has to survive a resume as well as a `retry:` ladder;
 //   * **the request identity** — and because replay does not re-gate, the whole
 //     binding is in it: a narrowed `output:`, a moved `env:` reference, the
 //     scrub turned off or a different model setting each diverge the resume
@@ -118,7 +123,7 @@ const SCHEMA = {
 /** One coder binding, with whatever this case overrides. */
 function binding(overrides = {}) {
   return {
-    node: "flow.patch.node.implement",
+    node: "flow.patch.implement",
     harness: "cc",
     model: "model.implementer",
     modelId: "claude-sonnet-4-5",
@@ -136,6 +141,15 @@ function binding(overrides = {}) {
     result: RESULT,
     ...overrides,
   };
+}
+
+/** One value as JSON with every object's keys in order — see case 9b. */
+function sorted(value) {
+  return JSON.stringify(value, (_key, held) =>
+    held !== null && typeof held === "object" && !Array.isArray(held)
+      ? Object.fromEntries(Object.entries(held).sort(([one], [two]) => (one < two ? -1 : 1)))
+      : held,
+  );
 }
 
 /** The answer a healthy run gives, as a script the stub yields. */
@@ -226,7 +240,6 @@ const results = {};
     toolCalls: record.toolCalls,
     cost: record.cost,
     extra: record.extra,
-    replayed: record.replayed ?? null,
     collected: held.harnessRuns.length,
     // The envelope carries three tool events and no fourth: the subagent's own
     // turn is not one, and neither is the `system` event.
@@ -450,8 +463,101 @@ const results = {};
     // The resume consumed the answer and ran nothing.
     replayedOutput: replayed.output,
     replayedDriverRuns: second.runs.length,
-    replayedFlag: replayed.harness[0].replayed ?? null,
-    liveFlag: written.harness[0].replayed ?? null,
+    // …and the record it files is the record the run left, told apart from the
+    // live one by **nothing**: a resumed generation's document answers what the
+    // execution did (`docs/durability.md` §9).
+    replayedRecord: replayed.harness[0],
+    liveRecord: written.harness[0],
+  };
+}
+
+// --- 9b. A run that FAILED is journaled too, and replays whole -------------
+//
+// The other half of section 9, and the one a `retry:` ladder needs: a resumed
+// generation's fresh trace has to hold the attempt that failed as well as the
+// one that answered (`docs/trace.md` §7.6, `docs/durability.md` §3.9). A journal
+// that kept only the failure's message would replay a bare error, and the record
+// of a run that really happened would vanish out of the resumed document.
+{
+  process.env["AGENT_COMPOSE_DATA"] = path.join(scratch, "failed");
+  const held = await journal.openJournal();
+  const site = "flow.patch/implement/0";
+  const failing = [
+    { source: { type: "assistant" }, tap: { kind: "turn", usage: { inputTokens: 11 } } },
+    {
+      source: { type: "tool_result", tool: "Read" },
+      tap: { kind: "tool", name: "Read", outcome: "completed" },
+    },
+    { source: { type: "error" }, tap: { kind: "error", message: "the workspace was busy" } },
+  ];
+
+  journal.openSession("exec_failed", held, false);
+  const first = harness.scriptedDriver("cc", failing);
+  const live = context({
+    execution: { id: "exec_failed" },
+    effects: journal.recorderFor("exec_failed", site),
+  });
+  let liveFailure;
+  try {
+    await runtime.runCoder(binding(), { goal: "fix it" }, live, { cc: first.driver });
+  } catch (error) {
+    liveFailure = error;
+  }
+  journal.closeSession("exec_failed");
+
+  // …and the resume: same site, same ordinal, and a driver that would answer if
+  // it were reached.
+  journal.openSession("exec_failed", held, true);
+  const second = harness.scriptedDriver("cc", script({ summary: "SHOULD NOT RUN", touched: [] }));
+  const resumed = context({
+    execution: { id: "exec_failed" },
+    effects: journal.recorderFor("exec_failed", site),
+  });
+  let replayedFailure;
+  try {
+    await runtime.runCoder(binding(), { goal: "fix it" }, resumed, { cc: second.driver });
+  } catch (error) {
+    replayedFailure = error;
+  }
+  journal.closeSession("exec_failed");
+
+  const records = held.effectsUnder("exec_failed", site).filter((one) => one.kind === "harness");
+  const payload = records[0]?.outcome?.kind === "value" ? records[0].outcome.value : null;
+  const replayedRecord = runtime.harnessRecordOf(replayedFailure);
+  results["failedReplay"] = {
+    // One effect, kept as a **value** — the shape that can carry a record.
+    effects: records.length,
+    outcomeKind: records[0]?.outcome?.kind ?? null,
+    keptOk: payload?.ok ?? null,
+    keptRecordOutcome: payload?.record?.outcome ?? null,
+    // The failed run's payload is journaled beside it, which is where a reader
+    // goes for what the run did before it died.
+    streamLength: payload?.stream?.length ?? null,
+    // The resume raised the failure rather than the answer, and ran nothing.
+    ranAgain: second.runs.length,
+    liveName: liveFailure?.name ?? null,
+    replayedName: replayedFailure?.name ?? null,
+    sameMessage: String(liveFailure?.message) === String(replayedFailure?.message),
+    namesTheNode: String(replayedFailure?.message ?? "").includes("flow.patch.implement"),
+    // …carrying the record the run really left, on the error and in the node's
+    // own collector, exactly as the live generation did.
+    replayedRecord:
+      replayedRecord === undefined
+        ? null
+        : {
+            outcome: replayedRecord.outcome,
+            turns: replayedRecord.turns.length,
+            toolCalls: (replayedRecord.toolCalls ?? []).length,
+            error: replayedRecord.error ?? null,
+            sdk: replayedRecord.sdk,
+          },
+    liveCollected: live.harnessRuns.map((run) => run.outcome),
+    replayedCollected: resumed.harnessRuns.map((run) => run.outcome),
+    // The two generations' records are one record, and nothing on either says
+    // which generation filed it. Compared **key-sorted**, because the journal
+    // canonicalizes what it keeps and the order a record's keys were written in
+    // is not part of what it says.
+    sameRecord: sorted(runtime.harnessRecordOf(liveFailure)) === sorted(replayedRecord),
   };
 }
 

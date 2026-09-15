@@ -337,6 +337,50 @@ mod tests {
         }
     }
 
+    /// …and the one option both audits above could each have let through, held
+    /// to the sentence that names it: **roots beside the working directory are
+    /// dropped, under every harness** (grammar 8.9, `explain
+    /// unknown-harness-setting`).
+    ///
+    /// It is the option that made the wider half of the dropped set worth
+    /// writing down, and neither test above can see it slip. The first reads
+    /// the driver, and a driver that assigns the option *from a settings key*
+    /// is assigning it from `run.settings` — which is exactly what that test
+    /// treats as settings-derived and exempts. The second compares one
+    /// hand-written inventory per harness, so a name missing from the driver
+    /// and from the inventory together is two halves of one omission agreeing.
+    ///
+    /// What the omission costs is the containment statement itself: a node
+    /// whose `workspace:` named one directory, under an `access:` preset that
+    /// bounds writes to it, handed the SDK a second writable root the
+    /// composition never wrote. `cc` drops it and says so in the warning; a
+    /// harness that promoted it to a checked key would make `access:` mean one
+    /// thing under one harness and another under the other, which PRD resolved
+    /// q57 ruling c's "stated per harness, never implied equivalent" is about
+    /// the *enforcement* of, not an invitation to differ about the bound.
+    #[test]
+    fn roots_beside_the_workspace_are_dropped_under_every_harness() {
+        for harness in Harness::ALL.iter().filter(|held| held.ships_in_v1()) {
+            let (source, curated, reserved) = driver_source(*harness);
+            let name = harness.as_str();
+            assert!(
+                quoted_list(source, reserved).contains("additionalDirectories"),
+                "`{reserved}` does not hold `additionalDirectories`, so a `settings:` key on a \
+                 `harness: {name}` node reaches the SDK with sandbox roots beside `workspace:` \
+                 (grammar 8.9's dropped set)"
+            );
+            for held in quoted_list(source, curated) {
+                assert!(
+                    !held
+                        .replace('_', "")
+                        .eq_ignore_ascii_case("additionaldirectories"),
+                    "`{curated}` holds `{held}`, which is the root-widening option grammar 8.9 \
+                     says is dropped rather than checked"
+                );
+            }
+        }
+    }
+
     /// A `cc` run keeps the **harness's own** system prompt and appends the
     /// node's `prompt:` to it (grammar 8.9, PRD resolved q57).
     ///
@@ -457,11 +501,13 @@ mod tests {
                 ],
             ),
             // `@openai/codex-sdk`'s `ThreadOptions`, which is closed and small:
-            // four of its eleven fields are a bound this node states, and the
-            // rest are the vendor's own vocabulary D140 leaves open.
+            // six of its eleven fields are a bound this node states — five that
+            // spell one and `additionalDirectories`, which contains one — and
+            // the rest are the vendor's own vocabulary D140 leaves open.
             Harness::Codex => (
                 "0.154.0",
                 &[
+                    "additionalDirectories",
                     "approvalPolicy",
                     "model",
                     "modelReasoningEffort",

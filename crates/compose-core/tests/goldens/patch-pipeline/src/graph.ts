@@ -118,7 +118,7 @@ const modelReviewer: runtime.ModelBinding = {
  * `flow.patch` node `implement` — the harness run it is: the config map, the workspace it is contained by, and the schema its answer is gated against (grammar 8.9, PRD resolved q57).
  */
 const flowPatchNodeImplementCoder: runtime.HarnessBinding = {
-  node: "flow.patch.node.implement",
+  node: "flow.patch.implement",
   harness: "cc",
   model: "model.implementer",
   modelId: "claude-sonnet-4-5",
@@ -196,7 +196,7 @@ const flowPatchNodeImplement: runtime.NodeDescriptor = {
  * `flow.patch` node `review` — the harness run it is: the config map, the workspace it is contained by, and the schema its answer is gated against (grammar 8.9, PRD resolved q57).
  */
 const flowPatchNodeReviewCoder: runtime.HarnessBinding = {
-  node: "flow.patch.node.review",
+  node: "flow.patch.review",
   harness: "codex",
   model: "model.reviewer",
   modelId: "gpt-5-codex",

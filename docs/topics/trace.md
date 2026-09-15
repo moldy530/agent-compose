@@ -191,10 +191,11 @@ three-outcome vocabulary a tool call uses, and a cost rollup — money where the
 harness estimates one, tokens where it counts them.
 
 Depth is the rule worth knowing: a harness that runs subagents of its own keeps
-their transcripts in the run's journal record and out of the trace. So is
-`replayed`, which marks a run a resume consumed out of the journal rather than
-performed — one record per attempt is what a `retry:` ladder leaves behind, and
-that field is how you tell which of them this process actually ran.
+their transcripts in the run's journal record and out of the trace. The other
+one is the count: a `retry:` ladder leaves **one record per attempt**, in the
+order the runs were made, and a resumed execution's trace holds the same set —
+nothing on a record says which generation ran it, because the trace answers what
+the *execution* did.
 
 ## What is not in a trace
 

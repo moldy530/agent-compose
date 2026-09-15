@@ -550,39 +550,50 @@ const CODEX_SETTINGS: readonly string[] = [
   "network_access",
   "web_search",
   "skip_git_repo_check",
-  "additional_directories",
 ];
 
 /**
  * The keys of a thread's options the **adapter** owns, and which a `settings:`
  * key therefore never reaches (see [`passthrough`]).
  *
- * Each one is a bound some other part of the node already states: `workspace:`
- * is `workingDirectory`, `access:` is `sandboxMode` and the approval policy
- * beside it, and `model:` is the model and the one reasoning setting Decision
- * D141 maps into it. A composition that spelled one of them here would be
- * reaching around the construct that states it, through the surface this
- * grammar deliberately leaves open — so these are dropped rather than passed.
- * The environment is not on the list because it is not a thread option at all:
- * it is handed to the `Codex` constructor below.
+ * Two kinds of name are on the list, exactly as on `cc`'s:
  *
- * `approvalPolicy` is the one that is not a second spelling of a key: it is the
- * **per-call approval tier** PRD resolved q57 ruling c says this release does
- * not adopt, and a run that escalated out of its sandbox to an approver nothing
- * answers for would be `access:` saying one thing and the run doing another.
- * The thread's other options are the vendor's own vocabulary and travel
- * unchanged, which is Decision D140's whole point.
+ *  * an option that **spells** a bound some other part of the node states:
+ *    `workspace:` is `workingDirectory`, `access:` is `sandboxMode` and the
+ *    approval policy beside it, and `model:` is the model and the one reasoning
+ *    setting Decision D141 maps into it. A composition that spelled one of them
+ *    here would be reaching around the construct that states it, through the
+ *    surface this grammar deliberately leaves open — so these are dropped
+ *    rather than passed. The environment is not on the list because it is not a
+ *    thread option at all: it is handed to the `Codex` constructor below;
+ *  * an option that **contains** one without spelling it, which is the wider
+ *    half of the dropped set grammar 8.9 states: `additionalDirectories` is
+ *    additional sandbox roots beside `workspace:`, so a run under it is written
+ *    where the node's own workspace never reached. It is the same option `cc`
+ *    drops by the same name, and the two harnesses answer that key the same way
+ *    or `access:` means one thing under one harness and another under the
+ *    other.
+ *
+ * `approvalPolicy` is the one that is neither: it is the **per-call approval
+ * tier** PRD resolved q57 ruling c says this release does not adopt, and a run
+ * that escalated out of its sandbox to an approver nothing answers for would be
+ * `access:` saying one thing and the run doing another. The thread's other
+ * options are the vendor's own vocabulary and travel unchanged, which is
+ * Decision D140's whole point.
  *
  * The list is audited against the pinned SDK's own `ThreadOptions`, which is
  * what `a_reserved_list_is_audited_against_the_pinned_option_surface`
  * (`codegen/harness.rs`) holds it to.
  */
 const CODEX_RESERVED: readonly string[] = [
+  // Options that spell a bound another key states.
   "approvalPolicy",
   "model",
   "modelReasoningEffort",
   "sandboxMode",
   "workingDirectory",
+  // …and the option that contains one without spelling it.
+  "additionalDirectories",
 ];
 
 /**
@@ -658,8 +669,6 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
       if (search !== undefined) options.webSearchMode = search as ThreadOptions["webSearchMode"];
       const skipGit = settingFlag(run.settings["skip_git_repo_check"]);
       if (skipGit !== undefined) options.skipGitRepoCheck = skipGit;
-      const directories = settingList(run.settings["additional_directories"]);
-      if (directories !== undefined) options.additionalDirectories = directories;
 
       const thread = codex.startThread(options);
       const streamed = await thread.runStreamed(codexTurn(run), {

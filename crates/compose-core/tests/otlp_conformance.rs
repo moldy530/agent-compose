@@ -471,8 +471,6 @@ fn every_expectation_is_a_well_formed_export() {
 ///    about which;
 ///  * a run that **failed**, because a span with `code: 2` and an error message
 ///    is the reading an operator opens a trace for;
-///  * a run a resume **replayed**, which is the one attribute about this
-///    generation rather than about the run;
 ///  * a **cost in money** and a **usage per turn**, which are the two halves of
 ///    the rollup and the two attribute types — a `doubleValue` and an
 ///    `intValue` — this exporter emits for it.
@@ -480,7 +478,6 @@ fn every_expectation_is_a_well_formed_export() {
 fn the_corpus_holds_a_harness_run_of_each_shape() {
     let mut harnesses: BTreeSet<String> = BTreeSet::new();
     let mut outcomes: BTreeSet<String> = BTreeSet::new();
-    let mut replayed = false;
     let mut money = false;
     let mut per_turn_usage = false;
     for (_, fixture) in fixtures() {
@@ -496,7 +493,6 @@ fn the_corpus_holds_a_harness_run_of_each_shape() {
                 if let Some(outcome) = run["outcome"].as_str() {
                     outcomes.insert(outcome.to_string());
                 }
-                replayed |= run["replayed"] == Value::Bool(true);
                 money |= run["cost"]["usd"].is_number();
                 per_turn_usage |= run["turns"]
                     .as_array()
@@ -523,7 +519,6 @@ fn the_corpus_holds_a_harness_run_of_each_shape() {
             .collect::<BTreeSet<String>>(),
         "a failed run is the span a reader opens a trace for"
     );
-    assert!(replayed, "no fixture carries a run a resume consumed");
     assert!(money, "no fixture carries a harness's own cost estimate");
     assert!(per_turn_usage, "no fixture carries usage reported per turn");
 }

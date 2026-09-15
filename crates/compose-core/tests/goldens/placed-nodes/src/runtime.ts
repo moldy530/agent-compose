@@ -7864,6 +7864,14 @@ export type WorkspaceAccess = "read_only" | "workspace_write" | "full_access";
  * runs subagents of its own yields their transcripts too, and those stay in the
  * journal's private payload where every other tool's answer already is
  * (`docs/durability.md` §8, PRD resolved q50).
+ *
+ * **Nothing here says whether a resume replayed the run**, and no field is
+ * missing: `docs/durability.md` §9 decides that for every record type at once —
+ * a resumed generation writes a fresh trace document whole, answering what the
+ * *execution* did rather than what this process did, and the reader who needs
+ * the other question reads the journal. The record is journaled
+ * ([`JournaledHarnessRun`]) so a resume can file it again, not so a resume can
+ * mark it.
  */
 export interface HarnessRecord {
   /** Which harness ran it. */
@@ -7884,8 +7892,6 @@ export interface HarnessRecord {
   readonly cost: HarnessCost;
   /** Whatever this harness reports that the other has no shape for. */
   readonly extra?: Readonly<Record<string, unknown>>;
-  /** Present on a run a resume consumed out of the journal rather than ran. */
-  readonly replayed?: boolean;
   /** What ended a `"failed"` run, in §3's `<error name>: <message>` shape. */
   readonly error?: string;
 }
@@ -8112,15 +8118,33 @@ export type HarnessDrivers = Readonly<Partial<Record<HarnessName, HarnessDriver>
  * resume consumes so the harness never runs twice. `record` is the trace record
  * that generation wrote, kept so a resumed execution's fresh trace says what
  * really happened rather than dropping the run out of it
- * (`docs/durability.md` §9). `stream` is the **private payload**: every event
+ * (`docs/durability.md` §3.9). `stream` is the **private payload**: every event
  * the SDK yielded, which is where a harness's transcripts, its commands and its
  * subagents live and where they stay (`docs/durability.md` §8).
+ *
+ * **A run that failed is journaled too**, as a value rather than through the
+ * slot's error path, and it holds the same three things minus the answer it
+ * never produced: a `detail`, which is the sentence [`HarnessRunFailed`]
+ * composes its message out of, and the record and the stream the run had built
+ * when it ended. `docs/trace.md` §7.6 promises one record per **attempt** — "a
+ * run that failed on the first attempt really ran" — and a journal that kept
+ * only the message would make that promise hold on the generation that ran and
+ * fail on the one that resumed. It is the shape [`JournaledCall`] already has
+ * for a spent model ladder, one construct along.
  */
-interface JournaledHarnessRun {
-  readonly output: unknown;
-  readonly record: HarnessRecord;
-  readonly stream: readonly unknown[];
-}
+type JournaledHarnessRun =
+  | {
+      readonly ok: true;
+      readonly output: unknown;
+      readonly record: HarnessRecord;
+      readonly stream: readonly unknown[];
+    }
+  | {
+      readonly ok: false;
+      readonly detail: string;
+      readonly record: HarnessRecord;
+      readonly stream: readonly unknown[];
+    };
 
 /**
  * The keywords `cc`'s output format does not compile (PRD resolved q55 ruling a,
@@ -8248,12 +8272,22 @@ export class HarnessRunFailed extends Error {
   override readonly name = "HarnessRunFailed";
   /** What the run had done when it ended. */
   readonly record: HarnessRecord;
+  /**
+   * What ended it, as the message above quotes it.
+   *
+   * Kept beside the composed message so a **resume** can raise the same failure
+   * rather than a restatement of it: the journal holds this sentence, and
+   * [`runCoder`] recomposes the message from it and the node's own address, so
+   * the two generations' failures read identically word for word.
+   */
+  readonly detail: string;
   constructor(node: string, record: HarnessRecord, detail: string, cause?: unknown) {
     super(
       `\`${node}\`'s \`harness: ${record.harness}\` run failed: ${detail}`,
       cause === undefined ? undefined : { cause },
     );
     this.record = record;
+    this.detail = detail;
   }
 }
 
@@ -8264,6 +8298,34 @@ export function harnessRecordOf(error: unknown): HarnessRecord | undefined {
     held = (held as { cause?: unknown }).cause;
   }
   return undefined;
+}
+
+/** The drivers a host registered, ahead of the ones `src/harness.ts` emits. */
+const HOSTED_HARNESS_DRIVERS = new Map<HarnessName, HarnessDriver>();
+
+/**
+ * Bind one harness to a driver of the host's own, ahead of the SDK-backed one
+ * (grammar 8.9, PRD resolved q57).
+ *
+ * The **test surface** the driver seam exists for, reachable from outside the
+ * process's own module graph: a harness SDK speaks its own wire, so the mock
+ * provider — deliberately — never sees it, and resolved q57 makes "a scripted
+ * stub driver is the test surface" the answer. `src/harness.ts` emits
+ * `scriptedDriver` into every project, and this is how a compiled graph is made
+ * to run one: register before `runFlow` loads the graph, exactly as
+ * [`registerFunction`] is registered before a `function:` binding runs, and
+ * every `coder:` node of the composition reaches the script instead of the
+ * vendor.
+ *
+ * It resolves **ahead of** the emitted registry rather than replacing it, so a
+ * composition binding two harnesses can have one scripted and the other left
+ * alone. Nothing about the node changes: the config map, the journal, the
+ * stream tap, the output gate, the `retry:` ladder and the trace record are the
+ * code a deployment ships, which is the whole reason the seam is one function
+ * deep.
+ */
+export function registerHarnessDriver(harness: HarnessName, driver: HarnessDriver): void {
+  HOSTED_HARNESS_DRIVERS.set(harness, driver);
 }
 
 /**
@@ -8291,7 +8353,10 @@ export function harnessRecordOf(error: unknown): HarnessRecord | undefined {
  *
  * `drivers` is a parameter rather than an import, which is what keeps this file
  * free of the SDKs: `src/graph.ts` imports `src/harness.ts` and hands the
- * registry in, and a test hands in a scripted driver instead.
+ * registry in, and a test calling this function directly hands in a scripted
+ * driver instead. A test driving the **whole graph** cannot reach the argument
+ * at all — `src/graph.ts` writes it — which is what
+ * [`registerHarnessDriver`] is for, and why it is consulted first.
  */
 export async function runCoder(
   binding: HarnessBinding,
@@ -8299,7 +8364,7 @@ export async function runCoder(
   context: RunContext,
   drivers: HarnessDrivers,
 ): Promise<{ output: unknown; harness: readonly HarnessRecord[] }> {
-  const driver = drivers[binding.harness];
+  const driver = HOSTED_HARNESS_DRIVERS.get(binding.harness) ?? drivers[binding.harness];
   if (driver === undefined) {
     throw new HarnessUnavailable(
       binding.node,
@@ -8373,22 +8438,47 @@ export async function runCoder(
     schema: binding.schema,
   };
 
-  // Whether the journal already held this effect, read at the moment the slot
-  // is claimed and before anything could be performed — which is what the
-  // `inspect` hook is for, and the only place the answer is knowable.
-  let replayed = false;
-  let journaledRun: JournaledHarnessRun;
-  try {
-    journaledRun = await journaled(
-      context.effects,
-      "harness",
-      request,
-      async () => await performHarnessRun(binding, driver, run),
-      (slot) => {
-        replayed = slot.held !== undefined;
-      },
-    );
-  } catch (error) {
+  // The whole event stream, filled by the run below and journaled whichever way
+  // it ends. Held **here** rather than inside [`performHarnessRun`] because a
+  // failed run is journaled too (see the `catch` below), and a payload the
+  // thrown failure would have had to carry is a payload this function can
+  // simply already have.
+  const stream: unknown[] = [];
+  // The error a **live** run threw, kept so it can be re-thrown with its `cause`
+  // chain intact. The journal gets a flattened copy of it in the same step; this
+  // is the original, which is what the human report prints.
+  let live: HarnessRunFailed | undefined;
+  const journaledRun = await journaled(
+    context.effects,
+    "harness",
+    request,
+    async (): Promise<JournaledHarnessRun> => {
+      try {
+        return await performHarnessRun(binding, driver, run, stream);
+      } catch (error) {
+        // Kept as a **value** rather than through the slot's error path, which
+        // is what [`callModel`] does with a spent ladder and for its reason: a
+        // failure is more than its message here. The `HarnessRecord` the run
+        // built is what a reader of the failed node's entry reads, and the
+        // journal's error outcome holds a name and a message and nothing else —
+        // so a resumed generation would replay the failure and file no record,
+        // and `docs/trace.md` §7.6's "one record per attempt" would hold on the
+        // generation that ran and not on the one that resumed.
+        if (!(error instanceof HarnessRunFailed)) throw error;
+        live = error;
+        return { ok: false, detail: error.detail, record: error.record, stream };
+      }
+    },
+  );
+
+  if (!journaledRun.ok) {
+    // A **replayed** failure is raised the way a live one was: same class, same
+    // record, and the same message, because the message is recomposed from the
+    // `detail` the record was filed with rather than restated. What a replay
+    // cannot restore is the platform `cause` chain, which is `replayedFailure`'s
+    // own standing rule and which only the human report prints.
+    const failure =
+      live ?? new HarnessRunFailed(binding.node, journaledRun.record, journaledRun.detail);
     // **A failed run is a run this node made**, and on a `retry:` ladder it is
     // one a *later, successful* attempt would otherwise erase: the answer only
     // ever carries the attempt it came out of, so a node that failed once and
@@ -8397,29 +8487,32 @@ export async function runCoder(
     // the record goes in here as well as riding out on the failure — which is
     // the path that reports the run that ended the node. [`runNode`] reconciles
     // the two **by identity**, so a record on both is filed once.
-    const ran = harnessRecordOf(error);
-    if (ran !== undefined) context.harnessRuns?.push(ran);
-    throw error;
+    context.harnessRuns?.push(failure.record);
+    throw failure;
   }
-  // A record a resume consumed out of the journal says so, which is the one
-  // field of it that is about *this* generation rather than about the run: the
-  // resumed execution writes a fresh trace document whole, and a reader of one
-  // is entitled to know which of its records describe work this process did
+  // **A replayed record is not marked as one**, and that is the trace's own
+  // decision rather than an omission here: a resumed generation writes a fresh
+  // document whole, saying what the *execution* did rather than what this
+  // process did, and a reader who needs the other question reads the journal
   // (`docs/durability.md` §9).
-  const record: HarnessRecord = replayed
-    ? { ...journaledRun.record, replayed: true }
-    : journaledRun.record;
-  context.harnessRuns?.push(record);
-  return { output: journaledRun.output, harness: [record] };
+  context.harnessRuns?.push(journaledRun.record);
+  return { output: journaledRun.output, harness: [journaledRun.record] };
 }
 
-/** One live run: the driver, the tap, and the gate (see [`runCoder`]). */
+/**
+ * One live run: the driver, the tap, and the gate (see [`runCoder`]).
+ *
+ * `stream` is the caller's, and it is filled rather than returned: a run that
+ * fails leaves through a `throw`, and the payload of a failed run is journaled
+ * with its record — so the one collection both endings need is the caller's to
+ * hold.
+ */
 async function performHarnessRun(
   binding: HarnessBinding,
   driver: HarnessDriver,
   run: HarnessRun,
-): Promise<JournaledHarnessRun> {
-  const stream: unknown[] = [];
+  stream: unknown[],
+): Promise<Extract<JournaledHarnessRun, { ok: true }>> {
   const turns: HarnessTurn[] = [];
   const toolCalls: HarnessToolCall[] = [];
   let cost: Omit<HarnessCost, "turns"> = {};
@@ -8508,7 +8601,7 @@ async function performHarnessRun(
       answer,
       `the answer of \`${binding.node}\`'s \`harness: ${binding.harness}\` run`,
     );
-    return { output, record: settled("completed"), stream };
+    return { ok: true, output, record: settled("completed"), stream };
   } catch (error) {
     throw new HarnessRunFailed(
       binding.node,

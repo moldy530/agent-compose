@@ -1,6 +1,6 @@
 {
   "name": "harness-runs",
-  "about": "A `coder:` node's harness runs, as child spans under their entry (`docs/trace.md` §7.6, §12.5, PRD resolved q57). Two runs on one entry, which is what a `retry:` ladder leaves behind: the first failed and carries its turns, its tool events and the error that ended it, and the second answered. Between them they reach every optional field of the record — usage per turn on one harness and a cost rollup in money on the other, the three-member tool vocabulary, the harness-tagged extras, and a `replayed` run a resume consumed out of the journal.",
+  "about": "A `coder:` node's harness runs, as child spans under their entry (`docs/trace.md` §7.6, §12.5, PRD resolved q57). Two runs on one entry, which is what a `retry:` ladder leaves behind: the first failed and carries its turns, its tool events and the error that ended it, and the second answered. Between them they reach every optional field of the record — usage per turn on one harness and a cost rollup in money on the other, the three-member tool vocabulary, and the harness-tagged extras.",
   "context": {
     "target": "local",
     "artifact": "sha256:00000000000000000000000000000000000000000000000000000000000000c0",
@@ -139,8 +139,7 @@
             "extra": {
               "cachedInputTokens": 128,
               "cacheWriteInputTokens": 0
-            },
-            "replayed": true
+            }
           }
         ]
       }
@@ -705,12 +704,6 @@
                     "key": "agentcompose.harness.output_tokens",
                     "value": {
                       "intValue": "310"
-                    }
-                  },
-                  {
-                    "key": "agentcompose.harness.replayed",
-                    "value": {
-                      "stringValue": "true"
                     }
                   }
                 ],

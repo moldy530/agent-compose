@@ -751,6 +751,18 @@ the largest private thing this journal holds, and it is the reason `docs/trace.m
 subagents yields their whole conversations, and those belong here beside a
 model's completions rather than in a document a run hands out.
 
+**A run that failed is recorded too, and it replays as the same failure** —
+§3.1's rule for a model call, one construct along, with one thing more kept
+beside the message. A harness run fails in ways that are the node's business
+rather than the machine's: the harness reported a fatal error of its own, it
+produced no structured output at all, or its answer failed the node's `output:`
+gate. Each of those really ran, and `docs/trace.md` §7.6 promises one record per
+attempt across a `retry:` ladder — so the run's **record** and its **payload**
+are kept with the sentence that ended it, and the resumed generation raises a
+failure reading word for word as the first one did, carrying that record into
+its own fresh trace. Keeping only the message would make §7.6's promise hold on
+the generation that ran and quietly fail on the one that resumed.
+
 **A crash mid-run recorded nothing.** The slot is claimed when the run starts and
 written when it ends, so a process that died in between left no record at all —
 which makes the next attempt an ordinary attempt: the node's `retry:` re-runs the
@@ -1213,9 +1225,11 @@ execution had run in one process:
   because all of them are deterministic (§4);
 * a replayed model call carries the `ModelCall` records the original ladder
   filed (§3.1), a replayed store op carries the `StoreRecord` the original op
-  filed (§3.3), and a replayed wait carries the original `pausedAt`,
-  `expiresAt` and `settledAt` (§3.4). A reader of the resumed document sees what
-  the execution did, not what this process did.
+  filed (§3.3), a replayed harness run carries the `HarnessRecord` the original
+  run filed — the attempts that failed included (§3.9) — and a replayed wait
+  carries the original `pausedAt`, `expiresAt` and `settledAt` (§3.4). A reader
+  of the resumed document sees what the execution did, not what this process
+  did.
 
 **Replayed and live entries are not distinguishable** in the trace, and that is
 a decision rather than an omission. `docs/trace.md` §10.3 requires a version

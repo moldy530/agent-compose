@@ -2475,6 +2475,14 @@ fn coder_descriptor(
 ) -> String {
     let id = node.id.value.as_str();
     let site = format!("{address}.node.{id}");
+    // …and the **node's own address**, which is a different string and is the
+    // one a person reads. `site` is this compiler's internal key — it names the
+    // emitted constants and every `${ENV}` reference site under this node — and
+    // its `.node.` segment is a namespace rather than an address. What the
+    // binding carries is what `plan`, the graph document and the trace entry
+    // spell: `<flow address>.<node id>`, and it is what four runtime messages
+    // quote back to an operator who is about to grep for it (PRD G3).
+    let address_of_node = format!("{address}.{id}");
     let output = surface_fields(surfaces, &format!("{site}.output"));
     let parse = names.value(&format!("{site}.output")).to_string();
     imported.push(parse.clone());
@@ -2493,7 +2501,7 @@ fn coder_descriptor(
         "const {}: runtime.HarnessBinding = {{\n",
         names.value(&format!("{site}.coder"))
     ));
-    text.push_str(&format!("  node: {},\n", names::string(&site)));
+    text.push_str(&format!("  node: {},\n", names::string(&address_of_node)));
     text.push_str(&format!(
         "  harness: {},\n",
         names::string(harness.as_str())

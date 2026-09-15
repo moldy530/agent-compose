@@ -637,11 +637,6 @@ function harnessSpan(
       ...(run.cost.usd === undefined
         ? []
         : [double("agentcompose.harness.cost_usd", run.cost.usd)]),
-      // A run a resume consumed out of the journal rather than performed. It is
-      // exported because an operator comparing two deployments needs to know
-      // which spans describe work a process did — the same argument
-      // `output_mechanism` is exported under.
-      ...(run.replayed === true ? [text("agentcompose.harness.replayed", "true")] : []),
       ...(run.error === undefined ? [] : [text("agentcompose.error", run.error)]),
     ],
     events,

@@ -860,6 +860,26 @@ stay in the durability journal's private payload with every other tool's answer
 (`docs/durability.md` §3.9, §8, PRD resolved q50). What a reader gets here is the
 shape of the run, not its transcript.
 
+**Which mechanism asked for the answer is the harness's own**, and that is why
+[§7.5](#75-which-mechanism-answered)'s field is not repeated here. PRD resolved
+q57 ruling d puts a coder node's structured output on a third mechanism family —
+a JSON-Schema output format on `cc`, an output schema on `codex` — on resolved
+q53's terms, and `harness` and `sdk` below name that mechanism between them: a
+harness's is fixed by the SDK release this compiler pins, and grammar §8.9
+states the mapping. What does not transfer is §7.5's own argument for carrying
+the field: two deployments of one composition reach different *endpoints* and so
+answer through different wire mechanisms, and there is no such variation inside
+a run.
+
+**A run a resume replayed reads exactly like one this process performed.** That
+is `docs/durability.md` §9's decision, taken for every record type at once
+rather than an omission here: a resumed generation writes a fresh trace document
+whole, answering what the *execution* did rather than what this process did, and
+a reader who needs the other question reads the journal. The record is journaled
+(`docs/durability.md` §3.9) so that the resumed document can carry it — every
+attempt's run, the ones that failed included — not so that the document can mark
+it.
+
 | field | type | presence | meaning |
 |---|---|---|---|
 | `harness` | `HarnessName` — `"cc"` \| `"codex"` | always | Which harness ran it: the `harness:` keyword the composition wrote (grammar §8.9). A closed vocabulary, and the two reserved names of grammar §15 are **not** members — `validate` refuses a composition that binds one, so no run under one exists to record. |
@@ -871,7 +891,6 @@ shape of the run, not its transcript.
 | `toolCalls` | array of [tool events](#763-a-tool-event) | when the run made any | Its top-level tool events, in the order it made them. Never empty: a run that called nothing carries no key. |
 | `cost` | [a rollup](#764-what-a-run-cost) | always | What the run cost, as far as this harness reports it. |
 | `extra` | object | when this harness reports something the other has no shape for | Harness-native extras, read **under `harness`**: its keys are that harness's own vocabulary and this format fixes none of them. It is the deliberate escape hatch PRD resolved q57 ruling a asks for — the alternative was a fixed row that would have to invent a value for whichever harness did not supply one. A reader that does not know a key ignores it, which is what §10.1 already requires. |
-| `replayed` | `true` | on a run a resume consumed out of the journal | The run happened in an **earlier** generation of this execution and this one consumed its recorded answer rather than running the harness again (`docs/durability.md` §3.9, §9). Present only when true, so its absence is a run this process performed. |
 | `error` | string | `"failed"` | What ended the run, in §3's `<error name>: <message>` shape: the harness reported a fatal error, it produced no structured output at all, or its answer failed the node's `output:` gate. Written for a person — §10.1 makes the text something a reader must not parse. |
 
 #### 7.6.1 A turn
@@ -1742,7 +1761,6 @@ or a row promising one nothing sets.
 | `agentcompose.harness` | harness run | which harness ran it (§7.6) |
 | `agentcompose.harness.sdk`, `agentcompose.harness.model_id`, `agentcompose.harness.outcome` | harness run | the record's own fields — the SDK and version this release pinned, the provider-native id the harness was handed, and how the run ended |
 | `agentcompose.harness.turns`, `agentcompose.harness.input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.cost_usd` | harness run | the run's cost rollup (§7.6.4). The token attributes are present only where that harness reports tokens and the money one only where it estimates a cost, which is the rollup's own presence rule read onto the span |
-| `agentcompose.harness.replayed` | harness run | present as `"true"` on a run a resume consumed out of the journal rather than performed, and absent otherwise (§7.6). An operator comparing two deployments needs to know which spans describe work a process did |
 | `agentcompose.harness.turn`, `agentcompose.harness.input_tokens`, `agentcompose.harness.cached_input_tokens`, `agentcompose.harness.output_tokens`, `agentcompose.harness.reasoning_tokens` | turn event | the turn's ordinal, and whatever usage that harness reported for it (§7.6.2) |
 | `agentcompose.store`, `agentcompose.store.op`, `agentcompose.store.effect`, `agentcompose.store.via`, `agentcompose.store.scope`, `agentcompose.store.key`, `agentcompose.store.deduped` | store event | the store record's own fields |
 | `agentcompose.human.expires_at`, `agentcompose.human.settled` | the two pause events | the pause's budget and how it ended |
