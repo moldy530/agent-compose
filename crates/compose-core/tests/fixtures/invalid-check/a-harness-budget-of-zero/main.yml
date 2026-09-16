@@ -1,0 +1,45 @@
+# rule: a `coder:` node's `settings:` budget of zero is refused as a bound that
+# rule: silences the run rather than bounding it (grammar 8.9, D140)
+# code: value-out-of-range
+# message: `max_budget_usd` of `flow.main` node `build` is not above zero
+# at: main.yml:39:27
+# label: main.yml:39:11 the setting is declared here
+# help: a budget of zero stops the run before its first call rather than bounding what it may spend; omit the key to leave the run unbounded (grammar 8.9)
+#
+# The strict tier's one shape with no stated range to quote, and the one an
+# author can write meaning the opposite of what it does. `max_budget_usd` is a
+# number, so its type is right; `0` is a number, so a range check with no floor
+# would let it through; and the run it configures makes no call at all. "Spend
+# nothing" reads as "do not bound me" and means "do not start" — so the refusal
+# says which, and says that the way to leave a run unbounded is to leave the key
+# out.
+#
+# A negative would be refused by the same guard; zero is the one a person
+# actually types.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        settings:
+          max_budget_usd: 0
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

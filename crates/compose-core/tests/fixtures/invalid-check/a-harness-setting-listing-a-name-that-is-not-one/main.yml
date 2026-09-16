@@ -1,0 +1,43 @@
+# rule: a `coder:` node's `settings:` list of names is checked entry by entry, and
+# rule: the refusal points at the entry (grammar 8.9, D140)
+# code: wrong-type
+# message: every entry of `disallowed_tools` of `flow.main` node `build` is a tool name
+# at: main.yml:37:15
+# label: main.yml:35:11 the setting is declared here
+# help: a tool name is a non-empty string (grammar 8.9)
+#
+# The strict tier's list shape. `disallowed_tools` is a sequence, so the
+# catch-all arm is satisfied the moment the value is one — and an empty string
+# inside it names no tool at all, which the `cc` SDK would take as a name and
+# then never match. The span is the **entry**, not the key: a list of eleven
+# tools with one typo is a place to put a cursor, and pointing at
+# `disallowed_tools` would make the author find it themselves.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        settings:
+          disallowed_tools:
+            - WebSearch
+            - ""
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
