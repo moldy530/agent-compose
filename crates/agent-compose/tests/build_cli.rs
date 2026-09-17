@@ -103,7 +103,7 @@ fn build_writes_the_project_layout_where_out_points() {
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert_eq!(stdout(&output), "", "human output goes to stderr");
     assert!(
-        stderr(&output).contains("wrote 24 files"),
+        stderr(&output).contains("wrote 25 files"),
         "{}",
         stderr(&output)
     );
@@ -121,6 +121,7 @@ fn build_writes_the_project_layout_where_out_points() {
             "src/deployment.ts",
             "src/env.ts",
             "src/graph.ts",
+            "src/harness.ts",
             "src/index.ts",
             "src/journal.ts",
             "src/mesh.ts",
@@ -236,7 +237,7 @@ fn build_emits_with_every_environment_reference_unset() {
     let output = command.output().expect("the command runs");
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("wrote 24 files"),
+        stderr(&output).contains("wrote 25 files"),
         "{}",
         stderr(&output)
     );

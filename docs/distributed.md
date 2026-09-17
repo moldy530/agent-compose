@@ -1476,7 +1476,29 @@ Which gives, concretely:
   exists to catch;
 - a variable reachable in two processes belongs to both. Two placed agents
   attaching one unplaced tool is the ordinary case, and the tool's secrets go to
-  both placements.
+  both placements;
+- a variable a **`coder:` node** declares — its `workspace:`, and every value of
+  its `env:` (grammar §8.9, PRD resolved q57) — belongs to the manifest of every
+  process that runs the node's **flow**. That is the hub's, always and
+  unconditionally, because every flow a composition declares is startable on the
+  hub (grammar Decision D64); and it is **also** the manifest of every placement
+  whose components reach that flow — a placed agent attaching it as a tool, or a
+  placed component naming it — because §14.1 rule 4 starts the attached flow's
+  instance inside that agent's own loop, on the worker. A coder node is
+  *declared* in a flow rather than defined, so §14.1's `members:` has nothing to
+  claim and the node is never placed **on its own**; what carries it to a worker
+  is the flow around it, exactly as the `store:` nodes of an attached flow are
+  carried. Its references are filed under the node's own address inside that
+  flow rather than under a definition's for the same reason. The addition works
+  the way the storage-backend clause above works: it **adds** placements and
+  never moves the variables off the hub's list. What does *not* travel with a
+  coder node is its `model:`'s **provider** credential: the provider connection
+  does not reach inside a harness run (PRD resolved q57 ruling d), so a process
+  that runs only coder nodes needs the variables the nodes declare and no
+  `api_key:` at all — the harness reads its own auth out of the node's `env:`.
+  Should a later release make a coder node placeable in its own right, this
+  bullet is where the rule moves, and the walk above needs no other edit — a
+  coder node's references enter the closure exactly as a `builtin:` tool's do.
 
 **One of a tool's `${ENV}` references is declared rather than walked, and the
 closure does not care.** A `module:` binding names hand-written TypeScript

@@ -27,10 +27,10 @@ use compose_core::ast::{HmacAlgorithm, SignatureEncoding};
 use jsonschema::Validator;
 use serde_json::{Value, json};
 
-/// Node kind keys the grammar defines (grammar 7.1 / PRD 5.5, 5.8). The example
-/// corpus is required to exercise all of them.
+/// Node kind keys the grammar defines (grammar 7.1 / PRD 5.5, 5.8, resolved
+/// q57). The example corpus is required to exercise all of them.
 const NODE_KINDS: &[&str] = &[
-    "agent", "exec", "http", "function", "flow", "map", "human", "store",
+    "agent", "exec", "http", "function", "flow", "map", "human", "store", "coder",
 ];
 
 fn repo_root() -> PathBuf {

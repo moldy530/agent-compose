@@ -183,6 +183,22 @@ pub const PACKAGE_NAME: &str = "agent-compose-generated";
 /// tool asked for.
 #[must_use]
 pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
+    // The harness SDKs, pinned per harness some `coder:` node binds (PRD
+    // resolved q57, and see [`super::harness::HARNESS_PINS`]). Between [`PINS`]
+    // and the declared set, and not inside either: they are the runtime's own
+    // rather than a composition's declaration, but a composition that binds no
+    // harness declares none of them — which is what makes "emit only the drivers
+    // a composition uses" true of the manifest as well as of the module.
+    let mut harness: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for bound in super::harness::bound(ir) {
+        for (package, version) in super::harness::pins_of(bound) {
+            let held = harness.insert((*package).to_string(), (*version).to_string());
+            assert!(
+                held.is_none_or(|held| held == *version),
+                "two harnesses pin `{package}` at two versions"
+            );
+        }
+    }
     let mut declared: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (address, module) in crate::check::modules::bindings(ir) {
@@ -194,6 +210,7 @@ pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
                 .chain(DEV_PINS)
                 .find(|(pinned, _)| *pinned == package)
                 .map(|(_, version)| (*version).to_string())
+                .or_else(|| harness.get(package).cloned())
                 .or_else(|| declared.get(package).cloned());
             if let Some(held) = held {
                 assert!(
@@ -208,6 +225,7 @@ pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
     }
     PINS.iter()
         .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+        .chain(harness)
         .chain(declared)
         .collect()
 }
@@ -368,6 +386,7 @@ const README_BODY: &str = r#"
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
+| `src/harness.ts` | the coding-harness drivers a `coder:` node reaches its SDK through, one per harness this composition binds, plus a scripted driver for tests. The one generated module whose *imports* depend on the composition (grammar 8.9) |
 | `src/triggers.ts` | the composition's declared `http` triggers: their routes, their response modes, and the CEL that reads a request payload |
 | `src/serve.ts` | the app over those triggers: start, status and resume (PRD 5.11) |
 | `src/cli.ts` | this project's own command line, which `agent-compose run`, `agent-compose resume` and `agent-compose serve` launch |

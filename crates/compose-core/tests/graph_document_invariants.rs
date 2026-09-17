@@ -30,6 +30,7 @@ use compose_core::resolve;
 const CORPUS: &[&str] = &[
     "examples/triage-fanout",
     "examples/review-loop",
+    "examples/patch-pipeline",
     "crates/compose-core/tests/projects/omitted-graph-keys",
     "crates/compose-core/tests/projects/default-tagged-variant",
 ];

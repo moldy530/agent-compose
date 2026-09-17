@@ -1,0 +1,27 @@
+# rule: an `allow_tools:` entry is declared once (grammar 8.9, D138)
+# code: invalid-value
+# message: `Read` is already in `allow_tools` of the `coder` block of node `build`
+# at: 23:35
+# help: a tool is allowed once; a second entry allows nothing further
+#
+# The list is a containment bound rather than a bag, so a repeat is a statement
+# an author expects to mean something and that means nothing — and the
+# diagnostic points at the second entry with the first labelled, the way every
+# other duplicate in this grammar is reported.
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+        allow_tools: [Read, Grep, Read]
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

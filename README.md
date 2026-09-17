@@ -137,6 +137,37 @@ failing the node. On a distributed deployment the file travels with the artifact
 — editing it is a new artifact hash, and every worker is handed it on its next
 join. See `agent-compose docs tools`.
 
+### Graphs that carry coding agents
+
+A `coder:` node runs a whole coding-agent harness as one node — the vendor's own
+loop, its tool shapes, its context management — and parses its answer against a
+schema you declare:
+
+```yaml
+implement:
+  coder:
+    harness: cc                 # or `codex`
+    model: model.smart
+    workspace: "${REPO_ROOT}"
+    access: workspace_write
+    prompt: Fix the failing test, then say what you changed.
+    output:
+      summary: { type: string }
+  input: "input.goal"
+  timeout: 20m
+```
+
+`harness:` is a **binding**: swap `cc` for `codex` and every other key means the
+same thing, which is what keeps a composition free of anybody's SDK. The run is
+one journaled effect — a resume consumes the recorded answer and the harness
+never runs twice — and the trace carries its turns, its tool calls and what it
+cost.
+
+Read the containment paragraph before you write one: a harness authors **and
+runs** the program inside its own tool surface, so what bounds it is the
+`workspace:`, the `access:` preset, the declared `env:` and the node's own
+deadline, and nothing else. See `agent-compose docs agents`.
+
 ### With a coding agent
 
 ```sh

@@ -1,0 +1,125 @@
+# Two harness runs and a bounded cycle between them (grammar 8.9, 7.4).
+#
+# The two nodes are deliberately not symmetrical, and the asymmetry is the point:
+# `implement` edits and `review` does not, so they take different containment
+# presets — and because they bind different harnesses, the `allow_tools:` on each
+# means a different thing. `cc` enforces its list inside its own loop, per call;
+# `codex` bounds at the sandbox and is *offered* the list. `agent-compose plan`
+# and `agent-compose visualize` both say which of the two a node is.
+flow.patch:
+  description: Implement a change with one coding agent and review it with another.
+  inputs:
+    goal:
+      description: What the change has to accomplish.
+      type: string
+      min_length: 1
+  outputs:
+    summary:
+      description: What the last implementing run says it changed.
+      type: string
+
+  nodes:
+    # The `cc` harness, writing inside the checkout.
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        # Interpolable, and required: which directory a graph may author and run
+        # a program in is a property of the machine running it, and there is no
+        # default that would be a containment bound (grammar 8.9, D138).
+        workspace: ${REPO_ROOT}
+        access: workspace_write
+        prompt: |
+          You are implementing one change in a repository you have been given.
+          Make the smallest change that satisfies the goal, run the test suite,
+          and report what you touched.
+        input:
+          goal: { type: string }
+          feedback: { type: string }
+        output:
+          summary: { type: string }
+          touched:
+            type: array
+            max_items: 50
+            items: { type: string }
+        # Enforced in-loop by this harness's own permission surface.
+        allow_tools: [Bash, Edit, Glob, Grep, Read, Write]
+        # Scrubbed: the run's children see these variables and no others, which
+        # is what keeps a placement's environment manifest the whole answer
+        # (PRD resolved q41, q54 ruling b).
+        env:
+          PATH: /usr/bin:/bin
+          ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+        settings:
+          # Checked strictly: `max_turns` is in this harness's curated table.
+          max_turns: 60
+          max_budget_usd: 5
+      input:
+        goal: "input.goal"
+        feedback: "state.feedback"
+      writes: { summary: summary }
+      # The chain wraps the WHOLE run: a crash mid-run is one attempt, and the
+      # next attempt re-runs the harness from the top (grammar 9.1, D142).
+      retry: { max: 1, backoff: 30s }
+      timeout: 20m
+
+    # The `codex` harness, reading only.
+    review:
+      coder:
+        harness: codex
+        model: model.reviewer
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: |
+          You are reviewing a change somebody else just made in this repository.
+          Read the working tree, decide whether it satisfies the goal, and say
+          what would have to change if it does not.
+        input:
+          goal: { type: string }
+          summary: { type: string }
+        output:
+          verdict: { enum: [approve, revise] }
+          feedback: { type: string }
+        # The same key, and a different meaning: `codex` is *offered* this list
+        # — the run's instructions name it — and bounded by the `read_only`
+        # sandbox above. Its per-call approval tier belongs to an app server
+        # this release does not adopt, so the sandbox is what holds and
+        # `tools_enforced` says so in the graph document (grammar 8.9, PRD
+        # resolved q57 ruling c). The names are the harness's own vocabulary
+        # rather than this grammar's.
+        allow_tools: [command_execution]
+        # Scrubbed here too, and this is the half that is easy to forget: the
+        # provider connection in `providers.yml` does not reach inside a run, so
+        # `model.reviewer` resolving through `provider.openai` gives this harness
+        # no credential at all. A harness reads its auth from the environment the
+        # node declares, like every other secret (grammar 8.9, PRD resolved q57
+        # ruling c/d).
+        env:
+          PATH: /usr/bin:/bin
+          OPENAI_API_KEY: ${OPENAI_API_KEY}
+        settings:
+          web_search: disabled
+          network_access: false
+      input:
+        goal: "input.goal"
+        summary: "state.summary"
+      writes: { feedback: feedback }
+      timeout: 10m
+      on_error: { fallback: end }
+
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: review }
+
+    # The back-edge, bounded: two harness runs in a cycle is exactly the shape
+    # grammar 7.4's termination proof exists for.
+    - from: review
+      to: implement
+      when: "review.output.verdict == 'revise'"
+      max_iterations: 2
+
+    # The escape edge the bounded cycle requires, and what makes `verdict`
+    # exhaustively routed (grammar 7.3.1, 7.4).
+    - from: review
+      to: end
+      else: true

@@ -358,7 +358,12 @@ fn http_block<'ir>(http: &'ir Http, site: &str, found: &mut Vec<Expression<'ir>>
 
 fn node_kind<'ir>(kind: &'ir NodeKind, site: &str, found: &mut Vec<Expression<'ir>>) {
     match kind {
+        // A coder node holds no CEL of its own: its `workspace:` and `env:`
+        // are interpolable text (grammar 4.3 class 2) and its `settings:` are
+        // literals, so everything expression-shaped about it is the node-level
+        // `input:` the caller already walked (grammar 8.9).
         NodeKind::Agent { .. }
+        | NodeKind::Coder { .. }
         | NodeKind::Exec { .. }
         | NodeKind::Function { .. }
         | NodeKind::Flow { .. }

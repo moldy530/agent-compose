@@ -516,7 +516,7 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
-        rule: "the `module:` bindings of a composition agree: one file per tool, one version per package (6.1, D132, D133)",
+        rule: "the `module:` bindings of a composition agree: one file per tool, one version per package — including the packages a bound `harness:` brings (6.1, 8.9, D132, D133)",
         pass: "check/modules.rs",
         codes: &["invalid-module-path", "invalid-dependency"],
         evidence: Evidence::Fixture,
@@ -530,6 +530,25 @@ const GRAMMAR: &[Check] = &[
         rule: "a `module:` binding's authored file is on disk (6.1, D132)",
         pass: "check/modules.rs",
         codes: &["io-error"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
+        // The `coder:` node's three whole-composition rules (PRD resolved q57).
+        // The parser owns the block's shape — a harness that is not one of the
+        // four names, a missing `workspace:`, an `access:` outside the presets —
+        // because each of those is one value against a constant; these three
+        // need the release's driver set, the definition an address names, and
+        // the harness's own curated table.
+        rule: "a `coder:` node binds a harness this release lowers, its `model:` is a direct binding, and its `settings:` are checked in two tiers (8.9, D136, D140, D141)",
+        pass: "check/coder.rs",
+        codes: &[
+            "unsupported-harness",
+            "unknown-harness-setting",
+            "invalid-value",
+            "value-out-of-range",
+            "unknown-variant",
+            "wrong-type",
+        ],
         evidence: Evidence::Fixture,
     },
     Check {

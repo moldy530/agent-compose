@@ -1,0 +1,40 @@
+# rule: a `coder:` node's `settings:` key outside the harness's curated table is
+# rule: warned about and carried (grammar 8.9, D140)
+# code: unknown-harness-setting
+# message: `parallel_universes` is not a `harness: cc` setting this release can check, so its value is unverified
+# at: main.yml:34:11
+# label: main.yml:29:18 the harness is bound here
+# help: it travels to the SDK unchanged, which is what keeps a harness option usable the day the vendor ships it; the keys this release checks are `max_turns`, `max_budget_usd`, `forward_subagent_text`, `disallowed_tools` (grammar 8.9, Decision D140)
+#
+# The second of Decision D140's two tiers, and the half that makes the first
+# affordable: a harness option this release has never heard of travels to the
+# SDK unchanged so that a key the vendor ships tomorrow is usable the day it
+# ships, and the warning is the honest record that nothing about it was checked.
+# The composition still builds.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        settings:
+          parallel_universes: 3
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

@@ -19,6 +19,11 @@
 //! another file. So the pairing — scalar into a string-in agent, field map into
 //! a declared object — is decided here (grammar 5.3, 8.6 rule 12, Decisions
 //! D14, D75).
+//!
+//! A `coder:` node is that same pairing with the surfaces declared in the
+//! node's own block instead of in a definition (grammar 8.9, Decisions D137,
+//! D88), so the form diagnostics below name the block and its decisions rather
+//! than an agent's: the node has no `agent.*` to be sent to.
 
 use crate::ast::common::{Address, Namespace};
 use crate::ast::definition::{AgentAccess, ProviderKind, StoreKind};
@@ -39,6 +44,15 @@ pub(crate) fn node<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, node: &'a Node) {
     let id = text(&node.id).to_string();
     let subject = format!("node `{id}`");
     let scope = expr::flow_scope(ctx, cx, format!("the `input:` binding of node `{id}`"));
+
+    // Grammar 8.9 gives a coder node its own copy of §5.3's two input forms, and
+    // its own decisions to go with them: the surfaces are declared in the
+    // `coder:` block rather than in an `agent.*` definition (Decision D137), and
+    // it is that block a scalar `input:` binds (Decision D88). So the form
+    // diagnostics below say which construct the author is actually looking at —
+    // a message naming "the agent" on a node that names none would send a reader
+    // to a definition to fix a block (PRD G3).
+    let coder = matches!(node.kind, NodeKind::Coder { .. });
 
     // A form the target cannot take is one mistake: the fields it leaves
     // unbound are a consequence of it, not a second finding.
@@ -74,7 +88,12 @@ pub(crate) fn node<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, node: &'a Node) {
                     format!("{subject} binds one unnamed value, but its target declares named input fields"),
                 )
                 .with_help(format!(
-                    "{contract_note}: bind them by name with `input: {{ <field>: <CEL> }}`; the scalar form binds a string-in agent, which declares no `input:` at all (grammar 5.3, Decision D14)"
+                    "{contract_note}: bind them by name with `input: {{ <field>: <CEL> }}`; the scalar form binds {}",
+                    if coder {
+                        "a string-in `coder:` block, which declares no `input:` at all (grammar 8.9, Decisions D137, D88)"
+                    } else {
+                        "a string-in agent, which declares no `input:` at all (grammar 5.3, Decision D14)"
+                    }
                 )),
             );
         }
@@ -84,11 +103,19 @@ pub(crate) fn node<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, node: &'a Node) {
                 Diagnostic::error(
                     DiagnosticCode::TypeMismatch,
                     bindings.span.clone(),
-                    format!("{subject} binds input fields by name, but its agent is string-in"),
+                    if coder {
+                        format!(
+                            "{subject} binds input fields by name, but its `coder:` block is string-in"
+                        )
+                    } else {
+                        format!("{subject} binds input fields by name, but its agent is string-in")
+                    },
                 )
-                .with_help(
-                    "an agent that declares no `input:` takes a single unnamed string: bind it with the scalar form, `input: \"<CEL>\"` (grammar 5.3, Decision D14)",
-                ),
+                .with_help(if coder {
+                    "a `coder:` block that declares no `input:` takes a single unnamed string: bind it with the scalar form, `input: \"<CEL>\"` (grammar 8.9, Decisions D137, D88)"
+                } else {
+                    "an agent that declares no `input:` takes a single unnamed string: bind it with the scalar form, `input: \"<CEL>\"` (grammar 5.3, Decision D14)"
+                }),
             );
         }
         (Some(NodeInput::Fields { bindings }), contract) => {
@@ -124,11 +151,17 @@ pub(crate) fn node<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, node: &'a Node) {
                     Diagnostic::error(
                         DiagnosticCode::MissingBinding,
                         node.span.clone(),
-                        format!("{subject} runs a string-in agent and must bind its input"),
+                        if coder {
+                            format!("{subject} is a string-in coder node and must bind its input")
+                        } else {
+                            format!("{subject} runs a string-in agent and must bind its input")
+                        },
                     )
-                    .with_help(
-                        "an agent that declares no `input:` takes a single unnamed string, bound at the node as `input: \"<CEL>\"` (grammar 5.3, Decision D14)",
-                    ),
+                    .with_help(if coder {
+                        "a `coder:` block that declares no `input:` takes a single unnamed string, bound at the node as `input: \"<CEL>\"` (grammar 8.9, Decisions D137, D88)"
+                    } else {
+                        "an agent that declares no `input:` takes a single unnamed string, bound at the node as `input: \"<CEL>\"` (grammar 5.3, Decision D14)"
+                    }),
                 );
             }
         }

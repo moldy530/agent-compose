@@ -1,0 +1,18 @@
+# rule: `workspace:` is required on a coder node and has no default - a harness authors and runs a program in it, so a defaulted root would be a containment bound nobody wrote (grammar 8.9 / D138)
+# at: /flow.patch/nodes/implement/coder
+# via: /$defs/coderNode/properties/coder/required
+flow.patch:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        prompt: Make the smallest change that satisfies the goal.
+        output:
+          summary: { type: string }
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

@@ -2,9 +2,11 @@
 
 use crate::ast::binding::NodeInput;
 use crate::ast::common::Namespace;
+use crate::ast::definition::Settings;
 use crate::ast::flow::{
-    Edge, FlowContext, FlowDef, FlowNode, HumanBlock, ItemError, MapBlock, MapDispatch, MapRoute,
-    NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind, StoreNode, StoreOp, StoreOpParams, StoreValue,
+    CoderBlock, Edge, FlowContext, FlowDef, FlowNode, Harness, HumanBlock, ItemError, MapBlock,
+    MapDispatch, MapRoute, NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind, StoreNode, StoreOp,
+    StoreOpParams, StoreValue, WorkspaceAccess,
 };
 use crate::ast::policy::PolicyBlock;
 use crate::ast::schema::Surface;
@@ -678,6 +680,13 @@ fn node_kind(
             });
             (kind, all)
         }
+        "coder" => {
+            let kind = fields
+                .take("coder")
+                .and_then(|node| coder_block(node, subject, cx))
+                .map_or(NodeKind::Invalid, |block| NodeKind::Coder(Box::new(block)));
+            (kind, all)
+        }
         "human" => {
             let kind = fields
                 .take("human")
@@ -869,6 +878,253 @@ fn store_param<'a>(
         return None;
     }
     fields.take(name)
+}
+
+/// Every harness keyword, in the order grammar 8.9 lists them — the two this
+/// release lowers and the two it reserves (Decision D136).
+const HARNESSES: &[(&str, Harness)] = &[
+    ("cc", Harness::Cc),
+    ("codex", Harness::Codex),
+    ("deepagents", Harness::DeepAgents),
+    ("native", Harness::Native),
+];
+
+/// The containment presets a coder node's `access:` takes (Decision D138).
+const WORKSPACE_ACCESS: &[(&str, WorkspaceAccess)] = &[
+    ("read_only", WorkspaceAccess::ReadOnly),
+    ("workspace_write", WorkspaceAccess::WorkspaceWrite),
+    ("full_access", WorkspaceAccess::FullAccess),
+];
+
+/// Read a `coder:` block (grammar 8.9, Decisions D136–D142, PRD resolved q57).
+///
+/// The block carries the whole component, because a coder node has no
+/// definition to carry it: the harness, the model registry address, the
+/// workspace it is contained by, its prompt and surfaces, the environment its
+/// children see, and the harness config Decision D140 checks in two tiers.
+///
+/// Three of its keys are read exactly as their neighbours elsewhere are, and
+/// deliberately so: `prompt:` is an agent's literal prompt (grammar 5.2,
+/// Decision D13), `input:`/`output:` are an agent's two surfaces with an agent's
+/// string-in default (grammar 5.1, 5.3), and `env:`/`inherit_env:` are a
+/// `builtin: bash` binding's scrubbed child environment (grammar 6.1, PRD
+/// resolved q54 ruling b). What is new is the harness, the workspace and its
+/// access preset, the tool allowlist, and `settings:`.
+fn coder_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<CoderBlock> {
+    let context = format!("the `coder` block of {subject}");
+    let mapping = expect_mapping(node, &context, cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), &context);
+
+    let harness = fields
+        .require("harness", cx)
+        .and_then(|node| lexical::keyword(node, "`harness`", HARNESSES, cx));
+    let model = fields
+        .require("model", cx)
+        .and_then(|node| lexical::reference(node, "`model`", &[Namespace::Model], cx));
+
+    // **Required**, unlike a `builtin:` binding's, and interpolable for the same
+    // reason (grammar 4.3 class 2): which directory a harness may author and run
+    // a program in is a property of the machine running it, and there is no
+    // per-execution default that would be a *containment* bound for a construct
+    // whose whole point is to work on a checkout somebody already has
+    // (Decision D138).
+    let workspace = fields
+        .require("workspace", cx)
+        .and_then(|node| lexical::interpolated(node, "`workspace`", cx))
+        .filter(|workspace| {
+            if !workspace.value.as_str().is_empty() {
+                return true;
+            }
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    workspace.span.clone(),
+                    format!("`workspace` in {context} must not be empty"),
+                )
+                .with_help(
+                    "name the directory this run works inside; an empty one would bound the \
+                     harness to wherever the runtime was started instead (grammar 8.9)",
+                ),
+            );
+            false
+        });
+    let access = fields
+        .take("access")
+        .and_then(|node| lexical::keyword(node, "`access`", WORKSPACE_ACCESS, cx));
+
+    let prompt = fields
+        .require("prompt", cx)
+        .and_then(|node| lexical::non_empty_text(node, "`prompt`", cx));
+
+    let input = fields.take("input").and_then(|node| {
+        let map = schema::field_map(node, &format!("`input` of {context}"), Surface::Input, cx)?;
+        if map.is_empty() {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    map.span.clone(),
+                    format!("`input` of {context} must declare at least one field"),
+                )
+                .with_help(
+                    "omitting `input:` is how a coder node takes a single unnamed string; `{}` \
+                     is neither contract (grammar 8.9, 5.3)",
+                ),
+            );
+        }
+        Some(map)
+    });
+    let output = fields.require("output", cx).and_then(|node| {
+        let map = schema::field_map(node, &format!("`output` of {context}"), Surface::Result, cx)?;
+        if map.is_empty() {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    map.span.clone(),
+                    format!("`output` of {context} must declare at least one property"),
+                )
+                .with_help(
+                    "structured output on every node is what routing reads and what the output \
+                     gate parses the harness's answer against (grammar 8.9, PRD 5.2)",
+                ),
+            );
+        }
+        Some(map)
+    });
+
+    let allow_tools = allow_tools(&mut fields, &context, cx);
+
+    // Exactly the `exec:` shape, and the default is exactly the built-ins':
+    // children see the declared variables and nothing else, which is what keeps
+    // a placement's environment manifest the whole answer (PRD resolved q41,
+    // q54 ruling b).
+    let env = fields
+        .take("env")
+        .map(|node| binding::interpolated_map(node, "`env`", binding::NameForm::EnvVar, cx))
+        .unwrap_or_default();
+    let inherit_env = fields
+        .take("inherit_env")
+        .and_then(|node| match &node.value {
+            Yaml::Bool(value) => Some(Spanned::new(*value, node.span.clone())),
+            _ => {
+                cx.wrong_type(node, "`inherit_env`", "a boolean");
+                None
+            }
+        });
+
+    let settings = coder_settings(&mut fields, &context, cx);
+
+    fields.finish(cx);
+    Some(CoderBlock {
+        harness,
+        model,
+        workspace,
+        access,
+        prompt,
+        input,
+        output,
+        allow_tools,
+        env,
+        inherit_env,
+        settings,
+        span: node.span.clone(),
+    })
+}
+
+/// Read `allow_tools:` — the harness tool names one run may use (Decision D138).
+///
+/// The names are the **harness's** vocabulary rather than this grammar's, so
+/// nothing here can say which ones exist: what is checked is that each entry is
+/// a non-empty string and that no name is written twice, which is the same pair
+/// of rules every other list of names in this grammar is held to. Which harness
+/// *enforces* the list is the asymmetry grammar 8.9 states out loud.
+///
+/// **`allow_tools: []` is refused**, for the reason `input: {}` is (§5.3) and
+/// `workspace: ""` is (D138): omitting the key is the whole of how a run takes
+/// the harness's own default set, so an empty sequence is a second spelling of
+/// it that reads like the opposite. Nothing downstream could tell the two
+/// apart — the emitted binding omits an empty list, and an omitted list is the
+/// default set — so an author who wrote `[]` meaning "call nothing" would get
+/// the widest surface the harness has. A run that may call no tools is an
+/// `agent:` node rather than a harness run, which is the answer this refusal
+/// points at.
+fn allow_tools(fields: &mut Fields<'_>, context: &str, cx: &mut Cx) -> Vec<Spanned<String>> {
+    let Some(node) = fields.take("allow_tools") else {
+        return Vec::new();
+    };
+    let span = node.span.clone();
+    let Some(items) = expect_sequence(node, &format!("`allow_tools` of {context}"), cx) else {
+        return Vec::new();
+    };
+    if items.is_empty() {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                span,
+                format!("`allow_tools` of {context} must list at least one tool"),
+            )
+            .with_help(
+                "omitting `allow_tools:` is how a run takes the harness's own default set; `[]` \
+                 is that same default rather than a denial, and a run that may call no tools at \
+                 all is an `agent:` node (grammar 8.9)",
+            ),
+        );
+    }
+    let mut names: Vec<Spanned<String>> = Vec::new();
+    for item in items {
+        let Some(name) = lexical::non_empty_text(item, "an `allow_tools` entry", cx) else {
+            continue;
+        };
+        if let Some(first) = names.iter().find(|other| other.value == name.value) {
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    name.span.clone(),
+                    format!("`{}` is already in `allow_tools` of {context}", name.value),
+                )
+                .with_label(first.span.clone(), "first declared here")
+                .with_help("a tool is allowed once; a second entry allows nothing further"),
+            );
+            continue;
+        }
+        names.push(name);
+    }
+    names
+}
+
+/// Read a coder node's `settings:` — the second open object in the logical
+/// layer (Decision D140, amending Decision D40).
+///
+/// Open here, as on a model, and for the same reason one level along: a harness
+/// option the vendor ships tomorrow has to be usable the day it ships, so what
+/// the compiler cannot speak for travels to the SDK unchanged. The two literal
+/// rules a model's settings are held to hold here too — no env reference, and no
+/// non-finite number — because this block is lowered into the artifact and from
+/// there into a harness's own config exactly as that one is.
+fn coder_settings(fields: &mut Fields<'_>, context: &str, cx: &mut Cx) -> Option<Settings> {
+    let node = fields.take("settings")?;
+    let mapping = expect_mapping(node, &format!("`settings` of {context}"), cx)?;
+    let entries: Vec<crate::ast::common::LiteralEntry> = mapping
+        .entries()
+        .iter()
+        .map(|entry| crate::ast::common::LiteralEntry {
+            key: entry.key.clone(),
+            value: schema::literal(&entry.value),
+        })
+        .collect();
+    let subject = format!("`settings` of {context}");
+    for entry in &entries {
+        lexical::reject_env_refs(&entry.key, &subject, cx);
+        schema::reject_env_refs_in_literal(&entry.value, &subject, cx);
+        schema::reject_non_finite_in_literal(
+            &entry.value,
+            &format!("`{}` in {subject}", entry.key.value),
+            cx,
+        );
+    }
+    Some(Settings {
+        entries,
+        span: node.span.clone(),
+    })
 }
 
 fn human_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<HumanBlock> {

@@ -1,0 +1,28 @@
+# rule: a `coder:` node's `workspace:` is required and may not be empty (grammar 8.9, D138)
+# code: invalid-value
+# message: `workspace` in the `coder` block of node `build` must not be empty
+# at: 21:20
+# help: name the directory this run works inside; an empty one would bound the harness to wherever the runtime was started instead (grammar 8.9)
+#
+# The containment bound, written as no bound at all. `workspace:` is the one
+# directory a harness may author and run a program in, and an empty path is
+# whichever directory the runtime happened to be started in — so the emptiest
+# value of the key is again its most permissive, which is the shape D138
+# refuses. The runtime makes the same refusal for a `${VAR}` that resolves
+# empty; this is the literal the parser can catch first.
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ""
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

@@ -142,6 +142,7 @@ mod tests {
             ("callFunction", runtime, "src/runtime.ts"),
             ("callModule", runtime, "src/runtime.ts"),
             ("runHuman", runtime, "src/runtime.ts"),
+            ("runCoder", runtime, "src/runtime.ts"),
             ("runStoreOp", stores, "src/stores.ts"),
         ] {
             let body = function_body(source, site);
@@ -155,22 +156,63 @@ mod tests {
             );
         }
 
-        // …and no ninth. The count is over both emitted modules, because the
+        // …and no tenth. The count is over both emitted modules, because the
         // document's table is.
         let reached = runtime.matches("journaled(").count()
             + runtime.matches(".claim(").count()
             + stores.matches("journaled(").count()
             + stores.matches(".claim(").count();
         assert_eq!(
-            reached, 8,
-            "`docs/durability.md` §3 says there are exactly eight effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
+            reached, 9,
+            "`docs/durability.md` §3 says there are exactly nine effect sites and this build              has {reached}: a new one belongs in that table, and a lost one is a replay that              re-issues an effect"
+        );
+    }
+
+    /// **§4's key vocabulary is the one the journal writes.**
+    ///
+    /// The inventory above binds §3's *sites*. A key carries a **kind**, which
+    /// §4 enumerates separately — and separately is how a fifth kind reached
+    /// §3's table while §4 went on naming four. That drift has a reader: a key
+    /// is `<site>#<kind>/<ordinal>`, and anything parsing one against §4's
+    /// stated vocabulary treats every key of the unnamed kind as malformed.
+    /// So the list is read off the type the runtime writes, in both directions
+    /// — every member is named, and nothing else is.
+    #[test]
+    fn the_documented_key_vocabulary_is_the_one_the_journal_writes() {
+        let document = include_str!("../../../../docs/durability.md");
+
+        let union = SOURCE
+            .split_once("export type EffectKind =")
+            .expect("`src/journal.ts` declares the kinds a key can carry")
+            .1;
+        let union = &union[..union.find(';').expect("…as one union type")];
+        let kinds: Vec<&str> = union
+            .split('|')
+            .map(|member| member.trim().trim_matches('"'))
+            .filter(|member| !member.is_empty())
+            .collect();
+
+        let bullet = document
+            .split_once("* `<kind>` is one of")
+            .expect("`docs/durability.md` §4 enumerates the kinds a key can carry")
+            .1;
+        let bullet = &bullet[..bullet
+            .find("\n* `<ordinal>`")
+            .expect("…in the bullet before the ordinal's")];
+        let named: Vec<&str> = bullet.split('`').skip(1).step_by(2).collect();
+
+        assert_eq!(
+            named, kinds,
+            "`docs/durability.md` §4's key vocabulary and `EffectKind` have parted company: a \
+             kind the runtime writes into a key and §4 does not name is a key a reader holding \
+             this document to its word calls malformed"
         );
     }
 
     /// **A delivery is journaled before it is attempted**
     /// (`docs/durability.md` §3.7, PRD resolved q35).
     ///
-    /// The inventory above is about the seven sites a *replay* consumes, and a
+    /// The inventory above is about the nine sites a *replay* consumes, and a
     /// callback delivery is deliberately none of them: nothing in the graph
     /// dispatches it, it is addressed by an execution and an ordinal rather
     /// than by an instance path, and no replay ever reads it back. So it sits

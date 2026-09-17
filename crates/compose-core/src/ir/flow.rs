@@ -9,12 +9,13 @@
 use serde::Serialize;
 
 use crate::ast::common::{
-    Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, PathExpr,
+    Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Interpolated, Literal,
+    PathExpr,
 };
-use crate::ast::flow::{FlowContext, StoreOp};
+use crate::ast::flow::{FlowContext, Harness, StoreOp, WorkspaceAccess};
 use crate::diag::{Span, Spanned};
 
-use super::binding::{Bindings, Exec, Http, NodeInput, Writes};
+use super::binding::{Bindings, Exec, Http, InterpolatedEntry, NodeInput, Writes};
 use super::policy::{Policy, Retry};
 use super::schema::FieldMap;
 
@@ -69,7 +70,7 @@ pub struct Node {
     pub kind: NodeKind,
 }
 
-/// The eight node kinds (grammar 7.1, Decision D23), tagged by `kind`.
+/// The nine node kinds (grammar 7.1, Decisions D23, D136), tagged by `kind`.
 ///
 /// The variants differ in size because the constructs do — a `map:` block
 /// carries a dispatch form, per-item bindings, and a policy, while an `agent:`
@@ -83,6 +84,11 @@ pub enum NodeKind {
     Agent {
         /// The agent this node runs.
         agent: Spanned<Address>,
+    },
+    /// `coder: { ... }` — one run of a coding-agent harness (grammar 8.9).
+    Coder {
+        /// The block.
+        coder: Coder,
     },
     /// `exec: { ... }` — an inline subprocess step (grammar 8.2).
     Exec {
@@ -130,6 +136,60 @@ pub enum NodeKind {
         /// The operation's parameters — exactly the op's row in grammar 11.4.
         params: StoreParams,
     },
+}
+
+/// A `coder:` block: one run of a coding-agent harness (grammar 8.9,
+/// Decision D136, PRD resolved q57).
+///
+/// Everything a run needs is here because a coder node has no definition to
+/// carry it: the harness that serves it, the model registry address the adapter
+/// maps down, the workspace the run is contained by, its declared surfaces, the
+/// environment its children see, and the harness config Decision D140 holds on
+/// two tiers.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Coder {
+    /// `harness:` — which harness runs it.
+    pub harness: Spanned<Harness>,
+    /// `model:` — the registry address, resolved to an id by the adapter.
+    pub model: Spanned<Address>,
+    /// `workspace:` — the root the run works inside.
+    pub workspace: Spanned<Interpolated>,
+    /// `access:` — absent means the default, `workspace_write`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<WorkspaceAccess>,
+    /// `prompt:` — literal text; there is no interpolation (grammar 5.2).
+    pub prompt: Spanned<String>,
+    /// `input:` — the declared surface; absent means string-in (grammar 5.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<FieldMap>,
+    /// `output:` — the structured answer the output gate parses in full.
+    pub output: FieldMap,
+    /// `allow_tools:` — the harness tool names the run may use, in declaration
+    /// order. Empty means the harness's own default set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allow_tools: Vec<Spanned<String>>,
+    /// `env:` — the declared environment, in declaration order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<InterpolatedEntry>,
+    /// `inherit_env:` — absent means `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherit_env: Option<bool>,
+    /// `settings:` — harness config by key, in **declaration order**: the block
+    /// is a set of settings rather than a sequence, and a harness reads it by
+    /// name (Decision D140).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<CoderSetting>,
+    /// The block's own span.
+    pub span: Span,
+}
+
+/// One entry of a coder node's `settings:` (Decision D140).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CoderSetting {
+    /// The key, as the author wrote it.
+    pub key: Spanned<String>,
+    /// The value, as the author wrote it.
+    pub value: Spanned<Literal>,
 }
 
 /// A `human:` block (grammar 8.7, Decision D52).

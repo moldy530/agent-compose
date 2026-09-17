@@ -370,6 +370,32 @@ pub fn surfaces(ir: &Ir) -> Vec<Surface<'_>> {
                 for node in &flow.nodes {
                     let id = node.id.value.as_str();
                     match &node.kind {
+                        // A coder node declares both surfaces in its own block,
+                        // as a `human:` node does, because it has no definition
+                        // to declare them on (grammar 8.9, Decision D137). Its
+                        // `input:` is optional — omitted is the string-in
+                        // default — so only the declared form contributes a
+                        // surface, exactly as an agent's does.
+                        NodeKind::Coder { coder } => {
+                            if let Some(input) = &coder.input {
+                                surfaces.push(Surface {
+                                    path: format!("{address}.node.{id}.input"),
+                                    about: format!(
+                                        "`{address}` node `{id}` — what the harness run is \
+                                         handed (grammar 8.9)."
+                                    ),
+                                    body: borrowed(input),
+                                });
+                            }
+                            surfaces.push(Surface {
+                                path: format!("{address}.node.{id}.output"),
+                                about: format!(
+                                    "`{address}` node `{id}` — what the harness answers with, \
+                                     parsed in full by the output gate (grammar 8.9)."
+                                ),
+                                body: borrowed(&coder.output),
+                            });
+                        }
                         NodeKind::Human { human } => {
                             surfaces.push(Surface {
                                 path: format!("{address}.node.{id}.input"),

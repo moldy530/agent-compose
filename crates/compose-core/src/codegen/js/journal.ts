@@ -176,7 +176,7 @@ export function journalPath(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The four families of effect a compiled graph issues.
+ * The five families of effect a compiled graph issues.
  *
  * They are families rather than node kinds on purpose: what a replay has to
  * answer is a *call to the world*, and the same family is reached from more
@@ -184,8 +184,15 @@ export function journalPath(): string {
  * binding, whether it is a node's own activity or a tool an agent's model
  * called. `docs/durability.md` §3 is the inventory, and names the site in
  * `./runtime.ts` each one is written at.
+ *
+ * `harness` is the one that is **not** a family: a coding-agent harness run is
+ * one effect per run, and there is exactly one construct that issues one — a
+ * `coder:` node (grammar 8.9, PRD resolved q57 ruling b). It is a kind of its
+ * own rather than a `model` because what a resume consumes is different in
+ * kind: a `model` record holds one completion, and this one holds a whole agent
+ * loop's answer, with the loop's own transcript as its private payload.
  */
-export type EffectKind = "model" | "tool" | "store" | "human";
+export type EffectKind = "model" | "tool" | "store" | "human" | "harness";
 
 /** How one recorded effect ended. */
 export type JournalOutcome =

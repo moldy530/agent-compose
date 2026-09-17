@@ -1,0 +1,39 @@
+# rule: a coder node that declares `input:` binds those fields by name, never
+# rule: with the scalar form (grammar 8.9, 5.3, D137, D88)
+# code: type-mismatch
+# message: node `build` binds one unnamed value, but its target declares named input fields
+# at: main.yml:36:14
+# help: the target declares `goal`: bind them by name with `input: { <field>: <CEL> }`; the scalar form binds a string-in `coder:` block, which declares no `input:` at all (grammar 8.9, Decisions D137, D88)
+#
+# The third form mistake, and the one the parser cannot catch: a scalar `input:`
+# is legal grammar on this kind (Decision D88), and whether the block it binds
+# declared fields is read here.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input: "input.goal"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

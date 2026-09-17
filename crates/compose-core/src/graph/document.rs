@@ -78,7 +78,15 @@ macro_rules! vocabulary {
 /// document, so a consumer can dispatch on it before reading anything else, and
 /// a consumer that does not know a version must refuse the document rather than
 /// guess.
-pub const GRAPH_VERSION: u32 = 1;
+/// Version `2` added a **node kind**: `coder`, PRD resolved q57's coding-agent
+/// harness node. [`NodeKind`] is one of §9.1's closed vocabularies and §9.3
+/// makes a member added to one a bump, not an addition — a reader written
+/// against `1` was entitled to the nine kinds that document named, and a tenth
+/// makes it wrong. Everything else the kind brought — [`CoderView`] and the
+/// [`GraphNode::coder`] key that reaches it — would have been compatible on its
+/// own under §9.2, and rides this bump because it arrived with the member that
+/// forced one.
+pub const GRAPH_VERSION: u32 = 2;
 
 /// One composition's flows, as a picture of them.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -252,6 +260,9 @@ pub struct GraphNode {
     /// An `agent:` node's resolved configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentView>,
+    /// A `coder:` node's harness run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coder: Option<CoderView>,
     /// An inline `exec:` block.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec: Option<ExecView>,
@@ -295,6 +306,8 @@ vocabulary! {
         End,
         /// `agent: agent.*`.
         Agent,
+        /// `coder: { … }` — one run of a coding-agent harness (grammar 8.9).
+        Coder,
         /// `function: tool.*` — the graph-invoked use of a tool definition.
         Function,
         /// `exec: { … }`.
@@ -320,6 +333,7 @@ impl NodeKind {
             Self::Start => "START",
             Self::End => "END",
             Self::Agent => "AGENT",
+            Self::Coder => "CODER",
             Self::Function => "TOOL",
             Self::Exec => "EXEC",
             Self::Http => "HTTP",
@@ -686,6 +700,61 @@ pub struct HumanView {
     pub on_timeout: Option<String>,
 }
 
+/// A `coder:` node's harness run (grammar 8.9, PRD resolved q57).
+///
+/// The **harness is named**, which is PRD resolved q56's content requirement
+/// read for this kind: two coder nodes side by side are two different agent
+/// loops with two different containment stories, and a picture that drew them
+/// identically would be hiding the one fact a reader most needs.
+///
+/// `access` carries the level the run is contained at — the preset `codex` maps
+/// to a sandbox and `cc` to a permission mode — and `tools_enforced` says
+/// whether the harness enforces `allow_tools` **in its own loop**. That
+/// asymmetry is a fact about the harness rather than about the composition
+/// (grammar 8.9, Decision D138), and a reader comparing two coder nodes cannot
+/// derive it from anything else in the document.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CoderView {
+    /// `harness:` — which harness runs it.
+    pub harness: String,
+    /// `model:` — the registry address the adapter maps down to a model id.
+    pub model: ModelView,
+    /// `workspace:` — the root the run works inside, exactly as written.
+    pub workspace: String,
+    /// `access:` — the containment preset, with the default materialized:
+    /// omitting the key is `workspace_write`, and a picture answers the
+    /// question rather than leaving it.
+    pub access: String,
+    /// `prompt:` — the run's system instructions, verbatim.
+    pub prompt: String,
+    /// `allow_tools:` — the harness tool names the run may use, in declaration
+    /// order. Absent where the node declares none, which is the harness's own
+    /// default set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allow_tools: Vec<String>,
+    /// Whether this harness enforces `allow_tools` inside its own loop.
+    /// `cc` does, by narrowing the tool set its loop is offered and denying the
+    /// rest at its per-call permission callback; `codex` bounds at the sandbox
+    /// only (grammar 8.9, PRD resolved q57 ruling c).
+    pub tools_enforced: bool,
+    /// `env:` — the declared environment, in declaration order. Absent where
+    /// the node declares none, which is a wholly scrubbed child environment.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<BindingView>,
+    /// `inherit_env:` — with the default materialized, for the reason `access`
+    /// is: `false` is the containment claim, and a reader should not have to
+    /// know it is the default to read it.
+    pub inherit_env: bool,
+    /// `settings:` in **declaration order** — the harness config, each value
+    /// reaching JSON as JSON exactly as a model's `settings:` do. The *order*
+    /// is not a model's: a model's settings reach the IR through a keyed map
+    /// and come out sorted, a coder node's are held as written, and
+    /// `docs/graph.md` §9.1 fixes this one with the node's other two lists
+    /// (`env`, `allow_tools`) rather than leaving a consumer to infer it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<SettingView>,
+}
+
 /// A `map:` node's fan-out (grammar 8.6, PRD 5.6).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MapView {
@@ -970,7 +1039,7 @@ mod tests {
         };
         let json = document.to_json().expect("the document serializes");
         assert!(
-            json.starts_with("{\n  \"graph_version\": 1,"),
+            json.starts_with("{\n  \"graph_version\": 2,"),
             "the document opens with its version: {json}"
         );
         assert!(json.ends_with("}\n"), "and ends with a newline");

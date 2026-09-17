@@ -1,0 +1,14 @@
+# Connection layer (PRD 5.9). Credentials are ${ENV} references, never literals.
+#
+# A `coder:` node's `model:` resolves against this registry for its **id** and
+# for the small settings subset its harness accepts — and for nothing else. The
+# connection below serves the composition's agent-shaped work; a harness owns its
+# own client and its own auth, which it reads from the environment the node
+# declares (grammar 8.9, PRD resolved q57 ruling d).
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+provider.openai:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}

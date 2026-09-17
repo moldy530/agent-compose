@@ -71,7 +71,7 @@ use crate::ast::definition::{
 };
 use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue, TraceSinkFormat};
 use crate::ast::document::Reduce;
-use crate::ast::flow::{FlowContext, StoreOp};
+use crate::ast::flow::{FlowContext, Harness, StoreOp, WorkspaceAccess};
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
 use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
 use crate::diag::{Position, Span, Spanned};
@@ -146,6 +146,7 @@ serialize_as_keyword!(
     BackendProvider,
     EventSourceKind,
     FlowContext,
+    Harness,
     HmacAlgorithm,
     HttpMethod,
     ProviderKind,
@@ -161,6 +162,7 @@ serialize_as_keyword!(
     Surface,
     TraceSinkFormat,
     TriggerMethod,
+    WorkspaceAccess,
 );
 
 /// Written as the text the author wrote: an identifier, an address, and the

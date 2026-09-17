@@ -456,6 +456,73 @@ fn every_expectation_is_a_well_formed_export() {
     }
 }
 
+/// The corpus holds a **harness run**, and holds one of each shape the record
+/// has two of (`docs/trace.md` §7.6, PRD resolved q57).
+///
+/// PRD resolved q51 makes this corpus the thing standing between the exporter
+/// and a collector that drops its spans, and a record type nothing in the corpus
+/// carries is a mapping nothing exercises: the expectation would regenerate to
+/// whatever the emitter answered, and the `UPDATE_GOLDENS` half of this suite
+/// would agree with itself. So the fixture is required, and required to reach
+/// the corners the record was designed around:
+///
+///  * both **harnesses**, because the two report different things and the whole
+///    argument for the record's optional members is that one shape must not lie
+///    about which;
+///  * a run that **failed**, because a span with `code: 2` and an error message
+///    is the reading an operator opens a trace for;
+///  * a **cost in money** and a **usage per turn**, which are the two halves of
+///    the rollup and the two attribute types — a `doubleValue` and an
+///    `intValue` — this exporter emits for it.
+#[test]
+fn the_corpus_holds_a_harness_run_of_each_shape() {
+    let mut harnesses: BTreeSet<String> = BTreeSet::new();
+    let mut outcomes: BTreeSet<String> = BTreeSet::new();
+    let mut money = false;
+    let mut per_turn_usage = false;
+    for (_, fixture) in fixtures() {
+        for entry in fixture["document"]["entries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for run in entry["harness"].as_array().into_iter().flatten() {
+                if let Some(name) = run["harness"].as_str() {
+                    harnesses.insert(name.to_string());
+                }
+                if let Some(outcome) = run["outcome"].as_str() {
+                    outcomes.insert(outcome.to_string());
+                }
+                money |= run["cost"]["usd"].is_number();
+                per_turn_usage |= run["turns"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|turn| turn["usage"].is_object());
+            }
+        }
+    }
+    assert_eq!(
+        harnesses,
+        ["cc", "codex"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<String>>(),
+        "the corpus exercises one harness, and the record's optional members are \
+         exactly what the two disagree about"
+    );
+    assert_eq!(
+        outcomes,
+        ["completed", "failed"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<String>>(),
+        "a failed run is the span a reader opens a trace for"
+    );
+    assert!(money, "no fixture carries a harness's own cost estimate");
+    assert!(per_turn_usage, "no fixture carries usage reported per turn");
+}
+
 /// **The uniqueness above is asked of data that could break it.**
 ///
 /// `every_expectation_is_a_well_formed_export` refuses two spans of one id, which

@@ -232,4 +232,62 @@ Every common node key is legal. Where the output goes is
 `agent-compose docs state`; what `retry:`/`timeout:`/`on_error:` resolve to is
 `agent-compose docs policies`.
 
-Normative source: `docs/grammar.md` §5, §5.1–5.4, §8.1
+## The other kind of model-backed node: `coder:`
+
+An agent node is **one LLM call** with a tool loop this runtime drives. A
+`coder:` node is the other thing: a whole coding-agent harness — the vendor's own
+loop, its tool shapes, its context management — run to completion as one node,
+with its answer parsed against a schema you declare.
+
+```yaml
+implement:
+  coder:
+    harness: cc                 # or `codex`
+    model: model.smart          # the same registry address an agent names
+    workspace: "${REPO_ROOT}"   # required — no default
+    access: workspace_write     # read_only | workspace_write | full_access
+    prompt: |
+      Make the smallest change that satisfies the goal, run the tests,
+      and report what you touched.
+    output:                     # required, like an agent's
+      summary: { type: string }
+    allow_tools: [Bash, Edit, Read, Write]
+    env:
+      PATH: "/usr/bin:/bin"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+  input: "input.goal"           # no `input:` in the block ⇒ string-in
+  writes: { summary: summary }
+  retry: { max: 1, backoff: 30s }
+  timeout: 20m
+```
+
+**`harness:` is a binding.** Swap `cc` for `codex` and every other key means the
+same thing — that is the point of it, and it is why a later harness is a name in
+an enum rather than new grammar. What *carries* a key is the harness's own
+primitive, though, and the grammar states those per harness rather than implying
+they are equivalent: `access: read_only` is a sandbox under one and a permission
+mode under the other, and `prompt:` joins the harness's own instructions rather
+than replacing them either way. `deepagents` and `native` are reserved and
+refused today; `agent-compose explain unsupported-harness` is the whole story.
+
+**Read the containment paragraph before you write one.** What bounds a harness
+run is the `workspace:`, the `access:` preset, the declared `env:`, and the
+node's own `timeout:` — and nothing else. The built-in tools above are bounded
+because *this* runtime implements them; a harness implements its own, so a coder
+node hands both the program and the loop to somebody else's agent inside their
+tool surface. `allow_tools:` is enforced per call by `cc` and is only *offered*
+to `codex` — named in the run's instructions, with the sandbox as the thing that
+actually holds; a `plan` report and a `visualize` canvas both say which of the
+two a node is.
+
+**One run is one journaled effect.** A resume consumes the recorded answer and
+the harness never runs twice; a crash mid-run is an attempt failure and the
+node's `retry:` re-runs the whole thing. The trace carries the run's turns, its
+tool events and what it cost — `agent-compose docs trace`.
+
+**`model:` is the registry address and nothing else crosses.** The harness owns
+its client, its auth and its own retries, so a provider's connection does not
+reach inside a run and a **route** is refused at that position: bind a direct
+`model.*` and let the node's `retry:` be the ladder.
+
+Normative source: `docs/grammar.md` §5, §5.1–5.4, §8.1, §8.9

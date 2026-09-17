@@ -1,0 +1,39 @@
+# rule: a `coder:` node's `settings:` key the harness's curated table knows is
+# rule: checked strictly (grammar 8.9, D140)
+# code: value-out-of-range
+# message: `max_turns` of `flow.main` node `build` is 0, outside 1..=1000
+# at: main.yml:33:22
+# label: main.yml:33:11 the setting is declared here
+# help: `harness: cc` takes `max_turns` in that range (grammar 8.9, Decision D140)
+#
+# The first of Decision D140's two tiers. `max_turns` is a key the `cc` table
+# knows, so a value outside its range is refused with the range quoted — the
+# strict half of resolved q30's bargain. Deciding it needs the `harness:` value
+# beside the key, which is what makes it a check rather than a parser rule.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        settings:
+          max_turns: 0
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

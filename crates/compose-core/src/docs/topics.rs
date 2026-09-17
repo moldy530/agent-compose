@@ -57,7 +57,7 @@ pub const TOPICS: &[Topic] = &[
     },
     Topic {
         name: "agents",
-        summary: "model-backed nodes: prompts, output schemas, tools, the bounded tool loop",
+        summary: "model-backed nodes: prompts, output schemas, tools, the bounded tool loop, and `coder:` harness runs",
         body: include_str!("../../../../docs/topics/agents.md"),
     },
     Topic {

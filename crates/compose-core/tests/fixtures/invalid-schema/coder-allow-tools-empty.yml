@@ -1,0 +1,20 @@
+# rule: `allow_tools:` written empty is refused - omitting the key takes the harness's own default set, so `[]` is a second spelling of the widest surface there is, written by somebody who meant the narrowest (grammar 8.9 / D138)
+# at: /flow.patch/nodes/implement/coder/allow_tools
+# via: /$defs/coderNode/properties/coder/properties/allow_tools/minItems
+flow.patch:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "${REPO_ROOT}"
+        prompt: Make the smallest change that satisfies the goal.
+        output:
+          summary: { type: string }
+        allow_tools: []
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

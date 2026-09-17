@@ -1,0 +1,38 @@
+# rule: a `coder:` node binds a harness this release lowers, and `deepagents`
+# rule: and `native` are reserved (grammar 8.9, D136, PRD resolved q57)
+# code: unsupported-harness
+# message: `harness: deepagents` is reserved: this release lowers `cc`, `codex` and no other
+# at: main.yml:29:18
+# label: main.yml:29:9 the `coder` block of `flow.main` node `build`
+# help: `deepagents` and `native` are spelled by the grammar so that a composition written against one is refused by name rather than by a suggestion list; what they lack is a driver, and the set grows by a resolved question rather than by a release adding a name (grammar 8.9, PRD resolved q57)
+#
+# Not decidable at the parser: `deepagents` is a member of the enum, so the
+# value is legal grammar. What it lacks is a **driver**, which is a fact about
+# this release rather than about the spelling — and the difference is what the
+# two answers look like. A name the enum does not have is a typo and gets a
+# suggestion; this one gets the scope.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: deepagents
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

@@ -163,7 +163,7 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// the repair is two edits in two places, and a one-line `over:` is only ever
 /// the second of them.
 ///
-/// The last two are a different case and are here for a different reason: they
+/// The last three are a different case and are here for a different reason: they
 /// are **warnings**, so their triggering example builds. A reader who is told
 /// "correct the spelling" or "drop the key" has no diagnostic to confirm they
 /// did — the report simply goes quiet — so the repaired spec is the only thing
@@ -176,6 +176,7 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "unbalanced-convergence",
     "undefined-channel",
     "unkeyed-map-write",
+    "unknown-harness-setting",
     "unknown-server-tool",
     "unknown-server-tool-field",
     "unsupported-server-tools",

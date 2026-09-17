@@ -38,6 +38,14 @@ pub struct Golden {
 /// `items:`. Each of those is a spelling this compiler could get wrong in a way
 /// only `tsc` or a real parse would notice.
 ///
+/// `patch-pipeline` is the fifth, and the coding-harness one. A `coder:` node is
+/// the one kind whose emitted material is spread over three files that have to
+/// agree — the config map in `src/graph.ts`, the driver in `src/harness.ts`, and
+/// the pins in `package.json` — so it is the kind a golden earns most. It binds
+/// **both** v1 harnesses in one composition on purpose: "emit only the drivers a
+/// composition uses" is a claim about a *set*, and a golden with one harness in
+/// it would read identically whether the rule were per-harness or all-or-nothing.
+///
 /// `placed-nodes` is the fourth composition and the mesh one. `triage-fanout`'s
 /// `staging` target already places a component, so a mesh reaches the corpus
 /// either way; what this adds is the **three shapes a placed component is
@@ -66,6 +74,11 @@ pub const GOLDENS: &[Golden] = &[
         directory: "triage-fanout-staging",
         project: "examples/triage-fanout",
         target: "staging",
+    },
+    Golden {
+        directory: "patch-pipeline",
+        project: "examples/patch-pipeline",
+        target: "local",
     },
     Golden {
         directory: "placed-nodes",

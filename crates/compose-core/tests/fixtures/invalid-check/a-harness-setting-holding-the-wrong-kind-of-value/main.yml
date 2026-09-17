@@ -1,0 +1,41 @@
+# rule: a `coder:` node's `settings:` value of the wrong kind for a curated key is
+# rule: refused naming the kind the SDK option takes (grammar 8.9, D140)
+# code: wrong-type
+# message: `network_access` of `flow.main` node `build` takes a boolean, found a string
+# at: main.yml:35:27
+# label: main.yml:35:11 the setting is declared here
+# help: `harness: codex` maps this key onto an SDK option of that type (grammar 8.9, Decision D140)
+#
+# The strict tier's catch-all, and the reason it cannot be left to the warning
+# tier: `network_access` *is* a key the `codex` table knows, so a value this
+# release can read is a value this release must refuse to hand over wrong. YAML
+# will not rescue it either — `"yes"` is quoted, so the reader has a string, and
+# the SDK option is a boolean. A run is where the mismatch would otherwise
+# surface, after the harness has already been paid for.
+version: "0.1"
+provider.p:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+model.smart:
+  provider: provider.p
+  id: gpt-5-codex
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: codex
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        settings:
+          network_access: "yes"
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

@@ -776,6 +776,20 @@ export interface RunContext {
    */
   readonly modelCalls?: ModelCall[];
   /**
+   * Where every harness run this node makes is recorded (PRD resolved q57
+   * ruling a, `docs/trace.md` §7.6).
+   *
+   * [`modelCalls`][`RunContext.modelCalls`]' sibling, and there for its reason
+   * exactly: a run that **failed** returns no answer, and the turns it took, the
+   * tools it called and what it cost are the reading an operator opens the trace
+   * for. A coder node makes one run per attempt, so what arrives here across a
+   * `retry:` ladder is one record per attempt, in the order they were made.
+   *
+   * Absent on a detached delivery's context, with the rest of this family: no
+   * dispatch target is a coder node, so nothing ever writes it there.
+   */
+  readonly harnessRuns?: HarnessRecord[];
+  /**
    * Where a subflow a **model** invoked records its dispatch, for this node's
    * trace entry (grammar 5.4, PRD §9.20, `docs/trace.md` §5).
    *
@@ -957,6 +971,7 @@ export async function runActivity<T>(
   modelCalls?: ModelCall[],
   innerTraces?: TraceEntry[],
   toolDispatches?: DispatchRecord[],
+  harnessRuns?: HarnessRecord[],
 ): Promise<{ value: T; attempts: number }> {
   const attempts = 1 + (policy.retry?.max ?? 0);
   const controller = new AbortController();
@@ -1049,6 +1064,7 @@ export async function runActivity<T>(
           node,
           ...(storeRecords === undefined ? {} : { storeRecords }),
           ...(modelCalls === undefined ? {} : { modelCalls }),
+          ...(harnessRuns === undefined ? {} : { harnessRuns }),
           ...(toolDispatches === undefined ? {} : { toolDispatches }),
           ...(effects === undefined ? {} : { effects }),
         });
@@ -7765,6 +7781,832 @@ function decode(
 }
 
 // ---------------------------------------------------------------------------
+// The coding-agent harness (grammar 8.9, Decisions D136–D142, PRD resolved q57)
+// ---------------------------------------------------------------------------
+//
+// # What a coder node is, from in here
+//
+// One node, one **run** of somebody else's agent loop. Everything this file does
+// for an `agent:` node — compose a request, drive a tool loop, ladder a
+// mechanism, parse an answer — is the harness's own business inside a coder
+// node, and what is left for this runtime is the outside of it: a config map in,
+// a stream tapped on the way past, an answer parsed against the contract the
+// composition declared, one journaled effect, one trace record.
+//
+// The SDKs themselves are **not** reached from this file. They are reached
+// through the driver seam below, whose implementations `src/harness.ts` emits —
+// one per harness a composition uses, and a scripted one for tests. Two reasons,
+// and the second is the load-bearing one: this module is byte-identical in every
+// project a compiler release builds, so a composition with no coder node must
+// not carry an import of an SDK it will never call; and a harness SDK speaks its
+// own wire, so the mock provider — deliberately — never sees it, which leaves a
+// scripted driver as the only way a test can drive a run end to end.
+//
+// # Where the bounds are, and where they are not
+//
+// PRD resolved q54 moved the trust boundary from the author to the **model**:
+// the model authors the program, inside this runtime's own tool surface, under
+// the workspace and the timeout a `builtin:` binding declares. A coder node
+// moves it one step further, and says so as loudly as q54 says its own: the
+// harness authors *and runs* the program inside **its** tool surface, so nothing
+// `builtin.bash` and `builtin.files` are bounded by applies here. `workspace:`
+// and `access:` are the bounds, they are the harness's own primitives, and the
+// two harnesses do not enforce them identically:
+//
+//  * `cc` takes a working directory and a permission mode, and enforces the
+//    node's `allow_tools:` **in its own loop**, per call, through the Agent
+//    SDK's permission callback;
+//  * `codex` takes a sandbox preset and bounds at that boundary only. Its
+//    per-call approval tier is their app server's, which this release does not
+//    adopt, so an `allow_tools:` on a `codex` node is what the harness is
+//    *offered* rather than what it is held to.
+//
+// [`HarnessRun.allowTools`] carries the list either way and
+// [`HarnessDriver.enforcesTools`] is where a driver says which of the two it is,
+// so the asymmetry is a value a reader can read rather than a paragraph they
+// have to remember.
+//
+// # What does not reach inside a run
+//
+// The provider *connection*. A coder node's `model:` is the registry address an
+// agent node spells (grammar 12.2), and the adapter maps it down to the model id
+// plus the small subset of that model's `settings:` the harness has a place for
+// ([`HARNESS_MODEL_SETTINGS`]). `provider.*`'s base URL, its headers and its
+// credentials, a route's failover ladder, and the mechanism ladder of PRD
+// resolved q53 all stop at this boundary: the harness owns its client, its auth
+// and its internal retries, and this runtime's `retry:` wraps whole runs. The
+// exemption is stated in `docs/grammar.md` 12.2, where PRD 5.9's failover
+// promise is made.
+
+/** Which harness serves a coder node (grammar 8.9, Decision D136). */
+export type HarnessName = "cc" | "codex";
+
+/** How far a harness may reach inside its workspace (grammar 8.9, D138). */
+export type WorkspaceAccess = "read_only" | "workspace_write" | "full_access";
+
+/**
+ * One harness run, as the trace records it (`docs/trace.md` §7.6, PRD resolved
+ * q57 ruling a).
+ *
+ * A record type of its own rather than a [`ModelCall`] with more fields on it,
+ * and that is half the reason it exists: §7.3's claim that an agent's tool loop
+ * is *the one place* a compiled graph does work a model asked for survives
+ * untouched, because a harness run is not an agent's tool loop and does not
+ * pretend to be one.
+ *
+ * The envelope carries **top-level turns and tool events only**. A harness that
+ * runs subagents of its own yields their transcripts too, and those stay in the
+ * journal's private payload where every other tool's answer already is
+ * (`docs/durability.md` §8, PRD resolved q50).
+ *
+ * **Nothing here says whether a resume replayed the run**, and no field is
+ * missing: `docs/durability.md` §9 decides that for every record type at once —
+ * a resumed generation writes a fresh trace document whole, answering what the
+ * *execution* did rather than what this process did, and the reader who needs
+ * the other question reads the journal. The record is journaled
+ * ([`JournaledHarnessRun`]) so a resume can file it again, not so a resume can
+ * mark it.
+ */
+export interface HarnessRecord {
+  /** Which harness ran it. */
+  readonly harness: HarnessName;
+  /** The SDK package and the version this compiler release pinned. */
+  readonly sdk: string;
+  /** The `model.*` the composition named (grammar 12.2). */
+  readonly model: string;
+  /** The provider-native model id the adapter handed the harness. */
+  readonly modelId: string;
+  /** How the run ended. */
+  readonly outcome: "completed" | "failed";
+  /** The run's **top-level** turns, in the order the harness took them. */
+  readonly turns: readonly HarnessTurn[];
+  /** Its top-level tool events, in the order it made them. */
+  readonly toolCalls?: readonly HarnessToolCall[];
+  /** What the run cost, rolled up. */
+  readonly cost: HarnessCost;
+  /** Whatever this harness reports that the other has no shape for. */
+  readonly extra?: Readonly<Record<string, unknown>>;
+  /** What ended a `"failed"` run, in §3's `<error name>: <message>` shape. */
+  readonly error?: string;
+}
+
+/** One top-level turn of a harness run. */
+export interface HarnessTurn {
+  /** Its ordinal in the run, from `0`. */
+  readonly index: number;
+  /** What the turn used, where the harness reported it. */
+  readonly usage?: HarnessUsage;
+}
+
+/**
+ * What one turn used.
+ *
+ * Every field is optional because the two harnesses count different things and
+ * one shape should not lie about it: `codex` reports token counters per turn,
+ * and `cc` reports usage for the run rather than per turn, so a `cc` record's
+ * turns carry no usage at all and its [`HarnessCost`] carries the totals.
+ */
+export interface HarnessUsage {
+  readonly inputTokens?: number;
+  readonly cachedInputTokens?: number;
+  readonly outputTokens?: number;
+  readonly reasoningTokens?: number;
+}
+
+/**
+ * One tool event of a harness run, in [`ToolCallRecord`]'s shape narrowed to
+ * what a harness reports.
+ *
+ * The **same three-member vocabulary**, meaning the same three things: a call
+ * the harness's loop completed, one its own permission surface refused, and one
+ * whose execution failed. What is not here is [`ToolCallRecord`]'s other four
+ * fields, and each absence is a rule of `docs/trace.md` §11 rather than an
+ * omission: there is no `target`, because the tool is the harness's rather than
+ * a component of this composition; no `instance`, because nothing a harness
+ * calls is a flow of this graph; no `result`, because a tool's answer is the one
+ * thing §11 keeps out at every surface; and no `program`, because PRD resolved
+ * q54 ruling c carved that out for the two built-ins this runtime implements,
+ * and a harness's commands are in the journal payload with the rest of its
+ * stream.
+ */
+export interface HarnessToolCall {
+  /** The tool the harness called, spelled as the harness spells it. */
+  readonly name: string;
+  /** What its loop did with the call. */
+  readonly outcome: "completed" | "refused" | "failed";
+  /** What went wrong, on the two outcomes that carry one. */
+  readonly error?: string;
+}
+
+/**
+ * What a run cost, rolled up (PRD resolved q57 ruling a).
+ *
+ * `turns` is always there because a turn is a thing both harnesses take. The
+ * rest is per harness and present only where that harness reports it — `cc`
+ * reports an estimated USD total and run-level token usage, `codex` reports
+ * tokens per turn and no money at all — which is the whole reason this is a
+ * rollup with optional members rather than a fixed row that would have to invent
+ * a number for whichever harness did not supply one.
+ */
+export interface HarnessCost {
+  /** How many top-level turns the run took. */
+  readonly turns: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  /** The harness's own estimate, in USD, where it makes one. */
+  readonly usd?: number;
+}
+
+/**
+ * One coder node's configuration, as `src/graph.ts` emits it (grammar 8.9).
+ *
+ * The **config map** half of the adapter: everything the composition declared,
+ * lowered once at build time, with the two things that cannot be lowered — an
+ * `${ENV}` reference, and the schema a harness is handed — left as the pieces
+ * [`runCoder`] assembles at the call.
+ */
+export interface HarnessBinding {
+  /** `<flow address>.<node id>`, for a message and for the journal's request. */
+  readonly node: string;
+  readonly harness: HarnessName;
+  /** The `model.*` address, exactly as an agent node spells it. */
+  readonly model: string;
+  /** The provider-native id that address resolves to (Decision D141). */
+  readonly modelId: string;
+  /**
+   * The subset of that model's `settings:` this harness has a place for.
+   *
+   * Computed at build time from [`HARNESS_MODEL_SETTINGS`], so what a reader
+   * sees in `src/graph.ts` is the settings that really travel rather than the
+   * whole block with a filter applied out of sight.
+   */
+  readonly modelSettings: Readonly<Record<string, unknown>>;
+  /** `prompt:` — the run's instructions, literal (grammar 5.2). */
+  readonly prompt: string;
+  /** `workspace:` — interpolable, resolved at the call (grammar 4.3 class 2). */
+  readonly workspace: readonly Interpolation[];
+  /** `access:` — with grammar 8.9's default already applied. */
+  readonly access: WorkspaceAccess;
+  /** `allow_tools:` — absent where the node declares none. */
+  readonly allowTools?: readonly string[];
+  /** `env:` — the declared environment, in declaration order. */
+  readonly env: readonly { readonly name: string; readonly value: readonly Interpolation[] }[];
+  /** `inherit_env:` — absent is `false`, PRD resolved q54 ruling b's default. */
+  readonly inheritEnv?: boolean;
+  /** `settings:` — the harness config, verbatim (Decision D140). */
+  readonly settings: Readonly<Record<string, unknown>>;
+  /**
+   * The declared `output:` as JSON Schema, **before** this harness's lowering
+   * table is applied — [`runCoder`] projects it, so what a reader sees here is
+   * the document the parse checks (PRD resolved q55 as it amends q16).
+   */
+  readonly schema: JsonSchema;
+  /** The emitted Zod for that same `output:` — the output gate. */
+  readonly result: ResultSchema<unknown>;
+}
+
+/** What the adapter hands a driver: one run, fully resolved. */
+export interface HarnessRun {
+  /** The node this run belongs to, for a message. */
+  readonly node: string;
+  /** `prompt:` — the run's system instructions. */
+  readonly instructions: string;
+  /** The user turn: the node's input, rendered exactly as an agent's is. */
+  readonly input: string;
+  /** The provider-native model id. */
+  readonly model: string;
+  /** The model settings this harness accepts. */
+  readonly modelSettings: Readonly<Record<string, unknown>>;
+  /** The harness config the composition declared (Decision D140). */
+  readonly settings: Readonly<Record<string, unknown>>;
+  /** The resolved workspace root. */
+  readonly workspace: string;
+  readonly access: WorkspaceAccess;
+  /** The tool allowlist, where the node declared one. */
+  readonly allowTools?: readonly string[];
+  /** The environment the harness runs with — scrubbed unless it inherits. */
+  readonly env: Readonly<Record<string, string>>;
+  readonly inheritEnv: boolean;
+  /**
+   * The output schema **as the harness is handed it**: the composition's,
+   * projected through this harness's lowering table (PRD resolved q55 ruling a),
+   * with every stripped bound folded into a `description` the model still reads
+   * (ruling b). The gate parses the full schema all the same (ruling c).
+   */
+  readonly schema: JsonSchema;
+  /** The node's deadline, which is grammar 9.2's and bounds the whole run. */
+  readonly signal: AbortSignal;
+}
+
+/**
+ * What one event of a driver's stream carries.
+ *
+ * Both halves at once, which is the **stream tap**: `source` is the SDK's own
+ * event, kept verbatim for the journal's private payload, and `tap` is the one
+ * thing this runtime read off it for the trace. A driver that recognizes nothing
+ * in an event yields it with no `tap` at all, and the payload still has it —
+ * which is what makes "the private payload is the full conversation stream" true
+ * of an SDK event this compiler release had never heard of.
+ */
+export interface HarnessEvent {
+  /** The SDK's event, verbatim. Never reaches the trace envelope. */
+  readonly source: unknown;
+  /** What this runtime read off it, where it read anything. */
+  readonly tap?: HarnessTap;
+}
+
+/** What a driver read off one SDK event, for the trace (PRD resolved q57 (a)). */
+export type HarnessTap =
+  /** A **top-level** turn completed. A subagent's turn is never one of these. */
+  | { readonly kind: "turn"; readonly usage?: HarnessUsage }
+  /** A **top-level** tool event, in [`HarnessToolCall`]'s shape. */
+  | {
+      readonly kind: "tool";
+      readonly name: string;
+      readonly outcome: "completed" | "refused" | "failed";
+      readonly error?: string;
+    }
+  /** The structured answer, as the harness's own output mechanism produced it. */
+  | { readonly kind: "output"; readonly value: unknown }
+  /** The run settled: its rollup, and whatever this harness reports beside it. */
+  | {
+      readonly kind: "settled";
+      readonly cost?: Omit<HarnessCost, "turns">;
+      readonly extra?: Readonly<Record<string, unknown>>;
+    }
+  /** The harness reported a fatal error of its own. */
+  | { readonly kind: "error"; readonly message: string };
+
+/**
+ * The **driver seam**: one interface, one thin mapping per SDK.
+ *
+ * A driver does exactly two things — turn a [`HarnessRun`] into the SDK's own
+ * call, and turn the SDK's own events into [`HarnessEvent`]s. It journals
+ * nothing, parses nothing, and records nothing: every rule this project has
+ * about effects, replay and the trace lives in [`runCoder`] above it, so the two
+ * shipped drivers and the scripted one tests drive are held to the same rules by
+ * construction rather than by three copies of them.
+ */
+export interface HarnessDriver {
+  /** The npm package this driver maps over. */
+  readonly sdk: string;
+  /** The exact version this compiler release pinned it to (PRD 5.12). */
+  readonly version: string;
+  /**
+   * Whether this harness enforces [`HarnessRun.allowTools`] **inside its own
+   * loop**, rather than bounding at its sandbox only (PRD resolved q57 (c)).
+   */
+  readonly enforcesTools: boolean;
+  /** Start one run, and yield what it does. */
+  run(run: HarnessRun): AsyncIterable<HarnessEvent>;
+}
+
+/** The drivers a composition uses, by harness — `src/harness.ts`'s whole export. */
+export type HarnessDrivers = Readonly<Partial<Record<HarnessName, HarnessDriver>>>;
+
+/**
+ * What one journaled harness run holds (PRD resolved q57 ruling b).
+ *
+ * One effect per run, and three things in it. `output` is the **replayable
+ * answer**: the structured output, already through the gate, which is what a
+ * resume consumes so the harness never runs twice. `record` is the trace record
+ * that generation wrote, kept so a resumed execution's fresh trace says what
+ * really happened rather than dropping the run out of it
+ * (`docs/durability.md` §3.9). `stream` is the **private payload**: every event
+ * the SDK yielded, which is where a harness's transcripts, its commands and its
+ * subagents live and where they stay (`docs/durability.md` §8).
+ *
+ * **A run that failed is journaled too**, as a value rather than through the
+ * slot's error path, and it holds the same three things minus the answer it
+ * never produced: a `detail`, which is the sentence [`HarnessRunFailed`]
+ * composes its message out of, and the record and the stream the run had built
+ * when it ended. `docs/trace.md` §7.6 promises one record per **attempt** — "a
+ * run that failed on the first attempt really ran" — and a journal that kept
+ * only the message would make that promise hold on the generation that ran and
+ * fail on the one that resumed. It is the shape [`JournaledCall`] already has
+ * for a spent model ladder, one construct along.
+ */
+type JournaledHarnessRun =
+  | {
+      readonly ok: true;
+      readonly output: unknown;
+      readonly record: HarnessRecord;
+      readonly stream: readonly unknown[];
+    }
+  | {
+      readonly ok: false;
+      readonly detail: string;
+      readonly record: HarnessRecord;
+      readonly stream: readonly unknown[];
+    };
+
+/**
+ * The keywords `cc`'s output format does not compile (PRD resolved q55 ruling a,
+ * q57 ruling d).
+ *
+ * The Agent SDK's `outputFormat: {type: "json_schema"}` reaches the same
+ * Anthropic structured-output decoder [`ANTHROPIC_NATIVE_UNCOMPILED`] is written
+ * for, so the row is that row. It is written out rather than aliased because q57
+ * gives **each harness validator its own table**: a harness is free to change
+ * what it compiles without the Messages wire changing, and a shared constant
+ * would make one edit move two contracts.
+ */
+const CC_UNCOMPILED: readonly string[] = [
+  "maxItems",
+  "minItems",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "minLength",
+  "maxLength",
+];
+
+/**
+ * …and the ones `codex`'s `outputSchema` does not compile.
+ *
+ * The Codex SDK hands its schema to the OpenAI strict decoder, so this is
+ * [`OPENAI_STRICT_UNCOMPILED`]'s row, written out for the reason above.
+ */
+const CODEX_UNCOMPILED: readonly string[] = [
+  "maxItems",
+  "minItems",
+  "uniqueItems",
+  "minimum",
+  "maximum",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "multipleOf",
+  "minLength",
+  "maxLength",
+];
+
+/** Each harness's lowering table, by harness (PRD resolved q57 ruling d). */
+const HARNESS_LOWERED_AWAY: Readonly<Record<HarnessName, readonly string[]>> = {
+  cc: CC_UNCOMPILED,
+  codex: CODEX_UNCOMPILED,
+};
+
+/**
+ * The output schema a harness is handed: the composition's, projected.
+ *
+ * The same projection the wire composers use ([`loweredSchema`]) over a table of
+ * this harness's own, so the amended q16 equality reads here exactly as it reads
+ * there — the harness is constrained by the lowering's image, the gate parses
+ * the full schema, and the delta is the table and nothing else.
+ */
+export function loweredHarnessSchema(schema: JsonSchema, harness: HarnessName): JsonSchema {
+  const away = HARNESS_LOWERED_AWAY[harness];
+  if (away.length === 0) return schema;
+  return lowerNode(schema, away) as JsonSchema;
+}
+
+/**
+ * What one harness strips, for a reader outside this file — [`loweredAway`]'s
+ * counterpart, and there for the gate that measures the delta.
+ */
+export function harnessLoweredAway(harness: HarnessName): readonly string[] {
+  return HARNESS_LOWERED_AWAY[harness];
+}
+
+/**
+ * The `settings:` keys of a `model.*` each harness has a place for (PRD resolved
+ * q57 ruling d).
+ *
+ * Deliberately **small**, and grounded on both sides: an entry is a key the
+ * provider plugin behind that harness's models really publishes *and* an option
+ * that harness's SDK really takes. Grammar 12.2's `settings:` is otherwise a
+ * *provider connection's* vocabulary — a temperature, a token cap, a `stop`
+ * sequence — and a harness owns its own client, so there is nothing on the other
+ * side of this boundary for most of them to be applied to.
+ *
+ * The two rows therefore differ, and the difference is the vendors': `cc` takes
+ * `thinking:`, whose `budget_tokens` is the Agent SDK's `maxThinkingTokens`, and
+ * `codex` takes `reasoning_effort:`, which is its `modelReasoningEffort`.
+ *
+ * Read by the **compiler** too, which computes [`HarnessBinding.modelSettings`]
+ * from the same list, so a settings key that stops crossing is one edit in one
+ * place.
+ */
+export const HARNESS_MODEL_SETTINGS: Readonly<Record<HarnessName, readonly string[]>> = {
+  cc: ["thinking"],
+  codex: ["reasoning_effort"],
+};
+
+/**
+ * The harness runtime this host does not have.
+ *
+ * PRD resolved q57 gives a missing harness the posture q54 gives a host with no
+ * `bash`: an **execution failure naming the requirement**, rather than a
+ * composition this compiler refuses to build. Which machine has which SDK
+ * installed is a property of the machine, and a `validate` that refused a coder
+ * node on a laptop with no Codex on it would be answering a question about the
+ * spec with a fact about the host.
+ */
+export class HarnessUnavailable extends Error {
+  override readonly name = "HarnessUnavailable";
+  constructor(node: string, harness: HarnessName, detail: string) {
+    super(
+      `\`${node}\` binds \`harness: ${harness}\`, and this process cannot reach it: ${detail}. A coder node runs the vendor's own SDK, which the generated \`package.json\` pins — install the project's dependencies on the machine that runs this node`,
+    );
+  }
+}
+
+/**
+ * A harness run that did not produce an answer this node can go on with.
+ *
+ * It carries the [`HarnessRecord`] the run had built by the time it ended,
+ * because an activity that **throws** returns no answer and the run really
+ * happened: its turns, its tool events and what it cost are exactly the reading
+ * an operator opens a failed trace for. [`SubflowFailure`] carries an instance's
+ * trace out of a failed `flow:` node for the same reason.
+ */
+export class HarnessRunFailed extends Error {
+  override readonly name = "HarnessRunFailed";
+  /** What the run had done when it ended. */
+  readonly record: HarnessRecord;
+  /**
+   * What ended it, as the message above quotes it.
+   *
+   * Kept beside the composed message so a **resume** can raise the same failure
+   * rather than a restatement of it: the journal holds this sentence, and
+   * [`runCoder`] recomposes the message from it and the node's own address, so
+   * the two generations' failures read identically word for word.
+   */
+  readonly detail: string;
+  constructor(node: string, record: HarnessRecord, detail: string, cause?: unknown) {
+    super(
+      `\`${node}\`'s \`harness: ${record.harness}\` run failed: ${detail}`,
+      cause === undefined ? undefined : { cause },
+    );
+    this.record = record;
+    this.detail = detail;
+  }
+}
+
+/** The record a failed harness run left on this error, walking the `cause` chain. */
+export function harnessRecordOf(error: unknown): HarnessRecord | undefined {
+  for (let held: unknown = error; typeof held === "object" && held !== null; ) {
+    if (held instanceof HarnessRunFailed) return held.record;
+    held = (held as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** The drivers a host registered, ahead of the ones `src/harness.ts` emits. */
+const HOSTED_HARNESS_DRIVERS = new Map<HarnessName, HarnessDriver>();
+
+/**
+ * Bind one harness to a driver of the host's own, ahead of the SDK-backed one
+ * (grammar 8.9, PRD resolved q57).
+ *
+ * The **test surface** the driver seam exists for, reachable from outside the
+ * process's own module graph: a harness SDK speaks its own wire, so the mock
+ * provider — deliberately — never sees it, and resolved q57 makes "a scripted
+ * stub driver is the test surface" the answer. `src/harness.ts` emits
+ * `scriptedDriver` into every project, and this is how a compiled graph is made
+ * to run one: register before `runFlow` loads the graph, exactly as
+ * [`registerFunction`] is registered before a `function:` binding runs, and
+ * every `coder:` node of the composition reaches the script instead of the
+ * vendor.
+ *
+ * It resolves **ahead of** the emitted registry rather than replacing it, so a
+ * composition binding two harnesses can have one scripted and the other left
+ * alone. Nothing about the node changes: the config map, the journal, the
+ * stream tap, the output gate, the `retry:` ladder and the trace record are the
+ * code a deployment ships, which is the whole reason the seam is one function
+ * deep.
+ */
+export function registerHarnessDriver(harness: HarnessName, driver: HarnessDriver): void {
+  HOSTED_HARNESS_DRIVERS.set(harness, driver);
+}
+
+/**
+ * Run one coder node: the adapter (grammar 8.9, PRD resolved q57).
+ *
+ * Four steps, in this order, and each is somebody else's rule kept here:
+ *
+ *  1. **the config map** — the workspace and the environment resolve their
+ *     `${ENV}` references now (grammar 4.3 class 2), the environment is scrubbed
+ *     unless the node opted into inheriting (q54 ruling b), and the declared
+ *     `output:` is projected through this harness's lowering table (q55 ruling
+ *     a);
+ *  2. **the driver invocation** — one journaled effect, `kind: "harness"`, whose
+ *     recorded answer is the gated output and whose payload is the whole stream
+ *     (q57 ruling b, `docs/durability.md` §3.9). A resume consumes the answer
+ *     and the harness never runs again; a crash mid-run left no record at all,
+ *     so the node's `retry:` re-runs the whole thing, which is an attempt
+ *     failure like any other;
+ *  3. **the stream tap** — one pass, building the trace record out of the
+ *     top-level turns and tool events and the payload out of everything;
+ *  4. **the output gate** — [`parseResult`] against the **full** declared
+ *     schema. A refusal fails the node, where `retry:`/`on_error:` decide the
+ *     run exactly as they do for an agent whose answer missed its contract (q55
+ *     ruling c).
+ *
+ * `drivers` is a parameter rather than an import, which is what keeps this file
+ * free of the SDKs: `src/graph.ts` imports `src/harness.ts` and hands the
+ * registry in, and a test calling this function directly hands in a scripted
+ * driver instead. A test driving the **whole graph** cannot reach the argument
+ * at all — `src/graph.ts` writes it — which is what
+ * [`registerHarnessDriver`] is for, and why it is consulted first.
+ */
+export async function runCoder(
+  binding: HarnessBinding,
+  input: unknown,
+  context: RunContext,
+  drivers: HarnessDrivers,
+): Promise<{ output: unknown; harness: readonly HarnessRecord[] }> {
+  const driver = HOSTED_HARNESS_DRIVERS.get(binding.harness) ?? drivers[binding.harness];
+  if (driver === undefined) {
+    throw new HarnessUnavailable(
+      binding.node,
+      binding.harness,
+      "this project emitted no driver for it",
+    );
+  }
+  const workspace = interpolate(binding.workspace);
+  if (workspace === "") {
+    // The refusal a `builtin:` workspace makes on an `${ENV}` that resolved
+    // empty, for the same reason: an empty path is the directory the runtime
+    // happened to be started in, and a bound nobody wrote is not a bound
+    // (grammar 8.9). Quoted **as written**, never resolved (§11.1).
+    throw new Error(
+      `\`${binding.node}\`'s \`workspace:\` (\`${asWritten(binding.workspace)}\`) resolved to an empty path, which is not a directory a harness run can be contained by`,
+    );
+  }
+  const environment: Record<string, string> =
+    binding.inheritEnv === true ? { ...(process.env as Record<string, string>) } : {};
+  for (const entry of binding.env) environment[entry.name] = interpolate(entry.value);
+
+  const run: HarnessRun = {
+    node: binding.node,
+    instructions: binding.prompt,
+    input: typeof input === "string" ? input : JSON.stringify(input),
+    model: binding.modelId,
+    modelSettings: binding.modelSettings,
+    settings: binding.settings,
+    workspace,
+    access: binding.access,
+    ...(binding.allowTools === undefined ? {} : { allowTools: binding.allowTools }),
+    env: environment,
+    inheritEnv: binding.inheritEnv === true,
+    schema: loweredHarnessSchema(binding.schema, binding.harness),
+    signal: context.signal,
+  };
+
+  // What identifies this effect to a resume. The **request** rather than the
+  // stream: `docs/durability.md` §4 keys an effect by its site and its ordinal
+  // and keeps the request so a divergence can say what changed, and a run's
+  // identity is the configuration it was started with.
+  //
+  // **The whole binding**, which is [`runExec`]'s word and its argument one
+  // agent loop larger: an `env:` entry, an `inherit_env:`, a model setting the
+  // harness takes and the `output:` schema all change what this call is and what
+  // its answer means. The schema is the sharpest of them, because replay does
+  // not re-gate: a resume that finds this slot returns the held answer and never
+  // reaches [`performHarnessRun`], where `parseResult` lives — so a narrowed
+  // `output:` left out of this identity would hand the graph an answer the
+  // node's current contract refuses, with no `ReplayDivergence` to say so.
+  //
+  // The **resolved** environment is deliberately not in it: those are the values
+  // `docs/trace.md` §11.1 keeps out of every artifact this project writes. What
+  // goes in is what the composition *wrote* — `${SECRET}`, not the secret —
+  // which is `asWritten`, the same form the workspace takes and the same form an
+  // `exec:` binding's `env:` has always been journaled in.
+  const request = {
+    node: binding.node,
+    harness: binding.harness,
+    model: binding.model,
+    modelId: binding.modelId,
+    modelSettings: binding.modelSettings,
+    instructions: binding.prompt,
+    input: run.input,
+    workspace: asWritten(binding.workspace),
+    access: binding.access,
+    ...(binding.allowTools === undefined ? {} : { allowTools: binding.allowTools }),
+    env: binding.env.map((entry) => ({ name: entry.name, value: asWritten(entry.value) })),
+    inheritEnv: binding.inheritEnv === true,
+    settings: binding.settings,
+    schema: binding.schema,
+  };
+
+  // The whole event stream, filled by the run below and journaled whichever way
+  // it ends. Held **here** rather than inside [`performHarnessRun`] because a
+  // failed run is journaled too (see the `catch` below), and a payload the
+  // thrown failure would have had to carry is a payload this function can
+  // simply already have.
+  const stream: unknown[] = [];
+  // The error a **live** run threw, kept so it can be re-thrown with its `cause`
+  // chain intact. The journal gets a flattened copy of it in the same step; this
+  // is the original, which is what the human report prints.
+  let live: HarnessRunFailed | undefined;
+  const journaledRun = await journaled(
+    context.effects,
+    "harness",
+    request,
+    async (): Promise<JournaledHarnessRun> => {
+      try {
+        return await performHarnessRun(binding, driver, run, stream);
+      } catch (error) {
+        // Kept as a **value** rather than through the slot's error path, which
+        // is what [`callModel`] does with a spent ladder and for its reason: a
+        // failure is more than its message here. The `HarnessRecord` the run
+        // built is what a reader of the failed node's entry reads, and the
+        // journal's error outcome holds a name and a message and nothing else —
+        // so a resumed generation would replay the failure and file no record,
+        // and `docs/trace.md` §7.6's "one record per attempt" would hold on the
+        // generation that ran and not on the one that resumed.
+        if (!(error instanceof HarnessRunFailed)) throw error;
+        live = error;
+        return { ok: false, detail: error.detail, record: error.record, stream };
+      }
+    },
+  );
+
+  if (!journaledRun.ok) {
+    // A **replayed** failure is raised the way a live one was: same class, same
+    // record, and the same message, because the message is recomposed from the
+    // `detail` the record was filed with rather than restated. What a replay
+    // cannot restore is the platform `cause` chain, which is `replayedFailure`'s
+    // own standing rule and which only the human report prints.
+    const failure =
+      live ?? new HarnessRunFailed(binding.node, journaledRun.record, journaledRun.detail);
+    // **A failed run is a run this node made**, and on a `retry:` ladder it is
+    // one a *later, successful* attempt would otherwise erase: the answer only
+    // ever carries the attempt it came out of, so a node that failed once and
+    // then answered would report a trace in which the first run never happened.
+    // The collector is what holds the whole set ([`RunContext.harnessRuns`]), so
+    // the record goes in here as well as riding out on the failure — which is
+    // the path that reports the run that ended the node. [`runNode`] reconciles
+    // the two **by identity**, so a record on both is filed once.
+    context.harnessRuns?.push(failure.record);
+    throw failure;
+  }
+  // **A replayed record is not marked as one**, and that is the trace's own
+  // decision rather than an omission here: a resumed generation writes a fresh
+  // document whole, saying what the *execution* did rather than what this
+  // process did, and a reader who needs the other question reads the journal
+  // (`docs/durability.md` §9).
+  context.harnessRuns?.push(journaledRun.record);
+  return { output: journaledRun.output, harness: [journaledRun.record] };
+}
+
+/**
+ * One live run: the driver, the tap, and the gate (see [`runCoder`]).
+ *
+ * `stream` is the caller's, and it is filled rather than returned: a run that
+ * fails leaves through a `throw`, and the payload of a failed run is journaled
+ * with its record — so the one collection both endings need is the caller's to
+ * hold.
+ */
+async function performHarnessRun(
+  binding: HarnessBinding,
+  driver: HarnessDriver,
+  run: HarnessRun,
+  stream: unknown[],
+): Promise<Extract<JournaledHarnessRun, { ok: true }>> {
+  const turns: HarnessTurn[] = [];
+  const toolCalls: HarnessToolCall[] = [];
+  let cost: Omit<HarnessCost, "turns"> = {};
+  let extra: Readonly<Record<string, unknown>> | undefined;
+  let answered = false;
+  let answer: unknown;
+  let fatal: string | undefined;
+
+  const settled = (outcome: "completed" | "failed", error?: string): HarnessRecord => ({
+    harness: binding.harness,
+    sdk: `${driver.sdk}@${driver.version}`,
+    model: binding.model,
+    modelId: binding.modelId,
+    outcome,
+    turns,
+    ...(toolCalls.length === 0 ? {} : { toolCalls }),
+    cost: { turns: turns.length, ...cost },
+    ...(extra === undefined ? {} : { extra }),
+    ...(error === undefined ? {} : { error }),
+  });
+
+  try {
+    for await (const event of driver.run(run)) {
+      // **Everything** goes to the payload, tapped or not: an SDK event this
+      // release does not recognize is still part of the conversation stream the
+      // journal is asked to hold (PRD resolved q57 ruling b).
+      stream.push(event.source);
+      const tap = event.tap;
+      if (tap === undefined) continue;
+      switch (tap.kind) {
+        case "turn":
+          turns.push({
+            index: turns.length,
+            ...(tap.usage === undefined ? {} : { usage: tap.usage }),
+          });
+          break;
+        case "tool":
+          toolCalls.push({
+            name: tap.name,
+            outcome: tap.outcome,
+            ...(tap.error === undefined ? {} : { error: tap.error }),
+          });
+          break;
+        case "output":
+          answered = true;
+          answer = tap.value;
+          break;
+        case "settled":
+          if (tap.cost !== undefined) cost = tap.cost;
+          if (tap.extra !== undefined) extra = tap.extra;
+          break;
+        case "error":
+          fatal = tap.message;
+          break;
+      }
+    }
+  } catch (error) {
+    throw new HarnessRunFailed(
+      binding.node,
+      settled("failed", describe(error)),
+      describe(error),
+      error,
+    );
+  }
+  if (fatal !== undefined) {
+    throw new HarnessRunFailed(binding.node, settled("failed", `HarnessFailed: ${fatal}`), fatal);
+  }
+  if (!answered) {
+    const detail =
+      "it produced no structured output, and the node's `output:` schema is what a coder node's answer is parsed against";
+    throw new HarnessRunFailed(
+      binding.node,
+      settled("failed", `HarnessAnswerMissing: ${detail}`),
+      detail,
+    );
+  }
+
+  // **The gate.** The full declared schema, never the lowering's image: what the
+  // harness was constrained by is the projection above, and what its answer is
+  // held to is the contract the composition wrote (PRD resolved q55 rulings a
+  // and c, amending q16). A refusal leaves here as a failure of this run, so the
+  // record travels with it and the node's `retry:`/`on_error:` decide the rest.
+  try {
+    const output = parseResult(
+      binding.result,
+      answer,
+      `the answer of \`${binding.node}\`'s \`harness: ${binding.harness}\` run`,
+    );
+    return { ok: true, output, record: settled("completed"), stream };
+  } catch (error) {
+    throw new HarnessRunFailed(
+      binding.node,
+      settled("failed", describe(error)),
+      describe(error),
+      error,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The host function registry (grammar 6.1's escape hatch)
 // ---------------------------------------------------------------------------
 
@@ -8248,6 +9090,18 @@ export interface TraceEntry {
    * infer from a provider's logs. See [`ModelCall`].
    */
   readonly models?: readonly ModelCall[];
+  /**
+   * Every coding-harness run this node made (grammar 8.9, PRD resolved q57).
+   *
+   * A record of its own rather than a [`ModelCall`], because a harness run is
+   * not this runtime's agent loop: `docs/trace.md` §7.3's claim that an agent's
+   * tool loop is *the one place* a compiled graph does work a model asked for
+   * survives exactly because this is somewhere else. A coder node makes one run
+   * per attempt, so an array is what a `retry:` ladder leaves behind.
+   *
+   * A node that is not a `coder` node never carries the key.
+   */
+  readonly harness?: readonly HarnessRecord[];
   /**
    * The wait a `human` node held, and how it ended (grammar 8.7, PRD 5.5).
    *
@@ -12394,6 +13248,8 @@ export interface NodeAnswer {
   readonly inner?: readonly TraceEntry[];
   /** Which member of its route served each model call (PRD 5.9). */
   readonly models?: readonly ModelCall[];
+  /** The harness runs a `coder:` node made (grammar 8.9, PRD resolved q57). */
+  readonly harness?: readonly HarnessRecord[];
   /** The wait a `human` node held, and how it ended (grammar 8.7). */
   readonly human?: HumanPause;
 }
@@ -12581,6 +13437,7 @@ export async function runNode(
   let toolDispatches: readonly DispatchRecord[] | undefined;
   let inner: readonly TraceEntry[] | undefined;
   let models: readonly ModelCall[] | undefined;
+  let harness: readonly HarnessRecord[] | undefined;
   let pause: HumanPause | undefined;
   let attempts = 0;
   let skipped = false;
@@ -12625,6 +13482,12 @@ export async function runNode(
   // order the node could put them, and `merged` reconciles the two.
   const toolDispatched: DispatchRecord[] = [];
 
+  // And every harness run this node made, for the fifth time the same reason: a
+  // run that failed on its second `retry:` attempt still took the turns it took
+  // and spent what it spent, and the record is the only account of them
+  // (grammar 8.9, PRD resolved q57, and see [`RunContext.harnessRuns`]).
+  const harnessRuns: HarnessRecord[] = [];
+
   /** This node's entry, for a failure that leaves nothing else behind. */
   const aborted = (error: unknown, made: number, routing?: RoutingDecision): TraceEntry => {
     // A subflow that failed still made a trace, and it is the only account of
@@ -12657,6 +13520,20 @@ export async function runNode(
     // indirection PRD §9.20 promises is always there (`docs/trace.md` §7.3,
     // §9).
     const called = models ?? (modelCalls.length === 0 ? undefined : settled(modelCalls));
+    // A harness run that failed leaves its record in **both** places:
+    // [`runCoder`] pushes it into the collector and carries it out on the
+    // failure, so the one run a reader most wants is reported whichever of the
+    // two survived — a `retry:` ladder's earlier attempt reaches here through
+    // the collector alone, and a run this node ended on reaches here through the
+    // error even where no collector was passed. [`harnessRecordOf`] is where it
+    // is read back off the chain, and the two are reconciled **by identity**: the
+    // record is dropped from the collected set and appended last, so a record on
+    // both is filed once and the run that ended the node is the last of them.
+    const failedRun = harnessRecordOf(error);
+    const ran =
+      failedRun === undefined
+        ? harnessRuns
+        : [...harnessRuns.filter((held) => held !== failedRun), failedRun];
     return {
       step,
       flow: descriptor.flow,
@@ -12674,6 +13551,7 @@ export async function runNode(
       ...(held === undefined ? {} : { inner: held }),
       ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
       ...(called === undefined ? {} : { models: called }),
+      ...(ran.length === 0 ? {} : { harness: [...ran] }),
       ...(paused === undefined ? {} : { human: paused }),
       error: describe(error),
     };
@@ -12703,6 +13581,7 @@ export async function runNode(
       modelCalls,
       innerTraces,
       toolDispatched,
+      harnessRuns,
     );
     attempts = answer.attempts;
     output = answer.value.output;
@@ -12735,6 +13614,11 @@ export async function runNode(
     // has always been the whole of `storeRecords` for the same reason, and this
     // is the half that was missing it.
     models = settled(merged(modelCalls, answer.value.models));
+    // Every harness run this node execution made, read the way `models` above
+    // is: the answer carries the run the attempt that answered made, and the
+    // collector holds every run that really happened — an earlier attempt's
+    // included (grammar 8.9, PRD resolved q57).
+    harness = merged(harnessRuns, answer.value.harness);
     pause = answer.value.human;
   } catch (error) {
     // Two outcomes of a `human` node reach here as throws and neither is an
@@ -12806,6 +13690,16 @@ export async function runNode(
     // And every subflow a model invoked before the call that ended the node,
     // for the same reason and off the same kind of collector (PRD §9.20).
     if (toolDispatched.length > 0) toolDispatches = [...toolDispatched];
+    // And every harness run, with the one that ended the node read off the
+    // error as well: [`runCoder`] files a failed run's record in the collector
+    // *and* carries it out on [`HarnessRunFailed`], so the two are reconciled
+    // here by identity and one attempt files one record (`docs/trace.md` §7.6).
+    const failedRun = harnessRecordOf(error);
+    const ran =
+      failedRun === undefined
+        ? harnessRuns
+        : [...harnessRuns.filter((held) => held !== failedRun), failedRun];
+    if (ran.length > 0) harness = [...ran];
     // `runActivity` wraps everything the activity threw in a `NodeFailure`
     // carrying the attempts it *made*, so the fallback is for an error that
     // reached here without one being made at all — and `0` is what that is.
@@ -12827,6 +13721,7 @@ export async function runNode(
         ...(inner === undefined ? {} : { inner }),
         ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
         ...(models === undefined ? {} : { models }),
+        ...(harness === undefined ? {} : { harness }),
         ...(pause === undefined ? {} : { human: pause }),
         fallback: strategy.fallback,
       };
@@ -12922,6 +13817,7 @@ export async function runNode(
     ...(inner === undefined ? {} : { inner }),
     ...(storeRecords.length === 0 ? {} : { stores: [...storeRecords] }),
     ...(models === undefined ? {} : { models }),
+    ...(harness === undefined ? {} : { harness }),
     ...(pause === undefined ? {} : { human: pause }),
     ...(absorbed === undefined ? {} : { error: absorbed }),
   };

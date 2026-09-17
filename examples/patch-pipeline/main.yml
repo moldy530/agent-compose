@@ -1,0 +1,40 @@
+# examples/patch-pipeline — a graph that carries coding agents (PRD resolved q57).
+#
+# Exercises: the `coder:` node kind under **both** v1 harnesses, the two
+# containment presets that differ (`workspace_write` for the harness that edits,
+# `read_only` for the one that reviews), an `allow_tools:` list and the
+# enforcement asymmetry between the two harnesses, harness `settings:` in both of
+# Decision D140's tiers, a scrubbed `env:`, the §9.1 policy chain wrapping a
+# whole run, and a bounded revise cycle between two harness runs.
+#
+# What it is *not*: an example of how to reach a model. That is `review-loop`.
+# Here `model:` is the registry address and nothing else crosses the boundary —
+# the harness owns its client, its auth and its own retries (grammar 8.9).
+#
+# Entrypoint: the only file that may declare `imports:` (grammar 1.4).
+version: "0.1"
+
+imports:
+  - providers.yml
+  - models.yml
+  - flows/patch.yml
+  - triggers.yml
+
+# Project-wide node policy: level 3 of the resolution chain (grammar 9.3). A
+# harness run is one activity, so this bound is the whole run's — the harness's
+# own internal retries are below it and invisible here.
+defaults:
+  on_error: fail
+
+# Shared graph state. `verdict` is deliberately NOT a channel: it stays
+# node-scoped and is read by the edge guards as `review.output.verdict`
+# (grammar 8.0, 10.3).
+state:
+  summary:
+    description: What the implementing run says it changed.
+    type: string
+    default: ""
+  feedback:
+    description: The reviewing run's most recent notes, fed back into the next pass.
+    type: string
+    default: ""

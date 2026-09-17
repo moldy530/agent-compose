@@ -1,0 +1,46 @@
+# rule: a `coder:` node's `settings:` key spelling an option the adapter owns is
+# rule: warned about and dropped, not carried (grammar 8.9, D140)
+# code: unknown-harness-setting
+# message: `extraArgs` is not a `harness: cc` setting this release can check, so its value is unverified
+# at: main.yml:40:11
+# label: main.yml:34:18 the harness is bound here
+# help: `extraArgs` is an option the generated adapter owns, so it is dropped rather than passed: what it would reach around is what `workspace:`, `access:`, `env:`, `output:`, `prompt:`, `allow_tools:`, `timeout:` and `model:` state, and the bound is the node's (grammar 8.9, Decision D140)
+#
+# Decision D140's other half, and the one an author has to be told apart from
+# the first: unchecked is not unbounded. `extraArgs` is the Agent SDK's
+# arbitrary-CLI-flag option, so a key here would carry
+# `dangerously-skip-permissions` and an extra `add-dir` past the `access:` and
+# `workspace:` this very node states — through the one surface the grammar
+# leaves open. The adapter drops it, and the warning says which of the two
+# happened, because a key that never reached the SDK and a key that reached it
+# unchecked are different things to go looking for.
+#
+# The composition still builds: what the node asked for is what the node gets.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: Read the tree and report.
+        settings:
+          extraArgs: { add-dir: / }
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

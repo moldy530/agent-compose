@@ -117,6 +117,10 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::MismatchedServerTools => {
             include_str!("codes/mismatched-server-tools.md")
         }
+        DiagnosticCode::UnsupportedHarness => include_str!("codes/unsupported-harness.md"),
+        DiagnosticCode::UnknownHarnessSetting => {
+            include_str!("codes/unknown-harness-setting.md")
+        }
         DiagnosticCode::DeadEnd => include_str!("codes/dead-end.md"),
         DiagnosticCode::UnboundedCycle => include_str!("codes/unbounded-cycle.md"),
         DiagnosticCode::UnbalancedConvergence => include_str!("codes/unbalanced-convergence.md"),

@@ -2,10 +2,11 @@
 
 use crate::diag::{Span, Spanned};
 
-use super::binding::{Bindings, ExecBlock, HttpBlock, NodeInput, Writes};
+use super::binding::{Bindings, ExecBlock, HttpBlock, InterpolatedEntry, NodeInput, Writes};
 use super::common::{
-    Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, PathExpr,
+    Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Interpolated, PathExpr,
 };
+use super::definition::Settings;
 use super::policy::{PolicyBlock, Retry};
 use super::schema::FieldMap;
 
@@ -46,7 +47,7 @@ pub struct Node {
     pub span: Span,
 }
 
-/// The eight node kinds (grammar 7.1, Decision D23).
+/// The nine node kinds (grammar 7.1, Decisions D23, D136).
 ///
 /// The variants differ in size because the constructs do — a `map:` block
 /// carries a dispatch form, per-item bindings, and a policy, while an `agent:`
@@ -58,6 +59,8 @@ pub struct Node {
 pub enum NodeKind {
     /// `agent: agent.*`
     Agent(Spanned<Address>),
+    /// `coder: { ... }` — a coding-agent harness, run as one node (grammar 8.9).
+    Coder(Box<CoderBlock>),
     /// `exec: { ... }`
     Exec(ExecBlock),
     /// `http: { ... }`
@@ -83,6 +86,7 @@ impl NodeKind {
     pub const fn key(&self) -> &'static str {
         match self {
             Self::Agent(_) => "agent",
+            Self::Coder(_) => "coder",
             Self::Exec(_) => "exec",
             Self::Http(_) => "http",
             Self::Function(_) => "function",
@@ -97,8 +101,144 @@ impl NodeKind {
 
 /// Every node kind key, in the order grammar 7.1 lists them.
 pub const NODE_KIND_KEYS: &[&str] = &[
-    "agent", "exec", "http", "function", "flow", "map", "human", "store",
+    "agent", "coder", "exec", "http", "function", "flow", "map", "human", "store",
 ];
+
+/// The coding-agent harnesses a `coder:` node may bind (grammar 8.9,
+/// Decision D136, PRD resolved q57).
+///
+/// A **closed** enum rather than an open name, and a *binding* rather than
+/// grammar: the spec never names an SDK type, so a composition reads identically
+/// whichever harness serves it, and a later harness is a member of this list
+/// rather than a new construct. Two of the four are reserved: they are spelled
+/// so that a composition written against them is refused by name and by scope
+/// rather than by a typo's suggestion list, which is the same posture grammar 15
+/// takes for every other reserved surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Harness {
+    /// `cc` — the Claude Agent SDK. Active in v1.
+    Cc,
+    /// `codex` — the Codex SDK. Active in v1.
+    Codex,
+    /// `deepagents` — RESERVED; refused by `validate` naming v1's scope.
+    DeepAgents,
+    /// `native` — RESERVED; refused by `validate` naming v1's scope.
+    Native,
+}
+
+impl Harness {
+    /// Every harness, in the order grammar 8.9 lists them.
+    pub const ALL: &'static [Self] = &[Self::Cc, Self::Codex, Self::DeepAgents, Self::Native];
+
+    /// The keyword `harness:` names it with.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cc => "cc",
+            Self::Codex => "codex",
+            Self::DeepAgents => "deepagents",
+            Self::Native => "native",
+        }
+    }
+
+    /// The harness spelled `keyword`, if it is one.
+    #[must_use]
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|harness| harness.as_str() == keyword)
+    }
+
+    /// Whether this release lowers the harness to a driver (PRD resolved q57).
+    #[must_use]
+    pub const fn ships_in_v1(self) -> bool {
+        matches!(self, Self::Cc | Self::Codex)
+    }
+}
+
+/// What a coder node's harness may do inside its workspace (grammar 8.9,
+/// Decision D138).
+///
+/// One vocabulary, mapped down per harness: `codex` has sandbox presets of
+/// exactly this shape, and the Agent SDK has a permission surface these three
+/// select a setting of. The names are this grammar's own — a spec never spells a
+/// vendor's — and the mapping is the adapter's.
+///
+/// The sentence each variant carries is what a preset *means*; **what holds it
+/// is stated per harness and never implied equivalent** (PRD resolved q57 ruling
+/// c). The two statements are the tables in `docs/grammar.md` §8.9 and the two
+/// drivers' own `CC_PERMISSION`/`CODEX_SANDBOX`, and they differ in kind: one
+/// harness holds `ReadOnly` at the operating system and the other holds it with
+/// a permission mode. An author reading only this enum has read half of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WorkspaceAccess {
+    /// Read the workspace; write nothing.
+    ReadOnly,
+    /// Read and write inside the workspace (the default).
+    WorkspaceWrite,
+    /// No containment beyond the working directory the harness is started in.
+    FullAccess,
+}
+
+impl WorkspaceAccess {
+    /// Every access level, in the order grammar 8.9 lists them.
+    pub const ALL: &'static [Self] = &[Self::ReadOnly, Self::WorkspaceWrite, Self::FullAccess];
+
+    /// The keyword `access:` names it with.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::WorkspaceWrite => "workspace_write",
+            Self::FullAccess => "full_access",
+        }
+    }
+
+    /// The access level spelled `keyword`, if it is one.
+    #[must_use]
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|access| access.as_str() == keyword)
+    }
+}
+
+/// A `coder:` block: one run of a coding-agent harness (grammar 8.9,
+/// Decision D136, PRD resolved q57).
+///
+/// The surfaces sit *inside* the block, as a `human:` node's do, because the
+/// construct has no definition of its own to carry them: a coder node is the
+/// whole component, declared where it is used.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoderBlock {
+    /// `harness:` — which harness runs it. Required.
+    pub harness: Option<Spanned<Harness>>,
+    /// `model:` — a `model.*` address, exactly as an agent node spells it.
+    pub model: Option<Spanned<Address>>,
+    /// `workspace:` — the root the run works inside. **Required**, and
+    /// interpolable (grammar 4.3 class 2).
+    pub workspace: Option<Spanned<Interpolated>>,
+    /// `access:` — the containment preset; absent means `workspace_write`.
+    pub access: Option<Spanned<WorkspaceAccess>>,
+    /// `prompt:` — required, literal text (Decision D13's rule, one surface on).
+    pub prompt: Option<Spanned<String>>,
+    /// `input:` — the declared input surface; absent means string-in (§5.3).
+    pub input: Option<FieldMap>,
+    /// `output:` — required; the structured answer the gate parses.
+    pub output: Option<FieldMap>,
+    /// `allow_tools:` — the harness tool names the run may use.
+    pub allow_tools: Vec<Spanned<String>>,
+    /// `env:` — the scrubbed environment the harness runs with (q54 ruling b).
+    pub env: Vec<InterpolatedEntry>,
+    /// `inherit_env:` — absent means `false`.
+    pub inherit_env: Option<Spanned<bool>>,
+    /// `settings:` — harness config, held on Decision D140's two tiers.
+    pub settings: Option<Settings>,
+    /// The block's own span.
+    pub span: Span,
+}
 
 /// Conversation-history scoping on a `flow:` node (grammar 8.5, Decision D27).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

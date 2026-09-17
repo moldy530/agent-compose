@@ -35,6 +35,8 @@ import { createHash } from "node:crypto";
 
 import type {
   DispatchRecord,
+  HarnessRecord,
+  HarnessUsage,
   HumanPause,
   ModelCall,
   StoreRecord,
@@ -59,6 +61,7 @@ export type OtlpValue =
   | { readonly stringValue: string }
   | { readonly boolValue: boolean }
   | { readonly intValue: string }
+  | { readonly doubleValue: number }
   | { readonly arrayValue: { readonly values: readonly OtlpValue[] } };
 
 /** One `key`/`value` pair, as every OTLP attribute list holds them. */
@@ -373,6 +376,9 @@ function walk(
     (entry.models ?? []).forEach((call, made) => {
       modelSpan(state, entry, call, made, key, spanId);
     });
+    (entry.harness ?? []).forEach((run, made) => {
+      harnessSpan(state, run, made, key, spanId);
+    });
     dispatchSpans(state, entry.dispatches ?? [], key, spanId, "map");
     dispatchSpans(state, entry.toolDispatches ?? [], key, spanId, "tool");
     walk(state, entry.inner ?? [], path, key, spanId);
@@ -551,6 +557,111 @@ function modelSpan(
 }
 
 /**
+ * Emit one coding-harness run as a span under its entry, with its turns and its
+ * tool events as events (grammar §8.9, `docs/trace.md` §7.6, PRD resolved q57).
+ *
+ * `kind: 3` — a **client** span, for [`modelSpan`]'s reason: a harness run is
+ * work that leaves this process, and it is the one node kind where *all* of the
+ * model calls are made by somebody else. It is a span of its own rather than a
+ * model span with more attributes on it, for the reason `docs/trace.md` §7.6
+ * gives the record: a harness run is not an agent's tool loop, and a collector
+ * that summed the two would be summing calls this graph made with calls it did
+ * not.
+ *
+ * **Depth is the envelope's**, not this exporter's to widen: what reaches a
+ * collector is what the record carries, which is top-level turns and top-level
+ * tool events. A harness's subagent transcripts are journal payload and reach no
+ * delivery surface at all (`docs/trace.md` §11, `docs/durability.md` §8).
+ */
+function harnessSpan(
+  state: Emission,
+  run: HarnessRecord,
+  index: number,
+  entryKey: string,
+  entrySpan: string,
+): void {
+  const spanId = spanIdOf(
+    state.document.execution_id,
+    "harness",
+    `${entryKey}/harness/${index}`,
+  );
+  const events: OtlpEvent[] = [];
+  for (const turn of run.turns) {
+    events.push({
+      timeUnixNano: state.window.start,
+      name: "turn",
+      attributes: [
+        integer("agentcompose.harness.turn", turn.index),
+        ...usageAttributes(turn.usage),
+      ],
+    });
+  }
+  for (const made of run.toolCalls ?? []) {
+    events.push({
+      timeUnixNano: state.window.start,
+      name: "tool_call",
+      attributes: [
+        text("agentcompose.tool.name", made.name),
+        text("agentcompose.tool.outcome", made.outcome),
+        ...(made.error === undefined ? [] : [text("agentcompose.error", made.error)]),
+      ],
+    });
+  }
+  state.spans.push({
+    traceId: state.traceId,
+    spanId,
+    parentSpanId: entrySpan,
+    name: run.harness,
+    kind: 3,
+    startTimeUnixNano: state.window.start,
+    endTimeUnixNano: state.window.end,
+    attributes: [
+      text("agentcompose.harness", run.harness),
+      text("agentcompose.harness.sdk", run.sdk),
+      text("agentcompose.model", run.model),
+      text("agentcompose.harness.model_id", run.modelId),
+      text("agentcompose.harness.outcome", run.outcome),
+      integer("agentcompose.harness.turns", run.cost.turns),
+      ...(run.cost.inputTokens === undefined
+        ? []
+        : [integer("agentcompose.harness.input_tokens", run.cost.inputTokens)]),
+      ...(run.cost.outputTokens === undefined
+        ? []
+        : [integer("agentcompose.harness.output_tokens", run.cost.outputTokens)]),
+      ...(run.cost.usd === undefined
+        ? []
+        : [double("agentcompose.harness.cost_usd", run.cost.usd)]),
+      ...(run.error === undefined ? [] : [text("agentcompose.error", run.error)]),
+    ],
+    events,
+    links: [],
+    status:
+      run.outcome === "completed"
+        ? { code: 1 }
+        : { code: 2, ...(run.error === undefined ? {} : { message: run.error }) },
+  });
+}
+
+/** One turn's usage, as the attributes an event carries. */
+function usageAttributes(usage: HarnessUsage | undefined): OtlpAttribute[] {
+  if (usage === undefined) return [];
+  return [
+    ...(usage.inputTokens === undefined
+      ? []
+      : [integer("agentcompose.harness.input_tokens", usage.inputTokens)]),
+    ...(usage.cachedInputTokens === undefined
+      ? []
+      : [integer("agentcompose.harness.cached_input_tokens", usage.cachedInputTokens)]),
+    ...(usage.outputTokens === undefined
+      ? []
+      : [integer("agentcompose.harness.output_tokens", usage.outputTokens)]),
+    ...(usage.reasoningTokens === undefined
+      ? []
+      : [integer("agentcompose.harness.reasoning_tokens", usage.reasoningTokens)]),
+  ];
+}
+
+/**
  * One dispatch record's key: its entry's key, its carrier, its instance path and
  * its position in the array that held it.
  *
@@ -717,6 +828,17 @@ function text(key: string, value: string): OtlpAttribute {
 /** An `int64` attribute — a **string** on the wire, per proto3's JSON mapping. */
 function integer(key: string, value: number): OtlpAttribute {
   return { key, value: { intValue: String(Math.trunc(value)) } };
+}
+
+/**
+ * A `double` attribute — a JSON **number**, per proto3's JSON mapping.
+ *
+ * The one attribute family this exporter emits that is neither a string nor an
+ * integer: a harness's own cost estimate is fractional money, and rounding it to
+ * an integer would report every real run as zero.
+ */
+function double(key: string, value: number): OtlpAttribute {
+  return { key, value: { doubleValue: value } };
 }
 
 function strings(key: string, values: readonly string[]): OtlpAttribute {

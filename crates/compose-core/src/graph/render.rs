@@ -85,7 +85,7 @@ mod tests {
             !page.contains(PLACEHOLDER),
             "the placeholder is gone from the artifact"
         );
-        assert!(page.contains("\"graph_version\": 1"));
+        assert!(page.contains("\"graph_version\": 2"));
     }
 
     /// A `</script>` or a `<!--<script` inside a string never reaches the

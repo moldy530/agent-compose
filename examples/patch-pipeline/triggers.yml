@@ -1,0 +1,7 @@
+# The entrypoints of a project are exactly the flows its DECLARED triggers point
+# at (PRD 5.11). `agent-compose run flow.patch` works whether or not one names it
+# (grammar 13, Decision D64); this one is written out for clarity.
+triggers:
+  cli:
+    type: manual
+    flow: flow.patch

@@ -1,6 +1,6 @@
 # agent-compose — Graph Document
 
-**Graph version:** `1`
+**Graph version:** `2`
 **Status:** Normative for the document `agent-compose visualize` emits
 **Companion artifacts:** [`docs/grammar.md`](grammar.md) (the DSL this describes compositions of), [`docs/trace.md`](trace.md) (the same discipline over a run), [`prd.md`](../prd.md) §5.5, §5.6, §5.7, §5.8, §5.9, resolved q56
 
@@ -101,7 +101,7 @@ people paste into pull requests.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `graph_version` | integer | always | The format this document is written in. `1` is this document. It is the **first** key, so a consumer can dispatch on it before reading anything else. See [Stability](#9-stability). |
+| `graph_version` | integer | always | The format this document is written in. `2` is this document. It is the **first** key, so a consumer can dispatch on it before reading anything else. See [Stability](#9-stability). |
 | `entrypoint` | string | always | The spec entrypoint, relative to the project root — the IR's own `entrypoint` (grammar §1.4). |
 | `target` | string | always | The deploy target the composition was resolved for. `visualize` takes no `--target`, so it is the built-in `local` (grammar §14); the key is written all the same, because a reader of the document should not have to know which verb produced it. |
 | `spec_version` | string | always | The DSL version the composition declares (grammar §1.3). |
@@ -204,6 +204,7 @@ Four small records the rest of the document is built from.
 | `policy` | [policy](#52-policy) | on every node of the flow; absent on the pseudo-nodes and on satellites | Grammar §9.3's chain, resolved. A satellite carries none because the dispatch has no policy of its own: what governs it is the map's `on_item_error` and the map node's own `policy` (grammar §8.6 rules 9, 10). |
 | `schemas` | [schemas](#53-schemas) | when the node has at least one of the two | What the node is handed and what it answers with. Absent on the pseudo-nodes, and on a `map`, which declares no surface of its own. |
 | `agent` | [agent](#8-agents) | `agent` nodes, and satellites whose target is an `agent.*` | The resolved agent: model, tools, prompt. |
+| `coder` | [coder](#58-a-harness-run) | `coder` nodes | The harness run: which harness, what contains it, and the resolved model (grammar §8.9). |
 | `tool` | [tool](#81-a-tool) | `function` nodes, and satellites whose target is a `tool.*` | The tool this node invokes (grammar §6). |
 | `exec` | [exec](#54-exec-and-http) | nodes bound to an `exec:` block, inline or through a `tool.*` | The subprocess step (grammar §6.1, §8.2). |
 | `http` | [http](#54-exec-and-http) | nodes bound to an `http:` block, inline or through a `tool.*` | The request (grammar §6.1, §8.3). |
@@ -213,12 +214,14 @@ Four small records the rest of the document is built from.
 | `map` | [map](#7-fan-out) | `map` nodes | The fan-out (grammar §8.6). |
 | `dispatch` | [dispatch](#71-a-satellite) | satellites | Which map dispatched this node, and on what. |
 
-`kind` is one of `"start"`, `"end"`, `"agent"`, `"function"`, `"exec"`,
-`"http"`, `"human"`, `"store"`, `"flow"`, `"map"` — grammar §7.1's eight, plus
-the two pseudo-nodes. Every one of them MUST render distinguishably, which is
-the content requirement PRD resolved q56 states. A satellite takes the kind of
-its **target**: a `tool.*` dispatched by a map is invoked the way a `function:`
-node invokes one, so it is `"function"`.
+`kind` is one of `"start"`, `"end"`, `"agent"`, `"coder"`, `"function"`,
+`"exec"`, `"http"`, `"human"`, `"store"`, `"flow"`, `"map"` — grammar §7.1's
+nine, plus the two pseudo-nodes. Every one of them MUST render distinguishably,
+which is the content requirement PRD resolved q56 states. A satellite takes the
+kind of its **target**: a `tool.*` dispatched by a map is invoked the way a
+`function:` node invokes one, so it is `"function"`. No satellite is ever
+`"coder"`: a `map` dispatches to a **component** (grammar §8.6, Decision D29),
+and a coder node is declared in a flow rather than defined.
 
 ### 5.1 Input bindings
 
@@ -259,7 +262,7 @@ budget is written down instead.
 
 | field | type | presence | meaning |
 |---|---|---|---|
-| `input` | [schema](#4-schemas-and-bindings) | when the construct has a declared input surface — `agent`, `function`, `flow` and `human` nodes, and satellites | What the node is handed. Absent on the inline blocks, which bind an object rather than declaring a surface. |
+| `input` | [schema](#4-schemas-and-bindings) | when the construct has a declared input surface — `agent`, `coder`, `function`, `flow` and `human` nodes, and satellites | What the node is handed. Absent on the inline blocks, which bind an object rather than declaring a surface. A `coder` node's carries `source: "string_input"` where its block declares no `input:`, exactly as a string-in agent's does (grammar §8.9, §5.3). |
 | `output` | [schema](#4-schemas-and-bindings) | on every kind but `map` | What the node answers with. |
 
 ### 5.4 `exec` and `http`
@@ -304,6 +307,30 @@ always present; the rest follow the same rule.
 |---|---|---|---|
 | `timeout` | string | when the block declares one | The wait's budget. Absent means the wait is unbounded. |
 | `on_timeout` | string | when the block declares one | Where control transfers on expiry: a node id, or `end`. Jointly optional and jointly required with `timeout`, and drawn as a [`timeout` edge](#6-edges). |
+
+---
+
+### 5.8 A harness run
+
+`CoderView` (grammar §8.9, PRD resolved q57).
+
+**The harness is named**, which is PRD resolved q56's content requirement read
+for this kind. Two coder nodes side by side are two different agent loops with
+two different containment stories, and a picture that drew them identically would
+be hiding the one fact a reader most needs.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `harness` | `"cc"` \| `"codex"` | always | Which harness runs it. The two reserved names of grammar §15 are not members: `visualize` validates first, and `validate` refuses a composition that binds one. |
+| `model` | [model](#8-agents) | always | The `model.*` resolved exactly as an agent's is. It is always the **direct** form here: a route is refused at this position (grammar §12.2, Decision D141). |
+| `workspace` | string | always | `workspace:`, exactly as written — an `${ENV}` reference reaches this document unresolved like every other (§10). |
+| `access` | `"read_only"` \| `"workspace_write"` \| `"full_access"` | always | The containment preset, **with the default materialized**: a node that omits `access:` reads `"workspace_write"` here. This document answers the question rather than leaving it (§1), and it is a containment claim, so a reader should not have to know which way the grammar's default falls. |
+| `prompt` | string | always | The run's instructions, verbatim. |
+| `allow_tools` | array of strings | when the node declares any | The harness tool names the run may use, in declaration order. Absent means the harness's own default set. |
+| `tools_enforced` | boolean | always | Whether this harness enforces `allow_tools` **inside its own loop** rather than bounding at its sandbox alone. It is a fact about the *harness* and is in no composition, which is why it is here: two nodes with identical lists are not under identical bounds, and PRD resolved q57 ruling c makes stating that this document's job. |
+| `env` | array of [bindings](#4-schemas-and-bindings) | when the node declares any | `env:`, in declaration order, values as written. Absent means a wholly scrubbed child environment. |
+| `inherit_env` | boolean | always | `inherit_env:`, with the default materialized for `access`'s reason: `false` is the containment claim. |
+| `settings` | array of [settings](#8-agents) | when the node declares any | The harness config **in declaration order**, each value reaching JSON as JSON — the same treatment a model's `settings:` get, in a different order: a model's reach this document sorted by key, and this block's are held as written (§9.1). |
 
 ---
 
@@ -458,6 +485,7 @@ At a given `graph_version`, a reader MAY rely on:
   produces, and where a cell does not, the key is present only with something in
   it;
 * the vocabularies of the closed enumerations: `GraphNode.kind`,
+  `CoderView.harness`, `CoderView.access`,
   `GraphEdge.class`, `SchemaView.source`, `ToolView.source` and `RetryView.level`
   — which `TimeoutView.level` and `OnErrorView.level` share — plus
   `InputView.form`, `OnErrorView.strategy`, `ItemErrorView.strategy`,
@@ -467,8 +495,9 @@ At a given `graph_version`, a reader MAY rely on:
 * the orders this document fixes — `flows` by address, a flow's `nodes` in
   declaration order with each satellite after its map, `edges` as §6 states,
   `routes` with `default:` last, a model's `route` in failover order, a
-  provider's `config` and a model's `settings` by key, and every field map in
-  declaration order;
+  provider's `config` and a model's `settings` by key, a coder node's
+  `settings`, `env` and `allow_tools` in declaration order, and every field map
+  in declaration order;
 * that `id` is unique within a flow, that every `from` and `to` names a node the
   same flow's `nodes` array holds, and that a `map_route` edge's `to` is the
   `node` of one of that map's `routes`.
@@ -499,6 +528,17 @@ Compatible, and made **without** a version bump:
   and the compiler was not carrying — a bug in the implementation of this format
   rather than a change to it;
 * improving the text of a summarized field.
+
+### 9.2.1 What version `2` changed
+
+PRD resolved q57's `coder:` node kind (grammar §8.9) added a member to
+`GraphNode.kind`, which §9.3 makes a **bump** rather than an addition: a reader
+written against `1` was entitled to the ten kinds that version named, and an
+eleventh makes it wrong. Nothing else moved. [`CoderView`](#58-a-harness-run) and
+the [`coder`](#5-nodes) key that reaches it are a new record type and a new
+field, both compatible on their own under §9.2; they ride this bump because they
+arrived with the member that forced one. A composition with no `coder:` node
+produces a byte-identical document but for its `graph_version`.
 
 ### 9.3 What requires a version bump
 

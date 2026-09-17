@@ -1,0 +1,35 @@
+# rule: a coder node that declares no `input:` is string-in, and the node must
+# rule: bind that one unnamed value (grammar 8.9, 5.3, D137, D88)
+# code: missing-binding
+# message: node `build` is a string-in coder node and must bind its input
+# at: main.yml:26:7
+# help: a `coder:` block that declares no `input:` takes a single unnamed string, bound at the node as `input: "<CEL>"` (grammar 8.9, Decisions D137, D88)
+#
+# The first diagnostic an author writing their first coder node meets, so it
+# names the construct they are looking at: the surfaces of a coder node are
+# declared in its own block, and there is no `agent.*` anywhere in this file to
+# send a reader to.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

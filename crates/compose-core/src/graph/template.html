@@ -17,6 +17,7 @@
   --warn: #b04a3e;
   --k-agent: #6d4fc9; --k-function: #a06e1f; --k-exec: #59741a; --k-http: #2f6dbb;
   --k-human: #ba4a70; --k-store: #3a8a4e; --k-flow: #0e7d6b; --k-map: #7a8a85;
+  --k-coder: #b5451f;
   --chip: #ffffff;
   --shadow: 0 1px 3px rgba(20, 35, 30, .10), 0 4px 14px rgba(20, 35, 30, .06);
 }
@@ -29,6 +30,7 @@
     --warn: #d97a6c;
     --k-agent: #a48ae8; --k-function: #d9a44a; --k-exec: #aac95a; --k-http: #6ba3e8;
     --k-human: #e08aa5; --k-store: #6fc287; --k-flow: #3fbfa5; --k-map: #8ca09a;
+    --k-coder: #ef8259;
     --chip: #1a211f;
     --shadow: 0 1px 3px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
   }
@@ -41,6 +43,7 @@
   --warn: #d97a6c;
   --k-agent: #a48ae8; --k-function: #d9a44a; --k-exec: #aac95a; --k-http: #6ba3e8;
   --k-human: #e08aa5; --k-store: #6fc287; --k-flow: #3fbfa5; --k-map: #8ca09a;
+  --k-coder: #ef8259;
   --chip: #1a211f;
   --shadow: 0 1px 3px rgba(0, 0, 0, .4), 0 4px 14px rgba(0, 0, 0, .3);
 }
@@ -269,6 +272,7 @@ const KIND = {
   start:    { color: "var(--k-map)",      label: "START" },
   end:      { color: "var(--k-map)",      label: "END" },
   agent:    { color: "var(--k-agent)",    label: "AGENT" },
+  coder:    { color: "var(--k-coder)",    label: "CODER" },
   function: { color: "var(--k-function)", label: "TOOL" },
   exec:     { color: "var(--k-exec)",     label: "EXEC" },
   http:     { color: "var(--k-http)",     label: "HTTP" },
@@ -278,8 +282,9 @@ const KIND = {
   map:      { color: "var(--k-map)",      label: "MAP" }
 };
 const LEGEND = [
-  ["agent", "agent"], ["function", "tool"], ["exec", "exec"], ["http", "http"],
-  ["human", "human"], ["store", "store"], ["flow", "subgraph"], ["map", "map"]
+  ["agent", "agent"], ["coder", "coder"], ["function", "tool"], ["exec", "exec"],
+  ["http", "http"], ["human", "human"], ["store", "store"], ["flow", "subgraph"],
+  ["map", "map"]
 ];
 
 /* ---------------------------------------------------------------------------
@@ -990,6 +995,27 @@ function select(id) {
       html += pairs([["max_tool_iterations", node.agent.max_tool_iterations]]);
     }
   }
+  if (node.coder) {
+    /* The harness first, because it is the fact two coder nodes differ by, then
+     * the containment the run is held inside. `tools_enforced` is the asymmetry
+     * grammar 8.9 states out loud: an allowlist a harness bounds at the sandbox
+     * rather than in its own loop is not the same bound, and the page says so
+     * where a reader is looking at the list. */
+    const allowed = list(node.coder.allow_tools);
+    html += "<h3>Harness</h3>" + pairs([
+      ["harness", node.coder.harness],
+      ["workspace", node.coder.workspace],
+      ["access", node.coder.access],
+      ["inherit_env", String(node.coder.inherit_env)]
+    ].concat(allowed.length
+      ? [["allow_tools", allowed.join(", ") +
+          (node.coder.tools_enforced ? " (enforced in-loop)" : " (sandbox bound only)")]]
+      : [])
+      .concat(list(node.coder.env).map(entry => ["env." + entry.name, entry.expression]))
+      .concat(list(node.coder.settings).map(entry =>
+        ["settings." + entry.name, JSON.stringify(entry.value)])));
+    html += "<h3>Model</h3>" + modelRows(node.coder.model);
+  }
   if (node.tool) html += "<h3>Tool</h3>" + toolRows([node.tool]);
   if (node.exec) {
     const args = list(node.exec.args), statuses = list(node.exec.expect_exit);
@@ -1072,6 +1098,10 @@ function select(id) {
       (held.timeout ? [["timeout", held.timeout]] : [])
         .concat(held.on_error ? [["on_error", held.on_error]] : [])
         .concat(held.retry ? [["retry", "max " + held.retry.max + ", backoff " + held.retry.backoff]] : []));
+  }
+  if (node.coder && node.coder.prompt) {
+    html += '<details class="prompt"><summary>Prompt</summary>' +
+      '<pre class="block" style="white-space:pre-wrap">' + esc(node.coder.prompt) + "</pre></details>";
   }
   if (node.agent && node.agent.prompt) {
     html += '<h3>Prompt</h3><details class="prompt"><summary>show prompt</summary>' +
