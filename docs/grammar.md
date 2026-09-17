@@ -3016,7 +3016,6 @@ implement:
     allow_tools: [Bash, Edit, Read, Write]
     env:
       PATH: "/usr/bin:/bin"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
     settings:
       max_turns: 60
   input:
@@ -3030,7 +3029,7 @@ implement:
 | Key | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `harness` | enum `cc codex deepagents native` | **yes** | — | which harness runs it; the last two are RESERVED (§15) |
-| `model` | `model.*` ref | **yes** | — | the registry address, exactly as an agent node spells it (§12.2); a **route** is refused ([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)) |
+| `model` | `model.*` ref | **yes** | — | the registry address, exactly as an agent node spells it (§12.2); a **route** is refused ([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)) |
 | `workspace` | string (non-empty, interpolable) | **yes** | — | the root this run works inside; §4.3 class 2 |
 | `access` | enum `read_only workspace_write full_access` | no | `workspace_write` | the containment preset ([D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)) |
 | `prompt` | string (non-empty) | **yes** | — | the run's instructions; literal text, no templating ([D13](#d13-prompt-is-required-and-literal)) |
@@ -3140,11 +3139,15 @@ instead of choosing a meaning for it ([D138](#d138-a-coder-nodes-containment-is-
 A run that may call no tools at all is an `agent:` node (§5), not a harness run.
 
 **`env:` is PRD resolved q54 ruling b, verbatim.** The harness and everything it
-forks run with a **scrubbed** environment holding only the declared variables,
-which is what keeps a placement's environment manifest the whole answer to what a
-machine is asked for; `inherit_env: true` is the explicit opt-in for the machines
-where inheriting is the point. A harness's own credential is an `${ENV}`
-reference in this map like every other secret (§4.3).
+forks run with a **scrubbed** environment holding only the declared variables and
+whatever the model's connection maps in (below), which is what keeps a
+placement's environment manifest the whole answer to what a machine is asked for;
+`inherit_env: true` is the explicit opt-in for the machines where inheriting is
+the point. What belongs here is what the *program* needs — a `PATH`, a proxy
+setting, a token some tool the run shells out to reads — each an `${ENV}`
+reference like every other secret (§4.3). The harness's own credential does
+**not**: it is the connection's, it arrives because the node named a `model.*`,
+and writing it here as well is a compile error.
 
 **And what does not bound it.** §5.5's built-in tools are bounded by their
 workspace and their timeout because *this runtime* implements them. A harness
@@ -3159,21 +3162,62 @@ host; a coder node holds it too, through a loop this compiler does not drive.
 That is the trade the kind exists to make, and it is stated here rather than
 discovered.
 
-#### The model, and what stops at the boundary
+#### The model, its connection, and what stops at the boundary
 
-`model:` is the registry address (§12.2), and the adapter resolves it to two
-things: the provider-native **id**, and the small subset of that model's
-`settings:` the harness has a place for — `thinking:` for `cc`, whose
-`budget_tokens` is its thinking budget, and `reasoning_effort:` for `codex`.
+`model:` is the registry address (§12.2), and the adapter resolves it to three
+things: the provider-native **id**; the small subset of that model's `settings:`
+the harness has a place for — `thinking:` for `cc`, whose `budget_tokens` is its
+thinking budget, and `reasoning_effort:` for `codex`; and the **connection facts**
+of the `provider.*` behind it.
 
-Everything else about the connection stops here. `provider.*`'s `base_url:`, its
-headers and its credential; a **route**'s failover ladder; and the
-structured-output mechanism ladder the runtime discovers per endpoint — none of
-them reaches inside a run, because the harness owns its client, its auth and its
-own internal retries. §12.2 states the exemption where the failover promise is
-made, and `model:` naming a route is a compile error rather than a ladder
-silently reduced to its first member
-([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)).
+**The connection crosses.** `base_url:`, the credential and `headers:` are the
+three keys of a provider that say where a client goes and how it authenticates
+(§12.1), and each harness SDK takes an endpoint and a credential precisely so
+that a client can be pointed. So they are mapped into the harness's own
+connection surface, through a table **per harness**:
+
+| fact | `cc` | `codex` |
+|---|---|---|
+| `base_url:` | `ANTHROPIC_BASE_URL` in the run's environment | the SDK client's base-URL option |
+| `api_key:` | `ANTHROPIC_API_KEY` in the run's environment | the SDK client's API-key option |
+| `headers:` | `ANTHROPIC_CUSTOM_HEADERS` in the run's environment, one `Name: value` per line | **nothing** — this SDK's connection surface has no header slot, and the composition is refused rather than handed a faked one |
+
+That table is the whole of what crosses, and three rules come with it
+([D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)):
+
+* **an absent fact sets nothing.** A provider that declares no `api_key:` — the
+  gateway shape §12.1 admits, where the proxy injects the vendor credential
+  server-side — injects **no** credential into the run. Not an empty one: the
+  same sentence §12.1 makes about the wire, one construct along;
+* **a declared fact the bound harness has no slot for is a compile error**
+  (`unsupported-connection-fact`) naming the fact and the harness. It is not
+  dropped with a warning the way an unverified `settings:` key is, and the
+  difference is what the value decides: an option nothing reads costs a feature,
+  and an endpoint or a credential that silently went missing costs a `401` on the
+  first live call, discovered in production;
+* **one spelling per fact.** A node `env:` entry naming a variable the table
+  would set is a compile error (`conflicting-connection-variable`) naming both
+  sources. There is no precedence rule to learn and nothing is shadowed
+  silently; an author who wants one node on a different endpoint defines another
+  `provider.*`, which is what §12.1 means by providers being cheap.
+
+Which is why a coder node's `env:` holds what the *program* needs — a `PATH`, a
+proxy variable, a token some tool it shells out to reads — and not the harness's
+own credential. That one is the provider's, and it arrives because the node named
+a `model.*`.
+
+**What still stops here.** A **route**'s failover ladder does not cross:
+failover is a property of the caller that issues a request, a harness issues its
+own and retries them itself, and `model:` naming a route is a compile error
+rather than a ladder silently reduced to its first member
+([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)).
+Neither does the structured-output mechanism ladder the runtime discovers per
+endpoint, for the same reason read one layer in: the harness composes its own
+request and asks for its own output format. Nor does the rest of a model's
+`settings:`, which is a *request's* vocabulary — a temperature, a token cap, a
+`stop` sequence — and a harness composes no request this compiler wrote. §12.2
+states the exemption where the failover promise is made, so a reader meets it
+there rather than only here.
 
 **Structured output rides the harness's own mechanism** — a JSON-Schema output
 format on `cc`, an output schema on `codex` — under the lowering discipline PRD
@@ -3212,7 +3256,7 @@ an unverified key that spells an SDK option it owns — the working directory, t
 permission mode or sandbox preset, the environment, the output schema, the
 system prompt, the tool allowlist and its callback, the abort signal, the model
 and the one model setting
-[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)
 maps into it. Those are `workspace:`, `access:`, `env:`, `output:`, `prompt:`,
 `allow_tools:`, `timeout:` and `model:` respectively, and a key here cannot
 reach around the construct that states them. The curated keys of the tier above
@@ -3226,7 +3270,7 @@ object carrying permission rules, additional roots beside the working directory,
 sandbox configuration, MCP servers and agent definitions that put a tool or a
 whole loop within reach of a run whose `allow_tools:` never mentioned it, hooks
 and permission handlers that move the decision somewhere else, a fallback model
-where [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)
+where [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)
 stops the connection — and each of those is dropped too. So is the option that
 says **which executable the harness itself is**, or what its language runtime
 loads before it: a key there does not widen one bound, it replaces or re-arms the
@@ -4289,18 +4333,26 @@ Rules (PRD 5.9):
   Failover conditions are infrastructure conditions only; content-based routing
   is out of scope — that is what graph edges are for.
 
-**One position is exempt from every promise on this page, and it is stated here
-rather than only where it is written.** A `coder:` node's `model:` (§8.9) is a
-registry address and nothing more: the adapter reads the **id** off it, plus the
-small settings subset the bound harness has a place for, and hands those to the
-harness. The *connection* does not cross — `provider.*`'s `base_url:`, its
-`headers:` and its credential are this runtime's client's, and a harness opens
-its own — and neither does a **route**: failover is a property of the caller that
+**One position is exempt from the failover promise on this page, and it is
+stated here rather than only where it is written.** A `coder:` node's `model:`
+(§8.9) is a registry address, and what the adapter reads off it is the **id**,
+the small settings subset the bound harness has a place for, and the
+**connection** of the `provider.*` behind it — its `base_url:`, its credential and
+its `headers:`, mapped into the harness's own connection surface by a curated
+table per harness (Decision
+[D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)).
+That much crosses, which is what keeps §12.1's one-line gateway edit true for a
+coder node as well as for an agent.
+
+What does **not** cross is a **route**: failover is a property of the caller that
 issues a request, and a harness issues its own and retries them itself. So a
-`route:` at that position is a compile error rather than a ladder quietly
-reduced to its first member, and what re-runs a failed harness run is the node's
-own `retry:` (§9.1, PRD resolved q57 ruling d, Decision
-[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-connection-stops-at-the-boundary)).
+`route:` at that position is a compile error rather than a ladder quietly reduced
+to its first member, and what re-runs a failed harness run is the node's own
+`retry:` (§9.1, PRD resolved q57 ruling d as resolved q58 amends it, Decisions
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)
+and [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)).
+The rest of a model's `settings:` does not cross either: those keys shape a
+*request*, and the requests a harness run makes are the harness's own.
 
 ---
 
@@ -8645,31 +8697,47 @@ bounds are not up for renegotiation from inside it.
 **Status**: ratified — PRD resolved q57 ruling e. *PRD 5.9,
 resolved q30, q57; §8.9.*
 
-### D141. A coder node's `model:` is a registry address, and the connection stops at the boundary
+### D141. A coder node's `model:` is a registry address, and the ladders stop at the boundary
 
-**PRD-extending** — see this appendix's preamble.
+**PRD-extending** — see this appendix's preamble. **Amended 2026-09-17** by
+[D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table),
+which is PRD resolved q58: this entry originally read *"and the connection stops
+at the boundary"*, and the connection facts — `base_url:`, the credential,
+`headers:` — now cross. What stops is what this entry's own rationale is about,
+and that half is unchanged. The amended text follows; the superseded sentence is
+quoted at the end so a reader of an older citation can see what moved.
 
 `model:` on a `coder:` node is a `model.*` address spelled exactly as an agent
-node spells it (§12.2). The adapter resolves it to the provider-native **id**
-plus the settings subset the bound harness accepts — `thinking:` for `cc`,
-`reasoning_effort:` for `codex` — and nothing else crosses. A `model:` naming a
-**route** is a compile error.
+node spells it (§12.2). The adapter resolves it to the provider-native **id**,
+the settings subset the bound harness accepts — `thinking:` for `cc`,
+`reasoning_effort:` for `codex` — and the provider's **connection facts**, mapped
+by [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)'s
+table. A `model:` naming a **route** is a compile error.
 
-**Rationale**: the harness owns its client, its auth and its internal retries, so
-there is nothing on the other side of this boundary for a `base_url:`, a header,
-a credential or a failover ladder to be applied to. Taking a route's first member
-is the shape this refusal exists to prevent: a composition would declare a
-failover policy, read as though it had one, and have none — the class of silent
-disagreement this compiler exists to make unwritable. What re-runs a failed
-harness run is the node's `retry:` (§9.1), which is a ladder over whole runs
-rather than over requests.
+**Rationale**: a failover ladder is a property of the caller that issues a
+request, and a harness issues its own and retries them itself, so there is
+nothing on the other side of this boundary for a route to be applied to. Taking a
+route's first member is the shape this refusal exists to prevent: a composition
+would declare a failover policy, read as though it had one, and have none — the
+class of silent disagreement this compiler exists to make unwritable. What
+re-runs a failed harness run is the node's `retry:` (§9.1), which is a ladder
+over whole runs rather than over requests. The structured-output mechanism ladder
+the runtime discovers per endpoint stops here for the same reason: the harness
+composes its own request and asks for its own output format.
 
 The **address** is still what the composition names, which is what keeps PRD
 5.9's promise intact: swapping the model a coder node runs is a one-line edit in
 `models.yml`, exactly as it is for an agent. §12.2 states the exemption where the
 failover promise is made, so a reader meets it there rather than only here.
-**Status**: ratified — PRD resolved q57 ruling d. *PRD 5.9, resolved q53, q57;
-§8.9, §12.2.*
+
+**What the amendment replaced**, verbatim: *"the harness owns its client, its
+auth and its internal retries, so there is nothing on the other side of this
+boundary for a `base_url:`, a header, a credential or a failover ladder to be
+applied to."* The harness does own its client — what D143 changed is that a
+client can be **pointed**, and every harness SDK this release pins takes an
+endpoint and a credential precisely so that it can be.
+**Status**: ratified — PRD resolved q57 ruling d, amended by resolved q58.
+*PRD 5.9, resolved q25, q53, q57, q58; §8.9, §12.2.*
 
 ### D142. The policy chain wraps a whole harness run, and harness-native resume is excluded
 
@@ -8698,6 +8766,68 @@ replays to the frontier — a local store on the wrong machine is no history at
 all. The stores are debugging backstops, and a partial run's cost is the accepted
 price of that invariant. **Status**: ratified — PRD resolved q57 ruling b.
 *PRD 5.11, resolved q26–q29, q42, q44, q57; §9.1, §9.3.*
+
+### D143. A coder node's provider connection crosses, through a per-harness table
+
+**PRD-extending** — see this appendix's preamble. Amends
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary).
+
+The **connection facts** of the provider a `coder:` node's `model:` resolves to —
+`base_url:`, the credential, and `headers:` — cross into the harness run, mapped
+into that harness's own connection surface by a **curated table per harness**:
+
+| fact | `cc` | `codex` |
+|---|---|---|
+| `base_url:` | the `ANTHROPIC_BASE_URL` environment variable | the SDK client's `baseUrl` option |
+| `api_key:` | the `ANTHROPIC_API_KEY` environment variable | the SDK client's `apiKey` option, which that SDK sets as `CODEX_API_KEY` for the process it spawns |
+| `headers:` | the `ANTHROPIC_CUSTOM_HEADERS` environment variable, one `Name: value` per line | **no slot** — refused (below) |
+
+Three rules come with it:
+
+1. **an absent fact sets nothing.** A provider with no `api_key:` injects no
+   credential variable and no credential option — never an empty one — which is
+   §12.1's keyless-gateway posture surviving the crossing unchanged;
+2. **a declared fact the bound harness has no slot for is a compile error**
+   (`unsupported-connection-fact`) naming the fact and the harness;
+3. **one spelling per fact**: a node `env:` entry naming a variable the map would
+   set is a compile error (`conflicting-connection-variable`) naming both
+   sources.
+
+**Rationale**: the deployment §12.1's keyless rule exists for is a gateway that
+every agent node reaches through one `base_url:` edit, and a coder node on the
+*same model address* silently reached the vendor instead — so an author
+hand-carried the gateway's URL and credential into every coder node's `env:`, in
+each harness's own native spelling, where they drifted. That is PRD 5.9's
+"swapping hosted to a gateway is a one-line provider edit" failing for exactly
+one node kind.
+
+**The table is curated on [D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers)'s terms**
+— a slot a vendor ships tomorrow is an edit to the table, never a change to this
+grammar — **with its second tier hardened.** D122 answers what it cannot verify
+with a warning and lets the value travel; rule 2 above answers with an **error**,
+because the three facts decide where traffic goes and whether it authenticates,
+and a value of that class failing on the first live call rather than at
+`validate` is the case §12.1's conditional credential rule was written to
+prevent (G3). Where a harness's SDK tier genuinely offers no slot, that
+narrowness is the table's honest content and the error's honest message: `codex`
+takes an API key and a base URL and has nowhere to put a header, and **a faked
+slot** — synthesizing a `model_providers.*` config table out of CLI overrides the
+composition never wrote — is what rule 2 exists instead of.
+
+**Rule 3 is refusal rather than precedence** for the reason the grammar refuses
+`allow_tools: []`: two spellings of one fact are indistinguishable from each
+other downstream, a silent pick is a run authenticating somewhere nobody chose,
+and a precedence rule is a fact about this compiler to be remembered at every
+call site. An author who wants one node on a different endpoint defines another
+`provider.*`, which is the move the two-tier tables already lean on.
+
+The `${ENV}` discipline is untouched and does the distribution work for free:
+references reach the artifact unresolved (§4.3), the launch check verifies
+presence at process start, and a placed coder node's worker holds its provider's
+variables because the reference walk already reaches provider definitions
+([`docs/distributed.md`](distributed.md) §9.1). **Status**: ratified — PRD
+resolved q58 rulings a–d. *PRD 5.9, resolved q15, q25, q30, q32, q41, q57, q58;
+§8.9, §12.1, §12.2.*
 
 ## Appendix B — Editor integration
 
