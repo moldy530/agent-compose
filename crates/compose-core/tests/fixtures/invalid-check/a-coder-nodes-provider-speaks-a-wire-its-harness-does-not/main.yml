@@ -5,7 +5,7 @@
 # at: main.yml:40:16
 # label: main.yml:24:1 `provider.gateway` is defined here, as `kind: openai`
 # label: main.yml:39:18 the harness is bound here
-# help: a coder node's `model:` carries its provider's connection into the run, and a slot is an endpoint and a credential on one wire: `harness: cc` carries `anthropic` connections, and no other, so this pairing would write one vendor's endpoint and key where another's are read. `codex` does carry it. Bind this node's `model:` to a `provider.*` whose kind the harness speaks — providers are cheap — or run the node under the harness that speaks this one (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling b)
+# help: a coder node's `model:` carries its provider's connection into the run, and a slot is an endpoint and a credential on one wire: `harness: cc` carries `anthropic` connections, and no other, so this pairing would write one vendor's endpoint and key where another's are read. `codex` does carry it, so there are two repairs and which is right depends on which half was meant: bind this node's `model:` to a `provider.*` whose kind `cc` speaks — providers are cheap — or run the node under `codex` (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling b)
 #
 # The mispairing the connection table's second half exists to refuse. Every
 # value here is legal on its own: `provider.gateway` is a correct `openai`

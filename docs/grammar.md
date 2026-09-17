@@ -8848,8 +8848,24 @@ Four rules come with it:
 3. **a declared fact the bound harness has no slot for is a compile error**
    (`unsupported-connection-fact`) naming the fact and the harness;
 4. **one spelling per fact**: a node `env:` entry naming a variable the map would
-   set is a compile error (`conflicting-connection-variable`) naming both
-   sources.
+   set — **or one the bound harness's own runtime reads for that same fact
+   beside it** — is a compile error (`conflicting-connection-variable`) naming
+   both sources.
+
+Rule 4 reads on the **fact**, not on the name in the table, because a harness's
+connection surface is wider than the slot. `cc`'s is the environment contract of
+the runtime the Agent SDK spawns, and that runtime takes `ANTHROPIC_AUTH_TOKEN`
+as a credential beside `ANTHROPIC_API_KEY` — sending both, so a gateway reading
+the bearer authenticates as whoever wrote the `env:` entry — and selects a
+different endpoint entirely through `CLAUDE_CODE_USE_BEDROCK` and the
+`ANTHROPIC_*_BASE_URL` companion beside it. Each of those is `api_key:` or
+`base_url:` spelled another way, so each belongs to the fact: guarding the three
+mapped names alone would let a node quietly add a second identity and repoint the
+run while the graph document `visualize` renders and the journal's request
+identity both went on reporting the mapped pair. The wider list is part of the
+same curated row, read off the same pinned release, and it is **per fact** — a
+provider with no `api_key:` claims no credential name at all, which is rule 2
+reading on the family rather than on the one variable.
 
 **Rationale**: the deployment §12.1's keyless rule exists for is a gateway that
 every agent node reaches through one `base_url:` edit, and a coder node on the
@@ -8877,8 +8893,17 @@ composition never wrote — is what rule 3 exists instead of.
 `allow_tools: []`: two spellings of one fact are indistinguishable from each
 other downstream, a silent pick is a run authenticating somewhere nobody chose,
 and a precedence rule is a fact about this compiler to be remembered at every
-call site. An author who wants one node on a different endpoint defines another
+call site. It is also why the rule cannot be a merge order: a second spelling is
+not a key the map writes, so no ordering of the two would ever have resolved it.
+An author who wants one node on a different endpoint defines another
 `provider.*`, which is the move the two-tier tables already lean on.
+
+**Rule 1's error offers one repair or two**, and says which. Where another
+harness speaks the kind, the two halves are a choice by intent — keep the harness
+and rebind the model, or keep the connection and change the harness. Where none
+does, which is every `bedrock`, `vertex` and `azure_openai` provider on a coder
+node, there is one, and the message says there is nowhere to move the node to
+rather than naming a harness that does not exist.
 
 The `${ENV}` discipline is untouched and does the distribution work for free:
 references reach the artifact unresolved (§4.3), the launch check verifies

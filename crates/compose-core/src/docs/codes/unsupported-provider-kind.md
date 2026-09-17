@@ -78,7 +78,8 @@ refusing: every value is legal on its own, and only the pair is wrong.
 
 ## The fix
 
-Two repairs, and which one is right depends on which half was intended.
+Two repairs where another harness speaks the kind, and which one is right
+depends on which half was intended.
 
 * **The harness is the point** — this node runs Claude Code. Then its `model:`
   belongs on an `anthropic` provider, and the gateway one goes on serving the
@@ -87,6 +88,13 @@ Two repairs, and which one is right depends on which half was intended.
 * **The connection is the point** — this node has to go through that gateway.
   Then it is a `codex` node, which is the harness whose connection surface
   speaks that wire.
+
+**One repair where none does.** `bedrock`, `vertex` and `azure_openai` are on
+neither row, so the second move has nowhere to go — there is no coder node in
+this release whose harness carries one of those connections — and the diagnostic
+says so rather than offering it. The node's `model:` binds a `provider.*` whose
+kind the bound harness speaks, and the cloud provider goes on serving the agent
+nodes it already serves.
 
 What is **not** a repair is hand-carrying the endpoint and the key into the
 node's `env:` under the other vendor's variable names. That is the per-node

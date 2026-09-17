@@ -30,9 +30,11 @@
 //!   speak is an error naming both (ruling b, read at the pairing); a declared
 //!   fact the harness has **no slot for** is an error naming the fact and the
 //!   harness (ruling b); and a node `env:` entry spelling a variable the map
-//!   would set is an error naming both sources (ruling c). Deciding any of the
-//!   three needs the `model.*` the node names, the `provider.*` behind it, and
-//!   the table — none of which one file has.
+//!   would set — **or one the harness's own runtime reads for the same fact
+//!   beside it**, which is the rest of the surface ruling a names — is an error
+//!   naming both sources (ruling c). Deciding any of the three needs the
+//!   `model.*` the node names, the `provider.*` behind it, and the table — none
+//!   of which one file has.
 //! * **the harness config is checked in two tiers.** Decision D140 holds
 //!   `settings:` on resolved q30's terms: the keys the curated table knows are
 //!   checked strictly, and everything else is a warning naming what could not be
@@ -54,7 +56,8 @@ use crate::ast::common::Literal;
 use crate::ast::flow::Harness;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::harness::{
-    ConnectionFact, declared, kinds_of, provider_of, slot_of, speaks, variables_set,
+    ConnectionFact, Slot, declared, kinds_of, provider_of, slot_of, speaks, variables_read,
+    variables_set,
 };
 use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::{Coder, Node};
@@ -217,20 +220,39 @@ fn connection(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
             no_slot(ctx, subject, coder, address, provider, *fact);
         }
     }
-    for (fact, variable) in variables_set(coder.harness.value, &held) {
-        for entry in &coder.env {
-            if entry.name.value == variable {
-                shadowed(
-                    ctx,
-                    subject,
-                    coder,
-                    address,
-                    provider,
-                    fact,
-                    variable,
-                    &entry.name.span,
-                );
-            }
+    // Ruling c, over the whole of the harness's connection surface rather than
+    // over the three names the table happens to write. A fact has more than one
+    // spelling on `cc` — `ANTHROPIC_AUTH_TOKEN` is a credential sent beside the
+    // key, `CLAUDE_CODE_USE_BEDROCK` an endpoint chosen instead of the base URL
+    // — and an `env:` entry naming one of those is the same two-sources mistake
+    // wearing another name. One walk over the node's `env:` rather than one per
+    // variable, so an entry earns at most one diagnostic.
+    let mapped = variables_set(coder.harness.value, &held);
+    let beside = variables_read(coder.harness.value, &held);
+    for entry in &coder.env {
+        let name = entry.name.value.as_str();
+        if let Some((fact, variable)) = mapped.iter().find(|(_, held)| *held == name) {
+            shadowed(
+                ctx,
+                subject,
+                coder,
+                address,
+                provider,
+                *fact,
+                Spelling::Mapped(variable),
+                &entry.name.span,
+            );
+        } else if let Some((fact, variable)) = beside.iter().find(|(_, held)| *held == name) {
+            shadowed(
+                ctx,
+                subject,
+                coder,
+                address,
+                provider,
+                *fact,
+                Spelling::Beside(variable),
+                &entry.name.span,
+            );
         }
     }
 }
@@ -245,6 +267,15 @@ fn connection(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
 /// the definition's first line. [`provider_of`] found that definition, so the
 /// lookup below answers; it is written as a lookup rather than an `expect` for
 /// the reason every other check here is, which is that a checker reports.
+///
+/// The help has **two** shapes and they are written as two, because the repair
+/// is not the same one. Where another harness speaks the kind there are two
+/// moves and an author picks by intent — keep the harness and rebind the model,
+/// or keep the connection and change the harness. Where none does — `bedrock`,
+/// `vertex` and `azure_openai`, the three kinds no row carries — there is one
+/// move, and a help that offered the second would be naming a node kind that
+/// does not exist. `a_kind_no_harness_carries_is_told_there_is_one_repair`
+/// covers the branch the shipped fixtures cannot reach.
 fn wrong_wire(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder, address: &str, provider: &Provider) {
     let harness = coder.harness.value.as_str();
     let spoken: Vec<&str> = kinds_of(coder.harness.value)
@@ -264,14 +295,27 @@ fn wrong_wire(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder, address: &str, pr
         .filter(|held| *held != coder.harness.value && speaks(*held, provider.kind))
         .map(Harness::as_str)
         .collect();
-    let moved = if elsewhere.is_empty() {
+    // …and the repair, which is **one** repair where no harness speaks the kind
+    // and two where one does. The two halves have to be written together: a help
+    // that ended on "or run the node under the harness that speaks this one"
+    // after saying no harness carries the connection would be sending an author
+    // to a node kind that does not exist.
+    let repair = if elsewhere.is_empty() {
         format!(
-            "no harness this release lowers carries a `{}` connection, so moving the node is not \
-             the repair here",
+            "No harness this release lowers carries a `{}` connection, so there is nowhere to \
+             move this node to: bind its `model:` to a `provider.*` whose kind `{harness}` speaks \
+             — providers are cheap — and leave `{address}` serving the agent nodes it already \
+             serves",
             provider.kind.as_str()
         )
     } else {
-        format!("{} does carry it", list(&elsewhere))
+        format!(
+            "{} does carry it, so there are two repairs and which is right depends on which half \
+             was meant: bind this node's `model:` to a `provider.*` whose kind `{harness}` speaks \
+             — providers are cheap — or run the node under {}",
+            list(&elsewhere),
+            list(&elsewhere)
+        )
     };
     let mut diagnostic = Diagnostic::error(
         DiagnosticCode::UnsupportedProviderKind,
@@ -298,9 +342,7 @@ fn wrong_wire(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder, address: &str, pr
                 "a coder node's `model:` carries its provider's connection into the run, and a \
                  slot is an endpoint and a credential on one wire: `harness: {harness}` carries \
                  {carries}, so this pairing would write one vendor's endpoint and key where \
-                 another's are read. {moved}. Bind this node's `model:` to a `provider.*` whose \
-                 kind the harness speaks — providers are cheap — or run the node under the \
-                 harness that speaks this one (grammar 8.9, 12.1, Decision D143, PRD resolved q58 \
+                 another's are read. {repair} (grammar 8.9, 12.1, Decision D143, PRD resolved q58 \
                  ruling b)"
             )),
     );
@@ -366,6 +408,30 @@ fn no_slot(
     );
 }
 
+/// Which of a fact's spellings a node's `env:` entry wrote.
+///
+/// The mistake is one mistake — two sources for one fact — and it arrives two
+/// ways, so the diagnostic says which. An author who wrote the mapped name can
+/// see the collision in the composition; an author who wrote a sibling cannot,
+/// because the name they chose appears nowhere in it, and a message that only
+/// said "set twice" would be pointing at a line the map never writes.
+enum Spelling<'a> {
+    /// The variable the connection map **sets** for this fact.
+    Mapped(&'a str),
+    /// A variable the harness's own runtime **reads** for this fact beside the
+    /// mapped one — another endpoint, or a second credential.
+    Beside(&'a str),
+}
+
+impl Spelling<'_> {
+    /// The name the `env:` entry spelled.
+    const fn variable(&self) -> &str {
+        match self {
+            Self::Mapped(variable) | Self::Beside(variable) => variable,
+        }
+    }
+}
+
 /// Ruling c: one spelling per fact.
 ///
 /// Anchored at the **`env:` entry**, unlike its sibling above: the connection is
@@ -382,37 +448,71 @@ fn shadowed(
     address: &str,
     provider: &Provider,
     fact: ConnectionFact,
-    variable: &str,
+    spelling: Spelling<'_>,
     at: &Span,
 ) {
     let harness = coder.harness.value.as_str();
-    ctx.push(
-        Diagnostic::error(
-            DiagnosticCode::ConflictingConnectionVariable,
-            at.clone(),
+    let variable = spelling.variable();
+    // The name the map writes, which both messages name: for a mapped spelling
+    // it is the entry itself, and for a sibling it is what the entry is a second
+    // spelling *of*. A sibling only exists on a fact this harness carries as a
+    // variable, so the lookup answers wherever one is reported.
+    let slot = slot_of(coder.harness.value, fact)
+        .and_then(Slot::variable)
+        .unwrap_or(variable);
+    let (message, help) = match spelling {
+        Spelling::Mapped(_) => (
             format!(
                 "`{variable}` is set twice for {subject}: by this `env:` entry, and by \
                  `{address}`'s `{}:`",
                 fact.as_str()
             ),
+            format!(
+                "one spelling per fact: the provider's `{fact}:` already reaches this run, so \
+                 there is nothing to shadow and no precedence rule to learn. Drop the `env:` \
+                 entry — it is for what the *program* needs — and a node that really has to \
+                 decide {decides} for itself binds a `model.*` on another `provider.*` (grammar \
+                 8.9, 12.1, Decision D143, PRD resolved q58 ruling c)",
+                fact = fact.as_str(),
+                decides = fact.decides()
+            ),
+        ),
+        Spelling::Beside(_) => (
+            format!(
+                "`{variable}` is a second spelling of `{}:` for {subject}: `harness: {harness}` \
+                 reads it beside the `{slot}` this `env:` entry does not name, and `{address}` \
+                 already declares the fact",
+                fact.as_str()
+            ),
+            format!(
+                "one spelling per fact, and a fact has more than one: `{variable}` is a name \
+                 `harness: {harness}` reads for {decides}, so this entry decides it a second time \
+                 beside the connection the node's `model:` already carries — the run would \
+                 authenticate as somebody else, or leave for an endpoint nothing in this \
+                 composition names, while the graph document and the journal's record of the run \
+                 both still report `{slot}`. Drop \
+                 the `env:` entry — it is for what the *program* needs — and a node that really \
+                 has to decide {decides} for itself binds a `model.*` on another `provider.*` \
+                 (grammar 8.9, 12.1, Decision D143, PRD resolved q58 rulings a and c)",
+                decides = fact.decides()
+            ),
+        ),
+    };
+    ctx.push(
+        Diagnostic::error(
+            DiagnosticCode::ConflictingConnectionVariable,
+            at.clone(),
+            message,
         )
         .with_label(
             fact_span(provider, fact),
             format!(
-                "`{}:` is declared here, and `harness: {harness}` carries it as `{variable}`",
+                "`{}:` is declared here, and `harness: {harness}` carries it as `{slot}`",
                 fact.as_str()
             ),
         )
         .with_label(coder.model.span.clone(), "the connection is bound here")
-        .with_help(format!(
-            "one spelling per fact: the provider's `{fact}:` already reaches this run, so there \
-             is nothing to shadow and no precedence rule to learn. Drop the `env:` entry — it is \
-             for what the *program* needs — and a node that really has to decide {decides} for itself \
-             binds a `model.*` on another `provider.*` (grammar 8.9, 12.1, Decision D143, PRD \
-             resolved q58 ruling c)",
-            fact = fact.as_str(),
-            decides = fact.decides()
-        )),
+        .with_help(help),
     );
 }
 
@@ -787,6 +887,121 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
             "`base_url:` under `codex` is a client option and sets no variable, so a node's \
              `env:` is free beside it: {option:#?}"
         );
+
+        // 3. …and the same two directions on a **sibling** rather than on the
+        // slot. A keyless gateway claims no credential name at all, so the
+        // second spelling is free beside the first.
+        let sibling_free = crate::check(&ir_of(&composition(
+            "provider.p:\n  kind: anthropic\n  base_url: ${GATEWAY_URL}\n",
+            "cc",
+            "ANTHROPIC_AUTH_TOKEN",
+        )));
+        assert!(
+            sibling_free.is_empty(),
+            "a provider with no `api_key:` claims no credential name — not the slot and not a \
+             name read beside it: {sibling_free:#?}"
+        );
+    }
+
+    /// **A second spelling of a declared fact is the same refusal** (grammar
+    /// 8.9, Decision D143, PRD resolved q58 rulings a and c).
+    ///
+    /// The hole the mapped-name list left open, read through the checker. `cc`'s
+    /// connection surface is the whole environment contract its bundled runtime
+    /// reads — ruling a says so — and a guard over the three names the table
+    /// writes let a node `env:` add a bearer identity the gateway would honour
+    /// and repoint the endpoint through the selector family, with `validate`
+    /// clean and the graph document still drawing `ANTHROPIC_BASE_URL` and
+    /// `ANTHROPIC_API_KEY`.
+    ///
+    /// Each entry earns **one** diagnostic and it names the mapped variable, so
+    /// an author who never wrote `ANTHROPIC_BASE_URL` is still told what the
+    /// name they did write collides with.
+    #[test]
+    fn a_second_spelling_of_a_declared_fact_is_refused_beside_the_slot() {
+        use crate::codegen::test_support::ir_of;
+
+        let composition = "version: \"0.1\"\n\
+provider.gateway:\n  kind: anthropic\n  base_url: ${GATEWAY_URL}\n  api_key: ${GATEWAY_KEY}\n\
+model.m:\n  provider: provider.gateway\n  id: some-model\n\
+state:\n  summary: { type: string, default: \"\" }\n\
+flow.main:\n  outputs:\n    summary: { type: string }\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: /srv/checkout\n        prompt: Do the work.\n        env:\n          PATH: /usr/bin:/bin\n          ANTHROPIC_AUTH_TOKEN: ${SOMEONE_ELSES_TOKEN}\n          CLAUDE_CODE_USE_BEDROCK: \"1\"\n          ANTHROPIC_BEDROCK_BASE_URL: ${ELSEWHERE}\n        output:\n          summary: { type: string }\n      input: \"'go'\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: end }\n";
+
+        let held = crate::check(&ir_of(composition));
+        assert_eq!(
+            held.len(),
+            3,
+            "three `env:` entries respell two declared facts, and `PATH` is what an `env:` is \
+             for: {held:#?}"
+        );
+        for diagnostic in &held {
+            assert_eq!(
+                diagnostic.code,
+                DiagnosticCode::ConflictingConnectionVariable,
+                "{diagnostic:#?}"
+            );
+        }
+        assert!(
+            held[0]
+                .message
+                .contains("`ANTHROPIC_AUTH_TOKEN` is a second spelling of `api_key:`")
+                && held[0]
+                    .message
+                    .contains("reads it beside the `ANTHROPIC_API_KEY`"),
+            "{:#?}",
+            held[0]
+        );
+        for held in &held[1..] {
+            assert!(
+                held.message.contains("second spelling of `base_url:`")
+                    && held.message.contains("beside the `ANTHROPIC_BASE_URL`"),
+                "{held:#?}"
+            );
+        }
+    }
+
+    /// **A kind no harness carries is told there is one repair** (grammar 8.9,
+    /// Decision D143, PRD resolved q58 ruling b).
+    ///
+    /// `bedrock`, `vertex` and `azure_openai` are the three kinds on neither
+    /// row, so every one of them takes the branch where the "does carry it"
+    /// half of the help has nothing to name. A help that still closed on *run
+    /// the node under the harness that speaks this one* would, in the same
+    /// paragraph, tell an author no harness carries the connection and then send
+    /// them to the harness that does.
+    #[test]
+    fn a_kind_no_harness_carries_is_told_there_is_one_repair() {
+        use crate::codegen::test_support::ir_of;
+
+        for provider in [
+            "provider.p:\n  kind: bedrock\n  region: us-east-1\n  access_key_id: ${AWS_KEY_ID}\n  \
+             secret_access_key: ${AWS_SECRET}\n",
+            "provider.p:\n  kind: vertex\n  project: acme\n  location: us-central1\n  \
+             credentials_json: ${GOOGLE_CREDENTIALS}\n",
+        ] {
+            for harness in ["cc", "codex"] {
+                let composition = format!(
+                    "version: \"0.1\"\n\
+{provider}\
+model.m:\n  provider: provider.p\n  id: some-model\n\
+state:\n  summary: {{ type: string, default: \"\" }}\n\
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: {harness}\n        model: model.m\n        workspace: /srv/checkout\n        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+                );
+                let held = crate::check(&ir_of(&composition));
+                assert_eq!(held.len(), 1, "{held:#?}");
+                assert_eq!(held[0].code, DiagnosticCode::UnsupportedProviderKind);
+                let help = held[0].help.clone().expect("the refusal carries a help");
+                assert!(
+                    help.contains("there is nowhere to move this node to"),
+                    "{help}"
+                );
+                assert!(
+                    !help.contains("run the node under"),
+                    "the help says no harness carries this connection and then sends the author \
+                     to the harness that does: {help}"
+                );
+            }
+        }
     }
 
     /// The names one emitted `<HARNESS>_SETTINGS` array lists, in order.

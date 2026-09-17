@@ -156,6 +156,17 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
  *  * `ANTHROPIC_CUSTOM_HEADERS` — one `Name: value` per line, which is how that
  *    runtime parses it.
  *
+ * Three variables written, and **more than three owned**. That runtime reads a
+ * whole endpoint table and a whole credential list — `ANTHROPIC_AUTH_TOKEN` is
+ * sent as a bearer header beside the `X-Api-Key` the second variable sets, and
+ * `CLAUDE_CODE_USE_BEDROCK` with its `ANTHROPIC_BEDROCK_BASE_URL` companion
+ * chooses an endpoint instead of the first — so `validate` refuses a node `env:`
+ * entry naming any of them for a fact this connection declares, not only the
+ * three below — the whole family is the compiler's per-harness connection table
+ * (grammar Decision D143, PRD resolved q58 rulings a and c). Nothing is filtered
+ * here: by the time a run reaches this function the composition has already been
+ * refused.
+ *
  * **An absent fact sets no variable**, which is the half a one-token slip would
  * turn into the opposite of q25's ruling: a keyless gateway connection must
  * leave the credential variable *unset*, not set to the empty string, or the
@@ -287,8 +298,10 @@ export function ccOptions(
     abortController: controllerFor(run.signal),
     // The node's declared environment, with the model's connection mapped over
     // the top. The order is not a precedence rule: `validate` refuses an `env:`
-    // entry spelling a variable this map sets, so the two never name one key
-    // (PRD resolved q58 ruling c).
+    // entry spelling a variable this map sets — or one this runtime reads for
+    // the same fact beside it, which is the half a merge order could not have
+    // fixed anyway — so the two never decide one fact (PRD resolved q58 ruling
+    // c).
     env: { ...run.env, ...ccConnection(run) },
     outputFormat: { type: "json_schema", schema: { ...run.schema } },
     ...passthrough(run, CC_SETTINGS, CC_RESERVED),

@@ -300,7 +300,10 @@ injects **no** credential at all rather than an empty one; a fact the bound
 harness has no slot for is refused rather than dropped
 (`agent-compose explain unsupported-connection-fact` — `codex` has nowhere to put
 a header); and writing a variable the map would set into the node's `env:` is
-refused too, because one fact gets one spelling
+refused too, because one fact gets one spelling — as is a variable the bound
+harness reads for that same fact *beside* the mapped one, since
+`ANTHROPIC_AUTH_TOKEN` is a second identity on the same request and
+`CLAUDE_CODE_USE_BEDROCK` is a different endpoint
 (`agent-compose explain conflicting-connection-variable`).
 
 What still does **not** cross is a **route**: failover belongs to the caller that

@@ -54,11 +54,39 @@
 //! `a_spoken_kinds_connection_keys_are_all_facts` holds the two halves together:
 //! a row that grows a kind grows this enum with it, or the suite fails.
 //!
+//! # A fact has more than one spelling, and the row owns all of them
+//!
+//! A slot is the name the map **writes**. It is not the only name the thing on
+//! the other side **reads**, and ruling c is about the fact rather than about
+//! the name: PRD resolved q58 ruling a calls `cc`'s surface "its base-URL,
+//! API-key/auth-token, and custom-header variables", plural, because the Agent
+//! SDK's bundled runtime carries a whole endpoint table and a whole credential
+//! list. `ANTHROPIC_AUTH_TOKEN` is read at client construction beside
+//! `ANTHROPIC_API_KEY` and sent as `Authorization: Bearer …` *alongside* the
+//! `X-Api-Key` the slot sets; `CLAUDE_CODE_USE_BEDROCK` and its
+//! `ANTHROPIC_BEDROCK_BASE_URL` companion select a different endpoint entirely.
+//!
+//! So a row carries, beside each slot, the **sibling variables** that harness's
+//! own runtime reads for the same fact ([`ConnectionRow::siblings`]), and
+//! [`variables_read`] is what ruling c compares a node's `env:` against next to
+//! [`variables_set`]. Guarding only the three names the table writes would leave
+//! a node `env:` free to add a second identity and repoint the endpoint on a
+//! `cc` run with no diagnostic — silent shadowing under another spelling, which
+//! is the thing ruling c exists to refuse — and would leave the `connection`
+//! field of the graph document and of the journal's request identity describing
+//! a run that went somewhere else.
+//!
+//! The siblings are read under the same discipline as the slots, from the same
+//! pinned release, and they are **per fact**: a provider that declares no
+//! `api_key:` claims no credential name at all, which is q25's keyless posture
+//! reading on the family rather than on the one variable.
+//!
 //! # Where each slot was read
 //!
-//! Every slot below was verified against the pinned SDK's own `.d.ts` and
-//! documented contract, exactly as resolved q57 verified its API shapes — never
-//! recalled. [`CONNECTION`] records the release each row was read against, and
+//! Every slot and every sibling below was verified against the pinned SDK's own
+//! `.d.ts`, bundled source and documented contract, exactly as resolved q57
+//! verified its API shapes — never recalled. [`CONNECTION`] records the release
+//! each row was read against, and
 //! `the_connection_table_is_audited_against_the_pinned_sdks` fails when the pin
 //! moves, so a vendor's new slot arrives with the bump rather than behind it.
 
@@ -208,6 +236,23 @@ pub struct ConnectionRow {
     pub kinds: &'static [ProviderKind],
     /// Each fact's slot, `None` where this harness's SDK tier offers none.
     pub slots: &'static [(ConnectionFact, Option<Slot>)],
+    /// The **other** variables this harness's own runtime reads for a fact the
+    /// row already carries — the same fact under another spelling.
+    ///
+    /// A slot is the name the map writes; these are the names the thing on the
+    /// other side reads beside it. `ANTHROPIC_AUTH_TOKEN` is a credential the
+    /// bundled runtime sends *in addition to* the `ANTHROPIC_API_KEY` the slot
+    /// sets, and `CLAUDE_CODE_USE_BEDROCK` with its `ANTHROPIC_BEDROCK_BASE_URL`
+    /// companion is an endpoint chosen instead of the one `ANTHROPIC_BASE_URL`
+    /// names. Both are the node `env:` PRD resolved q58 ruling c refuses,
+    /// spelled the way the table did not happen to write it, so both belong to
+    /// the fact rather than beside it (see this module's own documentation).
+    ///
+    /// Each entry's fact must have a [`Slot::Variable`] on this row:
+    /// `a_rows_siblings_are_other_spellings_of_a_fact_it_carries` holds that,
+    /// because a sibling of a fact the harness maps as a typed option is a claim
+    /// about an environment the composition does not fill.
+    pub siblings: &'static [(ConnectionFact, &'static str)],
 }
 
 /// The connection table (PRD resolved q58 ruling b).
@@ -247,6 +292,16 @@ pub struct ConnectionRow {
 ///    encoding lives so the compiler's account of it and the driver's cannot
 ///    disagree.
 ///
+/// …and the **siblings** are the rest of that environment contract, read from
+/// the same bundled runtime. Its endpoint table holds seven rows — one per
+/// vendor-hosted wire — each a base-URL variable and, for the six that are not
+/// the direct endpoint, a `CLAUDE_CODE_USE_*` selector that chooses it; its
+/// credential list holds seven names beside the six that decide whether a
+/// selected endpoint authenticates at all and the four that hand a credential
+/// over on a file descriptor. Every one of them is `base_url:` or `api_key:`
+/// under another spelling, which is why the row claims them for those two facts
+/// rather than leaving a node `env:` free to write them.
+///
 /// # `codex` — `@openai/codex-sdk`
 ///
 /// `CodexOptions` is the client's own connection surface and carries exactly two
@@ -262,6 +317,17 @@ pub struct ConnectionRow {
 /// variable. Writing one would be the faked slot PRD resolved q58 ruling b
 /// forbids by name, so `headers:` on a provider a `codex` node's model resolves
 /// through is a `validate` error instead.
+///
+/// It has **no siblings** either, and that narrowness is read from the same
+/// documented contract: this SDK's connection surface is two typed options, and
+/// the only name it puts in an environment is the `CODEX_API_KEY` the credential
+/// slot already records as its `injects` (the README: *"the SDK still injects
+/// its required variables (such as `CODEX_API_KEY`) on top of the environment
+/// you provide"*, and *"if you set `baseUrl`, the SDK passes it as a
+/// `--config openai_base_url=…` override"*). What the CLI it spawns reads out of
+/// that environment on its own account is the CLI's surface, pinned as its own
+/// artifact and never audited here — so this row claims nothing about it rather
+/// than claiming it is empty.
 pub const CONNECTION: &[ConnectionRow] = &[
     ConnectionRow {
         harness: Harness::Cc,
@@ -280,6 +346,81 @@ pub const CONNECTION: &[ConnectionRow] = &[
                 ConnectionFact::Headers,
                 Some(Slot::Variable("ANTHROPIC_CUSTOM_HEADERS")),
             ),
+        ],
+        siblings: &[
+            // The endpoint table's other six rows, each a base-URL variable and
+            // the `CLAUDE_CODE_USE_*` selector that chooses it over
+            // `ANTHROPIC_BASE_URL`, plus the companion that decides how the
+            // slot's own value is treated. A node `env:` writing any of them
+            // sends the run somewhere the composition's `base_url:` does not
+            // name.
+            (
+                ConnectionFact::BaseUrl,
+                "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+            ),
+            (ConnectionFact::BaseUrl, "ANTHROPIC_BEDROCK_BASE_URL"),
+            (ConnectionFact::BaseUrl, "CLAUDE_CODE_USE_BEDROCK"),
+            (ConnectionFact::BaseUrl, "ANTHROPIC_VERTEX_BASE_URL"),
+            (ConnectionFact::BaseUrl, "CLAUDE_CODE_USE_VERTEX"),
+            (ConnectionFact::BaseUrl, "ANTHROPIC_FOUNDRY_BASE_URL"),
+            (ConnectionFact::BaseUrl, "CLAUDE_CODE_USE_FOUNDRY"),
+            (ConnectionFact::BaseUrl, "ANTHROPIC_AWS_BASE_URL"),
+            (ConnectionFact::BaseUrl, "CLAUDE_CODE_USE_ANTHROPIC_AWS"),
+            (ConnectionFact::BaseUrl, "ANTHROPIC_GOOGLE_CLOUD_BASE_URL"),
+            (
+                ConnectionFact::BaseUrl,
+                "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+            ),
+            (ConnectionFact::BaseUrl, "ANTHROPIC_BEDROCK_MANTLE_BASE_URL"),
+            (ConnectionFact::BaseUrl, "CLAUDE_CODE_USE_MANTLE"),
+            // The credential list beside `ANTHROPIC_API_KEY`. The auth token is
+            // the one that matters most and reads least like a collision: the
+            // bundled client reads it at construction and sends
+            // `Authorization: Bearer …` *together with* the `X-Api-Key` the slot
+            // set, so a gateway keying off the bearer authenticates as whoever
+            // the `env:` entry names while the composition's own key rides along
+            // unused.
+            (ConnectionFact::Credential, "ANTHROPIC_AUTH_TOKEN"),
+            (ConnectionFact::Credential, "CLAUDE_CODE_OAUTH_TOKEN"),
+            (ConnectionFact::Credential, "AWS_BEARER_TOKEN_BEDROCK"),
+            (ConnectionFact::Credential, "ANTHROPIC_FOUNDRY_API_KEY"),
+            (ConnectionFact::Credential, "ANTHROPIC_FOUNDRY_AUTH_TOKEN"),
+            (ConnectionFact::Credential, "ANTHROPIC_AWS_API_KEY"),
+            // …the six that decide whether a selected endpoint authenticates at
+            // all, which is the same question `api_key:` answers…
+            (ConnectionFact::Credential, "CLAUDE_CODE_SKIP_BEDROCK_AUTH"),
+            (ConnectionFact::Credential, "CLAUDE_CODE_SKIP_VERTEX_AUTH"),
+            (ConnectionFact::Credential, "CLAUDE_CODE_SKIP_FOUNDRY_AUTH"),
+            (
+                ConnectionFact::Credential,
+                "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+            ),
+            (
+                ConnectionFact::Credential,
+                "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+            ),
+            (ConnectionFact::Credential, "CLAUDE_CODE_SKIP_MANTLE_AUTH"),
+            // …and the four that hand one over on a file descriptor instead of
+            // in the variable's own value.
+            (
+                ConnectionFact::Credential,
+                "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+            ),
+            (
+                ConnectionFact::Credential,
+                "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+            ),
+            (
+                ConnectionFact::Credential,
+                "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+            ),
+            (
+                ConnectionFact::Credential,
+                "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+            ),
+            // `headers:` has no sibling: `ANTHROPIC_CUSTOM_HEADERS` is the one
+            // name that runtime reads a request header out of, and it is the
+            // slot.
         ],
     },
     ConnectionRow {
@@ -304,6 +445,9 @@ pub const CONNECTION: &[ConnectionRow] = &[
             // No slot. See this constant's own documentation.
             (ConnectionFact::Headers, None),
         ],
+        // No siblings either, and for the same reason the header row is `None`:
+        // see this constant's own documentation.
+        siblings: &[],
     },
 ];
 
@@ -366,6 +510,39 @@ pub fn variables_set(
             slot_of(harness, fact)
                 .and_then(Slot::variable)
                 .map(|name| (fact, name))
+        })
+        .collect()
+}
+
+/// Every environment variable one harness's own runtime reads **beside** the
+/// slot, for a fact a provider declaring `facts` carries across.
+///
+/// The other half of the list PRD resolved q58 ruling c compares a node's `env:`
+/// against. [`variables_set`] answers what the map writes; this answers what the
+/// thing on the other side reads for the same fact under another name, which is
+/// where a second endpoint and a second identity get in.
+///
+/// Computed from the **declared** facts for [`variables_set`]'s own reason: a
+/// provider with no `api_key:` claims no credential name at all — not the slot
+/// and not a sibling of it — so a node bound to a keyless gateway is free to
+/// spell its own credential however that harness reads one.
+#[must_use]
+pub fn variables_read(
+    harness: Harness,
+    facts: &[ConnectionFact],
+) -> Vec<(ConnectionFact, &'static str)> {
+    let Some(row) = CONNECTION.iter().find(|row| row.harness == harness) else {
+        return Vec::new();
+    };
+    ConnectionFact::ALL
+        .iter()
+        .copied()
+        .filter(|fact| facts.contains(fact))
+        .flat_map(|fact| {
+            row.siblings
+                .iter()
+                .copied()
+                .filter(move |(held, _)| *held == fact)
         })
         .collect()
 }
@@ -548,6 +725,115 @@ mod tests {
         }
     }
 
+    /// **A sibling is another spelling of a fact this row already carries as a
+    /// variable** (PRD resolved q58 ruling c).
+    ///
+    /// Three things a sibling list gets wrong on its own, each silent:
+    ///
+    ///  1. a sibling of a fact with **no variable slot**. `codex` maps
+    ///     `base_url:` onto a typed option and fills no environment with it, so
+    ///     a name claimed for that fact would refuse a node `env:` entry over a
+    ///     variable nothing in the run writes — the over-rejection direction
+    ///     `a_connection_that_sets_no_variable_leaves_a_nodes_env_alone` guards
+    ///     one step earlier;
+    ///  2. a sibling that **is** the slot, which would make one collision two;
+    ///  3. one name claimed twice, which would do the same.
+    #[test]
+    fn a_rows_siblings_are_other_spellings_of_a_fact_it_carries() {
+        for row in CONNECTION {
+            let mut claimed = std::collections::BTreeSet::new();
+            for (fact, variable) in row.siblings {
+                let slot = slot_of(row.harness, *fact)
+                    .and_then(Slot::variable)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "`{}` claims `{variable}` for `{}:`, which it does not carry as a \
+                             variable at all: a sibling of an option slot refuses a node `env:` \
+                             entry over a name no part of this run writes",
+                            row.harness.as_str(),
+                            fact.as_str()
+                        )
+                    });
+                assert_ne!(
+                    *variable,
+                    slot,
+                    "`{}` lists its own `{}:` slot as a sibling of itself",
+                    row.harness.as_str(),
+                    fact.as_str()
+                );
+                assert!(
+                    claimed.insert(*variable),
+                    "`{}` claims `{variable}` twice, so one `env:` entry earns two diagnostics",
+                    row.harness.as_str()
+                );
+            }
+        }
+    }
+
+    /// **A declared fact claims every name that harness reads it under** (PRD
+    /// resolved q58 rulings a and c).
+    ///
+    /// The hole this list closes, named rather than derived. Guarding only the
+    /// three variables the table *writes* leaves a `cc` node's `env:` free to
+    /// add `ANTHROPIC_AUTH_TOKEN` — which the bundled client sends as a bearer
+    /// header *beside* the `X-Api-Key` the slot set, so a gateway reading the
+    /// bearer authenticates as somebody else — and free to set
+    /// `CLAUDE_CODE_USE_BEDROCK` with an `ANTHROPIC_BEDROCK_BASE_URL` of its
+    /// own, which sends the run to an endpoint the composition never named while
+    /// `visualize` and the journal's request identity both keep drawing the
+    /// mapped one. Ruling a calls that whole environment contract `cc`'s
+    /// connection surface, so all of it is inside the fact.
+    #[test]
+    fn a_declared_fact_claims_every_name_its_runtime_reads_it_under() {
+        let credential = variables_read(Harness::Cc, &[ConnectionFact::Credential]);
+        for name in [
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        ] {
+            assert!(
+                credential.iter().any(|(_, held)| *held == name),
+                "`{name}` is a credential the `cc` runtime reads beside `ANTHROPIC_API_KEY` and \
+                 nothing claims it for `api_key:`"
+            );
+        }
+        let endpoint = variables_read(Harness::Cc, &[ConnectionFact::BaseUrl]);
+        for name in [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "ANTHROPIC_BEDROCK_BASE_URL",
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_VERTEX_BASE_URL",
+        ] {
+            assert!(
+                endpoint.iter().any(|(_, held)| *held == name),
+                "`{name}` sends a `cc` run to an endpoint `ANTHROPIC_BASE_URL` does not name and \
+                 nothing claims it for `base_url:`"
+            );
+        }
+        // Each family belongs to its own fact, which is what keeps the keyless
+        // posture readable: a gateway with no `api_key:` claims no credential
+        // name, and a provider with no `base_url:` claims no endpoint name.
+        assert!(
+            !endpoint
+                .iter()
+                .any(|(_, held)| *held == "ANTHROPIC_AUTH_TOKEN")
+        );
+        assert!(
+            !credential
+                .iter()
+                .any(|(_, held)| *held == "CLAUDE_CODE_USE_BEDROCK")
+        );
+        assert!(variables_read(Harness::Cc, &[]).is_empty());
+        // …and the harness whose slots are typed options claims none, because
+        // its row is audited over an SDK surface that fills one variable and
+        // says so.
+        assert!(variables_read(Harness::Codex, ConnectionFact::ALL).is_empty());
+        for harness in [Harness::DeepAgents, Harness::Native] {
+            assert!(variables_read(harness, ConnectionFact::ALL).is_empty());
+        }
+    }
+
     /// **The table is an audit of the pinned SDKs' connection surfaces, re-opened
     /// by the pin** (PRD resolved q58 ruling b).
     ///
@@ -565,7 +851,8 @@ mod tests {
                 row.audited,
                 "`{}`'s SDK is pinned at {} and its connection row was audited against {}: read \
                  the release's own connection surface — its endpoint, its credential and its \
-                 header contract — and move this version up (grammar 8.9, Decision D143)",
+                 header contract, and every other variable it reads for one of those facts — and \
+                 move this version up (grammar 8.9, Decision D143)",
                 row.harness.as_str(),
                 version_of(row.harness),
                 row.audited

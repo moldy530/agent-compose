@@ -19,11 +19,31 @@ endpoint with nobody told, and a precedence rule is a fact about this compiler
 that has to be remembered at every call site. One spelling per fact needs no
 rule at all.
 
+## A fact has more than one spelling
+
+The rule is about the **fact**, not about the name the table happens to write.
+`cc`'s connection surface is the whole environment contract the Agent SDK's
+bundled runtime reads, and that runtime reads more than three names:
+
+* `ANTHROPIC_AUTH_TOKEN` is a credential it takes at construction beside
+  `ANTHROPIC_API_KEY`, and it sends **both** — an `X-Api-Key` from the
+  composition and an `Authorization: Bearer` from the node — so a gateway keying
+  off the bearer authenticates as whoever the `env:` entry names;
+* `CLAUDE_CODE_USE_BEDROCK` and its `ANTHROPIC_BEDROCK_BASE_URL` companion
+  select a different endpoint altogether, so the run leaves for somewhere the
+  composition never named while the graph document `visualize` renders and the
+  journal's record of the run both go on reporting the mapped pair.
+
+Both are `api_key:` and `base_url:` under another spelling, so both are refused
+the same way and the message names the mapped variable the entry collides with —
+the name the author did not write is the one that explains the collision.
+
 The check is computed from what the provider **declares**, not from the table:
 
 * a provider with no `api_key:` injects **no credential variable** — not an empty
-  one — so a node bound to a keyless gateway is free to declare a credential
-  variable of its own, and this diagnostic does not fire;
+  one, and not a name read beside one — so a node bound to a keyless gateway is
+  free to declare a credential variable of its own, whichever of that harness's
+  spellings it picks, and this diagnostic does not fire;
 * a fact whose slot is a typed option rather than a variable is not a collision
   either. `base_url:` under `codex` becomes a `--config` flag and touches no
   environment, so a node may declare whatever it likes beside it.

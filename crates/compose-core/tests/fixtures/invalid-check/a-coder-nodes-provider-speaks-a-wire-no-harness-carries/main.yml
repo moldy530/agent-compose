@@ -1,0 +1,48 @@
+# rule: a provider kind no harness's slots speak is refused with the one repair
+# rule: there is (grammar 8.9, 12.1, D143, PRD resolved q58 ruling b)
+# code: unsupported-provider-kind
+# message: `flow.main` node `implement` binds `harness: cc`, and `provider.aws` is `kind: bedrock`, whose connection that harness cannot carry
+# at: main.yml:40:16
+# label: main.yml:23:1 `provider.aws` is defined here, as `kind: bedrock`
+# label: main.yml:39:18 the harness is bound here
+# help: a coder node's `model:` carries its provider's connection into the run, and a slot is an endpoint and a credential on one wire: `harness: cc` carries `anthropic` connections, and no other, so this pairing would write one vendor's endpoint and key where another's are read. No harness this release lowers carries a `bedrock` connection, so there is nowhere to move this node to: bind its `model:` to a `provider.*` whose kind `cc` speaks — providers are cheap — and leave `provider.aws` serving the agent nodes it already serves (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling b)
+#
+# The other branch of the wire rule, and the one every `bedrock`, `vertex` and
+# `azure_openai` provider on a coder node takes: the kind is not merely on the
+# wrong row, it is on **no** row. Neither harness SDK's connection surface has a
+# cloud credential chain anywhere on it — an `access_key_id:` and a
+# `secret_access_key:` have nowhere to go — so `codex` is not the repair the
+# openai-under-cc fixture beside this one names.
+#
+# Which is why the help is pinned here. Where another harness does speak the
+# kind, an author chooses between two repairs by intent; where none does, there
+# is one, and a message that still ended on *run the node under the harness that
+# speaks this one* would contradict its own previous sentence and send the author
+# looking for a node kind this release does not have.
+version: "0.1"
+provider.aws:
+  kind: bedrock
+  region: us-east-1
+  access_key_id: ${AWS_ACCESS_KEY_ID}
+  secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+model.implementer:
+  provider: provider.aws
+  id: anthropic.claude-sonnet-4-5-v1:0
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: ${REPO_ROOT}
+        prompt: Fix the failing test, then say what you changed.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
