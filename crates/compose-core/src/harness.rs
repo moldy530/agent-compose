@@ -296,11 +296,25 @@ pub struct ConnectionRow {
 /// the same bundled runtime. Its endpoint table holds seven rows — one per
 /// vendor-hosted wire — each a base-URL variable and, for the six that are not
 /// the direct endpoint, a `CLAUDE_CODE_USE_*` selector that chooses it; its
-/// credential list holds seven names beside the six that decide whether a
-/// selected endpoint authenticates at all and the four that hand a credential
-/// over on a file descriptor. Every one of them is `base_url:` or `api_key:`
-/// under another spelling, which is why the row claims them for those two facts
-/// rather than leaving a node `env:` free to write them.
+/// **provider-selection** family holds those six selectors and a seventh,
+/// `CLAUDE_CODE_USE_GATEWAY`, which has no base-URL variable of its own in this
+/// bundle — the gateway path it turns on is resolved in the CLI the SDK spawns,
+/// not here — and is claimed all the same, because what a selector decides is
+/// *which endpoint the run talks to* and that is the question `base_url:`
+/// answers; its credential list holds seven names beside the six that decide
+/// whether a selected endpoint authenticates at all and the four that hand a
+/// credential over on a file descriptor. Every one of them is `base_url:` or
+/// `api_key:` under another spelling, which is why the row claims them for those
+/// two facts rather than leaving a node `env:` free to write them.
+///
+/// The selection family is claimed **whole** on purpose. A row that guarded six
+/// of seven selectors would be a completeness claim with a hole in it, and the
+/// hole is the one shape ruling c exists to refuse: a node `env:` that repoints
+/// the run while `validate` is clean and the graph document and the journal's
+/// request identity go on reporting `ANTHROPIC_BASE_URL`. Where this table
+/// cannot read a selector's endpoint out of the pinned bundle, the honest answer
+/// is to claim the selector and say why — never to leave it out because its
+/// companion could not be found.
 ///
 /// # `codex` — `@openai/codex-sdk`
 ///
@@ -373,6 +387,16 @@ pub const CONNECTION: &[ConnectionRow] = &[
             ),
             (ConnectionFact::BaseUrl, "ANTHROPIC_BEDROCK_MANTLE_BASE_URL"),
             (ConnectionFact::BaseUrl, "CLAUDE_CODE_USE_MANTLE"),
+            // …and the seventh member of that runtime's own provider-*selection*
+            // family, which the six selectors above are the rest of. It is the
+            // one selector with no base-URL variable beside it in this bundle:
+            // the gateway path it turns on is resolved in the CLI the SDK
+            // spawns, so what the bundle shows is the flag and the family it
+            // belongs to. The row claims it anyway, because a selector decides
+            // which endpoint the run talks to whether or not this table can read
+            // that endpoint's name, and six of seven is a completeness claim
+            // with exactly the hole ruling c refuses.
+            (ConnectionFact::BaseUrl, "CLAUDE_CODE_USE_GATEWAY"),
             // The credential list beside `ANTHROPIC_API_KEY`. The auth token is
             // the one that matters most and reads least like a collision: the
             // bundled client reads it at construction and sends
@@ -553,6 +577,18 @@ pub fn variables_read(
 /// so a header is one `Name: value` line. Written here rather than only in the
 /// driver because [`CONNECTION`]'s account of the slot is normative and a second
 /// spelling of the encoding is a second thing to keep true.
+///
+/// **A line-delimited encoding is only as honest as its values**, and this
+/// function does not police them because neither of the two places that can is
+/// here. A value carrying a carriage return or a newline would declare one
+/// header and send two — the second spelled by the value, `x-api-key` as easily
+/// as anything else — so it is refused twice: `parse::binding::header_map`
+/// refuses the text a composition **wrote** (`invalid-value`, at `validate`,
+/// which is where PRD resolved q58 ruling b puts a fact that decides what a
+/// connection sends), and the driver's own `forgesAHeaderField` refuses what a
+/// `${ENV}` **resolved to**, which is text no build ever sees and exactly what a
+/// gateway deployment's operator-set variables are. By the time a run reaches
+/// this encoding both questions have been asked.
 #[must_use]
 pub fn cc_custom_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
     headers
@@ -856,6 +892,51 @@ mod tests {
                 row.harness.as_str(),
                 version_of(row.harness),
                 row.audited
+            );
+        }
+    }
+
+    /// …and the half of that audit a version number cannot state: the endpoint
+    /// **selection family**, written out by name (grammar 8.9, Decision D143,
+    /// PRD resolved q58 ruling c).
+    ///
+    /// [`the_connection_table_is_audited_against_the_pinned_sdks`] says *when*
+    /// to re-read the bundle; this says what a re-reading has to come back with.
+    /// A selector is the sharpest thing a node `env:` can write — it repoints
+    /// the run while `validate` stays clean and the graph document and the
+    /// journal's request identity both go on reporting `ANTHROPIC_BASE_URL` — so
+    /// the family is claimed **whole** or the claim is not a claim. It is spelled
+    /// out here rather than counted, for
+    /// `a_reserved_list_is_audited_against_the_pinned_option_surface`'s reason
+    /// on the other table the SDKs own: a count is satisfied by any seven names,
+    /// and what is being asserted is these seven.
+    ///
+    /// `CLAUDE_CODE_USE_GATEWAY` is the one worth naming twice. It is the only
+    /// member with no base-URL variable beside it in the pinned bundle — the
+    /// path it turns on is resolved in the CLI the SDK spawns — and it was left
+    /// out of this row once for exactly that reason, which is the shape of hole
+    /// this test exists to keep out.
+    #[test]
+    fn the_cc_row_claims_the_whole_endpoint_selection_family() {
+        let claimed: Vec<&str> = variables_read(Harness::Cc, &[ConnectionFact::BaseUrl])
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        for selector in [
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+            "CLAUDE_CODE_USE_MANTLE",
+            "CLAUDE_CODE_USE_GATEWAY",
+        ] {
+            assert!(
+                claimed.contains(&selector),
+                "`{selector}` is a member of the pinned runtime's provider-selection family and \
+                 the `cc` row does not claim it for `base_url:`, so a coder node's `env:` may set \
+                 it with no diagnostic and send the run to an endpoint the composition never \
+                 named (grammar 8.9, Decision D143 rule 4)"
             );
         }
     }

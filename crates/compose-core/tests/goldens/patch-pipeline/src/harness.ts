@@ -323,6 +323,28 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
 };
 
 /**
+ * Whether one resolved header value would forge a second header field.
+ *
+ * The compiler asks this of the text a composition **wrote** (`validate`
+ * refuses it there, `invalid-value`); this asks it of what a `${ENV}` resolved
+ * to, which is text no build ever saw and precisely the shape a gateway
+ * deployment produces — an operator sets the variable, not the author.
+ *
+ * Every control character, not only the two that split a line: `\r` on its own
+ * is a byte no header value carries either, and `\r\n` splits on the newline and
+ * leaves the carriage return glued to the line before it. One shape, one rule —
+ * the same answer the parser gives a written value and the same one a trigger's
+ * `auth:` `prefix:` has always given.
+ */
+function forgesAHeaderField(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
+/**
  * How a provider connection reaches this harness (grammar 8.9, Decision D143,
  * PRD resolved q58 ruling a).
  *
@@ -358,6 +380,20 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
  * harness would authenticate as nobody instead of letting the gateway do it.
  * `validate` has already refused a node whose provider declares a fact this
  * harness has no slot for, so there is nothing here to drop.
+ *
+ * **The header encoding is the one slot that can be handed a value it cannot
+ * carry**, and this is where that is caught. `ANTHROPIC_CUSTOM_HEADERS` is
+ * newline-delimited and each line is split on its first colon, so a value
+ * carrying a line break would declare one header and send two — the second one
+ * spelled by the value, which is `x-api-key` as easily as anything else.
+ * `validate` refuses such a value where the composition *wrote* it, but a
+ * `${ENV}` is text this build never saw and a gateway deployment is exactly
+ * where operators set those variables (PRD resolved q58 ruling a). So the
+ * resolved value is asked the same question here, and a run is failed rather
+ * than quietly sent with a header nobody declared. The message names the node
+ * and the header and **never the value**, which is `docs/trace.md` §11.1's rule
+ * about every artifact this project writes: a connection header is where a
+ * gateway credential lives.
  */
 function ccConnection(run: runtime.HarnessRun): Record<string, string> {
   const held: Record<string, string> = {};
@@ -366,6 +402,14 @@ function ccConnection(run: runtime.HarnessRun): Record<string, string> {
   if (connection.credential !== undefined) held["ANTHROPIC_API_KEY"] = connection.credential;
   const headers = Object.entries(connection.headers ?? {});
   if (headers.length > 0) {
+    for (const [name, value] of headers) {
+      if (forgesAHeaderField(value)) {
+        throw new Error(
+          `\`${run.node}\`'s connection header \`${name}\` resolves to a value carrying a control character: ` +
+            "`ANTHROPIC_CUSTOM_HEADERS` is one `Name: value` per line, so the run would send a header the composition never declared",
+        );
+      }
+    }
     held["ANTHROPIC_CUSTOM_HEADERS"] = headers.map(([name, value]) => `${name}: ${value}`).join("\n");
   }
   return held;

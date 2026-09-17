@@ -6465,6 +6465,29 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         connection["keylessBaseUrl"],
         json!("https://gateway.internal/v1")
     );
+    // **A header value that would forge a second field**, which is the one slot
+    // whose *value* can break its own encoding: `ANTHROPIC_CUSTOM_HEADERS` is
+    // one `Name: value` per line, and a value carrying a line break declares one
+    // header and sends two — the second one spelled by the value, `x-api-key`
+    // as easily as anything else. `validate` refuses the text a composition
+    // wrote; this is the half no compile step can reach, because a `${ENV}` an
+    // operator set is the ordinary resolved q58 gateway deployment. The run
+    // fails rather than going out with a header nobody declared…
+    let forged = connection["forgedHeader"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a header value carrying a newline was encoded and sent"));
+    assert!(
+        forged.contains("flow.patch.implement") && forged.contains("x-team"),
+        "the refusal names neither the node nor the header: {forged}"
+    );
+    // …and the message says **which** header rather than what it resolved to: a
+    // connection header is where a gateway credential lives, and a node's error
+    // is a field the trace carries and a reader files (`docs/trace.md` §11.1).
+    assert_eq!(
+        connection["forgedNamesTheValue"],
+        json!(false),
+        "the refusal quoted the resolved header value: {forged}"
+    );
 
     // …and the other harness, whose connection surface is its client's options
     // rather than an environment — stated per harness, never implied equivalent.

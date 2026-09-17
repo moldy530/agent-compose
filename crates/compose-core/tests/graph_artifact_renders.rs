@@ -654,6 +654,22 @@ fn panes(project: &str) -> &'static [Pane] {
                     "model.implementer",
                     "claude-sonnet-4-5",
                     "provider.anthropic (anthropic)",
+                    // …and the **Connection** section, which is the same class
+                    // of harness-only fact as `tools_enforced` above: what the
+                    // provider declares is already on the model rows, and what
+                    // no composition anywhere says is which slot each fact lands
+                    // in on *this* harness (PRD resolved q58, Decision D143).
+                    // Asserted as whole `<dt>`/`<dd>` pairs, because the pair is
+                    // the claim — a slot drawn against the wrong value, or a
+                    // section quietly deleted from the template, is exactly what
+                    // a heading-only assertion would let through.
+                    "<h3>Connection</h3>",
+                    "<dt>base_url → ANTHROPIC_BASE_URL</dt><dd>${LLM_GATEWAY_URL}</dd>",
+                    "<dt>api_key → ANTHROPIC_API_KEY</dt><dd>${ANTHROPIC_API_KEY}</dd>",
+                    // The header slot, which is the one fact `codex` below has
+                    // nowhere to put and the one that is not a one-to-one carry:
+                    // every header of one provider shares this variable.
+                    "<dt>headers.x-agent-compose-team → ANTHROPIC_CUSTOM_HEADERS</dt><dd>${TEAM_NAME}</dd>",
                 ],
             },
             // …and the node beside it, which is the same picture with both
@@ -674,6 +690,14 @@ fn panes(project: &str) -> &'static [Pane] {
                     "(sandbox bound only)",
                     "gpt-5-codex",
                     "provider.openai (openai)",
+                    // The other harness's answer to the same question, which is
+                    // what makes the slot worth drawing at all: the same two
+                    // facts, under a client option's name rather than an
+                    // environment variable's — and no header row, because this
+                    // SDK has no slot for one and `validate` refuses a provider
+                    // that declares one here.
+                    "<dt>base_url → baseUrl</dt><dd>${LLM_GATEWAY_URL}</dd>",
+                    "<dt>api_key → apiKey</dt><dd>${OPENAI_API_KEY}</dd>",
                 ],
             },
         ],

@@ -359,7 +359,7 @@ pub(crate) fn http_block(
         .and_then(|node| lexical::interpolated(node, "`url`", cx));
     let headers = fields
         .take("headers")
-        .map(|node| interpolated_map(node, "`headers`", NameForm::HeaderLike, cx))
+        .map(|node| header_map(node, "`headers`", cx))
         .unwrap_or_default();
     let query = fields
         .take("query")
@@ -889,6 +889,63 @@ fn output_schema(
         );
     }
     Some(map)
+}
+
+/// A `headers:` map: [`interpolated_map`] under [`NameForm::HeaderLike`], with
+/// every value held to what one header field can carry (grammar 12.1).
+///
+/// The name half has been checked here since headers existed, because a name is
+/// written onto a request verbatim and a space or a colon in one forges a second
+/// field rather than naming this one awkwardly. The **value** half is the same
+/// sentence read one column along, and it became a compile-time question when
+/// PRD resolved q58 let a provider's `headers:` cross into a `coder:` node's
+/// run: on `cc` they are encoded into `ANTHROPIC_CUSTOM_HEADERS`, which the
+/// Agent SDK's bundled runtime splits on newlines and then on each line's first
+/// colon, so a value carrying a line break declares one header and sends two —
+/// the second of them spelled by whoever wrote the value, `x-api-key` included.
+/// On the agent path the same value goes to `fetch`, which refuses it at the
+/// call; q58 ruling b's own principle is that a fact deciding what a connection
+/// sends must fail at `validate` rather than on the first live request (PRD G3),
+/// and that is the same answer for both.
+///
+/// Every control character is refused rather than the two that split a line, for
+/// `section::prefix_shape`'s reason on the other half of a header field: none of
+/// them is a byte a header value can carry, and a rule with one shape needs no
+/// table. The rule is on the **written** text; the `cc` driver re-asks it of the
+/// resolved value, because a `${ENV}` a gateway deployment sets is text this
+/// compiler never sees.
+pub(crate) fn header_map(node: &Node, subject: &str, cx: &mut Cx) -> Vec<InterpolatedEntry> {
+    let mut held = Vec::new();
+    for entry in interpolated_map(node, subject, NameForm::HeaderLike, cx) {
+        if header_value_shape(&entry, subject, cx) {
+            held.push(entry);
+        }
+    }
+    held
+}
+
+/// Whether one `headers:` value is a value one header field can carry.
+///
+/// See [`header_map`] for why the question is asked at all.
+fn header_value_shape(entry: &InterpolatedEntry, subject: &str, cx: &mut Cx) -> bool {
+    if !entry.value.value.as_str().chars().any(char::is_control) {
+        return true;
+    }
+    cx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidValue,
+            entry.value.span.clone(),
+            format!(
+                "`{}` in {subject} must not contain control characters, found {:?}",
+                entry.name.value,
+                entry.value.value.as_str()
+            ),
+        )
+        .with_help(
+            "a header value is written onto the request as it stands — and, where a `coder:` node's `model:` carries it into a `cc` run, into the newline-delimited `ANTHROPIC_CUSTOM_HEADERS` — so a carriage return or a newline in it ends this field and begins another: the composition would declare one header and the run would send two, the second one spelled by the value",
+        ),
+    );
+    false
 }
 
 pub(crate) fn interpolated_map(

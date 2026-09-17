@@ -32,7 +32,11 @@ bundled runtime reads, and that runtime reads more than three names:
 * `CLAUDE_CODE_USE_BEDROCK` and its `ANTHROPIC_BEDROCK_BASE_URL` companion
   select a different endpoint altogether, so the run leaves for somewhere the
   composition never named while the graph document `visualize` renders and the
-  journal's record of the run both go on reporting the mapped pair.
+  journal's record of the run both go on reporting the mapped pair. Every
+  `CLAUDE_CODE_USE_*` selector that runtime has is refused the same way —
+  `CLAUDE_CODE_USE_GATEWAY` included, which is the one with no base-URL variable
+  beside it in the pinned bundle, because what it decides is still which
+  endpoint the run talks to.
 
 Both are `api_key:` and `base_url:` under another spelling, so both are refused
 the same way and the message names the mapped variable the entry collides with —

@@ -1,0 +1,11 @@
+# rule: a `headers:` value is written onto a request — and, on a `coder:` node's `cc` run, into the newline-delimited `ANTHROPIC_CUSTOM_HEADERS` — exactly as it stands, so no header value carries a line break (grammar 12.1, Decision D143)
+# code: invalid-value
+# message: `x-team` in `headers` must not contain control characters, found "platform\nx-api-key: someone-elses-key"
+# at: 11:13
+# help: a header value is written onto the request as it stands — and, where a `coder:` node's `model:` carries it into a `cc` run, into the newline-delimited `ANTHROPIC_CUSTOM_HEADERS` — so a carriage return or a newline in it ends this field and begins another: the composition would declare one header and the run would send two, the second one spelled by the value
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  base_url: ${LLM_GATEWAY_URL}
+  headers:
+    x-team: "platform\nx-api-key: someone-elses-key"

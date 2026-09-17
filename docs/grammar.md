@@ -1212,7 +1212,7 @@ http:
 |---|---|---|---|
 | `method` | enum `GET POST PUT PATCH DELETE HEAD OPTIONS` | yes | explicit; effects are never defaulted |
 | `url` | string (interpolable) | yes | |
-| `headers` | map header-name (`[A-Za-z0-9_-]+`) → string (interpolable) | no | header names are case-insensitive |
+| `headers` | map header-name (`[A-Za-z0-9_-]+`) → string (interpolable, **no control character**) | no | header names are case-insensitive. A value is written onto the request as it stands, so a newline in one would forge a second field rather than carry this one — the rule §12.1's `headers:` and §13.3's `prefix:` are held to, refused the same way (`invalid-value`) |
 | `query` | map param-name (`[A-Za-z0-9_-]+`) → CEL over `input` | no | |
 | `body` | map identifier→CEL over `input` | no | JSON body; illegal for `GET`/`HEAD` |
 | `expect_status` | **non-empty** array of **distinct** integers in `100..=599` | no | default: any 2xx. Non-empty and distinct on the same rule `expect_exit` obeys — see *Accepted-outcome lists* below (D80, [D100](#d100-both-accepted-outcome-lists-are-non-empty-and-distinct)) |
@@ -4176,7 +4176,19 @@ compiled graph sends **no** authentication header at all for it — not an empty
 one — because the gateway injects the vendor credential server-side. A gateway
 that wants a token of its *own* takes it through `headers:`, whose values
 interpolate (§4.3 class 2), so `authorization: "Bearer ${PROXY_TOKEN}"` reaches
-the wire as a declared header rather than as a vendor credential. The other four
+the wire as a declared header rather than as a vendor credential.
+
+**A `headers:` value carries no control character**, which is §13.3's rule on
+`header:` and `prefix:` read one column along and refused the same way
+(`invalid-value`). A resolved value is written onto the request as it stands, and
+— since [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)
+— into `cc`'s newline-delimited `ANTHROPIC_CUSTOM_HEADERS` as one `Name: value`
+line, so a carriage return or a newline in one ends that field and begins
+another: the composition would declare one header and the run would send two, the
+second spelled by the value. The rule is on the text the composition **writes**;
+a `${ENV}` resolves to text no build ever sees, so the `cc` driver asks the same
+question of the resolved value and fails the run rather than sending it. The
+other four
 kinds are unchanged: `azure_openai` has no default endpoint and keeps all three
 of its keys required, `openai_compatible` was already the fully flexible row, and
 the two SDK-reached kinds authenticate through their cloud's own credential
@@ -8862,7 +8874,12 @@ different endpoint entirely through `CLAUDE_CODE_USE_BEDROCK` and the
 `base_url:` spelled another way, so each belongs to the fact: guarding the three
 mapped names alone would let a node quietly add a second identity and repoint the
 run while the graph document `visualize` renders and the journal's request
-identity both went on reporting the mapped pair. The wider list is part of the
+identity both went on reporting the mapped pair. The endpoint selectors are
+claimed as a **family** rather than one at a time, `CLAUDE_CODE_USE_GATEWAY`
+included even though this release's bundle shows no base-URL variable beside it:
+what a selector decides is which endpoint the run talks to, and a list that
+guarded all but one would be a completeness claim with the hole rule 4 exists to
+close. The wider list is part of the
 same curated row, read off the same pinned release, and it is **per fact** — a
 provider with no `api_key:` claims no credential name at all, which is rule 2
 reading on the family rather than on the one variable.

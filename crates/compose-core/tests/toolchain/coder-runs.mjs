@@ -868,6 +868,27 @@ const results = {};
   );
   const ccKeyless = harness.ccOptions(ccKeylessStub.runs[0], [], new Set());
 
+  // …and the header slot's own hazard, which is the one fact whose *value* can
+  // break its encoding. `ANTHROPIC_CUSTOM_HEADERS` is one `Name: value` per
+  // line, so a value carrying a line break declares one header and sends two —
+  // the second one spelled by the value. `validate` refuses such a value where
+  // a composition **wrote** it; this is the other half, and the half no compile
+  // step can reach: a `${ENV}` an operator set, which is the ordinary q58
+  // gateway deployment. The run must fail rather than go out with a header
+  // nobody declared, and the message must name the node and the header and
+  // **not** the value — a connection header is where a gateway credential lives
+  // (`docs/trace.md` §11.1).
+  process.env["CODER_TEAM"] = "platform\nx-api-key: someone-elses-key";
+  const forgedStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(binding(), { goal: "fix it" }, context(), { cc: forgedStub.driver });
+  let forged = null;
+  try {
+    harness.ccOptions(forgedStub.runs[0], [], new Set());
+  } catch (error) {
+    forged = error instanceof Error ? error.message : String(error);
+  }
+  process.env["CODER_TEAM"] = "platform";
+
   results["connection"] = {
     // The run object: the composition's references, resolved once, for both
     // drivers to read.
@@ -885,6 +906,9 @@ const results = {};
     keylessHasCredential: Object.hasOwn(ccKeyless.env ?? {}, "ANTHROPIC_API_KEY"),
     keylessHasHeaders: Object.hasOwn(ccKeyless.env ?? {}, "ANTHROPIC_CUSTOM_HEADERS"),
     keylessBaseUrl: (ccKeyless.env ?? {})["ANTHROPIC_BASE_URL"] ?? null,
+    // The forged header: that the run failed, and what the failure does not say.
+    forgedHeader: forged,
+    forgedNamesTheValue: forged === null ? null : forged.indexOf("someone-elses-key") >= 0,
   };
 
   // `codex`, whose surface is its client's options rather than an environment.

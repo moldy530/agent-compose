@@ -14,12 +14,16 @@
 //!   spelling, which is why it is its own code rather than an
 //!   `unknown-variant`.
 //! * **the model is a direct binding.** A `model.*` may be a failover route
-//!   (grammar 12.2), and a route does not reach inside a harness run: PRD
-//!   resolved q57 ruling d stops the provider connection, its auth and q53's
-//!   mechanism ladder at this boundary, so a ladder here is a declared policy
-//!   with nothing to apply it. Taking the first member silently is the one
-//!   answer this compiler will not give. Deciding it needs the *definition* the
-//!   address names, which is a whole-composition fact.
+//!   (grammar 12.2), and a *route* does not reach inside a harness run. PRD
+//!   resolved q58 ruling a amends what q57 ruling d stopped here: the
+//!   connection facts — `base_url:`, the credential, `headers:` — now cross
+//!   (see the bullet below), and what still stops at this boundary is the
+//!   failover ladder itself, q53's mechanism ladder, and the rest of the
+//!   connection's *behavior*, because the harness owns its client and its
+//!   internal retries and our `retry:` wraps whole runs. So a ladder here is a
+//!   declared policy with nothing to apply it, and taking its first member
+//!   silently is the one answer this compiler will not give. Deciding it needs
+//!   the *definition* the address names, which is a whole-composition fact.
 //! * **the provider connection has somewhere to land, and lands in one place.**
 //!   PRD resolved q58 makes the resolved provider's `base_url:`, credential and
 //!   `headers:` cross the boundary, mapped by each driver into the harness's own
