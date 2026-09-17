@@ -76,6 +76,14 @@ const providerAnthropic: runtime.ProviderBinding = {
   get apiKey(): string {
     return runtime.environmentValue("ANTHROPIC_API_KEY", "provider.anthropic.api_key");
   },
+  get baseUrl(): string {
+    return runtime.environmentValue("LLM_GATEWAY_URL", "provider.anthropic.base_url");
+  },
+  get headers(): Record<string, string> {
+    return {
+      "x-agent-compose-team": runtime.interpolate([{ env: "TEAM_NAME", site: "provider.anthropic.headers.x-agent-compose-team" }]),
+    };
+  },
 };
 
 /**
@@ -86,6 +94,9 @@ const providerOpenai: runtime.ProviderBinding = {
   kind: "openai",
   get apiKey(): string {
     return runtime.environmentValue("OPENAI_API_KEY", "provider.openai.api_key");
+  },
+  get baseUrl(): string {
+    return runtime.environmentValue("LLM_GATEWAY_URL", "provider.openai.base_url");
   },
 };
 
@@ -125,13 +136,20 @@ const flowPatchNodeImplementCoder: runtime.HarnessBinding = {
   modelSettings: {
     "thinking": { "budget_tokens": 8000 },
   },
+  connection: {
+    provider: "provider.anthropic",
+    baseUrl: [{ env: "LLM_GATEWAY_URL", site: "provider.anthropic.base_url" }],
+    credential: [{ env: "ANTHROPIC_API_KEY", site: "provider.anthropic.api_key" }],
+    headers: [
+      { name: "x-agent-compose-team", value: [{ env: "TEAM_NAME", site: "provider.anthropic.headers.x-agent-compose-team" }] },
+    ],
+  },
   prompt: "You are implementing one change in a repository you have been given.\nMake the smallest change that satisfies the goal, run the test suite,\nand report what you touched.\n",
   workspace: [{ env: "REPO_ROOT", site: "flow.patch.node.implement.workspace" }],
   access: "workspace_write",
   allowTools: ["Bash", "Edit", "Glob", "Grep", "Read", "Write"],
   env: [
     { name: "PATH", value: ["/usr/bin:/bin"] },
-    { name: "ANTHROPIC_API_KEY", value: [{ env: "ANTHROPIC_API_KEY", site: "flow.patch.node.implement.env.ANTHROPIC_API_KEY" }] },
   ],
   settings: {
     "max_turns": 60,
@@ -203,13 +221,17 @@ const flowPatchNodeReviewCoder: runtime.HarnessBinding = {
   modelSettings: {
     "reasoning_effort": "medium",
   },
+  connection: {
+    provider: "provider.openai",
+    baseUrl: [{ env: "LLM_GATEWAY_URL", site: "provider.openai.base_url" }],
+    credential: [{ env: "OPENAI_API_KEY", site: "provider.openai.api_key" }],
+  },
   prompt: "You are reviewing a change somebody else just made in this repository.\nRead the working tree, decide whether it satisfies the goal, and say\nwhat would have to change if it does not.\n",
   workspace: [{ env: "REPO_ROOT", site: "flow.patch.node.review.workspace" }],
   access: "read_only",
   allowTools: ["command_execution"],
   env: [
     { name: "PATH", value: ["/usr/bin:/bin"] },
-    { name: "OPENAI_API_KEY", value: [{ env: "OPENAI_API_KEY", site: "flow.patch.node.review.env.OPENAI_API_KEY" }] },
   ],
   settings: {
     "web_search": "disabled",

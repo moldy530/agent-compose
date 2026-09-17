@@ -1,14 +1,28 @@
 # Connection layer (PRD 5.9). Credentials are ${ENV} references, never literals.
 #
-# A `coder:` node's `model:` resolves against this registry for its **id** and
-# for the small settings subset its harness accepts — and for nothing else. The
-# connection below serves the composition's agent-shaped work; a harness owns its
-# own client and its own auth, which it reads from the environment the node
-# declares (grammar 8.9, PRD resolved q57 ruling d).
+# Both connections here are **gateway-shaped**, which is the deployment PRD
+# resolved q25 exists for and the one resolved q58 fixed for coder nodes: a
+# `base_url:` names the proxy every call goes through, and the credential beside
+# it is an ${ENV} reference the run supplies. A `coder:` node's `model:` resolves
+# against this registry for its id, for the small settings subset its harness
+# accepts, and — since q58 — for these connection facts, which each driver maps
+# into its own harness's connection surface (grammar 8.9, 12.1, D143).
+#
+# The asymmetry between the two blocks is the connection table's, not this
+# project's: `cc` carries all three facts as environment variables of the
+# process it spawns, so `provider.anthropic` may declare a header; `codex`'s
+# client takes a base URL and an API key and has nowhere to put a header, so
+# `provider.openai` declares none. Writing one there is a compile error naming
+# the fact and the harness (`unsupported-connection-fact`) rather than a value
+# that vanishes on the way into the run.
 provider.anthropic:
   kind: anthropic
+  base_url: ${LLM_GATEWAY_URL}
   api_key: ${ANTHROPIC_API_KEY}
+  headers:
+    x-agent-compose-team: ${TEAM_NAME}
 
 provider.openai:
   kind: openai
+  base_url: ${LLM_GATEWAY_URL}
   api_key: ${OPENAI_API_KEY}

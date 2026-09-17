@@ -26,7 +26,10 @@ const CC_SETTINGS: readonly string[] = [
  *
  *  * an option that **spells** a bound another key states. `workspace:` is
  *    `cwd`, `access:` is `permissionMode`, the plan-mode body beside it and the
- *    flag `bypassPermissions` requires, `env:` is `env`, `output:` is
+ *    flag `bypassPermissions` requires, `env:` is `env` — which is also where
+ *    the model's **connection** lands, because this SDK's endpoint, credential
+ *    and custom headers are variables of the process it spawns (Decision D143),
+ *    so one reserved name holds both bounds — `output:` is
  *    `outputFormat`, `prompt:` is `systemPrompt`, `allow_tools:` is the
  *    available tool set, the allowlist and the callback over them, `timeout:`
  *    is the abort controller, and `model:` is the model and the one thinking
@@ -133,6 +136,44 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
   workspace_write: "acceptEdits",
   full_access: "bypassPermissions",
 };
+
+/**
+ * How a provider connection reaches this harness (grammar 8.9, Decision D143,
+ * PRD resolved q58 ruling a).
+ *
+ * The SDK's own `Options` carry no endpoint and no credential — what they carry
+ * is `env`, documented as **replacing** the subprocess environment outright —
+ * and the Claude Code runtime that subprocess runs reads its connection out of
+ * that environment. So all three facts are variables, merged into the `env` the
+ * adapter already built from the node's own `env:`:
+ *
+ *  * `ANTHROPIC_BASE_URL` — the endpoint the bundled client is constructed with;
+ *  * `ANTHROPIC_API_KEY` — the credential, read the same way. The **key** rather
+ *    than the auth-token variable beside it, because what grammar 12.1 spells
+ *    `api_key:` is a vendor API key; a gateway wanting a bearer token of its own
+ *    writes it into `headers:`, which is resolved q25's own answer and arrives
+ *    through the variable below;
+ *  * `ANTHROPIC_CUSTOM_HEADERS` — one `Name: value` per line, which is how that
+ *    runtime parses it.
+ *
+ * **An absent fact sets no variable**, which is the half a one-token slip would
+ * turn into the opposite of q25's ruling: a keyless gateway connection must
+ * leave the credential variable *unset*, not set to the empty string, or the
+ * harness would authenticate as nobody instead of letting the gateway do it.
+ * `validate` has already refused a node whose provider declares a fact this
+ * harness has no slot for, so there is nothing here to drop.
+ */
+function ccConnection(run: runtime.HarnessRun): Record<string, string> {
+  const held: Record<string, string> = {};
+  const connection = run.connection;
+  if (connection.baseUrl !== undefined) held["ANTHROPIC_BASE_URL"] = connection.baseUrl;
+  if (connection.credential !== undefined) held["ANTHROPIC_API_KEY"] = connection.credential;
+  const headers = Object.entries(connection.headers ?? {});
+  if (headers.length > 0) {
+    held["ANTHROPIC_CUSTOM_HEADERS"] = headers.map(([name, value]) => `${name}: ${value}`).join("\n");
+  }
+  return held;
+}
 
 /**
  * The `cc` driver: a thin mapping over the Claude Agent SDK.
@@ -244,7 +285,11 @@ export function ccOptions(
     model: run.model,
     permissionMode: CC_PERMISSION[run.access],
     abortController: controllerFor(run.signal),
-    env: { ...run.env },
+    // The node's declared environment, with the model's connection mapped over
+    // the top. The order is not a precedence rule: `validate` refuses an `env:`
+    // entry spelling a variable this map sets, so the two never name one key
+    // (PRD resolved q58 ruling c).
+    env: { ...run.env, ...ccConnection(run) },
     outputFormat: { type: "json_schema", schema: { ...run.schema } },
     ...passthrough(run, CC_SETTINGS, CC_RESERVED),
   };

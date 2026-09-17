@@ -116,6 +116,14 @@
                   {
                     "name": "api_key",
                     "value": "${ANTHROPIC_API_KEY}"
+                  },
+                  {
+                    "name": "base_url",
+                    "value": "${LLM_GATEWAY_URL}"
+                  },
+                  {
+                    "name": "headers.x-agent-compose-team",
+                    "value": "${TEAM_NAME}"
                   }
                 ]
               },
@@ -132,6 +140,23 @@
                 }
               ]
             },
+            "connection": [
+              {
+                "fact": "base_url",
+                "slot": "ANTHROPIC_BASE_URL",
+                "value": "${LLM_GATEWAY_URL}"
+              },
+              {
+                "fact": "api_key",
+                "slot": "ANTHROPIC_API_KEY",
+                "value": "${ANTHROPIC_API_KEY}"
+              },
+              {
+                "fact": "headers.x-agent-compose-team",
+                "slot": "ANTHROPIC_CUSTOM_HEADERS",
+                "value": "${TEAM_NAME}"
+              }
+            ],
             "workspace": "${REPO_ROOT}",
             "access": "workspace_write",
             "prompt": "You are implementing one change in a repository you have been given.\nMake the smallest change that satisfies the goal, run the test suite,\nand report what you touched.\n",
@@ -148,10 +173,6 @@
               {
                 "name": "PATH",
                 "expression": "/usr/bin:/bin"
-              },
-              {
-                "name": "ANTHROPIC_API_KEY",
-                "expression": "${ANTHROPIC_API_KEY}"
               }
             ],
             "inherit_env": false,
@@ -242,6 +263,10 @@
                   {
                     "name": "api_key",
                     "value": "${OPENAI_API_KEY}"
+                  },
+                  {
+                    "name": "base_url",
+                    "value": "${LLM_GATEWAY_URL}"
                   }
                 ]
               },
@@ -252,6 +277,18 @@
                 }
               ]
             },
+            "connection": [
+              {
+                "fact": "base_url",
+                "slot": "baseUrl",
+                "value": "${LLM_GATEWAY_URL}"
+              },
+              {
+                "fact": "api_key",
+                "slot": "apiKey",
+                "value": "${OPENAI_API_KEY}"
+              }
+            ],
             "workspace": "${REPO_ROOT}",
             "access": "read_only",
             "prompt": "You are reviewing a change somebody else just made in this repository.\nRead the working tree, decide whether it satisfies the goal, and say\nwhat would have to change if it does not.\n",
@@ -263,10 +300,6 @@
               {
                 "name": "PATH",
                 "expression": "/usr/bin:/bin"
-              },
-              {
-                "name": "OPENAI_API_KEY",
-                "expression": "${OPENAI_API_KEY}"
               }
             ],
             "inherit_env": false,

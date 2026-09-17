@@ -14,6 +14,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { Codex } from "@openai/codex-sdk";
 import type {
+  CodexOptions,
   SandboxMode,
   ThreadItem,
   ThreadOptions,
@@ -210,7 +211,10 @@ const CC_SETTINGS: readonly string[] = [
  *
  *  * an option that **spells** a bound another key states. `workspace:` is
  *    `cwd`, `access:` is `permissionMode`, the plan-mode body beside it and the
- *    flag `bypassPermissions` requires, `env:` is `env`, `output:` is
+ *    flag `bypassPermissions` requires, `env:` is `env` — which is also where
+ *    the model's **connection** lands, because this SDK's endpoint, credential
+ *    and custom headers are variables of the process it spawns (Decision D143),
+ *    so one reserved name holds both bounds — `output:` is
  *    `outputFormat`, `prompt:` is `systemPrompt`, `allow_tools:` is the
  *    available tool set, the allowlist and the callback over them, `timeout:`
  *    is the abort controller, and `model:` is the model and the one thinking
@@ -317,6 +321,44 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
   workspace_write: "acceptEdits",
   full_access: "bypassPermissions",
 };
+
+/**
+ * How a provider connection reaches this harness (grammar 8.9, Decision D143,
+ * PRD resolved q58 ruling a).
+ *
+ * The SDK's own `Options` carry no endpoint and no credential — what they carry
+ * is `env`, documented as **replacing** the subprocess environment outright —
+ * and the Claude Code runtime that subprocess runs reads its connection out of
+ * that environment. So all three facts are variables, merged into the `env` the
+ * adapter already built from the node's own `env:`:
+ *
+ *  * `ANTHROPIC_BASE_URL` — the endpoint the bundled client is constructed with;
+ *  * `ANTHROPIC_API_KEY` — the credential, read the same way. The **key** rather
+ *    than the auth-token variable beside it, because what grammar 12.1 spells
+ *    `api_key:` is a vendor API key; a gateway wanting a bearer token of its own
+ *    writes it into `headers:`, which is resolved q25's own answer and arrives
+ *    through the variable below;
+ *  * `ANTHROPIC_CUSTOM_HEADERS` — one `Name: value` per line, which is how that
+ *    runtime parses it.
+ *
+ * **An absent fact sets no variable**, which is the half a one-token slip would
+ * turn into the opposite of q25's ruling: a keyless gateway connection must
+ * leave the credential variable *unset*, not set to the empty string, or the
+ * harness would authenticate as nobody instead of letting the gateway do it.
+ * `validate` has already refused a node whose provider declares a fact this
+ * harness has no slot for, so there is nothing here to drop.
+ */
+function ccConnection(run: runtime.HarnessRun): Record<string, string> {
+  const held: Record<string, string> = {};
+  const connection = run.connection;
+  if (connection.baseUrl !== undefined) held["ANTHROPIC_BASE_URL"] = connection.baseUrl;
+  if (connection.credential !== undefined) held["ANTHROPIC_API_KEY"] = connection.credential;
+  const headers = Object.entries(connection.headers ?? {});
+  if (headers.length > 0) {
+    held["ANTHROPIC_CUSTOM_HEADERS"] = headers.map(([name, value]) => `${name}: ${value}`).join("\n");
+  }
+  return held;
+}
 
 /**
  * The `cc` driver: a thin mapping over the Claude Agent SDK.
@@ -428,7 +470,11 @@ export function ccOptions(
     model: run.model,
     permissionMode: CC_PERMISSION[run.access],
     abortController: controllerFor(run.signal),
-    env: { ...run.env },
+    // The node's declared environment, with the model's connection mapped over
+    // the top. The order is not a precedence rule: `validate` refuses an `env:`
+    // entry spelling a variable this map sets, so the two never name one key
+    // (PRD resolved q58 ruling c).
+    env: { ...run.env, ...ccConnection(run) },
     outputFormat: { type: "json_schema", schema: { ...run.schema } },
     ...passthrough(run, CC_SETTINGS, CC_RESERVED),
   };
@@ -602,7 +648,9 @@ const CODEX_SETTINGS: readonly string[] = [
  *    here would be reaching around the construct that states it, through the
  *    surface this grammar deliberately leaves open — so these are dropped
  *    rather than passed. The environment is not on the list because it is not a
- *    thread option at all: it is handed to the `Codex` constructor below;
+ *    thread option at all, and neither is the model's **connection**: both are
+ *    the *client's*, built by [`codexClient`] from a literal that no
+ *    `settings:` key reaches;
  *  * an option that **contains** one without spelling it, which is the wider
  *    half of the dropped set grammar 8.9 states: `additionalDirectories` is
  *    additional sandbox roots beside `workspace:`, so a run under it is written
@@ -685,11 +733,7 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
   enforcesTools: false,
   run(run: runtime.HarnessRun): AsyncIterable<runtime.HarnessEvent> {
     return (async function* driven(): AsyncGenerator<runtime.HarnessEvent> {
-      // The environment is handed to the SDK rather than inherited by it: the
-      // Codex SDK documents that a provided `env` replaces `process.env` for the
-      // CLI it spawns, which is exactly the scrubbed child PRD resolved q54
-      // ruling b asks for (Decision D139).
-      const codex = new Codex({ env: { ...run.env } });
+      const codex = new Codex(codexClient(run));
       const thread = codex.startThread(codexOptions(run));
       const streamed = await thread.runStreamed(codexTurn(run), {
         outputSchema: { ...run.schema },
@@ -763,6 +807,47 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
     })();
   },
 };
+
+/**
+ * The `CodexOptions` this run's client is built from: the scrubbed environment,
+ * and the model's connection (grammar 8.9, Decisions D139, D143).
+ *
+ * **The environment** is handed to the SDK rather than inherited by it: the
+ * Codex SDK documents that a provided `env` replaces `process.env` for the CLI
+ * it spawns, which is exactly the scrubbed child PRD resolved q54 ruling b asks
+ * for.
+ *
+ * **The connection** is this harness's own surface, and it is the *client's*
+ * rather than a thread's: `baseUrl`, which the SDK passes to the CLI as
+ * `--config openai_base_url=…`, and `apiKey`, which it sets as `CODEX_API_KEY`
+ * in that same environment on its way past. There is **no header slot** on
+ * either object, which is why a provider declaring `headers:` is refused at
+ * `validate` for a node bound to this harness rather than quietly dropped here
+ * (PRD resolved q58 ruling b) — a faked one would have meant composing a
+ * `model_providers.*` config table the composition never wrote.
+ *
+ * An absent fact sets no key at all, resolved q25's posture: a keyless gateway
+ * connection leaves `apiKey` undefined, and the SDK then sets no `CODEX_API_KEY`
+ * for the CLI to authenticate with.
+ *
+ * **Exported for the reason [`codexOptions`] is**, and for one more: what this
+ * object holds is the whole of where the run's traffic goes, and none of it is
+ * visible from a run's answer or from the events the driver yields.
+ *
+ * It is built from a literal and from `run.connection` alone. Nothing here reads
+ * `run.settings`, because [`passthrough`] feeds the **thread** and a key that
+ * could reach this object would be choosing the client — `codexPathOverride` is
+ * on it, and so is the `config` escape hatch — which is what
+ * `what_program_a_harness_run_is_cannot_be_chosen_by_a_settings_key` holds.
+ */
+export function codexClient(run: runtime.HarnessRun): CodexOptions {
+  const connection = run.connection;
+  return {
+    env: { ...run.env },
+    ...(connection.baseUrl === undefined ? {} : { baseUrl: connection.baseUrl }),
+    ...(connection.credential === undefined ? {} : { apiKey: connection.credential }),
+  };
+}
 
 /**
  * The `ThreadOptions` one `codex` run is made of — the config map of grammar

@@ -143,7 +143,7 @@ pub fn module(ir: &Ir) -> super::GeneratedFile {
     if harnesses.contains(&Harness::Codex) {
         contents.push_str("import { Codex } from \"@openai/codex-sdk\";\n");
         contents.push_str(
-            "import type {\n  SandboxMode,\n  ThreadItem,\n  ThreadOptions,\n} from \"@openai/codex-sdk\";\n",
+            "import type {\n  CodexOptions,\n  SandboxMode,\n  ThreadItem,\n  ThreadOptions,\n} from \"@openai/codex-sdk\";\n",
         );
     }
     contents.push_str(PRELUDE);
@@ -467,6 +467,22 @@ mod tests {
             "the `codex` client is built from the node's `settings:`, so a key spelling \
              `codexPathOverride` would choose what program the run is (grammar 8.9)"
         );
+        // …and through the **builder** the construction calls, because Decision
+        // D143 put the connection on that object and the call is now an
+        // indirection: a guard that read the `new Codex(…)` expression alone
+        // would be satisfied by any function name at all, whatever that function
+        // then read.
+        let body = codex
+            .split_once("export function codexClient(")
+            .expect("the `codex` client is built by `codexClient`")
+            .1;
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            !body.contains("run.settings") && !body.contains("passthrough"),
+            "`codexClient` reads the node's `settings:`, so an unverified key spelling \
+             `codexPathOverride`, `config` or `env` would choose what program the run is and what \
+             it may reach (grammar 8.9, Decisions D140, D143)"
+        );
     }
 
     /// A `cc` run keeps the **harness's own** system prompt and appends the
@@ -541,6 +557,79 @@ mod tests {
             "`codexTurn` does not name the offered tools, so `allow_tools:` reaches nothing on a \
              `codex` node"
         );
+    }
+
+    /// **The connection table and the drivers are one table** (grammar 8.9,
+    /// Decision D143, PRD resolved q58).
+    ///
+    /// `crate::harness::CONNECTION` is what `validate` refuses a composition on
+    /// and what the graph document draws; the driver below it is what actually
+    /// calls the SDK. Two hand-maintained accounts of one mapping drift in
+    /// silence, and this one drifts in the worst direction available: the table
+    /// says a fact crosses, `validate` accepts the composition on that basis, the
+    /// driver maps nothing, and the run reaches the vendor endpoint the gateway
+    /// deployment existed to avoid — with no diagnostic anywhere, because every
+    /// surface that could have complained was told the fact was carried.
+    ///
+    /// Read in both directions, because each miss is a different lie:
+    ///
+    ///  1. a fact the row gives a slot is **read** by that driver, and the slot's
+    ///     own name appears in it. A row that promised a carry nothing performs
+    ///     is the failure above;
+    ///  2. a fact the row gives **no** slot is not read at all. A driver that
+    ///     mapped one anyway would be carrying a fact `validate` refuses the
+    ///     composition over, so the error would be a compile error about a
+    ///     capability the release has — and the honest narrowness Decision D143
+    ///     insists on would be a lie in the other direction.
+    #[test]
+    fn a_driver_maps_exactly_the_connection_facts_its_row_names() {
+        use crate::harness::{ConnectionFact, Slot, slot_of};
+
+        for harness in Harness::ALL
+            .iter()
+            .copied()
+            .filter(|held| held.ships_in_v1())
+        {
+            let (source, _, _) = driver_source(harness);
+            let name = harness.as_str();
+            for fact in ConnectionFact::ALL.iter().copied() {
+                // The field of `runtime.HarnessConnection` this fact resolves
+                // into — the one name both sides of the seam agree on.
+                let field = match fact {
+                    ConnectionFact::BaseUrl => "connection.baseUrl",
+                    ConnectionFact::Credential => "connection.credential",
+                    ConnectionFact::Headers => "connection.headers",
+                };
+                let reads = source.contains(field);
+                let Some(slot) = slot_of(harness, fact) else {
+                    assert!(
+                        !reads,
+                        "`{name}`'s driver reads `{field}`, and its connection row says this \
+                         harness has no slot for `{}:` — so `validate` refuses a composition \
+                         over a fact the driver would in fact have carried",
+                        fact.as_str()
+                    );
+                    continue;
+                };
+                assert!(
+                    reads,
+                    "`{name}`'s connection row gives `{}:` a slot and its driver never reads \
+                     `{field}`: `validate` accepts the composition and the run is pointed \
+                     nowhere (grammar 8.9, Decision D143)",
+                    fact.as_str()
+                );
+                let spelled = match slot {
+                    Slot::Variable(variable) => variable,
+                    Slot::Option { name, .. } => name,
+                };
+                assert!(
+                    source.contains(spelled),
+                    "`{name}`'s row maps `{}:` onto `{spelled}` and its driver never writes that \
+                     name, so the two accounts of one mapping have parted company",
+                    fact.as_str()
+                );
+            }
+        }
     }
 
     /// The SDK release one driver's reserved list was read against, and the

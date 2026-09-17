@@ -379,6 +379,29 @@ impl Partition {
                                 NodeKind::Store { store, .. } => {
                                     carry(&store.value.to_string(), false, &store.span);
                                 }
+                                // A `coder:` node's harness is **pointed at** its
+                                // model's provider (grammar §8.9, Decision D143,
+                                // PRD resolved q58 ruling d): the endpoint, the
+                                // credential and the headers cross into the run,
+                                // so that connection's variables are spent
+                                // wherever this flow's instance runs. Not
+                                // placeable, like an agent's own model: a
+                                // `provider.*` is not a `members:` entry.
+                                //
+                                // Without this edge a provider reached *only*
+                                // from a placed component would never join the
+                                // hub's list, while the hub goes on being able
+                                // to start every flow (Decision D64) — so the
+                                // hub would launch clean and the coder node
+                                // would fail on its first run for a variable no
+                                // manifest asked for, which is §9.1's own
+                                // failure mode.
+                                NodeKind::Coder { coder } => {
+                                    for provider in providers_of(ir, &coder.model.value.to_string())
+                                    {
+                                        carry(&provider, false, &coder.model.span);
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -1107,6 +1130,53 @@ placements:\n  mac:\n    members: [agent.signer]\n",
         );
     }
 
+    /// **A `coder:` node's provider connection is on the manifest of every
+    /// process that runs its flow** (`docs/distributed.md` §9.1, PRD resolved
+    /// q58 ruling d).
+    ///
+    /// Resolved q58 made the provider's `base_url:`, credential and `headers:`
+    /// cross into a harness run, which turns a `model:` on a coder node into a
+    /// **reference site** the partition has to follow — exactly as an agent's
+    /// `model:` already is. Before it, the same provider was a connection this
+    /// runtime opened and no harness ever saw, so nothing was spent on the
+    /// process running the node.
+    ///
+    /// The composition below is built to make the missing edge visible, because
+    /// the easy case hides it: a provider **nothing** reaches falls to the hub
+    /// under the orphan floor at the end of [`Partition::of`], so a coder node's
+    /// connection would appear to work while the walk never looked at it. Here
+    /// the same `provider.gateway` also serves a **placed** agent, which gives it
+    /// `mac` and takes it off the orphan list — and the hub, which can start
+    /// every flow a composition declares (Decision D64) and therefore runs this
+    /// coder node, would launch clean and fail on the node's first run for a
+    /// variable no manifest asked for.
+    #[test]
+    fn a_coder_nodes_provider_is_on_the_manifest_of_every_process_running_its_flow() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.gateway:\n  kind: anthropic\n  base_url: ${GATEWAY_URL}\n  api_key: ${GATEWAY_KEY}\n\
+model.smart:\n  provider: provider.gateway\n  id: some-model\n\
+agent.signer:\n  model: model.smart\n  prompt: Sign what you are given.\n  input: { path: { type: string } }\n  output: { verdict: { type: string } }\n\
+state:\n  summary: { type: string, default: \"\" }\n\
+flow.release:\n  inputs:\n    path: { type: string }\n  outputs:\n    summary: { type: string }\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.smart\n        workspace: /srv/checkout\n        prompt: Build it.\n        output:\n          summary: { type: string }\n      input: \"input.path\"\n    sign:\n      agent: agent.signer\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: sign }\n    - { from: sign, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.signer]\n",
+        );
+
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Hub),
+            ["GATEWAY_KEY", "GATEWAY_URL", "MESH_TOKEN"],
+            "the hub runs `flow.release` and its `coder:` node, so it holds the connection that \
+             node's harness is pointed at — and the placed agent's own dispatch is the worker's"
+        );
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Placement("mac".to_string())),
+            ["GATEWAY_KEY", "GATEWAY_URL"],
+            "the worker runs the placed agent, which calls the same connection"
+        );
+    }
+
     /// **§9.1's second worked example**, "from the other side, because the
     /// symmetric mistake is the expensive one".
     ///
@@ -1201,6 +1271,12 @@ placements:\n  mac:\n    members: [agent.outer]\n",
     /// So both halves are asserted, the way the two above are: the placement's,
     /// because that is the manifest §9.2 checks; and the hub's, because a flow
     /// is startable there whatever else reaches it (Decision D64).
+    ///
+    /// The node's **provider** is on both lists too, since PRD resolved q58:
+    /// the connection crosses into the run, so its variables are spent wherever
+    /// the run happens. That edge has a case of its own, because this
+    /// composition cannot see it slip —
+    /// [`a_coder_nodes_provider_is_on_the_manifest_of_every_process_running_its_flow`].
     #[test]
     fn a_coder_nodes_workspace_and_env_follow_the_flow_that_holds_it() {
         let (ir, partition) = partitioned(
@@ -1223,12 +1299,17 @@ placements:\n  mac:\n    members: [agent.signer]\n",
         );
         assert_eq!(
             manifest(&ir, &partition, &Process::Hub),
-            ["CODER_REPO_ROOT", "CODER_SECRET", "MESH_TOKEN"],
+            [
+                "CODER_REPO_ROOT",
+                "CODER_SECRET",
+                "MESH_TOKEN",
+                "VENDOR_KEY"
+            ],
             "…and `agent-compose run main.yml flow.patch` starts the same flow on the hub, which \
              is why the placement **adds** rather than moves (Decision D64). `VENDOR_KEY` is \
-             absent because the provider *connection* does not reach inside a harness run: the \
-             harness owns its client and reads its auth from the node's own `env:` (PRD resolved \
-             q57 ruling d)"
+             there because the provider *connection* now crosses into a harness run: the harness \
+             owns its client and this composition points it (PRD resolved q58 ruling d, \
+             Decision D143)"
         );
     }
 

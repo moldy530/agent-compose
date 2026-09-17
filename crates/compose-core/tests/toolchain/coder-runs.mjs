@@ -8,7 +8,7 @@
 // hands in a script and everything above the seam — the config map, the journal,
 // the stream tap, the output gate — is the code a deployment really ships.
 //
-// Thirteen claims, and each is invisible from outside a run:
+// Fourteen claims, and each is invisible from outside a run:
 //
 //   * **the config map** — `workspace:` resolves its `${ENV}` at the call and an
 //     empty one is refused; the environment is **scrubbed** to the declared
@@ -51,7 +51,12 @@
 //   * **a missing driver** — a harness with no driver in the registry is an
 //     execution failure naming the requirement, never a silent skip;
 //   * **a `retry:` ladder** — every attempt's run is on the node's entry, so a
-//     later attempt answering does not erase the one that failed.
+//     later attempt answering does not erase the one that failed;
+//   * **the connection** — the provider's endpoint, credential and headers reach
+//     each harness's own surface, and a provider with **no** credential injects
+//     none at all rather than an empty one. Invisible from the seam for section
+//     11's reason: a scripted driver is handed `run.connection` whole, and it is
+//     the real driver that decides what the SDK is called with.
 //
 // Usage: node coder-runs.mjs <generated project directory> <scratch dir>
 // Output: one JSON object, read by `generated_code_gates.rs`.
@@ -133,6 +138,17 @@ function binding(overrides = {}) {
     model: "model.implementer",
     modelId: "claude-sonnet-4-5",
     modelSettings: { thinking: { budget_tokens: 8000 } },
+    // The gateway shape: an endpoint, a credential and a header, each an
+    // `${ENV}` reference the adapter resolves at the call (PRD resolved q58).
+    connection: {
+      provider: "provider.anthropic",
+      baseUrl: [{ env: "CODER_GATEWAY_URL", site: "provider.anthropic.base_url" }],
+      credential: [{ env: "CODER_GATEWAY_KEY", site: "provider.anthropic.api_key" }],
+      headers: [
+        { name: "x-team", value: [{ env: "CODER_TEAM", site: "provider.anthropic.headers.x-team" }] },
+        { name: "x-run", value: ["batch"] },
+      ],
+    },
     prompt: "Fix the failing test.",
     workspace: [{ env: "CODER_WORKSPACE", site: "flow.patch.node.implement.workspace" }],
     access: "workspace_write",
@@ -199,6 +215,9 @@ const results = {};
   process.env["CODER_WORKSPACE"] = workspace;
   process.env["CODER_TOKEN"] = "shh";
   process.env["LEAKED"] = "should-not-travel";
+  process.env["CODER_GATEWAY_URL"] = "https://gateway.internal/v1";
+  process.env["CODER_GATEWAY_KEY"] = "gw-key";
+  process.env["CODER_TEAM"] = "platform";
   const stub = harness.scriptedDriver("cc", script({ summary: "done", touched: ["a.ts"] }));
   const held = context();
   const answer = await runtime.runCoder(binding(), { goal: "fix it" }, held, { cc: stub.driver });
@@ -220,6 +239,10 @@ const results = {};
     instructions: run.instructions,
     model: run.model,
     modelSettings: run.modelSettings,
+    // …and the connection, resolved at the call like the workspace above it:
+    // the run object is the only place the composition's `${ENV}` references
+    // are visible as the values a harness client is pointed with.
+    connection: run.connection,
   };
   results["lowering"] = {
     // The bound came off the wire schema…
@@ -586,6 +609,7 @@ const results = {};
   // that came from the resolved value changing would prove the opposite of the
   // claim (`docs/trace.md` §11.1 keeps resolved values out of the identity).
   process.env["CODER_TOKEN_V2"] = process.env["CODER_TOKEN"];
+  process.env["CODER_GATEWAY_URL_V2"] = process.env["CODER_GATEWAY_URL"];
   const held = await journal.openJournal();
   const site = "flow.patch/implement/0";
   const answer = { summary: "recorded", touched: ["one.ts"] };
@@ -659,6 +683,25 @@ const results = {};
     // different run (Decision D141).
     movedModelSettings: await resumeWith({
       modelSettings: { thinking: { budget_tokens: 32000 } },
+    }),
+    // The **connection** repointed: the same node, the same prompt, the same
+    // schema, and a different endpoint — which is a different run in the one way
+    // that matters most, because the answer came from somewhere else. The
+    // reference moves, not the value, for the reason `movedEnv` above does
+    // (`docs/trace.md` §11.1 keeps resolved values out of the identity).
+    movedConnection: await resumeWith({
+      connection: {
+        provider: "provider.anthropic",
+        baseUrl: [{ env: "CODER_GATEWAY_URL_V2", site: "provider.anthropic.base_url" }],
+        credential: [{ env: "CODER_GATEWAY_KEY", site: "provider.anthropic.api_key" }],
+        headers: [
+          {
+            name: "x-team",
+            value: [{ env: "CODER_TEAM", site: "provider.anthropic.headers.x-team" }],
+          },
+          { name: "x-run", value: ["batch"] },
+        ],
+      },
     }),
   };
 }
@@ -775,6 +818,123 @@ const results = {};
     networkAccessEnabled: thread.networkAccessEnabled,
     curatedTravelled: Object.hasOwn(thread, "network_access"),
     unknown: thread["vendorOptionShippedTomorrow"] ?? null,
+  };
+}
+
+// --- 12. The connection reaches each harness's own surface -----------------
+//
+// PRD resolved q58 ruling a: the provider's `base_url:`, credential and
+// `headers:` cross the boundary and are mapped by each driver into the harness's
+// own connection surface. Like section 11's bound, none of it is visible from
+// the seam — a scripted driver is handed `run.connection` whole and it is the
+// *real* driver that decides what an SDK is called with — so the two real
+// drivers' own builders are what this case calls, on the run the adapter built.
+//
+// Three claims, and the third is the one a plausible-looking one-liner breaks:
+//
+//   * **`cc` carries all three as environment variables** of the process the
+//     Agent SDK spawns, merged into the run environment the node's own `env:`
+//     built, with the headers encoded one `Name: value` per line;
+//   * **`codex` carries two as client options** — its SDK has no header slot at
+//     all, which is why `validate` refuses a `headers:` provider on that harness
+//     rather than dropping one here;
+//   * **an absent credential injects nothing.** Resolved q25's keyless-gateway
+//     posture is that a provider with no `api_key:` sends no authentication at
+//     all rather than an empty one, and a mapping that wrote `""` would
+//     authenticate as nobody on every call. The claim is an *absence*, so it is
+//     read off the object's own keys rather than off a value.
+{
+  process.env["CODER_GATEWAY_URL"] = "https://gateway.internal/v1";
+  process.env["CODER_GATEWAY_KEY"] = "gw-key";
+  process.env["CODER_TEAM"] = "platform";
+
+  // `cc`, with every fact declared.
+  const ccStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(binding(), { goal: "fix it" }, context(), { cc: ccStub.driver });
+  const ccRun = ccStub.runs[0];
+  const ccFull = harness.ccOptions(ccRun, [], new Set());
+
+  // …and `cc` on a keyless gateway: a base URL, no credential, no headers.
+  const keylessConnection = {
+    provider: "provider.gateway",
+    baseUrl: [{ env: "CODER_GATEWAY_URL", site: "provider.gateway.base_url" }],
+  };
+  const ccKeylessStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(
+    binding({ connection: keylessConnection }),
+    { goal: "fix it" },
+    context(),
+    { cc: ccKeylessStub.driver },
+  );
+  const ccKeyless = harness.ccOptions(ccKeylessStub.runs[0], [], new Set());
+
+  results["connection"] = {
+    // The run object: the composition's references, resolved once, for both
+    // drivers to read.
+    resolved: ccRun.connection,
+    // The Agent SDK's `env`, which is the whole environment the subprocess gets:
+    // the node's own declared variables **and** the mapped connection.
+    env: Object.keys(ccFull.env ?? {}).sort(),
+    baseUrl: (ccFull.env ?? {})["ANTHROPIC_BASE_URL"] ?? null,
+    credential: (ccFull.env ?? {})["ANTHROPIC_API_KEY"] ?? null,
+    headers: (ccFull.env ?? {})["ANTHROPIC_CUSTOM_HEADERS"] ?? null,
+    // The node's own `env:` is still there, untouched.
+    token: (ccFull.env ?? {})["TOKEN"] ?? null,
+    // The keyless gateway: an endpoint and **no credential key at all**.
+    keylessEnv: Object.keys(ccKeyless.env ?? {}).sort(),
+    keylessHasCredential: Object.hasOwn(ccKeyless.env ?? {}, "ANTHROPIC_API_KEY"),
+    keylessHasHeaders: Object.hasOwn(ccKeyless.env ?? {}, "ANTHROPIC_CUSTOM_HEADERS"),
+    keylessBaseUrl: (ccKeyless.env ?? {})["ANTHROPIC_BASE_URL"] ?? null,
+  };
+
+  // `codex`, whose surface is its client's options rather than an environment.
+  const codexStub = harness.scriptedDriver("codex", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(
+    binding({
+      harness: "codex",
+      modelId: "gpt-5-codex",
+      modelSettings: {},
+      // No harness config, so the thread's options below are exactly what the
+      // adapter put there — which is what makes that key list a statement.
+      settings: {},
+      connection: {
+        provider: "provider.openai",
+        baseUrl: [{ env: "CODER_GATEWAY_URL", site: "provider.openai.base_url" }],
+        credential: [{ env: "CODER_GATEWAY_KEY", site: "provider.openai.api_key" }],
+      },
+    }),
+    { goal: "fix it" },
+    context(),
+    { codex: codexStub.driver },
+  );
+  const client = harness.codexClient(codexStub.runs[0]);
+
+  const codexKeylessStub = harness.scriptedDriver("codex", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(
+    binding({
+      harness: "codex",
+      modelId: "gpt-5-codex",
+      modelSettings: {},
+      settings: {},
+      connection: keylessConnection,
+    }),
+    { goal: "fix it" },
+    context(),
+    { codex: codexKeylessStub.driver },
+  );
+  const keylessClient = harness.codexClient(codexKeylessStub.runs[0]);
+
+  results["codexConnection"] = {
+    baseUrl: client.baseUrl ?? null,
+    apiKey: client.apiKey ?? null,
+    // The scrubbed environment is still the client's, beside the connection.
+    env: Object.keys(client.env ?? {}).sort(),
+    // Nothing of the connection leaked into the **thread's** options, which are
+    // the bounds the node states rather than the connection it inherits.
+    threadKeys: Object.keys(harness.codexOptions(codexStub.runs[0])).sort(),
+    // …and the keyless gateway: an endpoint and no key on the client at all.
+    keylessHasApiKey: Object.hasOwn(keylessClient, "apiKey"),
+    keylessBaseUrl: keylessClient.baseUrl ?? null,
   };
 }
 

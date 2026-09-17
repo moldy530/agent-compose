@@ -1,0 +1,46 @@
+# rule: one spelling per connection fact — a node `env:` entry naming a variable
+# rule: the connection map sets is refused (grammar 8.9, D143, q58 ruling c)
+# code: conflicting-connection-variable
+# message: `ANTHROPIC_API_KEY` is set twice for `flow.main` node `build`: by this `env:` entry, and by `provider.anthropic`'s `api_key:`
+# at: main.yml:40:11
+# label: main.yml:22:12 `api_key:` is declared here, and `harness: cc` carries it as `ANTHROPIC_API_KEY`
+# label: main.yml:35:16 the connection is bound here
+# help: one spelling per fact: the provider's `api_key:` already reaches this run, so there is nothing to shadow and no precedence rule to learn. Drop the `env:` entry — it is for what the *program* needs — and a node that really has to decide how a connection authenticates for itself binds a `model.*` on another `provider.*` (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling c)
+#
+# The shape this refuses reads like belt and braces, which is exactly why it is
+# not tolerated: the node's `env:` and the provider's `api_key:` happen to name
+# one variable *and* one reference here, and a composition where they disagree is
+# indistinguishable from it. A compiler with a precedence rule would run the
+# node against whichever source won and tell nobody; this one has no rule to
+# remember, because two sources for one fact do not compile.
+#
+# The `PATH` entry is what an `env:` is for and stays: the bound is what the
+# *program* needs, and the connection is what the model's provider says.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: ${REPO_ROOT}
+        prompt: Fix the failing test.
+        env:
+          PATH: /usr/bin:/bin
+          ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

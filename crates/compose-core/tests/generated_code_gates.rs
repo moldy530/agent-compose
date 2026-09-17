@@ -5560,7 +5560,7 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 /// a parameter, and `src/harness.ts` emits a scripted driver into every project,
 /// so everything *above* the seam is exercised as the code a deployment ships.
 ///
-/// Thirteen claims, and not one of them is visible from a run's answer:
+/// Fourteen claims, and not one of them is visible from a run's answer:
 ///
 ///  * **the config map** — the workspace resolves its `${ENV}` at the call and an
 ///    empty one is refused *as written*; the environment is scrubbed to the
@@ -5606,7 +5606,14 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 ///    naming the requirement, which is the q54 bash-absent posture;
 ///  * **a `retry:` ladder** — every attempt's run reaches the node's entry, in
 ///    the order they were made, because the answer can only carry the attempt it
-///    came out of.
+///    came out of;
+///  * **the connection** — the provider's endpoint, credential and headers reach
+///    each harness's own surface, mapped by the table in `src/harness.rs`: `cc`
+///    carries all three as environment variables of the process the Agent SDK
+///    spawns, `codex` carries two as its client's options, and a provider with
+///    **no** credential injects none at all rather than an empty one, which is
+///    resolved q25's keyless-gateway posture surviving the crossing (PRD
+///    resolved q58 ruling a).
 #[test]
 fn a_harness_run_is_contained_journaled_and_recorded() {
     let Some(root) = installed() else {
@@ -5866,6 +5873,16 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
     assert_eq!(
         map["modelSettings"],
         json!({ "thinking": { "budget_tokens": 8000 } })
+    );
+    // …and the connection the model resolves through, resolved at the call the
+    // way the workspace above it is (PRD resolved q58 ruling a).
+    assert_eq!(
+        map["connection"],
+        json!({
+            "baseUrl": "https://gateway.internal/v1",
+            "credential": "gw-key",
+            "headers": { "x-team": "platform", "x-run": "batch" }
+        })
     );
 
     // --- The lowering (PRD resolved q55, rulings a and b) ------------------
@@ -6227,6 +6244,14 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
             "movedModelSettings",
             "a different thinking budget, which is a different run (Decision D141)",
         ),
+        // The sharpest member of the family, because nothing else in the binding
+        // says where a run's traffic went: the same node, the same prompt, the
+        // same schema, and an answer that came from another endpoint (PRD
+        // resolved q58 ruling a).
+        (
+            "movedConnection",
+            "the connection repointed — the run this build would make talks somewhere else",
+        ),
     ] {
         assert_eq!(
             identity[case]["diverged"],
@@ -6263,9 +6288,21 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         "`settings: {{ permissionMode: … }}` replaced what `access:` states — \
          `bypassPermissions` is the preset that asks for no containment at all"
     );
+    // The node's two declared variables and the three the connection table maps,
+    // and **not** the one the `settings:` key tried to smuggle in: the two rules
+    // are different and both hold here at once. `SMUGGLED` is what q54 ruling b's
+    // declared-variables-only posture refuses (Decision D139); the three
+    // `ANTHROPIC_*` names are what the node's `model:` brought with it, which is
+    // the composition getting what it wrote (Decision D143).
     assert_eq!(
         bound["env"],
-        json!(["PATH", "TOKEN"]),
+        json!([
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "PATH",
+            "TOKEN"
+        ]),
         "`settings: {{ env: … }}` reached past the scrub, which is q54 ruling b's \
          declared-variables-only posture (Decision D139)"
     );
@@ -6362,6 +6399,102 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         codex["unknown"],
         json!("travels"),
         "the vendor's own vocabulary is what `settings:` buys (ruling e)"
+    );
+
+    // --- The connection crosses (PRD resolved q58 rulings a and b) ---------
+    //
+    // The facts that decide **where** a run's traffic goes and **whether** it
+    // authenticates, read off the object each vendor's SDK would really have
+    // been called with. Invisible from the seam for the reason the bound above
+    // is: a scripted driver is handed `run.connection` whole, and it is the real
+    // driver that maps it.
+    let connection = &answer["connection"];
+    assert_eq!(
+        connection["resolved"],
+        json!({
+            "baseUrl": "https://gateway.internal/v1",
+            "credential": "gw-key",
+            "headers": { "x-team": "platform", "x-run": "batch" }
+        }),
+        "the composition's `${{ENV}}` references resolved at the call, once, for the driver"
+    );
+    assert_eq!(
+        connection["env"],
+        json!([
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "PATH",
+            "TOKEN"
+        ]),
+        "the `cc` run's environment is the node's declared `env:` and the three variables the \
+         connection table maps — and nothing else, because that object replaces the subprocess \
+         environment outright"
+    );
+    assert_eq!(
+        connection["baseUrl"],
+        json!("https://gateway.internal/v1"),
+        "the gateway a one-line `providers.yml` edit named is where this run goes"
+    );
+    assert_eq!(connection["credential"], json!("gw-key"));
+    assert_eq!(
+        connection["headers"],
+        json!("x-team: platform\nx-run: batch"),
+        "one `Name: value` per line, which is the format that runtime parses"
+    );
+    assert_eq!(
+        connection["token"],
+        json!("shh"),
+        "the node's own `env:` is untouched beside it"
+    );
+    // **The keyless gateway**, which is the half a plausible one-liner breaks:
+    // an absent `api_key:` injects *no* credential variable, never an empty one.
+    assert_eq!(
+        connection["keylessEnv"],
+        json!(["ANTHROPIC_BASE_URL", "PATH", "TOKEN"]),
+        "a connection with no credential and no headers maps the endpoint alone"
+    );
+    assert_eq!(
+        connection["keylessHasCredential"],
+        json!(false),
+        "an absent `api_key:` set a credential variable — resolved q25's posture is no \
+         authentication at all rather than an empty one, and `\"\"` authenticates as nobody"
+    );
+    assert_eq!(connection["keylessHasHeaders"], json!(false));
+    assert_eq!(
+        connection["keylessBaseUrl"],
+        json!("https://gateway.internal/v1")
+    );
+
+    // …and the other harness, whose connection surface is its client's options
+    // rather than an environment — stated per harness, never implied equivalent.
+    let codex_connection = &answer["codexConnection"];
+    assert_eq!(
+        codex_connection["baseUrl"],
+        json!("https://gateway.internal/v1")
+    );
+    assert_eq!(codex_connection["apiKey"], json!("gw-key"));
+    assert_eq!(
+        codex_connection["env"],
+        json!(["PATH", "TOKEN"]),
+        "the scrubbed environment is still the node's own: this harness carries its connection \
+         as options, so nothing of it is written into the environment by us"
+    );
+    assert_eq!(
+        codex_connection["threadKeys"],
+        json!(["model", "sandboxMode", "workingDirectory"]),
+        "no connection fact reached the **thread's** options, which are the bounds the node \
+         states rather than the connection it inherits"
+    );
+    assert_eq!(
+        codex_connection["keylessHasApiKey"],
+        json!(false),
+        "an absent `api_key:` set the client's credential option, so the SDK would have written \
+         `CODEX_API_KEY` for a gateway that injects one itself"
+    );
+    assert_eq!(
+        codex_connection["keylessBaseUrl"],
+        json!("https://gateway.internal/v1")
     );
 }
 

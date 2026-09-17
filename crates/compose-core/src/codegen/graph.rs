@@ -2449,13 +2449,16 @@ fn human_descriptor(
 /// that the adapter at run time has nothing left to derive. Three of its entries
 /// are worth reading twice.
 ///
-/// `modelId` and `modelSettings` are the whole of what a `model.*` contributes
-/// (Decision D141). The address is carried beside them for the trace, and the
-/// *connection* — the provider, its credentials, a route's ladder — is not here
-/// at all, because it does not reach inside a run: the harness owns its client.
-/// The settings that do cross are the ones [`harness_model_settings`] names, and
-/// the filter runs here rather than in the runtime so a reader of `src/graph.ts`
-/// sees the settings that really travel.
+/// `modelId`, `modelSettings` and `connection` are what a `model.*` contributes
+/// (Decisions D141, D143). The address is carried beside them for the trace. The
+/// settings that cross are the ones [`harness_model_settings`] names, and the
+/// filter runs here rather than in the runtime so a reader of `src/graph.ts`
+/// sees the settings that really travel; the connection facts are the provider's
+/// `base_url:`, credential and `headers:`, emitted by [`coder_connection`] as
+/// the composition wrote them. What is still **not** here is a route's failover
+/// ladder — a `model:` naming one is a compile error — and the mechanism ladder
+/// the runtime discovers per endpoint, because a harness issues its own requests
+/// and retries them itself.
 ///
 /// `schema` is the declared `output:` **unlowered**. The adapter projects it
 /// through this harness's own table before the run and parses the answer against
@@ -2537,6 +2540,7 @@ fn coder_descriptor(
         }
         text.push_str("  },\n");
     }
+    text.push_str(&coder_connection(ir, coder));
     text.push_str(&format!(
         "  prompt: {},\n",
         names::string(&coder.prompt.value)
@@ -2607,6 +2611,62 @@ fn coder_descriptor(
     ));
     text.push_str(&format!("  result: {parse},\n"));
     text.push_str("};\n");
+    text
+}
+
+/// One coder node's provider connection, as the binding's `connection:` field
+/// (grammar 8.9, Decision D143, PRD resolved q58 ruling a).
+///
+/// The facts that say where a harness client goes and how it authenticates,
+/// carried across the boundary the node's `model:` opens — **as the composition
+/// wrote them**, `${ENV}` references intact, because a build must succeed on a
+/// machine holding no secret (resolved q15) and the launch check is what reads
+/// them (grammar 4.3).
+///
+/// Each key is emitted only where the provider **declares** the fact. That is
+/// resolved q25's keyless-gateway posture surviving the crossing, and it is the
+/// whole of it: a connection with no `api_key:` emits no `credential`, the
+/// adapter resolves no credential, and each driver injects **nothing** — never
+/// an empty string, which every SDK here would carry to the wire as a
+/// credential. The site each reference is filed under is the *provider's* own
+/// key, so a variable the environment does not hold names the definition that
+/// asked for it rather than the node that inherited it.
+///
+/// A model that did not resolve, or resolved to a route, emits the address alone
+/// — both are already compile errors, and codegen runs on a clean report.
+fn coder_connection(ir: &Ir, coder: &Coder) -> String {
+    let Some((address, provider)) = crate::harness::provider_of(ir, coder) else {
+        return "  connection: { provider: \"\" },\n".to_string();
+    };
+    let config = &provider.config;
+    let mut text = String::from("  connection: {\n");
+    text.push_str(&format!("    provider: {},\n", names::string(address)));
+    for (key, spelling, reference) in [
+        ("baseUrl", "base_url", config.base_url.as_ref()),
+        ("credential", "api_key", config.api_key.as_ref()),
+    ] {
+        let Some(reference) = reference else { continue };
+        text.push_str(&format!(
+            "    {key}: [{{ env: {}, site: {} }}],\n",
+            names::string(&reference.value.name),
+            names::string(&format!("{address}.{spelling}"))
+        ));
+    }
+    if !config.headers.is_empty() {
+        text.push_str("    headers: [\n");
+        for header in &config.headers {
+            text.push_str(&format!(
+                "      {{ name: {}, value: {} }},\n",
+                names::string(&header.name.value),
+                interpolation(
+                    &header.value.value,
+                    &format!("{address}.headers.{}", header.name.value)
+                )
+            ));
+        }
+        text.push_str("    ],\n");
+    }
+    text.push_str("  },\n");
     text
 }
 
@@ -6342,6 +6402,106 @@ flow.f:
             declaration(&emitted, "flowFNodeEachMap:").contains("input: (roots) => ({\n      }),"),
             "…and so does a `map` dispatch onto the same flow, which is the \
              position that already answered:\n{emitted}"
+        );
+    }
+
+    /// **A coder node's binding carries its provider's connection, and carries
+    /// an absent fact as an absent key** (grammar 8.9, Decision D143, PRD
+    /// resolved q58 rulings a and d).
+    ///
+    /// Two shapes, because the second is the one a plausible emitter gets wrong.
+    ///
+    /// A **gateway** connection emits all three facts, each as the `${{ENV}}`
+    /// reference the composition wrote and filed under the *provider's* own key
+    /// — so a variable the environment does not hold names the definition that
+    /// asked for it rather than the node that inherited it, and a build on a
+    /// machine holding no secret still succeeds (resolved q15).
+    ///
+    /// A **keyless** connection emits no `credential` key **at all**. That is
+    /// resolved q25's whole posture, and the failure it rules out is one line
+    /// long: an emitter that wrote `credential: []` would resolve to `""`, and
+    /// every SDK here carries an empty credential to the wire as a credential —
+    /// so a gateway that injects one server-side would be handed a request
+    /// claiming to authenticate as nobody. The claim is an **absence**, so it is
+    /// asserted as one.
+    #[test]
+    fn a_coder_binding_carries_the_connection_and_omits_what_is_not_declared() {
+        const GATEWAY: &str = r#"version: "0.1"
+
+state:
+  summary: { type: string, default: "" }
+
+provider.gateway:
+  kind: anthropic
+  base_url: ${GATEWAY_URL}
+  api_key: ${GATEWAY_KEY}
+  headers:
+    x-team: "${TEAM}-platform"
+
+model.smart:
+  provider: provider.gateway
+  id: some-model
+
+flow.f:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: /srv/checkout
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+"#;
+
+        let gateway = emit(GATEWAY);
+        let binding = declaration(&gateway, "flowFNodeBuildCoder");
+        assert!(
+            binding.contains(
+                "connection: {
+    provider: \"provider.gateway\",\n"
+            ),
+            "the binding names the connection it carries:\n{binding}"
+        );
+        assert!(
+            binding.contains(
+                "baseUrl: [{ env: \"GATEWAY_URL\", site: \"provider.gateway.base_url\" }],"
+            ),
+            "the endpoint reaches the run as written, filed under the provider's own \
+             key:\n{binding}"
+        );
+        assert!(
+            binding.contains(
+                "credential: [{ env: \"GATEWAY_KEY\", site: \"provider.gateway.api_key\" }],"
+            ),
+            "{binding}"
+        );
+        assert!(
+            binding.contains(
+                "{ name: \"x-team\", value: [{ env: \"TEAM\", site: \"provider.gateway.headers.x-team\" }, \"-platform\"] },"
+            ),
+            "a header is grammar 4.3 class 2 and interpolates part by part:\n{binding}"
+        );
+
+        // …and the keyless gateway, which is the same composition with one line
+        // taken out.
+        let emitted = emit(&GATEWAY.replace("  api_key: ${GATEWAY_KEY}\n", ""));
+        let keyless = declaration(&emitted, "flowFNodeBuildCoder");
+        assert!(
+            keyless.contains("baseUrl: [{ env: \"GATEWAY_URL\""),
+            "the endpoint still crosses:\n{keyless}"
+        );
+        assert!(
+            !keyless.contains("credential:"),
+            "a provider with no `api_key:` emitted a credential key — resolved q25's posture is \
+             that an absent key means no credential at all, and an empty one authenticates as \
+             nobody:\n{keyless}"
         );
     }
 

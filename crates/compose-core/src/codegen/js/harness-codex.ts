@@ -24,7 +24,9 @@ const CODEX_SETTINGS: readonly string[] = [
  *    here would be reaching around the construct that states it, through the
  *    surface this grammar deliberately leaves open — so these are dropped
  *    rather than passed. The environment is not on the list because it is not a
- *    thread option at all: it is handed to the `Codex` constructor below;
+ *    thread option at all, and neither is the model's **connection**: both are
+ *    the *client's*, built by [`codexClient`] from a literal that no
+ *    `settings:` key reaches;
  *  * an option that **contains** one without spelling it, which is the wider
  *    half of the dropped set grammar 8.9 states: `additionalDirectories` is
  *    additional sandbox roots beside `workspace:`, so a run under it is written
@@ -107,11 +109,7 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
   enforcesTools: false,
   run(run: runtime.HarnessRun): AsyncIterable<runtime.HarnessEvent> {
     return (async function* driven(): AsyncGenerator<runtime.HarnessEvent> {
-      // The environment is handed to the SDK rather than inherited by it: the
-      // Codex SDK documents that a provided `env` replaces `process.env` for the
-      // CLI it spawns, which is exactly the scrubbed child PRD resolved q54
-      // ruling b asks for (Decision D139).
-      const codex = new Codex({ env: { ...run.env } });
+      const codex = new Codex(codexClient(run));
       const thread = codex.startThread(codexOptions(run));
       const streamed = await thread.runStreamed(codexTurn(run), {
         outputSchema: { ...run.schema },
@@ -185,6 +183,47 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
     })();
   },
 };
+
+/**
+ * The `CodexOptions` this run's client is built from: the scrubbed environment,
+ * and the model's connection (grammar 8.9, Decisions D139, D143).
+ *
+ * **The environment** is handed to the SDK rather than inherited by it: the
+ * Codex SDK documents that a provided `env` replaces `process.env` for the CLI
+ * it spawns, which is exactly the scrubbed child PRD resolved q54 ruling b asks
+ * for.
+ *
+ * **The connection** is this harness's own surface, and it is the *client's*
+ * rather than a thread's: `baseUrl`, which the SDK passes to the CLI as
+ * `--config openai_base_url=…`, and `apiKey`, which it sets as `CODEX_API_KEY`
+ * in that same environment on its way past. There is **no header slot** on
+ * either object, which is why a provider declaring `headers:` is refused at
+ * `validate` for a node bound to this harness rather than quietly dropped here
+ * (PRD resolved q58 ruling b) — a faked one would have meant composing a
+ * `model_providers.*` config table the composition never wrote.
+ *
+ * An absent fact sets no key at all, resolved q25's posture: a keyless gateway
+ * connection leaves `apiKey` undefined, and the SDK then sets no `CODEX_API_KEY`
+ * for the CLI to authenticate with.
+ *
+ * **Exported for the reason [`codexOptions`] is**, and for one more: what this
+ * object holds is the whole of where the run's traffic goes, and none of it is
+ * visible from a run's answer or from the events the driver yields.
+ *
+ * It is built from a literal and from `run.connection` alone. Nothing here reads
+ * `run.settings`, because [`passthrough`] feeds the **thread** and a key that
+ * could reach this object would be choosing the client — `codexPathOverride` is
+ * on it, and so is the `config` escape hatch — which is what
+ * `what_program_a_harness_run_is_cannot_be_chosen_by_a_settings_key` holds.
+ */
+export function codexClient(run: runtime.HarnessRun): CodexOptions {
+  const connection = run.connection;
+  return {
+    env: { ...run.env },
+    ...(connection.baseUrl === undefined ? {} : { baseUrl: connection.baseUrl }),
+    ...(connection.credential === undefined ? {} : { apiKey: connection.credential }),
+  };
+}
 
 /**
  * The `ThreadOptions` one `codex` run is made of — the config map of grammar

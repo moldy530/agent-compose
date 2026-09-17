@@ -20,6 +20,16 @@
 //!   with nothing to apply it. Taking the first member silently is the one
 //!   answer this compiler will not give. Deciding it needs the *definition* the
 //!   address names, which is a whole-composition fact.
+//! * **the provider connection has somewhere to land, and lands in one place.**
+//!   PRD resolved q58 makes the resolved provider's `base_url:`, credential and
+//!   `headers:` cross the boundary, mapped by each driver into the harness's own
+//!   connection surface through the curated table in [`crate::harness`]. Two
+//!   rules fall out of that, and each needs the whole composition: a declared
+//!   fact the bound harness has **no slot for** is an error naming the fact and
+//!   the harness (ruling b), and a node `env:` entry spelling a variable the map
+//!   would set is an error naming both sources (ruling c). Deciding either needs
+//!   the `model.*` the node names, the `provider.*` behind it, and the table —
+//!   none of which one file has.
 //! * **the harness config is checked in two tiers.** Decision D140 holds
 //!   `settings:` on resolved q30's terms: the keys the curated table knows are
 //!   checked strictly, and everything else is a warning naming what could not be
@@ -39,8 +49,9 @@
 
 use crate::ast::common::Literal;
 use crate::ast::flow::Harness;
-use crate::diag::{Diagnostic, DiagnosticCode, Spanned};
-use crate::ir::definition::{DefinitionBody, Model};
+use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
+use crate::harness::{ConnectionFact, declared, provider_of, slot_of, variables_set};
+use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::{Coder, Node};
 use crate::parse::reader::{list, suggest};
 
@@ -166,7 +177,176 @@ pub(crate) fn coder_node(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, node: &Node, coder:
         return;
     }
     model_is_direct(ctx, &subject, coder);
+    connection(ctx, &subject, coder);
     settings(ctx, &subject, coder);
+}
+
+/// The provider connection the node's `model:` carries across (PRD resolved q58,
+/// Decision D143).
+///
+/// Both of the entry's compile errors, in one walk, because both read one thing:
+/// the facts the resolved provider **declares**. A provider that declares
+/// nothing produces neither diagnostic and injects nothing, which is resolved
+/// q25's keyless posture surviving the crossing — the absence of a key is the
+/// absence of a variable, never an empty one.
+fn connection(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
+    // `None` is a model that did not resolve, or a route — the resolver and
+    // [`model_is_direct`] have each already said so, and a second complaint
+    // about one mistake is noise.
+    let Some((address, provider)) = provider_of(ctx.ir, coder) else {
+        return;
+    };
+    let held = declared(provider);
+    for fact in &held {
+        if slot_of(coder.harness.value, *fact).is_none() {
+            no_slot(ctx, subject, coder, address, provider, *fact);
+        }
+    }
+    for (fact, variable) in variables_set(coder.harness.value, &held) {
+        for entry in &coder.env {
+            if entry.name.value == variable {
+                shadowed(
+                    ctx,
+                    subject,
+                    coder,
+                    address,
+                    provider,
+                    fact,
+                    variable,
+                    &entry.name.span,
+                );
+            }
+        }
+    }
+}
+
+/// Ruling b: a declared fact the bound harness has nowhere to put.
+///
+/// Anchored at the node's `model:`, which is [`model_is_direct`]'s position and
+/// for its reason: the *pairing* is what is wrong. The provider is a correct
+/// definition serving every agent that binds it, and the harness is a name the
+/// grammar has — what this composition cannot have is both at once, and the
+/// reference that brought them together is the line to change.
+fn no_slot(
+    ctx: &mut Ctx<'_>,
+    subject: &str,
+    coder: &Coder,
+    address: &str,
+    provider: &Provider,
+    fact: ConnectionFact,
+) {
+    let harness = coder.harness.value.as_str();
+    // What this harness *does* carry, and where — which is the half an author
+    // repairs against. Naming the slots rather than only the keys is what tells
+    // a reader whether the fact they are moving has somewhere else to go.
+    let carried: Vec<String> = ConnectionFact::ALL
+        .iter()
+        .copied()
+        .filter_map(|held| {
+            slot_of(coder.harness.value, held)
+                .map(|slot| format!("`{}:` as {}", held.as_str(), slot.describes()))
+        })
+        .collect();
+    let carries = if carried.is_empty() {
+        "no connection fact at all".to_string()
+    } else {
+        format!("{}, and no other", carried.join(", "))
+    };
+    ctx.push(
+        Diagnostic::error(
+            DiagnosticCode::UnsupportedConnectionFact,
+            coder.model.span.clone(),
+            format!(
+                "{subject} binds `harness: {harness}`, and `{address}` declares `{}:`, which that \
+                 harness has nowhere to carry",
+                fact.as_str()
+            ),
+        )
+        .with_label(
+            fact_span(provider, fact),
+            format!("`{}:` is declared here", fact.as_str()),
+        )
+        .with_label(coder.harness.span.clone(), "the harness is bound here")
+        .with_help(format!(
+            "a coder node's `model:` carries its provider's connection into the run, mapped by a \
+             curated table per harness: `harness: {harness}` carries {carries}. A fact with no \
+             slot is refused rather than dropped, because a key deciding {} must not go missing \
+             quietly and be found on the first live call. Bind a `model.*` on a `provider.*` \
+             declaring only what this harness carries — providers are cheap — or run the node \
+             under a harness with a slot for it (grammar 8.9, 12.1, Decision D143, PRD resolved \
+             q58 ruling b)",
+            fact.decides()
+        )),
+    );
+}
+
+/// Ruling c: one spelling per fact.
+///
+/// Anchored at the **`env:` entry**, unlike its sibling above: the connection is
+/// not the mistake here — it is what the composition asked for by binding this
+/// model — and the entry is the line that says the same thing twice.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a diagnostic naming both sources needs both"
+)]
+fn shadowed(
+    ctx: &mut Ctx<'_>,
+    subject: &str,
+    coder: &Coder,
+    address: &str,
+    provider: &Provider,
+    fact: ConnectionFact,
+    variable: &str,
+    at: &Span,
+) {
+    let harness = coder.harness.value.as_str();
+    ctx.push(
+        Diagnostic::error(
+            DiagnosticCode::ConflictingConnectionVariable,
+            at.clone(),
+            format!(
+                "`{variable}` is set twice for {subject}: by this `env:` entry, and by \
+                 `{address}`'s `{}:`",
+                fact.as_str()
+            ),
+        )
+        .with_label(
+            fact_span(provider, fact),
+            format!(
+                "`{}:` is declared here, and `harness: {harness}` carries it as `{variable}`",
+                fact.as_str()
+            ),
+        )
+        .with_label(coder.model.span.clone(), "the connection is bound here")
+        .with_help(format!(
+            "one spelling per fact: the provider's `{fact}:` already reaches this run, so there \
+             is nothing to shadow and no precedence rule to learn. Drop the `env:` entry — it is \
+             for what the *program* needs — and a node that really has to decide {decides} for itself \
+             binds a `model.*` on another `provider.*` (grammar 8.9, 12.1, Decision D143, PRD \
+             resolved q58 ruling c)",
+            fact = fact.as_str(),
+            decides = fact.decides()
+        )),
+    );
+}
+
+/// Where one declared fact is written, for a diagnostic's label.
+///
+/// A `headers:` block has no span of its own in the artifact — it is a list of
+/// entries — so the first entry's name is what a reader is pointed at, which is
+/// the line the block opens on.
+fn fact_span(provider: &Provider, fact: ConnectionFact) -> Span {
+    let span = match fact {
+        ConnectionFact::BaseUrl => provider.config.base_url.as_ref().map(|held| &held.span),
+        ConnectionFact::Credential => provider.config.api_key.as_ref().map(|held| &held.span),
+        ConnectionFact::Headers => provider
+            .config
+            .headers
+            .first()
+            .map(|entry| &entry.name.span),
+    };
+    span.expect("a fact is only reported where the provider declares it")
+        .clone()
 }
 
 /// The harness has a driver in this release (PRD resolved q57).
@@ -231,11 +411,11 @@ fn model_is_direct(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
             format!("`{address}` is defined here, with {members} members"),
         )
         .with_help(
-            "the provider connection does not reach inside a harness run: the harness owns its \
-             client, its auth and its own retries, and this compiler's `retry:` wraps whole runs. \
-             A route here would be a failover policy with nothing to apply it to, so bind a \
-             direct `model.*` and let the node's `retry:` be the ladder (grammar 8.9, 12.2, PRD \
-             resolved q57 ruling d)",
+            "a failover ladder does not reach inside a harness run: the harness owns its client \
+             and its own retries, and this compiler's `retry:` wraps whole runs. A route here \
+             would be a failover policy with nothing to apply it to, so bind a direct `model.*` \
+             — whose connection *does* cross (Decision D143) — and let the node's `retry:` be the \
+             ladder (grammar 8.9, 12.2, PRD resolved q57 ruling d as q58 amends it)",
         ),
     );
 }
@@ -411,7 +591,7 @@ fn check_shape(
 
 #[cfg(test)]
 mod tests {
-    use super::{Harness, reserved, table};
+    use super::{DiagnosticCode, Harness, reserved, table};
 
     /// The **reserved** list a warning reads is the one the adapter applies.
     ///
@@ -444,6 +624,83 @@ mod tests {
                 "a reserved harness has no driver to read a list off"
             );
         }
+    }
+
+    /// **Neither connection rule fires where it should not** (grammar 8.9,
+    /// Decision D143, PRD resolved q58 rulings b and c).
+    ///
+    /// The negative corpus pins what each refusal says; this is the direction a
+    /// corpus of refusals cannot reach, and both cases are ones an over-eager
+    /// implementation gets wrong in a way nothing else notices — a composition
+    /// that *should* build stops building, and the author's only clue is a
+    /// diagnostic about a line that is correct.
+    ///
+    ///  1. **a keyless gateway leaves the credential variable free.** Resolved
+    ///     q25's shape is a `base_url:` with no `api_key:`, and the map then
+    ///     injects no credential at all — so a node that declares
+    ///     `ANTHROPIC_API_KEY:` itself is shadowing nothing, and refusing it
+    ///     would make the keyless posture unusable on exactly the harness that
+    ///     carries the connection as variables. The collision list is computed
+    ///     from what the provider **declares**, and this is what says so;
+    ///  2. **a slot that is an option is not a variable.** `base_url:` under
+    ///     `codex` becomes a `--config` flag on the CLI and touches no
+    ///     environment, so a node `env:` may spell anything beside it. A list
+    ///     built from the table's facts rather than from its *slots* would
+    ///     refuse a composition over a name nothing writes.
+    #[test]
+    fn a_connection_that_sets_no_variable_leaves_a_nodes_env_alone() {
+        use crate::codegen::test_support::ir_of;
+
+        let composition = |provider: &str, harness: &str, variable: &str| {
+            format!(
+                "version: \"0.1\"\n\
+{provider}\
+model.m:\n  provider: provider.p\n  id: some-model\n\
+state:\n  summary: {{ type: string, default: \"\" }}\n\
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: {harness}\n        model: model.m\n        workspace: /srv/checkout\n        prompt: Do the work.\n        env:\n          {variable}: ${{HELD}}\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+            )
+        };
+
+        // 1. The keyless gateway, on the harness whose slots are variables.
+        let keyless = crate::check(&ir_of(&composition(
+            "provider.p:\n  kind: anthropic\n  base_url: ${GATEWAY_URL}\n",
+            "cc",
+            "ANTHROPIC_API_KEY",
+        )));
+        assert!(
+            keyless.is_empty(),
+            "a provider with no `api_key:` injects no credential variable, so a node declaring \
+             one shadows nothing: {keyless:#?}"
+        );
+
+        // …and the control, so the assertion above is not passing because this
+        // check never fires: the same node under a provider that *does* declare
+        // the credential is the corpus fixture's shape.
+        let declared = crate::check(&ir_of(&composition(
+            "provider.p:\n  kind: anthropic\n  base_url: ${GATEWAY_URL}\n  api_key: ${GATEWAY_KEY}\n",
+            "cc",
+            "ANTHROPIC_API_KEY",
+        )));
+        assert_eq!(declared.len(), 1, "{declared:#?}");
+        assert_eq!(
+            declared[0].code,
+            DiagnosticCode::ConflictingConnectionVariable
+        );
+
+        // 2. A slot that is an option rather than a variable. `CODEX_API_KEY` is
+        // the one name this harness *does* reach the environment with, and the
+        // provider below declares no credential — so nothing is set and the node
+        // may spell it.
+        let option = crate::check(&ir_of(&composition(
+            "provider.p:\n  kind: openai\n  base_url: ${GATEWAY_URL}\n",
+            "codex",
+            "CODEX_API_KEY",
+        )));
+        assert!(
+            option.is_empty(),
+            "`base_url:` under `codex` is a client option and sets no variable, so a node's \
+             `env:` is free beside it: {option:#?}"
+        );
     }
 
     /// The names one emitted `<HARNESS>_SETTINGS` array lists, in order.

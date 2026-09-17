@@ -323,6 +323,7 @@ be hiding the one fact a reader most needs.
 |---|---|---|---|
 | `harness` | `"cc"` \| `"codex"` | always | Which harness runs it. The two reserved names of grammar §15 are not members: `visualize` validates first, and `validate` refuses a composition that binds one. |
 | `model` | [model](#8-agents) | always | The `model.*` resolved exactly as an agent's is. It is always the **direct** form here: a route is refused at this position (grammar §12.2, Decision D141). |
+| `connection` | array of [connection facts](#581-a-connection-fact-that-crosses) | when the node's provider declares a fact that crosses | The provider connection this run is given, and the **slot** each fact lands in under this harness (grammar §8.9, Decision D143). In provider-key order: `base_url`, `api_key`, then each header in declaration order. Absent where the provider declares none — which is a statement, not a gap: nothing about the connection reaches the run. |
 | `workspace` | string | always | `workspace:`, exactly as written — an `${ENV}` reference reaches this document unresolved like every other (§10). |
 | `access` | `"read_only"` \| `"workspace_write"` \| `"full_access"` | always | The containment preset, **with the default materialized**: a node that omits `access:` reads `"workspace_write"` here. This document answers the question rather than leaving it (§1), and it is a containment claim, so a reader should not have to know which way the grammar's default falls. |
 | `prompt` | string | always | The run's instructions, verbatim. |
@@ -331,6 +332,28 @@ be hiding the one fact a reader most needs.
 | `env` | array of [bindings](#4-schemas-and-bindings) | when the node declares any | `env:`, in declaration order, values as written. Absent means a wholly scrubbed child environment. |
 | `inherit_env` | boolean | always | `inherit_env:`, with the default materialized for `access`'s reason: `false` is the containment claim. |
 | `settings` | array of [settings](#8-agents) | when the node declares any | The harness config **in declaration order**, each value reaching JSON as JSON — the same treatment a model's `settings:` get, in a different order: a model's reach this document sorted by key, and this block's are held as written (§9.1). |
+
+#### 5.8.1 A connection fact that crosses
+
+`ConnectionView` (grammar §8.9, §12.1, Decision D143).
+
+**The map, not the connection.** What the provider *declares* is already on this
+node's [`model.provider.config`](#8-agents); what a reader cannot derive from it
+is which of those facts the bound harness carries, and under what name. That is a
+property of the harness rather than of the composition — the two harnesses answer
+differently, and one of them has no slot for a header at all — so it is here, for
+the reason `tools_enforced` is.
+
+| field | type | presence | meaning |
+|---|---|---|---|
+| `fact` | string | always | The provider key it comes from: `base_url`, `api_key`, or `headers.<name>` — spelled as `ProviderView.config` spells it, so the two join. |
+| `slot` | string | always | What this harness carries it as: an environment variable's name under `cc`, an SDK client option's name under `codex`. Every header of one provider shares one `cc` slot, because that one variable carries them all. |
+| `value` | string | always | The value **exactly as written**, `${ENV}` references unresolved like every other (§10). |
+
+A fact the bound harness has **no slot for** never appears here, and not because
+this document drops it: `validate` refuses that composition outright
+(`unsupported-connection-fact`), and a graph document is only drawn for a
+composition that validates.
 
 ---
 
@@ -496,8 +519,9 @@ At a given `graph_version`, a reader MAY rely on:
   declaration order with each satellite after its map, `edges` as §6 states,
   `routes` with `default:` last, a model's `route` in failover order, a
   provider's `config` and a model's `settings` by key, a coder node's
-  `settings`, `env` and `allow_tools` in declaration order, and every field map
-  in declaration order;
+  `settings`, `env` and `allow_tools` in declaration order, a coder node's
+  `connection` by provider key — `base_url`, `api_key`, then the headers in
+  declaration order — and every field map in declaration order;
 * that `id` is unique within a flow, that every `from` and `to` names a node the
   same flow's `nodes` array holds, and that a `map_route` edge's `to` is the
   `node` of one of that map's `routes`.
@@ -522,8 +546,13 @@ A reader MUST NOT rely on:
 
 Compatible, and made **without** a version bump:
 
-* adding a field to an existing record type;
-* adding a new record type reachable from an existing one;
+* adding a field to an existing record type — `CoderView.connection` is the
+  worked example, added for PRD resolved q58 with no bump, because §9.3's list
+  names nothing it touches: no field was removed or renamed, no type or meaning
+  changed, no *existing* presence rule moved, no closed enumeration grew, no
+  fixed order changed, and nothing that used to be drawn is drawn differently;
+* adding a new record type reachable from an existing one —
+  [`ConnectionView`](#581-a-connection-fact-that-crosses), which arrived with it;
 * carrying a field in a case this document's presence column **already** names
   and the compiler was not carrying — a bug in the implementation of this format
   rather than a change to it;

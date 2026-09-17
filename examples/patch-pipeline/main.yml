@@ -1,15 +1,21 @@
-# examples/patch-pipeline — a graph that carries coding agents (PRD resolved q57).
+# examples/patch-pipeline — a graph that carries coding agents (PRD resolved
+# q57, q58).
 #
 # Exercises: the `coder:` node kind under **both** v1 harnesses, the two
 # containment presets that differ (`workspace_write` for the harness that edits,
 # `read_only` for the one that reviews), an `allow_tools:` list and the
 # enforcement asymmetry between the two harnesses, harness `settings:` in both of
-# Decision D140's tiers, a scrubbed `env:`, the §9.1 policy chain wrapping a
-# whole run, and a bounded revise cycle between two harness runs.
+# Decision D140's tiers, a scrubbed `env:`, the **provider connection** crossing
+# into each harness's own surface from one gateway-shaped registry, the §9.1
+# policy chain wrapping a whole run, and a bounded revise cycle between two
+# harness runs.
 #
-# What it is *not*: an example of how to reach a model. That is `review-loop`.
-# Here `model:` is the registry address and nothing else crosses the boundary —
-# the harness owns its client, its auth and its own retries (grammar 8.9).
+# What it is *not*: an example of how to *call* a model. That is `review-loop`.
+# Here `model:` is a registry address, and what crosses it is the id, the
+# settings subset the harness accepts, and the connection facts — where the
+# traffic goes, how it authenticates, what it carries. The harness still owns
+# its client, its loop and its own retries, so a failover **route** at this
+# position is refused (grammar 8.9, 12.2, D141, D143).
 #
 # Entrypoint: the only file that may declare `imports:` (grammar 1.4).
 version: "0.1"

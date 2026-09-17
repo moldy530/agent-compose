@@ -1015,6 +1015,16 @@ function select(id) {
       .concat(list(node.coder.settings).map(entry =>
         ["settings." + entry.name, JSON.stringify(entry.value)])));
     html += "<h3>Model</h3>" + modelRows(node.coder.model);
+    /* …and the half of that model resolution the rows above cannot show: which
+     * of the provider's connection facts this harness carries, and under what
+     * name. The slot is a fact about the harness rather than about the
+     * composition, and it differs between the two — the same reason
+     * `tools_enforced` is drawn beside the list it qualifies (grammar 8.9). */
+    const connection = list(node.coder.connection);
+    if (connection.length) {
+      html += "<h3>Connection</h3>" + pairs(connection.map(fact =>
+        [fact.fact + " → " + fact.slot, fact.value]));
+    }
   }
   if (node.tool) html += "<h3>Tool</h3>" + toolRows([node.tool]);
   if (node.exec) {

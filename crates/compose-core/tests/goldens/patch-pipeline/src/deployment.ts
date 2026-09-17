@@ -103,8 +103,10 @@ export const placements: readonly PlacementManifest[] = [];
 
 export const hubEnvironment: readonly string[] = [
   "ANTHROPIC_API_KEY",
+  "LLM_GATEWAY_URL",
   "OPENAI_API_KEY",
   "REPO_ROOT",
+  "TEAM_NAME",
 ];
 
 export const joinTokenEnv: string | undefined = undefined;

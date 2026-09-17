@@ -533,17 +533,19 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
-        // The `coder:` node's three whole-composition rules (PRD resolved q57).
+        // The `coder:` node's whole-composition rules (PRD resolved q57, q58).
         // The parser owns the block's shape — a harness that is not one of the
         // four names, a missing `workspace:`, an `access:` outside the presets —
-        // because each of those is one value against a constant; these three
-        // need the release's driver set, the definition an address names, and
-        // the harness's own curated table.
-        rule: "a `coder:` node binds a harness this release lowers, its `model:` is a direct binding, and its `settings:` are checked in two tiers (8.9, D136, D140, D141)",
+        // because each of those is one value against a constant; these need the
+        // release's driver set, the definition an address names, the connection
+        // behind it, and the harness's own two curated tables.
+        rule: "a `coder:` node binds a harness this release lowers, its `model:` is a direct binding whose provider connection every fact of has a slot on that harness and is spelled once, and its `settings:` are checked in two tiers (8.9, D136, D140, D141, D143)",
         pass: "check/coder.rs",
         codes: &[
             "unsupported-harness",
             "unknown-harness-setting",
+            "unsupported-connection-fact",
+            "conflicting-connection-variable",
             "invalid-value",
             "value-out-of-range",
             "unknown-variant",
