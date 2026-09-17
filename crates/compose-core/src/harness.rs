@@ -31,6 +31,29 @@
 //! whole `model_providers.*` entry out of `--config` overrides the composition
 //! never wrote.
 //!
+//! # A slot is a slot on **one wire**
+//!
+//! A row does not only say *whether* a fact crosses; it says what the thing on
+//! the other side is. `ANTHROPIC_BASE_URL` is an endpoint the Anthropic wire is
+//! spoken to, and `CodexOptions.baseUrl` is an endpoint OpenAI's is — so a row
+//! also names the `provider.*` **kinds** whose connection its slots speak for
+//! ([`ConnectionRow::kinds`]). Without that half the map is keyed on the harness
+//! alone, and an `openai` provider bound through a `cc` node writes an OpenAI
+//! endpoint and an OpenAI key into `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`
+//! with nothing said. That was inert while nothing crossed; it decides where the
+//! traffic goes now, which is q58 ruling b's own class, so the pairing is a
+//! `validate` error (`unsupported-provider-kind`) rather than a `401` on the
+//! first live call.
+//!
+//! It is also what keeps [`ConnectionFact`] honest. The facts are the connection
+//! keys of the kinds the table speaks; the cloud-SDK kinds' credentials
+//! (`access_key_id:`, `secret_access_key:`, `session_token:`,
+//! `credentials_json:`) are not among them because **no row speaks `bedrock` or
+//! `vertex`** — neither SDK's connection surface has a cloud credential chain on
+//! it — and the pairing is refused before a fact of one is read.
+//! `a_spoken_kinds_connection_keys_are_all_facts` holds the two halves together:
+//! a row that grows a kind grows this enum with it, or the suite fails.
+//!
 //! # Where each slot was read
 //!
 //! Every slot below was verified against the pinned SDK's own `.d.ts` and
@@ -39,6 +62,7 @@
 //! `the_connection_table_is_audited_against_the_pinned_sdks` fails when the pin
 //! moves, so a vendor's new slot arrives with the bump rather than behind it.
 
+use crate::ast::definition::ProviderKind;
 use crate::ast::flow::Harness;
 use crate::ir::Ir;
 use crate::ir::definition::{DefinitionBody, Model, Provider};
@@ -46,12 +70,23 @@ use crate::ir::flow::Coder;
 
 /// One fact of a provider connection, as grammar 12.1 spells it.
 ///
-/// Three, and no more: these are the keys of a `provider.*` that say **where**
-/// the traffic goes and **how** it authenticates. Everything else in a provider
-/// definition is either a plugin's own vocabulary (`region:`, `project:`, an
-/// `api_version:`) or a request-shaping key (`server_tools:`), and neither is a
-/// connection fact a harness client has a place for — the harness opens its own
-/// connection and speaks its own wire.
+/// Three, and the boundary is drawn twice. These are the keys of a `provider.*`
+/// that say **where** the traffic goes and **how** it authenticates, on the
+/// kinds [`CONNECTION`]'s rows speak for. Everything else on one of those kinds
+/// is either a plugin's own vocabulary (`organization:`, an `api_version:`) or a
+/// request-shaping key (`server_tools:`), and neither is a connection fact a
+/// harness client has a place for — the harness opens its own connection and
+/// composes its own requests.
+///
+/// **The cloud-SDK kinds' credentials are deliberately absent**, and their
+/// absence is not a silent drop. `bedrock`'s `access_key_id:`,
+/// `secret_access_key:` and `session_token:` and `vertex`'s `credentials_json:`
+/// are credential keys of grammar 12.1 just as much as `api_key:` is — what they
+/// are not is reachable, because neither harness row speaks `bedrock` or
+/// `vertex` and [`speaks`] refuses that pairing before a fact of one is read. A
+/// row that ever grows one of those kinds has to grow this enum with it, and
+/// `a_spoken_kinds_connection_keys_are_all_facts` is what makes that a test
+/// failure rather than an omission (PRD resolved q58 ruling b).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConnectionFact {
     /// `base_url:` — the endpoint, the one key that can say the traffic is not
@@ -148,17 +183,48 @@ impl Slot {
     }
 }
 
-/// One harness's row: the SDK release it was read against, and a slot per fact.
+/// One harness's row: the SDK release it was read against, the provider kinds
+/// its slots speak for, and a slot per fact.
 pub struct ConnectionRow {
     /// The harness this row is for.
     pub harness: Harness,
     /// The SDK version the row was audited against (PRD 5.12).
     pub audited: &'static str,
+    /// The `provider.*` kinds whose connection these slots carry.
+    ///
+    /// A slot is an endpoint and a credential **on one wire**: the Agent SDK's
+    /// runtime speaks Anthropic's, the Codex CLI speaks OpenAI's, and a row that
+    /// named only its variables would map either provider into either harness
+    /// and say nothing. So the wire is part of the row, and a model whose
+    /// provider is a kind this row does not name is refused where every other
+    /// mapping failure is refused — at `validate`, not at the first live call.
+    ///
+    /// Read narrowly on purpose, which is the same discipline the slots are read
+    /// under: `azure_openai` is not on the `codex` row because its endpoint
+    /// carries a deployment path and an `api_version:` the SDK has no slot for,
+    /// and the two cloud-SDK kinds are on neither row because neither SDK's
+    /// connection surface has a cloud credential chain on it. A kind a vendor
+    /// teaches its SDK tomorrow is an edit here, never a change to the grammar.
+    pub kinds: &'static [ProviderKind],
     /// Each fact's slot, `None` where this harness's SDK tier offers none.
     pub slots: &'static [(ConnectionFact, Option<Slot>)],
 }
 
 /// The connection table (PRD resolved q58 ruling b).
+///
+/// # The wire each row is a row of
+///
+/// `cc` carries the connection of an `anthropic` provider and no other: the
+/// variables below are the Anthropic wire's, and the Agent SDK's bundled runtime
+/// talks to a Claude endpoint with a Claude API key. `codex` carries `openai` and
+/// `openai_compatible`, which are the two kinds grammar 12.1 spells as *an
+/// OpenAI-wire endpoint with a key* — which is exactly and only what
+/// `CodexOptions.baseUrl` and `CodexOptions.apiKey` are. `azure_openai` is on
+/// neither: its endpoint carries a deployment path and a required `api_version:`,
+/// and a row claiming it would be claiming slots the SDK does not have. Nor are
+/// `bedrock` and `vertex`, whose credentials are a cloud provider's own chain and
+/// whose rows take no `base_url:` at all — grammar 12.1 already sends a
+/// deployment that needs a bare endpoint to `openai_compatible`.
 ///
 /// # `cc` — `@anthropic-ai/claude-agent-sdk`
 ///
@@ -200,6 +266,7 @@ pub const CONNECTION: &[ConnectionRow] = &[
     ConnectionRow {
         harness: Harness::Cc,
         audited: "0.3.272",
+        kinds: &[ProviderKind::Anthropic],
         slots: &[
             (
                 ConnectionFact::BaseUrl,
@@ -218,6 +285,7 @@ pub const CONNECTION: &[ConnectionRow] = &[
     ConnectionRow {
         harness: Harness::Codex,
         audited: "0.154.0",
+        kinds: &[ProviderKind::OpenAi, ProviderKind::OpenAiCompatible],
         slots: &[
             (
                 ConnectionFact::BaseUrl,
@@ -238,6 +306,27 @@ pub const CONNECTION: &[ConnectionRow] = &[
         ],
     },
 ];
+
+/// The `provider.*` kinds one harness's connection surface speaks for.
+///
+/// Empty for a reserved harness, which has no SDK to speak anything: `validate`
+/// refuses the node before its model's provider is read, so a row would be an
+/// invention rather than a table entry — the answer [`slot_of`] gives one fact
+/// along.
+#[must_use]
+pub fn kinds_of(harness: Harness) -> &'static [ProviderKind] {
+    CONNECTION
+        .iter()
+        .find(|row| row.harness == harness)
+        .map_or(&[], |row| row.kinds)
+}
+
+/// Whether one harness's connection surface speaks one provider kind's wire
+/// (PRD resolved q58 ruling b).
+#[must_use]
+pub fn speaks(harness: Harness, kind: ProviderKind) -> bool {
+    kinds_of(harness).contains(&kind)
+}
 
 /// The slot one fact lands in under one harness, or `None` where the harness's
 /// SDK tier offers none.
@@ -319,6 +408,12 @@ pub fn provider_of<'ir>(ir: &'ir Ir, coder: &Coder) -> Option<(&'ir str, &'ir Pr
 
 /// The connection facts one provider **declares**, in [`ConnectionFact::ALL`]
 /// order.
+///
+/// Read only where [`speaks`] already said yes: on a kind no row names, the list
+/// would be empty for a `bedrock` provider holding two AWS credentials, and an
+/// empty list is a claim ("nothing declared here crosses") this function must not
+/// be asked to make. The caller refuses the pairing first, and
+/// `a_spoken_kinds_connection_keys_are_all_facts` is what keeps the two in step.
 #[must_use]
 pub fn declared(provider: &Provider) -> Vec<ConnectionFact> {
     let config = &provider.config;
@@ -363,6 +458,92 @@ mod tests {
                     None,
                     "a reserved harness has no SDK to hold a connection fact"
                 );
+            }
+        }
+    }
+
+    /// Every shipping harness names the wire its slots speak, and a reserved one
+    /// names none (PRD resolved q58 ruling b).
+    #[test]
+    fn every_shipping_harness_names_the_kinds_its_slots_speak() {
+        for harness in Harness::ALL.iter().copied().filter(|h| h.ships_in_v1()) {
+            assert!(
+                !kinds_of(harness).is_empty(),
+                "`{}` maps connection facts into slots and says nothing about whose wire they \
+                 are: a row with no kinds maps every provider into every harness",
+                harness.as_str()
+            );
+        }
+        for harness in [Harness::DeepAgents, Harness::Native] {
+            assert!(
+                kinds_of(harness).is_empty(),
+                "a reserved harness has no SDK to speak a wire"
+            );
+        }
+        // The two mispairings the table exists to refuse, named rather than
+        // derived: an OpenAI connection under the Anthropic-wire harness, and an
+        // Anthropic one under the OpenAI-wire harness.
+        assert!(speaks(Harness::Cc, ProviderKind::Anthropic));
+        assert!(!speaks(Harness::Cc, ProviderKind::OpenAi));
+        assert!(speaks(Harness::Codex, ProviderKind::OpenAi));
+        assert!(speaks(Harness::Codex, ProviderKind::OpenAiCompatible));
+        assert!(!speaks(Harness::Codex, ProviderKind::Anthropic));
+        // …and the kinds whose credentials this enum does not spell are on
+        // neither row, which is what makes that narrowness safe.
+        for harness in [Harness::Cc, Harness::Codex] {
+            for kind in [ProviderKind::Bedrock, ProviderKind::Vertex] {
+                assert!(
+                    !speaks(harness, kind),
+                    "`{}` claims `{}`, whose credential chain no slot here carries",
+                    harness.as_str(),
+                    kind.as_str()
+                );
+            }
+        }
+    }
+
+    /// **Every connection key of a kind a row speaks is a [`ConnectionFact`]**
+    /// (PRD resolved q58 ruling b).
+    ///
+    /// The enum is three variants, and three is only honest while the kinds the
+    /// table speaks declare no fourth. `bedrock`'s `access_key_id:`,
+    /// `secret_access_key:` and `session_token:` and `vertex`'s
+    /// `credentials_json:` are connection keys of grammar 12.1 that this enum
+    /// does not spell — safe today only because no row names those kinds, and a
+    /// silent drop the moment one does: the key would be declared, cross
+    /// nothing, and raise nothing, which is the failure ruling b moved back to
+    /// `validate`.
+    ///
+    /// So the two halves are held together here. A row that grows a kind fails
+    /// this test until the enum, [`declared`] and the check's own `fact_span`
+    /// grow with it.
+    #[test]
+    fn a_spoken_kinds_connection_keys_are_all_facts() {
+        use crate::ast::deploy::SECRET_FIELDS;
+
+        let spelled: Vec<&str> = ConnectionFact::ALL
+            .iter()
+            .map(|fact| fact.as_str())
+            .collect();
+        for row in CONNECTION {
+            for kind in row.kinds {
+                for key in kind.keys() {
+                    // A connection key is a credential key of grammar 4.3 or the
+                    // header block; everything else on a kind's row is plugin
+                    // vocabulary or request shaping.
+                    if !SECRET_FIELDS.contains(key) && *key != "headers" {
+                        continue;
+                    }
+                    assert!(
+                        spelled.contains(key),
+                        "`{}` speaks `{}`, whose row takes `{key}:` — a connection key with no \
+                         `ConnectionFact` is declared, crosses nothing and raises nothing. Give \
+                         it a fact (and a slot, or an honest `None`) before this row claims that \
+                         kind (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling b)",
+                        row.harness.as_str(),
+                        kind.as_str()
+                    );
+                }
             }
         }
     }

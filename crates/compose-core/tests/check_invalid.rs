@@ -96,6 +96,7 @@ const CHECK_CODES: &[&str] = &[
     "unsupported-harness",
     "unknown-harness-setting",
     "unsupported-connection-fact",
+    "unsupported-provider-kind",
     "conflicting-connection-variable",
 ];
 

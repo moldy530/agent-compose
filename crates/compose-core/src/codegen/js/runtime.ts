@@ -7781,7 +7781,8 @@ function decode(
 }
 
 // ---------------------------------------------------------------------------
-// The coding-agent harness (grammar 8.9, Decisions D136–D142, PRD resolved q57)
+// The coding-agent harness (grammar 8.9, Decisions D136–D143, PRD resolved q57,
+// q58)
 // ---------------------------------------------------------------------------
 //
 // # What a coder node is, from in here
@@ -7826,17 +7827,34 @@ function decode(
 // so the asymmetry is a value a reader can read rather than a paragraph they
 // have to remember.
 //
-// # What does not reach inside a run
+// # What crosses into a run, and what stops at the boundary
 //
-// The provider *connection*. A coder node's `model:` is the registry address an
-// agent node spells (grammar 12.2), and the adapter maps it down to the model id
-// plus the small subset of that model's `settings:` the harness has a place for
-// ([`HARNESS_MODEL_SETTINGS`]). `provider.*`'s base URL, its headers and its
-// credentials, a route's failover ladder, and the mechanism ladder of PRD
-// resolved q53 all stop at this boundary: the harness owns its client, its auth
-// and its internal retries, and this runtime's `retry:` wraps whole runs. The
-// exemption is stated in `docs/grammar.md` 12.2, where PRD 5.9's failover
-// promise is made.
+// A coder node's `model:` is the registry address an agent node spells (grammar
+// 12.2), and the adapter maps it down to three things: the provider-native model
+// id, the small subset of that model's `settings:` the harness has a place for
+// ([`HARNESS_MODEL_SETTINGS`]), and the **connection facts** of the `provider.*`
+// behind it — its base URL, its credential and its headers.
+//
+// **Those three cross** (PRD resolved q58, grammar Decision D143).
+// [`HarnessConnectionBinding`] carries them as the composition wrote them,
+// [`harnessConnection`] resolves them at the call, and each driver maps them
+// into its own SDK's connection surface: `cc` into the environment variables the
+// bundled runtime reads, `codex` into the options its client takes. Two things
+// never reach here, because `validate` refused the composition first — a fact
+// the bound harness has no slot for (`unsupported-connection-fact`), and a
+// provider whose `kind:` speaks a wire that harness's slots do not
+// (`unsupported-provider-kind`). A fact the provider never declared maps to
+// nothing at all rather than to an empty value, which is the keyless-gateway
+// posture surviving the crossing.
+//
+// **What stops here is every ladder.** A route's failover chain does not cross —
+// a route on a coder node is a compile error — and neither does the wire
+// mechanism ladder of PRD resolved q53: the harness owns its client, composes
+// its own request, asks for its own output format and drives its own retries,
+// and this runtime's `retry:` wraps whole runs. Nor does the rest of a model's
+// `settings:`, which is a *request's* vocabulary and a harness composes no
+// request this runtime wrote. The exemption is stated in `docs/grammar.md` 12.2,
+// where PRD 5.9's failover promise is made.
 
 /** Which harness serves a coder node (grammar 8.9, Decision D136). */
 export type HarnessName = "cc" | "codex";

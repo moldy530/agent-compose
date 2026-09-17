@@ -291,7 +291,11 @@ its `base_url:`, its credential and its `headers:` — mapped into the harness's
 own connection surface. So pointing a project at a gateway stays the one-line
 edit in `providers.yml` that it is for an agent node, and a coder node's `env:`
 holds what the *program* needs rather than a hand-carried copy of the
-credential. Three rules come with it: a provider that declares no `api_key:`
+credential. Four rules come with it: a slot is an endpoint and a key on **one**
+wire, so a provider whose `kind:` the harness does not speak is refused
+(`agent-compose explain unsupported-provider-kind` — `cc` carries `anthropic`,
+`codex` carries `openai` and `openai_compatible`, and the cloud-SDK kinds'
+credentials have no slot on either); a provider that declares no `api_key:`
 injects **no** credential at all rather than an empty one; a fact the bound
 harness has no slot for is refused rather than dropped
 (`agent-compose explain unsupported-connection-fact` — `codex` has nowhere to put

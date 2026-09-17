@@ -1,0 +1,48 @@
+# rule: a coder node's provider speaks the wire its harness's slots are on
+# rule: (grammar 8.9, 12.1, D143, PRD resolved q58 ruling b)
+# code: unsupported-provider-kind
+# message: `flow.main` node `implement` binds `harness: cc`, and `provider.gateway` is `kind: openai`, whose connection that harness cannot carry
+# at: main.yml:40:16
+# label: main.yml:24:1 `provider.gateway` is defined here, as `kind: openai`
+# label: main.yml:39:18 the harness is bound here
+# help: a coder node's `model:` carries its provider's connection into the run, and a slot is an endpoint and a credential on one wire: `harness: cc` carries `anthropic` connections, and no other, so this pairing would write one vendor's endpoint and key where another's are read. `codex` does carry it. Bind this node's `model:` to a `provider.*` whose kind the harness speaks — providers are cheap — or run the node under the harness that speaks this one (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling b)
+#
+# The mispairing the connection table's second half exists to refuse. Every
+# value here is legal on its own: `provider.gateway` is a correct `openai`
+# connection an agent node could bind tomorrow, and `cc` is a harness this
+# release lowers. What the composition cannot have is both at once — `cc`'s
+# slots are `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`, and mapping an OpenAI
+# gateway's URL and key into them would point the bundled Claude runtime at an
+# endpoint that never sees a Claude request.
+#
+# Refused at the pairing rather than fact by fact, because no single fact is
+# wrong: `base_url:` and `api_key:` both have a slot on `cc`. It is also what
+# keeps `ConnectionFact`'s three variants an honest account of what crosses —
+# the cloud-SDK kinds' credentials are unreachable rather than dropped, because
+# no row speaks `bedrock` or `vertex` and this rule refuses the pairing first.
+version: "0.1"
+provider.gateway:
+  kind: openai
+  base_url: ${LLM_GATEWAY_URL}
+  api_key: ${GATEWAY_KEY}
+model.implementer:
+  provider: provider.gateway
+  id: gpt-5-codex
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: ${REPO_ROOT}
+        prompt: Fix the failing test, then say what you changed.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

@@ -353,7 +353,10 @@ the reason `tools_enforced` is.
 A fact the bound harness has **no slot for** never appears here, and not because
 this document drops it: `validate` refuses that composition outright
 (`unsupported-connection-fact`), and a graph document is only drawn for a
-composition that validates.
+composition that validates. The same holds one level up, where a provider's
+`kind:` is a wire the bound harness's slots do not speak
+(`unsupported-provider-kind`) — so every `connection` array here is a mapping
+that a driver really performs, onto a client that really speaks that provider.
 
 ---
 

@@ -2209,11 +2209,23 @@ flow.f:
 /// takes: `inherit_env: true` — q54 ruling b's explicit opt-in, and the only way
 /// a run sees the process's own environment — and a coder node with neither
 /// `input:` nor `allow_tools:` at all.
+///
+/// Each node's `model:` resolves through the provider kind its harness's
+/// connection table speaks for — `anthropic` under `cc`, `openai` under `codex`
+/// — which is why this case declares a second provider of its own: a slot is an
+/// endpoint on one wire, and the pairing is checked (Decision D143, PRD resolved
+/// q58 ruling b).
 #[test]
 fn a_coder_node_takes_every_containment_preset() {
     accepts(
         "coder-access-presets",
         r#"
+provider.o:
+  kind: openai
+  api_key: ${OK}
+model.o:
+  provider: provider.o
+  id: some-openai-model
 flow.f:
   outputs: {}
   nodes:
@@ -2243,7 +2255,7 @@ flow.f:
     narrow:
       coder:
         harness: codex
-        model: model.m
+        model: model.o
         workspace: ${ROOT}
         access: read_only
         prompt: Read the work.
@@ -2253,7 +2265,7 @@ flow.f:
     broad:
       coder:
         harness: codex
-        model: model.m
+        model: model.o
         workspace: ${ROOT}
         access: full_access
         prompt: Do the work outside the sandbox.
@@ -2263,7 +2275,7 @@ flow.f:
     writing:
       coder:
         harness: codex
-        model: model.m
+        model: model.o
         workspace: ${ROOT}
         access: workspace_write
         prompt: Edit inside the checkout.

@@ -124,6 +124,9 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::UnsupportedConnectionFact => {
             include_str!("codes/unsupported-connection-fact.md")
         }
+        DiagnosticCode::UnsupportedProviderKind => {
+            include_str!("codes/unsupported-provider-kind.md")
+        }
         DiagnosticCode::ConflictingConnectionVariable => {
             include_str!("codes/conflicting-connection-variable.md")
         }

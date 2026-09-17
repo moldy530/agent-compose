@@ -1,10 +1,10 @@
 //! What a `coder:` node's block says that one file cannot decide (grammar 8.9,
-//! Decisions D136–D142, PRD resolved q57).
+//! Decisions D136–D143, PRD resolved q57, q58).
 //!
 //! The parser owns the block's *shape* — a harness that is not one of the four
 //! names, a missing `workspace:`, an `access:` outside the three presets, a
 //! duplicate `allow_tools:` entry — because each of those is one value against a
-//! constant. Three rules are left, and each needs something the parser does not
+//! constant. Four rules are left, and each needs something the parser does not
 //! have:
 //!
 //! * **the harness ships in this release.** `deepagents` and `native` are
@@ -23,13 +23,16 @@
 //! * **the provider connection has somewhere to land, and lands in one place.**
 //!   PRD resolved q58 makes the resolved provider's `base_url:`, credential and
 //!   `headers:` cross the boundary, mapped by each driver into the harness's own
-//!   connection surface through the curated table in [`crate::harness`]. Two
-//!   rules fall out of that, and each needs the whole composition: a declared
-//!   fact the bound harness has **no slot for** is an error naming the fact and
-//!   the harness (ruling b), and a node `env:` entry spelling a variable the map
-//!   would set is an error naming both sources (ruling c). Deciding either needs
-//!   the `model.*` the node names, the `provider.*` behind it, and the table —
-//!   none of which one file has.
+//!   connection surface through the curated table in [`crate::harness`]. Three
+//!   rules fall out of that, and each needs the whole composition. The table's
+//!   rows are rows of **one wire** — `ANTHROPIC_BASE_URL` is where an Anthropic
+//!   client is pointed — so a provider whose `kind:` the bound harness does not
+//!   speak is an error naming both (ruling b, read at the pairing); a declared
+//!   fact the harness has **no slot for** is an error naming the fact and the
+//!   harness (ruling b); and a node `env:` entry spelling a variable the map
+//!   would set is an error naming both sources (ruling c). Deciding any of the
+//!   three needs the `model.*` the node names, the `provider.*` behind it, and
+//!   the table — none of which one file has.
 //! * **the harness config is checked in two tiers.** Decision D140 holds
 //!   `settings:` on resolved q30's terms: the keys the curated table knows are
 //!   checked strictly, and everything else is a warning naming what could not be
@@ -50,7 +53,9 @@
 use crate::ast::common::Literal;
 use crate::ast::flow::Harness;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
-use crate::harness::{ConnectionFact, declared, provider_of, slot_of, variables_set};
+use crate::harness::{
+    ConnectionFact, declared, kinds_of, provider_of, slot_of, speaks, variables_set,
+};
 use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::{Coder, Node};
 use crate::parse::reader::{list, suggest};
@@ -184,11 +189,11 @@ pub(crate) fn coder_node(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, node: &Node, coder:
 /// The provider connection the node's `model:` carries across (PRD resolved q58,
 /// Decision D143).
 ///
-/// Both of the entry's compile errors, in one walk, because both read one thing:
-/// the facts the resolved provider **declares**. A provider that declares
-/// nothing produces neither diagnostic and injects nothing, which is resolved
-/// q25's keyless posture surviving the crossing — the absence of a key is the
-/// absence of a variable, never an empty one.
+/// The entry's compile errors, in one walk: the pairing first, then the facts
+/// the resolved provider **declares**. A provider whose wire the harness speaks
+/// and which declares nothing produces no diagnostic and injects nothing, which
+/// is resolved q25's keyless posture surviving the crossing — the absence of a
+/// key is the absence of a variable, never an empty one.
 fn connection(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
     // `None` is a model that did not resolve, or a route — the resolver and
     // [`model_is_direct`] have each already said so, and a second complaint
@@ -196,6 +201,16 @@ fn connection(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
     let Some((address, provider)) = provider_of(ctx.ir, coder) else {
         return;
     };
+    // The wire first, and on its own: a slot is an endpoint and a credential of
+    // *one* vendor's client, so a provider the harness's slots do not speak for
+    // has no correct mapping to complain about fact by fact. Reporting the
+    // pairing and stopping is the one diagnostic there is to give — and
+    // [`declared`] must not be asked about a kind whose credential keys this
+    // table does not spell.
+    if !speaks(coder.harness.value, provider.kind) {
+        wrong_wire(ctx, subject, coder, address, provider);
+        return;
+    }
     let held = declared(provider);
     for fact in &held {
         if slot_of(coder.harness.value, *fact).is_none() {
@@ -218,6 +233,77 @@ fn connection(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
             }
         }
     }
+}
+
+/// Ruling b, one level up: the provider's **wire** is not the harness's.
+///
+/// Anchored at the node's `model:` for [`no_slot`]'s reason, and it is the same
+/// mistake read one step earlier: the provider is a correct definition and the
+/// harness is a name the grammar has, and what this composition cannot have is
+/// both at once. The label goes on the `provider.*` rather than on a key of it,
+/// because no single key is wrong — `kind:` is what decides the wire, and it is
+/// the definition's first line. [`provider_of`] found that definition, so the
+/// lookup below answers; it is written as a lookup rather than an `expect` for
+/// the reason every other check here is, which is that a checker reports.
+fn wrong_wire(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder, address: &str, provider: &Provider) {
+    let harness = coder.harness.value.as_str();
+    let spoken: Vec<&str> = kinds_of(coder.harness.value)
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect();
+    let carries = if spoken.is_empty() {
+        "no provider connection at all".to_string()
+    } else {
+        format!("{} connections, and no other", list(&spoken))
+    };
+    // Where the other harnesses would take this kind, so the repair that keeps
+    // the *connection* is a name rather than a search.
+    let elsewhere: Vec<&str> = Harness::ALL
+        .iter()
+        .copied()
+        .filter(|held| *held != coder.harness.value && speaks(*held, provider.kind))
+        .map(Harness::as_str)
+        .collect();
+    let moved = if elsewhere.is_empty() {
+        format!(
+            "no harness this release lowers carries a `{}` connection, so moving the node is not \
+             the repair here",
+            provider.kind.as_str()
+        )
+    } else {
+        format!("{} does carry it", list(&elsewhere))
+    };
+    let mut diagnostic = Diagnostic::error(
+        DiagnosticCode::UnsupportedProviderKind,
+        coder.model.span.clone(),
+        format!(
+            "{subject} binds `harness: {harness}`, and `{address}` is `kind: {}`, whose \
+             connection that harness cannot carry",
+            provider.kind.as_str()
+        ),
+    );
+    if let Some(definition) = ctx.ir.definitions.get(address) {
+        diagnostic = diagnostic.with_label(
+            definition.address.span.clone(),
+            format!(
+                "`{address}` is defined here, as `kind: {}`",
+                provider.kind.as_str()
+            ),
+        );
+    }
+    ctx.push(
+        diagnostic
+            .with_label(coder.harness.span.clone(), "the harness is bound here")
+            .with_help(format!(
+                "a coder node's `model:` carries its provider's connection into the run, and a \
+                 slot is an endpoint and a credential on one wire: `harness: {harness}` carries \
+                 {carries}, so this pairing would write one vendor's endpoint and key where \
+                 another's are read. {moved}. Bind this node's `model:` to a `provider.*` whose \
+                 kind the harness speaks — providers are cheap — or run the node under the \
+                 harness that speaks this one (grammar 8.9, 12.1, Decision D143, PRD resolved q58 \
+                 ruling b)"
+            )),
+    );
 }
 
 /// Ruling b: a declared fact the bound harness has nowhere to put.

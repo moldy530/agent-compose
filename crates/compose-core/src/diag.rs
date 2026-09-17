@@ -476,6 +476,18 @@ pub enum DiagnosticCode {
     /// on the first live call rather than at `validate` — which is the class
     /// resolved q25 refused (PRD G3).
     UnsupportedConnectionFact,
+    /// A `coder:` node's model resolves through a `provider.*` whose `kind:`
+    /// speaks a wire the bound harness's connection surface does not (grammar
+    /// 8.9, Decision D143, PRD resolved q58 ruling b).
+    ///
+    /// A slot is an endpoint and a credential **on one wire**: `cc` carries a
+    /// connection into `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`, `codex`
+    /// into its client's OpenAI base URL and key. Mapping an `openai` provider
+    /// through the first, or an `anthropic` one through the second, writes one
+    /// vendor's endpoint and key where the other's are read — the same class as
+    /// [`UnsupportedConnectionFact`](Self::UnsupportedConnectionFact), one level
+    /// up, and refused for the same reason: it decides where the traffic goes.
+    UnsupportedProviderKind,
     /// A `coder:` node's `env:` names a variable the connection map would set
     /// from its model's provider (grammar 8.9, Decision D143, PRD resolved q58
     /// ruling c).
@@ -618,6 +630,7 @@ impl DiagnosticCode {
         Self::UnsupportedHarness,
         Self::UnknownHarnessSetting,
         Self::UnsupportedConnectionFact,
+        Self::UnsupportedProviderKind,
         Self::ConflictingConnectionVariable,
         Self::DeadEnd,
         Self::UnboundedCycle,
@@ -697,6 +710,7 @@ impl DiagnosticCode {
             Self::UnsupportedHarness => "unsupported-harness",
             Self::UnknownHarnessSetting => "unknown-harness-setting",
             Self::UnsupportedConnectionFact => "unsupported-connection-fact",
+            Self::UnsupportedProviderKind => "unsupported-provider-kind",
             Self::ConflictingConnectionVariable => "conflicting-connection-variable",
             Self::DeadEnd => "dead-end",
             Self::UnboundedCycle => "unbounded-cycle",

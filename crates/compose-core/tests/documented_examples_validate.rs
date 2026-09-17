@@ -181,6 +181,7 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "unknown-server-tool",
     "unknown-server-tool-field",
     "unsupported-connection-fact",
+    "unsupported-provider-kind",
     "unsupported-server-tools",
 ];
 

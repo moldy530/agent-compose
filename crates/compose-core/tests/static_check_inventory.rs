@@ -539,12 +539,13 @@ const GRAMMAR: &[Check] = &[
         // because each of those is one value against a constant; these need the
         // release's driver set, the definition an address names, the connection
         // behind it, and the harness's own two curated tables.
-        rule: "a `coder:` node binds a harness this release lowers, its `model:` is a direct binding whose provider connection every fact of has a slot on that harness and is spelled once, and its `settings:` are checked in two tiers (8.9, D136, D140, D141, D143)",
+        rule: "a `coder:` node binds a harness this release lowers, its `model:` is a direct binding whose provider speaks that harness's wire and every fact of whose connection has a slot on it and is spelled once, and its `settings:` are checked in two tiers (8.9, D136, D140, D141, D143)",
         pass: "check/coder.rs",
         codes: &[
             "unsupported-harness",
             "unknown-harness-setting",
             "unsupported-connection-fact",
+            "unsupported-provider-kind",
             "conflicting-connection-variable",
             "invalid-value",
             "value-out-of-range",

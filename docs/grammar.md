@@ -3182,9 +3182,32 @@ connection surface, through a table **per harness**:
 | `api_key:` | `ANTHROPIC_API_KEY` in the run's environment | the SDK client's API-key option |
 | `headers:` | `ANTHROPIC_CUSTOM_HEADERS` in the run's environment, one `Name: value` per line | **nothing** — this SDK's connection surface has no header slot, and the composition is refused rather than handed a faked one |
 
-That table is the whole of what crosses, and three rules come with it
+**A slot is a slot on one wire**, which is the other half of the table.
+`ANTHROPIC_BASE_URL` is where an Anthropic client is pointed and
+`ANTHROPIC_API_KEY` is what authenticates there; the Codex options are OpenAI's.
+So each row also names the `provider.*` **kinds** whose connection it carries:
+
+| harness | carries the connection of |
+|---|---|
+| `cc` | `anthropic` |
+| `codex` | `openai`, `openai_compatible` — the two kinds that are an OpenAI-wire endpoint with a key, which is what its two options are |
+
+`azure_openai` is on neither row: its endpoint carries a deployment path and a
+required `api_version:`, and neither SDK has a slot for either. Neither are
+`bedrock` and `vertex`, whose connections are a cloud's own credential chain
+(`access_key_id:`, `secret_access_key:`, `session_token:`,
+`credentials_json:`) — keys no harness SDK here has anywhere to put, which is why
+those kinds are refused **with the pairing** rather than declared and silently
+dropped on the way into a run. §12.1 already sends a deployment that needs a bare
+endpoint to `openai_compatible`, and that is the row `codex` speaks.
+
+That table is the whole of what crosses, and four rules come with it
 ([D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)):
 
+* **a provider whose kind the bound harness does not speak is a compile error**
+  (`unsupported-provider-kind`) naming both. Every value in such a pairing is
+  legal on its own and only the pair is wrong, and what the pair decides is
+  whose endpoint and whose key a run is handed;
 * **an absent fact sets nothing.** A provider that declares no `api_key:` — the
   gateway shape §12.1 admits, where the proxy injects the vendor credential
   server-side — injects **no** credential into the run. Not an empty one: the
@@ -8636,22 +8659,44 @@ diagnostic says so. **Status**: ratified — PRD resolved q57 ruling c.
 
 ### D139. A coder node's `env:` is q54's, verbatim
 
-**PRD-extending** — see this appendix's preamble.
+**PRD-extending** — see this appendix's preamble. **Amended 2026-09-17** by
+[D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table),
+which is PRD resolved q58: this entry originally said a harness's own credential
+belongs in **this** map as an `${ENV}` reference, and the connection now carries
+it — writing it here as well is a compile error
+(`conflicting-connection-variable`). What the entry is actually about is
+unchanged: the scrub, the opt-in, and why a placement's manifest can be computed
+at all. The amended text follows; the superseded sentence is quoted at the end so
+a reader of an older citation can see what moved.
 
 `env:` is the `exec:` block's `env:` exactly (§6.1) and `inherit_env:` defaults
 to `false`: a harness and everything it forks run with a **scrubbed**
-environment holding only the declared variables, and inheriting this process's is
-an explicit opt-in.
+environment holding only the declared variables and whatever its model's
+connection maps in (§8.9,
+[D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)),
+and inheriting this process's is an explicit opt-in.
 
 **Rationale**: it is PRD resolved q54 ruling b applied one construct along, and
 the reason is the same one. A placement's environment manifest is computed
 statically by walking what the composition declares
 (`docs/distributed.md` §9.1), and a child that inherited whatever the host
-happened to hold would make that manifest a lower bound rather than the answer. A
-harness's own credential is therefore an `${ENV}` reference in this map like
+happened to hold would make that manifest a lower bound rather than the answer.
+What belongs in this map is what the *program* needs — a `PATH`, a proxy setting,
+a token some tool the run shells out to reads — each an `${ENV}` reference like
 every other secret (§4.3), which is what puts it on the manifest of the process
-that runs the node and on no other. **Status**: ratified — PRD resolved q57.
-*PRD resolved q41, q54, q57.*
+that runs the node and on no other. The harness's **own** credential is not one
+of them: it is the connection's, it arrives because the node named a `model.*`,
+and the manifest reaches it through the `provider.*` definition instead — the
+same static walk, one reference site along, which is why D143 needed no new rule
+here.
+
+**What the amendment replaced**, verbatim: *"A harness's own credential is
+therefore an `${ENV}` reference in this map like every other secret (§4.3), which
+is what puts it on the manifest of the process that runs the node and on no
+other."* The manifest sentence is the half that survived, and it survived
+unchanged — what moved is **where** the credential is written.
+**Status**: ratified — PRD resolved q57, amended by resolved q58.
+*PRD resolved q41, q54, q57, q58; §8.9.*
 
 ### D140. Harness `settings:` is a second open object, checked in two tiers
 
@@ -8782,14 +8827,27 @@ into that harness's own connection surface by a **curated table per harness**:
 | `api_key:` | the `ANTHROPIC_API_KEY` environment variable | the SDK client's `apiKey` option, which that SDK sets as `CODEX_API_KEY` for the process it spawns |
 | `headers:` | the `ANTHROPIC_CUSTOM_HEADERS` environment variable, one `Name: value` per line | **no slot** — refused (below) |
 
-Three rules come with it:
+Each row also names the `provider.*` **kinds** its slots speak for, because a
+slot is an endpoint and a credential on *one* wire: `cc` carries `anthropic`,
+`codex` carries `openai` and `openai_compatible`. `azure_openai` is on neither —
+its endpoint carries a deployment path and a required `api_version:` no slot
+holds — and neither are `bedrock` and `vertex`, whose credentials are their
+cloud's own chain (`access_key_id:`, `secret_access_key:`, `session_token:`,
+`credentials_json:`) and whose rows take no `base_url:` at all.
 
-1. **an absent fact sets nothing.** A provider with no `api_key:` injects no
+Four rules come with it:
+
+1. **a provider whose `kind:` the bound harness does not speak is a compile
+   error** (`unsupported-provider-kind`) naming the kind and the harness. It is
+   the rule that makes the three keys above a complete account of what crosses:
+   the cloud-SDK credential keys never reach a slot question, because the
+   pairing that could declare one is refused first;
+2. **an absent fact sets nothing.** A provider with no `api_key:` injects no
    credential variable and no credential option — never an empty one — which is
    §12.1's keyless-gateway posture surviving the crossing unchanged;
-2. **a declared fact the bound harness has no slot for is a compile error**
+3. **a declared fact the bound harness has no slot for is a compile error**
    (`unsupported-connection-fact`) naming the fact and the harness;
-3. **one spelling per fact**: a node `env:` entry naming a variable the map would
+4. **one spelling per fact**: a node `env:` entry naming a variable the map would
    set is a compile error (`conflicting-connection-variable`) naming both
    sources.
 
@@ -8804,17 +8862,18 @@ one node kind.
 **The table is curated on [D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers)'s terms**
 — a slot a vendor ships tomorrow is an edit to the table, never a change to this
 grammar — **with its second tier hardened.** D122 answers what it cannot verify
-with a warning and lets the value travel; rule 2 above answers with an **error**,
-because the three facts decide where traffic goes and whether it authenticates,
-and a value of that class failing on the first live call rather than at
-`validate` is the case §12.1's conditional credential rule was written to
-prevent (G3). Where a harness's SDK tier genuinely offers no slot, that
-narrowness is the table's honest content and the error's honest message: `codex`
-takes an API key and a base URL and has nowhere to put a header, and **a faked
+with a warning and lets the value travel; rules 1 and 3 above answer with an
+**error**, because a kind and the three facts each decide where traffic goes and
+whether it authenticates, and a value of that class failing on the first live
+call rather than at `validate` is the case §12.1's conditional credential rule
+was written to prevent (G3). Where a harness's SDK tier genuinely offers no slot
+— or no wire — that narrowness is the table's honest content and the error's
+honest message: `codex` takes an API key and a base URL and has nowhere to put a
+header, neither SDK has anywhere to put a cloud credential chain, and **a faked
 slot** — synthesizing a `model_providers.*` config table out of CLI overrides the
-composition never wrote — is what rule 2 exists instead of.
+composition never wrote — is what rule 3 exists instead of.
 
-**Rule 3 is refusal rather than precedence** for the reason the grammar refuses
+**Rule 4 is refusal rather than precedence** for the reason the grammar refuses
 `allow_tools: []`: two spellings of one fact are indistinguishable from each
 other downstream, a silent pick is a run authenticating somewhere nobody chose,
 and a precedence rule is a fact about this compiler to be remembered at every

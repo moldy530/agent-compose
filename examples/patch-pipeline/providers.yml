@@ -15,6 +15,13 @@
 # `provider.openai` declares none. Writing one there is a compile error naming
 # the fact and the harness (`unsupported-connection-fact`) rather than a value
 # that vanishes on the way into the run.
+#
+# Which block each coder node's `model:` resolves through is checked too, and it
+# is not a convention this project keeps by hand: a slot is an endpoint and a
+# credential on one wire, so `cc` carries an `anthropic` connection and `codex`
+# carries an `openai` (or `openai_compatible`) one. Crossing them — the `cc`
+# node on `provider.openai` — is `unsupported-provider-kind`, refused at
+# `validate` rather than by a `401` from the gateway.
 provider.anthropic:
   kind: anthropic
   base_url: ${LLM_GATEWAY_URL}

@@ -382,7 +382,10 @@ binding reaches the run: the id, the small settings subset the harness has a
 place for, and the provider's **connection** — its `base_url:`, its credential
 and its `headers:` — mapped into that harness's own connection surface. So the
 gateway shape above is a one-line edit for a coder node exactly as it is for an
-agent; `agent-compose docs agents` has the three rules that come with it.
+agent, as long as the provider is one that harness speaks: a slot is an endpoint
+and a key on one wire, so `cc` carries an `anthropic` connection and `codex` an
+`openai` or `openai_compatible` one, and crossing them is a compile error.
+`agent-compose docs agents` has the four rules that come with it.
 
 ## Settings
 
