@@ -76,6 +76,7 @@ pub mod codegen;
 pub mod diag;
 pub mod docs;
 pub mod graph;
+pub mod harness;
 pub mod ir;
 pub mod parse;
 pub mod plan;
