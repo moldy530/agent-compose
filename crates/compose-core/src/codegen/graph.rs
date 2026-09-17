@@ -135,6 +135,7 @@ use crate::ir::flow::{
 };
 use crate::ir::policy::Policy;
 use crate::ir::schema::{Field, FieldMap, TypeForm, TypeNode};
+use crate::parse::reader::article;
 
 use super::names::{self, Names};
 use super::policy::{self, Strategy};
@@ -479,15 +480,6 @@ fn providers(ir: &Ir, names: &Names) -> String {
         text.push_str("};\n");
     }
     text
-}
-
-/// `a` or `an`, so a generated sentence reads like one.
-fn article(word: &str) -> &'static str {
-    if word.starts_with(['a', 'e', 'i', 'o', 'u']) {
-        "an"
-    } else {
-        "a"
-    }
 }
 
 const fn provider_kind(kind: ProviderKind) -> &'static str {

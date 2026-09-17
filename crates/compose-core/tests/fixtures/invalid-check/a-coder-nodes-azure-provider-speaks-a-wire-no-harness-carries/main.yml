@@ -1,0 +1,50 @@
+# rule: the one repair is composed per kind, so `azure_openai` — the kind on no
+# rule: row whose other keys are all facts — reads as a sentence too (grammar
+# rule: 8.9, 12.1, D143, PRD resolved q58 ruling b)
+# code: unsupported-provider-kind
+# message: `flow.main` node `implement` binds `harness: codex`, and `provider.azure` is `kind: azure_openai`, whose connection that harness cannot carry
+# at: main.yml:42:16
+# label: main.yml:25:1 `provider.azure` is defined here, as `kind: azure_openai`
+# label: main.yml:41:18 the harness is bound here
+# help: a coder node's `model:` carries its provider's connection into the run, and a slot is an endpoint and a credential on one wire: `harness: codex` carries `openai`, `openai_compatible` connections, and no other, so this pairing would write one vendor's endpoint and key where another's are read. No harness this release lowers carries an `azure_openai` connection, so there is nowhere to move this node to: bind its `model:` to a `provider.*` whose kind `codex` speaks — providers are cheap — and leave `provider.azure` serving the agent nodes it already serves (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling b)
+#
+# The third kind on no row, and the one the sibling `bedrock` fixture cannot
+# stand in for. `azure_openai` is the near miss: its `base_url:`, `api_key:` and
+# `headers:` are connection facts this compiler already spells, so a reader —
+# and a guard written as a list of connection-looking key names — sees a kind
+# that all but fits. What it also carries is a **required** `api_version:` and a
+# deployment path inside the endpoint, neither of which either SDK's connection
+# surface has anywhere to put, which is why no row claims the kind and why the
+# refusal is the wire rule rather than a per-fact one.
+#
+# It is pinned under `codex` deliberately: that is the harness an author reaches
+# for with an Azure-hosted OpenAI model, so it is the pairing this message is
+# really written for — and the branch is the one-repair branch all the same,
+# because `cc` does not speak the kind either.
+version: "0.1"
+provider.azure:
+  kind: azure_openai
+  base_url: ${AZURE_OPENAI_ENDPOINT}
+  api_key: ${AZURE_OPENAI_API_KEY}
+  api_version: "2024-10-21"
+model.implementer:
+  provider: provider.azure
+  id: gpt-5-codex
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: codex
+        model: model.implementer
+        workspace: ${REPO_ROOT}
+        prompt: Fix the failing test, then say what you changed.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

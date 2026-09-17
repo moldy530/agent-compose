@@ -65,7 +65,7 @@ use crate::harness::{
 };
 use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::{Coder, Node};
-use crate::parse::reader::{list, suggest};
+use crate::parse::reader::{article, list, suggest};
 
 use super::{Ctx, FlowCx};
 
@@ -306,10 +306,11 @@ fn wrong_wire(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder, address: &str, pr
     // to a node kind that does not exist.
     let repair = if elsewhere.is_empty() {
         format!(
-            "No harness this release lowers carries a `{}` connection, so there is nowhere to \
+            "No harness this release lowers carries {} `{}` connection, so there is nowhere to \
              move this node to: bind its `model:` to a `provider.*` whose kind `{harness}` speaks \
              — providers are cheap — and leave `{address}` serving the agent nodes it already \
              serves",
+            article(provider.kind.as_str()),
             provider.kind.as_str()
         )
     } else {
@@ -973,15 +974,37 @@ flow.main:\n  outputs:\n    summary: { type: string }\n  nodes:\n    build:\n   
     /// the node under the harness that speaks this one* would, in the same
     /// paragraph, tell an author no harness carries the connection and then send
     /// them to the harness that does.
+    ///
+    /// **All three are driven**, and the third is the one a doc comment naming
+    /// it was not enough for: `azure_openai` is the kind whose keyword the
+    /// sentence has to article correctly, and the branch shipped reading "a
+    /// `azure_openai` connection" for exactly as long as no case drove it. The
+    /// corpus pins the `bedrock` wording; this pins that the wording is composed
+    /// per kind rather than written once against the kind that happened to have
+    /// a fixture.
     #[test]
     fn a_kind_no_harness_carries_is_told_there_is_one_repair() {
         use crate::codegen::test_support::ir_of;
 
-        for provider in [
-            "provider.p:\n  kind: bedrock\n  region: us-east-1\n  access_key_id: ${AWS_KEY_ID}\n  \
-             secret_access_key: ${AWS_SECRET}\n",
-            "provider.p:\n  kind: vertex\n  project: acme\n  location: us-central1\n  \
-             credentials_json: ${GOOGLE_CREDENTIALS}\n",
+        for (provider, kind, expected) in [
+            (
+                "provider.p:\n  kind: bedrock\n  region: us-east-1\n  access_key_id: \
+                 ${AWS_KEY_ID}\n  secret_access_key: ${AWS_SECRET}\n",
+                "bedrock",
+                "carries a `bedrock` connection",
+            ),
+            (
+                "provider.p:\n  kind: vertex\n  project: acme\n  location: us-central1\n  \
+                 credentials_json: ${GOOGLE_CREDENTIALS}\n",
+                "vertex",
+                "carries a `vertex` connection",
+            ),
+            (
+                "provider.p:\n  kind: azure_openai\n  base_url: ${AZURE_ENDPOINT}\n  api_key: \
+                 ${AZURE_KEY}\n  api_version: \"2024-10-21\"\n",
+                "azure_openai",
+                "carries an `azure_openai` connection",
+            ),
         ] {
             for harness in ["cc", "codex"] {
                 let composition = format!(
@@ -992,7 +1015,7 @@ state:\n  summary: {{ type: string, default: \"\" }}\n\
 flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: {harness}\n        model: model.m\n        workspace: /srv/checkout\n        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
                 );
                 let held = crate::check(&ir_of(&composition));
-                assert_eq!(held.len(), 1, "{held:#?}");
+                assert_eq!(held.len(), 1, "{kind} under {harness}: {held:#?}");
                 assert_eq!(held[0].code, DiagnosticCode::UnsupportedProviderKind);
                 let help = held[0].help.clone().expect("the refusal carries a help");
                 assert!(
@@ -1003,6 +1026,12 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
                     !help.contains("run the node under"),
                     "the help says no harness carries this connection and then sends the author \
                      to the harness that does: {help}"
+                );
+                // …and it reads like a sentence for every kind, not only for the
+                // one the corpus happens to have a fixture for.
+                assert!(
+                    help.contains(expected),
+                    "the one-repair help does not read `{expected}`: {help}"
                 );
             }
         }

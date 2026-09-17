@@ -53,10 +53,13 @@
 //   * **a `retry:` ladder** — every attempt's run is on the node's entry, so a
 //     later attempt answering does not erase the one that failed;
 //   * **the connection** — the provider's endpoint, credential and headers reach
-//     each harness's own surface, and a provider with **no** credential injects
-//     none at all rather than an empty one. Invisible from the seam for section
-//     11's reason: a scripted driver is handed `run.connection` whole, and it is
-//     the real driver that decides what the SDK is called with.
+//     each harness's own surface; a provider with **no** credential injects none
+//     at all rather than an empty one; and under `inherit_env: true` the host's
+//     own spellings of a declared fact are taken out of the inherited half
+//     before the map goes over the top, which is the one door `validate` cannot
+//     reach. Invisible from the seam for section 11's reason: a scripted driver
+//     is handed `run.connection` whole, and it is the real driver that decides
+//     what the SDK is called with.
 //
 // Usage: node coder-runs.mjs <generated project directory> <scratch dir>
 // Output: one JSON object, read by `generated_code_gates.rs`.
@@ -889,6 +892,51 @@ const results = {};
   }
   process.env["CODER_TEAM"] = "platform";
 
+  // …and the door `validate` cannot reach: `inherit_env: true`. The compiler
+  // refuses a node `env:` entry spelling any name this runtime reads for a
+  // declared fact, so the declared half of the environment arrives clean — the
+  // **inherited** half is whatever shell started this process, and a machine
+  // that runs `claude` interactively is the machine that has
+  // `CLAUDE_CODE_USE_BEDROCK` and an `ANTHROPIC_AUTH_TOKEN` set. Merging the
+  // three mapped names over the top leaves a selector that repoints the run and
+  // a bearer token sent beside the composition's own key, with `validate` clean
+  // and the graph document still reporting `ANTHROPIC_BASE_URL`.
+  process.env["CLAUDE_CODE_USE_BEDROCK"] = "1";
+  process.env["ANTHROPIC_BEDROCK_BASE_URL"] = "https://bedrock.internal";
+  process.env["ANTHROPIC_AUTH_TOKEN"] = "someone-elses-bearer";
+  process.env["CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"] = "7";
+  process.env["HOST_ONLY"] = "inherited-and-kept";
+  const inheritedStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(
+    binding({ inheritEnv: true }),
+    { goal: "fix it" },
+    context(),
+    { cc: inheritedStub.driver },
+  );
+  const ccInherited = harness.ccOptions(inheritedStub.runs[0], [], new Set());
+
+  // …and the same shell under a **keyless** gateway, which is the direction an
+  // over-eager scrub breaks: a provider with no `api_key:` claims no credential
+  // name at all — resolved q25's posture — so the inherited bearer stays, while
+  // the endpoint family it does claim still goes.
+  const keylessInheritedStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(
+    binding({ inheritEnv: true, connection: keylessConnection }),
+    { goal: "fix it" },
+    context(),
+    { cc: keylessInheritedStub.driver },
+  );
+  const ccKeylessInherited = harness.ccOptions(keylessInheritedStub.runs[0], [], new Set());
+  for (const name of [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "HOST_ONLY",
+  ]) {
+    delete process.env[name];
+  }
+
   results["connection"] = {
     // The run object: the composition's references, resolved once, for both
     // drivers to read.
@@ -909,6 +957,30 @@ const results = {};
     // The forged header: that the run failed, and what the failure does not say.
     forgedHeader: forged,
     forgedNamesTheValue: forged === null ? null : forged.indexOf("someone-elses-key") >= 0,
+    // `inherit_env: true`: the names this runtime reads for a **declared** fact
+    // are gone from the inherited half, the mapped three are the composition's,
+    // and an inherited variable that decides nothing about the connection is
+    // still there — the opt-in is not undone, only narrowed.
+    inheritedShadows: [
+      "CLAUDE_CODE_USE_BEDROCK",
+      "ANTHROPIC_BEDROCK_BASE_URL",
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    ].filter((name) => Object.hasOwn(ccInherited.env ?? {}, name)),
+    inheritedBaseUrl: (ccInherited.env ?? {})["ANTHROPIC_BASE_URL"] ?? null,
+    inheritedCredential: (ccInherited.env ?? {})["ANTHROPIC_API_KEY"] ?? null,
+    inheritedHostOnly: (ccInherited.env ?? {})["HOST_ONLY"] ?? null,
+    inheritedToken: (ccInherited.env ?? {})["TOKEN"] ?? null,
+    // …and the keyless gateway under the same shell: an undeclared fact claims
+    // no name, so the credential family survives and the endpoint family does
+    // not.
+    keylessInheritedCredentials: [
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    ].filter((name) => Object.hasOwn(ccKeylessInherited.env ?? {}, name)),
+    keylessInheritedSelectors: ["CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL"].filter(
+      (name) => Object.hasOwn(ccKeylessInherited.env ?? {}, name),
+    ),
   };
 
   // `codex`, whose surface is its client's options rather than an environment.

@@ -48,11 +48,17 @@
 //! It is also what keeps [`ConnectionFact`] honest. The facts are the connection
 //! keys of the kinds the table speaks; the cloud-SDK kinds' credentials
 //! (`access_key_id:`, `secret_access_key:`, `session_token:`,
-//! `credentials_json:`) are not among them because **no row speaks `bedrock` or
-//! `vertex`** — neither SDK's connection surface has a cloud credential chain on
-//! it — and the pairing is refused before a fact of one is read.
-//! `a_spoken_kinds_connection_keys_are_all_facts` holds the two halves together:
-//! a row that grows a kind grows this enum with it, or the suite fails.
+//! `credentials_json:`) and `azure_openai`'s required `api_version:` are not
+//! among them because **no row speaks `bedrock`, `vertex` or `azure_openai`** —
+//! neither SDK's connection surface has a cloud credential chain on it, and
+//! neither takes an API version beside an endpoint — and the pairing is refused
+//! before a fact of one is read. `a_spoken_kinds_connection_keys_are_all_facts`
+//! holds the two halves together: a row that grows a kind grows this enum with
+//! it, or the suite fails. That guard reads a **denylist** of the keys which
+//! decide nothing about a connection, because `azure_openai`'s other three keys
+//! are facts already — so a check phrased the other way round, as a list of
+//! connection-looking names, lets that one kind through with its `api_version:`
+//! declared, crossing nothing and raising nothing.
 //!
 //! # A fact has more than one spelling, and the row owns all of them
 //!
@@ -101,20 +107,23 @@ use crate::ir::flow::Coder;
 /// Three, and the boundary is drawn twice. These are the keys of a `provider.*`
 /// that say **where** the traffic goes and **how** it authenticates, on the
 /// kinds [`CONNECTION`]'s rows speak for. Everything else on one of those kinds
-/// is either a plugin's own vocabulary (`organization:`, an `api_version:`) or a
-/// request-shaping key (`server_tools:`), and neither is a connection fact a
-/// harness client has a place for — the harness opens its own connection and
-/// composes its own requests.
+/// is either a plugin's own vocabulary (`organization:`) or a request-shaping
+/// key (`server_tools:`), and neither is a connection fact a harness client has
+/// a place for — the harness opens its own connection and composes its own
+/// requests.
 ///
-/// **The cloud-SDK kinds' credentials are deliberately absent**, and their
+/// **The keys of the kinds no row speaks are deliberately absent**, and their
 /// absence is not a silent drop. `bedrock`'s `access_key_id:`,
-/// `secret_access_key:` and `session_token:` and `vertex`'s `credentials_json:`
-/// are credential keys of grammar 12.1 just as much as `api_key:` is — what they
-/// are not is reachable, because neither harness row speaks `bedrock` or
-/// `vertex` and [`speaks`] refuses that pairing before a fact of one is read. A
-/// row that ever grows one of those kinds has to grow this enum with it, and
-/// `a_spoken_kinds_connection_keys_are_all_facts` is what makes that a test
-/// failure rather than an omission (PRD resolved q58 ruling b).
+/// `secret_access_key:` and `session_token:`, `vertex`'s `credentials_json:` and
+/// `azure_openai`'s **required** `api_version:` are connection keys of grammar
+/// 12.1 just as much as `api_key:` is — what they are not is reachable, because
+/// no harness row speaks those three kinds and [`speaks`] refuses that pairing
+/// before a fact of one is read. A row that ever grows one of those kinds has to
+/// grow this enum with it, and `a_spoken_kinds_connection_keys_are_all_facts` is
+/// what makes that a test failure rather than an omission (PRD resolved q58
+/// ruling b). `azure_openai` is the one worth naming twice: its other three keys
+/// are facts already, so it is the kind a guard written as an allowlist of
+/// connection-looking names waves straight through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConnectionFact {
     /// `base_url:` — the endpoint, the one key that can say the traffic is not
@@ -730,9 +739,35 @@ mod tests {
     /// So the two halves are held together here. A row that grows a kind fails
     /// this test until the enum, [`declared`] and the check's own `fact_span`
     /// grow with it.
+    ///
+    /// **Read as a denylist**, which is the whole of what the guard is worth. An
+    /// allowlist of connection-looking names — grammar 4.3's credential fields
+    /// plus `headers:` — is satisfied by a row that grows a kind whose extra key
+    /// is spelled neither way, and `azure_openai` is exactly that kind: its
+    /// `base_url:`, `api_key:` and `headers:` are already facts, so an
+    /// allowlist-shaped check passes green while its **required** `api_version:`
+    /// — half of what makes that endpoint reachable — is declared, crosses
+    /// nothing and raises nothing. That is the near-miss this module's own
+    /// documentation and Decision D143 single out, so the keys that are *not*
+    /// connection facts are the list, named one by one with why, and everything
+    /// else on a spoken kind's row has to be one.
     #[test]
     fn a_spoken_kinds_connection_keys_are_all_facts() {
-        use crate::ast::deploy::SECRET_FIELDS;
+        // Every key of a `provider.*` that says nothing about where traffic goes
+        // or how it authenticates. A key outside this list is a connection key
+        // until somebody says otherwise **here**, where saying it is a commit.
+        const NOT_A_CONNECTION_KEY: &[&str] = &[
+            // The wire itself, which a row names rather than carries.
+            "kind",
+            // Prose, read by a human and by `visualize`.
+            "description",
+            // The `openai` plugin's own vocabulary: a billing account, not a
+            // connection.
+            "organization",
+            // Request shaping — grammar 12.1's server-side tool suite, which
+            // resolved q30's second tier already governs.
+            "server_tools",
+        ];
 
         let spelled: Vec<&str> = ConnectionFact::ALL
             .iter()
@@ -741,10 +776,7 @@ mod tests {
         for row in CONNECTION {
             for kind in row.kinds {
                 for key in kind.keys() {
-                    // A connection key is a credential key of grammar 4.3 or the
-                    // header block; everything else on a kind's row is plugin
-                    // vocabulary or request shaping.
-                    if !SECRET_FIELDS.contains(key) && *key != "headers" {
+                    if NOT_A_CONNECTION_KEY.contains(key) {
                         continue;
                     }
                     assert!(
@@ -752,12 +784,39 @@ mod tests {
                         "`{}` speaks `{}`, whose row takes `{key}:` — a connection key with no \
                          `ConnectionFact` is declared, crosses nothing and raises nothing. Give \
                          it a fact (and a slot, or an honest `None`) before this row claims that \
-                         kind (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling b)",
+                         kind — or, if `{key}:` really decides neither where a connection's \
+                         traffic goes nor how it authenticates, say so in \
+                         `NOT_A_CONNECTION_KEY` above (grammar 8.9, 12.1, Decision D143, PRD \
+                         resolved q58 ruling b)",
                         row.harness.as_str(),
                         kind.as_str()
                     );
                 }
             }
+        }
+
+        // …and the guard bites on the kinds no row speaks *yet*, which is the
+        // only direction the loop above cannot reach while the table is honest:
+        // a row that grew one of these would have to answer for the key named
+        // beside it before this test went green again.
+        for (kind, key) in [
+            (ProviderKind::AzureOpenAi, "api_version"),
+            (ProviderKind::Bedrock, "access_key_id"),
+            (ProviderKind::Vertex, "credentials_json"),
+        ] {
+            assert!(
+                kind.keys().contains(&key) && !NOT_A_CONNECTION_KEY.contains(&key),
+                "`{}` takes `{key}:`, and this guard would wave it through: the near-miss \
+                 Decision D143 names is a kind whose *other* connection keys are all facts \
+                 already",
+                kind.as_str()
+            );
+            assert!(
+                !spelled.contains(&key),
+                "`{key}:` is a `ConnectionFact` now, so `{}` may be worth a row — and this \
+                 assertion, which pins the guard rather than the table, has to be re-read with it",
+                kind.as_str()
+            );
         }
     }
 
@@ -937,6 +996,68 @@ mod tests {
                  the `cc` row does not claim it for `base_url:`, so a coder node's `env:` may set \
                  it with no diagnostic and send the run to an endpoint the composition never \
                  named (grammar 8.9, Decision D143 rule 4)"
+            );
+        }
+    }
+
+    /// **The `cc` row and the `cc` driver's own variable table are one table**
+    /// (grammar 8.9, Decision D143, PRD resolved q58 rulings a and c).
+    ///
+    /// The row above is what `validate` refuses a node `env:` against;
+    /// `CC_CONNECTION_VARIABLES` in `src/harness-cc.ts` is that same list
+    /// declared again for the runtime, where the driver **removes** those names
+    /// from the environment a run inherits before mapping the connection over
+    /// the top. The two halves answer one question from opposite ends — one at
+    /// compile time about what the composition wrote, one at run time about what
+    /// the host process happened to hold — and a name in one and not the other
+    /// is a hole with no diagnostic in it: `validate` stays clean, the graph
+    /// document and the journal's request identity go on reporting
+    /// `ANTHROPIC_BASE_URL`, and the run talks to whatever the inherited
+    /// selector chose.
+    ///
+    /// So they are compared, name for name and in order, the way
+    /// `the_curated_settings_table_is_one_table` compares the other pair of
+    /// hand-maintained copies this project keeps.
+    #[test]
+    fn the_cc_connection_variable_table_is_one_table() {
+        const DRIVER: &str = include_str!("codegen/js/harness-cc.ts");
+
+        let object = DRIVER
+            .split_once("const CC_CONNECTION_VARIABLES")
+            .expect("`src/harness-cc.ts` declares `CC_CONNECTION_VARIABLES`")
+            .1;
+        let object = &object[..object.find("};").expect("…and closes the object it opened")];
+        for fact in ConnectionFact::ALL.iter().copied() {
+            // What the driver's own surface spells this fact — a `match`, so a
+            // fourth fact cannot arrive without an answer here.
+            let key = match fact {
+                ConnectionFact::BaseUrl => "baseUrl",
+                ConnectionFact::Credential => "credential",
+                ConnectionFact::Headers => "headers",
+            };
+            let array = object
+                .split_once(&format!("{key}: ["))
+                .unwrap_or_else(|| {
+                    panic!("`CC_CONNECTION_VARIABLES` in `src/harness-cc.ts` answers `{key}`")
+                })
+                .1;
+            let array = &array[..array.find(']').expect("…and closes the array it opened")];
+            let emitted: Vec<&str> = array.split('"').skip(1).step_by(2).collect();
+            let owned: Vec<&str> = variables_set(Harness::Cc, &[fact])
+                .into_iter()
+                .chain(variables_read(Harness::Cc, &[fact]))
+                .map(|(_, name)| name)
+                .collect();
+            assert_eq!(
+                emitted,
+                owned,
+                "`CC_CONNECTION_VARIABLES.{key}` in `src/harness-cc.ts` and the `cc` row's \
+                 `{}:` slot and siblings here are two copies of one table and have parted \
+                 company. A name this row claims and the driver does not scrub is a name an \
+                 inherited environment decides the fact with; a name the driver scrubs and this \
+                 row does not claim is an `env:` entry `validate` accepts and the run then \
+                 silently drops",
+                fact.as_str()
             );
         }
     }

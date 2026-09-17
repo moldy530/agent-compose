@@ -6488,6 +6488,59 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         json!(false),
         "the refusal quoted the resolved header value: {forged}"
     );
+    // **`inherit_env: true`**, which is the one door ruling c's `validate` check
+    // cannot reach: the inherited half of the environment never passed through a
+    // compile step, and a machine that runs `claude` interactively is exactly the
+    // machine holding `CLAUDE_CODE_USE_BEDROCK` and an `ANTHROPIC_AUTH_TOKEN`.
+    // The mapped three would be merged over the top and the rest of the family
+    // left standing — a selector that repoints the run and a bearer sent beside
+    // the composition's own key, with `validate` clean and the graph document
+    // still drawing `ANTHROPIC_BASE_URL`.
+    assert_eq!(
+        connection["inheritedShadows"],
+        json!([]),
+        "`inherit_env: true` carried the host's own endpoint selector or credential into a \
+         gateway-bound run: every name this runtime reads for a fact the connection declares is \
+         the connection's, and the composition already said what it is (PRD resolved q58 rulings \
+         a and c)"
+    );
+    assert_eq!(
+        connection["inheritedBaseUrl"],
+        json!("https://gateway.internal/v1"),
+        "…and the endpoint the run really goes to is still the one the composition named"
+    );
+    assert_eq!(connection["inheritedCredential"], json!("gw-key"));
+    assert_eq!(
+        connection["inheritedHostOnly"],
+        json!("inherited-and-kept"),
+        "the scrub narrowed `inherit_env: true` into nothing: a host variable that decides no \
+         connection fact is exactly what the opt-in is for (PRD resolved q54 ruling b)"
+    );
+    assert_eq!(
+        connection["inheritedToken"],
+        json!("shh"),
+        "the node's own declared `env:` is untouched beside it"
+    );
+    // …and the other direction, which an over-eager scrub breaks: a provider
+    // with **no** `api_key:` claims no credential name at all, so a node bound
+    // to a keyless gateway may inherit whatever credential its shell holds —
+    // resolved q25's posture, read the same way the compiler's own collision
+    // list reads it.
+    assert_eq!(
+        connection["keylessInheritedCredentials"],
+        json!([
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"
+        ]),
+        "an undeclared fact claimed a name: a keyless gateway says nothing about how this run \
+         authenticates, so the inherited credential family is not the connection's to remove"
+    );
+    assert_eq!(
+        connection["keylessInheritedSelectors"],
+        json!([]),
+        "…while the fact that connection *does* declare still claims its whole family, which is \
+         what keeps the endpoint the one the composition named"
+    );
 
     // …and the other harness, whose connection surface is its client's options
     // rather than an environment — stated per harness, never implied equivalent.

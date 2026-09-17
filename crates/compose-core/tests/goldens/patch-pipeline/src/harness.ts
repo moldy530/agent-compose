@@ -363,16 +363,18 @@ function forgesAHeaderField(value: string): boolean {
  *  * `ANTHROPIC_CUSTOM_HEADERS` — one `Name: value` per line, which is how that
  *    runtime parses it.
  *
- * Three variables written, and **more than three owned**. That runtime reads a
- * whole endpoint table and a whole credential list — `ANTHROPIC_AUTH_TOKEN` is
- * sent as a bearer header beside the `X-Api-Key` the second variable sets, and
+ * Three variables written, and **more than three owned** — which is
+ * [`CC_CONNECTION_VARIABLES`], and why the merge that uses this function is
+ * [`ccEnvironment`] rather than a spread. That runtime reads a whole endpoint
+ * table and a whole credential list — `ANTHROPIC_AUTH_TOKEN` is sent as a bearer
+ * header beside the `X-Api-Key` the second variable sets, and
  * `CLAUDE_CODE_USE_BEDROCK` with its `ANTHROPIC_BEDROCK_BASE_URL` companion
  * chooses an endpoint instead of the first — so `validate` refuses a node `env:`
  * entry naming any of them for a fact this connection declares, not only the
- * three below — the whole family is the compiler's per-harness connection table
- * (grammar Decision D143, PRD resolved q58 rulings a and c). Nothing is filtered
- * here: by the time a run reaches this function the composition has already been
- * refused.
+ * three below (grammar Decision D143, PRD resolved q58 rulings a and c). The
+ * node's own `env:` therefore needs no filtering here; the **inherited** half
+ * does, and that is what [`ccEnvironment`] removes before this map goes over the
+ * top.
  *
  * **An absent fact sets no variable**, which is the half a one-token slip would
  * turn into the opposite of q25's ruling: a keyless gateway connection must
@@ -413,6 +415,120 @@ function ccConnection(run: runtime.HarnessRun): Record<string, string> {
     held["ANTHROPIC_CUSTOM_HEADERS"] = headers.map(([name, value]) => `${name}: ${value}`).join("\n");
   }
   return held;
+}
+
+/**
+ * Every variable the pinned runtime reads for one connection fact — the slot
+ * [`ccConnection`] writes **and** every other name that decides the same thing
+ * (grammar 8.9, Decision D143, PRD resolved q58 rulings a and c).
+ *
+ * This is the compiler's own `cc` connection row, declared again for the
+ * runtime, exactly as [`CC_SETTINGS`] is the curated settings table declared
+ * again for [`passthrough`] — and held to it by
+ * `the_cc_connection_variable_table_is_one_table` in `src/harness.rs`, because
+ * two hand-maintained copies of one document drift in silence.
+ *
+ * It exists because a slot is not the only name that answers its question.
+ * `ANTHROPIC_AUTH_TOKEN` is sent as `Authorization: Bearer …` *beside* the
+ * `X-Api-Key` the credential slot sets; the `CLAUDE_CODE_USE_*` selectors each
+ * choose an endpoint instead of `ANTHROPIC_BASE_URL`, and the
+ * `*_FILE_DESCRIPTOR` names hand a credential over on a file descriptor rather
+ * than in a value. Guarding only the three the map writes leaves every one of
+ * those free to decide the fact the composition already decided.
+ */
+const CC_CONNECTION_VARIABLES: Readonly<Record<keyof runtime.HarnessConnection, readonly string[]>> =
+  {
+    baseUrl: [
+      "ANTHROPIC_BASE_URL",
+      "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
+      "ANTHROPIC_BEDROCK_BASE_URL",
+      "CLAUDE_CODE_USE_BEDROCK",
+      "ANTHROPIC_VERTEX_BASE_URL",
+      "CLAUDE_CODE_USE_VERTEX",
+      "ANTHROPIC_FOUNDRY_BASE_URL",
+      "CLAUDE_CODE_USE_FOUNDRY",
+      "ANTHROPIC_AWS_BASE_URL",
+      "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+      "ANTHROPIC_GOOGLE_CLOUD_BASE_URL",
+      "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+      "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+      "CLAUDE_CODE_USE_MANTLE",
+      "CLAUDE_CODE_USE_GATEWAY",
+    ],
+    credential: [
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "AWS_BEARER_TOKEN_BEDROCK",
+      "ANTHROPIC_FOUNDRY_API_KEY",
+      "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+      "ANTHROPIC_AWS_API_KEY",
+      "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+      "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+      "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
+      "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
+      "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH",
+      "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+      "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+      "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+      "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+      "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+    ],
+    headers: ["ANTHROPIC_CUSTOM_HEADERS"],
+  };
+
+/**
+ * Whether the connection **declares** one fact, which is the same question
+ * [`ccConnection`] asks before it writes that fact's slot.
+ *
+ * `headers:` is the one that is not a bare `!== undefined`: an empty header map
+ * writes no variable, so it claims no name either — the two answers are one
+ * answer, and the compiler's `declared` reads it the same way.
+ */
+function ccDeclares(
+  connection: runtime.HarnessConnection,
+  fact: keyof runtime.HarnessConnection,
+): boolean {
+  if (fact === "headers") return Object.keys(connection.headers ?? {}).length > 0;
+  return connection[fact] !== undefined;
+}
+
+/**
+ * The environment one `cc` run is handed: the node's own, **minus every name
+ * this runtime reads for a fact the connection declares**, plus the connection
+ * itself (PRD resolved q58 rulings a and c, q54 ruling b).
+ *
+ * The subtraction is the whole of this function, and `inherit_env: true` is why
+ * it is not redundant. `validate` refuses a node `env:` entry spelling any name
+ * [`CC_CONNECTION_VARIABLES`] claims for a declared fact, so the *declared* half
+ * of the environment is already clean when it arrives. The **inherited** half
+ * never passed through `validate` at all: it is whatever shell started this
+ * process, and a machine that runs `claude` interactively is exactly the machine
+ * that has `CLAUDE_CODE_USE_BEDROCK` and an `ANTHROPIC_AUTH_TOKEN` set. Merging
+ * the map over the top only overwrites the three names it writes, so without
+ * this a gateway-bound coder run would inherit a selector that repoints it, or a
+ * bearer token sent beside the composition's own key — while `validate` stayed
+ * clean and the graph document and the journal's `connection` both went on
+ * reporting `ANTHROPIC_BASE_URL`. That is the failure the sibling list exists to
+ * refuse, arriving through the one door ruling c cannot reach.
+ *
+ * **An undeclared fact claims nothing**, which is q25's keyless posture read
+ * here rather than one surface along: a provider with no `api_key:` leaves the
+ * whole credential family alone, so a node that inherits a shell holding
+ * `ANTHROPIC_AUTH_TOKEN` keeps it — the connection says nothing about how this
+ * run authenticates, and the compiler's own `variables_read` is computed from
+ * the declared facts for the same reason.
+ */
+function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
+  const held: Record<string, string> = { ...run.env };
+  for (const [fact, names] of Object.entries(CC_CONNECTION_VARIABLES) as [
+    keyof runtime.HarnessConnection,
+    readonly string[],
+  ][]) {
+    if (!ccDeclares(run.connection, fact)) continue;
+    for (const name of names) delete held[name];
+  }
+  return { ...held, ...ccConnection(run) };
 }
 
 /**
@@ -525,13 +641,13 @@ export function ccOptions(
     model: run.model,
     permissionMode: CC_PERMISSION[run.access],
     abortController: controllerFor(run.signal),
-    // The node's declared environment, with the model's connection mapped over
-    // the top. The order is not a precedence rule: `validate` refuses an `env:`
-    // entry spelling a variable this map sets — or one this runtime reads for
-    // the same fact beside it, which is the half a merge order could not have
-    // fixed anyway — so the two never decide one fact (PRD resolved q58 ruling
-    // c).
-    env: { ...run.env, ...ccConnection(run) },
+    // The node's environment with the model's connection mapped over the top —
+    // and, first, with every other name this runtime reads for a declared fact
+    // taken out of it. `validate` refuses an `env:` entry spelling one of those,
+    // so the *declared* half needs no filtering; `inherit_env: true` is the half
+    // no compile step ever saw, and a merge order alone could not have fixed it
+    // (see [`ccEnvironment`], PRD resolved q58 ruling c).
+    env: ccEnvironment(run),
     outputFormat: { type: "json_schema", schema: { ...run.schema } },
     ...passthrough(run, CC_SETTINGS, CC_RESERVED),
   };
