@@ -163,6 +163,11 @@ one journaled effect — a resume consumes the recorded answer and the harness
 never runs twice — and the trace carries its turns, its tool calls and what it
 cost.
 
+`model:` is the same registry address an agent node writes, and the provider
+behind it points the harness: its `base_url:`, its credential and its `headers:`
+are mapped into that harness's own connection surface, so moving a project onto
+a gateway stays a one-line edit in `providers.yml` for coder nodes too.
+
 Read the containment paragraph before you write one: a harness authors **and
 runs** the program inside its own tool surface, so what bounds it is the
 `workspace:`, the `access:` preset, the declared `env:` and the node's own

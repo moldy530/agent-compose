@@ -1491,14 +1491,20 @@ Which gives, concretely:
   carried. Its references are filed under the node's own address inside that
   flow rather than under a definition's for the same reason. The addition works
   the way the storage-backend clause above works: it **adds** placements and
-  never moves the variables off the hub's list. What does *not* travel with a
-  coder node is its `model:`'s **provider** credential: the provider connection
-  does not reach inside a harness run (PRD resolved q57 ruling d), so a process
-  that runs only coder nodes needs the variables the nodes declare and no
-  `api_key:` at all — the harness reads its own auth out of the node's `env:`.
-  Should a later release make a coder node placeable in its own right, this
-  bullet is where the rule moves, and the walk above needs no other edit — a
-  coder node's references enter the closure exactly as a `builtin:` tool's do.
+  never moves the variables off the hub's list. Its `model:`'s **provider**
+  connection travels with it, and this is the half that reads like an exception
+  and is not: PRD resolved q58 made a provider's `base_url:`, credential and
+  `headers:` cross into a harness run, mapped into the harness's own connection
+  surface (`docs/grammar.md` §8.9, Decision D143), so those variables are spent
+  in whichever process runs the node exactly as an agent's `model:` spends them
+  wherever the agent runs. A process that runs only coder nodes therefore needs
+  the variables those nodes declare **and** the connection behind each one's
+  model. The walk follows it the way it follows an agent's: a `coder:` node's
+  `model:` is a reference site, and the provider it names joins the executes-in
+  closure of the flow holding the node. Should a later release make a coder node
+  placeable in its own right, this bullet is where the rule moves, and the walk
+  needs no other edit — a coder node's references enter the closure exactly as a
+  `builtin:` tool's do.
 
 **One of a tool's `${ENV}` references is declared rather than walked, and the
 closure does not care.** A `module:` binding names hand-written TypeScript

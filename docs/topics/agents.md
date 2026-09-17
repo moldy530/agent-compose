@@ -252,9 +252,8 @@ implement:
     output:                     # required, like an agent's
       summary: { type: string }
     allow_tools: [Bash, Edit, Read, Write]
-    env:
+    env:                        # what the *program* needs — not the credential
       PATH: "/usr/bin:/bin"
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
   input: "input.goal"           # no `input:` in the block ⇒ string-in
   writes: { summary: summary }
   retry: { max: 1, backoff: 30s }
@@ -285,9 +284,23 @@ the harness never runs twice; a crash mid-run is an attempt failure and the
 node's `retry:` re-runs the whole thing. The trace carries the run's turns, its
 tool events and what it cost — `agent-compose docs trace`.
 
-**`model:` is the registry address and nothing else crosses.** The harness owns
-its client, its auth and its own retries, so a provider's connection does not
-reach inside a run and a **route** is refused at that position: bind a direct
-`model.*` and let the node's `retry:` be the ladder.
+**`model:` is the registry address, and its connection crosses with it.** The
+adapter reads three things off it: the provider-native id, the small settings
+subset the harness has a place for, and the **connection** behind the provider —
+its `base_url:`, its credential and its `headers:` — mapped into the harness's
+own connection surface. So pointing a project at a gateway stays the one-line
+edit in `providers.yml` that it is for an agent node, and a coder node's `env:`
+holds what the *program* needs rather than a hand-carried copy of the
+credential. Three rules come with it: a provider that declares no `api_key:`
+injects **no** credential at all rather than an empty one; a fact the bound
+harness has no slot for is refused rather than dropped
+(`agent-compose explain unsupported-connection-fact` — `codex` has nowhere to put
+a header); and writing a variable the map would set into the node's `env:` is
+refused too, because one fact gets one spelling
+(`agent-compose explain conflicting-connection-variable`).
+
+What still does **not** cross is a **route**: failover belongs to the caller that
+issues a request, and a harness issues its own. Bind a direct `model.*` and let
+the node's `retry:` be the ladder.
 
 Normative source: `docs/grammar.md` §5, §5.1–5.4, §8.1, §8.9

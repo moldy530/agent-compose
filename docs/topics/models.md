@@ -374,6 +374,16 @@ A repeated `route:` member is a fallback to the model that just failed — an
 inert entry, and an error. `route_on: []` declares a route that never fails
 over; write a direct model instead.
 
+**One position takes a direct model only: a `coder:` node's `model:`.** A coding
+harness issues its own requests and retries them itself, so a failover ladder
+there would be a policy with nothing to apply it to — and taking the first member
+quietly is the one answer this compiler will not give. Everything else about the
+binding reaches the run: the id, the small settings subset the harness has a
+place for, and the provider's **connection** — its `base_url:`, its credential
+and its `headers:` — mapped into that harness's own connection surface. So the
+gateway shape above is a one-line edit for a coder node exactly as it is for an
+agent; `agent-compose docs agents` has the three rules that come with it.
+
 ## Settings
 
 `settings:` is the one **open** object in the logical layer. Known keys are
