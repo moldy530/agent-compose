@@ -1,0 +1,55 @@
+# rule: the second-spelling rule reads on `codex` too — a node `env:` entry
+# rule: naming an auth variable that harness's own CLI reads beside the injected
+# rule: one is refused (grammar 8.9, D143, PRD resolved q58 rulings a and c)
+# code: conflicting-connection-variable
+# message: `OPENAI_API_KEY` is a second spelling of `api_key:` for `flow.main` node `review`: `harness: codex` reads it beside the `CODEX_API_KEY` this `env:` entry does not name, and `provider.gateway` already declares the fact
+# at: main.yml:49:11
+# label: main.yml:30:12 `api_key:` is declared here, and `harness: codex` carries it as `CODEX_API_KEY`
+# label: main.yml:43:16 the connection is bound here
+# help: one spelling per fact, and a fact has more than one: `OPENAI_API_KEY` is a name `harness: codex` reads for how a connection authenticates, so this entry decides it a second time beside the connection the node's `model:` already carries — the run would authenticate as somebody else, or leave for an endpoint nothing in this composition names, while the graph document and the journal's record of the run both still report `CODEX_API_KEY`. Drop the `env:` entry — it is for what the *program* needs — and a node that really has to decide how a connection authenticates for itself binds a `model.*` on another `provider.*` (grammar 8.9, 12.1, Decision D143, PRD resolved q58 rulings a and c)
+#
+# The same hole as the `cc` case beside this one, on the harness whose slots are
+# typed options — and it stayed open a round longer for exactly that reason. A
+# reader of `CodexOptions` sees two fields and concludes the surface is two
+# fields wide; what the SDK actually does is set `CODEX_API_KEY` from `apiKey`
+# on top of the environment it was handed and spawn a CLI with it. That CLI is
+# pinned by the SDK's own dependency — `"@openai/codex": "0.154.0"` — and its
+# own string table names three supported auth variables together,
+# `OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` beside the `CODEX_API_KEY` the slot
+# injects, with "auth is configured, but multiple auth env vars are present" for
+# the case this entry creates.
+#
+# So the run would authenticate as whoever this entry names while the graph
+# document and the journal's request identity both went on reporting the
+# gateway's key — two sources for one fact, and the composition never spells the
+# variable they share. `PATH` is what an `env:` is for and stays.
+version: "0.1"
+provider.gateway:
+  kind: openai
+  base_url: ${LLM_GATEWAY_URL}
+  api_key: ${GATEWAY_KEY}
+model.reviewer:
+  provider: provider.gateway
+  id: gpt-5-codex
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    review:
+      coder:
+        harness: codex
+        model: model.reviewer
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: Read the tree and report.
+        env:
+          PATH: /usr/bin:/bin
+          OPENAI_API_KEY: ${SOMEONE_ELSES_KEY}
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

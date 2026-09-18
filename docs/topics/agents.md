@@ -302,8 +302,9 @@ harness has no slot for is refused rather than dropped
 a header); and writing a variable the map would set into the node's `env:` is
 refused too, because one fact gets one spelling — as is a variable the bound
 harness reads for that same fact *beside* the mapped one, since
-`ANTHROPIC_AUTH_TOKEN` is a second identity on the same request and
-`CLAUDE_CODE_USE_BEDROCK` is a different endpoint
+`ANTHROPIC_AUTH_TOKEN` is a second identity on the same request,
+`CLAUDE_CODE_USE_BEDROCK` is a different endpoint, and `OPENAI_API_KEY` is one of
+the three auth variables the CLI behind `codex` accepts
 (`agent-compose explain conflicting-connection-variable`).
 
 What still does **not** cross is a **route**: failover belongs to the caller that

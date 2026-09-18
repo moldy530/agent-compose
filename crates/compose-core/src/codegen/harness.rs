@@ -483,6 +483,21 @@ mod tests {
              `codexPathOverride`, `config` or `env` would choose what program the run is and what \
              it may reach (grammar 8.9, Decisions D140, D143)"
         );
+        // …and through the one function `codexClient` itself calls, for the same
+        // reason the builder is read rather than the `new Codex(…)` expression:
+        // the environment that object carries is assembled there, and an
+        // indirection a guard stops at is an indirection the guard does not
+        // cover.
+        let environment = codex
+            .split_once("function codexEnvironment(")
+            .expect("the `codex` client's environment is assembled by `codexEnvironment`")
+            .1;
+        let environment = &environment[..environment.find("\n}\n").unwrap_or(environment.len())];
+        assert!(
+            !environment.contains("run.settings") && !environment.contains("passthrough"),
+            "`codexEnvironment` reads the node's `settings:`, so an unverified key would decide \
+             what the spawned CLI's environment holds (grammar 8.9, Decisions D140, D143)"
+        );
     }
 
     /// A `cc` run keeps the **harness's own** system prompt and appends the

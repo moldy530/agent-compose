@@ -72,20 +72,33 @@
 //! `X-Api-Key` the slot sets; `CLAUDE_CODE_USE_BEDROCK` and its
 //! `ANTHROPIC_BEDROCK_BASE_URL` companion select a different endpoint entirely.
 //!
+//! **`codex` is the same shape and it took a round to see it.** Its slots are
+//! typed options rather than variables, which reads like a narrower surface —
+//! but one of them *becomes* a variable on the way past (the SDK sets
+//! `CODEX_API_KEY` from `apiKey`), and the program that reads it is the CLI the
+//! SDK spawns. That CLI is not out of reach: the SDK's own `package.json` pins
+//! it (`"dependencies": { "@openai/codex": "0.154.0" }`), so it is exactly as
+//! pinned as the `.d.ts`, and it supports **three** auth variables rather than
+//! one. `cc`'s own siblings were read out of the runtime its SDK spawns, not out
+//! of `Options`, so reading `codex`'s narrowly off `CodexOptions` was one audit
+//! done two ways.
+//!
 //! So a row carries, beside each slot, the **sibling variables** that harness's
 //! own runtime reads for the same fact ([`ConnectionRow::siblings`]), and
 //! [`variables_read`] is what ruling c compares a node's `env:` against next to
-//! [`variables_set`]. Guarding only the three names the table writes would leave
-//! a node `env:` free to add a second identity and repoint the endpoint on a
-//! `cc` run with no diagnostic — silent shadowing under another spelling, which
-//! is the thing ruling c exists to refuse — and would leave the `connection`
+//! [`variables_set`]. Guarding only the names the table writes would leave a
+//! node `env:` free to add a second identity and repoint the endpoint on a `cc`
+//! run — or hand a `codex` run an `OPENAI_API_KEY` beside the composition's own
+//! key — with no diagnostic: silent shadowing under another spelling, which is
+//! the thing ruling c exists to refuse, and which would leave the `connection`
 //! field of the graph document and of the journal's request identity describing
 //! a run that went somewhere else.
 //!
 //! The siblings are read under the same discipline as the slots, from the same
-//! pinned release, and they are **per fact**: a provider that declares no
-//! `api_key:` claims no credential name at all, which is q25's keyless posture
-//! reading on the family rather than on the one variable.
+//! pinned release — including the release a pinned SDK pins in turn — and they
+//! are **per fact**: a provider that declares no `api_key:` claims no credential
+//! name at all, which is q25's keyless posture reading on the family rather than
+//! on the one variable.
 //!
 //! # Where each slot was read
 //!
@@ -253,13 +266,18 @@ pub struct ConnectionRow {
     /// bundled runtime sends *in addition to* the `ANTHROPIC_API_KEY` the slot
     /// sets, and `CLAUDE_CODE_USE_BEDROCK` with its `ANTHROPIC_BEDROCK_BASE_URL`
     /// companion is an endpoint chosen instead of the one `ANTHROPIC_BASE_URL`
-    /// names. Both are the node `env:` PRD resolved q58 ruling c refuses,
-    /// spelled the way the table did not happen to write it, so both belong to
-    /// the fact rather than beside it (see this module's own documentation).
+    /// names; `OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` are the other two auth
+    /// variables the CLI the Codex SDK spawns supports beside the
+    /// `CODEX_API_KEY` that SDK injects from `apiKey`. Each is the node `env:`
+    /// PRD resolved q58 ruling c refuses, spelled the way the table did not
+    /// happen to write it, so each belongs to the fact rather than beside it
+    /// (see this module's own documentation).
     ///
-    /// Each entry's fact must have a [`Slot::Variable`] on this row:
+    /// Each entry's fact must **reach the run's environment** on this row —
+    /// either as a [`Slot::Variable`] or as a [`Slot::Option`] the SDK
+    /// `injects` one from, which is how `codex` carries its credential:
     /// `a_rows_siblings_are_other_spellings_of_a_fact_it_carries` holds that,
-    /// because a sibling of a fact the harness maps as a typed option is a claim
+    /// because a sibling of a fact that fills no variable at all is a claim
     /// about an environment the composition does not fill.
     pub siblings: &'static [(ConnectionFact, &'static str)],
 }
@@ -341,16 +359,43 @@ pub struct ConnectionRow {
 /// forbids by name, so `headers:` on a provider a `codex` node's model resolves
 /// through is a `validate` error instead.
 ///
-/// It has **no siblings** either, and that narrowness is read from the same
-/// documented contract: this SDK's connection surface is two typed options, and
-/// the only name it puts in an environment is the `CODEX_API_KEY` the credential
-/// slot already records as its `injects` (the README: *"the SDK still injects
+/// It **does** have siblings, on one fact, and the audit that missed them the
+/// first time is worth stating because the mistake was structural rather than
+/// clerical. This SDK's connection surface is two typed options — but one of
+/// them becomes a variable on the way past (the README: *"the SDK still injects
 /// its required variables (such as `CODEX_API_KEY`) on top of the environment
-/// you provide"*, and *"if you set `baseUrl`, the SDK passes it as a
-/// `--config openai_base_url=…` override"*). What the CLI it spawns reads out of
-/// that environment on its own account is the CLI's surface, pinned as its own
-/// artifact and never audited here — so this row claims nothing about it rather
-/// than claiming it is empty.
+/// you provide"*, and the bundle: `if (args.apiKey) { env.CODEX_API_KEY =
+/// args.apiKey; }`), and the program that reads that variable is the CLI this
+/// SDK spawns. Calling the CLI "somebody else's artifact" was the error:
+/// `@openai/codex-sdk`'s own `package.json` pins it — `"dependencies": {
+/// "@openai/codex": "0.154.0" }` — so it is exactly as pinned as the `.d.ts`
+/// above it, and every sibling on the `cc` row was itself read out of the
+/// runtime *that* SDK spawns rather than out of `Options`.
+///
+/// Read against that pinned binary, `api_key:` has **three** names and not one.
+/// Its own string table carries `auth.json OPENAI_API_KEY CODEX_API_KEY
+/// CODEX_ACCESS_TOKEN` beside *"Run codex login or provide an API key through a
+/// supported auth env var."*, *"auth is provided by environment"* and *"auth is
+/// configured, but multiple auth env vars are present"* — all three are
+/// supported auth env vars, and the CLI itself calls the multi-source case an
+/// ambiguity. `CODEX_API_KEY` is the slot's own `injects`; `OPENAI_API_KEY` and
+/// `CODEX_ACCESS_TOKEN` are `api_key:` under another spelling, so the row claims
+/// them rather than leaving a node `env:` free to authenticate the run as
+/// somebody else while the graph document and the journal's request identity go
+/// on reporting the mapped key.
+///
+/// `base_url:` claims **nothing** beside its option, and that is what the same
+/// reading came back with rather than a gap left in it. The pinned binary's
+/// provider table holds `https://api.openai.com/v1` as the built-in endpoint
+/// beside `env_key`, `OPENAI_ORGANIZATION` and the `CODEX_OSS_BASE_URL` of the
+/// other built-in provider, and no `OPENAI_BASE_URL` with them: the only
+/// occurrence of that name in the whole binary sits in its network proxy's
+/// secret-redaction list. What the SDK writes from `baseUrl` is the
+/// `--config openai_base_url=…` override, which is a config key and not a
+/// variable — so there is no environment name a node `env:` could repoint that
+/// fact with, which is also why a fact whose slot fills no variable carries no
+/// sibling. `headers:` has no slot at all, so it has nothing to be a second
+/// spelling of.
 pub const CONNECTION: &[ConnectionRow] = &[
     ConnectionRow {
         harness: Harness::Cc,
@@ -478,9 +523,25 @@ pub const CONNECTION: &[ConnectionRow] = &[
             // No slot. See this constant's own documentation.
             (ConnectionFact::Headers, None),
         ],
-        // No siblings either, and for the same reason the header row is `None`:
-        // see this constant's own documentation.
-        siblings: &[],
+        siblings: &[
+            // The other two auth variables the CLI this SDK pins and spawns
+            // supports, beside the `CODEX_API_KEY` the credential slot injects.
+            // The binary's own string table names all three together —
+            // `auth.json OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN`,
+            // beside "Run codex login or provide an API key through a supported
+            // auth env var." and "auth is configured, but multiple auth env vars
+            // are present" — so a node `env:` writing either of these hands the
+            // run a second identity the composition never named, and the CLI
+            // itself treats the multi-source case as an ambiguity.
+            (ConnectionFact::Credential, "OPENAI_API_KEY"),
+            (ConnectionFact::Credential, "CODEX_ACCESS_TOKEN"),
+            // `base_url:` has none: the SDK writes it as a `--config
+            // openai_base_url=…` override rather than into the environment, and
+            // the pinned binary's provider table carries no endpoint variable
+            // beside its built-in `https://api.openai.com/v1`. `headers:` has no
+            // slot to be a second spelling of. See this constant's own
+            // documentation.
+        ],
     },
 ];
 
@@ -825,12 +886,16 @@ mod tests {
     ///
     /// Three things a sibling list gets wrong on its own, each silent:
     ///
-    ///  1. a sibling of a fact with **no variable slot**. `codex` maps
-    ///     `base_url:` onto a typed option and fills no environment with it, so
-    ///     a name claimed for that fact would refuse a node `env:` entry over a
-    ///     variable nothing in the run writes — the over-rejection direction
+    ///  1. a sibling of a fact that reaches **no variable at all**. `codex` maps
+    ///     `base_url:` onto a typed option the SDK turns into a `--config`
+    ///     override rather than into the environment, so a name claimed for that
+    ///     fact would refuse a node `env:` entry over a variable nothing in the
+    ///     run writes — the over-rejection direction
     ///     `a_connection_that_sets_no_variable_leaves_a_nodes_env_alone` guards
-    ///     one step earlier;
+    ///     one step earlier. The test is *reaches a variable*, not *is a
+    ///     [`Slot::Variable`]*: `codex`'s credential is an option the SDK
+    ///     injects `CODEX_API_KEY` from, and the names the spawned CLI reads
+    ///     beside it are siblings of it;
     ///  2. a sibling that **is** the slot, which would make one collision two;
     ///  3. one name claimed twice, which would do the same.
     #[test]
@@ -842,9 +907,10 @@ mod tests {
                     .and_then(Slot::variable)
                     .unwrap_or_else(|| {
                         panic!(
-                            "`{}` claims `{variable}` for `{}:`, which it does not carry as a \
-                             variable at all: a sibling of an option slot refuses a node `env:` \
-                             entry over a name no part of this run writes",
+                            "`{}` claims `{variable}` for `{}:`, which reaches no environment \
+                             variable at all on this row: a sibling of a fact nothing in the run \
+                             spells as a variable refuses a node `env:` entry over a name no part \
+                             of this run writes",
                             row.harness.as_str(),
                             fact.as_str()
                         )
@@ -920,12 +986,68 @@ mod tests {
                 .any(|(_, held)| *held == "CLAUDE_CODE_USE_BEDROCK")
         );
         assert!(variables_read(Harness::Cc, &[]).is_empty());
-        // …and the harness whose slots are typed options claims none, because
-        // its row is audited over an SDK surface that fills one variable and
-        // says so.
-        assert!(variables_read(Harness::Codex, ConnectionFact::ALL).is_empty());
+        // …and the harness whose slots are typed options is the *same* question
+        // asked one process further out, which is the half this test pinned
+        // backwards once: `codex`'s credential option becomes `CODEX_API_KEY` in
+        // the environment the SDK spawns its CLI with, and that CLI — pinned by
+        // the SDK's own dependency, not out of reach — supports two more auth
+        // variables beside it.
+        let codex = variables_read(Harness::Codex, &[ConnectionFact::Credential]);
+        for name in ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            assert!(
+                codex.iter().any(|(_, held)| *held == name),
+                "`{name}` is a supported auth variable of the CLI the `codex` SDK spawns and \
+                 nothing claims it for `api_key:`: a node `env:` may hand the run a second \
+                 identity while the graph document reports the mapped key"
+            );
+        }
+        // The facts that reach no environment claim nothing on that row — the
+        // endpoint is a `--config` override and the header slot does not exist —
+        // so a `codex` node's `env:` is left alone over both.
+        assert!(variables_read(Harness::Codex, &[ConnectionFact::BaseUrl]).is_empty());
+        assert!(variables_read(Harness::Codex, &[ConnectionFact::Headers]).is_empty());
+        assert!(variables_read(Harness::Codex, &[]).is_empty());
         for harness in [Harness::DeepAgents, Harness::Native] {
             assert!(variables_read(harness, ConnectionFact::ALL).is_empty());
+        }
+    }
+
+    /// …and the `codex` half of that audit written out by name (grammar 8.9,
+    /// Decision D143, PRD resolved q58 ruling c).
+    ///
+    /// `the_cc_row_claims_the_whole_endpoint_selection_family`'s argument, on the
+    /// other row. The pinned CLI's auth surface is a **set**, named together in
+    /// its own string table — `auth.json OPENAI_API_KEY CODEX_API_KEY
+    /// CODEX_ACCESS_TOKEN`, beside *"Run codex login or provide an API key
+    /// through a supported auth env var."* and *"auth is configured, but
+    /// multiple auth env vars are present"* — and a row that claimed some of it
+    /// would be a completeness claim with the hole ruling c exists to close.
+    /// Spelled out rather than counted, for that test's reason: a count is
+    /// satisfied by any three names, and what is asserted is these three.
+    ///
+    /// The whole set is asserted through [`variables_set`] **and**
+    /// [`variables_read`] together, because one member of it is the slot: the
+    /// SDK writes `CODEX_API_KEY` itself, so it is claimed as a mapped name
+    /// rather than as a sibling, and a reader checking only one list would find
+    /// a hole that is not there.
+    #[test]
+    fn the_codex_row_claims_the_whole_supported_auth_family() {
+        let claimed: Vec<&str> = variables_set(Harness::Codex, &[ConnectionFact::Credential])
+            .into_iter()
+            .chain(variables_read(
+                Harness::Codex,
+                &[ConnectionFact::Credential],
+            ))
+            .map(|(_, name)| name)
+            .collect();
+        for name in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            assert!(
+                claimed.contains(&name),
+                "`{name}` is one of the three auth environment variables the pinned Codex CLI \
+                 supports and the `codex` row does not claim it for `api_key:`, so a coder \
+                 node's `env:` may set it with no diagnostic and authenticate the run as \
+                 somebody the composition never named (grammar 8.9, Decision D143 rule 4)"
+            );
         }
     }
 
@@ -1000,65 +1122,83 @@ mod tests {
         }
     }
 
-    /// **The `cc` row and the `cc` driver's own variable table are one table**
-    /// (grammar 8.9, Decision D143, PRD resolved q58 rulings a and c).
+    /// **Each row and its driver's own variable table are one table** (grammar
+    /// 8.9, Decision D143, PRD resolved q58 rulings a and c).
     ///
-    /// The row above is what `validate` refuses a node `env:` against;
-    /// `CC_CONNECTION_VARIABLES` in `src/harness-cc.ts` is that same list
-    /// declared again for the runtime, where the driver **removes** those names
-    /// from the environment a run inherits before mapping the connection over
-    /// the top. The two halves answer one question from opposite ends — one at
-    /// compile time about what the composition wrote, one at run time about what
-    /// the host process happened to hold — and a name in one and not the other
-    /// is a hole with no diagnostic in it: `validate` stays clean, the graph
-    /// document and the journal's request identity go on reporting
-    /// `ANTHROPIC_BASE_URL`, and the run talks to whatever the inherited
-    /// selector chose.
+    /// A row above is what `validate` refuses a node `env:` against;
+    /// `CC_CONNECTION_VARIABLES` in `src/harness-cc.ts` and
+    /// `CODEX_CONNECTION_VARIABLES` in `src/harness-codex.ts` are those same
+    /// lists declared again for the runtime, where each driver **removes** those
+    /// names from the environment a run inherits before mapping the connection
+    /// over the top. The two halves answer one question from opposite ends — one
+    /// at compile time about what the composition wrote, one at run time about
+    /// what the host process happened to hold — and a name in one and not the
+    /// other is a hole with no diagnostic in it: `validate` stays clean, the
+    /// graph document and the journal's request identity go on reporting the
+    /// mapped name, and the run talks to whatever the inherited selector chose
+    /// or authenticates with whatever key the shell had.
     ///
-    /// So they are compared, name for name and in order, the way
+    /// Both harnesses are compared, name for name and in order, the way
     /// `the_curated_settings_table_is_one_table` compares the other pair of
-    /// hand-maintained copies this project keeps.
+    /// hand-maintained copies this project keeps. **Both**, because the `codex`
+    /// half of it was empty on both sides for a round: a row and a driver that
+    /// agree on nothing agree, and the check that would have caught it is the
+    /// audit against the pinned artifacts rather than this one.
     #[test]
-    fn the_cc_connection_variable_table_is_one_table() {
-        const DRIVER: &str = include_str!("codegen/js/harness-cc.ts");
+    fn the_connection_variable_tables_are_one_table() {
+        const CC: &str = include_str!("codegen/js/harness-cc.ts");
+        const CODEX: &str = include_str!("codegen/js/harness-codex.ts");
 
-        let object = DRIVER
-            .split_once("const CC_CONNECTION_VARIABLES")
-            .expect("`src/harness-cc.ts` declares `CC_CONNECTION_VARIABLES`")
-            .1;
-        let object = &object[..object.find("};").expect("…and closes the object it opened")];
-        for fact in ConnectionFact::ALL.iter().copied() {
-            // What the driver's own surface spells this fact — a `match`, so a
-            // fourth fact cannot arrive without an answer here.
-            let key = match fact {
-                ConnectionFact::BaseUrl => "baseUrl",
-                ConnectionFact::Credential => "credential",
-                ConnectionFact::Headers => "headers",
-            };
-            let array = object
-                .split_once(&format!("{key}: ["))
-                .unwrap_or_else(|| {
-                    panic!("`CC_CONNECTION_VARIABLES` in `src/harness-cc.ts` answers `{key}`")
-                })
+        for (harness, file, driver, constant) in [
+            (
+                Harness::Cc,
+                "src/harness-cc.ts",
+                CC,
+                "CC_CONNECTION_VARIABLES",
+            ),
+            (
+                Harness::Codex,
+                "src/harness-codex.ts",
+                CODEX,
+                "CODEX_CONNECTION_VARIABLES",
+            ),
+        ] {
+            let object = driver
+                .split_once(&format!("const {constant}"))
+                .unwrap_or_else(|| panic!("`{file}` declares `{constant}`"))
                 .1;
-            let array = &array[..array.find(']').expect("…and closes the array it opened")];
-            let emitted: Vec<&str> = array.split('"').skip(1).step_by(2).collect();
-            let owned: Vec<&str> = variables_set(Harness::Cc, &[fact])
-                .into_iter()
-                .chain(variables_read(Harness::Cc, &[fact]))
-                .map(|(_, name)| name)
-                .collect();
-            assert_eq!(
-                emitted,
-                owned,
-                "`CC_CONNECTION_VARIABLES.{key}` in `src/harness-cc.ts` and the `cc` row's \
-                 `{}:` slot and siblings here are two copies of one table and have parted \
-                 company. A name this row claims and the driver does not scrub is a name an \
-                 inherited environment decides the fact with; a name the driver scrubs and this \
-                 row does not claim is an `env:` entry `validate` accepts and the run then \
-                 silently drops",
-                fact.as_str()
-            );
+            let object = &object[..object.find("};").expect("…and closes the object it opened")];
+            for fact in ConnectionFact::ALL.iter().copied() {
+                // What the driver's own surface spells this fact — a `match`, so
+                // a fourth fact cannot arrive without an answer here.
+                let key = match fact {
+                    ConnectionFact::BaseUrl => "baseUrl",
+                    ConnectionFact::Credential => "credential",
+                    ConnectionFact::Headers => "headers",
+                };
+                let array = object
+                    .split_once(&format!("{key}: ["))
+                    .unwrap_or_else(|| panic!("`{constant}` in `{file}` answers `{key}`"))
+                    .1;
+                let array = &array[..array.find(']').expect("…and closes the array it opened")];
+                let emitted: Vec<&str> = array.split('"').skip(1).step_by(2).collect();
+                let owned: Vec<&str> = variables_set(harness, &[fact])
+                    .into_iter()
+                    .chain(variables_read(harness, &[fact]))
+                    .map(|(_, name)| name)
+                    .collect();
+                assert_eq!(
+                    emitted,
+                    owned,
+                    "`{constant}.{key}` in `{file}` and the `{}` row's `{}:` slot and siblings \
+                     here are two copies of one table and have parted company. A name this row \
+                     claims and the driver does not scrub is a name an inherited environment \
+                     decides the fact with; a name the driver scrubs and this row does not claim \
+                     is an `env:` entry `validate` accepts and the run then silently drops",
+                    harness.as_str(),
+                    fact.as_str()
+                );
+            }
         }
     }
 

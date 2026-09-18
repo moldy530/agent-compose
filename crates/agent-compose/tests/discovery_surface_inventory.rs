@@ -122,6 +122,15 @@
 //! shape a feature implemented ahead of its ratification leaves behind, which
 //! `CLAUDE.md` forbids outright ("never implement against an unresolved
 //! question").
+//!
+//! **(e) One statement, written out three times.** A rule an author can meet in
+//! the grammar, in a diagnostic's explanation and in a comment of the emitted
+//! code is three copies of one claim, and an amendment that corrects one leaves
+//! the other two contradicting the section they sit in — green, because a
+//! document's fenced specs are run and its prose is not. The copies of Decision
+//! D141's boundary are bound to each other here: after PRD resolved q58 what
+//! stops at a coder node's boundary is the failover ladder, not the connection,
+//! and no copy may go back to saying otherwise.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -1538,6 +1547,68 @@ fn every_prd_question_the_project_cites_is_one_the_prd_resolved() {
             "{file} cites `resolved q{question}`, which the PRD's §9 log does not record. \
              Resolve the question there — with the rationale in the section it belongs to — \
              before the area that cites it (`CLAUDE.md`, PRD §10). Recorded: {resolved:?}"
+        );
+    }
+}
+
+/// (e) The three copies of the **dropped `fallbackModel`** sentence agree about
+/// what stops at a coder node's boundary (`docs/grammar.md` §8.9, Decisions
+/// D141 and D143, PRD resolved q58).
+///
+/// One statement, written out three times because three audiences meet it in
+/// three places: §8.9's reserved-options paragraph, the
+/// `unknown-harness-setting` explanation an author reads after `settings: {
+/// fallbackModel: … }`, and the comment over `CC_RESERVED` in the emitted
+/// driver. Before resolved q58 all three said the same true thing — the
+/// connection stops at the boundary — and after it the true thing is narrower:
+/// the **failover ladder** stops, and the connection crosses. The amendment
+/// corrected one copy and left two claiming the opposite of the section they
+/// sit in, which nothing caught, because a `.md`'s fenced specs are run and its
+/// prose is not.
+///
+/// So the sentence is bound rather than the wording: each copy has to say what
+/// `fallbackModel` **is** — the failover ladder — where it says why the option
+/// is dropped, and no copy of it may go back to claiming the connection stops
+/// there. It is deliberately not an equality between the three texts: they are
+/// written for three readers and a byte-identical sentence would be the wrong
+/// bind. What must not differ is the claim.
+#[test]
+fn the_dropped_fallback_option_reads_as_the_ladder_in_every_copy() {
+    // The claim, in the one form every copy has to be able to make: what the
+    // option is. A copy that instead said the connection stops there is the
+    // pre-q58 statement, and the assertion below names it.
+    const LADDER: &str = "failover ladder";
+    // Where the sentence is written, and the word each copy spells the option
+    // with — prose in two of them, the SDK's own key in the third.
+    const COPIES: &[(&str, &str)] = &[
+        ("docs/grammar.md", "a fallback model"),
+        (
+            "crates/compose-core/src/docs/codes/unknown-harness-setting.md",
+            "a fallback model",
+        ),
+        (
+            "crates/compose-core/src/codegen/js/harness-cc.ts",
+            "`fallbackModel` is",
+        ),
+    ];
+
+    for (path, mention) in COPIES {
+        let text = fs::read_to_string(repository().join(path))
+            .unwrap_or_else(|error| panic!("{path} is readable: {error}"));
+        let at = text
+            .find(mention)
+            .unwrap_or_else(|| panic!("{path} states why a fallback model is dropped"));
+        // The sentence, not the document: a window wide enough to hold the
+        // clause and narrow enough that a `failover ladder` somewhere else on
+        // the page cannot satisfy it.
+        let sentence = &text[at..text.len().min(at + 240)];
+        assert!(
+            sentence.contains(LADDER),
+            "{path} says why a fallback model is dropped without saying it is the {LADDER}: \
+             since PRD resolved q58 the ladder is what stops at a coder node's boundary and the \
+             provider's connection crosses, so a copy that still puts the *connection* there \
+             contradicts §8.9 and Decision D143 in the section that states them. The clause \
+             reads: {sentence:?}"
         );
     }
 }

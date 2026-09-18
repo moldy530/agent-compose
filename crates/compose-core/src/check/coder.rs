@@ -906,6 +906,31 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
             "a provider with no `api_key:` claims no credential name — not the slot and not a \
              name read beside it: {sibling_free:#?}"
         );
+
+        // …and the same on `codex`, whose credential reaches the environment
+        // through the SDK's own injection rather than through a variable slot:
+        // a keyless gateway leaves the whole auth family free, and the declared
+        // one takes it back.
+        let codex_sibling_free = crate::check(&ir_of(&composition(
+            "provider.p:\n  kind: openai\n  base_url: ${GATEWAY_URL}\n",
+            "codex",
+            "OPENAI_API_KEY",
+        )));
+        assert!(
+            codex_sibling_free.is_empty(),
+            "a `codex` provider with no `api_key:` claims none of the CLI's three auth \
+             variables: {codex_sibling_free:#?}"
+        );
+        let codex_declared = crate::check(&ir_of(&composition(
+            "provider.p:\n  kind: openai\n  base_url: ${GATEWAY_URL}\n  api_key: ${GATEWAY_KEY}\n",
+            "codex",
+            "CODEX_ACCESS_TOKEN",
+        )));
+        assert_eq!(codex_declared.len(), 1, "{codex_declared:#?}");
+        assert_eq!(
+            codex_declared[0].code,
+            DiagnosticCode::ConflictingConnectionVariable
+        );
     }
 
     /// **A second spelling of a declared fact is the same refusal** (grammar

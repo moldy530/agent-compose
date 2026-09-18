@@ -21,9 +21,10 @@ rule at all.
 
 ## A fact has more than one spelling
 
-The rule is about the **fact**, not about the name the table happens to write.
-`cc`'s connection surface is the whole environment contract the Agent SDK's
-bundled runtime reads, and that runtime reads more than three names:
+The rule is about the **fact**, not about the name the table happens to write,
+and it reads that way on both harnesses. `cc`'s connection surface is the whole
+environment contract the Agent SDK's bundled runtime reads, and that runtime
+reads more than three names:
 
 * `ANTHROPIC_AUTH_TOKEN` is a credential it takes at construction beside
   `ANTHROPIC_API_KEY`, and it sends **both** — an `X-Api-Key` from the
@@ -42,15 +43,27 @@ Both are `api_key:` and `base_url:` under another spelling, so both are refused
 the same way and the message names the mapped variable the entry collides with —
 the name the author did not write is the one that explains the collision.
 
+`codex` is the same rule one process further out, and its surface is wider than
+`CodexOptions` looks. The SDK sets `CODEX_API_KEY` from its `apiKey` option on
+top of the environment it is handed and spawns a CLI with it, and that CLI —
+pinned by the SDK's own dependency — accepts **three** auth variables:
+`OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` beside the injected `CODEX_API_KEY`,
+with "auth is configured, but multiple auth env vars are present" for the case
+two of them are set. So an `env:` entry spelling either of the other two on a
+node whose provider declares `api_key:` is refused for the same reason
+`ANTHROPIC_AUTH_TOKEN` is: the run would authenticate as somebody the
+composition never named.
+
 The check is computed from what the provider **declares**, not from the table:
 
 * a provider with no `api_key:` injects **no credential variable** — not an empty
   one, and not a name read beside one — so a node bound to a keyless gateway is
   free to declare a credential variable of its own, whichever of that harness's
   spellings it picks, and this diagnostic does not fire;
-* a fact whose slot is a typed option rather than a variable is not a collision
-  either. `base_url:` under `codex` becomes a `--config` flag and touches no
-  environment, so a node may declare whatever it likes beside it.
+* a fact that reaches no environment variable at all is not a collision either.
+  `base_url:` under `codex` becomes a `--config` flag and touches no
+  environment — and the pinned CLI has no endpoint variable of its own beside it
+  — so a node may declare whatever it likes over that fact.
 
 ## A spec that triggers it
 

@@ -185,13 +185,100 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
 };
 
 /**
+ * Every variable the pinned Codex CLI reads for one connection fact — the name
+ * the SDK injects from the client option **and** every other name that decides
+ * the same thing (grammar 8.9, Decision D143, PRD resolved q58 rulings a and c).
+ *
+ * This is the compiler's own `codex` connection row, declared again for the
+ * runtime, exactly as [`CC_CONNECTION_VARIABLES`] is under the other harness —
+ * and held to it by `the_connection_variable_tables_are_one_table` in
+ * `src/harness.rs`, because two hand-maintained copies of one document drift in
+ * silence.
+ *
+ * It exists because this harness's surface does not stop at `CodexOptions`. The
+ * SDK sets `CODEX_API_KEY` from `apiKey` on top of the environment it is handed,
+ * and the program that reads it is the CLI the SDK spawns — pinned by the SDK's
+ * own dependency (`"@openai/codex": "0.154.0"`), so as audited as the `.d.ts`
+ * above it. That CLI supports **three** auth variables, not one: its own string
+ * table names `OPENAI_API_KEY`, `CODEX_API_KEY` and `CODEX_ACCESS_TOKEN`
+ * together beside "Run codex login or provide an API key through a supported
+ * auth env var." and "auth is configured, but multiple auth env vars are
+ * present". An inherited `OPENAI_API_KEY` would authenticate a gateway-bound run
+ * as whoever the host shell is while the graph document and the journal's
+ * request identity both went on reporting the mapped key.
+ *
+ * `baseUrl` claims nothing: the SDK turns it into a `--config
+ * openai_base_url=…` override rather than a variable, and the pinned binary's
+ * provider table carries no endpoint variable beside its built-in endpoint.
+ * `headers:` has no slot at all on this harness — `validate` refuses a provider
+ * declaring one for a `codex` node — so it has nothing to be a second spelling
+ * of.
+ */
+const CODEX_CONNECTION_VARIABLES: Readonly<
+  Record<keyof runtime.HarnessConnection, readonly string[]>
+> = {
+  baseUrl: [],
+  credential: ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"],
+  headers: [],
+};
+
+/**
+ * The environment one `codex` run is handed: the node's own, **minus every name
+ * the spawned CLI reads for a fact the connection declares** (PRD resolved q58
+ * rulings a and c, q54 ruling b).
+ *
+ * [`ccEnvironment`]'s subtraction, on this harness, and `inherit_env: true` is
+ * why it is not redundant here either. `validate` refuses a node `env:` entry
+ * spelling any name [`CODEX_CONNECTION_VARIABLES`] claims for a declared fact,
+ * so the *declared* half of the environment arrives clean. The **inherited**
+ * half never passed through `validate` at all: it is whatever shell started this
+ * process, and a machine that runs `codex` interactively is exactly the machine
+ * that has an `OPENAI_API_KEY` exported. The SDK writes only `CODEX_API_KEY` on
+ * top, so without this a gateway-bound run would carry the host's key into a
+ * CLI that treats two auth variables as an ambiguity — while `validate` stayed
+ * clean and the journal's `connection` went on reporting the mapped one.
+ *
+ * **An undeclared fact claims nothing**, which is q25's keyless posture read
+ * here rather than one surface along: a provider with no `api_key:` leaves the
+ * whole auth family alone, so a node that inherits a shell holding
+ * `OPENAI_API_KEY` keeps it — the connection says nothing about how this run
+ * authenticates.
+ *
+ * The walk asks about a fact's **names first** and about the connection second,
+ * which is the order Decision D143's honest narrowness reads in: a fact this row
+ * claims nothing for scrubs nothing whatever the connection says, and `headers:`
+ * on this harness is a fact `validate` refuses a composition over — so a driver
+ * that went and read it would be carrying a fact the table says it cannot
+ * (`a_driver_maps_exactly_the_connection_facts_its_row_names`). The
+ * declared-ness test is written over the value rather than over the field for
+ * the same reason, and it reads an empty map as declaring nothing exactly as the
+ * compiler's own `declared` does.
+ */
+function codexEnvironment(run: runtime.HarnessRun): Record<string, string> {
+  const held: Record<string, string> = { ...run.env };
+  for (const [fact, names] of Object.entries(CODEX_CONNECTION_VARIABLES) as [
+    keyof runtime.HarnessConnection,
+    readonly string[],
+  ][]) {
+    if (names.length === 0) continue;
+    const declared = run.connection[fact];
+    if (declared === undefined) continue;
+    if (typeof declared === "object" && Object.keys(declared).length === 0) continue;
+    for (const name of names) delete held[name];
+  }
+  return held;
+}
+
+/**
  * The `CodexOptions` this run's client is built from: the scrubbed environment,
  * and the model's connection (grammar 8.9, Decisions D139, D143).
  *
  * **The environment** is handed to the SDK rather than inherited by it: the
  * Codex SDK documents that a provided `env` replaces `process.env` for the CLI
  * it spawns, which is exactly the scrubbed child PRD resolved q54 ruling b asks
- * for.
+ * for — and it is [`codexEnvironment`] rather than a spread, because the
+ * inherited half of an `inherit_env: true` run can spell this harness's
+ * credential under a name the SDK does not overwrite.
  *
  * **The connection** is this harness's own surface, and it is the *client's*
  * rather than a thread's: `baseUrl`, which the SDK passes to the CLI as
@@ -210,16 +297,18 @@ const CODEX_DRIVER: runtime.HarnessDriver = {
  * object holds is the whole of where the run's traffic goes, and none of it is
  * visible from a run's answer or from the events the driver yields.
  *
- * It is built from a literal and from `run.connection` alone. Nothing here reads
- * `run.settings`, because [`passthrough`] feeds the **thread** and a key that
- * could reach this object would be choosing the client — `codexPathOverride` is
- * on it, and so is the `config` escape hatch — which is what
- * `what_program_a_harness_run_is_cannot_be_chosen_by_a_settings_key` holds.
+ * It is built from a literal, from `run.connection`, and from the environment
+ * [`codexEnvironment`] assembles out of `run.env` and that same connection.
+ * Nothing on either path reads `run.settings`, because [`passthrough`] feeds the
+ * **thread** and a key that could reach this object would be choosing the client
+ * — `codexPathOverride` is on it, and so is the `config` escape hatch — which is
+ * what `what_program_a_harness_run_is_cannot_be_chosen_by_a_settings_key` holds,
+ * on this function and on the one it calls.
  */
 export function codexClient(run: runtime.HarnessRun): CodexOptions {
   const connection = run.connection;
   return {
-    env: { ...run.env },
+    env: codexEnvironment(run),
     ...(connection.baseUrl === undefined ? {} : { baseUrl: connection.baseUrl }),
     ...(connection.credential === undefined ? {} : { apiKey: connection.credential }),
   };

@@ -1020,6 +1020,62 @@ const results = {};
   );
   const keylessClient = harness.codexClient(codexKeylessStub.runs[0]);
 
+  // …and the door `validate` cannot reach on **this** harness either. The SDK's
+  // slots are typed options, which reads like a surface no environment can
+  // shadow — but it sets `CODEX_API_KEY` from `apiKey` on top of the
+  // environment it is handed and spawns a CLI with it, and that CLI accepts
+  // three auth variables. A machine that runs `codex` interactively is exactly
+  // the machine with an `OPENAI_API_KEY` exported, and the SDK overwrites only
+  // the one name, so without the driver's own scrub a gateway-bound run would
+  // carry the host's key into a CLI that calls two auth variables an ambiguity.
+  process.env["OPENAI_API_KEY"] = "someone-elses-key";
+  process.env["CODEX_ACCESS_TOKEN"] = "someone-elses-token";
+  process.env["HOST_ONLY"] = "inherited-and-kept";
+  const codexInheritedStub = harness.scriptedDriver("codex", script({ summary: "x", touched: [] }));
+  await runtime.runCoder(
+    binding({
+      harness: "codex",
+      modelId: "gpt-5-codex",
+      modelSettings: {},
+      settings: {},
+      inheritEnv: true,
+      connection: {
+        provider: "provider.openai",
+        baseUrl: [{ env: "CODER_GATEWAY_URL", site: "provider.openai.base_url" }],
+        credential: [{ env: "CODER_GATEWAY_KEY", site: "provider.openai.api_key" }],
+      },
+    }),
+    { goal: "fix it" },
+    context(),
+    { codex: codexInheritedStub.driver },
+  );
+  const inheritedClient = harness.codexClient(codexInheritedStub.runs[0]);
+
+  // …and the same shell on a **keyless** gateway, the direction an over-eager
+  // scrub breaks: a provider with no `api_key:` claims no credential name at
+  // all, so the host's own auth variables are what this run has and they stay.
+  const codexKeylessInheritedStub = harness.scriptedDriver(
+    "codex",
+    script({ summary: "x", touched: [] }),
+  );
+  await runtime.runCoder(
+    binding({
+      harness: "codex",
+      modelId: "gpt-5-codex",
+      modelSettings: {},
+      settings: {},
+      inheritEnv: true,
+      connection: keylessConnection,
+    }),
+    { goal: "fix it" },
+    context(),
+    { codex: codexKeylessInheritedStub.driver },
+  );
+  const keylessInheritedClient = harness.codexClient(codexKeylessInheritedStub.runs[0]);
+  for (const name of ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN", "HOST_ONLY"]) {
+    delete process.env[name];
+  }
+
   results["codexConnection"] = {
     baseUrl: client.baseUrl ?? null,
     apiKey: client.apiKey ?? null,
@@ -1031,6 +1087,20 @@ const results = {};
     // …and the keyless gateway: an endpoint and no key on the client at all.
     keylessHasApiKey: Object.hasOwn(keylessClient, "apiKey"),
     keylessBaseUrl: keylessClient.baseUrl ?? null,
+    // `inherit_env: true`: the auth variables this harness's own CLI reads for a
+    // **declared** credential are gone from the inherited half, and a host
+    // variable that decides nothing about the connection is still there.
+    inheritedShadows: ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"].filter((name) =>
+      Object.hasOwn(inheritedClient.env ?? {}, name),
+    ),
+    inheritedApiKey: inheritedClient.apiKey ?? null,
+    inheritedHostOnly: (inheritedClient.env ?? {})["HOST_ONLY"] ?? null,
+    inheritedToken: (inheritedClient.env ?? {})["TOKEN"] ?? null,
+    // …and the keyless gateway under the same shell: an undeclared fact claims
+    // no name, so the host's auth variables survive.
+    keylessInheritedCredentials: ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"].filter((name) =>
+      Object.hasOwn(keylessInheritedClient.env ?? {}, name),
+    ),
   };
 }
 

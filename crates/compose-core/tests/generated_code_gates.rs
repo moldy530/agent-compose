@@ -6572,6 +6572,33 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         codex_connection["keylessBaseUrl"],
         json!("https://gateway.internal/v1")
     );
+    // …and the half `validate` cannot reach on this harness either. The SDK's
+    // slots are typed options, but one of them becomes `CODEX_API_KEY` in the
+    // environment it spawns its CLI with, and that CLI accepts `OPENAI_API_KEY`
+    // and `CODEX_ACCESS_TOKEN` beside it — so an inherited shell holding either
+    // would authenticate a gateway-bound run as somebody else while the journal
+    // reported the mapped key (PRD resolved q58 rulings a and c).
+    assert_eq!(
+        codex_connection["inheritedShadows"],
+        json!([]),
+        "an inherited auth variable the pinned Codex CLI reads survived into a run whose \
+         provider declares `api_key:`, so the run carries two identities and the SDK overwrites \
+         only the one it injects"
+    );
+    assert_eq!(codex_connection["inheritedApiKey"], json!("gw-key"));
+    assert_eq!(
+        codex_connection["inheritedHostOnly"],
+        json!("inherited-and-kept"),
+        "the scrub is narrowed to the connection's own names: `inherit_env: true` is an opt-in \
+         and a host variable that decides nothing about the connection is what it opted into"
+    );
+    assert_eq!(codex_connection["inheritedToken"], json!("shh"));
+    assert_eq!(
+        codex_connection["keylessInheritedCredentials"],
+        json!(["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"]),
+        "a provider with no `api_key:` claims no credential name at all — resolved q25's keyless \
+         posture — so an over-eager scrub would leave a keyless run with no way to authenticate"
+    );
 }
 
 /// Gate 23: the wire schema is the lowering's image of the schema the parse

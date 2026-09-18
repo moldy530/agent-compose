@@ -3219,10 +3219,14 @@ That table is the whole of what crosses, and four rules come with it
   and an endpoint or a credential that silently went missing costs a `401` on the
   first live call, discovered in production;
 * **one spelling per fact.** A node `env:` entry naming a variable the table
-  would set is a compile error (`conflicting-connection-variable`) naming both
-  sources. There is no precedence rule to learn and nothing is shadowed
-  silently; an author who wants one node on a different endpoint defines another
-  `provider.*`, which is what §12.1 means by providers being cheap.
+  would set — or one the bound harness's own runtime reads for that same fact
+  beside it, since `ANTHROPIC_AUTH_TOKEN` is a second identity on the same
+  request and `OPENAI_API_KEY` is one of the three auth variables the CLI behind
+  `codex` accepts — is a compile error (`conflicting-connection-variable`)
+  naming both sources. There is no precedence rule to learn and nothing is
+  shadowed silently; an author who wants one node on a different endpoint
+  defines another `provider.*`, which is what §12.1 means by providers being
+  cheap.
 
 Which is why a coder node's `env:` holds what the *program* needs — a `PATH`, a
 proxy variable, a token some tool it shells out to reads — and not the harness's
@@ -3292,10 +3296,13 @@ rather than naming them — extra command-line arguments, a settings file or
 object carrying permission rules, additional roots beside the working directory,
 sandbox configuration, MCP servers and agent definitions that put a tool or a
 whole loop within reach of a run whose `allow_tools:` never mentioned it, hooks
-and permission handlers that move the decision somewhere else, a fallback model
-where [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)
-stops the connection — and each of those is dropped too. So is the option that
-says **which executable the harness itself is**, or what its language runtime
+and permission handlers that move the decision somewhere else, a fallback model —
+which is the failover ladder
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)
+stops at the boundary, the connection itself having crossed since
+[D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)
+— and each of those is dropped too. So is the option that says **which
+executable the harness itself is**, or what its language runtime
 loads before it: a key there does not widen one bound, it replaces or re-arms the
 program that enforces all of them, so every statement above it would be made
 about something else. So is every option that
@@ -8865,24 +8872,33 @@ Four rules come with it:
    both sources.
 
 Rule 4 reads on the **fact**, not on the name in the table, because a harness's
-connection surface is wider than the slot. `cc`'s is the environment contract of
-the runtime the Agent SDK spawns, and that runtime takes `ANTHROPIC_AUTH_TOKEN`
+connection surface is wider than the slot — and on **both** harnesses, including
+the one whose slots are typed options. `cc`'s surface is the environment contract
+of the runtime the Agent SDK spawns, and that runtime takes `ANTHROPIC_AUTH_TOKEN`
 as a credential beside `ANTHROPIC_API_KEY` — sending both, so a gateway reading
 the bearer authenticates as whoever wrote the `env:` entry — and selects a
 different endpoint entirely through `CLAUDE_CODE_USE_BEDROCK` and the
-`ANTHROPIC_*_BASE_URL` companion beside it. Each of those is `api_key:` or
-`base_url:` spelled another way, so each belongs to the fact: guarding the three
-mapped names alone would let a node quietly add a second identity and repoint the
-run while the graph document `visualize` renders and the journal's request
-identity both went on reporting the mapped pair. The endpoint selectors are
-claimed as a **family** rather than one at a time, `CLAUDE_CODE_USE_GATEWAY`
-included even though this release's bundle shows no base-URL variable beside it:
-what a selector decides is which endpoint the run talks to, and a list that
-guarded all but one would be a completeness claim with the hole rule 4 exists to
-close. The wider list is part of the
-same curated row, read off the same pinned release, and it is **per fact** — a
-provider with no `api_key:` claims no credential name at all, which is rule 2
-reading on the family rather than on the one variable.
+`ANTHROPIC_*_BASE_URL` companion beside it. `codex`'s is the same one process
+further out: the SDK sets `CODEX_API_KEY` from `apiKey` on top of the environment
+it is handed and spawns a CLI with it, that CLI is pinned by the SDK's own
+dependency, and it supports **three** auth variables rather than one —
+`OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` beside the injected name, a
+multi-source case the CLI itself reports as an ambiguity. Each of those is
+`api_key:` or `base_url:` spelled another way, so each belongs to the fact:
+guarding the mapped names alone would let a node quietly add a second identity
+and repoint the run while the graph document `visualize` renders and the
+journal's request identity both went on reporting the mapped pair. Each family is
+claimed **whole** rather than one member at a time — `cc`'s endpoint selectors
+include `CLAUDE_CODE_USE_GATEWAY` even though this release's bundle shows no
+base-URL variable beside it, and `codex`'s auth family is all three names — since
+a list that guarded all but one would be a completeness claim with the hole rule
+4 exists to close. The wider list is part of the
+same curated row, read off the same pinned release — including the release a
+pinned SDK pins in turn — and it is **per fact**: a provider with no `api_key:`
+claims no credential name at all, which is rule 2 reading on the family rather
+than on the one variable, and a fact that reaches no environment variable at all
+claims none either (`codex` writes `base_url:` as a `--config` override, so a
+node `env:` is left alone over it).
 
 **Rationale**: the deployment §12.1's keyless rule exists for is a gateway that
 every agent node reaches through one `base_url:` edit, and a coder node on the
