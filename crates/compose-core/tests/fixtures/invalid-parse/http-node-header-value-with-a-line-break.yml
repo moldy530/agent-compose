@@ -1,0 +1,20 @@
+# rule: an `http:` block's `headers:` values are held to the same shape a provider's are — a value is written onto the request as it stands, so a carriage return or a newline in one forges a second field (grammar 8.3, 12.1, Decision D144)
+# code: invalid-value
+# message: `x-note` in `headers` must not contain control characters other than a tab, found "batch\r\nx-api-key: someone-elses-key"
+# at: 15:19
+# help: a header value is written onto the request as it stands — and, where a `coder:` node's `model:` carries it into a `cc` run, into the newline-delimited `ANTHROPIC_CUSTOM_HEADERS` — so a carriage return or a newline in it ends this field and begins another: the composition would declare one header and the run would send two, the second one spelled by the value. A space and a tab are the whitespace a field value does carry (RFC 9110 5.5); nothing else is
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    notify:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+        headers:
+          x-note: "batch\r\nx-api-key: someone-elses-key"
+      input:
+        title: "state.title"
+  edges:
+    - { from: start, to: notify }
+    - { from: notify, to: end }

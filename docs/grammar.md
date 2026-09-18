@@ -1212,7 +1212,7 @@ http:
 |---|---|---|---|
 | `method` | enum `GET POST PUT PATCH DELETE HEAD OPTIONS` | yes | explicit; effects are never defaulted |
 | `url` | string (interpolable) | yes | |
-| `headers` | map header-name (`[A-Za-z0-9_-]+`) → string (interpolable, **no control character**) | no | header names are case-insensitive. A value is written onto the request as it stands, so a newline in one would forge a second field rather than carry this one — the rule §12.1's `headers:` and §13.3's `prefix:` are held to, refused the same way (`invalid-value`) |
+| `headers` | map header-name (`[A-Za-z0-9_-]+`) → string (interpolable, **no control character but a tab**) | no | header names are case-insensitive. A value is written onto the request as it stands, so a carriage return or a newline in one would forge a second field rather than carry this one — §12.1's `headers:` is held to the same rule and refused the same way (`invalid-value`), which is [D144](#d144-a-headers-value-carries-no-control-character-but-a-tab-at-both-positions-that-take-one) |
 | `query` | map param-name (`[A-Za-z0-9_-]+`) → CEL over `input` | no | |
 | `body` | map identifier→CEL over `input` | no | JSON body; illegal for `GET`/`HEAD` |
 | `expect_status` | **non-empty** array of **distinct** integers in `100..=599` | no | default: any 2xx. Non-empty and distinct on the same rule `expect_exit` obeys — see *Accepted-outcome lists* below (D80, [D100](#d100-both-accepted-outcome-lists-are-non-empty-and-distinct)) |
@@ -4185,9 +4185,14 @@ that wants a token of its *own* takes it through `headers:`, whose values
 interpolate (§4.3 class 2), so `authorization: "Bearer ${PROXY_TOKEN}"` reaches
 the wire as a declared header rather than as a vendor credential.
 
-**A `headers:` value carries no control character**, which is §13.3's rule on
-`header:` and `prefix:` read one column along and refused the same way
-(`invalid-value`). A resolved value is written onto the request as it stands, and
+**A `headers:` value carries no control character but a tab**, which is §13.3's
+rule on `header:` and `prefix:` read one column along and refused the same way
+(`invalid-value`) — one character looser than `prefix:`, since a tab is content a
+field value carries and a fixed credential prefix has no use for one. §8.3's
+`headers:` is held to this identically;
+[D144](#d144-a-headers-value-carries-no-control-character-but-a-tab-at-both-positions-that-take-one)
+holds both the pair and the tab. A resolved value is written onto the request as
+it stands, and
 — since [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)
 — into `cc`'s newline-delimited `ANTHROPIC_CUSTOM_HEADERS` as one `Name: value`
 line, so a carriage return or a newline in one ends that field and begins
@@ -4633,7 +4638,11 @@ triggers:
   than name or introduce this one; inbound the same two values are the name a
   header is looked up by and the text expected ahead of the credential, and a
   name or a prefix no caller could have sent matches nothing. Anything else is
-  `invalid-value`.
+  `invalid-value`. `prefix:` is stricter than a `headers:` **value** by exactly
+  one character: a tab is content a header value carries (§12.1,
+  [D144](#d144-a-headers-value-carries-no-control-character-but-a-tab-at-both-positions-that-take-one)),
+  while a prefix is a fixed token written ahead of a credential — `Bearer `,
+  `sha256=` — where a tab is a typo rather than something a caller sent.
 - **A header name is matched case-insensitively.** The name is recorded with the
   author's capitalisation and *looked up* without it: header names are
   case-insensitive by definition, HTTP/2 lowercases every one on the wire, and
@@ -8946,6 +8955,52 @@ variables because the reference walk already reaches provider definitions
 resolved q58 rulings a–d. *PRD 5.9, resolved q15, q25, q30, q32, q41, q57, q58;
 §8.9, §12.1, §12.2.*
 
+### D144. A `headers:` value carries no control character but a tab, at both positions that take one
+
+A `headers:` **value** — the interpolable right-hand side, not the name — is
+refused (`invalid-value`) when it carries a control character other than `HTAB`.
+The rule holds at **both** positions the grammar gives a `headers:` map: a
+provider's (§12.1) and an `http:` block's (§8.3, in a `tool.*` binding and in an
+inline `http:` node alike).
+
+**Why the value is checked at all** is [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table):
+a provider's `headers:` now crosses into a `cc` harness run encoded as
+`ANTHROPIC_CUSTOM_HEADERS`, which that runtime splits on newlines and then on
+each line's first colon. A value carrying a line break therefore declares one
+header and sends two, the second spelled by whoever wrote the value — `x-api-key`
+as easily as anything else. PRD resolved q58 ruling b's own principle is that a
+fact deciding what a connection sends fails at `validate` rather than on the
+first live request (PRD G3).
+
+**Why both positions.** q58 names the provider half because that is the half that
+newly crosses a boundary, but the sentence was never about the crossing: an
+`http:` value goes to `fetch`, which refuses a line break at the call, so the
+composition that compiles cleanly still cannot run. One construct over is the
+same byte reaching the same wire, and leaving it to fail on the first request is
+G3's failure mode rather than a narrower scope. Both positions read their values
+through one function, so the alternative was not a narrower rule but a fork. Each
+position pins its own message in the invalid-parse corpus
+(`provider-header-value-with-a-line-break.yml`,
+`http-node-header-value-with-a-line-break.yml`).
+
+**Why a tab passes, and why nothing else does.** RFC 9110 §5.5's `field-content`
+is visible characters with `SP` and `HTAB` admitted between them, so a tab is
+content a header value really carries: the wire sends it, and the split
+`ANTHROPIC_CUSTOM_HEADERS` performs — newlines, then each line's first colon —
+never sees one. Refusing the rest rather than only `\r` and `\n` is that same
+line read whole, not a widening of it: `\r` alone is no more carriable than
+`\r\n`, and `\0` truncates the environment variable the `cc` crossing encodes
+into. The set is deliberately **narrower than §13.3's `prefix:`**, which refuses a
+tab too and should — a prefix is a fixed token written ahead of a credential
+(`Bearer `, `sha256=`), where a tab is a typo rather than content a caller sent.
+
+**The rule is on the text a composition writes.** A `${ENV}` resolves to text no
+build ever sees, and a gateway deployment is precisely where an operator sets
+those variables, so the `cc` driver's `forgesAHeaderField` asks the same question
+of the resolved value over the same character set and fails the run rather than
+sending it. **Status**: shipped. *PRD G3, resolved q58 ruling b; §8.3, §12.1,
+§13.3, [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table).*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -8997,6 +9052,16 @@ authority. The schema cannot see across files, so it does not check:
   sibling an `else: true` edge requires (§7.3, D107), which relates two items of
   one `edges:` array through a shared `from` value, and item-derivation of
   a store key (§11.4, D83), which is a path through bindings in other files;
+- the character rule on a `headers:` **value** — no control character but a tab,
+  at both positions that take one (§8.3, §12.1,
+  [D144](#d144-a-headers-value-carries-no-control-character-but-a-tab-at-both-positions-that-take-one)).
+  Unlike the sibling rule on an auth scheme's `prefix:` (§13.3), which the schema
+  does carry as a `pattern` because that surface takes no `${ENV}` at all, a
+  `headers:` value is class 2: the half that matters most in a gateway
+  deployment is what an operator's variable *resolves to*, which no schema and no
+  compile step sees, so the refusal is `validate`'s and the `cc` driver's and the
+  schema states the rule in its property descriptions, where an editor hover
+  reaches it;
 - rules that turn on what a CEL expression *reads* rather than on its shape: a
   `method: GET` trigger reading through `payload.body` (§13.3, D117). Both
   values sit in one trigger object, but deciding it needs the expression

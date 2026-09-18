@@ -330,16 +330,26 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
  * to, which is text no build ever saw and precisely the shape a gateway
  * deployment produces — an operator sets the variable, not the author.
  *
- * Every control character, not only the two that split a line: `\r` on its own
- * is a byte no header value carries either, and `\r\n` splits on the newline and
- * leaves the carriage return glued to the line before it. One shape, one rule —
- * the same answer the parser gives a written value and the same one a trigger's
- * `auth:` `prefix:` has always given.
+ * Every control character **but a tab**, not only the two that split a line:
+ * `\r` on its own is a byte no header value carries either, `\r\n` splits on the
+ * newline and leaves the carriage return glued to the line before it, and `\0`
+ * truncates the environment variable this encoding writes. A tab passes because
+ * RFC 9110 5.5's `field-content` admits `SP` and `HTAB` between visible
+ * characters, so a tab is content a header value really carries and no split
+ * this variable performs — on newlines, then on each line's first colon —
+ * notices one.
+ *
+ * The set is the parser's set, character for character (grammar Decision D144,
+ * `parse::binding::header_value_shape`), including the C1 range Rust's
+ * `char::is_control` covers: the two halves of one rule ask the same question of
+ * written text and of resolved text, and a value this refuses at run time is one
+ * `validate` would have refused had the composition written it out.
  */
 function forgesAHeaderField(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
-    if (code < 0x20 || code === 0x7f) return true;
+    if (code === 0x09) continue;
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) return true;
   }
   return false;
 }
