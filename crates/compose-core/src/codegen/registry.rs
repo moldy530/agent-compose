@@ -52,6 +52,16 @@
 //!   is the address npm itself looks a credential up under ([`npm_auth_key`]),
 //!   which is the form npm's own documentation shows
 //!   (`//somewhere-else.com/myorg/:_authToken=…`).
+//!
+//! **Verified by a gate rather than by a reading**, which is the difference
+//! between a spelling somebody checked once and one CI checks every run: gate 26
+//! of `crates/compose-core/tests/generated_code_gates.rs` hands what this module
+//! emits to the parsers the two installers read these files with — Bun's own
+//! TOML parser over `bunfig.toml`, and the `ini` package out of npm's own
+//! installation over `.npmrc`, with `npm config get` asked what registry the
+//! file leaves a project on — and holds each answer to the `package_registry:`
+//! the deploy file declared, credential key included. The goldens pin these
+//! bytes; that gate is what says the two installers can read them.
 
 use std::fmt::Write as _;
 

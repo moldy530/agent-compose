@@ -5402,11 +5402,23 @@ The rules (Decision
    directory where an authored file already holds one of those names is refused
    naming it. A target that declares no `package_registry:` gets **neither**
    file — no empty stubs, and no row for them in the emitted `README.md`'s
-   boundary table. Two files rather than one because resolved q18 keeps npm a
-   supported fallback, and a fallback configured differently from the default is
-   not one. This **configures** an installer rather than pinning one, so it does
-   not touch q18's refusal of a `packageManager` field, and no lockfile is
-   emitted here either.
+   boundary table. A target that **stops** declaring it keeps the pair the last
+   build wrote, because `build` removes nothing (PRD resolved q47), and they go
+   on pointing every install in that directory at a mirror the spec no longer
+   names — so `build --check` is where that is said out loud: one of this
+   compiler's own files at a claimed path *this* target does not emit is
+   reported **`stale`**, alongside `missing` and `differs`, exits `1` like any
+   other drift, and carries a help line naming the two ways out — delete the
+   file, or declare the key again in this target — because a rebuild does
+   neither. This key is the only one whose presence moves a path in and out of
+   the emission set, so it is the only one that reaches that state. The
+   generated-file header is the test: a `bunfig.toml` or an `.npmrc` an *author*
+   put at that name is not this compiler's file and is not reported. Two files
+   rather than one because resolved q18 keeps npm a supported fallback, and a
+   fallback configured differently from the default is not one. This
+   **configures** an installer rather than pinning one, so it does not touch
+   q18's refusal of a `packageManager` field, and no lockfile is emitted here
+   either.
 5. **A credential is a spelling, not a byte.** Each file carries the
    environment-variable *reference* in that installer's own documented form —
    `${NAME}` in `.npmrc`, `$NAME` in `bunfig.toml` — and the installer expands it
@@ -8569,9 +8581,13 @@ typed interface meets the ergonomic need with none of that.
 
 *What it costs, stated.* A module an older compiler release wrote and this one no
 longer emits is left where it is. It is not drift, because drift is a
-disagreement about a file the compiler claims. The alternative was a walk that
-deleted whatever carried the generated-file header, which is the read-of-its-own-
-output this decision removes.
+disagreement about a file the compiler claims, and a path this release has
+dropped from `EMITTED_PATHS` is outside that claim. A path the list still claims
+that *this target* does not emit is the other case and **is** reported — the
+`stale` verdict of §14.6 rule 4
+([D145](#d145-the-package-registry-is-a-deploy-layer-slot-and-build-writes-both-installers-configuration),
+PRD resolved q59). The alternative was a walk that deleted whatever carried the
+generated-file header, which is the read-of-its-own-output this decision removes.
 
 *Why the type checker holds the contract.* `tsc` is already a gate on every
 generated project, and codegen already knows the tool's `input:`/`output:` — so
@@ -9250,6 +9266,27 @@ a file `build --check` compares, a file a first build into somebody's directory
 refuses over — for a configuration nobody asked for. The emitted file set is the
 compiler's claim on a directory, and a claim is worth making only over a file
 with content.
+
+*Why dropping the key is a `--check` verdict rather than a removal.* `build`
+removes nothing — the emitted file list is a claim about what is **written**,
+never a directory to be swept ([D132](#d132-the-emitted-file-list-is-the-boundary-and-module-is-the-way-across-it),
+PRD resolved q47) — so a target that stops declaring `package_registry:` leaves
+the last build's `bunfig.toml` and `.npmrc` behind, where they go on telling
+every `bun install` and `npm install` in that directory to resolve through a
+mirror the spec no longer names. Deleting them would make `build` a verb that
+removes files; saying nothing would leave CI green over a tree that installs from
+an address its spec does not carry. So `build --check` grows a **third** verdict
+beside *missing* and *differs*: **`stale`**, over a claimed path
+(`EMITTED_PATHS`) that this target does not emit and that holds a file carrying
+the generated-file header. It exits `1` like any other drift, and its help line
+names the two ways out — delete the file, or declare the key again in this
+target — because a rebuild does neither. This key is why the state exists at all
+— it is the only one whose presence moves a path in and out of the emission set
+— and the header is what keeps the report the compiler's business: an author's
+own `.npmrc` at that name is a file this compiler never wrote, and is not
+reported. D132's *what it costs* is the neighbouring case and stands as written:
+a path the **release** no longer emits is outside the claim entirely, and nothing
+reports it. §14.6 rule 4 carries the rule.
 
 *Why the token is a reference and never a value.* §4.3's posture, and here it
 buys three things at once: no secret in the artifact, an artifact hash (PRD
