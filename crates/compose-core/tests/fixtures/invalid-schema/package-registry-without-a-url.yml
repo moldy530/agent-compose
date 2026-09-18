@@ -1,0 +1,6 @@
+# rule: a package_registry names the address its packages resolve from (grammar 14.6)
+# at: /package_registry
+# via: /$defs/packageRegistry/required
+version: "0.1"
+package_registry:
+  token: ${NPM_MIRROR_TOKEN}

@@ -810,6 +810,109 @@ fn the_published_schema_accepts_the_whole_trace_sink_surface() {
     }
 }
 
+/// Grammar 14.6's registry, in the direction the negative corpus cannot reach:
+/// the shapes the schema must **accept**.
+///
+/// Six fixtures under `invalid-schema/` pin the refusals — the missing `url:`,
+/// the closed key set on the block and on a scope entry, the `@` a scopes key is
+/// spelled with, the `${ENV}` a `token:` is, and the credential a `url:`
+/// authority may not carry. Each of those is a keyword whose *accepting*
+/// direction breaks silently: delete `additionalProperties: false` from
+/// `packageRegistry`, loosen `propertyNames` to drop the `@`, swap `token`'s
+/// `$ref` off `envRef`, or write the URL pattern one character tighter, and the
+/// published schema disagrees with `agent-compose validate` while this workspace
+/// stays green. Since the schema is what editors read, the only place that shows
+/// is a red squiggle on correct YAML in somebody's editor, or a blessing on YAML
+/// the compiler refuses — the asymmetry `docs/grammar.md` Appendix B forbids
+/// outright.
+///
+/// The example corpus reaches exactly one of these shapes —
+/// `examples/triage-fanout/deploy/staging.yml` carries a mirror with a token and
+/// one tokened scope — so the rest are here. Every instance is run through the
+/// parser too, for the reason
+/// [`the_published_schema_accepts_the_whole_trace_sink_surface`] does it: a
+/// shape the compiler accepts and the schema refuses is the pair disagreeing
+/// about the language.
+#[test]
+fn the_published_schema_accepts_the_whole_package_registry_surface() {
+    let validator = compile_schema();
+    let legal = vec![
+        // The minimal form: an address and nothing else. A read-through mirror
+        // on a private network wants no credential.
+        json!({ "url": "https://npm.internal.example/repository/npm-group/" }),
+        // `http` and a port, which is what a Verdaccio on the same host is
+        // reached at — a pattern written one character too tight refuses it.
+        json!({ "url": "http://localhost:4873/" }),
+        // The host root, with and without its trailing slash.
+        json!({ "url": "https://npm.internal.example" }),
+        json!({ "url": "https://npm.internal.example/" }),
+        // An `@` in the *path* is a scope's own directory on the mirror, and it
+        // is the shape the authority rule must not reach.
+        json!({ "url": "https://npm.internal.example/repository/@corp/" }),
+        // A credential, which is the whole point of the key on a mirror that
+        // wants one.
+        json!({
+            "url": "https://npm.internal.example/repository/npm-group/",
+            "token": "${NPM_MIRROR_TOKEN}",
+        }),
+        // A scope with a credential of its own, at an address the default
+        // registry's does not reach.
+        json!({
+            "url": "https://npm.internal.example/repository/npm-group/",
+            "token": "${NPM_MIRROR_TOKEN}",
+            "scopes": {
+                "@corp": {
+                    "url": "https://npm.internal.example/repository/corp/",
+                    "token": "${NPM_CORP_TOKEN}",
+                },
+            },
+        }),
+        // …and a scope that reads through without one.
+        json!({
+            "url": "https://npm.internal.example/repository/npm-group/",
+            "scopes": {
+                "@corp": { "url": "https://npm.internal.example/repository/corp/" },
+            },
+        }),
+        // Every shape a scope key takes: a bare letter, a digit, and the three
+        // punctuation marks npm admits after the first character.
+        json!({
+            "url": "https://npm.internal.example/repository/npm-group/",
+            "scopes": {
+                "@a": { "url": "https://npm.internal.example/repository/a/" },
+                "@corp": { "url": "https://npm.internal.example/repository/corp/" },
+                "@my-org": { "url": "https://npm.internal.example/repository/my-org/" },
+                "@acme.co": { "url": "https://npm.internal.example/repository/acme-co/" },
+                "@org_2": { "url": "https://npm.internal.example/repository/org-2/" },
+                "@2fa": { "url": "https://npm.internal.example/repository/2fa/" },
+            },
+        }),
+    ];
+
+    for registry in legal {
+        let instance = json!({ "version": "0.1", "package_registry": registry });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal package registry:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "deploy/staging.yml");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "the parser must accept what the published schema accepts:\n{source}\n{}",
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
 /// The two closed sets an inbound `hmac:` chooses between are one table each,
 /// written twice: once as the parser's keywords and once as an `enum` in the
 /// published schema (grammar 13.3, PRD resolved q32).

@@ -5288,7 +5288,7 @@ deploy files (PRD 5.10, resolved q59). The composition says nothing.
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
-| `url` | absolute `http`/`https` URL | yes | the registry every package resolves from |
+| `url` | absolute `http`/`https` URL | yes | the registry every package resolves from; no credential in its authority |
 | `token` | `${ENV}` reference | no | the credential the installer presents; a literal is a compile error (§4.3) |
 | `scopes` | map scope → `{ url, token }` | no | per-scope overrides, keyed by the scope **with its `@`** |
 
@@ -5309,7 +5309,17 @@ The rules (Decision
    written lowercase, with **no wildcard** — §14.5 rule 1's shape rule and
    §14.2 rule 3's diagnostic voice, because it is the same kind of thing: an
    address this deployment writes out rather than a pattern matched against
-   somebody else's. A class-3 string (§4.3).
+   somebody else's. A class-3 string (§4.3). It carries **no credential in its
+   authority** either: `https://user:pass@npm.example/` is a spelling both
+   installers accept — Bun's own `bunfig.toml` documentation shows it — and
+   following it here writes a literal secret into both emitted files, into the
+   emitted `README.md` and into the artifact hash over all three, which is
+   everything rule 5 and PRD resolved q40 exist to prevent. It also makes the
+   declared `token:` dead: npm sends the URL's own Basic credentials and never
+   the `_authToken` line, whose key could not match that address anyway. The
+   credential is rule 2's, and the refusal says so. §14.2's `public_url:` and
+   §14.5's sink accept userinfo, because neither is a documented
+   credential-carrying idiom and neither has a `token:` to point at.
 2. **`token:` is an `${ENV}` reference and never a literal** (§4.3 class 1), the
    posture every deploy-layer credential takes. A scope's `token:` is the same
    key under the same rule. A registry that is read through without a
@@ -5341,11 +5351,26 @@ The rules (Decision
    resolved q40) is stable across a token rotation, and nothing secret transits
    a mesh (resolved q41). An `.npmrc` credential is keyed by **address** rather
    than by scope (`//host/path/:_authToken=${NAME}`, which is what npm requires),
-   and the address is the registry URL's own directory — so a `url:` written
-   without a trailing `/` keys at the host root. Two entries that would write one
-   such line with two different variables are a compile error naming both: an ini
-   parser keeps the last, and the two emitted files would then authenticate
-   differently under the two installers.
+   and that address is the one **npm derives from its own request** rather than
+   the text of the `url:`: npm builds it through a WHATWG `URL`, so the host
+   folds to lowercase, the scheme's own default port drops away and dot segments
+   resolve, and the key is that URL's directory — which is why a `url:` written
+   without a trailing `/` keys at the host root. A key spelled any other way is
+   one npm never looks up, and the failure is silent in the worst direction: the
+   `npm install` goes out unauthenticated while the `bun install` from the same
+   artifact, which carries the token inside its registry object rather than keyed
+   by an address, succeeds. Two shapes are therefore a compile error naming both
+   entries:
+   * **one address, two variables** — an ini parser keeps the last, while Bun's
+     per-scope table keeps both;
+   * **an entry with no `token:` at or under a tokened entry's address** — npm
+     finds a credential by walking *up* the address of its request
+     (`//host/repo/corp/` falls back to `//host/repo/`), so it spends the other's
+     there, while Bun's registry object for that entry carries none and sends
+     nothing. This is the credential reaching a registry the author scoped it
+     away from, which is the worse of the two directions. The repair is the
+     `token:` the entry should spend, or an address that is not under the
+     other's.
 6. **Unknown keys are errors**, as everywhere outside a plugin-config object
    ([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
 
@@ -9159,6 +9184,34 @@ write one `_authToken` line twice and an ini parser keeps the last — while Bun
 per-scope table keeps both. One artifact would then authenticate differently
 under the two installers, which is the class of divergence this key exists to
 remove. The choice belongs to the author, so `validate` makes them make it.
+
+*Why that address is derived rather than copied, and why the rule reaches past
+exact equality.* npm never compares an `_authToken` key against the text of a
+`registry=` line: it derives the key it looks up from the **request URI**,
+through a WHATWG `URL`. So the emitted key is derived the same way — host
+lowercased, the scheme's own default port dropped, dot segments resolved — and
+`validate` compares the derived keys rather than the URLs. A key spelled any
+other way is one npm never finds, and that failure is silent in the worst
+direction: the `npm install` resolves unauthenticated (or takes a `401`) while
+the `bun install` from the same artifact succeeds, because Bun carries the token
+inside its registry object rather than keyed by an address at all. Reading npm's
+lookup honestly is also what widens the collision rule: npm walks *up* the
+address of its request, so an entry with no `token:` at or under a tokened one
+authenticates under npm and not under Bun — the credential leaking to a registry
+the author scoped it away from, which is a worse failure than the 401 the exact
+collision produces.
+
+*Why a `url:` may not carry userinfo.* `https://user:pass@host/` is a spelling
+both installers accept and the one Bun's own `bunfig.toml` documentation shows,
+so it is what an author reaches for — and here it would write a literal secret
+into both emitted files, into the emitted `README.md` and into the artifact hash
+over all three, which is every guarantee §4.3's posture and resolved q40's stable
+hash are for. It would also make the declared `token:` dead code: npm sends the
+URL's Basic credentials and never the bearer line, whose key could not match that
+address anyway. §14.2's `public_url:` and §14.5's sink accept the same spelling,
+and the difference is the point — neither is a documented credential-carrying
+idiom and neither has a `token:` to redirect the author to, so a refusal there
+would be this compiler inventing a rule about somebody else's deployment.
 
 *Where presence is checked.* Not at build (resolved q15), and — stated because
 it is the thing a reader would assume wrongly — not by the installer either:

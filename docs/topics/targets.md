@@ -229,7 +229,7 @@ lives here.
 
 | Key | Shape |
 |---|---|
-| `url` | required; an absolute `http`/`https` URL naming a host, no wildcard |
+| `url` | required; an absolute `http`/`https` URL naming a host, no wildcard, and no credential before an `@` — that is what `token` is for |
 | `token` | an `${ENV}` reference, never a literal; omit it for a mirror that reads through without one |
 | `scopes` | scope (written with its `@`) → `{ url, token? }`, for the scopes that resolve somewhere of their own |
 
@@ -241,7 +241,7 @@ build into a directory where your own `.npmrc` already sits is refused naming it
 A target that declares no `package_registry:` gets **neither** file: there are no
 empty stubs.
 
-Three things worth knowing:
+Four things worth knowing:
 
 - **A token is a name, not a secret.** Each file carries the environment
   variable's *reference* in that installer's own spelling — `${NPM_TOKEN}` in
@@ -255,10 +255,23 @@ Three things worth knowing:
   on every placement's, because every process installs — so `readEnvironment()`
   refuses at launch naming it, and a worker without it is refused at join.
 - **npm authenticates by address, not by scope.** The `.npmrc` credential line is
-  `//host/path/:_authToken=${VAR}`, keyed by the registry's own directory. Two
-  entries whose URLs share that directory would write one line twice, so
-  `validate` refuses them naming both — give each its own path on the mirror
-  (trailing `/` included), or give both the same variable.
+  `//host/path/:_authToken=${VAR}`, keyed by the registry's own directory. That
+  address is the one npm derives from its own request rather than the text you
+  wrote — the host folds to lowercase, a default port drops away, `..` resolves —
+  so `https://NPM.Example/repo/` and `https://npm.example/repo/` are one address,
+  and `validate` compares them as one. Two shapes are refused naming both
+  entries: two entries at one address with two different variables (an ini parser
+  would keep the last), and an entry with **no** `token` at or under a tokened
+  entry's address — npm finds a credential by walking *up* the request's address,
+  so it would spend the other's there while Bun sends nothing. Give each entry
+  its own path on the mirror (trailing `/` included), or give it the `token` it
+  should spend.
+- **A credential belongs in `token`, never in the URL.**
+  `https://user:pass@npm.example/` is a spelling installers accept and the one
+  Bun's own documentation shows, so `validate` refuses it here on purpose: it
+  would put a literal secret in `.npmrc`, in `bunfig.toml`, in the emitted
+  `README.md` and in the artifact hash over all three — and npm would then send
+  those Basic credentials and ignore your `token` entirely.
 
 ## `trace_sink` — where every trace goes
 

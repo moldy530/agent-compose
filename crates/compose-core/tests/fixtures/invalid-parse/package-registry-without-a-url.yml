@@ -1,0 +1,10 @@
+# rule: a `package_registry:` declares `url:` (grammar 14.6)
+# code: missing-key
+# message: missing required key `url` in `package_registry`
+# at: 10:3
+version: "0.1"
+
+# A registry with no address names nowhere for a package to resolve from, so the
+# section is a key that could only have been meant to have one.
+package_registry:
+  token: ${NPM_MIRROR_TOKEN}

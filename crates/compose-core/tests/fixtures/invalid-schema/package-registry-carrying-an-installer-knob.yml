@@ -1,0 +1,7 @@
+# rule: a package_registry takes url, token and scopes and no other key — it says where packages resolve from, and every other installer knob stays the installer's (grammar 14.6, D50)
+# at: /package_registry
+# via: /$defs/packageRegistry/additionalProperties
+version: "0.1"
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  always_auth: true

@@ -257,6 +257,18 @@ struct UrlSubject {
     /// Completes "names the scheme `x`, and … is reached over `http` or
     /// `https`".
     reached: &'static str,
+    /// Completes "carries a credential in its authority, and …", for a key that
+    /// has somewhere else for a credential to go.
+    ///
+    /// `None` where the surface has no such elsewhere, and the arm is then
+    /// unreachable for it: `https://user:pass@host/` is a legal ingress base and
+    /// a legal collector address, and refusing one there would be this compiler
+    /// inventing a rule about somebody else's deployment. A registry is the one
+    /// of the three where the idiom is *documented* — Bun's own `bunfig.toml`
+    /// page shows `registry = "https://username:password@registry.npmjs.org"` —
+    /// and the one where following it writes a literal secret into two emitted
+    /// files, the emitted `README.md`, and the artifact hash over all of them.
+    userinfo: Option<&'static str>,
     /// The help every refusal of this key carries.
     help: &'static str,
 }
@@ -268,6 +280,7 @@ const PUBLIC_URL: UrlSubject = UrlSubject {
     absolute: "an ingress base",
     cased: "a URL derived from it is written out as text",
     reached: "a hub",
+    userinfo: None,
     help: "the base is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://hub.example`; `http` stays legal, which is what makes localhost development work (grammar 14.2, PRD resolved q44)",
 };
 
@@ -278,6 +291,7 @@ const TRACE_SINK_URL: UrlSubject = UrlSubject {
     absolute: "a sink address",
     cased: "the address is written onto the request as text",
     reached: "a trace sink",
+    userinfo: None,
     help: "the sink is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://collector.internal.example/v1/traces`; `http` stays legal, which is what makes a collector on the same host work (grammar 14.5, PRD resolved q50)",
 };
 
@@ -303,7 +317,10 @@ const PACKAGE_REGISTRY_URL: UrlSubject = UrlSubject {
     absolute: "a registry address",
     cased: "the address is written into `bunfig.toml` and `.npmrc` as text",
     reached: "a registry",
-    help: "the registry is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work (grammar 14.6, PRD resolved q59)",
+    userinfo: Some(
+        "a registry credential is `token:`, the `${ENV}` reference each installer expands for itself",
+    ),
+    help: "the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them (grammar 14.6, PRD resolved q59)",
 };
 
 /// Read one absolute-URL key, refusing what its [`UrlSubject`] describes.
@@ -391,6 +408,16 @@ fn url_problem(url: &str, subject: &UrlSubject) -> Option<String> {
             .expect("a non-empty rest has a first character");
         return Some(format!(
             "names no host between `{scheme}://` and the `{delimiter}` that follows it"
+        ));
+    }
+    // Userinfo is part of the authority, so it is read here, off the same slice
+    // the host came from: an `@` in the *path* — `…/@corp/` — is a scope and not
+    // a credential.
+    if let Some(elsewhere) = subject.userinfo
+        && host.contains('@')
+    {
+        return Some(format!(
+            "carries a credential in its authority, and {elsewhere}"
         ));
     }
     None
@@ -595,22 +622,43 @@ pub(crate) fn package_registry(node: &Node, cx: &mut Cx) -> Option<PackageRegist
     Some(section)
 }
 
-/// Two entries whose `.npmrc` authentication line would be one line, carrying
-/// two different variables, are refused (grammar 14.6, PRD resolved q59).
+/// One `package_registry` entry, as the credential rules below read it.
+struct RegistryEntry<'a> {
+    /// What a refusal calls it: `package_registry`, or the scope's own key.
+    name: &'a str,
+    /// The `url:` it declares, which is what anchors a refusal that is about an
+    /// entry rather than about a token it does not have.
+    url: &'a Spanned<String>,
+    token: Option<&'a Spanned<crate::ast::common::EnvRef>>,
+    /// The `.npmrc` key this entry's address produces.
+    address: String,
+}
+
+/// The two emitted files must authenticate the same way, and both rules that
+/// can make them differ are refused here (grammar 14.6, PRD resolved q59).
 ///
 /// npm scopes a credential to an **address** rather than to a package scope
-/// (`//host/path/:_authToken=`), so two `package_registry` entries pointing at
-/// one address with two tokens produce one key written twice — and an ini
-/// parser keeps the last. Bun's `[install.scopes]` has no such collapse, so the
-/// two emitted files would then authenticate differently under the two
-/// installers: a `bun install` that works and an `npm install` that 401s, from
-/// one artifact. That is a choice the author has to make, so it is made here.
+/// (`//host/path/:_authToken=`), and it looks one up by walking **up** the
+/// address of the request it is making: `//host/repo/corp/` falls back to
+/// `//host/repo/`, then to `//host/`. Bun does neither — a `[install.scopes]`
+/// entry carries its own `token =` or none, and nothing is keyed by an address
+/// at all. So two shapes make one artifact answer differently under the two
+/// installers, which is the divergence this key exists to remove:
 ///
-/// Equal variables collide into the identical line and are left alone: writing
-/// one line twice says what writing it once said.
+/// 1. **One address, two variables.** Two entries whose `url:`s share a
+///    directory write one `_authToken` key twice and an ini parser keeps the
+///    last, while Bun's per-scope table keeps both.
+/// 2. **A credential reaching an entry that declared none.** An entry with no
+///    `token:` whose address sits at or under a tokened entry's picks that
+///    token up under npm's walk-up and sends nothing under Bun — the credential
+///    leaking to a registry the author scoped it away from, which is the worse
+///    direction of the two.
+///
+/// Both are choices the author has to make, so `validate` makes them make it.
+/// Equal variables at one address are left alone: writing one line twice says
+/// what writing it once said.
 fn one_credential_per_address(section: &PackageRegistrySection, cx: &mut Cx) {
-    let mut held: BTreeMap<String, (&str, &Spanned<crate::ast::common::EnvRef>)> = BTreeMap::new();
-    let entries = std::iter::once((
+    let entries: Vec<RegistryEntry<'_>> = std::iter::once((
         "package_registry",
         section.url.as_ref(),
         section.token.as_ref(),
@@ -621,34 +669,89 @@ fn one_credential_per_address(section: &PackageRegistrySection, cx: &mut Cx) {
             scope.url.as_ref(),
             scope.token.as_ref(),
         )
-    }));
-    for (name, url, token) in entries {
-        let (Some(url), Some(token)) = (url, token) else {
+    }))
+    .filter_map(|(name, url, token)| {
+        let url = url?;
+        Some(RegistryEntry {
+            name,
+            url,
+            token,
+            address: crate::codegen::registry::npm_auth_key(&url.value),
+        })
+    })
+    .collect();
+
+    // Rule 1: one key, two variables.
+    let mut held: BTreeMap<&str, &RegistryEntry<'_>> = BTreeMap::new();
+    for entry in &entries {
+        let Some(token) = entry.token else { continue };
+        let Some(first) = held.insert(entry.address.as_str(), entry) else {
             continue;
         };
-        let address = crate::codegen::registry::npm_auth_key(&url.value);
-        match held.get(&address) {
-            Some((first, held_token)) if held_token.value.name != token.value.name => cx.push(
-                Diagnostic::error(
-                    DiagnosticCode::InvalidValue,
-                    token.span.clone(),
-                    format!(
-                        "`{name}` and `{first}` authenticate to `{address}` with two different variables"
-                    ),
-                )
-                .with_label(
-                    held_token.span.clone(),
-                    format!("`{first}` spends `{}` there", held_token.value.name),
-                )
-                .with_help(
-                    "an `.npmrc` credential is keyed by address rather than by scope — the registry's own directory, so a `url:` written without a trailing `/` keys at the host root — and two entries sharing one key write one `_authToken` line that an installer resolves last-one-wins: give each its own path on the mirror (trailing `/` included), or give both the same variable (grammar 14.6, PRD resolved q59)",
-                ),
-            ),
-            Some(_) => {}
-            None => {
-                held.insert(address, (name, token));
-            }
+        // `insert` returned the entry already holding this address, so put it
+        // back: the first writer is the one a refusal points at, however many
+        // entries pile onto one key.
+        held.insert(entry.address.as_str(), first);
+        let held_token = first
+            .token
+            .expect("only entries carrying a token are held here");
+        if held_token.value.name == token.value.name {
+            continue;
         }
+        let (name, first, address) = (entry.name, first.name, &entry.address);
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                token.span.clone(),
+                format!(
+                    "`{name}` and `{first}` authenticate to `{address}` with two different variables"
+                ),
+            )
+            .with_label(
+                held_token.span.clone(),
+                format!("`{first}` spends `{}` there", held_token.value.name),
+            )
+            .with_help(
+                "an `.npmrc` credential is keyed by address rather than by scope — the registry's own directory, so a `url:` written without a trailing `/` keys at the host root — and two entries sharing one key write one `_authToken` line that an installer resolves last-one-wins: give each its own path on the mirror (trailing `/` included), or give both the same variable (grammar 14.6, PRD resolved q59)",
+            ),
+        );
+    }
+
+    // Rule 2: a credential reaching an entry that declared none. The address npm
+    // would find is the **longest** tokened one the request's own address sits
+    // under, which is the one a refusal has to name.
+    for entry in &entries {
+        if entry.token.is_some() {
+            continue;
+        }
+        let Some(source) = entries
+            .iter()
+            .filter(|other| other.token.is_some() && entry.address.starts_with(&other.address))
+            .max_by_key(|other| other.address.len())
+        else {
+            continue;
+        };
+        let token = source.token.expect("a source entry carries a token");
+        let (name, lender, address) = (entry.name, source.name, &entry.address);
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                entry.url.span.clone(),
+                format!(
+                    "`{name}` declares no `token:`, and npm would spend `{lender}`'s at `{address}` anyway"
+                ),
+            )
+            .with_label(
+                token.span.clone(),
+                format!(
+                    "`{lender}` spends `{}` at `{}`",
+                    token.value.name, source.address
+                ),
+            )
+            .with_help(
+                "npm finds a credential by walking **up** the address of the request — `//host/repo/corp/` falls back to `//host/repo/` — while Bun's registry object carries its own `token =` or none, so an entry under a tokened address that declares none authenticates under one installer and not the other: give this entry the `token:` it should spend, or move it to an address that is not under the other's (grammar 14.6, PRD resolved q59)",
+            ),
+        );
     }
 }
 
@@ -1152,6 +1255,47 @@ mod tests {
         }
     }
 
+    /// The one arm that is not shared: a credential in the authority, refused
+    /// where the key has somewhere else to put one and accepted where it has
+    /// not.
+    ///
+    /// Both directions are asserted from the same URL, because this is the arm
+    /// whose two halves are each a real decision. On `package_registry.url` the
+    /// refusal keeps a literal secret out of `.npmrc`, `bunfig.toml`, the
+    /// emitted `README.md` and the artifact hash over all three — and keeps the
+    /// declared `token:` from becoming dead code, since npm sends the URL's own
+    /// Basic credentials and never the bearer line. On the other two it would
+    /// be this compiler inventing a rule about somebody else's ingress.
+    #[test]
+    fn a_credential_in_the_authority_is_refused_only_where_a_token_key_exists() {
+        const URL: &str = "https://deploy-user:hunter2@npm.internal.example/repository/npm-group/";
+        assert_eq!(
+            url_problem(URL, &PACKAGE_REGISTRY_URL).as_deref(),
+            Some(
+                "carries a credential in its authority, and a registry credential is `token:`, the `${ENV}` reference each installer expands for itself"
+            )
+        );
+        for (key, subject) in [
+            ("hub.public_url", &PUBLIC_URL),
+            ("trace_sink.url", &TRACE_SINK_URL),
+        ] {
+            assert_eq!(
+                url_problem(URL, subject),
+                None,
+                "`{key}` has no `token:` to point at, so userinfo is the author's business"
+            );
+        }
+        // An `@` in the *path* is a package scope, and every registry URL an
+        // author writes for one carries it.
+        assert_eq!(
+            url_problem(
+                "https://npm.internal.example/repository/@corp/",
+                &PACKAGE_REGISTRY_URL
+            ),
+            None
+        );
+    }
+
     /// …and the URLs an author writes are accepted, under either key.
     ///
     /// The other direction, which no negative corpus can catch: a rule written
@@ -1202,6 +1346,16 @@ mod tests {
                          names the other's construct"
                     );
                 }
+                // The optional clause: two subjects that both declare one are
+                // held to the same rule, and `None` is not a shared clause —
+                // it is an arm neither of them reaches.
+                if let (Some(left), Some(right)) = (subject.userinfo, other.userinfo) {
+                    assert_ne!(
+                        left, right,
+                        "`{key}` and `{other_key}` share the `userinfo` clause, so one of them \
+                         names the other's construct"
+                    );
+                }
             }
         }
     }
@@ -1249,6 +1403,114 @@ mod tests {
                 scope_problem(key),
                 None,
                 "`{key}` is a scope somebody publishes under and this pass refuses it"
+            );
+        }
+    }
+
+    /// One `package_registry:` with a mirror, a credential and one scope.
+    fn mirror(scope: &str) -> String {
+        format!(
+            "version: \"0.1\"\n\
+             package_registry:\n  \
+               url: \"https://npm.internal.example/repo/\"\n  \
+               token: ${{NPM_MIRROR_TOKEN}}\n  \
+               scopes:\n    \
+                 \"@corp\":\n{scope}"
+        )
+    }
+
+    /// An entry with no `token:` of its own, at an address npm's walk-up reaches
+    /// the tokened one from.
+    ///
+    /// This is the direction that **leaks** rather than the one that 401s: npm
+    /// looks a credential up by walking up the address of its request, finds the
+    /// parent's key and spends the credential at a registry the author scoped it
+    /// away from, while Bun's entry for that scope carries nothing and sends
+    /// nothing. Both shapes the walk-up reaches are here — the same address, and
+    /// a subpath of it — and so is the label, because the message names the
+    /// entry's *own* address and only the label says where the credential it
+    /// would pick up actually sits.
+    #[test]
+    fn an_entry_under_a_tokened_address_may_not_declare_no_credential() {
+        for (shape, url, address) in [
+            (
+                "the same address",
+                "https://npm.internal.example/repo/",
+                "//npm.internal.example/repo/",
+            ),
+            (
+                "a subpath of it",
+                "https://npm.internal.example/repo/corp/",
+                "//npm.internal.example/repo/corp/",
+            ),
+        ] {
+            let diagnostics = diagnose(&mirror(&format!("      url: \"{url}\"\n")));
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>(),
+                [format!(
+                    "`@corp` declares no `token:`, and npm would spend `package_registry`'s at `{address}` anyway"
+                )],
+                "{shape}"
+            );
+            assert_eq!(
+                diagnostics[0]
+                    .labels
+                    .iter()
+                    .map(|label| label.message.as_str())
+                    .collect::<Vec<_>>(),
+                ["`package_registry` spends `NPM_MIRROR_TOKEN` at `//npm.internal.example/repo/`"],
+                "{shape}"
+            );
+        }
+    }
+
+    /// …and the arrangements an operator actually writes stay legal.
+    ///
+    /// The other direction of both credential rules, which no negative corpus
+    /// reaches: a rule written one relation too wide makes the ordinary
+    /// corporate shape — a group mirror and a scope repository beside it —
+    /// unwritable, and nothing else would notice.
+    #[test]
+    fn a_registry_layout_an_operator_writes_is_accepted() {
+        for (shape, deploy) in [
+            (
+                "a scope beside the default registry rather than under it",
+                mirror(
+                    "      url: \"https://npm.internal.example/corp/\"\n      token: ${NPM_CORP_TOKEN}\n",
+                ),
+            ),
+            (
+                "one variable at one address, written twice",
+                mirror(
+                    "      url: \"https://npm.internal.example/repo/\"\n      token: ${NPM_MIRROR_TOKEN}\n",
+                ),
+            ),
+            (
+                "a scope under the default registry with a credential of its own",
+                mirror(
+                    "      url: \"https://npm.internal.example/repo/corp/\"\n      token: ${NPM_CORP_TOKEN}\n",
+                ),
+            ),
+            (
+                "a mirror nobody authenticates to",
+                "version: \"0.1\"\npackage_registry:\n  url: \"https://npm.internal.example/repo/\"\n  scopes:\n    \"@corp\":\n      url: \"https://npm.internal.example/repo/corp/\"\n".to_string(),
+            ),
+            (
+                "a credential below the address the default registry reads from",
+                "version: \"0.1\"\npackage_registry:\n  url: \"https://npm.internal.example/\"\n  scopes:\n    \"@corp\":\n      url: \"https://npm.internal.example/corp/\"\n      token: ${NPM_CORP_TOKEN}\n".to_string(),
+            ),
+        ] {
+            let diagnostics = diagnose(&deploy);
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>(),
+                Vec::<String>::new(),
+                "{shape} is a layout somebody deploys and this pass refuses it"
             );
         }
     }

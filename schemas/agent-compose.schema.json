@@ -2871,10 +2871,10 @@
       "type": "object",
       "properties": {
         "url": {
-          "description": "The registry every package resolves from: an absolute http or https URL naming a host, its scheme spelled lowercase. This deployment's own mirror rather than a pattern, so it carries no wildcard.",
+          "description": "The registry every package resolves from: an absolute http or https URL naming a host, its scheme spelled lowercase. This deployment's own mirror rather than a pattern, so it carries no wildcard - and no credential before an @ in its authority, because that is a literal secret in two emitted files and in the artifact hash over them; the credential is token:.",
           "allOf": [
             { "$ref": "#/$defs/noEnvRefString" },
-            { "pattern": "^https?://[^\\s/?#*]+([/?#][^\\s*]*)?$" }
+            { "pattern": "^https?://[^\\s/?#*@]+([/?#][^\\s*]*)?$" }
           ]
         },
         "token": {
@@ -2896,10 +2896,10 @@
       "type": "object",
       "properties": {
         "url": {
-          "description": "The registry packages in this scope resolve from: an absolute http or https URL naming a host, its scheme spelled lowercase, no wildcard.",
+          "description": "The registry packages in this scope resolve from: an absolute http or https URL naming a host, its scheme spelled lowercase, no wildcard and no credential before an @ in its authority - this scope's credential is its own token:.",
           "allOf": [
             { "$ref": "#/$defs/noEnvRefString" },
-            { "pattern": "^https?://[^\\s/?#*]+([/?#][^\\s*]*)?$" }
+            { "pattern": "^https?://[^\\s/?#*@]+([/?#][^\\s*]*)?$" }
           ]
         },
         "token": {

@@ -1,0 +1,14 @@
+# rule: a `package_registry.scopes` entry takes `url` and `token`, and no other key (grammar 14.6, D50)
+# code: unknown-key
+# message: unknown key `always_auth` in scope `@corp`
+# at: 14:7
+version: "0.1"
+
+# A scope's entry is the block's own two keys at one level down, under the same
+# rules — including this one.
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  scopes:
+    "@corp":
+      url: "https://npm.internal.example/repository/corp/"
+      always_auth: true

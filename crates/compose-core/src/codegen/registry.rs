@@ -166,18 +166,90 @@ fn token(reference: Option<&crate::diag::Spanned<crate::ast::common::EnvRef>>) -
 /// exists: two entries whose key is this one, carrying two different variables,
 /// would write one line twice and let an ini parser pick — so the parser refuses
 /// them, and it has to ask about the *emitted* key rather than about the URL.
+///
+/// # Why this normalizes rather than copies
+///
+/// npm does not compare this key against the text of a `registry=` line. It
+/// derives the key it looks up from the **request URI**, through a WHATWG
+/// `URL` — so the key it searches for is already canonical, and a key written
+/// any other way is one it never finds. A `_authToken` line npm cannot match is
+/// worse than no line at all: the install goes out unauthenticated while the
+/// `bunfig.toml` beside it authenticates, which is the one artifact / two
+/// answers divergence grammar 14.6 rule 5 exists to prevent. So the three things
+/// that constructor does to an address are done here:
+///
+/// * the host is **lowercased** (`//NPM.Example/` never matches);
+/// * the scheme's own **default port** is dropped, so `https://npm.example:443/`
+///   and `https://npm.example/` are one address;
+/// * `.` and `..` segments are **resolved**, because `new URL` resolves them
+///   before npm ever sees a path.
+///
+/// The path's own case is left alone: a WHATWG `URL` lowercases the host and
+/// nothing else, and so does a registry that serves `/Repo/`.
 #[must_use]
 pub fn npm_auth_key(url: &str) -> String {
-    // The scheme is not part of the key (npm's own spelling starts at `//`), and
-    // a query or fragment is not part of an address npm would authenticate to.
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    // The scheme is not part of the key (npm's own spelling starts at `//`) but
+    // it decides which port is the default one, and a query or fragment is not
+    // part of an address npm would authenticate to.
+    let (scheme, rest) = url
+        .split_once("://")
+        .map_or(("", url), |(scheme, rest)| (scheme, rest));
     let rest = rest.split(['?', '#']).next().unwrap_or(rest);
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    // The directory: everything up to and including the last `/`, which for a
-    // path with no `/` of its own — `repo` — is the host root, and for `repo/`
-    // is `repo/` itself.
-    let directory = path.rfind('/').map_or("", |end| &path[..=end]);
-    format!("//{authority}/{directory}")
+    format!(
+        "//{}/{}",
+        canonical_authority(scheme, authority),
+        canonical_directory(path)
+    )
+}
+
+/// The authority half of an `.npmrc` key, spelled the way a WHATWG `URL` spells
+/// it: ASCII lowercase, with the scheme's own default port dropped.
+fn canonical_authority(scheme: &str, authority: &str) -> String {
+    let lowered = authority.to_ascii_lowercase();
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => ":80",
+        "https" => ":443",
+        _ => return lowered,
+    };
+    match lowered.strip_suffix(default_port) {
+        Some(host) => host.to_string(),
+        None => lowered,
+    }
+}
+
+/// The directory half of an `.npmrc` key: the path with its dot segments
+/// resolved, up to and including the last `/`.
+///
+/// npm appends the package name to the registry URL and keys the credential by
+/// the *directory* of the request it then makes, so the final segment of a path
+/// written without a trailing `/` is where that package name goes rather than a
+/// directory above it — `https://npm.example/repo` keys at the host root, the
+/// same address `https://npm.example/` keys at. Standing the package name in for
+/// that segment is also what makes a trailing `..` resolve the way `new URL`
+/// resolves it on the request.
+fn canonical_directory(path: &str) -> String {
+    let segments: Vec<&str> = path.split('/').collect();
+    let last = segments.len() - 1;
+    let mut directory: Vec<&str> = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        match *segment {
+            "" | "." => {}
+            ".." => {
+                directory.pop();
+            }
+            // The package name's own slot: whatever is written here is replaced
+            // by the package npm is fetching, so it is never part of the key.
+            _ if index == last => {}
+            other => directory.push(other),
+        }
+    }
+    let mut canonical = String::new();
+    for segment in directory {
+        canonical.push_str(segment);
+        canonical.push('/');
+    }
+    canonical
 }
 
 /// One TOML basic string.
@@ -355,6 +427,50 @@ package_registry:
             ("https://npm.example", "//npm.example/"),
             ("https://npm.example:8443/a/b/", "//npm.example:8443/a/b/"),
             ("http://localhost:4873/", "//localhost:4873/"),
+            // A host an operator wrote in the case their runbook uses. npm
+            // derives its key through a WHATWG `URL`, which lowercases a host,
+            // so a key copied verbatim from here is one npm never looks up —
+            // the install would go out unauthenticated while `bunfig.toml`,
+            // which keys nothing by address, authenticates.
+            (
+                "https://NPM.Internal.Example/repository/npm-group/",
+                "//npm.internal.example/repository/npm-group/",
+            ),
+        ] {
+            assert_eq!(npm_auth_key(url), key, "the key derived for `{url}`");
+        }
+    }
+
+    /// The key is the address a WHATWG `URL` produces, because that is the one
+    /// npm looks up — not the text of the `url:` the author wrote.
+    ///
+    /// Each row is a spelling that reaches the *same* registry and would, copied
+    /// verbatim, write a `_authToken` line npm cannot match. The failure is
+    /// silent in the worst direction: `npm install` 401s (or resolves
+    /// anonymously) while `bun install` from the same artifact succeeds, since
+    /// Bun carries the token inside its registry object rather than keyed by an
+    /// address at all.
+    #[test]
+    fn the_key_is_the_address_npm_derives_rather_than_the_url_as_written() {
+        for (url, key) in [
+            // Case: the host folds, the path does not — `new URL` lowercases a
+            // host and leaves a pathname alone, and so does a registry serving
+            // `/Repo/`.
+            ("https://NPM.Example/Repo/", "//npm.example/Repo/"),
+            ("https://npm.EXAMPLE:8443/a/", "//npm.example:8443/a/"),
+            // A default port is not part of a WHATWG `URL`'s host.
+            ("https://npm.example:443/repo/", "//npm.example/repo/"),
+            ("http://npm.example:80/repo/", "//npm.example/repo/"),
+            // …and a non-default one is.
+            ("https://npm.example:80/repo/", "//npm.example:80/repo/"),
+            ("http://npm.example:443/repo/", "//npm.example:443/repo/"),
+            // Dot segments resolve before npm sees the path.
+            ("https://npm.example/a/b/../c/", "//npm.example/a/c/"),
+            ("https://npm.example/a/./b/", "//npm.example/a/b/"),
+            ("https://npm.example/a/b/..", "//npm.example/a/"),
+            ("https://npm.example/../", "//npm.example/"),
+            // A segment that merely ends in dots is an ordinary segment.
+            ("https://npm.example/a/x../", "//npm.example/a/x../"),
         ] {
             assert_eq!(npm_auth_key(url), key, "the key derived for `{url}`");
         }

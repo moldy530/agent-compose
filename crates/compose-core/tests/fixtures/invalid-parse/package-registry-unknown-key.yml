@@ -1,0 +1,12 @@
+# rule: a `package_registry:` takes `url`, `token` and `scopes`, and no other key (grammar 14.6, D50)
+# code: unknown-key
+# message: unknown key `always_auth` in `package_registry`
+# at: 12:3
+version: "0.1"
+
+# npm's own `always-auth` and Bun's `[install] auto` are installer settings this
+# key does not forward: it says where packages resolve from, and every other
+# knob stays the installer's.
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  always_auth: true

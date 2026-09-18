@@ -1,0 +1,7 @@
+# rule: a package_registry token is an ${ENV} reference and never a literal — the emitted files carry the name, not the secret (grammar 14.6, 4.3)
+# at: /package_registry/token
+# via: /$defs/envRef/pattern
+version: "0.1"
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: "npm_s3cret"
