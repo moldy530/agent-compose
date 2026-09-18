@@ -262,11 +262,12 @@ Four things worth knowing:
   away, `..` resolves, and a trailing `/` makes no difference. So
   `https://NPM.Example/repo/`, `https://npm.example/repo/` and
   `https://npm.example/repo` are one address, and `validate` compares them as
-  one. Two shapes are refused naming both entries: two entries at one address
-  with two different variables (an ini parser would keep the last), and an entry
-  with **no** `token` at or under a tokened entry's address — it would spend the
-  other's there while Bun sends nothing. Give each entry its own path on the
-  mirror, or give it the `token` it should spend.
+  one. Two shapes are refused naming both entries, each under its own code: two
+  entries at one address with two different variables (an ini parser would keep
+  the last) is `conflicting-registry-credential`, and an entry with **no**
+  `token` at or under a tokened entry's address — it would spend the other's
+  there while Bun sends nothing — is `missing-registry-token`. Give each entry
+  its own path on the mirror, or give it the `token` it should spend.
 - **A credential belongs in `token`, never in the URL.**
   `https://user:pass@npm.example/` is a spelling installers accept and the one
   Bun's own documentation shows, so `validate` refuses it here on purpose: it

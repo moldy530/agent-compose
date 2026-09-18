@@ -851,15 +851,26 @@ struct RegistryEntry<'a> {
 /// at all. So two shapes make one artifact answer differently under the two
 /// installers, which is the divergence this key exists to remove:
 ///
-/// 1. **One address, two variables.** Two entries whose `url:`s derive one
-///    address — including one registry written with a trailing `/` and once
-///    without — write one `_authToken` key twice and an ini parser keeps the
-///    last, while Bun's per-scope table keeps both.
-/// 2. **A credential reaching an entry that declared none.** An entry with no
-///    `token:` whose address sits at or under a tokened entry's picks that
-///    token up under npm's walk-up and sends nothing under Bun — the credential
-///    leaking to a registry the author scoped it away from, which is the worse
-///    direction of the two.
+/// 1. **One address, two variables** (`conflicting-registry-credential`). Two
+///    entries whose `url:`s derive one address — including one registry written
+///    with a trailing `/` and once without — write one `_authToken` key twice
+///    and an ini parser keeps the last, while Bun's per-scope table keeps both.
+/// 2. **A credential reaching an entry that declared none**
+///    (`missing-registry-token`). An entry with no `token:` whose address sits
+///    at or under a tokened entry's picks that token up under npm's walk-up and
+///    sends nothing under Bun — the credential leaking to a registry the author
+///    scoped it away from, which is the worse direction of the two.
+///
+/// Each gets a **code of its own** rather than an `invalid-value`, for the
+/// reasons the two families they join were minted for: nothing is wrong with
+/// either `url:` or either `${VAR}` read alone, so rule 1 is the
+/// `conflicting-connection-variable` shape — a pair refused rather than a value
+/// — and rule 2 is the `missing-credential` / `missing-callback-allowlist` /
+/// `missing-join-token` shape, where a **sibling entry's** contents decide
+/// whether `token:` is required and the repair is a choice of two. An
+/// `invalid-value` would anchor on a perfectly legal `url:` and hand the reader
+/// an `explain` page about inert and self-negating values, which describes
+/// neither (PRD G3).
 ///
 /// Both are choices the author has to make, so `validate` makes them make it.
 /// Equal variables at one address are left alone: writing one line twice says
@@ -908,7 +919,7 @@ fn one_credential_per_address(section: &PackageRegistrySection, cx: &mut Cx) {
         let (name, first, address) = (entry.name, first.name, &entry.address);
         cx.push(
             Diagnostic::error(
-                DiagnosticCode::InvalidValue,
+                DiagnosticCode::ConflictingRegistryCredential,
                 token.span.clone(),
                 format!(
                     "`{name}` and `{first}` authenticate to `{address}` with two different variables"
@@ -942,7 +953,7 @@ fn one_credential_per_address(section: &PackageRegistrySection, cx: &mut Cx) {
         let (name, lender, address) = (entry.name, source.name, &entry.address);
         cx.push(
             Diagnostic::error(
-                DiagnosticCode::InvalidValue,
+                DiagnosticCode::MissingRegistryToken,
                 entry.url.span.clone(),
                 format!(
                     "`{name}` declares no `token:`, and npm would spend `{lender}`'s at `{address}` anyway"
@@ -1886,6 +1897,14 @@ mod tests {
                 [format!(
                     "`@corp` declares no `token:`, and npm would spend `package_registry`'s at `{address}` anyway"
                 )],
+                "{shape}"
+            );
+            // The code is the half a message assertion cannot carry, and it is
+            // what routes the reader to an `explain` page about this rule
+            // rather than to `invalid-value`'s (PRD G3).
+            assert_eq!(
+                diagnostics[0].code,
+                DiagnosticCode::MissingRegistryToken,
                 "{shape}"
             );
             assert_eq!(

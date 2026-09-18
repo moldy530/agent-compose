@@ -562,6 +562,25 @@ pub enum DiagnosticCode {
     /// two answers to which worker runs one thing — one answer is enough, and
     /// what it forks is the store.
     ProcessLocalStore,
+
+    // --- package registry (grammar 14.6) ----------------------------------
+    /// Two `package_registry` entries authenticate to one derived `.npmrc`
+    /// address with two different variables (grammar 14.6 rule 5, PRD resolved
+    /// q59, Decision D145). Its own class rather than an
+    /// [`InvalidValue`](Self::InvalidValue), for the reason
+    /// [`ConflictingConnectionVariable`](Self::ConflictingConnectionVariable)
+    /// is: neither value is wrong on its own, and what is refused is the pair —
+    /// one emitted `_authToken` line written twice, which an ini parser
+    /// resolves last-one-wins while Bun's per-scope table keeps both.
+    ConflictingRegistryCredential,
+    /// A `package_registry` entry declares no `token:` at an address at or
+    /// under a tokened entry's, so npm's walk-up spends the other's there and
+    /// Bun sends nothing (grammar 14.6 rule 5, PRD resolved q59, Decision
+    /// D145). Its own class rather than a [`MissingKey`](Self::MissingKey), for
+    /// the reason [`MissingJoinToken`](Self::MissingJoinToken) is: whether the
+    /// key is required is decided by a **sibling entry's** contents, and the
+    /// repair is a choice of two.
+    MissingRegistryToken,
 }
 
 impl DiagnosticCode {
@@ -648,6 +667,8 @@ impl DiagnosticCode {
         Self::ConflictingPlacement,
         Self::MissingJoinToken,
         Self::ProcessLocalStore,
+        Self::ConflictingRegistryCredential,
+        Self::MissingRegistryToken,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -728,6 +749,8 @@ impl DiagnosticCode {
             Self::ConflictingPlacement => "conflicting-placement",
             Self::MissingJoinToken => "missing-join-token",
             Self::ProcessLocalStore => "process-local-store",
+            Self::ConflictingRegistryCredential => "conflicting-registry-credential",
+            Self::MissingRegistryToken => "missing-registry-token",
         }
     }
 }
@@ -960,7 +983,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::ProcessLocalStore as usize + 1,
+            DiagnosticCode::MissingRegistryToken as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

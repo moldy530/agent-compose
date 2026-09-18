@@ -5398,10 +5398,13 @@ The rules (Decision
    worst direction: the `npm install` goes out unauthenticated while the
    `bun install` from the same artifact, which carries the token inside its
    registry object rather than keyed by an address, succeeds. Two shapes are
-   therefore a compile error naming both entries:
-   * **one address, two variables** — an ini parser keeps the last, while Bun's
-     per-scope table keeps both;
-   * **an entry with no `token:` at or under a tokened entry's address** — npm
+   therefore a compile error naming both entries, each under a code of its own
+   rather than an `invalid-value`, because neither `url:` and neither `${VAR}`
+   is wrong read alone — what is refused is the pair:
+   * **one address, two variables** (`conflicting-registry-credential`) — an ini
+     parser keeps the last, while Bun's per-scope table keeps both;
+   * **an entry with no `token:` at or under a tokened entry's address**
+     (`missing-registry-token`) — npm
      finds a credential by walking *up* the address of its request
      (`//host/repo/corp/` falls back to `//host/repo/`), so it spends the other's
      there, while Bun's registry object for that entry carries none and sends
