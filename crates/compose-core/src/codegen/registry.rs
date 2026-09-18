@@ -116,6 +116,21 @@ fn bunfig_entry(key: &str, url: &str, token: Option<&str>) -> String {
 
 /// `.npmrc` — the npm and pnpm half, which is resolved q18's fallback getting
 /// the same configuration rather than a lesser one.
+///
+/// Every value here is written **unquoted**, which is the spelling npm's own
+/// documentation shows and the only one its reader takes without surprises —
+/// and it is honest because of what `parse::deploy` refuses. npm reads this
+/// file with the `ini` package: an unquoted key and an unquoted value both end
+/// at a `;` or a `#`, and a line splits at its **first** `=`. So a registry
+/// path carrying any of those three would write an `.npmrc` npm reads
+/// differently from the bytes on disk — a shorter `registry=` or an
+/// `_authToken` key npm never looks up — while `bunfig.toml`'s TOML basic
+/// string hands the same text back exactly. Those are refused at the `url:`
+/// (`parse::deploy::misread_npmrc_line_problem` for `;` and `=`, the fragment
+/// arm of `parse::deploy::respelled_address_problem` for `#`), for the same
+/// reason the address rules are: a refusal an author can read beats an escaper
+/// here whose rules would then have to match that parser's exactly
+/// (grammar 14.6 rule 1).
 fn npmrc(ir: &Ir, registry: &PackageRegistry) -> super::GeneratedFile {
     let mut contents = super::header(ir, "# ");
     contents.push_str(NPMRC_DOC);
@@ -213,7 +228,10 @@ fn token(reference: Option<&crate::diag::Spanned<crate::ast::common::EnvRef>>) -
 /// percent-encoded path character, a dot segment spelled with a `%2e`, and a
 /// query or a fragment that ends the path early are all compile errors at
 /// `package_registry.url:` (`parse::deploy::respelled_address_problem`,
-/// grammar 14.6 rule 1). So what reaches here is an address whose host differs
+/// grammar 14.6 rule 1) — as are the `;` and the `=` that survive that parse
+/// and are line syntax to the ini parser reading the key this function writes
+/// (`parse::deploy::misread_npmrc_line_problem`, and `npmrc` below on why the
+/// file is unquoted). So what reaches here is an address whose host differs
 /// from the parse's by case alone, whose port is written back unchanged or is
 /// the scheme's own default, and whose path a WHATWG `URL` alters only by
 /// resolving dot segments written in dots — which is exactly the list above.

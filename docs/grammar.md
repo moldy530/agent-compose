@@ -5327,7 +5327,9 @@ The rules (Decision
    the `.npmrc` key of rule 5, which npm parses out of its own request through
    a WHATWG `URL` rather than reading off the `registry=` line. So a spelling
    that parse rewrites is a key npm never looks up, and the compiler refuses it
-   here rather than emitting a line nothing reads:
+   here rather than emitting a line nothing reads. **Two** parses stand between
+   this text and what npm resolves, in fact — that `URL`, and the ini parser npm
+   reads `.npmrc` itself with — and the rule covers both:
 
    * **no query and no fragment.** npm appends `/<package>` to this text before
      parsing, so `…/repo?group=npm` fetches `…/repo?group=npm/lodash` — the
@@ -5343,7 +5345,7 @@ The rules (Decision
    * **the path is spelled in characters that parse leaves alone.** It
      percent-encodes every ASCII control, everything above `~`, and `"`, `<`,
      `>`, `` ` ``, `{`, `}`; it turns a `\` into a `/`. `|`, `^`, `[`, `]`,
-     `'`, `;`, `@` and a `%` escape all survive a path unchanged as
+     `'`, `@`, `~` and a `%` escape all survive a path unchanged as
      **characters** and are legal here; a `%2e` that is a whole *segment* is the
      next rule rather than this one.
    * **a `.` or `..` path segment is written in dots, not in `%2e`.** That
@@ -5356,11 +5358,31 @@ The rules (Decision
      the emitter, which is what keeps rule 5's list at three. A `%2e` inside a
      longer segment (`/a%2eb/`) and a segment of three dots or more are ordinary
      to that parse and legal here.
+   * **the path carries no `;` and no `=`.** These two are the *second* parse's,
+     and nothing above is about them: a WHATWG `URL` hands both back untouched,
+     while npm reads `.npmrc` with the `ini` package and `build` writes the
+     address into that file **unquoted**, twice — as the `registry=` value and
+     as the key of the `//host/path/:_authToken=` line (rule 5). An unquoted ini
+     key and an unquoted ini value both **end at a `;`**, and a line **splits at
+     its first `=`**. So `…/group;maven=false/` is read back as the registry
+     `https://host/group`, with its credential keyed at `//host/group`; and
+     `…/repo=corp/` keeps its `registry=` line whole while its credential key
+     stops at `//host/repo`. Either way `npm install` resolves from an address
+     nobody wrote, or unauthenticated, while `bun install` from the same
+     artifact is right, because `bunfig.toml` keeps the address inside a TOML
+     basic string that hands every character of it back. That is rule 5's one
+     artifact / two answers divergence reached through the *file format* rather
+     than through the address, and refusing it here is what lets the emitter go
+     on writing plain ini instead of carrying an escaper whose rules would have
+     to match that parser's exactly. A `#` is the third character that parser
+     ends a line on, and the first bullet above has already refused it as the
+     fragment a WHATWG `URL` reads it as.
 
    The refusal names the character or the part it found, and the same list is
    what lets the emitter normalize exactly three things — a host's case, the
    scheme's own default port, dot segments — instead of reimplementing a WHATWG
-   `URL` in the compiler.
+   `URL` in the compiler, and write plain unquoted ini instead of carrying an
+   escaper for it.
 2. **`token:` is an `${ENV}` reference and never a literal** (§4.3 class 1), the
    posture every deploy-layer credential takes. A scope's `token:` is the same
    key under the same rule. A registry that is read through without a
@@ -5405,7 +5427,11 @@ The rules (Decision
    percent-escaped host, an IP literal, a renumbered port, a `\`, a path
    character it percent-encodes, a dot segment spelled with a `%2e` — is
    refused at the `url:` instead, so the compiler never has to reimplement a
-   WHATWG `URL` to stay right. A key spelled
+   WHATWG `URL` to stay right. These lines are also written **unquoted**, which
+   the same rule makes honest from the other side: a `;` or an `=` in the path
+   would survive that parse and be line syntax to the ini parser npm reads this
+   file with, so rule 1 refuses those two as well rather than leaving an escaper
+   here to match that parser exactly. A key spelled
    any other way is one npm never looks up, and the failure is silent in the
    worst direction: the `npm install` goes out unauthenticated while the
    `bun install` from the same artifact, which carries the token inside its
@@ -9302,6 +9328,26 @@ without a normalization added in `codegen::registry::npm_auth_key` fails the
 test rather than shipping. A query is the reachable one of these — a Nexus or
 Artifactory group selected by a parameter is a URL an operator really pastes —
 and it carries a fixture of its own.
+
+*…and why the rule does not stop at that parse.* A WHATWG `URL` is only the
+first of **two** readers between the `url:` and what npm resolves. The second is
+`ini`: npm reads `.npmrc` with it, and the emitted address goes into that file
+unquoted twice, as the `registry=` value and as the key of the
+`//host/path/:_authToken=` line. An unquoted ini key and an unquoted ini value
+both end at a `;`, and a line splits at its first `=` — two characters a WHATWG
+`URL` writes back untouched, so nothing above catches them. A mirror at
+`…/group;maven=false/` therefore emits a file npm reads as the registry
+`https://host/group` with a credential keyed at `//host/group`, and one at
+`…/repo=corp/` emits a credential keyed at `//host/repo`; both are the same
+silent one-artifact / two-answers failure — `npm install` from the wrong path or
+unauthenticated while `bun install` from the same artifact is right, because
+`bunfig.toml` keeps the address inside a TOML basic string. §14.6 rule 1 refuses
+`;` and `=` in a path for that reason, which is also what lets the emitter go on
+writing plain unquoted ini: the alternative is an escaper in the compiler whose
+rules have to match that parser's exactly, which is the same bargain the address
+rules refuse to make with a WHATWG `URL`. `#` is the third character that parser
+ends a line on and is already refused as a fragment. The Nexus group path is the
+reachable one here too, and carries a fixture of its own.
 
 *Where presence is checked.* Not at build (resolved q15), and — stated because
 it is the thing a reader would assume wrongly — not by the installer either:

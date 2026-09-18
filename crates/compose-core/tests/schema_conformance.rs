@@ -813,10 +813,13 @@ fn the_published_schema_accepts_the_whole_trace_sink_surface() {
 /// Grammar 14.6's registry, in the direction the negative corpus cannot reach:
 /// the shapes the schema must **accept**.
 ///
-/// Six fixtures under `invalid-schema/` pin the refusals — the missing `url:`,
+/// Eight fixtures under `invalid-schema/` pin the refusals — the missing `url:`,
 /// the closed key set on the block and on a scope entry, the `@` a scopes key is
-/// spelled with, the `${ENV}` a `token:` is, and the credential a `url:`
-/// authority may not carry. Each of those is a keyword whose *accepting*
+/// spelled with, the `${ENV}` a `token:` is, the credential a `url:` authority
+/// may not carry, and the two spellings the readers of the emitted files
+/// disagree about: a query, which ends the path a WHATWG `URL` parses, and the
+/// `;` npm's ini parser ends an `.npmrc` line on. Each of those is a keyword
+/// whose *accepting*
 /// direction breaks silently: delete `additionalProperties: false` from
 /// `packageRegistry`, loosen `propertyNames` to drop the `@`, swap `token`'s
 /// `$ref` off `envRef`, or write the URL pattern one character tighter, and the
@@ -850,13 +853,14 @@ fn the_published_schema_accepts_the_whole_package_registry_surface() {
         // is the shape the authority rule must not reach.
         json!({ "url": "https://npm.internal.example/repository/@corp/" }),
         // The address rule (grammar 14.6 rules 1 and 5) refuses a query, a
-        // fragment and every character a WHATWG `URL` respells, so these are
-        // the shapes a pattern written one character too tight takes down with
-        // them: a mirror at an IPv4 address, a host with an underscore, and the
-        // path punctuation that parse leaves exactly as written.
+        // fragment, every character a WHATWG `URL` respells, and the `;` and
+        // `=` npm's ini parser reads as line syntax — so these are the shapes a
+        // pattern written one character too tight takes down with them: a
+        // mirror at an IPv4 address, a host with an underscore, and the path
+        // punctuation that survives *both* readers exactly as written.
         json!({ "url": "https://10.0.0.5:8443/repository/npm-group/" }),
         json!({ "url": "https://npm_mirror.internal.example/repo/" }),
-        json!({ "url": "https://npm.internal.example/a%2Fb/c'd;e[f]|g^h~i/" }),
+        json!({ "url": "https://npm.internal.example/a%2Fb/c'd[e]|f^g~h/" }),
         // A credential, which is the whole point of the key on a mirror that
         // wants one.
         json!({

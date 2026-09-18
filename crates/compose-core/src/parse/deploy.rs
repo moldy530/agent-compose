@@ -288,7 +288,10 @@ struct UrlSubject {
     /// carries the token inside its registry object rather than keyed by an
     /// address, authenticates. So this pass refuses every URL whose address
     /// `npm_auth_key` could not spell back, which is what lets that function
-    /// document three normalizations rather than reimplement a WHATWG `URL`.
+    /// document three normalizations rather than reimplement a WHATWG `URL` —
+    /// and every URL the `.npmrc` **line** carrying that address could not
+    /// spell back either ([`misread_npmrc_line_problem`]), which is what lets
+    /// the emitter write that file unquoted.
     ///
     /// Unlike every other field here, this one is a flag rather than a clause:
     /// the arms it opens are prose about npm and `.npmrc` throughout, so a
@@ -349,7 +352,7 @@ const PACKAGE_REGISTRY_URL: UrlSubject = UrlSubject {
         "a registry credential is `token:`, the `${ENV}` reference each installer expands for itself",
     ),
     derives_an_address: true,
-    help: "the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them. It is an address and nothing more: no query and no fragment, a host of ASCII letters, digits, `-`, `_` and `.` with an optional port, and a path spelled in characters a WHATWG `URL` leaves alone, its `.` and `..` segments written in dots rather than in `%2e` — npm looks a credential up under the address it parses out of its own request, so a spelling that parse rewrites is a line npm never reads (grammar 14.6, PRD resolved q59)",
+    help: "the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them. It is an address and nothing more: no query and no fragment, a host of ASCII letters, digits, `-`, `_` and `.` with an optional port, and a path spelled in characters both readers of `.npmrc` hand back — a WHATWG `URL` leaves it alone, its `.` and `..` segments written in dots rather than in `%2e`, and an ini parser does not end a line on it, so no `;` and no `=` in it. npm looks a credential up under the address it parses out of its own request, and reads that request's registry and that credential's key through those two parses, so a spelling either one rewrites is a line npm never reads (grammar 14.6, PRD resolved q59)",
 };
 
 /// Read one absolute-URL key, refusing what its [`UrlSubject`] describes.
@@ -455,7 +458,14 @@ fn url_problem(url: &str, subject: &UrlSubject) -> Option<String> {
     if subject.derives_an_address {
         // Everything after the authority, which is the path plus whichever of
         // `?` and `#` may have ended it.
-        return respelled_address_problem(host, &rest[host.len()..], subject.own);
+        let path = &rest[host.len()..];
+        // Two readers stand between this text and what npm resolves, and each
+        // gets its own pass: the WHATWG `URL` that derives the address, then
+        // the ini parser that reads the `.npmrc` line the address is written
+        // on. The address comes first because a query or a fragment is a
+        // mistake about the URL rather than about the file.
+        return respelled_address_problem(host, path, subject.own)
+            .or_else(|| misread_npmrc_line_problem(path, subject.own));
     }
     None
 }
@@ -510,6 +520,13 @@ fn url_problem(url: &str, subject: &UrlSubject) -> Option<String> {
 ///   `//host/a/%2e%2e/repo/` while npm walks up from `//host/repo/lodash`,
 ///   which is the silent failure again. Three dots or more is an ordinary
 ///   segment to that parse and so to this arm.
+///
+/// This is the *first* of two readers between the `url:` and what npm resolves,
+/// and it is only the one that derives the address. The `.npmrc` line that
+/// address is written on is read by an ini parser, which ends a line at a `;`
+/// and splits one at its first `=` — two characters this parse writes back
+/// untouched, and therefore two this function accepts and
+/// [`misread_npmrc_line_problem`] refuses immediately after it.
 fn respelled_address_problem(authority: &str, path: &str, own: &str) -> Option<String> {
     if let Some(delimiter) = path
         .chars()
@@ -591,6 +608,64 @@ fn respelled_address_problem(authority: &str, path: &str, own: &str) -> Option<S
         ));
     }
     None
+}
+
+/// Why a URL is not a path the `.npmrc` lines built from it spell back, if it
+/// is not (grammar 14.6 rule 1).
+///
+/// `path` is the same slice [`respelled_address_problem`] reads, and this runs
+/// after it — so a `?`, a `#` and every character a WHATWG `URL` respells are
+/// already refused, and what is left is the **second** reader the registry
+/// passes through. That reader is not a `URL` at all: npm parses `.npmrc` with
+/// the `ini` package, and
+/// [`codegen::registry`](crate::codegen::registry) writes this text into it
+/// **unquoted**, twice — as the value of `registry=` and as the key of the
+/// `//host/path/:_authToken=` line. Two characters a WHATWG `URL` is perfectly
+/// happy to leave in a path are line syntax to that parser:
+///
+/// * **a `;`** ends an unquoted key *and* an unquoted value, because `ini`'s
+///   `unsafe()` treats `;` and `#` as the start of a comment. A registry at
+///   `…/group;maven=false/` writes `registry=https://host/group;maven=false/`,
+///   which npm reads as `https://host/group` — a different path on the mirror —
+///   and a credential key that stops at `//host/group`, which the walk up from
+///   the request never reaches;
+/// * **an `=`** ends the key alone, because `ini` splits a line at its **first**
+///   `=`. A registry at `…/repo=corp/` keeps its `registry=` value whole (that
+///   line's first `=` is the one after `registry`) while its credential is
+///   keyed at `//host/repo`, so npm finds no `_authToken`.
+///
+/// `bunfig.toml` carries the same text inside a TOML basic string and hands it
+/// back exactly, so either character is the one-artifact / two-answers
+/// divergence grammar 14.6 rule 5 exists to prevent — reached through the file
+/// *format* rather than through the address, and in the same silent direction:
+/// `npm install` resolves from the wrong path or unauthenticated while
+/// `bun install` from the same artifact is right. Refusing at the `url:` is
+/// what lets the emitter go on writing plain ini, rather than carrying an
+/// escaper whose rules would then have to match that parser's exactly.
+///
+/// A `#` would be the third such character; it is refused one rule earlier, as
+/// the fragment a WHATWG `URL` reads it as.
+fn misread_npmrc_line_problem(path: &str, own: &str) -> Option<String> {
+    let character = path
+        .chars()
+        .find(|character| matches!(character, ';' | '='))?;
+    let read = format!(
+        "{own} is written into `.npmrc` unquoted, both as the `registry=` value and as the key \
+         of its `_authToken` line, and npm reads that file with an ini parser"
+    );
+    Some(if character == ';' {
+        format!(
+            "carries `;` in its path, and {read} — that parser ends an unquoted key and an \
+             unquoted value at a `;`, so npm would resolve from a shorter address than this one \
+             and look its credential up under one shorter still"
+        )
+    } else {
+        format!(
+            "carries `=` in its path, and {read} — that parser splits a line at its first `=`, \
+             so the `_authToken` key would end at this character and npm would find no \
+             credential at all"
+        )
+    })
 }
 
 /// The `.` or `..` a WHATWG `URL` reads this path segment as, where the segment
@@ -1678,8 +1753,10 @@ mod tests {
                 format!("names the host `2130706433`, and {DERIVED} — a host whose last label is a number is read as an IPv4 address and written back as a dotted quad"),
             ),
             // The WHATWG path percent-encode set, which is not the set of
-            // characters a reader would guess: `|`, `^`, `[`, `'` and `;` all
-            // survive a path unchanged, and these six do not.
+            // characters a reader would guess: `|`, `^`, `[`, `'` and `~` all
+            // survive a path unchanged, and these six do not. (`;` and `=`
+            // survive this parse too, and are refused a rule later by the ini
+            // reader — [`misread_npmrc_line_problem`], asserted below.)
             (
                 "https://npm.internal.example/a{b}/",
                 Some("//npm.internal.example/a%7Bb%7D/"),
@@ -1798,15 +1875,19 @@ mod tests {
                 "https://npm.internal.example/a/b/../repo/",
                 "//npm.internal.example/a/repo/",
             ),
-            // Path characters a WHATWG `URL` leaves alone, including the `@` of
-            // a scope and the `%` of an escape it does not re-encode.
+            // Path characters a WHATWG `URL` leaves alone **and** an ini parser
+            // hands back, including the `@` of a scope and the `%` of an escape
+            // that parse does not re-encode. The `;` and the `=` that would
+            // otherwise sit in this row are line syntax to the parser that
+            // reads `.npmrc`, and are asserted refused in
+            // [`a_path_npms_ini_parser_misreads_is_refused_only_where_a_registry_is_derived`].
             (
                 "https://npm.internal.example/repository/@corp/",
                 "//npm.internal.example/repository/@corp/",
             ),
             (
-                "https://npm.internal.example/a|b^c'd;e[f]/",
-                "//npm.internal.example/a|b^c'd;e[f]/",
+                "https://npm.internal.example/a|b^c'd[e]f~g/",
+                "//npm.internal.example/a|b^c'd[e]f~g/",
             ),
             (
                 "https://npm.internal.example/a%2Fb/",
@@ -1839,6 +1920,116 @@ mod tests {
                 key,
                 "the key derived for `{url}`"
             );
+        }
+    }
+
+    /// The **second** reader of a registry address, and the one a WHATWG `URL`
+    /// says nothing about: the ini parser npm reads `.npmrc` with
+    /// (grammar 14.6 rule 1).
+    ///
+    /// `codegen::registry` writes the address into that file unquoted, twice —
+    /// as the `registry=` value and as the key of the `//host/path/:_authToken`
+    /// line — and npm's `ini` ends an unquoted key and an unquoted value at a
+    /// `;` and splits a line at its first `=`. Both characters survive a
+    /// WHATWG `URL` path untouched, so
+    /// [`an_address_a_url_parse_respells_is_refused_only_where_one_is_derived`]
+    /// cannot see them: the *address* this compiler derives is right, and the
+    /// *file* it writes that address into is the thing that is misread.
+    ///
+    /// Each row therefore asserts the refusal beside the second half that makes
+    /// it a test of a bug rather than of a rule — that the emitted key really
+    /// would carry the character into an `.npmrc` line — and beside what npm's
+    /// own bundled `ini` hands back for that line, read off it rather than
+    /// recalled:
+    ///
+    /// ```text
+    /// registry=https://npm.internal.example/group;maven=false/
+    /// //npm.internal.example/group;maven=false/:_authToken=${NPM_MIRROR_TOKEN}
+    ///   → { "registry": "https://npm.internal.example/group",
+    ///       "//npm.internal.example/group": "false/:_authToken=${NPM_MIRROR_TOKEN}" }
+    ///
+    /// registry=https://npm.internal.example/repo=corp/
+    /// //npm.internal.example/repo=corp/:_authToken=${NPM_CORP_TOKEN}
+    ///   → { "registry": "https://npm.internal.example/repo=corp/",
+    ///       "//npm.internal.example/repo": "corp/:_authToken=${NPM_CORP_TOKEN}" }
+    /// ```
+    ///
+    /// No `_authToken` key in either, and under the `;` not even the registry
+    /// the author wrote — while `bun install` from the same artifact reads the
+    /// address correctly out of `bunfig.toml`, whose TOML basic string hands
+    /// every one of these characters back. That is grammar 14.6 rule 5's
+    /// one-artifact / two-answers divergence, reached through the file format
+    /// instead of through the address.
+    ///
+    /// The other two subjects accept every row, for the reason they accept a
+    /// query: an ingress base and a collector address are written out as text
+    /// and no file keys anything by either.
+    #[test]
+    fn a_path_npms_ini_parser_misreads_is_refused_only_where_a_registry_is_derived() {
+        const READ: &str = "a registry address is written into `.npmrc` unquoted, both as the \
+                            `registry=` value and as the key of its `_authToken` line, and npm \
+                            reads that file with an ini parser";
+        for (url, character, problem) in [
+            (
+                "https://npm.internal.example/group;maven=false/",
+                ';',
+                format!(
+                    "carries `;` in its path, and {READ} — that parser ends an unquoted key and \
+                     an unquoted value at a `;`, so npm would resolve from a shorter address \
+                     than this one and look its credential up under one shorter still"
+                ),
+            ),
+            (
+                "https://npm.internal.example/repo=corp/",
+                '=',
+                format!(
+                    "carries `=` in its path, and {READ} — that parser splits a line at its \
+                     first `=`, so the `_authToken` key would end at this character and npm \
+                     would find no credential at all"
+                ),
+            ),
+            // A `;` reached before an `=` and an `=` reached before a `;`: the
+            // refusal names the character it found first, so neither spelling
+            // is answered with the other's sentence.
+            (
+                "https://npm.internal.example/a;b=c/",
+                ';',
+                format!(
+                    "carries `;` in its path, and {READ} — that parser ends an unquoted key and \
+                     an unquoted value at a `;`, so npm would resolve from a shorter address \
+                     than this one and look its credential up under one shorter still"
+                ),
+            ),
+            (
+                "https://npm.internal.example/a=b;c/",
+                '=',
+                format!(
+                    "carries `=` in its path, and {READ} — that parser splits a line at its \
+                     first `=`, so the `_authToken` key would end at this character and npm \
+                     would find no credential at all"
+                ),
+            ),
+        ] {
+            assert_eq!(
+                url_problem(url, &PACKAGE_REGISTRY_URL).as_deref(),
+                Some(problem.as_str()),
+                "`{url}` no longer reaches the arm written for it"
+            );
+            assert!(
+                crate::codegen::registry::npm_auth_key(url).contains(character),
+                "`{url}` would key its credential at a line an ini parser cuts at `{character}`, \
+                 which is why it is refused here rather than escaped there"
+            );
+            for (key, subject) in [
+                ("hub.public_url", &PUBLIC_URL),
+                ("trace_sink.url", &TRACE_SINK_URL),
+            ] {
+                assert_eq!(
+                    url_problem(url, subject),
+                    None,
+                    "`{key}` writes no `.npmrc`, so `{url}` is the author's business"
+                );
+            }
         }
     }
 
