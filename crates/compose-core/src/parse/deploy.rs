@@ -6,8 +6,9 @@ use crate::ast::common::Namespace;
 use crate::ast::definition::StoreKind;
 use crate::ast::deploy::{
     BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
-    EventSourceKind, EventSourcesSection, HubSection, Placement, PlacementsSection, PluginEntry,
-    PluginValue, SECRET_FIELDS, StorageBackendsSection, TraceSinkFormat, TraceSinkSection,
+    EventSourceKind, EventSourcesSection, HubSection, PackageRegistryScope, PackageRegistrySection,
+    Placement, PlacementsSection, PluginEntry, PluginValue, SECRET_FIELDS, StorageBackendsSection,
+    TraceSinkFormat, TraceSinkSection,
 };
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::yaml::{Mapping, Node, Yaml};
@@ -233,14 +234,18 @@ pub(crate) fn hub(node: &Node, cx: &mut Cx) -> Option<HubSection> {
 
 /// One absolute-URL key of the deploy layer, and how its refusals name it.
 ///
-/// Two keys take an absolute URL written out — `hub.public_url:` (grammar 14.2)
-/// and `trace_sink.url:` (grammar 14.5) — and they are held to **one** shape
-/// rule with one arm inventory, because an author meeting both surfaces should
-/// meet one set of URL rules. What differs is only the noun each refusal uses
-/// for the thing being written, which is what these fields carry.
+/// Three keys take an absolute URL written out — `hub.public_url:`
+/// (grammar 14.2), `trace_sink.url:` (grammar 14.5) and `package_registry`'s two
+/// `url:`s (grammar 14.6) — and they are held to **one** shape rule with one arm
+/// inventory, because an author meeting these surfaces should meet one set of
+/// URL rules. What differs is only the noun each refusal uses for the thing
+/// being written, which is what these fields carry.
+///
+/// The *key* is passed beside the subject rather than held on it, because one of
+/// them is not a constant: a scope's URL is written at
+/// `package_registry.scopes."@corp".url`, so the key names the entry the author
+/// is looking at.
 struct UrlSubject {
-    /// The key, as a diagnostic spells it.
-    key: &'static str,
     /// Completes "contains `*`, and … is this deployment's own URL rather than
     /// a pattern".
     own: &'static str,
@@ -259,7 +264,6 @@ struct UrlSubject {
 /// `hub.public_url:` — the ingress base every URL this deployment hands out
 /// derives from (grammar 14.2, PRD resolved q44 invariant 4).
 const PUBLIC_URL: UrlSubject = UrlSubject {
-    key: "hub.public_url",
     own: "a public base",
     absolute: "an ingress base",
     cased: "a URL derived from it is written out as text",
@@ -270,7 +274,6 @@ const PUBLIC_URL: UrlSubject = UrlSubject {
 /// `trace_sink.url:` — where every settled execution's trace is POSTed
 /// (grammar 14.5, PRD resolved q50).
 const TRACE_SINK_URL: UrlSubject = UrlSubject {
-    key: "trace_sink.url",
     own: "a sink address",
     absolute: "a sink address",
     cased: "the address is written onto the request as text",
@@ -287,8 +290,21 @@ const TRACE_SINK_URL: UrlSubject = UrlSubject {
 /// rather than a match against anything, and a base carrying one is a URL that
 /// resolves nowhere.
 fn public_url(node: &Node, cx: &mut Cx) -> Option<Spanned<String>> {
-    absolute_url(node, &PUBLIC_URL, cx)
+    absolute_url(node, "hub.public_url", &PUBLIC_URL, cx)
 }
+
+/// `package_registry.url:` and a scope's — where the installer of a generated
+/// project fetches packages from (grammar 14.6, PRD resolved q59).
+///
+/// One subject for both, because they are one thing at two scopes: the refusal
+/// names the key it was given, and the prose is about registries either way.
+const PACKAGE_REGISTRY_URL: UrlSubject = UrlSubject {
+    own: "a registry address",
+    absolute: "a registry address",
+    cased: "the address is written into `bunfig.toml` and `.npmrc` as text",
+    reached: "a registry",
+    help: "the registry is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work (grammar 14.6, PRD resolved q59)",
+};
 
 /// Read one absolute-URL key, refusing what its [`UrlSubject`] describes.
 ///
@@ -297,14 +313,19 @@ fn public_url(node: &Node, cx: &mut Cx) -> Option<Spanned<String>> {
 /// be a value this pass could not read. A deployment whose ingress — or whose
 /// collector — differs per environment writes a different deploy file, which is
 /// the layer's whole point.
-fn absolute_url(node: &Node, subject: &UrlSubject, cx: &mut Cx) -> Option<Spanned<String>> {
-    let text = lexical::text(node, &format!("`{}`", subject.key), cx)?;
+fn absolute_url(
+    node: &Node,
+    key: &str,
+    subject: &UrlSubject,
+    cx: &mut Cx,
+) -> Option<Spanned<String>> {
+    let text = lexical::text(node, &format!("`{key}`"), cx)?;
     if let Some(problem) = url_problem(&text.value, subject) {
         cx.push(
             Diagnostic::error(
                 DiagnosticCode::InvalidValue,
                 text.span.clone(),
-                format!("{:?} is not a `{}`: it {problem}", text.value, subject.key),
+                format!("{:?} is not a `{key}`: it {problem}", text.value),
             )
             .with_help(subject.help),
         );
@@ -459,7 +480,7 @@ pub(crate) fn trace_sink(node: &Node, cx: &mut Cx) -> Option<TraceSinkSection> {
     let mut fields = Fields::new(mapping, node.span.clone(), "`trace_sink`");
     let url = fields
         .require("url", cx)
-        .and_then(|node| absolute_url(node, &TRACE_SINK_URL, cx));
+        .and_then(|node| absolute_url(node, "trace_sink.url", &TRACE_SINK_URL, cx));
     let format = fields
         .take("format")
         .and_then(|node| lexical::keyword(node, "`trace_sink.format`", TRACE_SINK_FORMATS, cx));
@@ -490,6 +511,189 @@ pub(crate) fn trace_sink(node: &Node, cx: &mut Cx) -> Option<TraceSinkSection> {
 /// an unauthenticated collector on a private network — and it buys no allowlist
 /// obligation, because there is none to buy.
 const TRACE_SINK_AUTH_WITHOUT_A_SCHEME: &str = "`hmac` signs the delivered body and `bearer` sends a static token; a delivery that carries neither is what leaving `auth:` out already means, which is the posture a collector on a private network takes (grammar 14.5, PRD resolved q50)";
+
+/// Read the `package_registry:` section (grammar 14.6, PRD resolved q59).
+///
+/// A closed construct like `hub:` and `trace_sink:`: all three keys are this
+/// compiler's own, and an unknown one is a mistake rather than a plugin's
+/// business (Decision D50).
+///
+/// Nothing here reaches a running process. What it reaches is the two files
+/// `build` writes beside `package.json` — `bunfig.toml` and `.npmrc` — which is
+/// why the one rule that is not about a single value lives at the bottom of this
+/// function: two entries that would write **one** `.npmrc` authentication line
+/// with two different variables are refused, because npm's auth is keyed by
+/// address and an emitted file whose last line silently won would make the two
+/// installers disagree about a credential.
+pub(crate) fn package_registry(node: &Node, cx: &mut Cx) -> Option<PackageRegistrySection> {
+    let mapping = expect_mapping(node, "`package_registry`", cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), "`package_registry`");
+    let url = fields
+        .require("url", cx)
+        .and_then(|node| absolute_url(node, "package_registry.url", &PACKAGE_REGISTRY_URL, cx));
+    let token = fields
+        .take("token")
+        .and_then(|node| lexical::env_ref(node, "`package_registry.token`", cx));
+    let mut scopes = Vec::new();
+    if let Some(node) = fields.take("scopes")
+        && let Some(body) = expect_mapping(node, "`package_registry.scopes`", cx)
+    {
+        for entry in body.entries() {
+            let name = Spanned::new(entry.key.value.clone(), entry.key.span.clone());
+            if let Some(problem) = scope_problem(&name.value) {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::InvalidValue,
+                        name.span.clone(),
+                        format!(
+                            "`{}` is not a `package_registry.scopes` key: it {problem}",
+                            name.value
+                        ),
+                    )
+                    .with_help(SCOPE_RULE),
+                );
+                continue;
+            }
+            let subject = format!("scope `{}`", name.value);
+            let Some(body) = expect_mapping(&entry.value, &subject, cx) else {
+                continue;
+            };
+            let mut fields = Fields::new(body, entry.value.span.clone(), &subject);
+            let url = fields.require("url", cx).and_then(|node| {
+                absolute_url(
+                    node,
+                    &format!("package_registry.scopes.{}.url", name.value),
+                    &PACKAGE_REGISTRY_URL,
+                    cx,
+                )
+            });
+            let token = fields.take("token").and_then(|node| {
+                lexical::env_ref(
+                    node,
+                    &format!("`package_registry.scopes.{}.token`", name.value),
+                    cx,
+                )
+            });
+            fields.finish(cx);
+            scopes.push(PackageRegistryScope {
+                name,
+                url,
+                token,
+                span: entry.key.span.joined(&entry.value.span),
+            });
+        }
+    }
+    fields.finish(cx);
+
+    let section = PackageRegistrySection {
+        url,
+        token,
+        scopes,
+        span: node.span.clone(),
+    };
+    one_credential_per_address(&section, cx);
+    Some(section)
+}
+
+/// Two entries whose `.npmrc` authentication line would be one line, carrying
+/// two different variables, are refused (grammar 14.6, PRD resolved q59).
+///
+/// npm scopes a credential to an **address** rather than to a package scope
+/// (`//host/path/:_authToken=`), so two `package_registry` entries pointing at
+/// one address with two tokens produce one key written twice — and an ini
+/// parser keeps the last. Bun's `[install.scopes]` has no such collapse, so the
+/// two emitted files would then authenticate differently under the two
+/// installers: a `bun install` that works and an `npm install` that 401s, from
+/// one artifact. That is a choice the author has to make, so it is made here.
+///
+/// Equal variables collide into the identical line and are left alone: writing
+/// one line twice says what writing it once said.
+fn one_credential_per_address(section: &PackageRegistrySection, cx: &mut Cx) {
+    let mut held: BTreeMap<String, (&str, &Spanned<crate::ast::common::EnvRef>)> = BTreeMap::new();
+    let entries = std::iter::once((
+        "package_registry",
+        section.url.as_ref(),
+        section.token.as_ref(),
+    ))
+    .chain(section.scopes.iter().map(|scope| {
+        (
+            scope.name.value.as_str(),
+            scope.url.as_ref(),
+            scope.token.as_ref(),
+        )
+    }));
+    for (name, url, token) in entries {
+        let (Some(url), Some(token)) = (url, token) else {
+            continue;
+        };
+        let address = crate::codegen::registry::npm_auth_key(&url.value);
+        match held.get(&address) {
+            Some((first, held_token)) if held_token.value.name != token.value.name => cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::InvalidValue,
+                    token.span.clone(),
+                    format!(
+                        "`{name}` and `{first}` authenticate to `{address}` with two different variables"
+                    ),
+                )
+                .with_label(
+                    held_token.span.clone(),
+                    format!("`{first}` spends `{}` there", held_token.value.name),
+                )
+                .with_help(
+                    "an `.npmrc` credential is keyed by address rather than by scope — the registry's own directory, so a `url:` written without a trailing `/` keys at the host root — and two entries sharing one key write one `_authToken` line that an installer resolves last-one-wins: give each its own path on the mirror (trailing `/` included), or give both the same variable (grammar 14.6, PRD resolved q59)",
+                ),
+            ),
+            Some(_) => {}
+            None => {
+                held.insert(address, (name, token));
+            }
+        }
+    }
+}
+
+/// What a `package_registry.scopes` key must look like, as a refusal's help.
+const SCOPE_RULE: &str = "a scope is the `@…` prefix of a package name, written here exactly as a package spells it — `\"@corp\"`, the scope of `@corp/ui` — because that is how it is emitted, into `.npmrc`'s `@corp:registry=` line and Bun's `[install.scopes]` table (grammar 14.6, PRD resolved q59)";
+
+/// Why a value is not a legal npm scope, if it is not.
+///
+/// Completes ``` `<key>` is not a `package_registry.scopes` key: it … ```. The
+/// arms are ordered so each is the only answer to some key, and every one of
+/// them is reached by [`tests::every_scope_refusal_arm_answers_some_key`].
+///
+/// The rule is npm's own, narrowed to what a *scope* may be: an `@`, then a
+/// lowercase letter or digit, then lowercase letters, digits, `-`, `_` and `.`.
+/// Uppercase is refused rather than folded, because npm lowercases package names
+/// and a scope this compiler quietly rewrote would be one the author could not
+/// find in either emitted file.
+fn scope_problem(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("is empty".to_string());
+    }
+    let Some(rest) = name.strip_prefix('@') else {
+        return Some(
+            "does not start with `@`, and a scope is written the way a package spells it"
+                .to_string(),
+        );
+    };
+    let mut chars = rest.chars();
+    let Some(first) = chars.next() else {
+        return Some("names no scope after its `@`".to_string());
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Some(format!(
+            "begins with `{first}` after its `@`, and a scope starts with a lowercase letter or a digit"
+        ));
+    }
+    if let Some(bad) = chars
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')))
+    {
+        return Some(format!(
+            "contains `{bad}`, and a scope is lowercase letters, digits, `-`, `_` and `.`"
+        ));
+    }
+    None
+}
 
 const STORE_KINDS: &[(&str, StoreKind)] = &[
     ("kv", StoreKind::Kv),
@@ -741,7 +945,9 @@ pub(crate) fn plugin_value(node: &Node, subject: &str, cx: &mut Cx) -> Spanned<P
 
 #[cfg(test)]
 mod tests {
-    use super::{PUBLIC_URL, TRACE_SINK_URL, UrlSubject, url_problem};
+    use super::{
+        PACKAGE_REGISTRY_URL, PUBLIC_URL, TRACE_SINK_URL, UrlSubject, scope_problem, url_problem,
+    };
     use crate::diag::{Diagnostic, DiagnosticCode};
     use crate::parse::parse_str;
 
@@ -876,14 +1082,24 @@ mod tests {
     /// author is likeliest to hit — a relative base and a wildcard — carry
     /// fixtures there as well.
     ///
-    /// Run over **both** subjects, because one shape rule serving two keys is
-    /// exactly the arrangement where a clause added for one of them reads as
-    /// nonsense on the other: every arm has to be a sentence about whichever key
-    /// reached it.
+    /// Every subject this module declares, with the key a refusal of it names.
+    ///
+    /// The tests below run over all of them, because one shape rule serving
+    /// several keys is exactly the arrangement where a clause added for one of
+    /// them reads as nonsense on the others.
+    const SUBJECTS: [(&str, &UrlSubject); 3] = [
+        ("hub.public_url", &PUBLIC_URL),
+        ("trace_sink.url", &TRACE_SINK_URL),
+        ("package_registry.url", &PACKAGE_REGISTRY_URL),
+    ];
+
+    /// Run over **every** subject: every arm has to be a sentence about
+    /// whichever key reached it.
     #[test]
     fn every_refusal_arm_answers_some_url() {
-        for (subject, expected) in [
+        for (key, subject, expected) in [
             (
+                "hub.public_url",
                 &PUBLIC_URL,
                 [
                     "contains `*`, and a public base is this deployment's own URL rather than a pattern",
@@ -893,12 +1109,23 @@ mod tests {
                 ],
             ),
             (
+                "trace_sink.url",
                 &TRACE_SINK_URL,
                 [
                     "contains `*`, and a sink address is this deployment's own URL rather than a pattern",
                     "names no scheme, and a sink address is absolute",
                     "names the scheme `HTTPS`, and the address is written onto the request as text — write `https://`",
                     "names the scheme `ftp`, and a trace sink is reached over `http` or `https`",
+                ],
+            ),
+            (
+                "package_registry.url",
+                &PACKAGE_REGISTRY_URL,
+                [
+                    "contains `*`, and a registry address is this deployment's own URL rather than a pattern",
+                    "names no scheme, and a registry address is absolute",
+                    "names the scheme `HTTPS`, and the address is written into `bunfig.toml` and `.npmrc` as text — write `https://`",
+                    "names the scheme `ftp`, and a registry is reached over `http` or `https`",
                 ],
             ),
         ] {
@@ -919,8 +1146,7 @@ mod tests {
                 assert_eq!(
                     url_problem(url, subject).as_deref(),
                     Some(expected),
-                    "`{url}` no longer reaches the arm written for it under `{}`",
-                    subject.key
+                    "`{url}` no longer reaches the arm written for it under `{key}`"
                 );
             }
         }
@@ -934,7 +1160,7 @@ mod tests {
     /// path prefix, and `http` for localhost are all URLs somebody deploys.
     #[test]
     fn a_url_an_author_writes_is_accepted() {
-        for subject in [&PUBLIC_URL, &TRACE_SINK_URL] {
+        for (key, subject) in SUBJECTS {
             for url in [
                 "https://hub.example",
                 "https://hub.example/",
@@ -942,30 +1168,28 @@ mod tests {
                 "https://hub.example:8443/agent-compose",
                 "https://hub.internal.example/ingress/v1",
                 "http://localhost:4318/v1/traces",
+                "https://npm.internal.example/repository/npm-group/",
             ] {
                 assert_eq!(
                     url_problem(url, subject),
                     None,
-                    "`{url}` is a URL somebody deploys and this pass refuses it under `{}`",
-                    subject.key
+                    "`{url}` is a URL somebody deploys and this pass refuses it under `{key}`"
                 );
             }
         }
     }
 
-    /// The two subjects really are two: no clause is shared between them, so no
-    /// refusal reads as a sentence about the other key.
+    /// The subjects really are distinct: no clause is shared between any two of
+    /// them, so no refusal reads as a sentence about another key.
     ///
-    /// Cheap, and it is the failure the parameterization invites — a fifth
-    /// subject copied from a fourth and half-edited, whose messages then name
+    /// Cheap, and it is the failure the parameterization invites — a fourth
+    /// subject copied from a third and half-edited, whose messages then name
     /// the wrong construct in the two arms nobody re-read.
     #[test]
     fn each_url_subject_names_itself() {
-        let subjects: [&UrlSubject; 2] = [&PUBLIC_URL, &TRACE_SINK_URL];
-        for (index, subject) in subjects.iter().enumerate() {
-            for other in &subjects[index + 1..] {
+        for (index, (key, subject)) in SUBJECTS.iter().enumerate() {
+            for (other_key, other) in &SUBJECTS[index + 1..] {
                 for (left, right, clause) in [
-                    (subject.key, other.key, "key"),
                     (subject.own, other.own, "own"),
                     (subject.absolute, other.absolute, "absolute"),
                     (subject.cased, other.cased, "cased"),
@@ -974,12 +1198,58 @@ mod tests {
                 ] {
                     assert_ne!(
                         left, right,
-                        "`{}` and `{}` share the `{clause}` clause, so one of them names the \
-                         other's construct",
-                        subject.key, other.key
+                        "`{key}` and `{other_key}` share the `{clause}` clause, so one of them \
+                         names the other's construct"
                     );
                 }
             }
+        }
+    }
+
+    /// Every arm of the scope-key refusal, and the key that reaches it.
+    ///
+    /// The same discipline [`every_refusal_arm_answers_some_url`] holds the URL
+    /// rule to: an arm no value reaches is a message no reader has read, and the
+    /// fixture corpus pins one rule per file rather than one arm.
+    #[test]
+    fn every_scope_refusal_arm_answers_some_key() {
+        for (key, expected) in [
+            ("", "is empty"),
+            (
+                "corp",
+                "does not start with `@`, and a scope is written the way a package spells it",
+            ),
+            ("@", "names no scope after its `@`"),
+            (
+                "@-corp",
+                "begins with `-` after its `@`, and a scope starts with a lowercase letter or a digit",
+            ),
+            (
+                "@Corp",
+                "begins with `C` after its `@`, and a scope starts with a lowercase letter or a digit",
+            ),
+            (
+                "@corp/ui",
+                "contains `/`, and a scope is lowercase letters, digits, `-`, `_` and `.`",
+            ),
+        ] {
+            assert_eq!(
+                scope_problem(key).as_deref(),
+                Some(expected),
+                "`{key}` no longer reaches the arm written for it"
+            );
+        }
+    }
+
+    /// …and the scopes an author writes are accepted.
+    #[test]
+    fn a_scope_an_author_writes_is_accepted() {
+        for key in ["@corp", "@my-org", "@acme.co", "@a", "@org_2"] {
+            assert_eq!(
+                scope_problem(key),
+                None,
+                "`{key}` is a scope somebody publishes under and this pass refuses it"
+            );
         }
     }
 }

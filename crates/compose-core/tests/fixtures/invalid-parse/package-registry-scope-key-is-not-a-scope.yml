@@ -1,0 +1,14 @@
+# rule: a `package_registry.scopes` key is an npm scope, written with its `@` (grammar 14.6)
+# code: invalid-value
+# message: `corp` is not a `package_registry.scopes` key: it does not start with `@`, and a scope is written the way a package spells it
+# at: 13:5
+# help: a scope is the `@…` prefix of a package name, written here exactly as a package spells it — `"@corp"`, the scope of `@corp/ui` — because that is how it is emitted, into `.npmrc`'s `@corp:registry=` line and Bun's `[install.scopes]` table (grammar 14.6, PRD resolved q59)
+version: "0.1"
+
+# The key is emitted verbatim, into `.npmrc`'s `@corp:registry=` line and Bun's
+# `[install.scopes]` table, so it has to be spelled the way a package spells it.
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  scopes:
+    corp:
+      url: "https://npm.internal.example/repository/corp/"

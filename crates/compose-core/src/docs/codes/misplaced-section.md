@@ -5,7 +5,7 @@
 There are exactly two document kinds and they are **disjoint**. A spec file
 carries `version`, `imports` (entrypoint only), `defaults`, `state`, `triggers`
 and definition keys. A deploy file carries `version`, `hub`, `placements`,
-`storage_backends`, `trace_sink` and `event_sources`.
+`storage_backends`, `package_registry`, `trace_sink` and `event_sources`.
 
 That split is the mechanical enforcement of the per-target invariant: **only the
 deploy layer forks per environment**. A `state:` section in a deploy file, or a

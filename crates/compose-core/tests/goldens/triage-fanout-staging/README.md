@@ -16,6 +16,8 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `.gitignore` | the three things a checkout of this directory leaves out: the install artifact, the `.env` the spec deliberately never contains, and the data this project's own stores keep |
 | `README.md` | this file |
 | `package.json` | the dependency set, each package pinned to the version this compiler release was built against — plus whatever a `module:` binding declared under `dependencies:` — the `typecheck` script, and the Node floor |
+| `bunfig.toml` | where `bun install` resolves this project's packages from, written from the target's `package_registry:`. A credential in it is the *name* of an environment variable, expanded at install time |
+| `.npmrc` | the same configuration in npm's own spelling, so `npm install` and `pnpm install` reach the same registry |
 | `tsconfig.json` | the type checker's settings: strict, `noEmit`, and the `.ts` import extensions both supported runtimes resolve |
 | `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, which files here the compiler did not write, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
 | `src/artifact.ts` | what this tree **is**: a content hash over its own files — the emitted ones and the authored ones the composition references — the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
@@ -246,6 +248,30 @@ installer-specific — no `packageManager` field, no lockfile, no install-time
 script — so bun, npm and pnpm all resolve it to the same versions. The lockfile
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
+
+## Installing through a private registry
+
+This project was built for a target whose deploy file declares a
+`package_registry:`, so `bunfig.toml` and `.npmrc` beside this README point both
+installers at `https://npm.internal.example/repository/npm-group/`. They are generated files like every other one in the table
+above: edit the deploy file and rebuild, rather than editing them.
+
+These scopes resolve somewhere of their own:
+
+| scope | registry |
+|---|---|
+| `@corp` | `https://npm.internal.example/repository/corp/` |
+
+The credential is the **name** of an environment variable — `NPM_CORP_TOKEN`, `NPM_MIRROR_TOKEN` — and the
+installer expands it when it runs. No secret is in this directory, and rotating
+the token does not change what `agent-compose build` writes here.
+
+**An unset variable is not an install-time error.** Both installers send the
+reference as text and the registry refuses it, so a `401` from the registry is
+what a missing variable looks like at `install`. What catches it earlier is the
+environment check this project already makes: the variable is in
+`environmentReferences`, so loading `src/index.ts` names it, and a worker that
+does not have it is refused at join rather than after a failed install.
 
 ## Answering a `human` node
 

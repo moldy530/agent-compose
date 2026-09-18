@@ -2909,10 +2909,42 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
       },
       "span": "deploy/staging.yml:30:3..40:26"
     },
+    "package_registry": {
+      "url": {
+        "value": "https://npm.internal.example/repository/npm-group/",
+        "span": "deploy/staging.yml:50:8..50:60"
+      },
+      "token": {
+        "value": {
+          "env_ref": "NPM_MIRROR_TOKEN"
+        },
+        "span": "deploy/staging.yml:51:10..51:29"
+      },
+      "scopes": {
+        "@corp": {
+          "name": {
+            "value": "@corp",
+            "span": "deploy/staging.yml:54:5..54:12"
+          },
+          "url": {
+            "value": "https://npm.internal.example/repository/corp/",
+            "span": "deploy/staging.yml:55:12..55:59"
+          },
+          "token": {
+            "value": {
+              "env_ref": "NPM_CORP_TOKEN"
+            },
+            "span": "deploy/staging.yml:56:14..56:31"
+          },
+          "span": "deploy/staging.yml:54:5..56:31"
+        }
+      },
+      "span": "deploy/staging.yml:50:3..56:31"
+    },
     "trace_sink": {
       "url": {
         "value": "https://collector.internal.example/v1/traces",
-        "span": "deploy/staging.yml:51:8..51:54"
+        "span": "deploy/staging.yml:67:8..67:54"
       },
       "format": "envelope",
       "auth": {
@@ -2921,20 +2953,20 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
             "value": {
               "env_ref": "TRACE_SINK_TOKEN"
             },
-            "span": "deploy/staging.yml:54:14..54:33"
+            "span": "deploy/staging.yml:70:14..70:33"
           },
           "header": "Authorization",
           "prefix": "Bearer "
         }
       },
-      "span": "deploy/staging.yml:51:3..54:33"
+      "span": "deploy/staging.yml:67:3..70:33"
     },
     "event_sources": {
       "entries": {
         "bug_reports": {
           "name": {
             "value": "bug_reports",
-            "span": "deploy/staging.yml:59:3..59:14"
+            "span": "deploy/staging.yml:75:3..75:14"
           },
           "kind": "redis_streams",
           "connection": {
@@ -2942,7 +2974,7 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "env_ref": "REDIS_URL"
               },
-              "span": "deploy/staging.yml:61:5..61:22"
+              "span": "deploy/staging.yml:77:5..77:22"
             }
           },
           "extra": {
@@ -2950,19 +2982,19 @@ expression: "resolve_clean(\"examples/triage-fanout\", \"staging\")"
               "value": {
                 "text": "agent-compose"
               },
-              "span": "deploy/staging.yml:63:5..63:34"
+              "span": "deploy/staging.yml:79:5..79:34"
             },
             "stream": {
               "value": {
                 "text": "bug-reports"
               },
-              "span": "deploy/staging.yml:62:5..62:24"
+              "span": "deploy/staging.yml:78:5..78:24"
             }
           },
-          "span": "deploy/staging.yml:59:3..63:34"
+          "span": "deploy/staging.yml:75:3..79:34"
         }
       },
-      "span": "deploy/staging.yml:59:3..63:34"
+      "span": "deploy/staging.yml:75:3..79:34"
     }
   }
 }

@@ -108,6 +108,8 @@ export const placements: readonly PlacementManifest[] = [
     ],
     environment: [
       "ANTHROPIC_API_KEY",
+      "NPM_CORP_TOKEN",
+      "NPM_MIRROR_TOKEN",
       "REPO_ROOT",
       "RG_CONFIG_PATH",
     ],
@@ -121,6 +123,8 @@ export const hubEnvironment: readonly string[] = [
   "LOCAL_LLM_KEY",
   "LOCAL_LLM_URL",
   "MESH_JOIN_TOKEN",
+  "NPM_CORP_TOKEN",
+  "NPM_MIRROR_TOKEN",
   "OPS_BIN",
   "QUEUE_HOST",
   "QUEUE_TOKEN",

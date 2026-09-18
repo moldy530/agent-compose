@@ -158,6 +158,75 @@ fn validate_enforces_the_trace_sink_credentials_class() {
     }
 }
 
+/// …and so is the `package_registry:` credential, which the class-1 table has to
+/// name **where it lives** for the reason the trace sink's row does.
+///
+/// `token` was already a class-1 name, so a reader asking "may
+/// `package_registry.token:` be a literal?" would find a row about §13.3 and
+/// §14.5 and have to infer that a name borrowed from them carries their rule.
+/// §4.3's totality rule (D92) makes that inference the *wrong* one to have to
+/// make: a surface the section does not place in class 1 or 2 is class 3, so an
+/// unnamed credential reads as one a literal is required in — which is the
+/// secret in the spec text, in the one block whose whole point is that the
+/// secret never enters the artifact (PRD resolved q59).
+#[test]
+fn the_package_registry_credential_is_tabulated_as_class_one() {
+    let grammar =
+        fs::read_to_string(repository().join("docs/grammar.md")).expect("the grammar is readable");
+    let table = class_one_table(&grammar);
+    let row = table
+        .lines()
+        .find(|line| line.contains("§14.6"))
+        .expect("grammar 4.3's class-1 table carries the package-registry row");
+    assert!(
+        row.contains("`token`"),
+        "grammar 4.3's §14.6 row does not name `token`: {row}"
+    );
+    assert!(
+        row.contains("scopes"),
+        "the row names the block but not its `scopes:` entries, whose `token:` is the same key \
+         under the same rule: {row}"
+    );
+}
+
+/// …and the class the table names is the class `validate` enforces, on both
+/// positions that take that credential.
+#[test]
+fn validate_enforces_the_package_registry_credentials_class() {
+    const REGISTRY: &str = "version: \"0.1\"\npackage_registry:\n  url: \"https://npm.internal.example/repository/npm-group/\"\n";
+    let scope =
+        "  scopes:\n    \"@corp\":\n      url: \"https://npm.internal.example/repository/corp/\"\n";
+
+    for (what, literal, reference) in [
+        (
+            "package_registry.token",
+            format!("{REGISTRY}  token: \"npm_s3cret\"\n"),
+            format!("{REGISTRY}  token: ${{NPM_MIRROR_TOKEN}}\n"),
+        ),
+        (
+            "package_registry.scopes.@corp.token",
+            format!("{REGISTRY}{scope}      token: \"npm_s3cret\"\n"),
+            format!("{REGISTRY}{scope}      token: ${{NPM_CORP_TOKEN}}\n"),
+        ),
+    ] {
+        assert_eq!(
+            parse_str(&literal, "deploy/staging.yml")
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["invalid-env-ref"],
+            "a literal `{what}:` must be refused as class 1 requires"
+        );
+        assert!(
+            parse_str(&reference, "deploy/staging.yml")
+                .diagnostics
+                .is_empty(),
+            "the value form is the form class 1 asks for and it must be accepted for `{what}:`"
+        );
+    }
+}
+
 /// The other end of the bind: the class the table names is the class `validate`
 /// enforces.
 ///

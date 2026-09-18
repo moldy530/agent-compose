@@ -39,6 +39,22 @@ storage_backends:
       url: ${CHROMA_URL}
       index: project-docs
 
+# Where the installer of a built project resolves packages from (grammar 14.6,
+# PRD resolved q59). This network mandates an internal mirror, so `build` writes
+# a `bunfig.toml` and an `.npmrc` into the artifact — which is what makes the
+# `bun install` every worker runs at materialise reach the mirror instead of the
+# public registry it cannot see. The tokens are `${ENV}` references and stay
+# references in the emitted bytes: nothing secret is in the build directory, and
+# rotating one does not change the artifact hash.
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}
+  scopes:
+    # The private scope lives on its own path, with its own credential.
+    "@corp":
+      url: "https://npm.internal.example/repository/corp/"
+      token: ${NPM_CORP_TOKEN}
+
 # Where every settled execution's trace ships (grammar 14.5, PRD resolved q50).
 # One address for the whole target, delivered on the same journal-backed
 # at-least-once machinery a `callback:` uses — a collector that is down costs

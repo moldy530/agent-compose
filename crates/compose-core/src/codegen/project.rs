@@ -74,6 +74,8 @@
 //! 5.9's "resolution happens at process start in generated code" happens.
 //! Loading the project is the check.
 
+use std::fmt::Write as _;
+
 use crate::ir::Ir;
 
 use super::names;
@@ -341,7 +343,10 @@ pub fn readme(ir: &Ir, partition: &super::env::Partition) -> super::GeneratedFil
          resolved for the `{}` target.\n",
         ir.entrypoint, ir.target
     ));
+    contents.push_str(README_LAYOUT);
+    contents.push_str(&installer_layout_rows(ir));
     contents.push_str(README_BODY);
+    contents.push_str(&private_registry(ir));
     contents.push_str(&human_waits(ir, partition));
     contents.push_str(&store_data(ir));
     contents.push_str(&builtin_workspaces(ir));
@@ -362,7 +367,9 @@ pub fn readme(ir: &Ir, partition: &super::env::Partition) -> super::GeneratedFil
     }
 }
 
-const README_BODY: &str = r#"
+/// The Layout table's opening rows, up to where the **target**-dependent ones
+/// go (see [`installer_layout_rows`]).
+const README_LAYOUT: &str = r#"
 ## Layout
 
 | path | what it holds |
@@ -370,7 +377,26 @@ const README_BODY: &str = r#"
 | `.gitignore` | the three things a checkout of this directory leaves out: the install artifact, the `.env` the spec deliberately never contains, and the data this project's own stores keep |
 | `README.md` | this file |
 | `package.json` | the dependency set, each package pinned to the version this compiler release was built against — plus whatever a `module:` binding declared under `dependencies:` — the `typecheck` script, and the Node floor |
-| `tsconfig.json` | the type checker's settings: strict, `noEmit`, and the `.ts` import extensions both supported runtimes resolve |
+"#;
+
+/// The two rows a target that declares a `package_registry:` adds, and nothing
+/// where it does not (grammar §14.6).
+///
+/// The table is **normative** in the emitted project — the paragraph under it
+/// says the file list is the boundary — so a row for a file this build did not
+/// write would tell a reader the compiler owns a name it never touches, and a
+/// missing row would tell the owner of a `bunfig.toml` that it is theirs right
+/// up until the next build replaces it.
+fn installer_layout_rows(ir: &Ir) -> String {
+    if ir.deploy.package_registry.is_none() {
+        return String::new();
+    }
+    "| `bunfig.toml` | where `bun install` resolves this project's packages from, written from the target's `package_registry:`. A credential in it is the *name* of an environment variable, expanded at install time |\n\
+     | `.npmrc` | the same configuration in npm's own spelling, so `npm install` and `pnpm install` reach the same registry |\n"
+        .to_string()
+}
+
+const README_BODY: &str = r#"| `tsconfig.json` | the type checker's settings: strict, `noEmit`, and the `.ts` import extensions both supported runtimes resolve |
 | `manifest.json` | what a **worker** reads out of this tree before it can run anything: the node runner's path, which files here the compiler did not write, and each placement's environment as `docs/distributed.md` §9.1 partitions it. The same partition `src/deployment.ts` carries, in the format the `agent-compose worker` binary can read without a JavaScript runtime |
 | `src/artifact.ts` | what this tree **is**: a content hash over its own files — the emitted ones and the authored ones the composition references — the file list a worker fetch is served from, and the compiler release that wrote it (`docs/distributed.md` §4) |
 | `src/cel.ts` | the CEL evaluator the routers embed (PRD 5.5) |
@@ -601,6 +627,71 @@ script — so bun, npm and pnpm all resolve it to the same versions. The lockfil
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
 "#;
+
+/// The section a **target** declaring a `package_registry:` gets (grammar
+/// §14.6, PRD resolved q59).
+///
+/// A reader of such a project meets two things the install blocks above do not
+/// explain: why there are two configuration files they did not write, and what
+/// happens when the variable one of them names is not set. The second is the
+/// one worth writing down, because neither installer treats it as an error —
+/// the reference goes out as text and the registry answers `401`.
+fn private_registry(ir: &Ir) -> String {
+    let Some(registry) = ir.deploy.package_registry.as_ref() else {
+        return String::new();
+    };
+    let mut section = format!(
+        "\n## Installing through a private registry\n\n\
+         This project was built for a target whose deploy file declares a\n\
+         `package_registry:`, so `bunfig.toml` and `.npmrc` beside this README point both\n\
+         installers at `{}`. They are generated files like every other one in the table\n\
+         above: edit the deploy file and rebuild, rather than editing them.\n",
+        registry.url.value
+    );
+    if !registry.scopes.is_empty() {
+        section.push_str(
+            "\nThese scopes resolve somewhere of their own:\n\n| scope | registry |\n|---|---|\n",
+        );
+        for scope in registry.scopes.values() {
+            let _ = writeln!(
+                section,
+                "| `{}` | `{}` |",
+                scope.name.value, scope.url.value
+            );
+        }
+    }
+    let mut credentials: Vec<&str> = std::iter::once(registry.token.as_ref())
+        .chain(registry.scopes.values().map(|scope| scope.token.as_ref()))
+        .flatten()
+        .map(|token| token.value.name.as_str())
+        .collect();
+    credentials.sort_unstable();
+    credentials.dedup();
+    if credentials.is_empty() {
+        section.push_str(
+            "\nNeither file carries a credential: this registry is read through without one.\n",
+        );
+        return section;
+    }
+    let _ = write!(
+        section,
+        "\nThe credential is the **name** of an environment variable — {} — and the\n\
+         installer expands it when it runs. No secret is in this directory, and rotating\n\
+         the token does not change what `agent-compose build` writes here.\n\n\
+         **An unset variable is not an install-time error.** Both installers send the\n\
+         reference as text and the registry refuses it, so a `401` from the registry is\n\
+         what a missing variable looks like at `install`. What catches it earlier is the\n\
+         environment check this project already makes: the variable is in\n\
+         `environmentReferences`, so loading `src/index.ts` names it, and a worker that\n\
+         does not have it is refused at join rather than after a failed install.\n",
+        credentials
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    section
+}
 
 /// The section a composition declaring a `human` node gets.
 ///
@@ -1831,7 +1922,7 @@ model.default:
         }
     }
 
-    /// The README's Layout table and [`crate::codegen::EMITTED_PATHS`] are one
+    /// The README's Layout table and [`crate::codegen::emitted_paths`] are one
     /// list, in both directions.
     ///
     /// That table is **normative** in the emitted project rather than a summary
@@ -1843,25 +1934,81 @@ model.default:
     /// project does not have. Neither is visible to a golden diff, which shows
     /// what the README says and never what the emitter does — which is why this
     /// reads the table back rather than trusting a reviewer to.
+    ///
+    /// Run under **both** shapes of the table, because two of its rows are the
+    /// target's rather than the layout's (grammar §14.6): a build with no
+    /// `package_registry:` writes no installer configuration and must document
+    /// none, and a build with one must document both files it wrote.
     #[test]
     fn the_readme_documents_every_emitted_file() {
-        let contents = readme_of(&ir_of("version: \"0.1\"\n")).contents;
-        let below = contents
-            .split_once("## Layout")
-            .expect("the layout table has a heading")
-            .1;
-        let table = below.split_once("\n## ").map_or(below, |(above, _)| above);
-        let listed: std::collections::BTreeSet<&str> = table
-            .lines()
-            .filter_map(|line| line.strip_prefix("| `"))
-            .filter_map(|row| row.split_once('`'))
-            .map(|(path, _)| path)
-            .collect();
-        let emitted: std::collections::BTreeSet<&str> =
-            crate::codegen::EMITTED_PATHS.iter().copied().collect();
-        assert_eq!(
-            listed, emitted,
-            "the README's layout table and the file list `build` replaces disagree"
+        for ir in [
+            ir_of("version: \"0.1\"\n"),
+            ir_of_mesh(
+                "version: \"0.1\"\n",
+                "version: \"0.1\"\npackage_registry:\n  url: \"https://npm.internal.example/mirror/\"\n",
+            ),
+        ] {
+            let contents = readme_of(&ir).contents;
+            let below = contents
+                .split_once("## Layout")
+                .expect("the layout table has a heading")
+                .1;
+            let table = below.split_once("\n## ").map_or(below, |(above, _)| above);
+            let listed: std::collections::BTreeSet<&str> = table
+                .lines()
+                .filter_map(|line| line.strip_prefix("| `"))
+                .filter_map(|row| row.split_once('`'))
+                .map(|(path, _)| path)
+                .collect();
+            let emitted: std::collections::BTreeSet<&str> =
+                crate::codegen::emitted_paths(&ir).into_iter().collect();
+            assert_eq!(
+                listed, emitted,
+                "the README's layout table and the file list `build` replaces disagree"
+            );
+        }
+    }
+
+    /// A target with a mirror gets the section about it; one without gets
+    /// nothing — and the section says the thing a reader cannot guess, which is
+    /// that an unset variable is not an install-time error.
+    #[test]
+    fn a_target_with_a_private_registry_is_told_what_an_unset_variable_costs() {
+        let plain = readme_of(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            !plain.contains("## Installing through a private registry"),
+            "a project with no mirror is not told about one"
+        );
+
+        let contents = readme_of(&ir_of_mesh(
+            "version: \"0.1\"\n",
+            r#"version: "0.1"
+
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}
+  scopes:
+    "@corp":
+      url: "https://npm.internal.example/repository/corp/"
+"#,
+        ))
+        .contents;
+        assert!(
+            contents.contains("## Installing through a private registry"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("https://npm.internal.example/repository/npm-group/"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("| `@corp` | `https://npm.internal.example/repository/corp/` |"),
+            "a scope that resolves elsewhere is named: {contents}"
+        );
+        assert!(contents.contains("`NPM_MIRROR_TOKEN`"), "{contents}");
+        assert!(
+            contents.contains("**An unset variable is not an install-time error.**"),
+            "{contents}"
         );
     }
 

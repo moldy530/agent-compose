@@ -274,6 +274,7 @@ const DEPLOY_ONLY: &[&str] = &[
     "hub",
     "placements",
     "storage_backends",
+    "package_registry",
     "trace_sink",
     "event_sources",
 ];
@@ -401,6 +402,7 @@ fn deploy_file(
         placements: None,
         hub: None,
         storage_backends: None,
+        package_registry: None,
         trace_sink: None,
         event_sources: None,
         span: root.span.clone(),
@@ -414,6 +416,9 @@ fn deploy_file(
             "placements" => file.placements = deploy::placements(&entry.value, cx),
             "storage_backends" => {
                 file.storage_backends = deploy::storage_backends(&entry.value, cx);
+            }
+            "package_registry" => {
+                file.package_registry = deploy::package_registry(&entry.value, cx);
             }
             "trace_sink" => file.trace_sink = deploy::trace_sink(&entry.value, cx),
             "event_sources" => file.event_sources = deploy::event_sources(&entry.value, cx),

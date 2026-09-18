@@ -990,6 +990,20 @@ finds step 1 equal, skips 2 through 4, and is dispatchable on the join it made
 in the first place — which is the ordinary steady state, one join and no
 download.
 
+**Step 4 needs no configuration of its own, and that is the point of
+`package_registry:`.** On a network that mandates an internal npm mirror, a
+`bun install` against the public registry is an install that cannot complete —
+and nothing a worker holds but the artifact could tell it otherwise. So a target
+that declares a `package_registry:` (`docs/grammar.md` §14.6, PRD resolved q59)
+has `build` write a `bunfig.toml` and an `.npmrc` into the tree, as ordinary
+members of `ARTIFACT_FILES` covered by `ARTIFACT_HASH`: they arrive in the
+tarball step 2 fetched, are unpacked by step 3 into the directory step 4 runs in,
+and the installer reads them because they sit beside `package.json`. **Nothing in
+this document changes** — no route, no field, no step. A credential in them is
+the *name* of an environment variable, expanded by the installer, so the tarball
+carries no secret and a rotated token is the same artifact under the same hash;
+the variable itself is on the worker's own manifest, which is §9.1's business.
+
 ### 4.1 The handshake triple
 
 A join agrees on three values, and all three are on the wire, in the join §3.1
@@ -1462,8 +1476,21 @@ Which gives, concretely:
   moves them off the hub's. An unplaced `tool.*` a `function:` node names is the
   same case for the same reason;
 - a variable referenced from the deploy layer itself — a storage backend, an
-  event source, `hub.join_token:` — belongs to the hub's. A **storage backend**
-  is the one entry of that layer a placement can also reach, and it reads like a
+  event source, `hub.join_token:` — belongs to the hub's. Two entries of that
+  layer a placement can **also** reach are the exceptions, and each adds
+  placements without moving anything off the hub's list. The first is a
+  **package registry** (`docs/grammar.md` §14.6, PRD resolved q59), and it is the
+  widest membership anything here has: its credential belongs to the hub's
+  manifest **and to every placement's**, because every one of those processes
+  runs an install — the hub installs the project it serves, and a worker runs
+  `bun install` over each artifact it materialises (§4 step 4). It is the one
+  variable on a manifest that no *running* process spends: what reads it is the
+  installer, over the emitted `bunfig.toml`/`.npmrc`, before any of this
+  project's code exists. It is on the manifest all the same, and deliberately —
+  neither installer treats an unset reference as an error, it goes out as text
+  and the mirror answers `401`, so §9.2's join-time check is what turns that into
+  a named variable at the moment a machine joins rather than at its first
+  dispatch. The second is a **storage backend**, and it reads like a
   conflict with the executes-in rule above until the two are read the way the
   unplaced-agent clause is read: the credential that opens a store is spent in
   whichever process opens it, so a backend's variables belong to the hub's

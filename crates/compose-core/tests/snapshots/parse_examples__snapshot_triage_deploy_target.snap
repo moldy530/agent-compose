@@ -86,10 +86,33 @@ Deploy(
                 span: 30:3..40:26,
             },
         ),
+        package_registry: Some(
+            PackageRegistrySection {
+                url: Some(
+                    "https://npm.internal.example/repository/npm-group/" @ 50:8..50:60,
+                ),
+                token: Some(
+                    env("${NPM_MIRROR_TOKEN}") @ 51:10..51:29,
+                ),
+                scopes: [
+                    PackageRegistryScope {
+                        name: "@corp" @ 54:5..54:12,
+                        url: Some(
+                            "https://npm.internal.example/repository/corp/" @ 55:12..55:59,
+                        ),
+                        token: Some(
+                            env("${NPM_CORP_TOKEN}") @ 56:14..56:31,
+                        ),
+                        span: 54:5..56:31,
+                    },
+                ],
+                span: 50:3..56:31,
+            },
+        ),
         trace_sink: Some(
             TraceSinkSection {
                 url: Some(
-                    "https://collector.internal.example/v1/traces" @ 51:8..51:54,
+                    "https://collector.internal.example/v1/traces" @ 67:8..67:54,
                 ),
                 format: None,
                 auth: Some(
@@ -97,52 +120,52 @@ Deploy(
                         bearer: Some(
                             BearerAuth {
                                 token: Some(
-                                    env("${TRACE_SINK_TOKEN}") @ 54:14..54:33,
+                                    env("${TRACE_SINK_TOKEN}") @ 70:14..70:33,
                                 ),
                                 header: None,
                                 prefix: None,
                             },
                         ),
                         hmac: None,
-                    } @ 53:5..54:33,
+                    } @ 69:5..70:33,
                 ),
-                span: 51:3..54:33,
+                span: 67:3..70:33,
             },
         ),
         event_sources: Some(
             EventSourcesSection {
                 sources: [
                     EventSource {
-                        name: "bug_reports" @ 59:3..59:14,
+                        name: "bug_reports" @ 75:3..75:14,
                         kind: Some(
-                            RedisStreams @ 60:11..60:24,
+                            RedisStreams @ 76:11..76:24,
                         ),
                         connection: [
                             ConnectionField {
-                                name: "url" @ 61:5..61:8,
-                                value: env("${REDIS_URL}") @ 61:10..61:22,
+                                name: "url" @ 77:5..77:8,
+                                value: env("${REDIS_URL}") @ 77:10..77:22,
                             },
                         ],
                         extra: [
                             PluginEntry {
-                                key: "stream" @ 62:5..62:11,
+                                key: "stream" @ 78:5..78:11,
                                 value: Text(
                                     "bug-reports",
-                                ) @ 62:13..62:24,
+                                ) @ 78:13..78:24,
                             },
                             PluginEntry {
-                                key: "consumer_group" @ 63:5..63:19,
+                                key: "consumer_group" @ 79:5..79:19,
                                 value: Text(
                                     "agent-compose",
-                                ) @ 63:21..63:34,
+                                ) @ 79:21..79:34,
                             },
                         ],
-                        span: 59:3..63:34,
+                        span: 75:3..79:34,
                     },
                 ],
-                span: 59:3..63:34,
+                span: 75:3..79:34,
             },
         ),
-        span: 4:1..63:34,
+        span: 4:1..79:34,
     },
 )

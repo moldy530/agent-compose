@@ -68,6 +68,10 @@
       },
       "additionalProperties": false
     },
+    "package_registry": {
+      "description": "DEPLOY FILE ONLY. Where a generated project's installer resolves packages from; build writes a bunfig.toml and an .npmrc from it. Grammar 14.6 / PRD resolved q59.",
+      "$ref": "#/$defs/packageRegistry"
+    },
     "trace_sink": {
       "description": "DEPLOY FILE ONLY. Where every settled execution's trace ships, on the same journal-backed at-least-once delivery a callback: uses. Grammar 14.5 / PRD resolved q50, q51.",
       "$ref": "#/$defs/traceSink"
@@ -93,6 +97,7 @@
     "hub": ["version"],
     "placements": ["version"],
     "storage_backends": ["version"],
+    "package_registry": ["version"],
     "trace_sink": ["version"],
     "event_sources": ["version"]
   },
@@ -117,6 +122,7 @@
     "hub": { "$ref": "#/$defs/deployFileOnly" },
     "placements": { "$ref": "#/$defs/deployFileOnly" },
     "storage_backends": { "$ref": "#/$defs/deployFileOnly" },
+    "package_registry": { "$ref": "#/$defs/deployFileOnly" },
     "trace_sink": { "$ref": "#/$defs/deployFileOnly" },
     "event_sources": { "$ref": "#/$defs/deployFileOnly" }
   },
@@ -129,13 +135,14 @@
           { "required": ["hub"] },
           { "required": ["placements"] },
           { "required": ["storage_backends"] },
+          { "required": ["package_registry"] },
           { "required": ["trace_sink"] },
           { "required": ["event_sources"] }
         ]
       }
     },
     "deployFileOnly": {
-      "description": "A deploy file carries only version + hub/placements/storage_backends/trace_sink/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
+      "description": "A deploy file carries only version + hub/placements/storage_backends/package_registry/trace_sink/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
       "not": {
         "anyOf": [
           { "required": ["imports"] },
@@ -2854,6 +2861,50 @@
         "auth": {
           "description": "How a delivery identifies itself to the sink: the outbound signing shape of grammar 13.3, because a sink delivery is a delivery and carries the same X-AgentCompose- headers. At least one scheme, and both together are legal.",
           "$ref": "#/$defs/callbackAuth"
+        }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "packageRegistry": {
+      "description": "DEPLOY FILE ONLY. Where a generated project's installer resolves packages from. build writes a bunfig.toml and an .npmrc from it, both pure-generated members of the emitted file list, so a worker that materialises the artifact installs through the mirror too. A token is the NAME of an environment variable, which the installer expands at install time (grammar 14.6 / PRD resolved q59).",
+      "type": "object",
+      "properties": {
+        "url": {
+          "description": "The registry every package resolves from: an absolute http or https URL naming a host, its scheme spelled lowercase. This deployment's own mirror rather than a pattern, so it carries no wildcard.",
+          "allOf": [
+            { "$ref": "#/$defs/noEnvRefString" },
+            { "pattern": "^https?://[^\\s/?#*]+([/?#][^\\s*]*)?$" }
+          ]
+        },
+        "token": {
+          "description": "The credential the installer presents, as an ${ENV} reference. Omit it for a mirror that reads through without one.",
+          "$ref": "#/$defs/envRef"
+        },
+        "scopes": {
+          "description": "Per-scope overrides, keyed by the npm scope written with its @ - \"@corp\", the scope of @corp/ui - because that is how it is emitted, into .npmrc's @corp:registry= line and Bun's [install.scopes] table.",
+          "type": "object",
+          "propertyNames": { "pattern": "^@[a-z0-9][a-z0-9._-]*$" },
+          "additionalProperties": { "$ref": "#/$defs/packageRegistryScope" }
+        }
+      },
+      "required": ["url"],
+      "additionalProperties": false
+    },
+    "packageRegistryScope": {
+      "description": "One scope's registry: the same two keys the block itself takes, under the same rules (grammar 14.6).",
+      "type": "object",
+      "properties": {
+        "url": {
+          "description": "The registry packages in this scope resolve from: an absolute http or https URL naming a host, its scheme spelled lowercase, no wildcard.",
+          "allOf": [
+            { "$ref": "#/$defs/noEnvRefString" },
+            { "pattern": "^https?://[^\\s/?#*]+([/?#][^\\s*]*)?$" }
+          ]
+        },
+        "token": {
+          "description": "This scope's own credential, as an ${ENV} reference.",
+          "$ref": "#/$defs/envRef"
         }
       },
       "required": ["url"],

@@ -1,0 +1,12 @@
+# rule: a `package_registry:` is reached over http or https (grammar 14.6)
+# code: invalid-value
+# message: "file:///srv/npm-mirror" is not a `package_registry.url`: it names the scheme `file`, and a registry is reached over `http` or `https`
+# at: 12:8
+# help: the registry is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work (grammar 14.6, PRD resolved q59)
+version: "0.1"
+
+# A registry served off a filesystem path is a real arrangement and neither
+# installer's registry setting is how it is reached: `file://` is a package
+# specifier, not a registry.
+package_registry:
+  url: "file:///srv/npm-mirror"

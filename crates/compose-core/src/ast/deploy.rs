@@ -133,6 +133,53 @@ impl TraceSinkFormat {
     }
 }
 
+/// The `package_registry:` section (grammar 14.6, PRD resolved q59).
+///
+/// Where a generated project's **installer** resolves packages from. A
+/// deploy-layer key for the reason the journal and the trace sink are ones (PRD
+/// resolved q27, q50): which registry a machine may reach is a placement fact,
+/// and placement facts belong in deploy files. The composition says nothing.
+///
+/// It is the one deploy-layer section whose effect is not on a running process
+/// at all — `build` writes it out as `bunfig.toml` and `.npmrc`, and the two
+/// installers read those before any of this project's code exists.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackageRegistrySection {
+    /// `url:` — required; the registry every package resolves from unless a
+    /// scope names another. An absolute `http`/`https` address, shape-checked
+    /// the way [`HubSection::public_url`] and [`TraceSinkSection::url`] are, and
+    /// a class-3 string for the same reason (grammar 4.3, Decision D92).
+    pub url: Option<Spanned<String>>,
+    /// `token:` — the credential the installer presents, as an `${ENV}`
+    /// reference and never a literal (grammar 4.3, PRD resolved q32). Absent
+    /// where the mirror wants none, which is the ordinary read-through case.
+    pub token: Option<Spanned<EnvRef>>,
+    /// `scopes:` — per-scope overrides, in declaration order. Corporate setups
+    /// routinely split a private scope off a read-through mirror, which is why
+    /// the slot has this second half at all.
+    pub scopes: Vec<PackageRegistryScope>,
+    /// The section's own span.
+    pub span: Span,
+}
+
+/// One entry of `package_registry.scopes` (grammar 14.6).
+///
+/// The key is an npm **scope**, written with its `@` — `"@corp"` — because that
+/// is how a scope is spelled everywhere else a reader meets one: in a package
+/// name, in `.npmrc`'s `@corp:registry=`, and in Bun's `[install.scopes]` table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackageRegistryScope {
+    /// The scope, from the section key, `@` included.
+    pub name: Spanned<String>,
+    /// `url:` — required, the same shape rule the section's own takes.
+    pub url: Option<Spanned<String>>,
+    /// `token:` — optional, the same env-ref rule the section's own takes.
+    pub token: Option<Spanned<EnvRef>>,
+    /// The whole entry's span, name and body together. [`Self::name`] carries
+    /// the name alone, for the diagnostics that are about it.
+    pub span: Span,
+}
+
 /// The `storage_backends:` section (grammar 14.3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StorageBackendsSection {

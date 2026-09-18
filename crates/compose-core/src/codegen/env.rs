@@ -110,6 +110,18 @@ fn backend_owner(site: &str) -> String {
     format!("{DEPLOY_OWNER}{site}")
 }
 
+/// The owner key the `package_registry:` credentials are filed under
+/// (grammar 14.6, PRD resolved q59).
+///
+/// A key of its own for [`backend_owner`]'s reason, arrived at from the other
+/// end: a registry token is spent by whichever process runs `bun install`, and
+/// every process does. The hub installs the project it serves, and a worker
+/// installs the artifact it materialises (`docs/distributed.md` §4 step 4) — so
+/// this owner runs in **every** process of the deployment, which is the widest
+/// membership any surface has and the honest one. §9.1's fifth clause holds as
+/// it does for a backend: the hub keeps it, and the placements are added.
+const REGISTRY_OWNER: &str = "deploy:package_registry";
+
 /// Which processes each reference-holding surface can execute in
 /// (`docs/distributed.md` §9.1).
 ///
@@ -234,6 +246,21 @@ impl Partition {
         // The deploy layer and the trigger table are the hub's, always
         // (§9.1's fifth clause).
         arrive(&mut runs, DEPLOY_OWNER, Process::Hub, own(None));
+        // …and the installer configuration is **every** process's, because
+        // every process installs: the hub installs the project it serves, and a
+        // worker runs `bun install` over the artifact it just materialised
+        // (`docs/distributed.md` §4 step 4, grammar 14.6). Like the backend
+        // clause below, this only ever adds processes.
+        if let Some(registry) = ir.deploy.package_registry.as_ref() {
+            for process in &processes {
+                arrive(
+                    &mut runs,
+                    REGISTRY_OWNER,
+                    process.clone(),
+                    own(Some(&registry.span)),
+                );
+            }
+        }
         // …and each `storage_backends:` entry is the hub's too, unconditionally
         // and for the same clause. The pass below **adds** the placements whose
         // components open a store bound to it; nothing takes it off the hub's
@@ -785,6 +812,33 @@ impl References {
                 let site = format!("deploy.storage_backends.aliases.{alias}");
                 if wanted(&backend_owner(&site)) {
                     references.backend(config, &site);
+                }
+            }
+        }
+
+        // **Before** the deploy layer's own gate, for the backend's reason read
+        // the other way round: a registry credential is spent wherever an
+        // install runs, which is the hub *and* every placement that materialises
+        // the artifact (PRD resolved q41, q59, `docs/distributed.md` §4, §9.1).
+        //
+        // It is a credential no *running* process spends: what reads it is
+        // `bun install` over the emitted `bunfig.toml`/`.npmrc`, before this
+        // project's code exists. It is on the manifest all the same, and
+        // deliberately — an unset variable is not an install-time error in
+        // either installer, so the presence check at launch and at join is what
+        // turns a `401` from a mirror into a named variable (resolved q15).
+        if let Some(registry) = &ir.deploy.package_registry
+            && wanted(REGISTRY_OWNER)
+        {
+            if let Some(token) = &registry.token {
+                references.record(&token.value.name, "deploy.package_registry.token");
+            }
+            for (scope, entry) in &registry.scopes {
+                if let Some(token) = &entry.token {
+                    references.record(
+                        &token.value.name,
+                        &format!("deploy.package_registry.scopes.{scope}.token"),
+                    );
                 }
             }
         }

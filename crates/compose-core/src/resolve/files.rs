@@ -452,6 +452,7 @@ fn deploy(
                     placements: None,
                     hub: None,
                     storage_backends: None,
+                    package_registry: None,
                     trace_sink: None,
                     event_sources: None,
                     span: file.span,
@@ -565,6 +566,11 @@ fn deploy_section_span(file: &DeployFile) -> Option<Span> {
         .or_else(|| file.placements.as_ref().map(|section| section.span.clone()))
         .or_else(|| {
             file.storage_backends
+                .as_ref()
+                .map(|section| section.span.clone())
+        })
+        .or_else(|| {
+            file.package_registry
                 .as_ref()
                 .map(|section| section.span.clone())
         })

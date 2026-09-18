@@ -8,7 +8,8 @@ compositions.
 
 A deploy file is never imported. It is a document kind of its own, and the two
 kinds are disjoint — a spec file declaring `hub:`, `placements:`,
-`storage_backends:`, `trace_sink:` or `event_sources:` is an error, and so is a
+`storage_backends:`, `package_registry:`, `trace_sink:` or `event_sources:` is an
+error, and so is a
 deploy file declaring definitions, `imports:`, `state:`, `triggers:` or
 `defaults:`.
 
@@ -30,6 +31,14 @@ storage_backends:
     kv: { provider: redis, url: "${REDIS_URL}" }
   aliases:
     docs_db: { provider: chroma, url: "${CHROMA_URL}" }
+
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}
+  scopes:
+    "@corp":
+      url: "https://npm.internal.example/repository/corp/"
+      token: ${NPM_CORP_TOKEN}
 
 trace_sink:
   url: "https://collector.internal.example/v1/traces"
@@ -209,6 +218,48 @@ env-ref values only.
 Capability checks apply at the alias definition: a `vector` store bound to a
 non-vector-capable provider is a compile error.
 
+## `package_registry` — where the installer resolves packages
+
+A built project is a plain npm project: somebody runs `bun install` in it, and on
+a mesh every worker runs one over the artifact it just materialised. On a network
+that mandates an internal mirror, the public registry is blocked, and a
+`bunfig.toml` you drop beside the emitted project is not in the artifact — so the
+workers never see it. Where a package resolves from is a placement fact, so it
+lives here.
+
+| Key | Shape |
+|---|---|
+| `url` | required; an absolute `http`/`https` URL naming a host, no wildcard |
+| `token` | an `${ENV}` reference, never a literal; omit it for a mirror that reads through without one |
+| `scopes` | scope (written with its `@`) → `{ url, token? }`, for the scopes that resolve somewhere of their own |
+
+`agent-compose build main.yml --target staging` turns that into **two** generated files beside
+`package.json`: a `bunfig.toml` for Bun, which is the default installer, and an
+`.npmrc` for npm and pnpm, which is the supported fallback. Both are on the
+emitted file list — `build` overwrites them, `build --check` compares them, and a
+build into a directory where your own `.npmrc` already sits is refused naming it.
+A target that declares no `package_registry:` gets **neither** file: there are no
+empty stubs.
+
+Three things worth knowing:
+
+- **A token is a name, not a secret.** Each file carries the environment
+  variable's *reference* in that installer's own spelling — `${NPM_TOKEN}` in
+  `.npmrc`, `$NPM_TOKEN` in `bunfig.toml` — and the installer expands it when it
+  runs. Nothing secret is in the built directory, nothing secret crosses a mesh,
+  and rotating the token does not change the artifact's hash, so workers are not
+  redeployed over a credential change.
+- **An unset variable is not an install-time error.** Both installers send the
+  reference as text and the registry answers `401`. What names the variable
+  instead is the environment manifest: this credential is on the hub's list *and*
+  on every placement's, because every process installs — so `readEnvironment()`
+  refuses at launch naming it, and a worker without it is refused at join.
+- **npm authenticates by address, not by scope.** The `.npmrc` credential line is
+  `//host/path/:_authToken=${VAR}`, keyed by the registry's own directory. Two
+  entries whose URLs share that directory would write one line twice, so
+  `validate` refuses them naming both — give each its own path on the mirror
+  (trailing `/` included), or give both the same variable.
+
 ## `trace_sink` — where every trace goes
 
 Every other way of reading a trace is somebody asking for **one**: `run --format
@@ -384,4 +435,4 @@ outside the list — see `agent-compose docs triggers`. What that adds to a
 the manifest a built project checks at process start, so a deployment receiving
 only the secrets its own surfaces name receives these too.
 
-Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/trace.md`, `docs/grammar.md` §14, §14.1–14.5, §15
+Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/trace.md`, `docs/grammar.md` §14, §14.1–14.6, §15

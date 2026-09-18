@@ -46,6 +46,10 @@ pub struct Deploy {
     /// it holds two maps rather than one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_backends: Option<StorageBackends>,
+    /// `package_registry:` — where this target's installer resolves packages
+    /// from (grammar 14.6, PRD resolved q59).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_registry: Option<PackageRegistry>,
     /// `trace_sink:` — where every settled execution's trace ships
     /// (grammar 14.5, PRD resolved q50).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +82,52 @@ pub struct TraceSink {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<crate::ir::trigger::CallbackAuth>,
     /// The section's own span.
+    pub span: Span,
+}
+
+/// The `package_registry:` block, resolved (grammar 14.6, PRD resolved q59).
+///
+/// A struct beside [`Section`] rather than one of them, for the reason [`Hub`]
+/// and [`TraceSink`] are: it is the deployment's own singleton rather than a map
+/// of named entries — with one map hanging off it, which is the per-scope half.
+///
+/// It is the one part of the deploy layer no *running* process reads. `build`
+/// lowers it to `bunfig.toml` and `.npmrc` (`codegen::registry`), and the two
+/// installers read those before this project's own code exists, which is why the
+/// token here is an unresolved reference like every other credential: what ships
+/// in the artifact is the variable's **name**, and the installer expands it
+/// (PRD resolved q32, q40).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PackageRegistry {
+    /// `url:` — the registry every package resolves from unless a scope names
+    /// another.
+    pub url: Spanned<String>,
+    /// `token:` — the credential the installer presents, unresolved
+    /// (grammar 4.3), absent where the mirror reads through without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<Spanned<EnvRef>>,
+    /// `scopes:` — the per-scope overrides, keyed by the scope with its `@`.
+    /// Sorted: a config object's key order carries nothing, and the emitted
+    /// files are a function of what was declared rather than of the order it was
+    /// written in.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub scopes: BTreeMap<String, PackageRegistryScope>,
+    /// The section's own span.
+    pub span: Span,
+}
+
+/// One entry of `package_registry.scopes` (grammar 14.6).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PackageRegistryScope {
+    /// The scope, repeated from the key with its own span — which is what
+    /// carries the span a diagnostic about the entry points at.
+    pub name: Spanned<String>,
+    /// `url:` — the registry packages in this scope resolve from.
+    pub url: Spanned<String>,
+    /// `token:` — this scope's own credential, unresolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<Spanned<EnvRef>>,
+    /// The whole entry's span.
     pub span: Span,
 }
 
