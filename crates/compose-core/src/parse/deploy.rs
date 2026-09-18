@@ -349,7 +349,7 @@ const PACKAGE_REGISTRY_URL: UrlSubject = UrlSubject {
         "a registry credential is `token:`, the `${ENV}` reference each installer expands for itself",
     ),
     derives_an_address: true,
-    help: "the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them. It is an address and nothing more: no query and no fragment, a host of ASCII letters, digits, `-`, `_` and `.` with an optional port, and a path spelled in characters a WHATWG `URL` leaves alone — npm looks a credential up under the address it parses out of its own request, so a spelling that parse rewrites is a line npm never reads (grammar 14.6, PRD resolved q59)",
+    help: "the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them. It is an address and nothing more: no query and no fragment, a host of ASCII letters, digits, `-`, `_` and `.` with an optional port, and a path spelled in characters a WHATWG `URL` leaves alone, its `.` and `..` segments written in dots rather than in `%2e` — npm looks a credential up under the address it parses out of its own request, so a spelling that parse rewrites is a line npm never reads (grammar 14.6, PRD resolved q59)",
 };
 
 /// Read one absolute-URL key, refusing what its [`UrlSubject`] describes.
@@ -499,7 +499,17 @@ fn url_problem(url: &str, subject: &UrlSubject) -> Option<String> {
 /// * **a path character it percent-encodes** — every ASCII control, everything
 ///   above `~`, and the six graphic characters in the WHATWG path percent-encode
 ///   set (`"`, `<`, `>`, `` ` ``, `{`, `}`), plus the `\` it turns into `/`. A
-///   `%` in a *path* is left alone by the parse and so is left alone here.
+///   `%` in a *path* is left alone by the parse as a **character**, and so is
+///   left alone here — but not as a whole segment, which is the arm below;
+/// * **a `.` or `..` path segment spelled with a `%2e`** — that parse's
+///   dot-segment rules are written over the escape as well as over the
+///   character. A single-dot segment is `.` or an ASCII case-insensitive `%2e`;
+///   a double-dot segment is `..`, `.%2e`, `%2e.` or `%2e%2e`, in any case. All
+///   six resolve, and `codegen::registry::canonical_directory` resolves the two
+///   written in dots alone — so `…/a/%2e%2e/repo/` would key at
+///   `//host/a/%2e%2e/repo/` while npm walks up from `//host/repo/lodash`,
+///   which is the silent failure again. Three dots or more is an ordinary
+///   segment to that parse and so to this arm.
 fn respelled_address_problem(authority: &str, path: &str, own: &str) -> Option<String> {
     if let Some(delimiter) = path
         .chars()
@@ -571,7 +581,59 @@ fn respelled_address_problem(authority: &str, path: &str, own: &str) -> Option<S
             spelled(character)
         ));
     }
+    if let Some((segment, dots)) = path.split('/').find_map(|segment| {
+        a_dot_segment_spelled_with_an_escape(segment).map(|dots| (segment, dots))
+    }) {
+        return Some(format!(
+            "carries the path segment `{segment}`, and {derived} — that parse reads a whole \
+             segment of `%2e` as a `.`, in either case, so this is a `{dots}` segment it resolves \
+             rather than writing back; write `{dots}`"
+        ));
+    }
     None
+}
+
+/// The `.` or `..` a WHATWG `URL` reads this path segment as, where the segment
+/// spells one with a `%2e` escape rather than in dots alone.
+///
+/// That parse's dot-segment rules are written over the escape as well as over
+/// the character: a single-dot segment is `.` or an ASCII case-insensitive
+/// `%2e`, and a double-dot segment is `..` or an ASCII case-insensitive `.%2e`,
+/// `%2e.` or `%2e%2e`. All six resolve on the request npm parses, while
+/// `codegen::registry::canonical_directory` resolves the two written in dots
+/// alone — so the four escaped spellings are refused at the `url:`, and the
+/// emitter never has to decode a percent-escape to stay right.
+///
+/// `None` for `.` and `..` themselves, which the emitter does resolve, and for
+/// three dots or more, which that parse reads as an ordinary segment
+/// (`/a/.../b` and `/a/%2e%2e%2e/b` both keep their middle segment).
+fn a_dot_segment_spelled_with_an_escape(segment: &str) -> Option<&'static str> {
+    if matches!(segment, "." | "..") {
+        return None;
+    }
+    let mut rest = segment;
+    let mut dots = 0_usize;
+    while !rest.is_empty() {
+        rest = if let Some(tail) = rest.strip_prefix('.') {
+            tail
+        } else if rest
+            .get(..3)
+            .is_some_and(|head| head.eq_ignore_ascii_case("%2e"))
+        {
+            &rest[3..]
+        } else {
+            return None;
+        };
+        dots += 1;
+        if dots > 2 {
+            return None;
+        }
+    }
+    match dots {
+        1 => Some("."),
+        2 => Some(".."),
+        _ => None,
+    }
 }
 
 /// A character as a refusal spells it: as written where it is a printable ASCII
@@ -1641,6 +1703,30 @@ mod tests {
                 Some("//npm.internal.example/a%01b/"),
                 format!("carries `\\u{{1}}` in its path, and {DERIVED} — that parse rewrites this character rather than writing it back"),
             ),
+            // A dot segment is a dot segment to that parse however it is
+            // spelled: `%2e` is a `.` and `%2e%2e`, `.%2e` and `%2e.` are a
+            // `..`, in either case — so the path it walks is not the path this
+            // text writes, and the key stops nowhere npm visits.
+            (
+                "https://npm.internal.example/a/%2e%2e/repo/",
+                Some("//npm.internal.example/repo/"),
+                format!("carries the path segment `%2e%2e`, and {DERIVED} — that parse reads a whole segment of `%2e` as a `.`, in either case, so this is a `..` segment it resolves rather than writing back; write `..`"),
+            ),
+            (
+                "https://npm.internal.example/a/%2E./repo/",
+                Some("//npm.internal.example/repo/"),
+                format!("carries the path segment `%2E.`, and {DERIVED} — that parse reads a whole segment of `%2e` as a `.`, in either case, so this is a `..` segment it resolves rather than writing back; write `..`"),
+            ),
+            (
+                "https://npm.internal.example/a/.%2e/repo/",
+                Some("//npm.internal.example/repo/"),
+                format!("carries the path segment `.%2e`, and {DERIVED} — that parse reads a whole segment of `%2e` as a `.`, in either case, so this is a `..` segment it resolves rather than writing back; write `..`"),
+            ),
+            (
+                "https://npm.internal.example/%2e/repo/",
+                Some("//npm.internal.example/repo/"),
+                format!("carries the path segment `%2e`, and {DERIVED} — that parse reads a whole segment of `%2e` as a `.`, in either case, so this is a `.` segment it resolves rather than writing back; write `.`"),
+            ),
         ] {
             assert_eq!(
                 url_problem(url, &PACKAGE_REGISTRY_URL).as_deref(),
@@ -1725,6 +1811,22 @@ mod tests {
             (
                 "https://npm.internal.example/a%2Fb/",
                 "//npm.internal.example/a%2Fb/",
+            ),
+            // A `%2e` is a dot segment to that parse only as a **whole**
+            // segment, and only one or two of them: these three are ordinary
+            // segments it writes back untouched, so the refusal above must not
+            // reach them.
+            (
+                "https://npm.internal.example/a%2eb/",
+                "//npm.internal.example/a%2eb/",
+            ),
+            (
+                "https://npm.internal.example/%2e%2e%2e/repo/",
+                "//npm.internal.example/%2e%2e%2e/repo/",
+            ),
+            (
+                "https://npm.internal.example/.../repo/",
+                "//npm.internal.example/.../repo/",
             ),
         ] {
             assert_eq!(

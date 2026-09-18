@@ -2871,7 +2871,7 @@
       "type": "object",
       "properties": {
         "url": {
-          "description": "The registry every package resolves from: an absolute http or https URL naming a host, its scheme spelled lowercase. This deployment's own mirror rather than a pattern, so it carries no wildcard - and no credential before an @ in its authority, because that is a literal secret in two emitted files and in the artifact hash over them; the credential is token:. It is an address and nothing more: no query, no fragment, a host of ASCII letters, digits, -, _ and . with an optional port, and a path spelled in characters a WHATWG URL leaves alone, because npm looks a credential up under the address it parses out of its own request rather than under this text.",
+          "description": "The registry every package resolves from: an absolute http or https URL naming a host, its scheme spelled lowercase. This deployment's own mirror rather than a pattern, so it carries no wildcard - and no credential before an @ in its authority, because that is a literal secret in two emitted files and in the artifact hash over them; the credential is token:. It is an address and nothing more: no query, no fragment, a host of ASCII letters, digits, -, _ and . with an optional port, and a path spelled in characters a WHATWG URL leaves alone with its . and .. segments written in dots rather than in %2e, because npm looks a credential up under the address it parses out of its own request rather than under this text.",
           "allOf": [
             { "$ref": "#/$defs/noEnvRefString" },
             { "pattern": "^https?://[a-zA-Z0-9._-]+(:[0-9]{1,5})?(/[!$-)+-;=@-\\[\\]-_a-z|~]*)?$" }

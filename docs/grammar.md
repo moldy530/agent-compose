@@ -5343,8 +5343,19 @@ The rules (Decision
    * **the path is spelled in characters that parse leaves alone.** It
      percent-encodes every ASCII control, everything above `~`, and `"`, `<`,
      `>`, `` ` ``, `{`, `}`; it turns a `\` into a `/`. `|`, `^`, `[`, `]`,
-     `'`, `;`, `@` and a `%` escape all survive a path unchanged and are legal
-     here.
+     `'`, `;`, `@` and a `%` escape all survive a path unchanged as
+     **characters** and are legal here; a `%2e` that is a whole *segment* is the
+     next rule rather than this one.
+   * **a `.` or `..` path segment is written in dots, not in `%2e`.** That
+     parse's dot-segment rules are spelled over the escape as well as over the
+     character: a whole segment of `%2e` is a `.`, and `%2e%2e`, `.%2e` and
+     `%2e.` are a `..`, in either case. All of them resolve on the request, so
+     `…/a/%2e%2e/repo/` is walked as `//host/repo/` while a key derived from the
+     text reads `//host/a/%2e%2e/repo/` — the same silent failure by another
+     spelling. The escaped forms are refused and the dotted ones are resolved by
+     the emitter, which is what keeps rule 5's list at three. A `%2e` inside a
+     longer segment (`/a%2eb/`) and a segment of three dots or more are ordinary
+     to that parse and legal here.
 
    The refusal names the character or the part it found, and the same list is
    what lets the emitter normalize exactly three things — a host's case, the
@@ -5392,8 +5403,9 @@ The rules (Decision
    of what the emitter reproduces**, and rule 1 is what makes that honest: every
    other spelling the parse would rewrite — a query, a fragment, a non-ASCII or
    percent-escaped host, an IP literal, a renumbered port, a `\`, a path
-   character it percent-encodes — is refused at the `url:` instead, so the
-   compiler never has to reimplement a WHATWG `URL` to stay right. A key spelled
+   character it percent-encodes, a dot segment spelled with a `%2e` — is
+   refused at the `url:` instead, so the compiler never has to reimplement a
+   WHATWG `URL` to stay right. A key spelled
    any other way is one npm never looks up, and the failure is silent in the
    worst direction: the `npm install` goes out unauthenticated while the
    `bun install` from the same artifact, which carries the token inside its
@@ -9271,13 +9283,19 @@ three things. It ends the path at a `?` or a `#`; it punycodes a non-ASCII host
 and percent-decodes an escape in one; it re-serializes a bracketed IPv6 literal
 in compressed form and a numeric host as a dotted quad, in whatever base the
 author wrote it (`010.0.0.5` is `8.0.0.5`); it reads a port as a number
-(`:08443` is `:8443`, an empty `:` is nothing); it turns a `\` into a `/`; and
-it percent-encodes every ASCII control, everything above `~`, and `"`, `<`, `>`,
-`` ` ``, `{`, `}` in a path. Each of those makes the emitted key an address npm
-never visits — the same silent one-artifact / two-answers failure, reached by a
-spelling rather than by a collision — so §14.6 rule 1 refuses them at the `url:`
-and the compiler never has to carry an IDNA table or an IP-literal serializer to
-stay right. The two directions are pinned together in
+(`:08443` is `:8443`, an empty `:` is nothing); it turns a `\` into a `/`; it
+percent-encodes every ASCII control, everything above `~`, and `"`, `<`, `>`,
+`` ` ``, `{`, `}` in a path; and it resolves a dot segment spelled with a `%2e`
+as readily as one spelled in dots, its own rules naming `%2e` a `.` and
+`%2e%2e`, `.%2e` and `%2e.` a `..`, in either case. Each of those makes the
+emitted key an address npm never visits — the same silent one-artifact /
+two-answers failure, reached by a spelling rather than by a collision. The
+escaped dot segment reaches it from the other side too: two entries that derive
+two compiler keys can be one address to npm, which walks the resolved path, so
+rule 5's pair of refusals stays silent while npm spends whichever `_authToken`
+line the ini parser kept — the credential-leaking direction. §14.6 rule 1
+refuses them all at the `url:`, and the compiler never has to carry an IDNA
+table or an IP-literal serializer to stay right. The two directions are pinned together in
 `crates/compose-core/src/parse/deploy.rs`, where each refused spelling is
 asserted beside the key npm would actually look up for it: a rule relaxed there
 without a normalization added in `codegen::registry::npm_auth_key` fails the

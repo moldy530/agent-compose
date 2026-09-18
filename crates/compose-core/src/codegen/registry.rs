@@ -210,13 +210,14 @@ fn token(reference: Option<&crate::diag::Spanned<crate::ast::common::EnvRef>>) -
 /// rather than this function reimplementing a WHATWG `URL`. A punycoded host,
 /// a percent-escape decoded out of an authority, a renumbered port, an IPv4
 /// literal re-serialized as a dotted quad, a `\` turned into a `/`, a
-/// percent-encoded path character, and a query or a fragment that ends the path
-/// early are all compile errors at `package_registry.url:`
-/// (`parse::deploy::respelled_address_problem`, grammar 14.6 rule 1). So what
-/// reaches here is an address whose host differs from the parse's by case
-/// alone, whose port is written back unchanged or is the scheme's own default,
-/// and whose path a WHATWG `URL` alters only by resolving dot segments — which
-/// is exactly the list above. A rule relaxed there without a normalization
+/// percent-encoded path character, a dot segment spelled with a `%2e`, and a
+/// query or a fragment that ends the path early are all compile errors at
+/// `package_registry.url:` (`parse::deploy::respelled_address_problem`,
+/// grammar 14.6 rule 1). So what reaches here is an address whose host differs
+/// from the parse's by case alone, whose port is written back unchanged or is
+/// the scheme's own default, and whose path a WHATWG `URL` alters only by
+/// resolving dot segments written in dots — which is exactly the list above.
+/// A rule relaxed there without a normalization
 /// added here would put this claim back in the compiler's mouth, so the two
 /// sides are pinned together from the parser's, where both are visible:
 /// `parse::deploy::tests::an_address_a_url_parse_respells_is_refused_only_where_one_is_derived`.
@@ -263,6 +264,12 @@ fn canonical_authority(scheme: &str, authority: &str) -> String {
 /// A trailing `.` or `..` is resolved rather than kept, because the `/<package>`
 /// npm appends makes `new URL` resolve it on the request: `…/a/b/..` fetches
 /// `…/a/b/../lodash`, which is `…/a/lodash`, which keys at `//host/a/`.
+///
+/// Only the two spellings written *in dots* are matched here, because they are
+/// the only ones that reach this function: a WHATWG `URL` reads a whole segment
+/// of `%2e` as a `.` too — `%2e`, `.%2e`, `%2e.`, `%2e%2e`, in either case — and
+/// `parse::deploy::respelled_address_problem` refuses all four at the `url:`
+/// rather than have this function decode a percent-escape (grammar 14.6 rule 1).
 fn canonical_directory(path: &str) -> String {
     let segments: Vec<&str> = path.split('/').collect();
     let last = segments.len() - 1;
