@@ -207,6 +207,28 @@ pub(super) fn components(before: &Ir, after: &Ir) -> Vec<ComponentChange> {
         &[],
     );
 
+    // …and so is `package_registry:`, by the same shape again: one block at one
+    // address (grammar 14.6, PRD resolved q59). It is compared under `local`
+    // like the other three sections that target admits — unlike
+    // `storage_backends:`, which `local` refuses outright — so a deployment that
+    // changed where it installs from is a change a plan reports.
+    entry(
+        &mut found,
+        ComponentKind::PackageRegistry,
+        "package_registry",
+        before
+            .deploy
+            .package_registry
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        after
+            .deploy
+            .package_registry
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        &[],
+    );
+
     let sources: BTreeSet<&str> = names(before.deploy.event_sources.as_ref())
         .chain(names(after.deploy.event_sources.as_ref()))
         .collect();

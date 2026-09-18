@@ -1,6 +1,6 @@
 # agent-compose — Plan Format
 
-**Plan version:** `2`
+**Plan version:** `3`
 
 This document is **normative** for `agent-compose plan --format json`. It is the
 whole of what a consumer of that document may rely on, and §12 is the contract:
@@ -38,7 +38,8 @@ which is a report rather than a contract.
   - [12.2 What is a compatible change](#122-what-is-a-compatible-change)
   - [12.3 What requires a version bump](#123-what-requires-a-version-bump)
   - [12.4 What version `2` changed](#124-what-version-2-changed)
-  - [12.5 How the two are held together](#125-how-the-two-are-held-together)
+  - [12.5 What version `3` changed](#125-what-version-3-changed)
+  - [12.6 How the two are held together](#126-how-the-two-are-held-together)
 - [13. The human report](#13-the-human-report)
 
 ## 1. What a plan is
@@ -287,6 +288,7 @@ is accounted for.
 | `"placement"` | an entry of the active target's `placements:` |
 | `"hub"` | the active target's `hub:` block |
 | `"trace_sink"` | the active target's `trace_sink:` block |
+| `"package_registry"` | the active target's `package_registry:` block |
 | `"event_source"` | an entry of the active target's `event_sources:` |
 
 **What this section owns.** Every component arriving or leaving, and every field
@@ -303,8 +305,8 @@ Concretely, two components have fields held elsewhere:
   and what it is for. Its whole delivery surface is §6's.
 
 Everything else — an agent, a tool, a store, a provider, a model, a placement, the
-`hub:` block, the `trace_sink:` block, an event source — reports every field of
-its resolved definition here.
+`hub:` block, the `trace_sink:` block, the `package_registry:` block, an event
+source — reports every field of its resolved definition here.
 
 One field of every entry is never reported: the key the artifact repeats
 **inside** the value, so that an entry read on its own still names what it is.
@@ -320,9 +322,13 @@ Which field it is depends on what the entry is, and this is all of them:
 | a trigger | `name` |
 | a `state:` channel (§5) | `name` |
 
-The `hub:` and `trace_sink:` blocks are not in that table and need no row: each
+The `hub:`, `trace_sink:` and `package_registry:` blocks are not in that table
+and need no row: each
 is a singleton rather than an entry under a key, so nothing inside one repeats
-one.
+one. A `package_registry:` **scope** does repeat its key, as a `name` beside the
+registry it names, and it is reported inside its block rather than as a subject
+of its own — one deployment has one place it installs from, and splitting a
+scope out would make an edit to two lines of one block read as two changes.
 
 A definition's `namespace` — the tag its body is written under (grammar 2.2) — is
 equal by construction for the same reason: it follows from the address. It is
@@ -509,6 +515,7 @@ Every record names its subject by an address, and the spelling is fixed:
 | a placement | `placement.` and the name it is declared under: `placement.mac` |
 | the `hub:` block | `hub` |
 | the `trace_sink:` block | `trace_sink` |
+| the `package_registry:` block | `package_registry` |
 | an event source | `event_source.` and its logical name: `event_source.bug_reports` |
 | a node | the flow's address, a `.`, and the flow-local node id: `flow.review_loop.draft` |
 | an edge | the flow's address, a `.`, the source, `->`, and the target: `flow.review_loop.draft->review` |
@@ -660,8 +667,9 @@ a reason:
 * **`storage_backends:`** — the deploy layer's backend bindings. `plan` resolves
   the built-in `local` target on both sides (§1), and grammar 14 makes
   `storage_backends:` a compile error under `local` (Decision D87), so no
-  artifact this command can build carries one. The four sections `local` *does*
-  admit — `hub:`, `placements:`, `trace_sink:` and `event_sources:` — are
+  artifact this command can build carries one. The five sections `local` *does*
+  admit — `hub:`, `placements:`, `package_registry:`, `trace_sink:` and
+  `event_sources:` — are
   compared, and appear in §4.
 * **a declared-but-empty section**, as against an absent one. The IR draws that
   distinction — `state:` written with no channels is not `state:` unwritten — and
@@ -842,7 +850,19 @@ bump rather than an addition a reader could have absorbed. Nothing else moved:
 every key, every address spelling, the ordering and the location rule are
 version `1`'s.
 
-### 12.5 How the two are held together
+### 12.5 What version `3` changed
+
+One member again, added to the same closed vocabulary: `component` gained
+`"package_registry"`, and §8 gained the address `package_registry` that goes with
+it. The deploy layer grew a section — `package_registry:`, where a generated
+project's installer resolves packages from (`docs/grammar.md` §14.6, PRD
+resolved q59) — and it is a section the built-in `local` target admits, so a plan
+really can carry one. §12.3 makes a reader entitled to exhaust `component`, so a
+kind version `2` never listed is a bump rather than an addition a reader could
+have absorbed. Nothing else moved: every key, every address spelling, the
+ordering and the location rule are version `1`'s.
+
+### 12.6 How the two are held together
 
 `crates/compose-core/tests/plan_format_inventory.rs` reads the record types out
 of `crates/compose-core/src/plan/` and holds each of them to this file: every
