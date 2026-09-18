@@ -203,6 +203,23 @@ fn token(reference: Option<&crate::diag::Spanned<crate::ast::common::EnvRef>>) -
 ///
 /// The path's own case is left alone: a WHATWG `URL` lowercases the host and
 /// nothing else, and so does a registry that serves `/Repo/`.
+///
+/// # Why three normalizations are the whole list
+///
+/// Because the parser refuses every other spelling that parse would rewrite,
+/// rather than this function reimplementing a WHATWG `URL`. A punycoded host,
+/// a percent-escape decoded out of an authority, a renumbered port, an IPv4
+/// literal re-serialized as a dotted quad, a `\` turned into a `/`, a
+/// percent-encoded path character, and a query or a fragment that ends the path
+/// early are all compile errors at `package_registry.url:`
+/// (`parse::deploy::respelled_address_problem`, grammar 14.6 rule 1). So what
+/// reaches here is an address whose host differs from the parse's by case
+/// alone, whose port is written back unchanged or is the scheme's own default,
+/// and whose path a WHATWG `URL` alters only by resolving dot segments — which
+/// is exactly the list above. A rule relaxed there without a normalization
+/// added here would put this claim back in the compiler's mouth, so the two
+/// sides are pinned together from the parser's, where both are visible:
+/// `parse::deploy::tests::an_address_a_url_parse_respells_is_refused_only_where_one_is_derived`.
 #[must_use]
 pub fn npm_auth_key(url: &str) -> String {
     // The scheme is not part of the key (npm's own spelling starts at `//`) but

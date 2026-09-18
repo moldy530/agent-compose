@@ -849,6 +849,14 @@ fn the_published_schema_accepts_the_whole_package_registry_surface() {
         // An `@` in the *path* is a scope's own directory on the mirror, and it
         // is the shape the authority rule must not reach.
         json!({ "url": "https://npm.internal.example/repository/@corp/" }),
+        // The address rule (grammar 14.6 rules 1 and 5) refuses a query, a
+        // fragment and every character a WHATWG `URL` respells, so these are
+        // the shapes a pattern written one character too tight takes down with
+        // them: a mirror at an IPv4 address, a host with an underscore, and the
+        // path punctuation that parse leaves exactly as written.
+        json!({ "url": "https://10.0.0.5:8443/repository/npm-group/" }),
+        json!({ "url": "https://npm_mirror.internal.example/repo/" }),
+        json!({ "url": "https://npm.internal.example/a%2Fb/c'd;e[f]|g^h~i/" }),
         // A credential, which is the whole point of the key on a mirror that
         // wants one.
         json!({

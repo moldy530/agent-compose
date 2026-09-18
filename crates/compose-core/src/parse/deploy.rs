@@ -269,6 +269,32 @@ struct UrlSubject {
     /// and the one where following it writes a literal secret into two emitted
     /// files, the emitted `README.md`, and the artifact hash over all of them.
     userinfo: Option<&'static str>,
+    /// Whether an emitted file keys something by an address **derived** from
+    /// this URL rather than only writing the URL out as text.
+    ///
+    /// `false` for an ingress base and a collector address: both are written
+    /// out verbatim and nothing is computed from either, so a query, a
+    /// fragment or a host spelled a way this compiler cannot reproduce is the
+    /// author's business — refusing one there would be this compiler inventing
+    /// a rule about somebody else's deployment.
+    ///
+    /// `true` for a registry, where `.npmrc`'s credential line is keyed by the
+    /// address **npm parses out of its own request** rather than by the text of
+    /// the `url:` (grammar 14.6 rule 5,
+    /// [`codegen::registry::npm_auth_key`](crate::codegen::registry::npm_auth_key)).
+    /// A spelling that parse rewrites is a key npm never looks up, and the
+    /// failure is silent in the worst direction: `npm install` goes out
+    /// unauthenticated while the `bunfig.toml` from the same artifact, which
+    /// carries the token inside its registry object rather than keyed by an
+    /// address, authenticates. So this pass refuses every URL whose address
+    /// `npm_auth_key` could not spell back, which is what lets that function
+    /// document three normalizations rather than reimplement a WHATWG `URL`.
+    ///
+    /// Unlike every other field here, this one is a flag rather than a clause:
+    /// the arms it opens are prose about npm and `.npmrc` throughout, so a
+    /// second subject that ever derived an address of its own would need its
+    /// own sentences rather than a `true` here.
+    derives_an_address: bool,
     /// The help every refusal of this key carries.
     help: &'static str,
 }
@@ -281,6 +307,7 @@ const PUBLIC_URL: UrlSubject = UrlSubject {
     cased: "a URL derived from it is written out as text",
     reached: "a hub",
     userinfo: None,
+    derives_an_address: false,
     help: "the base is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://hub.example`; `http` stays legal, which is what makes localhost development work (grammar 14.2, PRD resolved q44)",
 };
 
@@ -292,6 +319,7 @@ const TRACE_SINK_URL: UrlSubject = UrlSubject {
     cased: "the address is written onto the request as text",
     reached: "a trace sink",
     userinfo: None,
+    derives_an_address: false,
     help: "the sink is an absolute URL naming a host, its scheme written lowercase and no wildcard in it — `https://collector.internal.example/v1/traces`; `http` stays legal, which is what makes a collector on the same host work (grammar 14.5, PRD resolved q50)",
 };
 
@@ -320,7 +348,8 @@ const PACKAGE_REGISTRY_URL: UrlSubject = UrlSubject {
     userinfo: Some(
         "a registry credential is `token:`, the `${ENV}` reference each installer expands for itself",
     ),
-    help: "the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them (grammar 14.6, PRD resolved q59)",
+    derives_an_address: true,
+    help: "the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them. It is an address and nothing more: no query and no fragment, a host of ASCII letters, digits, `-`, `_` and `.` with an optional port, and a path spelled in characters a WHATWG `URL` leaves alone — npm looks a credential up under the address it parses out of its own request, so a spelling that parse rewrites is a line npm never reads (grammar 14.6, PRD resolved q59)",
 };
 
 /// Read one absolute-URL key, refusing what its [`UrlSubject`] describes.
@@ -355,11 +384,14 @@ fn absolute_url(
 ///
 /// Completes ``` "<value>" is not a `<key>`: it … ```. The arms are ordered so
 /// each is the only answer to some value, and every one of them is reached by
-/// [`tests::every_refusal_arm_answers_some_url`] — an arm no value reaches is a
-/// message no reader has read, and the negative fixture corpus pins one rule per
-/// file rather than one arm. The wording follows `callback_allow:`'s (PRD
-/// resolved q33), because an author meeting these surfaces should meet one set
-/// of URL rules.
+/// [`tests::every_refusal_arm_answers_some_url`] — or, for the two groups a
+/// subject opts into, by
+/// [`tests::a_credential_in_the_authority_is_refused_only_where_a_token_key_exists`]
+/// and [`tests::an_address_a_url_parse_respells_is_refused_only_where_one_is_derived`].
+/// An arm no value reaches is a message no reader has read, and the negative
+/// fixture corpus pins one rule per file rather than one arm. The wording
+/// follows `callback_allow:`'s (PRD resolved q33), because an author meeting
+/// these surfaces should meet one set of URL rules.
 fn url_problem(url: &str, subject: &UrlSubject) -> Option<String> {
     if url.is_empty() {
         return Some("is empty".to_string());
@@ -420,7 +452,181 @@ fn url_problem(url: &str, subject: &UrlSubject) -> Option<String> {
             "carries a credential in its authority, and {elsewhere}"
         ));
     }
+    if subject.derives_an_address {
+        // Everything after the authority, which is the path plus whichever of
+        // `?` and `#` may have ended it.
+        return respelled_address_problem(host, &rest[host.len()..], subject.own);
+    }
     None
+}
+
+/// Why a URL is not an address the key derived from it spells back, if it is
+/// not (grammar 14.6 rule 5).
+///
+/// `authority` is the slice between `://` and whichever of `/`, `?` and `#`
+/// ends it; `path` is everything after that slice, so it still carries a `?` or
+/// a `#` when one is there — which is the first thing these arms look for.
+///
+/// npm never reads a registry's address out of the `registry=` line it was
+/// given: it appends `/<package>` to that text, parses the result through a
+/// WHATWG `URL` and then walks *up* what comes out looking for a credential. So
+/// the `_authToken` key this compiler writes has to be an address on that walk,
+/// spelled the way the parse spells it, and the three normalizations
+/// [`codegen::registry::npm_auth_key`](crate::codegen::registry::npm_auth_key)
+/// performs — the host's case, the scheme's own default port, dot segments —
+/// are the whole of what it reproduces. Every other spelling the parse would
+/// rewrite is refused here instead, because refusing beats emitting a line npm
+/// never reads: an unmatched key fails *silently*, with `npm install` resolving
+/// unauthenticated while the `bunfig.toml` from the same artifact authenticates.
+///
+/// What the parse rewrites, and therefore what these arms refuse:
+///
+/// * **a query or a fragment** — `new URL` ends the path at the `?` or the `#`,
+///   and npm's `/<package>` goes after the whole text, so
+///   `…/repo?group=npm` fetches `…/repo?group=npm/lodash`: the package name
+///   lands in the query and the key stops at `//host/repo`;
+/// * **an authority it does not spell back** — a non-ASCII host becomes
+///   punycode, a percent-escape is decoded before that, a `\` ends the
+///   authority the way a `/` does, a bracketed IPv6 literal is re-serialized in
+///   its compressed form, and a port is renumbered (`:08443` → `:8443`, an
+///   empty `:` dropped). The authority this accepts is the one this compiler
+///   can spell: ASCII letters, digits, `-`, `_` and `.`, with an optional port
+///   of up to five digits and no leading zero;
+/// * **a numeric host** — `new URL` reads a host whose last label is a number
+///   as an IPv4 address and writes it back as a dotted quad, so `010.0.0.5` is
+///   `8.0.0.5` and `2130706433` is `127.0.0.1`. Only the quad it writes back is
+///   accepted;
+/// * **a path character it percent-encodes** — every ASCII control, everything
+///   above `~`, and the six graphic characters in the WHATWG path percent-encode
+///   set (`"`, `<`, `>`, `` ` ``, `{`, `}`), plus the `\` it turns into `/`. A
+///   `%` in a *path* is left alone by the parse and so is left alone here.
+fn respelled_address_problem(authority: &str, path: &str, own: &str) -> Option<String> {
+    if let Some(delimiter) = path
+        .chars()
+        .find(|character| matches!(character, '?' | '#'))
+    {
+        let part = if delimiter == '?' {
+            "query"
+        } else {
+            "fragment"
+        };
+        return Some(format!(
+            "carries a `{delimiter}` {part}, and {own} is the text npm appends `/<package>` to \
+             before parsing the result — the package name would land in the {part}"
+        ));
+    }
+    let (name, port) = match authority.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (authority, None),
+    };
+    // Every arm below completes the same sentence, because they are one rule
+    // about one derived address read at five places in the authority and one in
+    // the path.
+    let derived =
+        format!("{own} is keyed in `.npmrc` by the address a WHATWG `URL` derives from it");
+    if name.is_empty() {
+        return Some(format!(
+            "names no host before its `:`, and {derived} — a host is ASCII letters, digits, `-`, \
+             `_` and `.`"
+        ));
+    }
+    if let Some(character) = name
+        .chars()
+        .find(|character| !matches!(character, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.'))
+    {
+        return Some(format!(
+            "carries `{}` in its authority, and {derived} — a host is ASCII letters, digits, \
+             `-`, `_` and `.`",
+            spelled(character)
+        ));
+    }
+    if let Some(port) = port {
+        if port.is_empty() {
+            return Some(format!(
+                "ends its authority in a `:` with no port, and {derived} — that parse drops an \
+                 empty port rather than writing it back"
+            ));
+        }
+        if !is_a_port_written_back_unchanged(port) {
+            return Some(format!(
+                "names the port `{}`, and {derived} — a port is up to five digits, no leading \
+                 zero, and at most 65535",
+                port.escape_debug()
+            ));
+        }
+    }
+    if is_read_as_an_ipv4_address(name) && !is_the_dotted_quad_written_back(name) {
+        return Some(format!(
+            "names the host `{name}`, and {derived} — a host whose last label is a number is \
+             read as an IPv4 address and written back as a dotted quad"
+        ));
+    }
+    if let Some(character) = path.chars().find(|character| {
+        !character.is_ascii_graphic()
+            || matches!(character, '"' | '<' | '>' | '`' | '{' | '}' | '\\')
+    }) {
+        return Some(format!(
+            "carries `{}` in its path, and {derived} — that parse rewrites this character rather \
+             than writing it back",
+            spelled(character)
+        ));
+    }
+    None
+}
+
+/// A character as a refusal spells it: as written where it is a printable ASCII
+/// character, and in Rust's escaped form otherwise, so a control byte an author
+/// pasted in is named rather than carried into the message invisibly.
+fn spelled(character: char) -> String {
+    if character.is_ascii_graphic() {
+        character.to_string()
+    } else {
+        character.escape_debug().to_string()
+    }
+}
+
+/// Whether a WHATWG `URL` writes this port back exactly as written.
+///
+/// Its port parser reads the digits as a number and re-serializes it, so a
+/// leading zero is dropped and an empty port disappears entirely; above 65535
+/// the URL does not parse at all.
+fn is_a_port_written_back_unchanged(port: &str) -> bool {
+    !port.is_empty()
+        && port.len() <= 5
+        && port.chars().all(|digit| digit.is_ascii_digit())
+        && (port.len() == 1 || !port.starts_with('0'))
+        && port.parse::<u32>().is_ok_and(|number| number <= 65535)
+}
+
+/// Whether a WHATWG `URL` reads this host as an IPv4 address rather than as a
+/// name: its rule is the last non-empty label being a number, written in
+/// decimal, octal or hex.
+fn is_read_as_an_ipv4_address(name: &str) -> bool {
+    let trimmed = name.strip_suffix('.').unwrap_or(name);
+    let last = trimmed.rsplit('.').next().unwrap_or(trimmed);
+    match last.strip_prefix("0x").or_else(|| last.strip_prefix("0X")) {
+        Some(hexadecimal) => hexadecimal.chars().all(|digit| digit.is_ascii_hexdigit()),
+        None => !last.is_empty() && last.chars().all(|digit| digit.is_ascii_digit()),
+    }
+}
+
+/// Whether a host is the dotted quad a WHATWG `URL` writes an IPv4 address back
+/// as: four decimal parts, none of them empty or leading-zeroed, each at most
+/// 255.
+fn is_the_dotted_quad_written_back(name: &str) -> bool {
+    let mut parts = 0;
+    for label in name.split('.') {
+        parts += 1;
+        let canonical = !label.is_empty()
+            && label.len() <= 3
+            && label.chars().all(|digit| digit.is_ascii_digit())
+            && (label.len() == 1 || !label.starts_with('0'))
+            && label.parse::<u16>().is_ok_and(|number| number <= 255);
+        if !canonical {
+            return false;
+        }
+    }
+    parts == 4
 }
 
 /// `join_token:` is required exactly where placements are (grammar 14.2,
@@ -1295,6 +1501,232 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The other group of arms that is not shared: a URL whose address a WHATWG
+    /// `URL` spells differently from the text, refused where an emitted file
+    /// keys something by that derived address (grammar 14.6 rule 5).
+    ///
+    /// Each row carries the key **npm actually looks up** for that registry —
+    /// read off `new URL`'s own output for the request npm builds — beside the
+    /// refusal, and the row asserts both halves: that the value is refused, and
+    /// that
+    /// [`npm_auth_key`](crate::codegen::registry::npm_auth_key) would have
+    /// emitted something else. The second half is what makes this a test of a
+    /// bug rather than of a rule: without the refusal, every one of these
+    /// deploy files builds an artifact whose `.npmrc` carries an `_authToken`
+    /// line at an address npm never visits, so `npm install` and `pnpm install`
+    /// resolve unauthenticated — 401 against a private mirror — while
+    /// `bun install` from the same artifact authenticates, because `bunfig.toml`
+    /// carries the token inside its registry object rather than keyed by an
+    /// address at all. That is the one artifact / two answers divergence
+    /// grammar 14.6 rule 5 exists to prevent, and it is silent.
+    ///
+    /// A `None` in that column is the louder failure and the one row that is
+    /// not silent: `new URL` refuses the address outright, so npm reaches no
+    /// key at all and every install against that registry fails.
+    ///
+    /// The other two subjects are asserted to accept every row: an ingress base
+    /// and a collector address are written out as text and nothing is derived
+    /// from either, so a query on a collector URL is the operator's business.
+    #[test]
+    fn an_address_a_url_parse_respells_is_refused_only_where_one_is_derived() {
+        const DERIVED: &str =
+            "a registry address is keyed in `.npmrc` by the address a WHATWG `URL` derives from it";
+        for (url, npm_looks_up, problem) in [
+            // A query and a fragment both end the path `new URL` parses, and
+            // npm appends `/<package>` to the *text*: the package name lands
+            // after the delimiter and the address stops before it.
+            (
+                "https://npm.internal.example/repo?group=npm",
+                Some("//npm.internal.example/repo"),
+                "carries a `?` query, and a registry address is the text npm appends `/<package>` to before parsing the result — the package name would land in the query".to_string(),
+            ),
+            (
+                "https://npm.internal.example/repo#mirror",
+                Some("//npm.internal.example/repo"),
+                "carries a `#` fragment, and a registry address is the text npm appends `/<package>` to before parsing the result — the package name would land in the fragment".to_string(),
+            ),
+            // A `\` is a path separator to a WHATWG `URL` parsing a special
+            // scheme, so the address npm walks has a `/` where this text has a
+            // `\`.
+            (
+                "https://npm.internal.example/a\\b/",
+                Some("//npm.internal.example/a/b/"),
+                format!("carries `\\` in its path, and {DERIVED} — that parse rewrites this character rather than writing it back"),
+            ),
+            // A non-ASCII host is punycoded; `to_ascii_lowercase` is not IDNA.
+            (
+                "https://npm.\u{ed}nternal.example/repo/",
+                Some("//npm.xn--nternal-6ya.example/repo/"),
+                format!("carries `\u{ed}` in its authority, and {DERIVED} — a host is ASCII letters, digits, `-`, `_` and `.`"),
+            ),
+            // A percent-escape in an authority is decoded before the host
+            // parser ever sees it.
+            (
+                "https://ex%41mple.com/repo/",
+                Some("//example.com/repo/"),
+                format!("carries `%` in its authority, and {DERIVED} — a host is ASCII letters, digits, `-`, `_` and `.`"),
+            ),
+            // A bracketed IPv6 literal is re-serialized in its compressed form.
+            (
+                "https://[0:0:0:0:0:0:0:1]:4873/repo/",
+                Some("//[::1]:4873/repo/"),
+                format!("carries `[` in its authority, and {DERIVED} — a host is ASCII letters, digits, `-`, `_` and `.`"),
+            ),
+            // …and an authority with no host at all, which that parse refuses
+            // outright rather than respelling.
+            (
+                "https://:4873/repo/",
+                None,
+                format!("names no host before its `:`, and {DERIVED} — a host is ASCII letters, digits, `-`, `_` and `.`"),
+            ),
+            // A port is a number to that parse, not a string of digits.
+            (
+                "https://npm.internal.example:08443/repo/",
+                Some("//npm.internal.example:8443/repo/"),
+                format!("names the port `08443`, and {DERIVED} — a port is up to five digits, no leading zero, and at most 65535"),
+            ),
+            (
+                "https://npm.internal.example:/repo/",
+                Some("//npm.internal.example/repo/"),
+                format!("ends its authority in a `:` with no port, and {DERIVED} — that parse drops an empty port rather than writing it back"),
+            ),
+            // A host whose last label is a number is an IPv4 address, read in
+            // whatever base it was written in and written back in decimal.
+            (
+                "https://010.0.0.5/repo/",
+                Some("//8.0.0.5/repo/"),
+                format!("names the host `010.0.0.5`, and {DERIVED} — a host whose last label is a number is read as an IPv4 address and written back as a dotted quad"),
+            ),
+            (
+                "https://2130706433/repo/",
+                Some("//127.0.0.1/repo/"),
+                format!("names the host `2130706433`, and {DERIVED} — a host whose last label is a number is read as an IPv4 address and written back as a dotted quad"),
+            ),
+            // The WHATWG path percent-encode set, which is not the set of
+            // characters a reader would guess: `|`, `^`, `[`, `'` and `;` all
+            // survive a path unchanged, and these six do not.
+            (
+                "https://npm.internal.example/a{b}/",
+                Some("//npm.internal.example/a%7Bb%7D/"),
+                format!("carries `{{` in its path, and {DERIVED} — that parse rewrites this character rather than writing it back"),
+            ),
+            (
+                "https://npm.internal.example/a`b/",
+                Some("//npm.internal.example/a%60b/"),
+                format!("carries `{}` in its path, and {DERIVED} — that parse rewrites this character rather than writing it back", '`'),
+            ),
+            // Everything above `~` is percent-encoded in a path, as UTF-8.
+            (
+                "https://npm.internal.example/caf\u{e9}/",
+                Some("//npm.internal.example/caf%C3%A9/"),
+                format!("carries `\u{e9}` in its path, and {DERIVED} — that parse rewrites this character rather than writing it back"),
+            ),
+            // …and so is every ASCII control, which a refusal names rather than
+            // carrying invisibly.
+            (
+                "https://npm.internal.example/a\u{1}b/",
+                Some("//npm.internal.example/a%01b/"),
+                format!("carries `\\u{{1}}` in its path, and {DERIVED} — that parse rewrites this character rather than writing it back"),
+            ),
+        ] {
+            assert_eq!(
+                url_problem(url, &PACKAGE_REGISTRY_URL).as_deref(),
+                Some(problem.as_str()),
+                "`{url}` no longer reaches the arm written for it"
+            );
+            if let Some(npm_looks_up) = npm_looks_up {
+                assert_ne!(
+                    crate::codegen::registry::npm_auth_key(url),
+                    npm_looks_up,
+                    "`{url}` would emit a key npm never looks up, which is why it is refused \
+                     here rather than normalized there"
+                );
+            }
+            for (key, subject) in [
+                ("hub.public_url", &PUBLIC_URL),
+                ("trace_sink.url", &TRACE_SINK_URL),
+            ] {
+                assert_eq!(
+                    url_problem(url, subject),
+                    None,
+                    "`{key}` derives no address from its URL, so `{url}` is the author's business"
+                );
+            }
+        }
+    }
+
+    /// …and the registry addresses an operator really writes still parse.
+    ///
+    /// The other direction of the rule above, which no negative corpus catches:
+    /// a shape rule one character too tight makes a working mirror unwritable.
+    /// Every row here is a spelling
+    /// [`npm_auth_key`](crate::codegen::registry::npm_auth_key) reproduces
+    /// exactly — the host's case, the scheme's own default port and dot
+    /// segments are the three things it normalizes, and each is represented —
+    /// so the row asserts the accepted URL **and** the key it emits, which is
+    /// the address npm walks to.
+    #[test]
+    fn the_registry_addresses_an_operator_writes_are_accepted_and_keyed_as_npm_walks_them() {
+        for (url, key) in [
+            (
+                "https://npm.internal.example/repository/npm-group/",
+                "//npm.internal.example/repository/npm-group/",
+            ),
+            (
+                "https://npm.internal.example/repo",
+                "//npm.internal.example/repo/",
+            ),
+            ("http://localhost:4873/", "//localhost:4873/"),
+            ("https://10.0.0.5:8443/repo/", "//10.0.0.5:8443/repo/"),
+            (
+                "https://npm_mirror.internal.example/repo/",
+                "//npm_mirror.internal.example/repo/",
+            ),
+            (
+                "https://npm.internal.example./repo/",
+                "//npm.internal.example./repo/",
+            ),
+            // The three normalizations, each written the way an operator does.
+            (
+                "https://NPM.Internal.Example/repo/",
+                "//npm.internal.example/repo/",
+            ),
+            (
+                "https://npm.internal.example:443/repo/",
+                "//npm.internal.example/repo/",
+            ),
+            (
+                "https://npm.internal.example/a/b/../repo/",
+                "//npm.internal.example/a/repo/",
+            ),
+            // Path characters a WHATWG `URL` leaves alone, including the `@` of
+            // a scope and the `%` of an escape it does not re-encode.
+            (
+                "https://npm.internal.example/repository/@corp/",
+                "//npm.internal.example/repository/@corp/",
+            ),
+            (
+                "https://npm.internal.example/a|b^c'd;e[f]/",
+                "//npm.internal.example/a|b^c'd;e[f]/",
+            ),
+            (
+                "https://npm.internal.example/a%2Fb/",
+                "//npm.internal.example/a%2Fb/",
+            ),
+        ] {
+            assert_eq!(
+                url_problem(url, &PACKAGE_REGISTRY_URL),
+                None,
+                "`{url}` is a registry somebody deploys and this pass refuses it"
+            );
+            assert_eq!(
+                crate::codegen::registry::npm_auth_key(url),
+                key,
+                "the key derived for `{url}`"
+            );
+        }
     }
 
     /// …and the URLs an author writes are accepted, under either key.

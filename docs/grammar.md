@@ -5320,6 +5320,36 @@ The rules (Decision
    credential is rule 2's, and the refusal says so. §14.2's `public_url:` and
    §14.5's sink accept userinfo, because neither is a documented
    credential-carrying idiom and neither has a `token:` to point at.
+
+   It is also an **address and nothing more**, which is where this rule goes
+   past §14.2's and §14.5's. Those two URLs are written out as text and nothing
+   is computed from either; this one has a *second* address derived from it —
+   the `.npmrc` key of rule 5, which npm parses out of its own request through
+   a WHATWG `URL` rather than reading off the `registry=` line. So a spelling
+   that parse rewrites is a key npm never looks up, and the compiler refuses it
+   here rather than emitting a line nothing reads:
+
+   * **no query and no fragment.** npm appends `/<package>` to this text before
+     parsing, so `…/repo?group=npm` fetches `…/repo?group=npm/lodash` — the
+     package name inside the query, and the address stopping at `//host/repo`.
+   * **the host is ASCII letters, digits, `-`, `_` and `.`**, with an optional
+     port of up to five digits and no leading zero. That parse punycodes a
+     non-ASCII host, percent-decodes an escape in one, re-serializes a
+     bracketed IPv6 literal in its compressed form, renumbers a port
+     (`:08443` → `:8443`) and drops an empty one.
+   * **a numeric host is the dotted quad that parse writes back.** A host whose
+     last label is a number is read as an IPv4 address in whatever base it was
+     written in: `010.0.0.5` is `8.0.0.5` and `2130706433` is `127.0.0.1`.
+   * **the path is spelled in characters that parse leaves alone.** It
+     percent-encodes every ASCII control, everything above `~`, and `"`, `<`,
+     `>`, `` ` ``, `{`, `}`; it turns a `\` into a `/`. `|`, `^`, `[`, `]`,
+     `'`, `;`, `@` and a `%` escape all survive a path unchanged and are legal
+     here.
+
+   The refusal names the character or the part it found, and the same list is
+   what lets the emitter normalize exactly three things — a host's case, the
+   scheme's own default port, dot segments — instead of reimplementing a WHATWG
+   `URL` in the compiler.
 2. **`token:` is an `${ENV}` reference and never a literal** (§4.3 class 1), the
    posture every deploy-layer credential takes. A scope's `token:` is the same
    key under the same rule. A registry that is read through without a
@@ -5358,12 +5388,17 @@ The rules (Decision
    scheme's own default port drops away and dot segments resolve — and the key
    is the registry's **whole** path with a trailing `/`, because the package
    name goes after its last segment rather than over it. `…/repo` and `…/repo/`
-   are therefore one registry at one address. A key spelled any other way is
-   one npm never looks up, and the failure is silent in the worst direction: the
-   `npm install` goes out unauthenticated while the `bun install` from the same
-   artifact, which carries the token inside its registry object rather than keyed
-   by an address, succeeds. Two shapes are therefore a compile error naming both
-   entries:
+   are therefore one registry at one address. **Those three are the whole list
+   of what the emitter reproduces**, and rule 1 is what makes that honest: every
+   other spelling the parse would rewrite — a query, a fragment, a non-ASCII or
+   percent-escaped host, an IP literal, a renumbered port, a `\`, a path
+   character it percent-encodes — is refused at the `url:` instead, so the
+   compiler never has to reimplement a WHATWG `URL` to stay right. A key spelled
+   any other way is one npm never looks up, and the failure is silent in the
+   worst direction: the `npm install` goes out unauthenticated while the
+   `bun install` from the same artifact, which carries the token inside its
+   registry object rather than keyed by an address, succeeds. Two shapes are
+   therefore a compile error naming both entries:
    * **one address, two variables** — an ini parser keeps the last, while Bun's
      per-scope table keeps both;
    * **an entry with no `token:` at or under a tokened entry's address** — npm
@@ -9226,6 +9261,26 @@ address anyway. §14.2's `public_url:` and §14.5's sink accept the same spellin
 and the difference is the point — neither is a documented credential-carrying
 idiom and neither has a `token:` to redirect the author to, so a refusal there
 would be this compiler inventing a rule about somebody else's deployment.
+
+*Why the `url:` is an address and nothing more.* The three normalizations above
+are the whole of what the emitter reproduces, and a WHATWG `URL` does more than
+three things. It ends the path at a `?` or a `#`; it punycodes a non-ASCII host
+and percent-decodes an escape in one; it re-serializes a bracketed IPv6 literal
+in compressed form and a numeric host as a dotted quad, in whatever base the
+author wrote it (`010.0.0.5` is `8.0.0.5`); it reads a port as a number
+(`:08443` is `:8443`, an empty `:` is nothing); it turns a `\` into a `/`; and
+it percent-encodes every ASCII control, everything above `~`, and `"`, `<`, `>`,
+`` ` ``, `{`, `}` in a path. Each of those makes the emitted key an address npm
+never visits — the same silent one-artifact / two-answers failure, reached by a
+spelling rather than by a collision — so §14.6 rule 1 refuses them at the `url:`
+and the compiler never has to carry an IDNA table or an IP-literal serializer to
+stay right. The two directions are pinned together in
+`crates/compose-core/src/parse/deploy.rs`, where each refused spelling is
+asserted beside the key npm would actually look up for it: a rule relaxed there
+without a normalization added in `codegen::registry::npm_auth_key` fails the
+test rather than shipping. A query is the reachable one of these — a Nexus or
+Artifactory group selected by a parameter is a URL an operator really pastes —
+and it carries a fixture of its own.
 
 *Where presence is checked.* Not at build (resolved q15), and — stated because
 it is the thing a reader would assume wrongly — not by the installer either:
