@@ -5352,10 +5352,13 @@ The rules (Decision
    a mesh (resolved q41). An `.npmrc` credential is keyed by **address** rather
    than by scope (`//host/path/:_authToken=${NAME}`, which is what npm requires),
    and that address is the one **npm derives from its own request** rather than
-   the text of the `url:`: npm builds it through a WHATWG `URL`, so the host
-   folds to lowercase, the scheme's own default port drops away and dot segments
-   resolve, and the key is that URL's directory — which is why a `url:` written
-   without a trailing `/` keys at the host root. A key spelled any other way is
+   the text of the `url:`: to fetch a package npm strips one trailing `/` from
+   the registry, appends `/<package>`, parses the result through a WHATWG `URL`
+   and then walks *up* that address. So the host folds to lowercase, the
+   scheme's own default port drops away and dot segments resolve — and the key
+   is the registry's **whole** path with a trailing `/`, because the package
+   name goes after its last segment rather than over it. `…/repo` and `…/repo/`
+   are therefore one registry at one address. A key spelled any other way is
    one npm never looks up, and the failure is silent in the worst direction: the
    `npm install` goes out unauthenticated while the `bun install` from the same
    artifact, which carries the token inside its registry object rather than keyed
@@ -9179,7 +9182,7 @@ a mesh's wire (resolved q41). Both installers expand the reference themselves,
 which is why the two spellings differ and why each file carries its own.
 
 *Why an `.npmrc` collision is refused rather than resolved.* npm keys a
-credential by address, so two entries whose registry URLs share a directory
+credential by address, so two entries whose registry URLs derive one address
 write one `_authToken` line twice and an ini parser keeps the last — while Bun's
 per-scope table keeps both. One artifact would then authenticate differently
 under the two installers, which is the class of divergence this key exists to
@@ -9187,10 +9190,21 @@ remove. The choice belongs to the author, so `validate` makes them make it.
 
 *Why that address is derived rather than copied, and why the rule reaches past
 exact equality.* npm never compares an `_authToken` key against the text of a
-`registry=` line: it derives the key it looks up from the **request URI**,
-through a WHATWG `URL`. So the emitted key is derived the same way — host
-lowercased, the scheme's own default port dropped, dot segments resolved — and
-`validate` compares the derived keys rather than the URLs. A key spelled any
+`registry=` line: it derives the key it looks up from the **request URI**. It
+builds that URI itself — the registry with one trailing `/` stripped, then
+`/<package>` — parses it through a WHATWG `URL`, and walks *up* the result until
+a credential answers. So the emitted key is derived the same way — host
+lowercased, the scheme's own default port dropped, dot segments resolved, and
+the registry's whole path kept with a trailing `/`, because `/<package>` lands
+after its last segment rather than on it — and `validate` compares the derived
+keys rather than the URLs. That last point is where npm's two sides disagree and
+only one of them is the one that matters here: `npm login` *writes* a credential
+under `@npmcli/config`'s `nerfDart`, which does drop a last segment written
+without a trailing `/`; `npm install` *reads* one under `npm-registry-fetch`'s
+`regFromURI`, which does not. Keying by the writer would scope a credential
+declared for one repository to the mirror's entire host, and would let the two
+spellings of one registry derive two keys — which is exactly the one-artifact /
+two-answers divergence the rule below refuses. A key spelled any
 other way is one npm never finds, and that failure is silent in the worst
 direction: the `npm install` resolves unauthenticated (or takes a `401`) while
 the `bun install` from the same artifact succeeds, because Bun carries the token

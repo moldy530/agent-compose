@@ -46,11 +46,11 @@
 //!   `[install.scopes]` entries `"@scope" = { url = "…", token = "$VAR" }`,
 //!   with `$variable` substitution. Bun's documented `bunfig.toml` contract.
 //! * **npm** — `registry=…` and `@scope:registry=…`, with the credential on a
-//!   separate **host-scoped** line, `//host/path/:_authToken=${VAR}`: npm
+//!   separate **address-scoped** line, `//host/path/:_authToken=${VAR}`: npm
 //!   documents that `_authToken` "must be scoped to a specific registry", and
 //!   that environment variables are replaced using `${VARIABLE_NAME}`. The key
-//!   is the registry URL's address and directory ([`npm_auth_key`]), which is
-//!   the form npm's own documentation shows
+//!   is the address npm itself looks a credential up under ([`npm_auth_key`]),
+//!   which is the form npm's own documentation shows
 //!   (`//somewhere-else.com/myorg/:_authToken=…`).
 
 use std::fmt::Write as _;
@@ -156,33 +156,50 @@ fn token(reference: Option<&crate::diag::Spanned<crate::ast::common::EnvRef>>) -
 /// The address an `.npmrc` credential line is keyed by, for a registry URL.
 ///
 /// npm scopes auth to an **address** rather than to a package scope, and the key
-/// is the registry's authority plus the *directory* of its path: a registry at
-/// `https://npm.example/repo/` authenticates under `//npm.example/repo/`, and
-/// one at the host root under `//npm.example/`. A URL written without a trailing
-/// slash names the same directory as one written with it, because npm appends
-/// the package name to it either way.
+/// is the registry's authority plus its **whole path**, with a trailing `/`: a
+/// registry at `https://npm.example/repo` — or at `https://npm.example/repo/`,
+/// which is the same registry — authenticates under `//npm.example/repo/`, and
+/// one at the host root under `//npm.example/`. The two spellings of that path
+/// are one key, because npm strips a trailing `/` from the registry before it
+/// appends the package name.
 ///
 /// It is public because `parse::deploy` asks the same question before a build
 /// exists: two entries whose key is this one, carrying two different variables,
 /// would write one line twice and let an ini parser pick — so the parser refuses
 /// them, and it has to ask about the *emitted* key rather than about the URL.
 ///
-/// # Why this normalizes rather than copies
+/// # Why this is derived rather than copied
 ///
-/// npm does not compare this key against the text of a `registry=` line. It
-/// derives the key it looks up from the **request URI**, through a WHATWG
-/// `URL` — so the key it searches for is already canonical, and a key written
-/// any other way is one it never finds. A `_authToken` line npm cannot match is
-/// worse than no line at all: the install goes out unauthenticated while the
-/// `bunfig.toml` beside it authenticates, which is the one artifact / two
-/// answers divergence grammar 14.6 rule 5 exists to prevent. So the three things
-/// that constructor does to an address are done here:
+/// npm never compares this key against the text of a `registry=` line. To fetch
+/// a package it builds the request URI itself — the registry with any trailing
+/// `/` stripped, then `/`, then the package name — parses that through a WHATWG
+/// `URL`, and then **walks up** the resulting address looking for a credential:
+/// for `https://npm.example/repo` and package `lodash` it tries
+/// `//npm.example/repo/lodash`, `//npm.example/repo/`, `//npm.example/repo`,
+/// `//npm.example/` and `//npm.example`, longest first, and spends the first
+/// token it finds (`npm-registry-fetch`'s `regFromURI` and `regFetch`). So the
+/// key written here has to be one of the addresses on that walk, spelled the way
+/// the `URL` constructor spells it. A `_authToken` line npm cannot match is worse
+/// than no line at all: the install goes out unauthenticated while the
+/// `bunfig.toml` beside it authenticates, which is the one artifact / two answers
+/// divergence grammar 14.6 rule 5 exists to prevent.
 ///
-/// * the host is **lowercased** (`//NPM.Example/` never matches);
-/// * the scheme's own **default port** is dropped, so `https://npm.example:443/`
-///   and `https://npm.example/` are one address;
-/// * `.` and `..` segments are **resolved**, because `new URL` resolves them
-///   before npm ever sees a path.
+/// Two things follow, and they are the whole of what this function does:
+///
+/// * **the last path segment stays.** The package name is appended *after* the
+///   registry's path, not written over its final segment, so a `url:` of
+///   `https://npm.example/repo` keys at `//npm.example/repo/` and not at the host
+///   root. (npm's config-**writing** side, the `nerfDart` behind `npm login`,
+///   does drop a last segment that has no trailing `/` — but that is a different
+///   function from the lookup, and keying by it would scope a declared
+///   repository's credential to its entire host.)
+/// * **the address is canonical rather than as-written**, because `new URL` has
+///   already normalized it by the time npm walks:
+///   * the host is **lowercased** (`//NPM.Example/` never matches);
+///   * the scheme's own **default port** is dropped, so `https://npm.example:443/`
+///     and `https://npm.example/` are one address;
+///   * `.` and `..` segments are **resolved**, and an empty segment is kept,
+///     because that is what `new URL` does to a path.
 ///
 /// The path's own case is left alone: a WHATWG `URL` lowercases the host and
 /// nothing else, and so does a registry that serves `/Repo/`.
@@ -218,29 +235,32 @@ fn canonical_authority(scheme: &str, authority: &str) -> String {
     }
 }
 
-/// The directory half of an `.npmrc` key: the path with its dot segments
-/// resolved, up to and including the last `/`.
+/// The path half of an `.npmrc` key: the registry's own path, dot segments
+/// resolved and a trailing `/` guaranteed.
 ///
-/// npm appends the package name to the registry URL and keys the credential by
-/// the *directory* of the request it then makes, so the final segment of a path
-/// written without a trailing `/` is where that package name goes rather than a
-/// directory above it — `https://npm.example/repo` keys at the host root, the
-/// same address `https://npm.example/` keys at. Standing the package name in for
-/// that segment is also what makes a trailing `..` resolve the way `new URL`
-/// resolves it on the request.
+/// npm appends `/<package>` to the registry — after stripping one trailing `/`
+/// from it — and then walks up the address of that request. The directory the
+/// walk reaches first is therefore the registry's **whole** path, which is why
+/// nothing here drops its last segment and why `repo` and `repo/` are one key.
+///
+/// A trailing `.` or `..` is resolved rather than kept, because the `/<package>`
+/// npm appends makes `new URL` resolve it on the request: `…/a/b/..` fetches
+/// `…/a/b/../lodash`, which is `…/a/lodash`, which keys at `//host/a/`.
 fn canonical_directory(path: &str) -> String {
     let segments: Vec<&str> = path.split('/').collect();
     let last = segments.len() - 1;
     let mut directory: Vec<&str> = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         match *segment {
-            "" | "." => {}
+            // A path's final empty segment *is* the trailing `/`, which every
+            // segment below writes for itself. An **interior** empty segment is
+            // an ordinary segment that a WHATWG `URL` keeps, and so does the
+            // address npm walks: `/a//b/` is `//host/a//b/`, not `//host/a/b/`.
+            "" if index == last => {}
+            "." => {}
             ".." => {
                 directory.pop();
             }
-            // The package name's own slot: whatever is written here is replaced
-            // by the package npm is fetching, so it is never part of the key.
-            _ if index == last => {}
             other => directory.push(other),
         }
     }
@@ -419,10 +439,18 @@ package_registry:
 
     /// The address a credential is keyed by, over the shapes an operator writes.
     #[test]
-    fn a_credential_is_keyed_by_the_registrys_own_directory() {
+    fn a_credential_is_keyed_by_the_registrys_whole_address() {
         for (url, key) in [
             ("https://npm.example/repo/", "//npm.example/repo/"),
-            ("https://npm.example/repo", "//npm.example/"),
+            // The ordinary spelling of a repository on a mirror. npm appends
+            // `/lodash` *after* `repo` and walks up from
+            // `//npm.example/repo/lodash`, so the credential is the
+            // repository's and not the whole host's.
+            ("https://npm.example/repo", "//npm.example/repo/"),
+            (
+                "https://nexus.example/repository/npm-group",
+                "//nexus.example/repository/npm-group/",
+            ),
             ("https://npm.example/", "//npm.example/"),
             ("https://npm.example", "//npm.example/"),
             ("https://npm.example:8443/a/b/", "//npm.example:8443/a/b/"),
@@ -471,8 +499,43 @@ package_registry:
             ("https://npm.example/../", "//npm.example/"),
             // A segment that merely ends in dots is an ordinary segment.
             ("https://npm.example/a/x../", "//npm.example/a/x../"),
+            // An **empty** segment is an ordinary segment too: `new URL` keeps
+            // it, and npm's walk-up therefore passes through `//host/a//b/`
+            // before it ever reaches `//host/a/`.
+            ("https://npm.example/a//b/", "//npm.example/a//b/"),
+            ("https://npm.example/a//../b/", "//npm.example/a/b/"),
         ] {
             assert_eq!(npm_auth_key(url), key, "the key derived for `{url}`");
         }
+    }
+
+    /// The **lookup** side of npm, not the config-writing side.
+    ///
+    /// `npm login` writes a credential under `@npmcli/config`'s `nerfDart`,
+    /// which resolves `new URL(".", registry)` and so drops a last segment
+    /// written without a trailing `/`. `npm install` reads one under
+    /// `npm-registry-fetch`'s `regFromURI`, which walks up the URI of the
+    /// request it is making — and that URI is the registry with one trailing
+    /// `/` stripped, then `/`, then the package. The two disagree about exactly
+    /// one URL shape, and it is the shape an operator writes most often.
+    ///
+    /// Keying by the writer would put a credential declared for one repository
+    /// on the mirror's whole host, and — because the two spellings of one
+    /// registry would then derive two keys — let
+    /// `parse::deploy::one_credential_per_address` pass a deploy file whose
+    /// `.npmrc` and `bunfig.toml` spend two different variables at one registry,
+    /// which is the divergence grammar 14.6 rule 5 exists to refuse.
+    #[test]
+    fn a_registrys_last_segment_is_part_of_its_address_rather_than_the_packages_slot() {
+        assert_eq!(
+            npm_auth_key("https://npm.internal.example/repo"),
+            "//npm.internal.example/repo/",
+            "npm fetches `https://npm.internal.example/repo/lodash` and walks up from there"
+        );
+        assert_eq!(
+            npm_auth_key("https://npm.internal.example/repo"),
+            npm_auth_key("https://npm.internal.example/repo/"),
+            "one registry, written the two ways it is written, is one address"
+        );
     }
 }

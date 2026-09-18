@@ -255,17 +255,18 @@ Four things worth knowing:
   on every placement's, because every process installs — so `readEnvironment()`
   refuses at launch naming it, and a worker without it is refused at join.
 - **npm authenticates by address, not by scope.** The `.npmrc` credential line is
-  `//host/path/:_authToken=${VAR}`, keyed by the registry's own directory. That
-  address is the one npm derives from its own request rather than the text you
-  wrote — the host folds to lowercase, a default port drops away, `..` resolves —
-  so `https://NPM.Example/repo/` and `https://npm.example/repo/` are one address,
-  and `validate` compares them as one. Two shapes are refused naming both
-  entries: two entries at one address with two different variables (an ini parser
-  would keep the last), and an entry with **no** `token` at or under a tokened
-  entry's address — npm finds a credential by walking *up* the request's address,
-  so it would spend the other's there while Bun sends nothing. Give each entry
-  its own path on the mirror (trailing `/` included), or give it the `token` it
-  should spend.
+  `//host/path/:_authToken=${VAR}`, keyed by the registry's authority and its
+  whole path. That address is the one npm derives from its own request rather
+  than the text you wrote — it appends the package name to your registry and
+  walks *up* the result, so the host folds to lowercase, a default port drops
+  away, `..` resolves, and a trailing `/` makes no difference. So
+  `https://NPM.Example/repo/`, `https://npm.example/repo/` and
+  `https://npm.example/repo` are one address, and `validate` compares them as
+  one. Two shapes are refused naming both entries: two entries at one address
+  with two different variables (an ini parser would keep the last), and an entry
+  with **no** `token` at or under a tokened entry's address — it would spend the
+  other's there while Bun sends nothing. Give each entry its own path on the
+  mirror, or give it the `token` it should spend.
 - **A credential belongs in `token`, never in the URL.**
   `https://user:pass@npm.example/` is a spelling installers accept and the one
   Bun's own documentation shows, so `validate` refuses it here on purpose: it

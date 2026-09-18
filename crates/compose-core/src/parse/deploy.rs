@@ -645,8 +645,9 @@ struct RegistryEntry<'a> {
 /// at all. So two shapes make one artifact answer differently under the two
 /// installers, which is the divergence this key exists to remove:
 ///
-/// 1. **One address, two variables.** Two entries whose `url:`s share a
-///    directory write one `_authToken` key twice and an ini parser keeps the
+/// 1. **One address, two variables.** Two entries whose `url:`s derive one
+///    address — including one registry written with a trailing `/` and once
+///    without — write one `_authToken` key twice and an ini parser keeps the
 ///    last, while Bun's per-scope table keeps both.
 /// 2. **A credential reaching an entry that declared none.** An entry with no
 ///    `token:` whose address sits at or under a tokened entry's picks that
@@ -712,7 +713,7 @@ fn one_credential_per_address(section: &PackageRegistrySection, cx: &mut Cx) {
                 format!("`{first}` spends `{}` there", held_token.value.name),
             )
             .with_help(
-                "an `.npmrc` credential is keyed by address rather than by scope — the registry's own directory, so a `url:` written without a trailing `/` keys at the host root — and two entries sharing one key write one `_authToken` line that an installer resolves last-one-wins: give each its own path on the mirror (trailing `/` included), or give both the same variable (grammar 14.6, PRD resolved q59)",
+                "an `.npmrc` credential is keyed by address rather than by scope — the registry's authority and its whole path, so one written with a trailing `/` and one written without it are the same address — and two entries sharing one key write one `_authToken` line that an installer resolves last-one-wins: give each its own path on the mirror, or give both the same variable (grammar 14.6, PRD resolved q59)",
             ),
         );
     }
