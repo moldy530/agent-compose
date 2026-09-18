@@ -315,9 +315,13 @@ pub struct ConnectionRow {
 ///    is q25's own answer and reaches the runtime through the row below;
 ///  * `ANTHROPIC_CUSTOM_HEADERS` — the runtime's custom-header variable, whose
 ///    format is one `Name: value` per line. It is the one slot on either harness
-///    that is not a one-to-one carry, and [`cc_custom_headers`] is where the
-///    encoding lives so the compiler's account of it and the driver's cannot
-///    disagree.
+///    that is not a one-to-one carry, so this row names the *variable* and the
+///    encoding has exactly one spelling — the `cc` driver's own `ccConnection`,
+///    which `generated_code_gates`'
+///    `a_harness_run_is_contained_journaled_and_recorded` executes and pins to
+///    `"x-team: platform\nx-run: batch"`. A second copy here would be a second
+///    thing to keep true, and nothing would notice the day the two parted
+///    company.
 ///
 /// …and the **siblings** are the rest of that environment contract, read from
 /// the same bundled runtime. Its endpoint table holds seven rows — one per
@@ -639,33 +643,6 @@ pub fn variables_read(
                 .filter(move |(held, _)| *held == fact)
         })
         .collect()
-}
-
-/// The `ANTHROPIC_CUSTOM_HEADERS` value for a provider's headers.
-///
-/// The runtime splits the variable on newlines and each line on its first colon,
-/// so a header is one `Name: value` line. Written here rather than only in the
-/// driver because [`CONNECTION`]'s account of the slot is normative and a second
-/// spelling of the encoding is a second thing to keep true.
-///
-/// **A line-delimited encoding is only as honest as its values**, and this
-/// function does not police them because neither of the two places that can is
-/// here. A value carrying a carriage return or a newline would declare one
-/// header and send two — the second spelled by the value, `x-api-key` as easily
-/// as anything else — so it is refused twice: `parse::binding::header_map`
-/// refuses the text a composition **wrote** (`invalid-value`, at `validate`,
-/// which is where PRD resolved q58 ruling b puts a fact that decides what a
-/// connection sends), and the driver's own `forgesAHeaderField` refuses what a
-/// `${ENV}` **resolved to**, which is text no build ever sees and exactly what a
-/// gateway deployment's operator-set variables are. By the time a run reaches
-/// this encoding both questions have been asked.
-#[must_use]
-pub fn cc_custom_headers<'a>(headers: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
-    headers
-        .into_iter()
-        .map(|(name, value)| format!("{name}: {value}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// The provider one `coder:` node's `model:` resolves to, with its address.
@@ -1200,17 +1177,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The one slot that is not a one-to-one carry, pinned to the format the
-    /// runtime parses: one `Name: value` per line.
-    #[test]
-    fn custom_headers_are_one_name_value_pair_per_line() {
-        assert_eq!(
-            cc_custom_headers([("x-team", "platform"), ("authorization", "Bearer t")]),
-            "x-team: platform\nauthorization: Bearer t"
-        );
-        assert_eq!(cc_custom_headers([]), "");
     }
 
     /// A provider declaring nothing sets nothing, which is q25's posture read as
