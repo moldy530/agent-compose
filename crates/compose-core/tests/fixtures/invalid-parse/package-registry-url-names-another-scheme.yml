@@ -1,0 +1,12 @@
+# rule: a `package_registry:` is reached over http or https (grammar 14.6)
+# code: invalid-value
+# message: "file:///srv/npm-mirror" is not a `package_registry.url`: it names the scheme `file`, and a registry is reached over `http` or `https`
+# at: 12:8
+# help: the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them. It is an address and nothing more: no query and no fragment, a host of ASCII letters, digits, `-`, `_` and `.` with an optional port, and a path spelled in characters both readers of `.npmrc` hand back — a WHATWG `URL` leaves it alone, its `.` and `..` segments written in dots rather than in `%2e`, and an ini parser does not end a line on it, so no `;` and no `=` in it. npm looks a credential up under the address it parses out of its own request, and reads that request's registry and that credential's key through those two parses, so a spelling either one rewrites is a line npm never reads (grammar 14.6, PRD resolved q59)
+version: "0.1"
+
+# A registry served off a filesystem path is a real arrangement and neither
+# installer's registry setting is how it is reached: `file://` is a package
+# specifier, not a registry.
+package_registry:
+  url: "file:///srv/npm-mirror"

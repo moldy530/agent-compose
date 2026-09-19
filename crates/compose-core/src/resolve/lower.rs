@@ -814,6 +814,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
             hub: None,
             placements: None,
             storage_backends: None,
+            package_registry: None,
             trace_sink: None,
             event_sources: None,
         });
@@ -880,6 +881,31 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         })
     })?;
 
+    // The scopes become a map keyed by the scope itself: a config object's key
+    // order carries nothing, and what `build` writes has to be a function of
+    // what was declared rather than of the order somebody wrote it in
+    // (grammar 14.6, PRD resolved q59).
+    let package_registry = optional(file.file.package_registry.as_ref(), |section| {
+        let mut scopes = BTreeMap::new();
+        for scope in &section.scopes {
+            scopes.insert(
+                scope.name.value.clone(),
+                ir::deploy::PackageRegistryScope {
+                    name: scope.name.clone(),
+                    url: scope.url.clone()?,
+                    token: scope.token.clone(),
+                    span: scope.span.clone(),
+                },
+            );
+        }
+        Some(ir::deploy::PackageRegistry {
+            url: section.url.clone()?,
+            token: section.token.clone(),
+            scopes,
+            span: section.span.clone(),
+        })
+    })?;
+
     // The grammar's defaults land here rather than in whoever reads the
     // artifact: `format:` decides what a delivery's body is, and a reader that
     // re-derived it differently would ship a collector something it cannot
@@ -922,6 +948,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         hub,
         placements,
         storage_backends,
+        package_registry,
         trace_sink,
         event_sources,
     })

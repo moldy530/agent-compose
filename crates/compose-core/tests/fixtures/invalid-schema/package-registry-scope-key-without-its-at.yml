@@ -1,0 +1,9 @@
+# rule: a package_registry scopes key is an npm scope written with its @, because that is how it is emitted into .npmrc and bunfig.toml (grammar 14.6)
+# at: /package_registry/scopes
+# via: /$defs/packageRegistry/properties/scopes/propertyNames/pattern
+version: "0.1"
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  scopes:
+    corp:
+      url: "https://npm.internal.example/repository/corp/"

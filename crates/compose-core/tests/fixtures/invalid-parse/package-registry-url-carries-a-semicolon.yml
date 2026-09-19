@@ -1,0 +1,24 @@
+# rule: a `package_registry.url:` path carries no `;` and no `=` — the emitted `.npmrc` is ini, and that parser ends a line at the one and splits a line at the other (grammar 14.6 rule 1)
+# code: invalid-value
+# message: "https://npm.internal.example/repository/group;maven=false/" is not a `package_registry.url`: it carries `;` in its path, and a registry address is written into `.npmrc` unquoted, both as the `registry=` value and as the key of its `_authToken` line, and npm reads that file with an ini parser — that parser ends an unquoted key and an unquoted value at a `;`, so npm would resolve from a shorter address than this one and look its credential up under one shorter still
+# at: 23:8
+# help: the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them. It is an address and nothing more: no query and no fragment, a host of ASCII letters, digits, `-`, `_` and `.` with an optional port, and a path spelled in characters both readers of `.npmrc` hand back — a WHATWG `URL` leaves it alone, its `.` and `..` segments written in dots rather than in `%2e`, and an ini parser does not end a line on it, so no `;` and no `=` in it. npm looks a credential up under the address it parses out of its own request, and reads that request's registry and that credential's key through those two parses, so a spelling either one rewrites is a line npm never reads (grammar 14.6, PRD resolved q59)
+version: "0.1"
+
+# A Nexus group repository selected by a `;`-delimited parameter in the path —
+# a spelling a WHATWG `URL` hands back untouched, and the second reader of the
+# emitted address does not. `build` would write
+# `registry=https://npm.internal.example/repository/group;maven=false/` and
+# `//npm.internal.example/repository/group;maven=false/:_authToken=${NPM_MIRROR_TOKEN}`
+# into an `.npmrc`, and npm's own `ini` — which ends an unquoted key and an
+# unquoted value at a `;` — reads back the registry
+# `https://npm.internal.example/repository/group` and the key
+# `//npm.internal.example/repository/group`. So `npm install` resolves from a
+# path nobody wrote and carries no credential, while `bun install` from the same
+# artifact reaches the registry as written and authenticates, because
+# `bunfig.toml` keeps the address inside a TOML basic string. That is grammar
+# 14.6 rule 5's one artifact / two answers divergence, reached through the file
+# format rather than through the address.
+package_registry:
+  url: "https://npm.internal.example/repository/group;maven=false/"
+  token: ${NPM_MIRROR_TOKEN}

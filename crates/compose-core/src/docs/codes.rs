@@ -148,6 +148,10 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ConflictingPlacement => include_str!("codes/conflicting-placement.md"),
         DiagnosticCode::MissingJoinToken => include_str!("codes/missing-join-token.md"),
         DiagnosticCode::ProcessLocalStore => include_str!("codes/process-local-store.md"),
+        DiagnosticCode::ConflictingRegistryCredential => {
+            include_str!("codes/conflicting-registry-credential.md")
+        }
+        DiagnosticCode::MissingRegistryToken => include_str!("codes/missing-registry-token.md"),
     }
 }
 

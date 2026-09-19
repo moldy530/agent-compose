@@ -14,6 +14,8 @@
       "name": "patchers",
       "environment": [
         "ANTHROPIC_API_KEY",
+        "NPM_CORP_TOKEN",
+        "NPM_MIRROR_TOKEN",
         "REPO_ROOT",
         "RG_CONFIG_PATH"
       ]

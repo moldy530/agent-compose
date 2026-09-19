@@ -1,0 +1,10 @@
+# rule: a package_registry scope entry takes url and token and no other key, the same closed pair the block itself takes (grammar 14.6, D50)
+# at: /package_registry/scopes/@corp
+# via: /$defs/packageRegistryScope/additionalProperties
+version: "0.1"
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  scopes:
+    "@corp":
+      url: "https://npm.internal.example/repository/corp/"
+      always_auth: true

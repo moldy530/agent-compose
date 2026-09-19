@@ -52,6 +52,8 @@ const PARSER_CODES: &[&str] = &[
     "missing-credential",
     "missing-callback-allowlist",
     "missing-join-token",
+    "conflicting-registry-credential",
+    "missing-registry-token",
     "unsupported-placement",
     "conflicting-placement",
     "unsupported-server-tools",

@@ -78,9 +78,10 @@ other, never both (Decision [D3](#d3-spec-files-and-deploy-files-are-disjoint-do
 | Kind | Selected by | May contain |
 |---|---|---|
 | **Spec file** | reachable from the entrypoint's `imports:`, or being the entrypoint | `version`, `imports` (entrypoint only), `defaults`, `state`, `triggers`, typed-address definition keys |
-| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `trace_sink`, `event_sources` |
+| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `package_registry`, `trace_sink`, `event_sources` |
 
-A spec file that declares `hub`, `placements`, `storage_backends`, `trace_sink`,
+A spec file that declares `hub`, `placements`, `storage_backends`,
+`package_registry`, `trace_sink`,
 or `event_sources` is a compile error, and a deploy file that declares
 definitions, `imports`, `state`, `triggers`, or `defaults` is a compile error. This is the
 mechanical enforcement of the PRD 5.8 per-target invariant: only the deploy layer
@@ -156,6 +157,7 @@ imports:
 | `hub` | illegal | illegal | allowed | ≤ 1 per target |
 | `placements` | illegal | illegal | allowed | ≤ 1 per target |
 | `storage_backends` | illegal | illegal | allowed | ≤ 1 per target |
+| `package_registry` | illegal | illegal | allowed | ≤ 1 per target |
 | `trace_sink` | illegal | illegal | allowed | ≤ 1 per target |
 | `event_sources` | illegal | illegal | allowed | ≤ 1 per target |
 
@@ -752,6 +754,7 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
 | `token`, `secret` | an `http` trigger's `auth:` and `callback_auth:` blocks (§13.3), and the deploy layer's `trace_sink.auth:` block (§14.5) |
+| `token` | the deploy layer's `package_registry:` block and each of its `scopes:` entries (§14.6) |
 | `join_token` | the deploy layer's `hub:` block (§14.2) |
 
 The table classifies these field *names* wherever they occur; it never makes one
@@ -782,7 +785,8 @@ channel names, typed addresses, a store's `backend:` alias, a tool's
 `function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
 a trigger's `path:`, `cron:`, and `timezone:` (§13.3, §13.4); the `header:` and
 `prefix:` of an `auth:`/`callback_auth:` scheme and every `callback_allow:` entry
-(§13.3); `hub.public_url:` (§14.2) and `trace_sink.url:` (§14.5), which are
+(§13.3); `hub.public_url:` (§14.2), `trace_sink.url:` (§14.5) and
+`package_registry`'s `url:`s (§14.6), which are
 shape-checked here and are part of what a deployment *is*; a `blob put`'s `content_type:` (§11.4); and every
 enum-valued key.
 
@@ -4897,13 +4901,18 @@ well-defined rather than a file the grammar half-recognizes (Decision
 [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)):
 
 - `deploy/local.yml` is OPTIONAL. When present it MAY declare `hub:`,
-  `placements:`, `trace_sink:` and `event_sources:`. The first two are **live**
+  `placements:`, `package_registry:`, `trace_sink:` and `event_sources:`. The
+  first two are **live**
   static grammar (§14.1, §14.2) and are checked under every target including
   `local`, which is what a mesh looks like on one machine: this process is the
   hub, and an `agent-compose worker` beside it is the spoke. `trace_sink:` is
   live under `local` too, and deliberately: an `agent-compose run` on a laptop
   settles executions like any other target, and §14.5 ships the trace of every
-  execution that settles. `event_sources:` is reserved grammar (§15), parsed,
+  execution that settles. `package_registry:` is live under `local` as well, and
+  for the plainest version of the same reason: a project built on the laptop is
+  a project somebody runs `bun install` in, and the network that mandates a
+  mirror mandates it there too (§14.6). `event_sources:` is reserved grammar
+  (§15), parsed,
   type-checked, and carried into the IR under every target, so it is not inert
   there either.
 - It MUST NOT declare `storage_backends:`. That section is *active* grammar which
@@ -4946,6 +4955,14 @@ storage_backends:
     kv: { provider: redis, url: "${REDIS_URL}" }
   aliases:
     docs_db: { provider: chroma, url: "${CHROMA_URL}" }
+
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}
+  scopes:
+    "@corp":
+      url: "https://npm.internal.example/repository/corp/"
+      token: ${NPM_CORP_TOKEN}
 
 trace_sink:
   url: "https://collector.internal.example/v1/traces"
@@ -5258,6 +5275,206 @@ that resolves to the **empty string** refuses `serve` at launch naming the
 variable, and a `run` — which has no launch to refuse at, and settles executions
 under this target all the same — says so on stderr and leaves the export
 `pending` on the ledger rather than signing it with nothing.
+
+### 14.6 `package_registry`
+
+**Where a generated project's installer resolves packages from.** A company
+network that mandates an internal npm mirror blocks the public registry
+outright, and a hand-placed `bunfig.toml` beside an emitted project is not in the
+artifact — so on a mesh every worker's `bun install` at materialise
+(`docs/distributed.md` §4) still reaches for the registry the network refuses.
+Where a package resolves from is a placement fact, and placement facts belong in
+deploy files (PRD 5.10, resolved q59). The composition says nothing.
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `url` | absolute `http`/`https` URL | yes | the registry every package resolves from; no credential in its authority |
+| `token` | `${ENV}` reference | no | the credential the installer presents; a literal is a compile error (§4.3) |
+| `scopes` | map scope → `{ url, token }` | no | per-scope overrides, keyed by the scope **with its `@`** |
+
+```yaml
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}
+  scopes:
+    "@corp":
+      url: "https://npm.internal.example/repository/corp/"
+      token: ${NPM_CORP_TOKEN}
+```
+
+The rules (Decision
+[D145](#d145-the-package-registry-is-a-deploy-layer-slot-and-build-writes-both-installers-configuration)):
+
+1. **`url:` is an absolute URL naming a host**, its scheme `http` or `https`
+   written lowercase, with **no wildcard** — §14.5 rule 1's shape rule and
+   §14.2 rule 3's diagnostic voice, because it is the same kind of thing: an
+   address this deployment writes out rather than a pattern matched against
+   somebody else's. A class-3 string (§4.3). It carries **no credential in its
+   authority** either: `https://user:pass@npm.example/` is a spelling both
+   installers accept — Bun's own `bunfig.toml` documentation shows it — and
+   following it here writes a literal secret into both emitted files, into the
+   emitted `README.md` and into the artifact hash over all three, which is
+   everything rule 5 and PRD resolved q40 exist to prevent. It also makes the
+   declared `token:` dead: npm sends the URL's own Basic credentials and never
+   the `_authToken` line, whose key could not match that address anyway. The
+   credential is rule 2's, and the refusal says so. §14.2's `public_url:` and
+   §14.5's sink accept userinfo, because neither is a documented
+   credential-carrying idiom and neither has a `token:` to point at.
+
+   It is also an **address and nothing more**, which is where this rule goes
+   past §14.2's and §14.5's. Those two URLs are written out as text and nothing
+   is computed from either; this one has a *second* address derived from it —
+   the `.npmrc` key of rule 5, which npm parses out of its own request through
+   a WHATWG `URL` rather than reading off the `registry=` line. So a spelling
+   that parse rewrites is a key npm never looks up, and the compiler refuses it
+   here rather than emitting a line nothing reads. **Two** parses stand between
+   this text and what npm resolves, in fact — that `URL`, and the ini parser npm
+   reads `.npmrc` itself with — and the rule covers both:
+
+   * **no query and no fragment.** npm appends `/<package>` to this text before
+     parsing, so `…/repo?group=npm` fetches `…/repo?group=npm/lodash` — the
+     package name inside the query, and the address stopping at `//host/repo`.
+   * **the host is ASCII letters, digits, `-`, `_` and `.`**, with an optional
+     port of up to five digits and no leading zero. That parse punycodes a
+     non-ASCII host, percent-decodes an escape in one, re-serializes a
+     bracketed IPv6 literal in its compressed form, renumbers a port
+     (`:08443` → `:8443`) and drops an empty one.
+   * **a numeric host is the dotted quad that parse writes back.** A host whose
+     last label is a number is read as an IPv4 address in whatever base it was
+     written in: `010.0.0.5` is `8.0.0.5` and `2130706433` is `127.0.0.1`.
+   * **the path is spelled in characters that parse leaves alone.** It
+     percent-encodes every ASCII control, everything above `~`, and `"`, `<`,
+     `>`, `` ` ``, `{`, `}`; it turns a `\` into a `/`. `|`, `^`, `[`, `]`,
+     `'`, `@`, `~` and a `%` escape all survive a path unchanged as
+     **characters** and are legal here; a `%2e` that is a whole *segment* is the
+     next rule rather than this one.
+   * **a `.` or `..` path segment is written in dots, not in `%2e`.** That
+     parse's dot-segment rules are spelled over the escape as well as over the
+     character: a whole segment of `%2e` is a `.`, and `%2e%2e`, `.%2e` and
+     `%2e.` are a `..`, in either case. All of them resolve on the request, so
+     `…/a/%2e%2e/repo/` is walked as `//host/repo/` while a key derived from the
+     text reads `//host/a/%2e%2e/repo/` — the same silent failure by another
+     spelling. The escaped forms are refused and the dotted ones are resolved by
+     the emitter, which is what keeps rule 5's list at three. A `%2e` inside a
+     longer segment (`/a%2eb/`) and a segment of three dots or more are ordinary
+     to that parse and legal here.
+   * **the path carries no `;` and no `=`.** These two are the *second* parse's,
+     and nothing above is about them: a WHATWG `URL` hands both back untouched,
+     while npm reads `.npmrc` with the `ini` package and `build` writes the
+     address into that file **unquoted**, twice — as the `registry=` value and
+     as the key of the `//host/path/:_authToken=` line (rule 5). An unquoted ini
+     key and an unquoted ini value both **end at a `;`**, and a line **splits at
+     its first `=`**. So `…/group;maven=false/` is read back as the registry
+     `https://host/group`, with its credential keyed at `//host/group`; and
+     `…/repo=corp/` keeps its `registry=` line whole while its credential key
+     stops at `//host/repo`. Either way `npm install` resolves from an address
+     nobody wrote, or unauthenticated, while `bun install` from the same
+     artifact is right, because `bunfig.toml` keeps the address inside a TOML
+     basic string that hands every character of it back. That is rule 5's one
+     artifact / two answers divergence reached through the *file format* rather
+     than through the address, and refusing it here is what lets the emitter go
+     on writing plain ini instead of carrying an escaper whose rules would have
+     to match that parser's exactly. A `#` is the third character that parser
+     ends a line on, and the first bullet above has already refused it as the
+     fragment a WHATWG `URL` reads it as.
+
+   The refusal names the character or the part it found, and the same list is
+   what lets the emitter normalize exactly three things — a host's case, the
+   scheme's own default port, dot segments — instead of reimplementing a WHATWG
+   `URL` in the compiler, and write plain unquoted ini instead of carrying an
+   escaper for it.
+2. **`token:` is an `${ENV}` reference and never a literal** (§4.3 class 1), the
+   posture every deploy-layer credential takes. A scope's `token:` is the same
+   key under the same rule. A registry that is read through without a
+   credential simply omits it.
+3. **A `scopes:` key is an npm scope, written with its `@`** — `"@corp"`, the
+   scope of `@corp/ui` — because that is how it is emitted, into `.npmrc`'s
+   `@corp:registry=` line and Bun's `[install.scopes]` table. After the `@` it is
+   a lowercase letter or a digit, then lowercase letters, digits, `-`, `_` and
+   `.`; anything else is a compile error naming the key. Uppercase is refused
+   rather than folded, because a scope this compiler quietly rewrote would be one
+   its author could not find in either emitted file. Each entry takes `url:`
+   (required) and `token:`, under rules 1 and 2.
+4. **`build` writes both installers' configuration, and only where this key is
+   declared.** A target that declares it gets a `bunfig.toml` and an `.npmrc`,
+   both **pure-generated members of the emitted file list** (PRD resolved q47):
+   `build` overwrites them, `build --check` compares them, and a build into a
+   directory where an authored file already holds one of those names is refused
+   naming it. A target that declares no `package_registry:` gets **neither**
+   file — no empty stubs, and no row for them in the emitted `README.md`'s
+   boundary table. A target that **stops** declaring it keeps the pair the last
+   build wrote, because `build` removes nothing (PRD resolved q47), and they go
+   on pointing every install in that directory at a mirror the spec no longer
+   names — so `build --check` is where that is said out loud: one of this
+   compiler's own files at a claimed path *this* target does not emit is
+   reported **`stale`**, alongside `missing` and `differs`, exits `1` like any
+   other drift, and carries a help line naming the two ways out — delete the
+   file, or declare the key again in this target — because a rebuild does
+   neither. This key is the only one whose presence moves a path in and out of
+   the emission set, so it is the only one that reaches that state. The
+   generated-file header is the test: a `bunfig.toml` or an `.npmrc` an *author*
+   put at that name is not this compiler's file and is not reported. Two files
+   rather than one because resolved q18 keeps npm a supported fallback, and a
+   fallback configured differently from the default is not one. This
+   **configures** an installer rather than pinning one, so it does not touch
+   q18's refusal of a `packageManager` field, and no lockfile is emitted here
+   either.
+5. **A credential is a spelling, not a byte.** Each file carries the
+   environment-variable *reference* in that installer's own documented form —
+   `${NAME}` in `.npmrc`, `$NAME` in `bunfig.toml` — and the installer expands it
+   when it runs. So no secret enters the artifact, the artifact hash (PRD
+   resolved q40) is stable across a token rotation, and nothing secret transits
+   a mesh (resolved q41). An `.npmrc` credential is keyed by **address** rather
+   than by scope (`//host/path/:_authToken=${NAME}`, which is what npm requires),
+   and that address is the one **npm derives from its own request** rather than
+   the text of the `url:`: to fetch a package npm strips one trailing `/` from
+   the registry, appends `/<package>`, parses the result through a WHATWG `URL`
+   and then walks *up* that address. So the host folds to lowercase, the
+   scheme's own default port drops away and dot segments resolve — and the key
+   is the registry's **whole** path with a trailing `/`, because the package
+   name goes after its last segment rather than over it. `…/repo` and `…/repo/`
+   are therefore one registry at one address. **Those three are the whole list
+   of what the emitter reproduces**, and rule 1 is what makes that honest: every
+   other spelling the parse would rewrite — a query, a fragment, a non-ASCII or
+   percent-escaped host, an IP literal, a renumbered port, a `\`, a path
+   character it percent-encodes, a dot segment spelled with a `%2e` — is
+   refused at the `url:` instead, so the compiler never has to reimplement a
+   WHATWG `URL` to stay right. These lines are also written **unquoted**, which
+   the same rule makes honest from the other side: a `;` or an `=` in the path
+   would survive that parse and be line syntax to the ini parser npm reads this
+   file with, so rule 1 refuses those two as well rather than leaving an escaper
+   here to match that parser exactly. A key spelled
+   any other way is one npm never looks up, and the failure is silent in the
+   worst direction: the `npm install` goes out unauthenticated while the
+   `bun install` from the same artifact, which carries the token inside its
+   registry object rather than keyed by an address, succeeds. Two shapes are
+   therefore a compile error naming both entries, each under a code of its own
+   rather than an `invalid-value`, because neither `url:` and neither `${VAR}`
+   is wrong read alone — what is refused is the pair:
+   * **one address, two variables** (`conflicting-registry-credential`) — an ini
+     parser keeps the last, while Bun's per-scope table keeps both;
+   * **an entry with no `token:` at or under a tokened entry's address**
+     (`missing-registry-token`) — npm
+     finds a credential by walking *up* the address of its request
+     (`//host/repo/corp/` falls back to `//host/repo/`), so it spends the other's
+     there, while Bun's registry object for that entry carries none and sends
+     nothing. This is the credential reaching a registry the author scoped it
+     away from, which is the worse of the two directions. The repair is the
+     `token:` the entry should spend, or an address that is not under the
+     other's.
+6. **Unknown keys are errors**, as everywhere outside a plugin-config object
+   ([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
+
+**Where presence is checked, stated plainly.** Nowhere at build: `build` reads no
+environment (§4.3, PRD resolved q15). And **not by the installer either** —
+neither `bun install` nor `npm install` fails on an unset variable; both send the
+reference as text and the registry answers `401`. What names the variable is the
+environment manifest it joins: a registry credential belongs to the hub's list
+**and** to every placement's, because every process installs — the hub installs
+the project it serves and a worker runs `bun install` over the artifact it just
+materialised (`docs/distributed.md` §4 step 4, §9.1). So `readEnvironment()`
+refuses at launch naming it, and a worker without it is refused at join naming it
+(§9.2), which is resolved q15's posture landing at the surfaces that install.
 
 ---
 
@@ -8364,9 +8581,13 @@ typed interface meets the ergonomic need with none of that.
 
 *What it costs, stated.* A module an older compiler release wrote and this one no
 longer emits is left where it is. It is not drift, because drift is a
-disagreement about a file the compiler claims. The alternative was a walk that
-deleted whatever carried the generated-file header, which is the read-of-its-own-
-output this decision removes.
+disagreement about a file the compiler claims, and a path this release has
+dropped from `EMITTED_PATHS` is outside that claim. A path the list still claims
+that *this target* does not emit is the other case and **is** reported — the
+`stale` verdict of §14.6 rule 4
+([D145](#d145-the-package-registry-is-a-deploy-layer-slot-and-build-writes-both-installers-configuration),
+PRD resolved q59). The alternative was a walk that deleted whatever carried the
+generated-file header, which is the read-of-its-own-output this decision removes.
 
 *Why the type checker holds the contract.* `tsc` is already a gate on every
 generated project, and codegen already knows the tool's `input:`/`output:` — so
@@ -9001,6 +9222,178 @@ of the resolved value over the same character set and fails the run rather than
 sending it. **Status**: shipped. *PRD G3, resolved q58 ruling b; §8.3, §12.1,
 §13.3, [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table).*
 
+---
+
+### D145. The package registry is a deploy-layer slot, and `build` writes both installers' configuration
+
+`package_registry:` is a deploy-layer key beside `storage_backends:` (§14.6)
+taking `url:` (required, absolute `http`/`https`, no wildcard), `token:` (an
+`${ENV}` reference, never a literal) and `scopes:` (a map keyed by an npm scope
+written with its `@`, each entry taking the same two keys). A target that
+declares it gets a generated `bunfig.toml` **and** a generated `.npmrc`, both
+members of the emitted file list; a target that does not gets neither.
+
+**Rationale.**
+
+*Why a deploy-layer key.* Which registry a machine may reach is a property of a
+network, and only this layer forks per environment (PRD 5.8) — the same sentence
+that placed the journal ([D59](#d59-checkpointing-is-a-target-property-and-detach-is-checked-per-target), PRD resolved q27)
+and the trace sink ([D134](#d134-the-trace-sink-is-operator-written-config-and-ships-on-the-delivery-ledger)).
+The composition says nothing, because nothing about a flow changes.
+
+*Why the compiler writes the file at all, rather than leaving it beside the
+project.* A hand-placed `bunfig.toml` survives a build — the manifest is the
+boundary ([D132](#d132-the-emitted-file-list-is-the-boundary-and-module-is-the-way-across-it), PRD resolved q47) and nothing
+outside the emitted list is touched — but it is not **in the artifact**, so every
+worker that materialises the tree and runs `bun install`
+([`docs/distributed.md`](distributed.md) §4) resolves against the public
+registry. The field report this key comes from is exactly that gap, papered over
+with a post-process script; membership in the emitted list is what removes the
+script.
+
+*Why two files.* Resolved q18 makes Bun the default and Node/npm a supported
+fallback, and a fallback configured differently from the default is not a
+fallback. Each file is written in its own installer's documented spelling —
+Bun's `[install] registry = { url, token = "$VAR" }` and `[install.scopes]`,
+npm's `registry=`/`@scope:registry=` with a host-scoped
+`//host/path/:_authToken=${VAR}` — rather than in one normalized form of this
+compiler's invention. Writing *configuration* is not pinning an installer, so
+q18's refusal of `packageManager` is untouched and no lockfile appears.
+
+*Why neither file exists without the key.* An emitted `bunfig.toml` saying
+nothing would still claim a name — a row in the emitted README's boundary table,
+a file `build --check` compares, a file a first build into somebody's directory
+refuses over — for a configuration nobody asked for. The emitted file set is the
+compiler's claim on a directory, and a claim is worth making only over a file
+with content.
+
+*Why dropping the key is a `--check` verdict rather than a removal.* `build`
+removes nothing — the emitted file list is a claim about what is **written**,
+never a directory to be swept ([D132](#d132-the-emitted-file-list-is-the-boundary-and-module-is-the-way-across-it),
+PRD resolved q47) — so a target that stops declaring `package_registry:` leaves
+the last build's `bunfig.toml` and `.npmrc` behind, where they go on telling
+every `bun install` and `npm install` in that directory to resolve through a
+mirror the spec no longer names. Deleting them would make `build` a verb that
+removes files; saying nothing would leave CI green over a tree that installs from
+an address its spec does not carry. So `build --check` grows a **third** verdict
+beside *missing* and *differs*: **`stale`**, over a claimed path
+(`EMITTED_PATHS`) that this target does not emit and that holds a file carrying
+the generated-file header. It exits `1` like any other drift, and its help line
+names the two ways out — delete the file, or declare the key again in this
+target — because a rebuild does neither. This key is why the state exists at all
+— it is the only one whose presence moves a path in and out of the emission set
+— and the header is what keeps the report the compiler's business: an author's
+own `.npmrc` at that name is a file this compiler never wrote, and is not
+reported. D132's *what it costs* is the neighbouring case and stands as written:
+a path the **release** no longer emits is outside the claim entirely, and nothing
+reports it. §14.6 rule 4 carries the rule.
+
+*Why the token is a reference and never a value.* §4.3's posture, and here it
+buys three things at once: no secret in the artifact, an artifact hash (PRD
+resolved q40) that does not move when a token is rotated, and nothing secret on
+a mesh's wire (resolved q41). Both installers expand the reference themselves,
+which is why the two spellings differ and why each file carries its own.
+
+*Why an `.npmrc` collision is refused rather than resolved.* npm keys a
+credential by address, so two entries whose registry URLs derive one address
+write one `_authToken` line twice and an ini parser keeps the last — while Bun's
+per-scope table keeps both. One artifact would then authenticate differently
+under the two installers, which is the class of divergence this key exists to
+remove. The choice belongs to the author, so `validate` makes them make it.
+
+*Why that address is derived rather than copied, and why the rule reaches past
+exact equality.* npm never compares an `_authToken` key against the text of a
+`registry=` line: it derives the key it looks up from the **request URI**. It
+builds that URI itself — the registry with one trailing `/` stripped, then
+`/<package>` — parses it through a WHATWG `URL`, and walks *up* the result until
+a credential answers. So the emitted key is derived the same way — host
+lowercased, the scheme's own default port dropped, dot segments resolved, and
+the registry's whole path kept with a trailing `/`, because `/<package>` lands
+after its last segment rather than on it — and `validate` compares the derived
+keys rather than the URLs. That last point is where npm's two sides disagree and
+only one of them is the one that matters here: `npm login` *writes* a credential
+under `@npmcli/config`'s `nerfDart`, which does drop a last segment written
+without a trailing `/`; `npm install` *reads* one under `npm-registry-fetch`'s
+`regFromURI`, which does not. Keying by the writer would scope a credential
+declared for one repository to the mirror's entire host, and would let the two
+spellings of one registry derive two keys — which is exactly the one-artifact /
+two-answers divergence the rule below refuses. A key spelled any
+other way is one npm never finds, and that failure is silent in the worst
+direction: the `npm install` resolves unauthenticated (or takes a `401`) while
+the `bun install` from the same artifact succeeds, because Bun carries the token
+inside its registry object rather than keyed by an address at all. Reading npm's
+lookup honestly is also what widens the collision rule: npm walks *up* the
+address of its request, so an entry with no `token:` at or under a tokened one
+authenticates under npm and not under Bun — the credential leaking to a registry
+the author scoped it away from, which is a worse failure than the 401 the exact
+collision produces.
+
+*Why a `url:` may not carry userinfo.* `https://user:pass@host/` is a spelling
+both installers accept and the one Bun's own `bunfig.toml` documentation shows,
+so it is what an author reaches for — and here it would write a literal secret
+into both emitted files, into the emitted `README.md` and into the artifact hash
+over all three, which is every guarantee §4.3's posture and resolved q40's stable
+hash are for. It would also make the declared `token:` dead code: npm sends the
+URL's Basic credentials and never the bearer line, whose key could not match that
+address anyway. §14.2's `public_url:` and §14.5's sink accept the same spelling,
+and the difference is the point — neither is a documented credential-carrying
+idiom and neither has a `token:` to redirect the author to, so a refusal there
+would be this compiler inventing a rule about somebody else's deployment.
+
+*Why the `url:` is an address and nothing more.* The three normalizations above
+are the whole of what the emitter reproduces, and a WHATWG `URL` does more than
+three things. It ends the path at a `?` or a `#`; it punycodes a non-ASCII host
+and percent-decodes an escape in one; it re-serializes a bracketed IPv6 literal
+in compressed form and a numeric host as a dotted quad, in whatever base the
+author wrote it (`010.0.0.5` is `8.0.0.5`); it reads a port as a number
+(`:08443` is `:8443`, an empty `:` is nothing); it turns a `\` into a `/`; it
+percent-encodes every ASCII control, everything above `~`, and `"`, `<`, `>`,
+`` ` ``, `{`, `}` in a path; and it resolves a dot segment spelled with a `%2e`
+as readily as one spelled in dots, its own rules naming `%2e` a `.` and
+`%2e%2e`, `.%2e` and `%2e.` a `..`, in either case. Each of those makes the
+emitted key an address npm never visits — the same silent one-artifact /
+two-answers failure, reached by a spelling rather than by a collision. The
+escaped dot segment reaches it from the other side too: two entries that derive
+two compiler keys can be one address to npm, which walks the resolved path, so
+rule 5's pair of refusals stays silent while npm spends whichever `_authToken`
+line the ini parser kept — the credential-leaking direction. §14.6 rule 1
+refuses them all at the `url:`, and the compiler never has to carry an IDNA
+table or an IP-literal serializer to stay right. The two directions are pinned together in
+`crates/compose-core/src/parse/deploy.rs`, where each refused spelling is
+asserted beside the key npm would actually look up for it: a rule relaxed there
+without a normalization added in `codegen::registry::npm_auth_key` fails the
+test rather than shipping. A query is the reachable one of these — a Nexus or
+Artifactory group selected by a parameter is a URL an operator really pastes —
+and it carries a fixture of its own.
+
+*…and why the rule does not stop at that parse.* A WHATWG `URL` is only the
+first of **two** readers between the `url:` and what npm resolves. The second is
+`ini`: npm reads `.npmrc` with it, and the emitted address goes into that file
+unquoted twice, as the `registry=` value and as the key of the
+`//host/path/:_authToken=` line. An unquoted ini key and an unquoted ini value
+both end at a `;`, and a line splits at its first `=` — two characters a WHATWG
+`URL` writes back untouched, so nothing above catches them. A mirror at
+`…/group;maven=false/` therefore emits a file npm reads as the registry
+`https://host/group` with a credential keyed at `//host/group`, and one at
+`…/repo=corp/` emits a credential keyed at `//host/repo`; both are the same
+silent one-artifact / two-answers failure — `npm install` from the wrong path or
+unauthenticated while `bun install` from the same artifact is right, because
+`bunfig.toml` keeps the address inside a TOML basic string. §14.6 rule 1 refuses
+`;` and `=` in a path for that reason, which is also what lets the emitter go on
+writing plain unquoted ini: the alternative is an escaper in the compiler whose
+rules have to match that parser's exactly, which is the same bargain the address
+rules refuse to make with a WHATWG `URL`. `#` is the third character that parser
+ends a line on and is already refused as a fragment. The Nexus group path is the
+reachable one here too, and carries a fixture of its own.
+
+*Where presence is checked.* Not at build (resolved q15), and — stated because
+it is the thing a reader would assume wrongly — not by the installer either:
+both send an unset reference as text and take a `401`. The check that names the
+variable is the environment manifest, which this credential joins on the hub's
+list **and** on every placement's, because every process installs. **Status**:
+shipped. *PRD resolved q15, q18, q27, q32, q40, q41, q47, q49, q50, q59; §4.3,
+§14.6.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -9297,6 +9690,9 @@ version: "0.1"
 hub:              { join_token?: ${VAR}, public_url?: "https://<host>" }
 placements:       { <name>: { members: [agent.*|tool.*, ...], description? } }
 storage_backends: { defaults: { kv|vector|blob: {...} }, aliases: { <alias>: {...} } }
+package_registry: { url: "https://<host>/<path>", token?: ${VAR},
+                    scopes?: { "@<scope>": { url, token?: ${VAR} } } }
+                                   # 14.6: build writes bunfig.toml + .npmrc
 trace_sink:       { url: "https://<host>/<path>", format?: envelope|otlp,
                     auth?: { bearer?: {...}, hmac?: {...} } }   # 13.3's outbound
                                    # block; no allowlist key, and none is wanted

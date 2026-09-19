@@ -50,6 +50,8 @@
 //! tsconfig.json         strict, NodeNext, no build step
 //! README.md             what this directory is, how to run it, how to eject
 //! .gitignore            the two paths a generated project acquires
+//! bunfig.toml           where `bun install` resolves packages (grammar 14.6)
+//! .npmrc                the same, for npm and pnpm (grammar 14.6)
 //! manifest.json         what a worker reads out of the tree (distributed §9.1)
 //! src/artifact.ts       this tree's content hash and file list (distributed §4)
 //! src/cel.ts            the CEL evaluator the routers embed (PRD 5.5)
@@ -84,9 +86,15 @@
 //! `src/artifact.ts` is emitted **last and over the rest**, because what it
 //! carries is a hash of them (`docs/distributed.md` §4, and see [`artifact`]).
 //!
+//! `bunfig.toml` and `.npmrc` are the one pair that is **not** in every build:
+//! they exist exactly where the target declares a `package_registry:`
+//! (grammar 14.6, PRD resolved q59, and see [`registry`]), which is what
+//! [`TARGET_PATHS`] and [`emitted_paths`] say in code.
+//!
 //! **The manifest is the boundary** (PRD resolved q47). [`EMITTED_PATHS`] is
 //! this list and is the compiler's whole claim on an output directory: `build`
-//! overwrites exactly it, `build --check` compares exactly it, and nothing else
+//! overwrites exactly [`emitted_paths`], `build --check` compares exactly it,
+//! and nothing else
 //! under the output directory is written, removed, or reported — not a
 //! `node_modules/`, not a `.env`, and not the hand-authored TypeScript a
 //! `module:` binding names (grammar 6.1). A file this compiler does not emit is
@@ -102,7 +110,7 @@
 //! artifact, so the file the binding names has to be *in* the tree the hub
 //! serves. [`GeneratedProject`] therefore holds two lists:
 //!
-//! * [`GeneratedProject::files`] — the emission set, [`EMITTED_PATHS`] exactly.
+//! * [`GeneratedProject::files`] — the emission set, [`emitted_paths`] exactly.
 //!   Generated, header-carrying, byte-identical for byte-identical input.
 //! * [`GeneratedProject::carried`] — the authored files the composition
 //!   references, at the same project-relative path they are edited at. Their
@@ -200,6 +208,7 @@ pub mod otlp;
 pub mod pattern;
 pub mod policy;
 pub mod project;
+pub mod registry;
 pub mod runtime;
 pub mod schema;
 pub mod serve;
@@ -215,24 +224,28 @@ use crate::ir::schema::TypeForm;
 /// The compiler release this build is, as it appears in every generated header.
 pub const COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Every path [`emit`] writes, sorted — the compiler's whole claim on an output
-/// directory (PRD resolved q47).
+/// Every path [`emit`] may write, sorted — the compiler's whole claim on an
+/// output directory (PRD resolved q47).
 ///
-/// The list is a **constant** rather than a walk because it is the same for
-/// every composition: the layout is fixed, and what varies is the contents of
-/// each file rather than which files there are.
+/// The list is a **constant** rather than a walk because the layout is fixed:
+/// what varies is the contents of each file, and — for the two paths
+/// [`TARGET_PATHS`] names — whether the file is there at all.
 /// [`the_file_set_is_the_documented_layout_for_every_composition`] is what holds
-/// that, over two compositions with nothing in common.
+/// that, over compositions with nothing in common.
 ///
 /// It is a constant here so that the *front end* can read it: a `module:`
 /// binding naming a path this list carries is refused where it is written
 /// (grammar 6.1), rather than at a build that would have to choose between
-/// overwriting the author's file and refusing to emit its own.
+/// overwriting the author's file and refusing to emit its own. That refusal
+/// reads the **whole** claim rather than one composition's emission set, because
+/// a path a sibling target writes is still not a name a binding may take.
 ///
 /// [`the_file_set_is_the_documented_layout_for_every_composition`]: tests::the_file_set_is_the_documented_layout_for_every_composition
 pub const EMITTED_PATHS: &[&str] = &[
     ".gitignore",
+    ".npmrc",
     "README.md",
+    "bunfig.toml",
     "manifest.json",
     "package.json",
     "src/artifact.ts",
@@ -257,6 +270,33 @@ pub const EMITTED_PATHS: &[&str] = &[
     "src/worker-node.ts",
     "tsconfig.json",
 ];
+
+/// The paths of [`EMITTED_PATHS`] a build writes only where the **target** asks
+/// for them (grammar 14.6, PRD resolved q59).
+///
+/// The installer configuration, and the only part of the layout that is not the
+/// same for every build. A target declaring no `package_registry:` gets neither
+/// file rather than two empty stubs: a stub would claim a name — and so a line
+/// in the emitted `README.md`'s boundary table — for a configuration nobody
+/// asked for, and would put a `registry=` in front of every reader who does not
+/// have a mirror.
+pub const TARGET_PATHS: &[&str] = &[".npmrc", "bunfig.toml"];
+
+/// Every path a build of **this** artifact writes, sorted.
+///
+/// [`EMITTED_PATHS`] minus whatever [`TARGET_PATHS`] this target did not ask
+/// for. This is the list the emitted `README.md` tabulates and the list
+/// `build --check` compares; `EMITTED_PATHS` stays the compiler's claim across
+/// every target, which is the question `parse::binding` asks.
+#[must_use]
+pub fn emitted_paths(ir: &Ir) -> Vec<&'static str> {
+    let registry = ir.deploy.package_registry.is_some();
+    EMITTED_PATHS
+        .iter()
+        .copied()
+        .filter(|path| registry || !TARGET_PATHS.contains(path))
+        .collect()
+}
 
 /// The directory a scaffolded module implementation is conventionally written
 /// under (PRD resolved q47).
@@ -316,7 +356,7 @@ impl GeneratedProject {
         Self { files, carried }
     }
 
-    /// Every **emitted** file, sorted by path — [`EMITTED_PATHS`] exactly.
+    /// Every **emitted** file, sorted by path — [`emitted_paths`] exactly.
     #[must_use]
     pub fn files(&self) -> &[GeneratedFile] {
         &self.files
@@ -448,6 +488,12 @@ pub fn emit(ir: &Ir, authored: &authored::Authored) -> GeneratedProject {
         worker::manifest(ir, &partition),
         project::index(ir),
     ];
+    // The installer configuration, which exists only where the target declares
+    // a `package_registry:` (grammar 14.6, PRD resolved q59). It goes in with
+    // the rest rather than after the artifact module, because the two files
+    // travel in the artifact like everything else: a worker installs out of the
+    // tree it materialised.
+    files.extend(registry::files(ir));
     // The authored half of the tree, at the same project-relative path it is
     // edited at (PRD resolved q49). It goes in before the artifact module,
     // because the hash is over the whole tree and a module tool that did not
@@ -1182,21 +1228,47 @@ flow.f:
     }
 
     /// [`EMITTED_PATHS`] is the compiler's whole claim on an output directory
-    /// (PRD resolved q47), and everything downstream reads it as a constant: the
-    /// front end refuses a `module:` binding that names one of these, `build`
-    /// writes and `--check`s exactly this list, and nothing else under the
-    /// output directory is touched. So the constant has to be the emitter's own
-    /// answer for **every** composition, not for the one a test happened to
-    /// pick — two with nothing in common is the cheapest way to say so.
+    /// (PRD resolved q47), and everything downstream reads it: the front end
+    /// refuses a `module:` binding that names one of these, `build` writes and
+    /// `--check`s exactly [`emitted_paths`], and nothing else under the output
+    /// directory is touched. So the answer has to be the emitter's own for
+    /// **every** composition, not for the one a test happened to pick — two with
+    /// nothing in common is the cheapest way to say so.
     #[test]
     fn the_file_set_is_the_documented_layout_for_every_composition() {
         for source in [
             "version: \"0.1\"\n",
             crate::codegen::test_support::EVERY_FORM,
         ] {
-            let project = emit(&ir_of(source), &authored::Authored::none());
-            assert_eq!(project.paths().collect::<Vec<_>>(), EMITTED_PATHS);
+            let ir = ir_of(source);
+            let project = emit(&ir, &authored::Authored::none());
+            assert_eq!(project.paths().collect::<Vec<_>>(), emitted_paths(&ir));
+            assert!(
+                TARGET_PATHS
+                    .iter()
+                    .all(|path| !project.paths().any(|emitted| emitted == *path)),
+                "a target with no `package_registry:` writes no installer configuration"
+            );
         }
+    }
+
+    /// …and the target half of the claim: a `package_registry:` adds exactly the
+    /// two paths [`TARGET_PATHS`] names, and nothing else moves.
+    ///
+    /// Both directions matter. A stub emitted unconditionally would put a
+    /// `registry=` in front of every reader who has no mirror and a row in every
+    /// README's boundary table; a file *missing* where the target declares one
+    /// is the field report resolved q59 exists for, arrived at from inside the
+    /// compiler instead of from a post-process script.
+    #[test]
+    fn declaring_a_registry_adds_the_installer_configuration_and_nothing_else() {
+        let ir = crate::codegen::test_support::ir_of_mesh(
+            "version: \"0.1\"\n",
+            "version: \"0.1\"\npackage_registry:\n  url: \"https://npm.internal.example/mirror/\"\n",
+        );
+        let project = emit(&ir, &authored::Authored::none());
+        assert_eq!(project.paths().collect::<Vec<_>>(), EMITTED_PATHS);
+        assert_eq!(emitted_paths(&ir), EMITTED_PATHS);
     }
 
     /// Every emitted name fits the tar header the artifact is served in.
@@ -1244,7 +1316,7 @@ tool.sign:
                 .iter()
                 .map(|file| file.path.as_str())
                 .collect::<Vec<_>>(),
-            EMITTED_PATHS,
+            emitted_paths(&ir),
             "the compiler's claim on a directory does not depend on the spec"
         );
         assert_eq!(
@@ -1255,7 +1327,7 @@ tool.sign:
                 .collect::<Vec<_>>(),
             [("src/tools/sign.ts", "// yours\n")]
         );
-        let mut every = EMITTED_PATHS.to_vec();
+        let mut every = emitted_paths(&ir);
         every.push("src/tools/sign.ts");
         every.sort_unstable();
         assert_eq!(project.paths().collect::<Vec<_>>(), every);

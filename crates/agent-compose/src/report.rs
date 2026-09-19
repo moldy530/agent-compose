@@ -328,7 +328,7 @@ pub(crate) fn build_verdict(
         renderer.render(&[Group::with_title(level.primary_title(title.as_str()))])
     ));
     if !drift.is_empty() {
-        report.push_str(&drift_help(not_ours));
+        report.push_str(&drift_help(drift, not_ours));
     }
     report
 }
@@ -400,25 +400,59 @@ pub(crate) fn scaffold_notice(scaffolded: &[(String, String)], color: bool) -> S
 /// generated file somebody edited, because both are `differs`.
 /// `crate::build::not_ours` answers it off the same scan the write makes, so the
 /// remedy printed here is the one the next command actually performs.
-fn drift_help(not_ours: &[String]) -> String {
-    if not_ours.is_empty() {
-        return "help: run `agent-compose build` to regenerate\n".to_string();
+///
+/// A [`State::Stale`](crate::build::State::Stale) line is the other case a
+/// single remedy would get wrong, and in the same direction: `build` removes
+/// nothing (PRD resolved q47), so a file an earlier build of this target wrote
+/// and this one does not is one a rebuild leaves exactly where it is. It gets a
+/// line of its own naming the paths and the removal, beside the rebuild line
+/// when the same report carries both kinds.
+fn drift_help(drift: &[crate::build::Drift], not_ours: &[String]) -> String {
+    use crate::build::State;
+
+    let mut help = String::new();
+    if drift.iter().any(|entry| entry.state != State::Stale) {
+        if not_ours.is_empty() {
+            help.push_str("help: run `agent-compose build` to regenerate\n");
+        } else {
+            let (noun, pronoun) = if not_ours.len() == 1 {
+                ("a file", "it")
+            } else {
+                ("files", "them")
+            };
+            help.push_str(&format!(
+                "help: `agent-compose build` will not regenerate this directory: it holds {noun} \
+                 this compiler did not write at {noun} this build writes ({}), and the build \
+                 would have replaced {pronoun}. Point `--out` at a directory of its own, or move \
+                 {pronoun} aside\n",
+                paths(not_ours),
+            ));
+        }
     }
-    let (noun, pronoun) = if not_ours.len() == 1 {
-        ("a file", "it")
-    } else {
-        ("files", "them")
-    };
-    format!(
-        "help: `agent-compose build` will not regenerate this directory: it holds {noun} this \
-         compiler did not write at {noun} this build writes ({}), and the build would have \
-         replaced {pronoun}. Point `--out` at a directory of its own, or move {pronoun} aside\n",
-        not_ours
-            .iter()
-            .map(|path| format!("`{path}`"))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
+    let stale: Vec<String> = drift
+        .iter()
+        .filter(|entry| entry.state == State::Stale)
+        .map(|entry| entry.path.clone())
+        .collect();
+    if !stale.is_empty() {
+        let pronoun = if stale.len() == 1 { "it" } else { "them" };
+        help.push_str(&format!(
+            "help: `agent-compose build` will not remove {}: a build writes {pronoun} only for a \
+             target that asks for {pronoun} and deletes nothing, so what is there is an earlier \
+             build's. Delete {pronoun}, or declare in this target the key that writes {pronoun}\n",
+            paths(&stale),
+        ));
+    }
+    help
+}
+
+/// A list of paths, each in backticks, for a help line.
+fn paths(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("`{path}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The human report, as one string ready for stderr.
@@ -748,11 +782,17 @@ mod tests {
     #[test]
     fn the_drift_help_names_a_command_that_would_run() {
         assert_eq!(
-            drift_help(&[]),
+            drift_help(
+                &[drifted("src/graph.ts", crate::build::State::Differs)],
+                &[]
+            ),
             "help: run `agent-compose build` to regenerate\n"
         );
         assert_eq!(
-            drift_help(&["src/graph.ts".to_string()]),
+            drift_help(
+                &[drifted("src/graph.ts", crate::build::State::Differs)],
+                &["src/graph.ts".to_string()]
+            ),
             "help: `agent-compose build` will not regenerate this directory: it holds a file this \
              compiler did not write at a file this build writes (`src/graph.ts`), and the build \
              would have replaced it. Point `--out` at a directory of its own, or move it aside\n"
@@ -761,12 +801,51 @@ mod tests {
         // is wider than what it emits (PRD resolved q49), so the sentence says
         // "writes" — `src/tools/sign.ts` is a name this compiler never emits.
         assert_eq!(
-            drift_help(&["src/graph.ts".to_string(), "src/tools/sign.ts".to_string()]),
+            drift_help(
+                &[drifted("src/graph.ts", crate::build::State::Differs)],
+                &["src/graph.ts".to_string(), "src/tools/sign.ts".to_string()]
+            ),
             "help: `agent-compose build` will not regenerate this directory: it holds files this \
              compiler did not write at files this build writes (`src/graph.ts`, \
              `src/tools/sign.ts`), and the build would have replaced them. Point `--out` at a \
              directory of its own, or move them aside\n"
         );
+    }
+
+    /// A stale claimed path is the one drift a rebuild does **not** settle, so
+    /// the help says to delete it instead of naming `build` (PRD resolved q47:
+    /// nothing is ever removed).
+    #[test]
+    fn a_stale_file_is_told_to_be_deleted_rather_than_rebuilt() {
+        assert_eq!(
+            drift_help(&[drifted(".npmrc", crate::build::State::Stale)], &[]),
+            "help: `agent-compose build` will not remove `.npmrc`: a build writes it only for a \
+             target that asks for it and deletes nothing, so what is there is an earlier build's. \
+             Delete it, or declare in this target the key that writes it\n"
+        );
+        // Both kinds in one report: two remedies, because one command performs
+        // neither half of the other's.
+        assert_eq!(
+            drift_help(
+                &[
+                    drifted(".npmrc", crate::build::State::Stale),
+                    drifted("bunfig.toml", crate::build::State::Stale),
+                    drifted("src/graph.ts", crate::build::State::Differs),
+                ],
+                &[]
+            ),
+            "help: run `agent-compose build` to regenerate\n\
+             help: `agent-compose build` will not remove `.npmrc`, `bunfig.toml`: a build writes \
+             them only for a target that asks for them and deletes nothing, so what is there is \
+             an earlier build's. Delete them, or declare in this target the key that writes them\n"
+        );
+    }
+
+    fn drifted(path: &str, state: crate::build::State) -> crate::build::Drift {
+        crate::build::Drift {
+            path: path.to_string(),
+            state,
+        }
     }
 
     #[test]

@@ -244,3 +244,98 @@ fn bind(
         .with_help(help),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::DEPLOY_SECTIONS;
+    use crate::prose::enumeration;
+
+    /// The only deploy section `local` refuses, which is what [`super::check`]
+    /// reports: `local` substitutes local storage for every store
+    /// unconditionally, so the block could only be an inert key whose author
+    /// expected a substitution that never happens (grammar 14, Decision D87).
+    const REFUSED_UNDER_LOCAL: &[&str] = &["storage_backends"];
+
+    /// `version:` belongs to both document kinds (grammar 1.5), so it is never
+    /// what a "what `deploy/local.yml` may declare" sentence is enumerating.
+    const SHARED_BY_BOTH_DOCUMENT_KINDS: &[&str] = &["version"];
+
+    /// **What `deploy/local.yml` may declare is published in three places, and
+    /// they must agree with the mechanism.**
+    ///
+    /// `local` admits every deploy section except the one [`super::check`]
+    /// refuses, so [`DEPLOY_SECTIONS`] minus [`REFUSED_UNDER_LOCAL`] is the
+    /// list — and three documents state it in prose: `docs/grammar.md` §14's
+    /// `local` bullet, `docs/plan.md` §11, which is why a plan compares those
+    /// sections and no others, and `agent-compose docs targets`, which is the
+    /// copy an author on a laptop actually reads.
+    ///
+    /// A section made live under `local` and written into only two of them
+    /// leaves the third telling that author the key they just wrote is not
+    /// allowed in the file the grammar says it belongs in — error UX (PRD G3)
+    /// failing where it is being read, and with nothing else in the suite
+    /// disagreeing, because a topic doc is prose and prose does not compile.
+    /// `package_registry:` (PRD resolved q59) went live under `local` in the
+    /// grammar, in the plan document and in this module while the topic's list
+    /// still named four sections.
+    #[test]
+    fn what_deploy_local_yml_may_declare_is_the_same_list_wherever_it_is_published() {
+        // All three sentences wrap, so each document is read with its newlines
+        // flattened: a list broken across lines is the same list.
+        let grammar = include_str!("../../../../docs/grammar.md").replace('\n', " ");
+        let plan = include_str!("../../../../docs/plan.md").replace('\n', " ");
+        let targets = include_str!("../../../../docs/topics/targets.md").replace('\n', " ");
+        let published: [(&str, &str); 3] = [
+            (
+                "docs/grammar.md §14",
+                enumeration(
+                    "docs/grammar.md",
+                    &grammar,
+                    "When present it MAY declare",
+                    ".",
+                ),
+            ),
+            (
+                "docs/plan.md §11",
+                enumeration("docs/plan.md", &plan, "admit —", "— are"),
+            ),
+            (
+                "`agent-compose docs targets`",
+                enumeration(
+                    "docs/topics/targets.md",
+                    &targets,
+                    "When present it may declare",
+                    ".",
+                ),
+            ),
+        ];
+        for (place, sentence) in published {
+            for section in DEPLOY_SECTIONS {
+                if SHARED_BY_BOTH_DOCUMENT_KINDS.contains(section) {
+                    continue;
+                }
+                let named = sentence.contains(&format!("`{section}:`"));
+                if REFUSED_UNDER_LOCAL.contains(section) {
+                    assert!(
+                        !named,
+                        "{place} lists `{section}` among the sections `deploy/local.yml` may \
+                         declare: `{sentence}`. `local` refuses that section — \
+                         `resolve::target::check` reports `misplaced-section` for it — so an \
+                         author who writes it because this sentence said to is refused by the \
+                         very compiler the sentence is describing."
+                    );
+                } else {
+                    assert!(
+                        named,
+                        "{place} does not name `{section}` among the sections \
+                         `deploy/local.yml` may declare: `{sentence}`. `local` admits every \
+                         deploy section but {REFUSED_UNDER_LOCAL:?}, and all three of \
+                         `docs/grammar.md` §14, `docs/plan.md` §11 and `agent-compose docs \
+                         targets` publish that list, so a reader of this one is told the key \
+                         is unavailable on the target they develop on."
+                    );
+                }
+            }
+        }
+    }
+}

@@ -274,6 +274,7 @@ const DEPLOY_ONLY: &[&str] = &[
     "hub",
     "placements",
     "storage_backends",
+    "package_registry",
     "trace_sink",
     "event_sources",
 ];
@@ -401,6 +402,7 @@ fn deploy_file(
         placements: None,
         hub: None,
         storage_backends: None,
+        package_registry: None,
         trace_sink: None,
         event_sources: None,
         span: root.span.clone(),
@@ -414,6 +416,9 @@ fn deploy_file(
             "placements" => file.placements = deploy::placements(&entry.value, cx),
             "storage_backends" => {
                 file.storage_backends = deploy::storage_backends(&entry.value, cx);
+            }
+            "package_registry" => {
+                file.package_registry = deploy::package_registry(&entry.value, cx);
             }
             "trace_sink" => file.trace_sink = deploy::trace_sink(&entry.value, cx),
             "event_sources" => file.event_sources = deploy::event_sources(&entry.value, cx),
@@ -574,6 +579,7 @@ fn version(node: &Node, cx: &mut Cx) -> Option<Spanned<String>> {
 #[cfg(test)]
 mod tests {
     use super::{DEPLOY_ONLY, DiagnosticCode, FileRole, SPEC_ONLY, parse_as};
+    use crate::prose::enumeration;
 
     const IMPORTS_NO_VERSION: &str = "imports:\n  - other.yml\n";
     const DEPLOY_NO_VERSION: &str =
@@ -641,27 +647,6 @@ mod tests {
     fn a_file_in_the_wrong_place_is_not_also_told_the_other_rule() {
         assert!(missing_version(DEPLOY_NO_VERSION, FileRole::Entrypoint).is_empty());
         assert!(missing_version(IMPORTS_NO_VERSION, FileRole::Deploy).is_empty());
-    }
-
-    /// The fragment of `document` between two markers, or a failure naming the
-    /// one that has moved.
-    ///
-    /// The prose is asserted about **where it enumerates**, not anywhere in the
-    /// file: `docs/grammar.md` names `trace_sink` in §14.5 whether or not §1.5's
-    /// table row does, so a whole-file search would pass over exactly the drift
-    /// below is written to catch. A reworded sentence fails here saying which
-    /// marker went missing, which is the same posture
-    /// `codegen::otlp::the_resource_attributes_are_the_documented_ones` takes to
-    /// the emitted source it reads.
-    fn enumeration<'a>(name: &str, document: &'a str, from: &str, to: &str) -> &'a str {
-        let after = document.split_once(from).unwrap_or_else(|| {
-            panic!("`{name}` no longer says `{from}`, so nothing here reads its list of sections")
-        });
-        after
-            .1
-            .split_once(to)
-            .unwrap_or_else(|| panic!("`{name}`'s `{from}` sentence no longer ends at `{to}`"))
-            .0
     }
 
     /// **The document-kind split is published in three places, and they must

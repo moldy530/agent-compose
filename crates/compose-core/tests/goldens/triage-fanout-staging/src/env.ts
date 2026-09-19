@@ -65,6 +65,18 @@ export const environmentReferences: readonly EnvironmentReference[] = [
     ],
   },
   {
+    name: "NPM_CORP_TOKEN",
+    sites: [
+      "deploy.package_registry.scopes.@corp.token",
+    ],
+  },
+  {
+    name: "NPM_MIRROR_TOKEN",
+    sites: [
+      "deploy.package_registry.token",
+    ],
+  },
+  {
     name: "OPS_BIN",
     sites: [
       "flow.triage.node.announce_failed.exec.command",

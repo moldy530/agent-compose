@@ -1,0 +1,11 @@
+# rule: a package_registry url is an address and nothing more — no query, no fragment, and no character a WHATWG URL respells, because npm keys its credential by the address it parses out of its own request (grammar 14.6 rules 1 and 5)
+# at: /package_registry/scopes/@corp/url
+# via: /$defs/packageRegistryScope/properties/url/allOf/1/pattern
+version: "0.1"
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}
+  scopes:
+    "@corp":
+      url: "https://npm.internal.example/repository/corp?repo=corp"
+      token: ${NPM_CORP_TOKEN}

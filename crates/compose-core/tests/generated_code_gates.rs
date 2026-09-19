@@ -2,7 +2,7 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Twenty-five gates. The first four are in increasing strength, each one
+//! Twenty-six gates. The first four are in increasing strength, each one
 //! existing because the one above it passes on code the one below it catches;
 //! the fifth is about a construct whose guarantees are only observable from
 //! inside the runtime; the next two are about the schemas rather than the graph;
@@ -18,9 +18,10 @@
 //! one at, and the process's own standard input that terminal really is; the
 //! twenty-second is about the two built-in tools a model drives, read from
 //! inside one call of them; the twenty-third is back to the schemas, about the
-//! one place the two columns are *not* equal and what bounds that gap; and the
-//! last two are about a node kind the acceptance suite cannot reach at all —
-//! one run of a coding harness, and then a whole graph of them:
+//! one place the two columns are *not* equal and what bounds that gap; the next
+//! two are about a node kind the acceptance suite cannot reach at all — one run
+//! of a coding harness, and then a whole graph of them; and the last is about
+//! the two emitted files whose reader is an **installer** rather than a runtime:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -300,6 +301,32 @@
 //!     node's entry and the flow answers what the last implementing run wrote,
 //!     and the `on_error: { fallback: end }`, where the failed run's record
 //!     reaches the entry through the error it rode out on.
+//! 26. **The two files an installer reads** — `bunfig.toml` and `.npmrc`
+//!     (grammar 14.6, PRD resolved q59), handed to the parsers their own
+//!     installers read them with, out of `installer-config.mjs`. Every other
+//!     emitted format is gated by the tool that consumes it: the modules and
+//!     `tsconfig.json` by `tsc` in gate 1, `manifest.json` by the real worker in
+//!     the acceptance suite. These two had a byte-for-byte golden and a doc
+//!     comment recording that the spellings were "verified rather than
+//!     recalled" — a person having checked once, which is the manual
+//!     verification gate CLAUDE.md's validation strategy rules out, and which
+//!     leaves a `bunfig.toml` Bun refuses to parse failing nothing but a golden
+//!     comparison the next contributor re-blesses. So Bun's own TOML parser
+//!     reads the emitted `bunfig.toml`, and what it parsed is compared against
+//!     the `package_registry:` the deploy file declared, key by key. Its
+//!     **`26b`** half is the npm one and runs under Node for the reason gate 13
+//!     does — the reader in question is npm's: the `ini` package **out of the
+//!     npm installation on this machine** parses the emitted `.npmrc`,
+//!     `npm-registry-fetch`'s `getAuth` is asked which credential npm finds for
+//!     a package fetched from each registry the file configures, and
+//!     `npm config get` is asked what registry that file leaves a project on. A
+//!     path character an ini value ends at or an ini line splits on — what
+//!     grammar 14.6 rule 1 refuses a `url:` over — therefore fails here rather
+//!     than in somebody's `npm install`, and so does a credential keyed at an
+//!     address npm's own lookup never walks up to, which no parse of the file
+//!     can see. Hermetic on both sides: the parsers read a file, the lookup
+//!     resolves a URL as a string, and nothing installs from a registry (PRD
+//!     resolved q59 ruling e).
 //!
 //! # The toolchain fixture
 //!
@@ -346,7 +373,9 @@ use std::sync::OnceLock;
 
 use compose_core::ast::common::{Ident, Literal};
 use compose_core::ast::schema::{Number, ScalarKind, StringFormat, Surface};
+use compose_core::codegen::registry::npm_auth_key;
 use compose_core::diag::{Position, SourceName, Span, Spanned};
+use compose_core::ir::deploy::PackageRegistry;
 use compose_core::ir::schema::{
     ArrayType, EnumType, Field, FieldMap, ObjectType, Scalar, TypeForm, TypeNode, UnionType,
     UnionVariant,
@@ -8425,6 +8454,370 @@ fn the_staged_copy_is_the_golden_it_came_from() {
             )
             .expect("a staged file is readable");
             assert_eq!(staged, file.contents, "`{}` was not copied", file.path);
+        }
+    }
+}
+
+/// Every golden whose target declares a `package_registry:`, with the block it
+/// declared (grammar 14.6, PRD resolved q59).
+///
+/// Read off the corpus rather than listed here, so a second registry golden is
+/// checked by both gates below without anyone having remembered to come back —
+/// and asserted non-empty, because a corpus that stopped carrying one would
+/// leave the two gates iterating over nothing and passing.
+fn declared_registries() -> Vec<(&'static Golden, PackageRegistry)> {
+    let found: Vec<(&'static Golden, PackageRegistry)> = GOLDENS
+        .iter()
+        .filter_map(|golden| {
+            artifact(golden)
+                .deploy
+                .package_registry
+                .map(|registry| (golden, registry))
+        })
+        .collect();
+    assert!(
+        !found.is_empty(),
+        "no golden's target declares a `package_registry:`, so the two installer-configuration \
+         gates read nothing — the corpus moved (grammar 14.6, PRD resolved q59)"
+    );
+    found
+}
+
+/// One golden **emitted** into a scratch directory, rather than copied from the
+/// committed tree the way [`staged`] copies it.
+///
+/// The difference decides whether the two gates below catch the failure they are
+/// written against. That failure is an emission somebody changed — a
+/// `bunfig.toml` line that stops being TOML, an `.npmrc` value an ini reader
+/// ends early — and the *only* thing a committed golden can say about it is that
+/// the bytes moved, which the contributor answers by re-blessing the golden. A
+/// gate reading the golden would then agree with whatever that re-bless wrote,
+/// one commit late. Reading the emitter puts both verdicts in the same run: the
+/// golden says the bytes changed, and this says the parser cannot take them.
+fn built(golden: &Golden, root: &Path, purpose: &str) -> PathBuf {
+    let destination = root.join("projects").join(purpose).join(golden.directory);
+    let _ = fs::remove_dir_all(&destination);
+    for file in emitted(golden).artifact() {
+        write_into(&destination, &file.path, &file.contents);
+    }
+    destination
+}
+
+/// The declared registry in the shape Bun's TOML parser answers a correct
+/// `bunfig.toml` with.
+///
+/// The object form where there is a credential and the bare URL where there is
+/// not, which is what `codegen::registry` writes and what Bun's own
+/// documentation shows — and `$VAR` rather than `${VAR}`, because the two
+/// installers expand two different spellings and this is Bun's.
+fn bun_reads(registry: &PackageRegistry) -> Value {
+    fn entry(url: &str, variable: Option<&str>) -> Value {
+        match variable {
+            Some(name) => json!({ "url": url, "token": format!("${name}") }),
+            None => json!(url),
+        }
+    }
+
+    let mut install = serde_json::Map::new();
+    install.insert(
+        "registry".to_string(),
+        entry(
+            &registry.url.value,
+            registry
+                .token
+                .as_ref()
+                .map(|token| token.value.name.as_str()),
+        ),
+    );
+    if !registry.scopes.is_empty() {
+        let mut scopes = serde_json::Map::new();
+        for scope in registry.scopes.values() {
+            scopes.insert(
+                scope.name.value.clone(),
+                entry(
+                    &scope.url.value,
+                    scope.token.as_ref().map(|token| token.value.name.as_str()),
+                ),
+            );
+        }
+        install.insert("scopes".to_string(), Value::Object(scopes));
+    }
+    json!({ "install": Value::Object(install) })
+}
+
+/// The declared registry in the shape an ini parser answers a correct `.npmrc`
+/// with: one flat key per line, the credential keyed by the **address** npm
+/// derives from its own request.
+///
+/// The credential key here is `codegen::registry::npm_auth_key` — the same
+/// function the emitter writes the line with — so what this half asserts is that
+/// the **line survived the file**: an `_authToken` an ini reader ends at a `;` or
+/// splits at an early `=` parses to neither that key nor that value, and the
+/// whole-map equality leaves no room for a credential line nobody declared.
+///
+/// It deliberately says nothing about whether npm would *look that key up*.
+/// That question cannot be put to a parse at all — the address is derived from
+/// the request npm is about to make rather than written anywhere in the file, so
+/// any key a test computes for it is the compiler's own answer restated, and a
+/// key naming somewhere npm never walks would satisfy both sides. It is put to
+/// npm instead, by [`npm_authenticates`] over the `auth` half of the same
+/// answer (grammar 14.6 rule 5).
+fn npm_reads(registry: &PackageRegistry) -> Value {
+    fn reference(variable: &str) -> Value {
+        json!(format!("${{{variable}}}"))
+    }
+
+    let mut keys = serde_json::Map::new();
+    keys.insert("registry".to_string(), json!(registry.url.value));
+    if let Some(token) = registry.token.as_ref() {
+        keys.insert(
+            format!("{}:_authToken", npm_auth_key(&registry.url.value)),
+            reference(&token.value.name),
+        );
+    }
+    for scope in registry.scopes.values() {
+        keys.insert(
+            format!("{}:registry", scope.name.value),
+            json!(scope.url.value),
+        );
+        if let Some(token) = scope.token.as_ref() {
+            keys.insert(
+                format!("{}:_authToken", npm_auth_key(&scope.url.value)),
+                reference(&token.value.name),
+            );
+        }
+    }
+    Value::Object(keys)
+}
+
+/// What npm's own credential lookup must come back with for each registry the
+/// emitted `.npmrc` configures, read off the **declaration** alone.
+///
+/// Every value here is text the deploy file wrote: the registry's `url:` and the
+/// `${VAR}` its `token:` named. No address is derived, which is the whole point
+/// — the runner walks npm's real path to a credential (`pacote`'s packument URL
+/// for a package in that registry, through `npm-registry-fetch`'s `getAuth`),
+/// and holding *that* to the declaration is what says the emitted `_authToken`
+/// key is one npm reaches. A key npm never walks — a segment too many, a host
+/// npm spells differently, a path whose dot segments the request resolves away —
+/// comes back `null` here however confidently `npm_auth_key` derived it.
+///
+/// An entry that declares no `token:` expects `null`: it named no credential, so
+/// npm finding one would mean the file lends it another entry's, which is the
+/// leak `parse::deploy`'s `missing-registry-token` refuses at the spec. That
+/// refusal reasons about the addresses the compiler derives; this is where npm
+/// rather than the compiler gets to say whether the walk really stops.
+fn npm_authenticates(registry: &PackageRegistry) -> Value {
+    fn entry(url: &str, variable: Option<&str>) -> Value {
+        json!({
+            "registry": url,
+            "token": variable.map_or(Value::Null, |name| json!(format!("${{{name}}}"))),
+        })
+    }
+
+    let mut found = serde_json::Map::new();
+    found.insert(
+        "registry".to_string(),
+        entry(
+            &registry.url.value,
+            registry
+                .token
+                .as_ref()
+                .map(|token| token.value.name.as_str()),
+        ),
+    );
+    for scope in registry.scopes.values() {
+        found.insert(
+            format!("{}:registry", scope.name.value),
+            entry(
+                &scope.url.value,
+                scope.token.as_ref().map(|token| token.value.name.as_str()),
+            ),
+        );
+    }
+    Value::Object(found)
+}
+
+/// What `npm config get <key>` answers from inside a staged project.
+///
+/// npm's **own** configuration pipeline rather than a parse of the file: it
+/// finds the project, reads its `.npmrc` with `ini`, and resolves the key
+/// through the whole precedence chain — which is the question an author is
+/// really asking when they declare a mirror.
+///
+/// Every `npm_config_*` variable is cleared for the child. npm's environment
+/// layer outranks a project's `.npmrc`, so a CI runner or a developer shell that
+/// exports one would otherwise be what this reads, and the gate would be
+/// reporting on the machine instead of on the emitted file.
+fn npm_config(project: &Path, key: &str) -> String {
+    let mut command = Command::new("npm");
+    for (name, _) in std::env::vars() {
+        if name.to_ascii_lowercase().starts_with("npm_config_") {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .args(["config", "get", key])
+        .current_dir(project)
+        .output()
+        .expect("npm runs");
+    assert!(
+        output.status.success(),
+        "`npm config get {key}` failed in {}:\n{}",
+        project.display(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Gate 26: the emitted `bunfig.toml` is TOML **Bun** parses, and what Bun reads
+/// out of it is the `package_registry:` the deploy file declared.
+///
+/// The gate this file was missing. Every other emitted format has the tool that
+/// consumes it standing behind a gate here — `tsc` over the modules and
+/// `tsconfig.json`, a real worker over `manifest.json` — while the whole of the
+/// evidence that Bun accepts these bytes was a committed golden a human had
+/// eyeballed and a doc comment in `codegen::registry` recording that the
+/// spellings were "verified rather than recalled". A golden is a byte
+/// comparison: emit a TOML construct Bun refuses and the only thing that fails
+/// is that comparison, which the next contributor fixes by re-blessing the
+/// golden — shipping a `bunfig.toml` no `bun install` can read, with CI green.
+///
+/// Parsed with Bun's own TOML parser rather than with a Rust crate, because what
+/// is in question is what **Bun** does with the bytes; and the parse is compared
+/// against the declaration rather than merely required to succeed, since a file
+/// that parses to the wrong table configures the wrong mirror just as silently
+/// as one that does not parse at all.
+///
+/// Over what the emitter writes rather than over the committed golden, for the
+/// reason [`built`] gives.
+#[test]
+fn the_emitted_bunfig_is_the_configuration_bun_parses_out_of_it() {
+    let Some(root) = installed() else {
+        return;
+    };
+    for (golden, registry) in declared_registries() {
+        let project = built(golden, root, "installer-config");
+        let output = runner("installer-config.mjs")
+            .arg("bunfig")
+            .arg(&project)
+            .output()
+            .expect("bun runs");
+        assert!(
+            output.status.success(),
+            "Bun's own TOML parser could not read `{}/bunfig.toml`:\n{}",
+            golden.directory,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let answer: Value =
+            serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+        assert_eq!(
+            answer["read"],
+            bun_reads(&registry),
+            "`{}/bunfig.toml` parses to something other than the `package_registry:` its deploy \
+             file declares, so `bun install` in that project resolves from somewhere the spec \
+             does not name (grammar 14.6, PRD resolved q59)",
+            golden.directory,
+        );
+    }
+}
+
+/// Gate 26b: the emitted `.npmrc` is ini **npm** reads, npm's own credential
+/// lookup finds the credentials the deploy file declared where it wrote them,
+/// and the file leaves a project on the registry that declaration named.
+///
+/// Three questions, because that is how many npm's answer is.
+///
+/// **What the file parses to.** The `ini` package is the one npm parses
+/// `.npmrc` with, and it is resolved out of the npm installation on this machine
+/// rather than added to the fixture — a second copy of a parser is a second
+/// parser, and the point is the one npm uses. It is also the only reader that
+/// sees the credential line at all: npm marks `_authToken` protected, so
+/// `npm config get` refuses it and `npm config list` omits it, and a line an ini
+/// reader ends at a `;` or splits at an `=` would be invisible to the two halves
+/// below (grammar 14.6 rules 1 and 5).
+///
+/// **Which credential npm finds.** A parse cannot answer that, and this is the
+/// half that makes the answer npm's rather than the compiler's. An `.npmrc`
+/// credential is keyed by an address npm *derives* from the request it is about
+/// to make, so an expectation computed here would be
+/// `codegen::registry::npm_auth_key` held to itself: a key naming somewhere npm
+/// never walks would satisfy it, and the emitted artifact would install
+/// unauthenticated under npm while the `bunfig.toml` beside it authenticated —
+/// one artifact, two answers, which is what grammar 14.6 rule 5 exists to
+/// refuse. So npm is asked: the runner builds `pacote`'s own packument URL for a
+/// package in each configured registry and hands it to
+/// `npm-registry-fetch`'s `getAuth`, the lookup every `npm install` spends a
+/// token through, and [`npm_authenticates`] holds what comes back to the
+/// `${VAR}` the deploy file named — or to no credential at all where it named
+/// none.
+///
+/// **What the project installs from.** npm's whole configuration pipeline over
+/// the registry lines, which is the question the author asked.
+///
+/// Under Node, and behind the same blocker as gates 13 and 15, for the reason
+/// they are: npm is the Node fallback's installer (PRD resolved q18, §9.18), so
+/// a machine without it cannot answer this and says so rather than passing.
+///
+/// Over what the emitter writes rather than over the committed golden, for the
+/// reason [`built`] gives.
+#[test]
+fn the_emitted_npmrc_is_the_configuration_npm_reads_out_of_it() {
+    let Some(root) = node_fallback() else {
+        return;
+    };
+    for (golden, registry) in declared_registries() {
+        let project = built(golden, root, "installer-config");
+        let output = node_command("installer-config.mjs")
+            .arg("npmrc")
+            .arg(&project)
+            .output()
+            .expect("node runs");
+        assert!(
+            output.status.success(),
+            "npm's own `ini` could not read `{}/.npmrc`:\n{}",
+            golden.directory,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let answer: Value =
+            serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+        assert_eq!(
+            answer["read"],
+            npm_reads(&registry),
+            "`{}/.npmrc` reads back as something other than the `package_registry:` its deploy \
+             file declares — a line an ini reader ends early or splits somewhere else is one npm \
+             never sees the way it was written (grammar 14.6 rules 1 and 5, PRD resolved q59)",
+            golden.directory,
+        );
+
+        assert_eq!(
+            answer["auth"],
+            npm_authenticates(&registry),
+            "npm's own credential lookup does not answer `{}/.npmrc` with the credentials its \
+             deploy file declares — a `_authToken` keyed at an address npm never walks up to is \
+             an `npm install` that goes out unauthenticated while the `bun install` beside it \
+             succeeds, and one that reaches an entry declaring no `token:` is that entry \
+             spending a credential the spec scoped away from it (grammar 14.6 rule 5, PRD \
+             resolved q59)",
+            golden.directory,
+        );
+
+        assert_eq!(
+            npm_config(&project, "registry"),
+            registry.url.value,
+            "`npm config get registry` in `{}` does not answer the registry its deploy file \
+             declares",
+            golden.directory,
+        );
+        for scope in registry.scopes.values() {
+            let key = format!("{}:registry", scope.name.value);
+            assert_eq!(
+                npm_config(&project, &key),
+                scope.url.value,
+                "`npm config get {key}` in `{}` does not answer the registry its deploy file \
+                 declares for that scope",
+                golden.directory,
+            );
         }
     }
 }

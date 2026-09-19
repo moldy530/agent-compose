@@ -1,0 +1,18 @@
+# rule: a `package_registry.url:` is an address npm can derive its credential key from — no query, no fragment (grammar 14.6 rules 1 and 5)
+# code: invalid-value
+# message: "https://npm.internal.example/repository/npm-group?repo=npm-group" is not a `package_registry.url`: it carries a `?` query, and a registry address is the text npm appends `/<package>` to before parsing the result — the package name would land in the query
+# at: 17:8
+# help: the registry is an absolute URL naming a host, its scheme written lowercase, no wildcard in it and no credential before an `@` — `https://npm.internal.example/repo/`; `http` stays legal, which is what makes a mirror on the same network work, and the credential goes in `token:` as an `${ENV}` reference, which is what keeps it out of the two emitted files and out of the artifact hash over them. It is an address and nothing more: no query and no fragment, a host of ASCII letters, digits, `-`, `_` and `.` with an optional port, and a path spelled in characters both readers of `.npmrc` hand back — a WHATWG `URL` leaves it alone, its `.` and `..` segments written in dots rather than in `%2e`, and an ini parser does not end a line on it, so no `;` and no `=` in it. npm looks a credential up under the address it parses out of its own request, and reads that request's registry and that credential's key through those two parses, so a spelling either one rewrites is a line npm never reads (grammar 14.6, PRD resolved q59)
+version: "0.1"
+
+# A mirror whose repository is selected by a query parameter rather than by a
+# path. npm never sends this URL as written: it appends `/<package>` to the
+# text and parses the result, so the request is
+# `…/npm-group?repo=npm-group/lodash` — the package name inside the query — and
+# the address it then walks for a credential is `//npm.internal.example/repository/npm-group`,
+# which no `_authToken` line derived from this text would ever be keyed at. The
+# `npm install` half of the artifact would resolve unauthenticated while the
+# `bun install` half, whose token sits inside the registry object, would not.
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group?repo=npm-group"
+  token: ${NPM_MIRROR_TOKEN}

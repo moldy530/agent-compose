@@ -19,13 +19,23 @@
 //!   binding names are all the same case, and the last of them is why the rule
 //!   has to be stated this way rather than "everything under `src/` is ours"
 //!   (grammar 6.1).
-//! * **checking** reports a file that is missing and one whose bytes differ —
-//!   the two ways a committed project can stop matching its spec (PRD §8:
-//!   "hand-edited generated code forks the source of truth", mitigated by
-//!   "`build --check` in CI"). There is no third way any more: a file the build
-//!   does not produce is not drift, because drift is a disagreement about a file
-//!   the compiler claims.
-//! * neither **removes** anything, anywhere.
+//! * **checking** reports a file that is missing, one whose bytes differ, and
+//!   one of this compiler's own files sitting at a claimed path that *this*
+//!   build does not emit — the three ways a committed project can stop matching
+//!   its spec (PRD §8: "hand-edited generated code forks the source of truth",
+//!   mitigated by "`build --check` in CI"). The third exists because the
+//!   emission set is target-dependent while `EMITTED_PATHS` is not: a target
+//!   that stops declaring `package_registry:` stops emitting `.npmrc` and
+//!   `bunfig.toml` (grammar 14.6, PRD resolved q59), and the previous build's
+//!   copies stay where they are — still carrying the generated-file header, so
+//!   still reading as this compiler's, and still telling every `bun install` in
+//!   that directory to go through a mirror the spec no longer names. That is a
+//!   disagreement about a file the compiler claims, which is what drift is.
+//!   A file **outside** [`EMITTED_PATHS`], or one at a claimed path that this
+//!   compiler did not write, is still nobody's business but its author's.
+//! * neither **removes** anything, anywhere — so a stale claimed path is
+//!   reported and never deleted, and the help under it says so rather than
+//!   promising a rebuild that would not touch it.
 //!
 //! # The first write that is not the compiler's code: a carried implementation
 //!
@@ -130,13 +140,24 @@ pub(crate) struct Drift {
     pub(crate) state: State,
 }
 
-/// The two ways a generated project can stop matching its spec.
+/// The three ways a generated project can stop matching its spec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum State {
     /// The compiler emits it and the directory does not have it.
     Missing,
     /// Both have it and the bytes differ.
     Differs,
+    /// The directory holds one of this compiler's files at a path
+    /// [`compose_core::codegen::EMITTED_PATHS`] claims, and **this** build does
+    /// not emit it.
+    ///
+    /// An earlier build of this target did, before the deploy file stopped
+    /// asking for it (grammar 14.6's `package_registry:` is the one key whose
+    /// presence moves a path in and out of the emission set today). Nothing
+    /// deletes it — PRD resolved q47 — so `--check` is where it is said out
+    /// loud, and [`Self::Stale`] is a different sentence from
+    /// [`Self::Differs`] because the remedy is a removal rather than a rebuild.
+    Stale,
 }
 
 impl State {
@@ -144,6 +165,7 @@ impl State {
         match self {
             Self::Missing => "missing",
             Self::Differs => "differs",
+            Self::Stale => "stale",
         }
     }
 
@@ -152,6 +174,7 @@ impl State {
         match self {
             Self::Missing => "is not in the output directory",
             Self::Differs => "differs from what the spec produces",
+            Self::Stale => "is an earlier build's, and this target does not emit it",
         }
     }
 }
@@ -380,6 +403,12 @@ fn generated(path: &Path) -> io::Result<bool> {
 /// a build writes and what the artifact hash covers; nothing else under the
 /// output directory is the compiler's to have an opinion about (see the module
 /// header).
+///
+/// Then one question the tree cannot answer, because it is about a file that is
+/// *not* in it: [`stale`]. The emission set is target-dependent
+/// (`compose_core::codegen::TARGET_PATHS`) and the compiler's claim on a
+/// directory is not, so a path this build does not write can still be one it
+/// owns — and this compiler's own file sitting there is drift like any other.
 pub(crate) fn check(project: &GeneratedProject, out: &Path) -> io::Result<Vec<Drift>> {
     let mut drift = Vec::new();
     for file in project.artifact() {
@@ -396,8 +425,48 @@ pub(crate) fn check(project: &GeneratedProject, out: &Path) -> io::Result<Vec<Dr
             Err(error) => return Err(error),
         }
     }
+    for path in stale(project, out)? {
+        drift.push(Drift {
+            path,
+            state: State::Stale,
+        });
+    }
     drift.sort();
     Ok(drift)
+}
+
+/// The claimed paths in `out` that hold one of this compiler's files and that
+/// **this** build does not emit, sorted.
+///
+/// The claim is [`compose_core::codegen::EMITTED_PATHS`] — every path the
+/// compiler owns across every target, which is the same whole claim
+/// `parse::binding` refuses a `module:` binding against. What varies per target
+/// is the *emission set*, and the difference is exactly where an artifact can
+/// keep a file its spec no longer asks for: drop `package_registry:` from a
+/// deploy file and the next build stops writing `.npmrc` and `bunfig.toml`
+/// (grammar 14.6, PRD resolved q59) without removing the pair the last one
+/// wrote.
+///
+/// The generated-file header is the test, for the reason it is everywhere else
+/// in this module: it is the only evidence on disk that a file is this
+/// compiler's. An `.npmrc` an author placed in the output directory of a target
+/// that emits none is the author's file at a name nothing is writing, and
+/// reporting it would be this compiler having an opinion about somebody else's
+/// file.
+fn stale(project: &GeneratedProject, out: &Path) -> io::Result<Vec<String>> {
+    let mut left = Vec::new();
+    for path in compose_core::codegen::EMITTED_PATHS {
+        if project.file(path).is_some() {
+            continue;
+        }
+        match generated(&at(out, path)) {
+            Ok(true) => left.push((*path).to_string()),
+            Ok(false) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(left)
 }
 
 /// Where a `/`-separated generated path lands on this host.
@@ -581,6 +650,68 @@ tool.sign:
         );
         assert!(out.join("src/old.ts").is_file());
         assert!(out.join("node_modules/left/index.js").is_file());
+    }
+
+    /// The other side of that boundary: a **claimed** path is the compiler's
+    /// whether or not this target emits it, so one of its own files left at a
+    /// name this build does not write is drift (grammar 14.6, PRD resolved q59).
+    ///
+    /// `project()` declares no `package_registry:`, so `.npmrc` and
+    /// `bunfig.toml` are exactly the pair an earlier build of a target that did
+    /// would have written and that nothing removes (PRD resolved q47).
+    #[test]
+    fn a_claimed_file_this_build_does_not_emit_is_drift() {
+        let project = project();
+        let out = scratch("stale");
+        write(&project, &out).expect("writable");
+        assert!(
+            project.file(".npmrc").is_none() && project.file("bunfig.toml").is_none(),
+            "this composition's target declares no `package_registry:`"
+        );
+
+        for name in [".npmrc", "bunfig.toml"] {
+            std::fs::write(
+                out.join(name),
+                format!("# {GENERATED_MARKER} 0.0.1 from `main.yml`.\n"),
+            )
+            .expect("writable");
+        }
+        assert_eq!(
+            check(&project, &out).expect("readable"),
+            [
+                Drift {
+                    path: ".npmrc".to_string(),
+                    state: State::Stale,
+                },
+                Drift {
+                    path: "bunfig.toml".to_string(),
+                    state: State::Stale,
+                },
+            ]
+        );
+        // Reported, never removed, and no obstacle to the rebuild the report
+        // does not recommend for it.
+        assert_eq!(
+            write(&project, &out).expect("writable"),
+            Written {
+                files: project.files().len(),
+                carried: 0,
+            },
+        );
+        assert!(out.join(".npmrc").is_file() && out.join("bunfig.toml").is_file());
+    }
+
+    /// …and only one of *its own* files. A claimed name is not a claim on
+    /// whatever holds it: the generated-file header is the evidence everywhere
+    /// else in this module, and an author's `.npmrc` in the output directory of
+    /// a target that emits none is the author's.
+    #[test]
+    fn a_claimed_name_someone_else_holds_is_not_stale() {
+        let project = project();
+        let out = scratch("stale-not-ours");
+        write(&project, &out).expect("writable");
+        std::fs::write(out.join(".npmrc"), "registry=https://npm.example/\n").expect("writable");
+        assert_eq!(check(&project, &out).expect("readable"), []);
     }
 
     /// A directory this compiler never built into is not one it may overwrite —

@@ -506,6 +506,15 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
             Slice::own(sink.clone()),
         );
     }
+    // …and `package_registry:` the same way again: one block at one address
+    // (`docs/plan.md` §4, §8). Its `scopes:` are *inside* it rather than
+    // subjects of their own — one deployment has one place it installs from.
+    if let Some(registry) = artifact.pointer("/deploy/package_registry") {
+        found.insert(
+            (COMPONENTS, "package_registry".to_string()),
+            Slice::own(registry.clone()),
+        );
+    }
     for (name, source) in section(&artifact, &["deploy", "event_sources"]) {
         found.insert(
             (COMPONENTS, format!("event_source.{name}")),
@@ -514,7 +523,13 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
     }
     accounted(
         artifact.get("deploy").unwrap_or(&Value::Null),
-        &["hub", "placements", "trace_sink", "event_sources"],
+        &[
+            "hub",
+            "placements",
+            "package_registry",
+            "trace_sink",
+            "event_sources",
+        ],
         "the deploy layer",
     );
 
@@ -1290,6 +1305,38 @@ trace_sink:
     bearer:
       token: ${TRACE_SINK_TOKEN}"#;
 
+/// A package registry planted under the same anchor, and the edits a plan has to
+/// report about one (grammar §14.6, `docs/plan.md` §4).
+///
+/// Planted for [`TRACE_SINK`]'s reason exactly: `local` admits the section — a
+/// project built on a laptop is one somebody runs `bun install` in, on the same
+/// network — and the example carries none under `local`. A section a plan
+/// stopped reporting would let a deployment repoint where every machine
+/// downloads its code from, or move which variable authenticates that download,
+/// with nothing in the review.
+const PACKAGE_REGISTRY: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}"#;
+const PACKAGE_REGISTRY_REPOINTED: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+package_registry:
+  url: "https://npm.eu.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}"#;
+const PACKAGE_REGISTRY_SCOPED: &str = r#"hub:
+  join_token: ${MESH_JOIN_TOKEN}
+
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: ${NPM_MIRROR_TOKEN}
+  scopes:
+    "@corp":
+      url: "https://npm.internal.example/repository/corp/"
+      token: ${NPM_CORP_TOKEN}"#;
+
 /// A placement planted under the same anchor, and the two edits a plan has to
 /// report about one (grammar §14.1, `docs/plan.md` §4).
 ///
@@ -1669,6 +1716,24 @@ const CASES: &[Case] = &[
         what: "a trace sink added to a target that had none",
         before: &[],
         after: &[("deploy/local.yml", HUB, TRACE_SINK)],
+        differs: true,
+    },
+    Case {
+        what: "a package registry repointed at another mirror",
+        before: &[("deploy/local.yml", HUB, PACKAGE_REGISTRY)],
+        after: &[("deploy/local.yml", HUB, PACKAGE_REGISTRY_REPOINTED)],
+        differs: true,
+    },
+    Case {
+        what: "a package registry given a scope of its own",
+        before: &[("deploy/local.yml", HUB, PACKAGE_REGISTRY)],
+        after: &[("deploy/local.yml", HUB, PACKAGE_REGISTRY_SCOPED)],
+        differs: true,
+    },
+    Case {
+        what: "a package registry added to a target that had none",
+        before: &[],
+        after: &[("deploy/local.yml", HUB, PACKAGE_REGISTRY)],
         differs: true,
     },
     // --- Every remaining key of one component, swept a component at a time. ---

@@ -1,0 +1,13 @@
+# rule: a `package_registry.token:` is an env reference, never a literal (grammar 14.6)
+# code: invalid-env-ref
+# message: `package_registry.token` takes an environment reference, found the literal `npm_s3cret`
+# at: 13:10
+# help: the spec never contains credentials or connection strings: write `${NAME}`
+version: "0.1"
+
+# The credential reaches the emitted `bunfig.toml` and `.npmrc` as the variable's
+# name, which the installer expands — so a literal here would put the secret in
+# the spec text and then in every artifact built from it.
+package_registry:
+  url: "https://npm.internal.example/repository/npm-group/"
+  token: "npm_s3cret"

@@ -1,0 +1,7 @@
+# rule: a package_registry url path carries no ; and no = — the emitted .npmrc is ini, and that parser ends an unquoted key and value at a ; and splits a line at its first = (grammar 14.6 rule 1)
+# at: /package_registry/url
+# via: /$defs/packageRegistry/properties/url/allOf/1/pattern
+version: "0.1"
+package_registry:
+  url: "https://npm.internal.example/repository/group;maven=false/"
+  token: ${NPM_MIRROR_TOKEN}

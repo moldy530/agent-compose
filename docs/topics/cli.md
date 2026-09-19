@@ -134,6 +134,13 @@ compiler's own files is refused rather than overwritten — the generated-file
 header is how it tells its work from yours — and a file the emitter does not
 produce is nobody's business but yours, wherever it sits.
 
+Not every target emits the same *set*, though: `package_registry:` in a deploy
+file adds `bunfig.toml` and `.npmrc` (see `agent-compose docs targets`), and
+dropping the key takes them away again. `build` removes nothing, so `--check`
+reports one of the compiler's own files left at a name this target no longer
+emits — `stale`, with a help line saying to delete it, because a rebuild will
+not. A file of *yours* at that name is still yours and is not reported.
+
 The one exception is a write rather than a removal: a `tool.*` bound to
 `module: ./src/tools/<name>.ts` gets that file **scaffolded once**, in the
 project beside the entrypoint, when it is not there. `validate` and

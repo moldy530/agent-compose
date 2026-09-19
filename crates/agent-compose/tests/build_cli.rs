@@ -253,6 +253,242 @@ fn build_emits_with_every_environment_reference_unset() {
     }
 }
 
+/// A registry credential reaches the emitted installer configuration as the
+/// **name** of a variable, even when the build is run with that variable set to
+/// a value (grammar §14.6, PRD resolved q59 ruling c).
+///
+/// The claim the ruling makes is that the token is a spelling rather than a
+/// byte, so nothing secret enters the artifact and the artifact hash is stable
+/// across a rotation. A unit test over the emitter cannot make it honestly —
+/// mutating a test binary's environment races every thread beside it — so it is
+/// made here, over a real `agent-compose build` that has the value in its
+/// environment and writes the name anyway. The second half, that the hash does
+/// not move, is the same build run again under a different value.
+#[test]
+fn build_writes_the_registry_reference_rather_than_the_token_it_resolves_to() {
+    const SECRET: &str = "npm-token-that-must-not-be-written";
+    let out = scratch("registry-reference");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+
+    let mut command = Command::cargo_bin("agent-compose").expect("the binary under test is built");
+    command
+        .current_dir(repo_root())
+        .env("NO_COLOR", "1")
+        .env("NPM_MIRROR_TOKEN", SECRET)
+        .env("NPM_CORP_TOKEN", SECRET)
+        .args([
+            "build",
+            "examples/triage-fanout/main.yml",
+            "--target",
+            "staging",
+            "--out",
+            path,
+        ]);
+    let output = command.output().expect("the command runs");
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+
+    let bunfig = fs::read_to_string(out.join("bunfig.toml")).expect("`bunfig.toml` was written");
+    let npmrc = fs::read_to_string(out.join(".npmrc")).expect("`.npmrc` was written");
+    for (name, contents) in [("bunfig.toml", &bunfig), (".npmrc", &npmrc)] {
+        assert!(
+            !contents.contains(SECRET),
+            "`{name}` carries the resolved value of a credential:\n{contents}"
+        );
+        assert!(
+            contents.contains("NPM_MIRROR_TOKEN") && contents.contains("NPM_CORP_TOKEN"),
+            "`{name}` does not carry the references:\n{contents}"
+        );
+    }
+    assert!(
+        bunfig.contains("token = \"$NPM_MIRROR_TOKEN\""),
+        "Bun's substitution is `$VAR`:\n{bunfig}"
+    );
+    assert!(
+        npmrc.contains(":_authToken=${NPM_MIRROR_TOKEN}"),
+        "npm's is `${{VAR}}`, on a host-scoped line:\n{npmrc}"
+    );
+
+    // …and the artifact hash does not move when the value does, which is what
+    // makes a token rotation not a redeployment (PRD resolved q40).
+    let artifact = fs::read_to_string(out.join("src/artifact.ts")).expect("the artifact module");
+    let rotated = scratch("registry-reference-rotated");
+    let mut second = Command::cargo_bin("agent-compose").expect("the binary under test is built");
+    second
+        .current_dir(repo_root())
+        .env("NO_COLOR", "1")
+        .env("NPM_MIRROR_TOKEN", "a-rotated-value")
+        .env("NPM_CORP_TOKEN", "another-rotated-value")
+        .args([
+            "build",
+            "examples/triage-fanout/main.yml",
+            "--target",
+            "staging",
+            "--out",
+            rotated.to_str().expect("a UTF-8 scratch path"),
+        ]);
+    assert_eq!(code(&second.output().expect("the command runs")), 0);
+    assert_eq!(
+        fs::read_to_string(rotated.join("src/artifact.ts")).expect("the artifact module"),
+        artifact,
+        "rotating a registry token changed the artifact"
+    );
+}
+
+/// A target that declares no `package_registry:` gets neither installer file,
+/// and a `--check` of such a build does not ask for one (grammar §14.6).
+#[test]
+fn a_target_with_no_registry_writes_no_installer_configuration() {
+    let out = scratch("no-registry");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+    let built = build(&["examples/triage-fanout/main.yml", "--out", path]);
+    assert_eq!(code(&built), 0, "{}", stderr(&built));
+    assert!(!out.join("bunfig.toml").exists());
+    assert!(!out.join(".npmrc").exists());
+
+    let checked = build(&["examples/triage-fanout/main.yml", "--out", path, "--check"]);
+    assert_eq!(code(&checked), 0, "{}", stderr(&checked));
+
+    // …and a `bunfig.toml` an author left there is theirs, because the compiler
+    // claims no name it does not write: the refusal below is about the target
+    // that *does* declare a registry.
+    fs::write(out.join("bunfig.toml"), "# mine\n").expect("writable");
+    let again = build(&["examples/triage-fanout/main.yml", "--out", path, "--check"]);
+    assert_eq!(code(&again), 0, "{}", stderr(&again));
+}
+
+/// Dropping `package_registry:` from a deploy file leaves the previous build's
+/// installer configuration in `--out`, and `--check` says so (grammar §14.6
+/// rule 4, PRD resolved q47, q59).
+///
+/// The emission set is target-dependent and the compiler's claim on a directory
+/// is not, so this is the one shape where a built tree can hold a file of this
+/// compiler's that its spec no longer asks for. Nothing deletes it — q47 — and
+/// a `--check` that stayed silent would mean "CI green" while every
+/// `bun install` in that directory still went through a mirror the target no
+/// longer declares, unauthenticated, because the token is no longer on the
+/// environment manifest either.
+#[test]
+fn installer_files_a_target_stopped_declaring_are_reported_as_stale() {
+    let project = scratch("registry-dropped");
+    fs::write(
+        project.join("main.yml"),
+        "version: \"0.1\"\nstate:\n  draft: { type: string }\n",
+    )
+    .expect("writable");
+    fs::create_dir_all(project.join("deploy")).expect("writable");
+    let deploy = project.join("deploy/mirror.yml");
+    fs::write(
+        &deploy,
+        "version: \"0.1\"\n\npackage_registry:\n  url: \"https://npm.internal.example/repo/\"\n  token: ${NPM_MIRROR_TOKEN}\n",
+    )
+    .expect("writable");
+
+    let entrypoint = project.join("main.yml");
+    let entrypoint = entrypoint.to_str().expect("a UTF-8 scratch path");
+    let out = scratch("registry-dropped-out");
+    let path = out.to_str().expect("a UTF-8 scratch path");
+
+    let first = build(&[entrypoint, "--target", "mirror", "--out", path]);
+    assert_eq!(code(&first), 0, "{}", stderr(&first));
+    assert!(out.join(".npmrc").is_file());
+    assert!(out.join("bunfig.toml").is_file());
+
+    // The key goes away, and with it the two files this target emits.
+    fs::write(&deploy, "version: \"0.1\"\n").expect("writable");
+    let second = build(&[entrypoint, "--target", "mirror", "--out", path]);
+    assert_eq!(code(&second), 0, "{}", stderr(&second));
+    assert!(
+        out.join(".npmrc").is_file() && out.join("bunfig.toml").is_file(),
+        "a build removes nothing (PRD resolved q47)"
+    );
+
+    let checked = build(&[entrypoint, "--target", "mirror", "--out", path, "--check"]);
+    assert_eq!(code(&checked), 1, "{}", stderr(&checked));
+    for name in [".npmrc", "bunfig.toml"] {
+        assert!(
+            stderr(&checked).contains(&format!(
+                "`{name}` is an earlier build's, and this target does not emit it"
+            )),
+            "{}",
+            stderr(&checked)
+        );
+    }
+    assert!(
+        stderr(&checked).contains(
+            "help: `agent-compose build` will not remove `.npmrc`, `bunfig.toml`: a build writes \
+             them only for a target that asks for them and deletes nothing"
+        ),
+        "the remedy has to be the removal, because a rebuild does not do it: {}",
+        stderr(&checked)
+    );
+    assert!(
+        !stderr(&checked).contains("help: run `agent-compose build` to regenerate"),
+        "a rebuild settles no part of this report: {}",
+        stderr(&checked)
+    );
+
+    // The JSON report carries the same third state, so a CI job that parses it
+    // branches on the same fact the human line states.
+    let json = build(&[
+        entrypoint, "--target", "mirror", "--out", path, "--check", "--format", "json",
+    ]);
+    assert_eq!(code(&json), 1, "{}", stderr(&json));
+    let report: serde_json::Value =
+        serde_json::from_str(stdout(&json)).expect("the report is JSON");
+    assert_eq!(
+        report["drift"],
+        serde_json::json!([
+            { "path": ".npmrc", "state": "stale" },
+            { "path": "bunfig.toml", "state": "stale" },
+        ])
+    );
+
+    // And a file of the author's at one of those names is still the author's:
+    // the generated-file header is the only evidence a file is this compiler's.
+    fs::remove_file(out.join(".npmrc")).expect("removable");
+    fs::remove_file(out.join("bunfig.toml")).expect("removable");
+    fs::write(out.join(".npmrc"), "# mine\n").expect("writable");
+    let mine = build(&[entrypoint, "--target", "mirror", "--out", path, "--check"]);
+    assert_eq!(code(&mine), 0, "{}", stderr(&mine));
+}
+
+/// An authored file already holding one of the two installer names stops a first
+/// build of a target that declares a registry, naming it (grammar §14.6 rule 4,
+/// PRD resolved q47).
+///
+/// The two files are pure-generated members of the emitted list, so the refusal
+/// that protects `package.json` protects these — which is exactly the promotion
+/// q59 makes: the shape it replaces is a `bunfig.toml` somebody dropped beside a
+/// built project, and a build that silently replaced one would destroy the very
+/// configuration this key exists to stop people hand-maintaining.
+#[test]
+fn an_authored_installer_file_stops_a_build_that_would_write_one() {
+    for name in ["bunfig.toml", ".npmrc"] {
+        let out = scratch(&format!("installer-collision-{name}"));
+        let path = out.to_str().expect("a UTF-8 scratch path");
+        fs::write(out.join(name), "# mine\n").expect("writable");
+
+        let refused = build(&[
+            "examples/triage-fanout/main.yml",
+            "--target",
+            "staging",
+            "--out",
+            path,
+        ]);
+        assert_eq!(code(&refused), 2, "{}", stderr(&refused));
+        assert!(
+            stderr(&refused).contains(&format!("`{name}`")),
+            "the refusal does not name the file it would have replaced: {}",
+            stderr(&refused)
+        );
+        assert_eq!(
+            fs::read_to_string(out.join(name)).expect("readable"),
+            "# mine\n",
+            "the author's file was replaced before the scan decided"
+        );
+    }
+}
+
 /// A build whose output already matches checks clean, and a `--check` against an
 /// empty directory does not.
 #[test]
