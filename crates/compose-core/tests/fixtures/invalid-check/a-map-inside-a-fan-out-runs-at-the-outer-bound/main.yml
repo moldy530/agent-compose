@@ -1,0 +1,108 @@
+# rule: a `map` inside a fan-out is read at the looser of its own bound and the
+# rule: enclosing one, so a serial inner map does not license the race (D147)
+# code: shared-workspace
+# message: `flow.edit` node `implement` is dispatched by the map `each_file` of `flow.repo` with `max_concurrency: 1`, and that dispatch is itself inside a fan-out of 4 issued by the map `each_repo` of `flow.main`, so its `workspace:` is one directory for up to 4 runs at once
+# at: main.yml:60:20
+# label: main.yml:80:7 the fan-out is issued here
+# label: main.yml:98:7 and that dispatch is inside this one
+# help: a harness run is contained by its `workspace:`, so 4 dispatches sharing `'${REPO_ROOT}'` are 4 coding agents editing one checkout and overwriting each other's work. Two repairs, and each says something different about the graph: bind the item's own path — carry it on the dispatch (`input: { worktree: "item.worktree" }`) and read it here (`workspace: "input.worktree"`), or write `workspace: fresh` for a directory the runtime provisions per dispatch — or declare `max_concurrency: 1` on the map `each_repo` of `flow.main` as well, which says the whole fan-out is serial — the bound on the map `each_file` of `flow.repo` holds inside one instance and says nothing about the others. `workspace:` is evaluated in this node's input scope at every dispatch precisely so the first repair is writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# The field report's race one construct deeper, and the shape a rule that read
+# the dispatching map's own `max_concurrency:` and nothing else accepts.
+# `flow.edit` is dispatched by a map that says `max_concurrency: 1` — one file
+# at a time — and every reader who stops there has read a serial fan-out. The
+# map is inside `flow.repo`, which an outer map fans **four** ways, so four
+# instances of it run side by side and each dispatches its files serially: four
+# `cc` runs in flight, all of them inside `'${REPO_ROOT}'`, which is exactly the
+# checkout-clobbering PRD resolved q61 ruling b exists to make unwritable.
+#
+# So the bound a frame carries is the looser of the two, and the message says
+# both numbers: the map's own, because that is the key it declares, and the
+# fan-out's, because that is how many runs the directory really holds. Quoting
+# only the first would send the author to a line already written correctly, and
+# quoting only the second would attribute a four to a map that declares one —
+# so the second repair moves to the map that states the bound (PRD G3).
+#
+# Nothing else about the composition is wrong. Serialising either map, binding
+# the item's own path, or `workspace: fresh` each clear it.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: List the checkouts that need a change.
+  output:
+    repos:
+      type: array
+      max_items: 10
+      items: { type: string }
+agent.splitter:
+  model: model.implementer
+  prompt: List the files in this checkout that need a change.
+  output:
+    files:
+      type: array
+      max_items: 10
+      items: { type: string }
+flow.edit:
+  inputs:
+    file: { type: string }
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          file: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        file: "input.file"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.repo:
+  inputs:
+    repo: { type: string }
+  outputs: {}
+  nodes:
+    split:
+      agent: agent.splitter
+      input: "input.repo"
+    each_file:
+      map:
+        over: split.output.files
+        as: file
+        max_concurrency: 1
+        node: flow.edit
+        input:
+          file: "file"
+  edges:
+    - { from: start, to: split }
+    - { from: split, to: each_file }
+    - { from: each_file, to: end }
+flow.main:
+  outputs: {}
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    each_repo:
+      map:
+        over: plan.output.repos
+        as: repo
+        max_concurrency: 4
+        node: flow.repo
+        input:
+          repo: "repo"
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: each_repo }
+    - { from: each_repo, to: end }

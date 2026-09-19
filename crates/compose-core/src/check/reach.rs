@@ -25,11 +25,20 @@
 //! [`frames`] enumerates those sites: one [`Frame`] per (site, flow instance)
 //! pair, carrying which of that instance's input fields are item-derived.
 //!
-//! The seeding of a site depends on nothing outside the map block itself — a
-//! nested map re-roots the computation at its own item — so a map's frames are
-//! the same wherever the map's own flow is instantiated. What propagates is the
-//! inside of a dispatched flow: a `flow:` node there carries derivation inward
-//! exactly when its binding expression is item-derived in the frame it sits in.
+//! **Derivation** is seeded from nothing outside the map block itself — a
+//! nested map re-roots the computation at its own item — so which of a
+//! dispatched flow's fields are item-derived is the same wherever the map's own
+//! flow is instantiated. What propagates is the inside of a dispatched flow: a
+//! `flow:` node there carries derivation inward exactly when its binding
+//! expression is item-derived in the frame it sits in.
+//!
+//! **The bound is not seeded that way**, and it is the one part of a site that
+//! is not a property of the map block: a map runs once per dispatch of the
+//! fan-out it is *inside*, so `max_concurrency: 1` on a map that an outer map
+//! fans four ways is four of its dispatches in flight at once and not one
+//! (Decision D147, PRD resolved q61 ruling b). So the walk descends through
+//! `map` nodes as well as `flow:` nodes, and a nested map's frames are recorded
+//! at the **looser** of its own bound and the one carried in.
 //!
 //! Detachment needs no walk of its own. A dispatched flow instance holds its
 //! own channel values (grammar 10.1), so nothing a node inside it writes
@@ -52,6 +61,7 @@
 //! nested flows are done with it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use crate::ast::common::{Address, Namespace};
 use crate::cel::Scope;
@@ -370,6 +380,7 @@ pub(crate) fn targets(dispatch: &MapDispatch) -> Vec<&Spanned<Address>> {
 }
 
 /// One `coder:` node a flow contains, with the flow that declares it.
+#[derive(Clone)]
 pub(crate) struct Contained<'a> {
     /// The address of the flow the node is declared in — this flow, or one
     /// below it.
@@ -395,7 +406,24 @@ pub(crate) struct Contained<'a> {
 /// tool, because a model decides whether and when to call one and no static
 /// rule can put that call beside another node. Both are the boundaries
 /// [`frames`] already draws, drawn here again rather than differently.
-pub(crate) fn coders_within<'a>(ctx: &Ctx<'a>, address: &str) -> Vec<Contained<'a>> {
+///
+/// **Answered out of a memo the caller carries across flows** ([`Coders`]),
+/// because the relation is transitive and the rule reading it asks it of steps
+/// all the way down a composition: a chain of *n* nested flows walked once per
+/// link is quadratic in a nesting depth nothing in this compiler bounds
+/// (`tests/check_scale.rs`), and `validate` is held to a millisecond budget. The
+/// answer is a property of the composition, so one walk per address is one too
+/// many and never one too few. The memo is a parameter rather than a cell on the
+/// check context because a `RefCell` there would make [`Ctx`] invariant over its
+/// artifact's lifetime, which is a cost every other check would pay for this one.
+pub(crate) fn coders_within<'a>(
+    ctx: &Ctx<'a>,
+    memo: &mut Coders<'a>,
+    address: &str,
+) -> Rc<Vec<Contained<'a>>> {
+    if let Some(held) = memo.get(address) {
+        return Rc::clone(held);
+    }
     let mut found = Vec::new();
     let mut seen = BTreeSet::new();
     let mut pending = vec![address.to_string()];
@@ -424,7 +452,31 @@ pub(crate) fn coders_within<'a>(ctx: &Ctx<'a>, address: &str) -> Vec<Contained<'
         nested.reverse();
         pending.extend(nested);
     }
+    let found = Rc::new(found);
+    memo.insert(address.to_string(), Rc::clone(&found));
     found
+}
+
+/// [`coders_within`]'s answers, held across the flows one pass walks.
+pub(crate) type Coders<'a> = BTreeMap<String, Rc<Vec<Contained<'a>>>>;
+
+/// The fan-out a dispatch is itself inside, where that fan-out is the looser of
+/// the two (Decision D147, PRD resolved q61 ruling b).
+///
+/// Carried so a diagnostic about the inner dispatch can name the bound it is
+/// really read at, and the map that states it: a message quoting
+/// `max_concurrency: 1` off the inner map while refusing it over four
+/// concurrent runs would be pointing at the line the author already wrote
+/// correctly (PRD G3).
+#[derive(Clone)]
+pub(crate) struct Enclosing {
+    /// How the enclosing map is named in a diagnostic.
+    pub(crate) dispatcher: String,
+    /// Its **effective** bound, which is the one the dispatch inside it is read
+    /// at.
+    pub(crate) concurrency: i64,
+    /// The enclosing map node's span.
+    pub(crate) span: Span,
 }
 
 /// One flow instance running inside a fan-out.
@@ -451,17 +503,31 @@ pub(crate) struct Frame<'a> {
     pub(crate) dispatcher: String,
     /// The dispatching map node's span.
     pub(crate) span: Span,
-    /// How many of this dispatch may be in flight at once
-    /// ([`Dispatch::concurrency`]), carried inward unchanged through the
-    /// `flow:` nodes below it: an instance nested inside a dispatched one runs
-    /// once per dispatch of the outermost, so the bound that decides whether
-    /// two of *it* overlap is the dispatch's (grammar 8.6 rule 1, PRD resolved
-    /// q61 ruling b).
+    /// How many harness runs of this instance may be in flight at once, carried
+    /// inward unchanged through the `flow:` nodes below it: an instance nested
+    /// inside a dispatched one runs once per dispatch of the outermost, so the
+    /// bound that decides whether two of *it* overlap is the dispatch's
+    /// (grammar 8.6 rule 1, PRD resolved q61 ruling b).
     ///
-    /// Where one map reaches one flow from **several** routes, this is the
+    /// **The effective bound rather than the map's own**, and the two differ two
+    /// ways. Where one map reaches one flow from **several** routes, this is the
     /// loosest of their bounds rather than the first one walked: see
-    /// [`push_frame`], which merges it.
+    /// [`push_frame`], which merges it. And where the dispatching map is itself
+    /// inside a fan-out, it is the looser of that fan-out's bound and its own
+    /// ([`Frame::enclosing`]) — a map declaring `max_concurrency: 1` inside a
+    /// flow an outer map fans four ways issues four of its dispatches at once,
+    /// one per concurrent instance, and a rule reading the inner 1 would accept
+    /// the very race Decision D147 makes unwritable.
     pub(crate) concurrency: i64,
+    /// What the dispatching map's own `max_concurrency:` says
+    /// ([`Dispatch::concurrency`]) — the number a diagnostic quotes when it
+    /// names that map's key, as against [`Frame::concurrency`], which is what a
+    /// rule tests.
+    pub(crate) declared: i64,
+    /// The fan-out this dispatch is itself inside, where that fan-out is looser
+    /// than the dispatch's own bound — which is exactly when
+    /// [`Frame::concurrency`] is not [`Frame::declared`].
+    pub(crate) enclosing: Option<Enclosing>,
 }
 
 /// Every flow instance any `map` in the composition dispatches, directly or
@@ -476,46 +542,76 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
             let NodeKind::Map { map } = &node.kind else {
                 continue;
             };
-            let dispatcher = format!("the map `{}` of `{address}`", node.id.value);
-            let item = map
-                .item_binding
-                .as_ref()
-                .map_or("item", |binding| binding.value.as_str());
-            for dispatch in dispatches(map) {
-                if dispatch.target.namespace != Namespace::Flow {
-                    continue;
-                }
-                let dispatched_at = dispatch.target.to_string();
-                let Some(dispatched) = ctx.flow_named(&dispatched_at) else {
-                    continue;
-                };
-                let (derived, bound_at) = seed(dispatched, dispatch.input, item);
+            // Seeded at the map's own bound and nothing else, because this scan
+            // has no idea what the map's flow is instantiated inside. Where that
+            // is a fan-out, the walk below reaches the same map from the outer
+            // dispatch and merges the looser bound onto these frames.
+            for frame in seeded(ctx, address, node, map, None) {
                 let mut path = BTreeSet::new();
-                push_frame(
-                    ctx,
-                    &mut frames,
-                    &mut path,
-                    Frame {
-                        address: dispatched_at,
-                        flow: dispatched,
-                        derived,
-                        bound_at,
-                        dispatcher: dispatcher.clone(),
-                        span: node.span.clone(),
-                        concurrency: dispatch.concurrency,
-                    },
-                );
+                push_frame(ctx, &mut frames, &mut path, frame);
             }
         }
     }
     frames
 }
 
+/// The frames one `map` node seeds: one per `flow.*` dispatch it issues, at the
+/// bound that dispatch really runs under.
+///
+/// Stated once and read twice — by [`frames`]'s scan over every definition, and
+/// by [`push_frame`] where the walk reaches a map *inside* a dispatched
+/// instance — so the two cannot seed a site differently. Derivation is the map
+/// block's own either way (Decision D83); the bound is not, and `enclosing` is
+/// where the difference lives.
+fn seeded<'a>(
+    ctx: &Ctx<'a>,
+    address: &str,
+    node: &Node,
+    map: &Map,
+    enclosing: Option<&Enclosing>,
+) -> Vec<Frame<'a>> {
+    let dispatcher = format!("the map `{}` of `{address}`", node.id.value);
+    let item = map
+        .item_binding
+        .as_ref()
+        .map_or("item", |binding| binding.value.as_str());
+    let mut seeded = Vec::new();
+    for dispatch in dispatches(map) {
+        if dispatch.target.namespace != Namespace::Flow {
+            continue;
+        }
+        let dispatched_at = dispatch.target.to_string();
+        let Some(dispatched) = ctx.flow_named(&dispatched_at) else {
+            continue;
+        };
+        let (derived, bound_at) = seed(dispatched, dispatch.input, item);
+        // The enclosing fan-out is recorded only where it is the **looser** of
+        // the two, because that is the only case a diagnostic has to say
+        // anything about: a map bounded more loosely than what it sits inside
+        // is read at its own bound and reads exactly as it would anywhere.
+        let raised = enclosing.filter(|outer| outer.concurrency > dispatch.concurrency);
+        seeded.push(Frame {
+            address: dispatched_at,
+            flow: dispatched,
+            derived,
+            bound_at,
+            dispatcher: dispatcher.clone(),
+            span: node.span.clone(),
+            concurrency: raised.map_or(dispatch.concurrency, |outer| outer.concurrency),
+            declared: dispatch.concurrency,
+            enclosing: raised.cloned(),
+        });
+    }
+    seeded
+}
+
 /// One item of [`push_frame`]'s worklist: a frame to record, or a frame whose
 /// nested flows are done with and whose address leaves the path.
 enum Step<'a> {
-    /// Record this frame and queue the `flow:` nodes inside it.
-    Enter(Frame<'a>),
+    /// Record this frame and queue the `flow:` and `map` nodes inside it. Boxed
+    /// so the worklist's element is the size of the marker beside it rather than
+    /// the size of a frame.
+    Enter(Box<Frame<'a>>),
     /// Every frame below this address has been recorded; drop it from the path.
     Leave(String),
 }
@@ -542,6 +638,18 @@ enum Step<'a> {
 /// raised it, goes on to walk the nested flows again: those were recorded with
 /// the tighter bound and carry it inward.
 ///
+/// **A `map` node inside a dispatched instance is followed too**, and that is
+/// the other half of the bound not being a property of the map block. A map runs
+/// once per dispatch of the fan-out above it, so a map declaring
+/// `max_concurrency: 1` inside a flow an outer map fans four ways has four of
+/// its dispatches in flight at once — one per concurrent instance — and reading
+/// only the inner 1 accepts the race Decision D147 exists to refuse. Such a
+/// frame is seeded at the looser of the two bounds and carries the outer
+/// fan-out in [`Frame::enclosing`] so a diagnostic can name it. The *site* it
+/// produces is the one [`frames`]'s own scan produces for that map — same
+/// address, same dispatcher, same derivation — so the dedup above merges the two
+/// and only the bound differs.
+///
 /// The worklist is a stack and each frame's nested flows go onto it in reverse,
 /// so the order frames are recorded in is the depth-first, declaration-order one
 /// a recursive walk would produce — which is what makes *which* repetition the
@@ -552,10 +660,10 @@ fn push_frame<'a>(
     path: &mut BTreeSet<String>,
     frame: Frame<'a>,
 ) {
-    let mut pending = vec![Step::Enter(frame)];
+    let mut pending = vec![Step::Enter(Box::new(frame))];
     while let Some(step) = pending.pop() {
         let frame = match step {
-            Step::Enter(frame) => frame,
+            Step::Enter(frame) => *frame,
             Step::Leave(address) => {
                 path.remove(&address);
                 continue;
@@ -574,6 +682,10 @@ fn push_frame<'a>(
                 continue;
             }
             frames[at].concurrency = frame.concurrency;
+            // …and the fan-out that *raised* it travels with it, or the
+            // diagnostic would quote a bound and name a map that does not
+            // state it.
+            frames[at].enclosing.clone_from(&frame.enclosing);
         }
         // A flow that reaches itself is refused by the graph pass's recursion
         // check; guarding the path here keeps this traversal finite meanwhile.
@@ -586,49 +698,75 @@ fn push_frame<'a>(
         let dispatcher = frame.dispatcher.clone();
         let span = frame.span.clone();
         let concurrency = frame.concurrency;
+        let declared = frame.declared;
+        // The fan-out this frame's bound *is* — the enclosing one where that
+        // raised it, this frame's own dispatch otherwise. Either way its
+        // `concurrency` is the frame's, which is what a map below it is read
+        // against.
+        let widest = frame.enclosing.clone().unwrap_or_else(|| Enclosing {
+            dispatcher: dispatcher.clone(),
+            concurrency,
+            span: span.clone(),
+        });
+        let enclosing = frame.enclosing.clone();
         if repeat.is_none() {
             frames.push(frame);
         }
-        pending.push(Step::Leave(address));
+        pending.push(Step::Leave(address.clone()));
         let mut nested_frames = Vec::new();
         for node in &flow.nodes {
-            let NodeKind::Flow { flow: target, .. } = &node.kind else {
-                continue;
-            };
-            let address = target.value.to_string();
-            let Some(nested) = ctx.flow_named(&address) else {
-                continue;
-            };
-            let mut inner = BTreeMap::new();
-            let mut bound_at = BTreeMap::new();
-            if let Some(inputs) = &nested.inputs {
-                for field in &inputs.fields {
-                    let name = field.name.value.to_string();
-                    let binding = match &node.input {
-                        Some(NodeInput::Fields { bindings }) => bindings
-                            .entries
-                            .iter()
-                            .find(|binding| binding.name.value == name),
-                        _ => None,
+            match &node.kind {
+                NodeKind::Flow { flow: target, .. } => {
+                    let address = target.value.to_string();
+                    let Some(nested) = ctx.flow_named(&address) else {
+                        continue;
                     };
-                    let value = binding.is_some_and(|binding| {
-                        is_item_derived(binding.value.value.as_str(), None, &derived)
-                    });
-                    if let Some(binding) = binding {
-                        bound_at.insert(name.clone(), binding.value.span.clone());
+                    let mut inner = BTreeMap::new();
+                    let mut bound_at = BTreeMap::new();
+                    if let Some(inputs) = &nested.inputs {
+                        for field in &inputs.fields {
+                            let name = field.name.value.to_string();
+                            let binding = match &node.input {
+                                Some(NodeInput::Fields { bindings }) => bindings
+                                    .entries
+                                    .iter()
+                                    .find(|binding| binding.name.value == name),
+                                _ => None,
+                            };
+                            let value = binding.is_some_and(|binding| {
+                                is_item_derived(binding.value.value.as_str(), None, &derived)
+                            });
+                            if let Some(binding) = binding {
+                                bound_at.insert(name.clone(), binding.value.span.clone());
+                            }
+                            inner.insert(name, value);
+                        }
                     }
-                    inner.insert(name, value);
+                    // One instance of the same dispatch, so everything the site
+                    // is travels unchanged: the bound, the map that states it,
+                    // and the fan-out that raised it.
+                    nested_frames.push(Step::Enter(Box::new(Frame {
+                        address,
+                        flow: nested,
+                        derived: inner,
+                        bound_at,
+                        dispatcher: dispatcher.clone(),
+                        span: span.clone(),
+                        concurrency,
+                        declared,
+                        enclosing: enclosing.clone(),
+                    })));
                 }
+                // A new site rather than the same one carried inward: its
+                // derivation is re-rooted at this map's own item, and its bound
+                // is the looser of this map's and the fan-out it is inside.
+                NodeKind::Map { map } => nested_frames.extend(
+                    seeded(ctx, &address, node, map, Some(&widest))
+                        .into_iter()
+                        .map(|frame| Step::Enter(Box::new(frame))),
+                ),
+                _ => {}
             }
-            nested_frames.push(Step::Enter(Frame {
-                address,
-                flow: nested,
-                derived: inner,
-                bound_at,
-                dispatcher: dispatcher.clone(),
-                span: span.clone(),
-                concurrency,
-            }));
         }
         nested_frames.reverse();
         pending.extend(nested_frames);

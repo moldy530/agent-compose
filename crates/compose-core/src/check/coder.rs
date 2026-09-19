@@ -190,12 +190,23 @@ pub(crate) fn coder_node(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, node: &Node, coder:
 /// written before resolved q61 holds, and it is answered with the rewrite
 /// rather than with a parse error naming a character
 /// ([`written_as_a_path`], PRD G3).
+///
+/// A value this refuses is **rejected** for the two rules stated over the same
+/// expression ([`dispatched_workspaces`], [`concurrent_workspaces`]), exactly as
+/// [`edge_guard`](super::expr::edge_guard) rejects a guard the routing analyses
+/// must not read again. Those two ask what the expression *depends on*, and
+/// `cel::analyze` answers "nothing" for a source it could not parse — so a
+/// `workspace:` already reported as malformed would come back a second time as
+/// one directory for every dispatch, telling an author to make a repair they
+/// have just been told to make, about an expression that has no reads because it
+/// has no parse (PRD G3, resolved q22).
 fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
     let Some(expression) = coder.workspace.value.expression() else {
         return;
     };
     if written_as_a_path(expression.as_str()) {
         a_path_where_an_expression_goes(ctx, subject, coder, expression);
+        ctx.reject_workspace(&coder.workspace.span);
         return;
     }
     let written = Spanned::new(Cel::new(expression.as_str()), coder.workspace.span.clone());
@@ -208,6 +219,9 @@ fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
         &Type::String,
         &format!("`workspace:` of {subject}"),
     );
+    if !analysis.problems.is_empty() || !analysis.ty.assignable_to(&Type::String) {
+        ctx.reject_workspace(&coder.workspace.span);
+    }
 }
 
 /// Whether a `workspace:` value is a **path** rather than an expression — the
@@ -1243,17 +1257,30 @@ fn check_shape(
 /// is outside grammar 11.4's — and outside
 /// [`concurrent_workspaces`]'s as well, which draws the same boundary.
 ///
-/// And a **nested** map re-roots the computation at its own item, which is the
-/// property that makes a map's frames the same wherever the map's own flow is
-/// instantiated. What that gives up here is the outer bound: a map declaring
-/// `max_concurrency: 1` inside a flow that an *outer* map fans four ways runs
-/// serially within each of four concurrent instances, and this reads only the
-/// inner 1. The rule PRD resolved q61 ruling b states is the one this
-/// implements — the dispatching map's own bound — and the shape it does not
-/// reach is named here rather than claimed. `workspace: fresh` closes it
-/// whatever the nesting, because an instance path holds every frame.
+/// And a **nested** map is read at the looser of its own bound and the fan-out
+/// it is inside, which is [`reach::frames`]' own doing. A map declaring
+/// `max_concurrency: 1` inside a flow an outer map fans four ways runs serially
+/// *within each of four concurrent instances*, so four harness runs are in one
+/// directory at once — the field report's race, one construct deeper — and
+/// reading the inner 1 would accept it. The frame carries both numbers, and the
+/// message below quotes the map's own while naming the fan-out that raised it,
+/// because `max_concurrency: 1` is already written on the line a message quoting
+/// four would send the author to.
+///
+/// # One diagnostic per `workspace:`
+///
+/// A node is reported **once**, whatever number of frames reach it. A routed map
+/// naming one flow from two routes with two different item-derivations seeds two
+/// frames that no dedup in [`reach::frames`] merges — they are two sites — but
+/// the mistake is one line and the repair is one edit, so a second byte-identical
+/// sentence at the same span would only bury the first. That is the policy
+/// [`concurrent_workspaces`] states for its own quadratic, kept here: the frame
+/// that speaks is the one with the **loosest** bound, which is the worst case the
+/// author has to answer for.
 pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
-    let mut reported = Vec::new();
+    // Keyed by the node and the position of its `workspace:` — one key per line
+    // an author would have to edit.
+    let mut reported: BTreeMap<(String, String, usize), Shared> = BTreeMap::new();
     for frame in reach::frames(ctx) {
         // A serial dispatch is a statement the author made, and it is the
         // second repair this rule's message offers: one run at a time is one
@@ -1268,43 +1295,126 @@ pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
             let Some(expression) = coder.workspace.value.expression() else {
                 continue;
             };
+            // An expression the CEL front-end already refused reads nothing
+            // because it has no parse, not because it names one directory
+            // (see `workspace`).
+            if !ctx.workspace_type_checked(&coder.workspace.span) {
+                continue;
+            }
             if reach::is_item_derived(expression.as_str(), None, &frame.derived) {
                 continue;
             }
-            reported.push((
-                format!("`{}` node `{}`", frame.address, node.id.value),
-                coder.workspace.span.clone(),
-                frame.dispatcher.clone(),
-                frame.span.clone(),
-                frame.concurrency,
-                expression.as_str().to_string(),
-            ));
+            let subject = format!("`{}` node `{}`", frame.address, node.id.value);
+            let key = (
+                subject.clone(),
+                coder.workspace.span.source.as_str().to_string(),
+                coder.workspace.span.bytes.start,
+            );
+            let shared = Shared {
+                subject,
+                at: coder.workspace.span.clone(),
+                dispatcher: frame.dispatcher.clone(),
+                dispatched_at: frame.span.clone(),
+                declared: frame.declared,
+                concurrency: frame.concurrency,
+                enclosing: frame.enclosing.clone(),
+                expression: expression.as_str().to_string(),
+            };
+            match reported.get(&key) {
+                // The loosest bound wins, and a tie keeps the frame walked
+                // first — which `reach::frames` fixes to the composition's own
+                // order rather than to any loop's.
+                Some(held) if held.concurrency >= shared.concurrency => {}
+                _ => {
+                    reported.insert(key, shared);
+                }
+            }
         }
     }
-    for (subject, at, dispatcher, dispatched_at, concurrency, expression) in reported {
-        ctx.push(
-            Diagnostic::error(
-                DiagnosticCode::SharedWorkspace,
-                at,
-                format!(
-                    "{subject} is dispatched by {dispatcher} with `max_concurrency: \
-                     {concurrency}`, and its `workspace:` is one directory for every dispatch"
-                ),
-            )
-            .with_label(dispatched_at, "the fan-out is issued here")
-            .with_help(format!(
-                "a harness run is contained by its `workspace:`, so {concurrency} dispatches \
-                 sharing `{expression}` are {concurrency} coding agents editing one checkout \
-                 and overwriting each other's work. Two repairs, and each says something \
-                 different about the graph: bind the item's own path — carry it on the \
-                 dispatch (`input: {{ worktree: \"item.worktree\" }}`) and read it here \
-                 (`workspace: \"input.worktree\"`), or write `workspace: fresh` for a directory \
-                 the runtime provisions per dispatch — or declare `max_concurrency: 1` on the \
-                 map, which says these runs are serial. `workspace:` is evaluated in this \
-                 node's input scope at every dispatch precisely so the first repair is \
-                 writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 ruling b)"
-            )),
-        );
+    for shared in reported.into_values() {
+        ctx.push(shared.diagnostic());
+    }
+}
+
+/// One refusal [`dispatched_workspaces`] has decided on, before it is worded.
+struct Shared {
+    /// How the coder node is named.
+    subject: String,
+    /// Its `workspace:`, which is the line the refusal anchors at.
+    at: Span,
+    /// How the dispatching map is named.
+    dispatcher: String,
+    /// That map node's span.
+    dispatched_at: Span,
+    /// What the dispatching map's own `max_concurrency:` says.
+    declared: i64,
+    /// How many runs can really be in flight at once.
+    concurrency: i64,
+    /// The fan-out that raised the one above the other, where one did.
+    enclosing: Option<reach::Enclosing>,
+    /// The `workspace:` expression as written.
+    expression: String,
+}
+
+impl Shared {
+    fn diagnostic(self) -> Diagnostic {
+        let Self {
+            subject,
+            at,
+            dispatcher,
+            dispatched_at,
+            declared,
+            concurrency,
+            enclosing,
+            expression,
+        } = self;
+        let message = match &enclosing {
+            None => format!(
+                "{subject} is dispatched by {dispatcher} with `max_concurrency: {concurrency}`, \
+                 and its `workspace:` is one directory for every dispatch"
+            ),
+            // The map's own bound *and* the one it really runs under, because
+            // quoting either alone misreads the composition: the first says
+            // `max_concurrency: 1` about a node four runs share, and the second
+            // attributes a four to a map that declares one.
+            Some(outer) => format!(
+                "{subject} is dispatched by {dispatcher} with `max_concurrency: {declared}`, and \
+                 that dispatch is itself inside a fan-out of {} issued by {}, so its \
+                 `workspace:` is one directory for up to {concurrency} runs at once",
+                outer.concurrency, outer.dispatcher
+            ),
+        };
+        // Two repairs where the map's own bound is the whole of it, and the same
+        // two where it is not — but the serial one moves to the map that states
+        // the bound, because the inner map already says `max_concurrency: 1`
+        // and saying it again is not an edit.
+        let serial = match &enclosing {
+            None => "or declare `max_concurrency: 1` on the map, which says these runs are serial"
+                .to_string(),
+            Some(outer) => format!(
+                "or declare `max_concurrency: 1` on {} as well, which says the whole fan-out is \
+                 serial — the bound on {dispatcher} holds inside one instance and says nothing \
+                 about the others",
+                outer.dispatcher
+            ),
+        };
+        let mut diagnostic = Diagnostic::error(DiagnosticCode::SharedWorkspace, at, message)
+            .with_label(dispatched_at, "the fan-out is issued here");
+        if let Some(outer) = &enclosing {
+            diagnostic =
+                diagnostic.with_label(outer.span.clone(), "and that dispatch is inside this one");
+        }
+        diagnostic.with_help(format!(
+            "a harness run is contained by its `workspace:`, so {concurrency} dispatches sharing \
+             `{expression}` are {concurrency} coding agents editing one checkout and overwriting \
+             each other's work. Two repairs, and each says something different about the graph: \
+             bind the item's own path — carry it on the dispatch (`input: {{ worktree: \
+             \"item.worktree\" }}`) and read it here (`workspace: \"input.worktree\"`), or write \
+             `workspace: fresh` for a directory the runtime provisions per dispatch — {serial}. \
+             `workspace:` is evaluated in this node's input scope at every dispatch precisely so \
+             the first repair is writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 \
+             ruling b)"
+        ))
     }
 }
 
@@ -1348,20 +1458,44 @@ pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
 /// two paths — which is the repair this ruling exists for — and warning about it
 /// would be warning about the fix. A closed expression is where that difference
 /// cannot arise, and it is also the shape the field report had.
-pub(crate) fn concurrent_workspaces(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, graph: &Graph<'_>) {
-    let runs: Vec<Vec<Run>> = (0..graph.nodes().len())
-        .map(|at| runs_of(ctx, cx, graph, at))
-        .collect();
+pub(crate) fn concurrent_workspaces<'a>(
+    ctx: &mut Ctx<'a>,
+    cx: &FlowCx<'_>,
+    graph: &Graph<'_>,
+    memo: &mut reach::Coders<'a>,
+) {
+    // The steps that *could* hold a run, decided on the node's kind alone —
+    // which is a read rather than a walk. Enumerating the runs first would
+    // answer the same question more precisely and walk the whole composition
+    // below every `flow:` node to do it, including the overwhelmingly common
+    // case where the flow has no fork at all and no pair can exist: `validate`
+    // is held to a millisecond budget over a nesting depth nothing bounds
+    // (`tests/check_scale.rs`). A step admitted here that turns out to hold no
+    // run costs a pair the loops below drop, and never a diagnostic.
     let of_interest: Vec<usize> = (0..graph.nodes().len())
-        .filter(|at| !runs[*at].is_empty())
+        .filter(|at| {
+            matches!(
+                graph.node(*at).kind,
+                crate::ir::flow::NodeKind::Coder { .. } | crate::ir::flow::NodeKind::Flow { .. }
+            )
+        })
         .collect();
+    let concurrent = super::convergence::concurrent_among(ctx, graph, &of_interest);
+    // …so the walk happens for the steps a pair actually named, once each.
+    let mut runs: BTreeMap<usize, Vec<Run>> = BTreeMap::new();
+    for (one, other) in &concurrent {
+        for at in [*one, *other] {
+            runs.entry(at)
+                .or_insert_with(|| runs_of(ctx, cx, graph, at, memo));
+        }
+    }
     // The chosen pair per directory, ordered by the two steps and then by the
     // two runs inside them, so which repetition is reported is a property of
     // the composition rather than of this loop.
     let mut collided: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
-    for (one, other) in super::convergence::concurrent_among(ctx, graph, &of_interest) {
-        for (first, run) in runs[one].iter().enumerate() {
-            for (second, against) in runs[other].iter().enumerate() {
+    for (one, other) in concurrent {
+        for (first, run) in runs[&one].iter().enumerate() {
+            for (second, against) in runs[&other].iter().enumerate() {
                 if run.written != against.written {
                     continue;
                 }
@@ -1384,8 +1518,8 @@ pub(crate) fn concurrent_workspaces(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, graph: &
         }
     }
     for (expression, (one, other, first, second)) in collided {
-        let run = &runs[one][first];
-        let against = &runs[other][second];
+        let run = &runs[&one][first];
+        let against = &runs[&other][second];
         let local = run.local && against.local;
         let message = if local {
             format!(
@@ -1477,13 +1611,25 @@ struct Run {
 }
 
 /// The runs one step of this flow's graph contains, in declaration order.
-fn runs_of(ctx: &Ctx<'_>, cx: &FlowCx<'_>, graph: &Graph<'_>, at: usize) -> Vec<Run> {
+///
+/// A `workspace:` the CEL front-end refused contributes none: "written the same
+/// way" is a statement about two expressions, and a source with no parse is not
+/// one of those — it would pair with every other malformed value in the flow and
+/// tell both authors their directories collide (see [`workspace`]).
+fn runs_of<'a>(
+    ctx: &Ctx<'a>,
+    cx: &FlowCx<'_>,
+    graph: &Graph<'_>,
+    at: usize,
+    memo: &mut reach::Coders<'a>,
+) -> Vec<Run> {
     let node = graph.node(at);
     match &node.kind {
         crate::ir::flow::NodeKind::Coder { coder } => coder
             .workspace
             .value
             .expression()
+            .filter(|_| ctx.workspace_type_checked(&coder.workspace.span))
             .map(|expression| Run {
                 written: expression.as_str().to_string(),
                 span: coder.workspace.span.clone(),
@@ -1495,10 +1641,13 @@ fn runs_of(ctx: &Ctx<'_>, cx: &FlowCx<'_>, graph: &Graph<'_>, at: usize) -> Vec<
             .into_iter()
             .collect(),
         crate::ir::flow::NodeKind::Flow { flow, .. } => {
-            reach::coders_within(ctx, &flow.value.to_string())
-                .into_iter()
+            reach::coders_within(ctx, memo, &flow.value.to_string())
+                .iter()
                 .filter_map(|held| {
                     let expression = held.coder.workspace.value.expression()?;
+                    if !ctx.workspace_type_checked(&held.coder.workspace.span) {
+                        return None;
+                    }
                     Some(Run {
                         written: expression.as_str().to_string(),
                         span: held.coder.workspace.span.clone(),

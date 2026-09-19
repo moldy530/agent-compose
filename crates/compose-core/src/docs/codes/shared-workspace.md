@@ -17,6 +17,13 @@ it can happen:
   can have a checkout of its own. A node whose expression reads nothing from that
   scope resolves to one directory for the whole fan-out, so `max_concurrency: 8`
   is eight agents in one tree. That is an **error**.
+
+  The bound read is the one the dispatch really runs under, which is not always
+  the one its own map declares. A map **inside** a fan-out issues its dispatches
+  once per concurrent instance of the flow that holds it, so a map saying
+  `max_concurrency: 1` inside a flow an outer map fans four ways still has four
+  harness runs in flight — and the refusal quotes both numbers and sends you to
+  the outer map, because the inner one already says `max_concurrency: 1`.
 * **Two harness runs on concurrent branches.** Two edges of one fork that are not
   provably exclusive can both fire, so the branches they start run side by side
   (grammar §7.6.1) — and if both runs write the same `workspace:`, both are in one
@@ -146,7 +153,9 @@ Three repairs, and each says something different about the graph.
 * **Say the runs are serial.** `max_concurrency: 1` on the map is a statement
   rather than a workaround — one dispatch at a time is one run in the directory
   at a time — and it is the honest spelling of what a shared-workspace fan-out
-  was doing anyway, minus the corruption.
+  was doing anyway, minus the corruption. Where the message named an *enclosing*
+  fan-out, that is the map to write it on: serialising the inner one leaves one
+  run per instance and as many instances as the outer map allows.
 
 ## The fix, applied
 

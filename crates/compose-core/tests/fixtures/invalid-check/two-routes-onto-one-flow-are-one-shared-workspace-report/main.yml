@@ -1,0 +1,103 @@
+# rule: one `workspace:` reached from two dispatch sites is one refusal, not one
+# rule: per site (grammar 8.6 rule 1, D147, PRD G3)
+# code: shared-workspace
+# message: `flow.fix` node `implement` is dispatched by the map `work` of `flow.main` with `max_concurrency: 4`, and its `workspace:` is one directory for every dispatch
+# at: main.yml:63:20
+# label: main.yml:86:7 the fan-out is issued here
+#
+# The sibling of `a-tighter-route-does-not-silence-a-sibling-dispatch`, and the
+# half that file cannot show. There both routes bind `goal:` the same way, so
+# the two sites are one site and `reach::frames`' own dedup merges them. Here
+# `slow:` carries the item's goal and `fast:` binds a constant, so the two
+# frames differ in their item-derivation and **nothing** merges them — they are
+# two sites, and grammar 11.4's store rule reports per site for exactly that
+# reason.
+#
+# This rule does not, because what it reports is not a site: it is one
+# `workspace:` on one line, and the repair is one edit. A report that printed
+# the same sentence at the same span with the same label and the same help twice
+# would bury the first under the second, which is the policy the warning half of
+# the same rule already states and implements for its own quadratic — one
+# diagnostic per directory, not one per colliding pair. So the node speaks once,
+# through the frame with the loosest bound.
+#
+# `# count:` is left at its default of one on purpose: the count is the
+# assertion.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: Sort the failing tests into the ones worth a long run and the ones worth a short one.
+  output:
+    tasks:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          slow: { goal: { type: string } }
+          fast: { goal: { type: string } }
+state:
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 10
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  outputs:
+    summaries:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    work:
+      map:
+        over: plan.output.tasks
+        as: step
+        route_by: kind
+        routes:
+          slow:
+            node: flow.fix
+            input: { goal: "step.goal" }
+            writes: { summary: summaries }
+          fast:
+            node: flow.fix
+            input: { goal: "'the one fixed goal'" }
+            writes: { summary: summaries }
+        max_concurrency: 4
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }

@@ -121,11 +121,6 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
     triggers::check(&mut ctx);
     stores::check_session_scope(&mut ctx);
     stores::check_map_writes(&mut ctx);
-    // The unwritable race (PRD resolved q61 ruling b): stated over the dispatch
-    // sites `reach::frames` enumerates, which is the same relation the store
-    // rule above reads and for the same reason — whether a construct is inside
-    // a fan-out is a property of the whole composition.
-    coder::dispatched_workspaces(&mut ctx);
     placements::check(&mut ctx);
     placements::check_stores(&mut ctx);
     components::check(&mut ctx);
@@ -141,9 +136,26 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
         }
     }
 
+    // The unwritable race (PRD resolved q61 ruling b): stated over the dispatch
+    // sites `reach::frames` enumerates, which is the same relation
+    // `stores::check_map_writes` reads and for the same reason — whether a
+    // construct is inside a fan-out is a property of the whole composition.
+    //
+    // **After** the loop above rather than beside that store rule, for the same
+    // reason the graph checks run last: it reads only the `workspace:`
+    // expressions that type-checked, and which those are is what the loop has
+    // just decided (see `Ctx::reject_workspace`).
+    coder::dispatched_workspaces(&mut ctx);
+
     // The graph checks run after the data ones on purpose: the routing analyses
     // read only the guards that type-checked, and which those are is what the
     // pass above has just decided (see `Ctx::reject_guard`).
+    //
+    // The memo outlives the loop because what it answers — the coder nodes one
+    // flow contains, transitively — is a property of the composition rather than
+    // of the flow being checked, and every flow instantiating a common subflow
+    // asks the same question of it (see `reach::coders_within`).
+    let mut contained = reach::Coders::new();
     for (address, definition) in &ir.definitions {
         let DefinitionBody::Flow(flow) = &definition.body else {
             continue;
@@ -157,7 +169,7 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
         // …and the other half of that race, which needs the same fork analysis
         // the line above runs: two coder nodes that may be in flight at once
         // and name one directory (PRD resolved q61 ruling b).
-        coder::concurrent_workspaces(&mut ctx, &cx, &graph);
+        coder::concurrent_workspaces(&mut ctx, &cx, &graph, &mut contained);
         fanout::check(&mut ctx, &cx, &graph);
     }
 
@@ -233,8 +245,17 @@ pub(crate) struct Ctx<'a> {
     pub(crate) ir: &'a Ir,
     diagnostics: Diagnostics,
     channels: BTreeMap<&'a str, &'a Channel>,
-    /// The edge guards the CEL front-end refused, by the position they were
+    /// The expressions the CEL front-end refused, by the position they were
     /// written at — a file and a byte offset, which is one expression.
+    ///
+    /// Two surfaces record into it and both for one reason: an expression
+    /// already reported as a mistake is not read a second time by an analysis
+    /// that would draw a *different* conclusion from the same failure. An
+    /// unparsed guard reads as grammar 7.3.1's `∅` and comes back as a variant
+    /// left unrouted; an unparsed `workspace:` reads as an expression with no
+    /// roots and comes back as one directory for every dispatch. Neither second
+    /// report is true, and both tell an author to make a repair they have
+    /// already made (PRD G3).
     rejected: BTreeSet<(String, usize)>,
 }
 
@@ -258,12 +279,31 @@ impl<'a> Ctx<'a> {
     /// Record that an edge guard did not type-check, so the routing analyses
     /// leave it alone (see [`routing`], [`convergence`]).
     pub(crate) fn reject_guard(&mut self, at: &Span) {
-        self.rejected
-            .insert((at.source.as_str().to_string(), at.bytes.start));
+        self.reject(at);
     }
 
     /// Whether the guard written at this position type-checked.
     pub(crate) fn guard_type_checked(&self, at: &Span) -> bool {
+        self.type_checked(at)
+    }
+
+    /// Record that a `coder:` node's `workspace:` did not type-check, so the
+    /// two shared-workspace analyses leave it alone (see [`coder`]).
+    pub(crate) fn reject_workspace(&mut self, at: &Span) {
+        self.reject(at);
+    }
+
+    /// Whether the `workspace:` written at this position type-checked.
+    pub(crate) fn workspace_type_checked(&self, at: &Span) -> bool {
+        self.type_checked(at)
+    }
+
+    fn reject(&mut self, at: &Span) {
+        self.rejected
+            .insert((at.source.as_str().to_string(), at.bytes.start));
+    }
+
+    fn type_checked(&self, at: &Span) -> bool {
         !self
             .rejected
             .contains(&(at.source.as_str().to_string(), at.bytes.start))

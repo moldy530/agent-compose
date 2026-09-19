@@ -1,0 +1,94 @@
+# rule: a `workspace:` the CEL front-end refused is not read a second time as a
+# rule: directory every dispatch shares (grammar 4.1, D147, PRD G3)
+# code: invalid-expression
+# message: `input.goal + ` is not a valid CEL expression: Syntax error: mismatched input '<EOF>' expecting {'[', '{', '(', '.', '-', '!', 'true', 'false', 'null', NUM_FLOAT, NUM_INT, NUM_UINT, STRING, BYTES, IDENTIFIER}
+# at: main.yml:60:20
+# help: a `coder:` node's `workspace:` takes a CEL expression (grammar 4.1)
+#
+# The cascade `check::expr::edge_guard` already refuses to allow, on the other
+# expression surface `check/coder.rs` owns. `goal` **is** item-derived here —
+# the map binds it from the item, and the whole expression is the author
+# reaching for exactly the repair the shared-workspace error names — so the only
+# thing wrong is the trailing `+`. `cel::analyze` answers "reads nothing" for a
+# source it could not parse, though, and a rule that asks what the expression
+# depends on reads that answer as a literal path: a second error telling the
+# author to bind the item's own path, about a line where they were binding the
+# item's own path.
+#
+# So the front-end's refusal is recorded, and the two rules stated over the same
+# expression — the dispatch refusal and the concurrent-runs warning — leave it
+# alone. One mistake, one diagnostic, and the one that names the character.
+#
+# `# count:` is left at its default of one on purpose: the count is the
+# assertion.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: List the checkouts that need a change.
+  output:
+    tasks:
+      type: array
+      max_items: 10
+      items:
+        type: object
+        properties:
+          goal: { type: string }
+state:
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 10
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "input.goal + "
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  outputs:
+    summaries:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    work:
+      map:
+        over: plan.output.tasks
+        as: task
+        node: flow.fix
+        input:
+          goal: "task.goal"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }

@@ -291,7 +291,9 @@ upstream step that makes one.
 
 Two harness runs in one directory edit each other's files, so that is refused
 where it can be seen: a map-dispatched coder whose `workspace:` does not read
-the per-dispatch scope is an error unless the map says `max_concurrency: 1`, and
+the per-dispatch scope is an error unless the map says `max_concurrency: 1` —
+and a map *inside* another map's fan-out is read at the outer bound, since it
+runs once per concurrent instance — and
 two runs concurrent branches can have in flight at once writing the same
 `workspace:` draw a warning naming both — a `coder:` node of the flow, or one
 inside a flow a `flow:` node instantiates, so a subflow instantiated twice reads

@@ -2454,3 +2454,140 @@ flow.main:
 "#,
     );
 }
+
+/// A `map` **inside** a fan-out, accepted at the bound it really runs under
+/// (grammar 8.9, 8.6 rule 1, Decision D147).
+///
+/// `tests/fixtures/invalid-check/a-map-inside-a-fan-out-runs-at-the-outer-bound`
+/// pins the refusal: a serial inner map inside a concurrent outer one is still
+/// four harness runs in one directory, so the frame carries the looser bound.
+/// The direction that corpus cannot see is the one where reading the outer bound
+/// makes a legal composition unwritable, and there are two of those:
+///
+///  * **the fan-out is serial the whole way down.** Both maps declare
+///    `max_concurrency: 1`, so one run is in the directory at a time however
+///    deeply the dispatch is nested, and an implementation that raised every
+///    nested map to the composition's loosest bound rather than to its own
+///    enclosing one would refuse it;
+///  * **the inner item carries the directory.** The outer map fans four ways,
+///    the inner map fans four ways inside each of those, and the dispatched
+///    coder reads the *inner* map's own item. Derivation is re-rooted at the
+///    nested map's item (Decision D83) and the bound is the only thing carried
+///    inward, so this is the repair the refusal names, written one construct
+///    deeper — and an implementation that carried the outer frame's derivation
+///    inward instead of re-seeding would read `input.file` as not item-derived
+///    and refuse the fix.
+#[test]
+fn a_nested_fan_out_is_read_at_the_bound_it_runs_under() {
+    accepts(
+        "coder-nested-fan-out-workspaces",
+        r#"
+flow.edit:
+  inputs:
+    file: { type: string }
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "'${ROOT}'"
+        prompt: Work in the one checkout, one run at a time.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.per_file:
+  inputs:
+    file: { type: string }
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "input.file"
+        prompt: Work in the checkout this item names.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.serial_repo:
+  inputs:
+    files:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    each_file:
+      map:
+        over: input.files
+        as: file
+        max_concurrency: 1
+        node: flow.edit
+        input:
+          file: "file"
+  edges:
+    - { from: start, to: each_file }
+    - { from: each_file, to: end }
+flow.carried_repo:
+  inputs:
+    files:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    each_file:
+      map:
+        over: input.files
+        as: file
+        max_concurrency: 4
+        node: flow.per_file
+        input:
+          file: "file"
+  edges:
+    - { from: start, to: each_file }
+    - { from: each_file, to: end }
+flow.main:
+  inputs:
+    repos:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          files:
+            type: array
+            max_items: 4
+            items: { type: string }
+  outputs: {}
+  nodes:
+    serially:
+      map:
+        over: input.repos
+        as: repo
+        max_concurrency: 1
+        node: flow.serial_repo
+        input:
+          files: "repo.files"
+    carried:
+      map:
+        over: input.repos
+        as: repo
+        max_concurrency: 4
+        node: flow.carried_repo
+        input:
+          files: "repo.files"
+  edges:
+    - { from: start, to: serially }
+    - { from: serially, to: carried }
+    - { from: carried, to: end }
+"#,
+    );
+}

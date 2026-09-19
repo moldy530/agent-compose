@@ -3186,7 +3186,11 @@ with (`shared-workspace`, PRD resolved q61 ruling b):
   read the per-dispatch scope — neither the dispatch's own `input.<field>` nor
   `execution.item_index` — is a **compile error** unless the map declares
   `max_concurrency: 1`. The message names both repairs: bind the item's own path
-  (or take `fresh`), or say the runs are serial;
+  (or take `fresh`), or say the runs are serial. A map **inside** a fan-out is
+  read at the looser of that fan-out's bound and its own, because it issues its
+  dispatches once per concurrent instance of the flow that holds it — so
+  `max_concurrency: 1` on a map an outer map fans four ways is four runs in the
+  directory, and the refusal names the outer map as the one to serialise;
 * two coder nodes on statically-concurrent branches (§7.6.1) whose `workspace:`
   values are **written identically** draw a **warning** naming both. Not an
   error, and the reason is stated rather than papered over: what decides it is
@@ -9804,12 +9808,27 @@ are ([D83](#d83-a-map-written-store-key-is-derived-from-the-item)): frames of a
 flow instance inside a fan-out, with the item-derivation of each of its input
 fields, carried inward through `flow:` nodes and stopping at an agent's `flow.*`
 tool — because a model decides whether and when to call one of those, and no
-static rule can put that call inside a dispatch. Where a routed map names one
-flow from **several** routes ([D28](#d28-max_concurrency-is-required-on-the-map-node-routes-may-only-tighten-it)),
-the bound read is the loosest of theirs: a route tightening its own
+static rule can put that call inside a dispatch.
+
+*The bound is the one the dispatch really runs under*, which is not always the
+one its map declares, and it is read that way two ways. Where a routed map names
+one flow from **several** routes ([D28](#d28-max_concurrency-is-required-on-the-map-node-routes-may-only-tighten-it)),
+the bound is the loosest of theirs: a route tightening its own
 `max_concurrency` says nothing about its sibling's, and reading the first would
 let one serial route silence the refusal for every other route into the same
-directory.
+directory. And where the dispatching map is itself **inside** a fan-out — a
+`map` in a flow another map dispatches, directly or through `flow:` nodes — the
+bound is the looser of that fan-out's and its own: a map declaring
+`max_concurrency: 1` inside a flow an outer map fans four ways issues its
+dispatches serially *within each of four concurrent instances*, so four harness
+runs are in the directory at once and the inner 1 says nothing about the other
+three. Item-derivation is **not** read that way and a nested map re-roots it at
+its own item (D83): the bound is the one thing a map's frames carry in from
+outside, which is why `workspace: "input.file"` bound from the inner map's own
+item is the repair at any depth. A refusal naming an enclosing fan-out quotes
+both numbers, because the map's own is the key it declares and the fan-out's is
+how many runs the directory really holds — and it names the *enclosing* map as
+the place to write `max_concurrency: 1`, since the inner one already says it.
 
 **3. `workspace: fresh` is the batteries-included spelling.** The runtime
 provisions a per-dispatch directory under the execution's scratch, named by §9.4
