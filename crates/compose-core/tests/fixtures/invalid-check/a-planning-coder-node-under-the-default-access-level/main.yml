@@ -1,0 +1,49 @@
+# rule: a `permission_mode:` the node's `access:` level does not admit names the
+# rule: level that does admit it, which is sometimes the narrower one (8.9, D146)
+# code: widening-permission-mode
+# message: `permission_mode: plan` of `flow.main` node `survey` is outside what `access: workspace_write` admits
+# at: main.yml:42:26
+# label: main.yml:39:18 `harness: cc` is bound here
+# help: `access:` says how far a run may reach and `permission_mode:` says how its harness approves a call inside that reach, so a mode may never grant an operation the level would refuse: `plan` plans, and executes no tool, and `access: workspace_write` bounds writes to the workspace. `access: workspace_write` admits `default`, `acceptEdits`, `dontAsk`, `auto` and derives `acceptEdits` when the key is absent. Either name one of those, or state the containment that admits `plan`, reading the narrower one first because the levels are not a chain: `access: read_only`, which is read the workspace and write nothing; or `access: full_access`, which asks for no containment at all. Either way a level is a containment statement a reader sees on the node rather than a mode reaching around one (grammar 8.9, Decision D146, PRD resolved q60 ruling a)
+#
+# The same rule as `a-coder-nodes-permission-mode-widens-its-access-level`, from
+# the other end of the table, and the repair is what makes it a second fixture.
+# The three levels are **not a chain** (Decision D146): `plan` is admitted under
+# `read_only` and under `full_access` and refused under the `workspace_write`
+# between them, because what `workspace_write` states is that edits under the
+# workspace are the run's job and a mode that executes no tool is a different
+# node.
+#
+# So this is the most natural planning node there is — `permission_mode: plan`,
+# no `access:` written, grammar 8.9's default underneath it — and its repair is
+# to *narrow* `access:` to `read_only`. A message that could only offer to raise
+# `access:` would answer it with `full_access`, the widest containment this
+# grammar grants, to reach the one mode that executes no tool at all. The help
+# is pinned here because that is the sentence, not the code, that has to be
+# right (PRD G3).
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    survey:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        permission_mode: plan
+        prompt: Read the tree and report what the change would take.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: survey }
+    - { from: survey, to: end }

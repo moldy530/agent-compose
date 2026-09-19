@@ -4,7 +4,7 @@
 # message: `permission_mode: bypassPermissions` of `flow.main` node `build` is outside what `access: workspace_write` admits
 # at: main.yml:40:26
 # label: main.yml:36:18 `harness: cc` is bound here
-# help: `access:` says how far a run may reach and `permission_mode:` says how its harness approves a call inside that reach, so a mode may never grant an operation the level would refuse: `bypassPermissions` bypasses every permission check, and `access: workspace_write` bounds writes to the workspace. `access: workspace_write` admits `default`, `acceptEdits`, `dontAsk`, `auto` and derives `acceptEdits` when the key is absent. Either name one of those, or raise `access:` — which is a containment statement a reader sees on the node rather than a mode reaching around one (grammar 8.9, Decision D146, PRD resolved q60 ruling a)
+# help: `access:` says how far a run may reach and `permission_mode:` says how its harness approves a call inside that reach, so a mode may never grant an operation the level would refuse: `bypassPermissions` bypasses every permission check, and `access: workspace_write` bounds writes to the workspace. `access: workspace_write` admits `default`, `acceptEdits`, `dontAsk`, `auto` and derives `acceptEdits` when the key is absent. Either name one of those, or raise `access:` to a level that admits `bypassPermissions` — `access: full_access`, which asks for no containment at all — because a level is a containment statement a reader sees on the node rather than a mode reaching around one (grammar 8.9, Decision D146, PRD resolved q60 ruling a)
 #
 # The invariant the whole key is held to: a mode may never grant an operation
 # the node's `access:` level would refuse. `bypassPermissions` turns the Agent

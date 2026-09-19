@@ -72,8 +72,8 @@ use crate::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::harness::{
     Answered, ConnectionFact, Slot, admitted, declared, harnesses_with_a_permission_axis,
-    has_permission_axis, kinds_of, permission_level, provider_of, reserved_option, slot_of, speaks,
-    variables_read, variables_set,
+    has_permission_axis, kinds_of, levels_admitting, permission_level, provider_of,
+    reserved_option, slot_of, speaks, variables_read, variables_set,
 };
 use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::{Coder, Node};
@@ -271,15 +271,87 @@ fn widens(
          approves a call inside that reach, so a mode may never grant an operation the level \
          would refuse: `{mode}` {decides}, and `access: {level}` {holds}. `access: {level}` \
          admits {admits} and derives `{derived}` when the key is absent. Either name one of \
-         those, or raise `access:` — which is a containment statement a reader sees on the node \
-         rather than a mode reaching around one (grammar 8.9, Decision D146, PRD resolved q60 \
-         ruling a)",
+         those, or {repair} (grammar 8.9, Decision D146, PRD resolved q60 ruling a)",
         mode = stated.value.as_str(),
         decides = stated.value.decides(),
         level = access.as_str(),
         holds = level_states(access),
         admits = list(&admits),
+        repair = elsewhere(coder.harness.value, stated.value, access),
     )));
+}
+
+/// The second half of a widening repair: the `access:` level the refused mode
+/// **does** belong under, read off the same table the refusal came from.
+///
+/// The levels are not a chain (Decision D146), so this cannot be "raise
+/// `access:`" spelled once. `plan` is admitted under `read_only` and under
+/// `full_access` and refused under the `workspace_write` between them — so the
+/// most natural planning node, `permission_mode: plan` with no `access:` written
+/// and grammar 8.9's default underneath it, has `read_only` as its repair and
+/// would be sent to `full_access` by a message that only knew how to widen.
+/// Which is the one repair this whole entry exists to discourage, handed out by
+/// the diagnostic that exists to discourage it (PRD G3, resolved q22).
+///
+/// So the admitting levels are split at the node's own and each side is named
+/// for what it is. Both sides can be occupied at once, and the narrower one is
+/// read first.
+fn elsewhere(harness: Harness, mode: PermissionMode, access: WorkspaceAccess) -> String {
+    let admitting = levels_admitting(harness, mode);
+    let named = |levels: &[WorkspaceAccess]| {
+        levels
+            .iter()
+            .map(|level| {
+                format!(
+                    "`access: {}`, which {}",
+                    level.as_str(),
+                    level_states(*level)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let narrower: Vec<WorkspaceAccess> = admitting
+        .iter()
+        .copied()
+        .filter(|level| *level < access)
+        .collect();
+    let wider: Vec<WorkspaceAccess> = admitting
+        .iter()
+        .copied()
+        .filter(|level| *level > access)
+        .collect();
+    let mode = mode.as_str();
+    // A level is a containment statement a reader sees on the node, which is the
+    // sentence every one of these repairs ends on — and the reason none of them
+    // is "reach the mode through `settings:`".
+    let seen = "a level is a containment statement a reader sees on the node rather than a mode \
+                reaching around one";
+    match (narrower.is_empty(), wider.is_empty()) {
+        // Nothing this harness's table admits it under. Unreachable while
+        // `full_access` admits every mode, and written out rather than left to
+        // an `unwrap` because a table is a thing that gets edited.
+        (true, true) => {
+            format!(
+                "drop `permission_mode:`: no `access:` level under `{harness}` admits `{mode}`",
+                harness = harness.as_str()
+            )
+        }
+        (true, false) => format!(
+            "raise `access:` to a level that admits `{mode}` — {} — because {seen}",
+            named(&wider)
+        ),
+        (false, true) => format!(
+            "narrow `access:` to a level that admits `{mode}` — {} — because {seen}",
+            named(&narrower)
+        ),
+        (false, false) => format!(
+            "state the containment that admits `{mode}`, reading the narrower one first because \
+             the levels are not a chain: {}; or {}. Either way {seen}",
+            named(&narrower),
+            named(&wider)
+        ),
+    }
 }
 
 /// What one `access:` level states, as grammar 8.9 words it — the half of the
@@ -1055,6 +1127,26 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
                     access.as_str(),
                     mode.as_str()
                 );
+                // …and the repair names **every** level that does admit the
+                // mode, narrower ones included. The negative corpus pins two of
+                // these seven messages word for word; this is the property all
+                // seven hold, and it is the one a sentence that only knew how to
+                // *widen* would fail: `plan` under `workspace_write` would be
+                // answered with `full_access` alone — the widest containment
+                // this grammar grants, offered to reach the one mode that
+                // executes no tool — while `read_only`, the level the mode
+                // belongs under, went unnamed (PRD G3, resolved q22).
+                let help = held[0].help.as_deref().unwrap_or_default();
+                for level in crate::harness::levels_admitting(Harness::Cc, mode) {
+                    assert!(
+                        help.contains(&format!("`access: {}`", level.as_str())),
+                        "`access: {}` does not admit `{}` and the help does not name \
+                         `access: {}`, which does: {help}",
+                        access.as_str(),
+                        mode.as_str(),
+                        level.as_str()
+                    );
+                }
             }
         }
         assert_eq!(

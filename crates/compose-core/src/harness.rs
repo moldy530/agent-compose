@@ -870,6 +870,27 @@ pub fn admitted(harness: Harness, access: WorkspaceAccess) -> &'static [Permissi
     permission_level(harness, access).map_or(&[], |level| level.admits)
 }
 
+/// The `access:` levels that admit one mode under one harness, in
+/// [`WorkspaceAccess::ALL`] order. Empty where the harness has no axis.
+///
+/// [`admitted`] read the other way, and the direction a **repair** needs. The
+/// three levels are not a chain (Decision D146): `plan` is admitted under
+/// `read_only` and under `full_access` and refused under the `workspace_write`
+/// between them, because what `workspace_write` states is that edits under the
+/// workspace are the run's job and a mode that executes no tool is a different
+/// node. So the level a refused mode belongs under is sometimes the **narrower**
+/// one, and a diagnostic that could only offer to raise `access:` would answer
+/// the most natural planning node with `full_access` — the widest containment
+/// this grammar grants — to reach the one mode that executes nothing.
+#[must_use]
+pub fn levels_admitting(harness: Harness, mode: PermissionMode) -> Vec<WorkspaceAccess> {
+    WorkspaceAccess::ALL
+        .iter()
+        .copied()
+        .filter(|access| admitted(harness, *access).contains(&mode))
+        .collect()
+}
+
 /// The mode one node **runs under**: the one it states, or the one its `access:`
 /// derives (PRD resolved q60 ruling a).
 ///
@@ -1974,6 +1995,76 @@ mod tests {
             }
         }
         assert_eq!(harnesses_with_a_permission_axis(), vec![Harness::Cc]);
+    }
+
+    /// **A stated mode is the mode the graph document reports** (PRD resolved
+    /// q60 ruling a, `docs/graph.md` §5.8).
+    ///
+    /// [`resolved_mode`] has two branches, and only one of them is in any
+    /// composition this repository commits: every example, golden and valid
+    /// fixture leaves `permission_mode:` out, so the `access:`-derived branch is
+    /// drawn everywhere and the **stated** branch — the one the ruling's
+    /// graph-document clause is about — would be drawn nowhere. Deleting it
+    /// would ship green, with `visualize` and `--format json` reporting
+    /// `acceptEdits` for a node written `permission_mode: dontAsk`: a document
+    /// stating a bound the run does not hold, which is the failure
+    /// [`the_permission_tables_are_one_table`] keeps off the compiler/driver
+    /// pair one surface along.
+    ///
+    /// So the node states `dontAsk` and writes no `access:`, which makes the
+    /// expected value one **no derivation produces** — grammar 8.9's default is
+    /// `workspace_write` and its derived mode is `acceptEdits`. A case that
+    /// stated `acceptEdits` would pass against a document that had ignored the
+    /// key entirely.
+    #[test]
+    fn a_stated_mode_is_the_mode_the_graph_document_reports() {
+        use crate::codegen::test_support::ir_of;
+
+        let composition = |stated: &str| {
+            format!(
+                "version: \"0.1\"\n\
+provider.p:\n  kind: anthropic\n  api_key: ${{K}}\n\
+model.m:\n  provider: provider.p\n  id: some-model\n\
+state:\n  summary: {{ type: string, default: \"\" }}\n\
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: /srv/checkout\n{stated}        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+            )
+        };
+        let drawn = |source: &str| {
+            let ir = ir_of(source);
+            let diagnostics = crate::check(&ir);
+            assert!(
+                diagnostics.is_empty(),
+                "a document is only drawn for a composition that validates: {diagnostics:#?}"
+            );
+            crate::graph::graph(&ir)
+                .flows
+                .iter()
+                .flat_map(|flow| &flow.nodes)
+                .find(|node| node.id == "build")
+                .expect("the flow draws its coder node")
+                .coder
+                .as_ref()
+                .expect("a coder node carries a coder view")
+                .permission_mode
+                .clone()
+        };
+
+        assert_eq!(
+            drawn(&composition("        permission_mode: dontAsk\n")),
+            Some("dontAsk".to_string()),
+            "the graph document reports a mode the node did not state, so `visualize` and \
+             `--format json` draw a bound the run does not hold (PRD resolved q60 ruling a)"
+        );
+        // …and the control, which is what says the assertion above is about the
+        // stated branch rather than about a field that happens to be filled:
+        // the same node with the key dropped is the derivation, and the two
+        // answers differ.
+        assert_eq!(
+            drawn(&composition("")),
+            Some("acceptEdits".to_string()),
+            "a node that states no `permission_mode:` is drawn with something other than the mode \
+             grammar 8.9's default level derives"
+        );
     }
 
     /// **The compiler's derived mapping and the driver's are one table**
