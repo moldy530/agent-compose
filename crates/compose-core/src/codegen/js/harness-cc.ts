@@ -25,8 +25,10 @@ const CC_SETTINGS: readonly string[] = [
  * what the driver below assigns:
  *
  *  * an option that **spells** a bound another key states. `workspace:` is
- *    `cwd`, `access:` is `permissionMode`, the plan-mode body beside it and the
- *    flag `bypassPermissions` requires, `env:` is `env` — which is also where
+ *    `cwd`; `permission_mode:` is `permissionMode`, the plan-mode body beside it
+ *    and the flag `bypassPermissions` requires, with `access:` the key that
+ *    derives that mode where the node states none (Decision D146); `env:` is
+ *    `env` — which is also where
  *    the model's **connection** lands, because this SDK's endpoint, credential
  *    and custom headers are variables of the process it spawns (Decision D143),
  *    so one reserved name holds both bounds — `output:` is
@@ -110,7 +112,7 @@ const CC_RESERVED: readonly string[] = [
 ];
 
 /**
- * How `access:` reaches the Agent SDK (grammar 8.9, Decision D138).
+ * How `access:` reaches the Agent SDK (grammar 8.9, Decisions D138, D146).
  *
  * The SDK's containment primitive is a permission *mode* plus a working
  * directory, so the preset selects the mode and `cwd` carries the root. Which
@@ -130,12 +132,39 @@ const CC_RESERVED: readonly string[] = [
  *    working directory and still asks about everything else;
  *  * `full_access` → `bypassPermissions`, with the flag the SDK requires beside
  *    it, which is the preset that asks for no containment at all.
+ *
+ * This is the **derived** mode: what a node that states no `permission_mode:`
+ * runs under, which is every node written before that key existed (Decision
+ * D146). A node that states one supersedes the map here and nowhere else — the
+ * compiler has already refused any mode the level does not admit, so the value
+ * arriving at [`ccPermissionMode`] is never wider than this one.
  */
 const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> = {
   read_only: "plan",
   workspace_write: "acceptEdits",
   full_access: "bypassPermissions",
 };
+
+/**
+ * The mode one run works under: the one the node stated, or the one its
+ * `access:` level derives (grammar 8.9, Decision D146, PRD resolved q60 ruling
+ * a).
+ *
+ * **One function, because three options answer to this value** and a second
+ * reading of it would be a second answer. `permissionMode` is the mode itself;
+ * `allowDangerouslySkipPermissions` is the flag the SDK *requires* beside
+ * `bypassPermissions` and beside nothing else; and `planModeInstructions` is
+ * plan mode's body, which exists only when the mode is `plan`. Keying those two
+ * off `run.access` instead — which is what this driver did while `access:` was
+ * the only axis — would arm the skip flag on a `full_access` node that asked for
+ * `plan`, and leave a `full_access` node that asked for `plan` running the
+ * vendor's default code-implementation body instead of the node's own prompt.
+ * Reading the resolved mode is the same answer in every case the two used to
+ * agree on, which is every node that states no mode at all.
+ */
+function ccPermissionMode(run: runtime.HarnessRun): PermissionMode {
+  return run.permissionMode ?? CC_PERMISSION[run.access];
+}
 
 /**
  * Whether one resolved header value would forge a second header field.
@@ -460,11 +489,15 @@ export function ccOptions(
   refusals: runtime.HarnessEvent[],
   refused: Set<string>,
 ): Options {
+  // The node's approval mode, resolved once: the three options below that
+  // answer to it read this value rather than `run.access`, so a stated mode and
+  // the flags its SDK requires can never disagree (see [`ccPermissionMode`]).
+  const mode = ccPermissionMode(run);
   const options: Options = {
     cwd: run.workspace,
     systemPrompt: { type: "preset", preset: "claude_code", append: run.instructions },
     model: run.model,
-    permissionMode: CC_PERMISSION[run.access],
+    permissionMode: mode,
     abortController: controllerFor(run.signal),
     // The node's environment with the model's connection mapped over the top —
     // and, first, with every other name this runtime reads for a declared fact
@@ -476,11 +509,14 @@ export function ccOptions(
     outputFormat: { type: "json_schema", schema: { ...run.schema } },
     ...passthrough(run, CC_SETTINGS, CC_RESERVED),
   };
-  if (run.access === "full_access") options.allowDangerouslySkipPermissions = true;
+  // The flag the SDK documents `bypassPermissions` as requiring, and nothing
+  // else does — so it is armed by the mode rather than by the preset that
+  // usually derives it (see [`ccPermissionMode`]).
+  if (mode === "bypassPermissions") options.allowDangerouslySkipPermissions = true;
   // Plan mode's body, replaced by what this node asked for: the mode's
-  // default body is a code-implementation workflow, and a `read_only` node
+  // default body is a code-implementation workflow, and a node under `plan`
   // is a run that reads and reports (see [`CC_PERMISSION`]).
-  if (run.access === "read_only") options.planModeInstructions = run.instructions;
+  if (mode === "plan") options.planModeInstructions = run.instructions;
   // The one `model.*` setting this harness has a place for: the `anthropic`
   // plugin's `thinking: { budget_tokens: … }` is the SDK's
   // `maxThinkingTokens` (Decision D141).

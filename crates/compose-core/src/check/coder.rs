@@ -39,15 +39,26 @@
 //!   naming both sources (ruling c). Deciding any of the three needs the
 //!   `model.*` the node names, the `provider.*` behind it, and the table — none
 //!   of which one file has.
-//! * **the harness config is checked in two tiers.** Decision D140 holds
+//! * **the approval mode is inside the containment `access:` states.** PRD
+//!   resolved q60 ruling a gives the Agent SDK's approval axis a key of its own,
+//!   `permission_mode:`, because a bound must be readable off the node that
+//!   holds it (resolved q54's principle, the same reason `allow_tools:` and
+//!   `access:` are keys). Two rules come with it, and each needs the table in
+//!   [`crate::harness`] rather than the one value the parser has: the bound
+//!   harness must **have** such an axis at all — `codex` does not, its per-call
+//!   approval tier being the app-server tier resolved q57 ruling c declines — and
+//!   the mode must be one the node's own `access:` level **admits**, which is the
+//!   widening bound.
+//! * **the harness config is checked in three tiers.** Decision D140 holds
 //!   `settings:` on resolved q30's terms: the keys the curated table knows are
 //!   checked strictly, and everything else is a warning naming what could not be
 //!   verified and travels to the SDK unchanged — except the keys the *adapter*
-//!   owns, which are dropped instead, because unchecked was never meant to mean
-//!   unbounded. The warning says which of the two happened. Both lists are per
-//!   harness, so the check needs the `harness:` value beside the key — which the
-//!   parser has, but the *tables* belong beside the refusals they produce rather
-//!   than scattered through the reader.
+//!   owns, which are **refused** (PRD resolved q60 ruling b, amending the
+//!   warn-and-silently-drop q57 shipped). Both tiers are per harness, so the
+//!   check needs the `harness:` value beside the key — which the parser has, but
+//!   the *tables* belong beside the refusals they produce rather than scattered
+//!   through the reader, and the reserved one now lives in [`crate::harness`]
+//!   with the connection table it copies.
 //!
 //! **What is deliberately not checked here** is the enforcement asymmetry of
 //! ruling c. `allow_tools:` on a `codex` node is not a mistake — the list is
@@ -57,11 +68,12 @@
 //! about a composition that is doing exactly what its author wrote.
 
 use crate::ast::common::Literal;
-use crate::ast::flow::Harness;
+use crate::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::harness::{
-    ConnectionFact, Slot, declared, kinds_of, provider_of, slot_of, speaks, variables_read,
-    variables_set,
+    Answered, ConnectionFact, Slot, admitted, declared, harnesses_with_a_permission_axis,
+    has_permission_axis, kinds_of, permission_level, provider_of, reserved_option, slot_of, speaks,
+    variables_read, variables_set,
 };
 use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::{Coder, Node};
@@ -123,53 +135,6 @@ const CODEX_SETTINGS: &[(&str, Shape)] = &[
     ("skip_git_repo_check", Shape::Flag),
 ];
 
-/// The keys one harness's **adapter owns**, read off the driver that owns them
-/// (grammar 8.9, Decision D140).
-///
-/// The reserved list lives in the emitted driver, because that is where it is
-/// applied: `passthrough` drops these rather than handing them to the SDK. It
-/// is read here rather than copied here for the reason
-/// [`the_curated_settings_table_is_one_table`] states about the other list —
-/// two hand-maintained copies of one document drift in silence — and it is read
-/// at all so the warning can say which half of Decision D140 a key landed in.
-/// A key that is dropped and a key that travels are two different things to be
-/// told, and an author who is told the wrong one debugs a run for an option
-/// that never reached it.
-fn reserved(harness: Harness) -> &'static [String] {
-    static CC: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-        names_of(include_str!("../codegen/js/harness-cc.ts"), "CC_RESERVED")
-    });
-    static CODEX: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-        names_of(
-            include_str!("../codegen/js/harness-codex.ts"),
-            "CODEX_RESERVED",
-        )
-    });
-    match harness {
-        Harness::Cc => &CC,
-        Harness::Codex => &CODEX,
-        // …and a reserved harness has no driver to read one off, which is the
-        // same answer [`table`] gives one key along.
-        Harness::DeepAgents | Harness::Native => &[],
-    }
-}
-
-/// The strings of one `readonly string[]` in a driver's source.
-fn names_of(source: &str, declaration: &str) -> Vec<String> {
-    let opened = format!("const {declaration}: readonly string[] = [");
-    let Some((_, rest)) = source.split_once(&opened) else {
-        return Vec::new();
-    };
-    let Some((body, _)) = rest.split_once("];") else {
-        return Vec::new();
-    };
-    body.split('"')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_string)
-        .collect()
-}
-
 /// One harness's curated table.
 const fn table(harness: Harness) -> &'static [(&'static str, Shape)] {
     match harness {
@@ -190,7 +155,141 @@ pub(crate) fn coder_node(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, node: &Node, coder:
     }
     model_is_direct(ctx, &subject, coder);
     connection(ctx, &subject, coder);
+    permission_mode(ctx, &subject, coder);
     settings(ctx, &subject, coder);
+}
+
+/// The approval mode the run's loop works under (PRD resolved q60 ruling a,
+/// Decision D146).
+///
+/// Two refusals, and the order is the order the questions come in: a harness
+/// that has no approval axis has no admitted set to compare against, so the
+/// pairing is reported once and the walk stops. A node that states no mode at
+/// all is checked by nothing here — its mode is the one its `access:` level
+/// derives, which is a value this compiler chose and not a claim to verify.
+fn permission_mode(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
+    let Some(stated) = &coder.permission_mode else {
+        return;
+    };
+    let harness = coder.harness.value;
+    if !has_permission_axis(harness) {
+        no_permission_axis(ctx, subject, coder, stated);
+        return;
+    }
+    // The node's own level, with grammar 8.9's default materialized: an omitted
+    // `access:` is `workspace_write`, and the bound is read off the level the
+    // run really has rather than off the key the author happened to write.
+    let access = coder.access.unwrap_or(WorkspaceAccess::WorkspaceWrite);
+    if !admitted(harness, access).contains(&stated.value) {
+        widens(ctx, subject, coder, stated, access);
+    }
+}
+
+/// Ruling a: the bound harness has no approval axis for a mode to select.
+///
+/// Anchored at the **key**, unlike [`wrong_wire`]: nothing else in the block is
+/// wrong and nothing else has to change for the composition to build — the key
+/// is the line to delete or the harness is the line to change, and the message
+/// says which of the two each repair is.
+fn no_permission_axis(
+    ctx: &mut Ctx<'_>,
+    subject: &str,
+    coder: &Coder,
+    stated: &Spanned<PermissionMode>,
+) {
+    let harness = coder.harness.value.as_str();
+    let carries: Vec<&str> = harnesses_with_a_permission_axis()
+        .into_iter()
+        .map(Harness::as_str)
+        .collect();
+    ctx.push(
+        Diagnostic::error(
+            DiagnosticCode::UnsupportedPermissionMode,
+            stated.span.clone(),
+            format!(
+                "{subject} binds `harness: {harness}`, which has no permission mode for \
+                 `{}` to select",
+                stated.value.as_str()
+            ),
+        )
+        .with_label(coder.harness.span.clone(), "the harness is bound here")
+        .with_help(format!(
+            "the two harnesses are not symmetrical here and this document says so rather than \
+             implying they are: `{harness}` contains a run with a sandbox preset, and its \
+             per-call approval axis belongs to an app server this release does not adopt — so \
+             there is nothing for a mode to choose and a faked one would be a bound nothing \
+             holds. {} carries the axis. Drop `permission_mode:` and let `access:` state the \
+             containment, which is the whole of what this harness holds a run to — or run the \
+             node under {} (grammar 8.9, Decision D146, PRD resolved q57 ruling c, q60 ruling a)",
+            list(&carries),
+            list(&carries)
+        )),
+    );
+}
+
+/// Ruling a: the mode would widen what the node's `access:` states.
+///
+/// **The invariant of the whole key**, so the message carries all three facts a
+/// repair needs: the mode, the level it is written under, and what that level
+/// admits. Anchored at the mode for [`no_permission_axis`]'s reason — both
+/// values are legal on their own, and what this composition cannot have is the
+/// pair, which is the shape [`wrong_wire`] reports one construct over.
+fn widens(
+    ctx: &mut Ctx<'_>,
+    subject: &str,
+    coder: &Coder,
+    stated: &Spanned<PermissionMode>,
+    access: WorkspaceAccess,
+) {
+    let harness = coder.harness.value.as_str();
+    let admits: Vec<&str> = admitted(coder.harness.value, access)
+        .iter()
+        .map(|mode| mode.as_str())
+        .collect();
+    let derived = permission_level(coder.harness.value, access)
+        .map(|level| level.derived.as_str())
+        .unwrap_or_default();
+    // The level is named in the message rather than labelled in the source,
+    // because a node that omits `access:` is under grammar 8.9's default and
+    // there is no line to point at — and a diagnostic that labelled the key only
+    // when it happened to be written would read as two different rules.
+    let diagnostic = Diagnostic::error(
+        DiagnosticCode::WideningPermissionMode,
+        stated.span.clone(),
+        format!(
+            "`permission_mode: {}` of {subject} is outside what `access: {}` admits",
+            stated.value.as_str(),
+            access.as_str()
+        ),
+    )
+    .with_label(
+        coder.harness.span.clone(),
+        format!("`harness: {harness}` is bound here"),
+    );
+    ctx.push(diagnostic.with_help(format!(
+        "`access:` says how far a run may reach and `permission_mode:` says how its harness \
+         approves a call inside that reach, so a mode may never grant an operation the level \
+         would refuse: `{mode}` {decides}, and `access: {level}` {holds}. `access: {level}` \
+         admits {admits} and derives `{derived}` when the key is absent. Either name one of \
+         those, or raise `access:` — which is a containment statement a reader sees on the node \
+         rather than a mode reaching around one (grammar 8.9, Decision D146, PRD resolved q60 \
+         ruling a)",
+        mode = stated.value.as_str(),
+        decides = stated.value.decides(),
+        level = access.as_str(),
+        holds = level_states(access),
+        admits = list(&admits),
+    )));
+}
+
+/// What one `access:` level states, as grammar 8.9 words it — the half of the
+/// widening message that says *why* the pair is refused.
+const fn level_states(access: WorkspaceAccess) -> &'static str {
+    match access {
+        WorkspaceAccess::ReadOnly => "is read the workspace and write nothing",
+        WorkspaceAccess::WorkspaceWrite => "bounds writes to the workspace",
+        WorkspaceAccess::FullAccess => "asks for no containment at all",
+    }
 }
 
 /// The provider connection the node's `model:` carries across (PRD resolved q58,
@@ -611,20 +710,29 @@ fn model_is_direct(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
     );
 }
 
-/// The harness config, in Decision D140's two tiers.
+/// The harness config, in Decision D140's tiers as PRD resolved q60 ruling b
+/// hardens them.
+///
+/// Three answers now, and the order they are asked in is the order they matter:
+/// a key the curated table knows is checked strictly; a key the **reserved**
+/// table holds is refused; anything else is the warning resolved q30's second
+/// tier exists for, and travels to the SDK unchanged.
+///
+/// The reserved question comes before the warning and after the curated table
+/// because the middle answer is the one that changed: it was a warning and a
+/// silent run-time drop, and a dropped key that would have changed what a run
+/// may do is the class PRD G3 refuses to discover from a run's behaviour.
 fn settings(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
     let harness = coder.harness.value;
     let known = table(harness);
     for setting in &coder.settings {
         let key = setting.key.value.as_str();
         let Some((_, shape)) = known.iter().find(|(name, _)| *name == key) else {
+            if let Some(held) = reserved_option(harness, key) {
+                reserved_setting(ctx, subject, coder, &setting.key, held.answered);
+                continue;
+            }
             let names: Vec<&str> = known.iter().map(|(name, _)| *name).collect();
-            // Which half of D140 the key landed in. An **owned** option is
-            // dropped by the adapter rather than passed, so telling its author
-            // that it travels unchanged would send them looking for an option
-            // the SDK never saw — and the reason it is dropped is the one worth
-            // reading: the bound it would have reached around.
-            let owned = reserved(harness).iter().any(|name| name == key);
             ctx.push(
                 Diagnostic::warning(
                     DiagnosticCode::UnknownHarnessSetting,
@@ -636,14 +744,7 @@ fn settings(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
                     ),
                 )
                 .with_label(coder.harness.span.clone(), "the harness is bound here")
-                .with_optional_help(if owned {
-                    Some(format!(
-                        "`{key}` is an option the generated adapter owns, so it is dropped rather \
-                         than passed: what it would reach around is what `workspace:`, `access:`, \
-                         `env:`, `output:`, `prompt:`, `allow_tools:`, `timeout:` and `model:` \
-                         state, and the bound is the node's (grammar 8.9, Decision D140)"
-                    ))
-                } else {
+                .with_optional_help(
                     suggest(key, &names)
                         .map(|name| format!("did you mean `{name}`?"))
                         .or_else(|| {
@@ -653,13 +754,78 @@ fn settings(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
                                  checks are {} (grammar 8.9, Decision D140)",
                                 list(&names)
                             ))
-                        })
-                }),
+                        }),
+                ),
             );
             continue;
         };
         check_shape(ctx, subject, harness, &setting.key, &setting.value, shape);
     }
+}
+
+/// Ruling b: a `settings:` key spelling an option the generated adapter owns.
+///
+/// **An error, and the repair is the point.** PRD resolved q57 shipped this as a
+/// warning beside a silent run-time drop, and the field report resolved q60
+/// comes from is what that cost: an author who needed a permission mode the
+/// `access:` enum could not reach found `settings:`, was told the value was
+/// unverified, watched the run ignore it, and had no way to tell a key that
+/// travelled from a key that was dropped. So the key is refused where it is
+/// written, and the message names three things — the option, the bound it would
+/// reach around, and the key that states that bound where one does.
+///
+/// Anchored at the **key** rather than the value, because the value is not the
+/// mistake: no value of this key reaches the SDK.
+fn reserved_setting(
+    ctx: &mut Ctx<'_>,
+    subject: &str,
+    coder: &Coder,
+    key: &Spanned<String>,
+    answered: Answered,
+) {
+    let harness = coder.harness.value.as_str();
+    let held = key.value.as_str();
+    let (message, repair) = match answered {
+        Answered::By(first_class) => (
+            format!(
+                "`{held}` of {subject} is a `harness: {harness}` option the generated adapter \
+                 owns: it is what `{first_class}:` states"
+            ),
+            format!(
+                "write `{first_class}:` on the node instead. A bound has to be readable off the \
+                 construct that holds it, which is why `{first_class}:` is a key and not a \
+                 setting, and two spellings of one option would leave a reader and `validate` \
+                 disagreeing about which wins"
+            ),
+        ),
+        Answered::Nothing(why) => (
+            format!(
+                "`{held}` of {subject} is a `harness: {harness}` option the generated adapter \
+                 owns, and no key of this block states it"
+            ),
+            format!(
+                "there is no key to write instead: {why}. Take the setting off — what \
+                 `settings:` buys is the vendor's *other* options, never the ones this node \
+                 already states"
+            ),
+        ),
+    };
+    ctx.push(
+        Diagnostic::error(
+            DiagnosticCode::ReservedHarnessSetting,
+            key.span.clone(),
+            message,
+        )
+        .with_label(coder.harness.span.clone(), "the harness is bound here")
+        .with_help(format!(
+            "{repair}. `settings:` is open so that a harness option the vendor ships tomorrow is \
+             usable the day it ships — it is not a second way to state this construct's own \
+             bounds, and a key here that reached one would be the only one no check covers. \
+             Refused rather than dropped, because a key silently removed leaves a run doing \
+             something no line of the composition says (grammar 8.9, Decision D146, PRD resolved \
+             q60 ruling b)"
+        )),
+    );
 }
 
 /// One curated key's value, strictly.
@@ -782,39 +948,117 @@ fn check_shape(
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticCode, Harness, reserved, table};
+    use super::{DiagnosticCode, Harness, table};
+    use crate::harness::reserved_of;
 
-    /// The **reserved** list a warning reads is the one the adapter applies.
+    /// **The refusal reads the table the adapter's own list is a copy of**
+    /// (grammar 8.9, Decision D146, PRD resolved q60 ruling b).
     ///
-    /// [`reserved`](super::reserved) parses the driver's own declaration rather
-    /// than restating it, so what can go wrong is the parse: a list read as
-    /// empty would make every dropped key claim it travelled to the SDK, which
-    /// is the one thing the reading exists to prevent. Two of the options that
-    /// reach furthest are named here, plus the closed harness's own, so a parse
-    /// that silently found nothing fails.
+    /// The reserved set moved from the emitted driver — where `validate` used to
+    /// parse it back out of the TypeScript so a *warning* could say which half
+    /// of Decision D140 a key landed in — to a compiler table beside the
+    /// connection table it copies, because an error has to name a repair and a
+    /// list of strings carries none. What can still go wrong is the same thing:
+    /// a row that lost an option lets a `settings:` key through with the
+    /// warning's "it travels to the SDK unchanged", which is the one sentence
+    /// that is never true of a name the driver subtracts. Two of the options
+    /// that reach furthest are named here per harness, plus the reserved
+    /// harnesses' empty rows.
     #[test]
-    fn a_warning_reads_the_reserved_list_the_adapter_applies() {
-        let cc = reserved(Harness::Cc);
-        for option in ["cwd", "extraArgs", "settings", "resume"] {
+    fn a_refusal_reads_the_reserved_table_the_adapter_copies() {
+        let cc = reserved_of(Harness::Cc);
+        for option in ["cwd", "extraArgs", "settings", "resume", "permissionMode"] {
             assert!(
-                cc.iter().any(|held| held == option),
-                "`CC_RESERVED` is read without `{option}`, so a `settings:` key spelling it would \
-                 be warned about as one that travels to the SDK"
+                cc.iter().any(|held| held.option == option),
+                "`cc`'s reserved row is read without `{option}`, so a `settings:` key spelling it \
+                 is warned about as one that travels to the SDK and then dropped by the driver"
             );
         }
-        let codex = reserved(Harness::Codex);
+        let codex = reserved_of(Harness::Codex);
         for option in ["sandboxMode", "workingDirectory", "approvalPolicy"] {
             assert!(
-                codex.iter().any(|held| held == option),
-                "`CODEX_RESERVED` is read without `{option}`"
+                codex.iter().any(|held| held.option == option),
+                "`codex`'s reserved row is read without `{option}`"
             );
         }
         for held in [Harness::DeepAgents, Harness::Native] {
             assert!(
-                reserved(held).is_empty(),
-                "a reserved harness has no driver to read a list off"
+                reserved_of(held).is_empty(),
+                "a reserved harness has no SDK whose options an adapter could own"
             );
         }
+    }
+
+    /// **Every mode a level admits builds, and the derived one builds written
+    /// out longhand** (grammar 8.9, Decision D146, PRD resolved q60 ruling a).
+    ///
+    /// The direction the negative corpus cannot reach, and the one an
+    /// over-eager admissibility check gets wrong in a way nothing else notices:
+    /// a composition that *should* build stops building, and the author's only
+    /// clue is a diagnostic about a line that is correct. The key exists because
+    /// three of the SDK's six modes were unreachable, so a table that admitted
+    /// the derived mode alone would ship the same gap under a new name.
+    ///
+    /// Written out as the **whole** admissibility table rather than as a
+    /// sample, because what is being asserted is which modes each level takes:
+    /// every admitted pairing is checked clean, and every other pairing is
+    /// checked refused with the code that says why. That second half is what
+    /// makes this a statement about the bound rather than about three examples —
+    /// the negative corpus pins one refusal's wording, and this pins that there
+    /// are exactly fourteen of them.
+    #[test]
+    fn each_access_level_takes_every_mode_it_admits_and_no_other() {
+        use crate::ast::flow::{PermissionMode, WorkspaceAccess};
+        use crate::codegen::test_support::ir_of;
+        use crate::harness::admitted;
+
+        let composition = |access: &str, mode: &str| {
+            format!(
+                "version: \"0.1\"\n\
+provider.p:\n  kind: anthropic\n  api_key: ${{K}}\n\
+model.m:\n  provider: provider.p\n  id: some-model\n\
+state:\n  summary: {{ type: string, default: \"\" }}\n\
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: /srv/checkout\n        access: {access}\n        permission_mode: {mode}\n        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+            )
+        };
+
+        let mut refusals = 0;
+        for access in WorkspaceAccess::ALL.iter().copied() {
+            for mode in PermissionMode::ALL.iter().copied() {
+                let held = crate::check(&ir_of(&composition(access.as_str(), mode.as_str())));
+                if admitted(Harness::Cc, access).contains(&mode) {
+                    assert!(
+                        held.is_empty(),
+                        "`access: {}` admits `{}` and a node writing it was refused: {held:#?}",
+                        access.as_str(),
+                        mode.as_str()
+                    );
+                    continue;
+                }
+                refusals += 1;
+                assert_eq!(held.len(), 1, "{access:?} + {mode:?}: {held:#?}");
+                assert_eq!(
+                    held[0].code,
+                    DiagnosticCode::WideningPermissionMode,
+                    "`access: {}` does not admit `{}` and the refusal is not the widening one",
+                    access.as_str(),
+                    mode.as_str()
+                );
+            }
+        }
+        assert_eq!(
+            refusals, 7,
+            "the admissibility table changed shape: `read_only` refuses five of the six modes, \
+             `workspace_write` refuses two, and `full_access` refuses none (grammar 8.9)"
+        );
+
+        // …and the absent key, which is the form every composition written
+        // before this one had: it is checked by nothing here, and the mode it
+        // means is the level's own.
+        let absent = crate::check(&ir_of(
+            &composition("read_only", "plan").replace("        permission_mode: plan\n", ""),
+        ));
+        assert!(absent.is_empty(), "{absent:#?}");
     }
 
     /// **Neither connection rule fires where it should not** (grammar 8.9,

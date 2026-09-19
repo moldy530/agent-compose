@@ -25,7 +25,7 @@
 // agent-compose release that generated this tree, which a join carries and a
 // mismatch is refused on, naming both sides.
 
-export const ARTIFACT_HASH = "sha256:b3a6e9004119558ccd7a8e7950bde24c18a94dc8c8ac3210fb34f39e50f04e53";
+export const ARTIFACT_HASH = "sha256:d291bc785b14ac9b82d21ae791348a7af8b1ab87d2f5f260f06de5522b9fc35f";
 
 export const COMPILER_VERSION = "0.0.0-dev";
 

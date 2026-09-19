@@ -529,6 +529,51 @@ mod tests {
         );
     }
 
+    /// **The three options that answer to a `cc` run's approval mode read the
+    /// resolved mode, not the `access:` preset** (grammar 8.9, Decision D146,
+    /// PRD resolved q60 ruling a).
+    ///
+    /// `generated_code_gates`' `a_harness_run_is_contained_journaled_and_recorded`
+    /// drives this end to end and pins what each of the six combinations is
+    /// handed; this is the source-reading half, and it is here for the reason the
+    /// spawn-family guard is: it names the shape that is wrong rather than the
+    /// values that are right, so a driver that reverts to keying a flag off
+    /// `run.access` fails on the line itself rather than on one case somebody
+    /// forgot to add.
+    ///
+    /// The wrong shape is the one this driver shipped while `access:` was the
+    /// only axis, and it reads as an obvious simplification: arm
+    /// `allowDangerouslySkipPermissions` when the preset is `full_access`, fill
+    /// `planModeInstructions` when it is `read_only`. Under a stated mode both
+    /// are wrong in the same direction — a `full_access` node that asked for
+    /// `plan` would be handed the flag for a mode it is not under and the
+    /// vendor's default code-implementation body instead of its own `prompt:`.
+    #[test]
+    fn a_cc_runs_mode_decides_its_mode_bound_options_rather_than_its_access_preset() {
+        assert!(
+            CC.contains("return run.permissionMode ?? CC_PERMISSION[run.access];"),
+            "the `cc` driver does not resolve `permission_mode:` against the mode its `access:` \
+             level derives, so either a stated mode reaches nothing or an absent one changed \
+             meaning (grammar 8.9, Decision D146)"
+        );
+        for (option, guard) in [
+            ("allowDangerouslySkipPermissions", "bypassPermissions"),
+            ("planModeInstructions", "plan"),
+        ] {
+            assert!(
+                CC.contains(&format!("if (mode === \"{guard}\") options.{option} =")),
+                "`options.{option}` is not set from the run's resolved mode: the SDK ties it to \
+                 `{guard}` and this driver would be tying it to an `access:` preset, which a \
+                 stated `permission_mode:` supersedes (grammar 8.9, Decision D146)"
+            );
+        }
+        assert!(
+            !CC.contains("if (run.access === "),
+            "the `cc` driver still branches on `run.access` for an option its resolved mode \
+             decides — `access:` chooses the *default* mode and nothing else (Decision D146)"
+        );
+    }
+
     /// A call the `cc` permission callback denied is **one** tool event
     /// (`docs/trace.md` §7.6.3).
     ///

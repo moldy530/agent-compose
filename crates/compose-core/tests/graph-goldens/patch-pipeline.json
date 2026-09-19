@@ -159,6 +159,7 @@
             ],
             "workspace": "${REPO_ROOT}",
             "access": "workspace_write",
+            "permission_mode": "acceptEdits",
             "prompt": "You are implementing one change in a repository you have been given.\nMake the smallest change that satisfies the goal, run the test suite,\nand report what you touched.\n",
             "allow_tools": [
               "Bash",

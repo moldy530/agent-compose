@@ -118,8 +118,17 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
             include_str!("codes/mismatched-server-tools.md")
         }
         DiagnosticCode::UnsupportedHarness => include_str!("codes/unsupported-harness.md"),
+        DiagnosticCode::UnsupportedPermissionMode => {
+            include_str!("codes/unsupported-permission-mode.md")
+        }
+        DiagnosticCode::WideningPermissionMode => {
+            include_str!("codes/widening-permission-mode.md")
+        }
         DiagnosticCode::UnknownHarnessSetting => {
             include_str!("codes/unknown-harness-setting.md")
+        }
+        DiagnosticCode::ReservedHarnessSetting => {
+            include_str!("codes/reserved-harness-setting.md")
         }
         DiagnosticCode::UnsupportedConnectionFact => {
             include_str!("codes/unsupported-connection-fact.md")

@@ -5589,7 +5589,7 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 /// a parameter, and `src/harness.ts` emits a scripted driver into every project,
 /// so everything *above* the seam is exercised as the code a deployment ships.
 ///
-/// Fourteen claims, and not one of them is visible from a run's answer:
+/// Fifteen claims, and not one of them is visible from a run's answer:
 ///
 ///  * **the config map** — the workspace resolves its `${ENV}` at the call and an
 ///    empty one is refused *as written*; the environment is scrubbed to the
@@ -5602,7 +5602,19 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 ///    own option builder is called on the run the adapter built, and the object
 ///    the vendor's SDK would have been handed holds the node's `workspace:`,
 ///    `access:`, `env:` and `allow_tools:` — not a `settings:` key spelling any
-///    of them, and not one naming the executable that would have enforced them;
+///    of them, and not one naming the executable that would have enforced them.
+///    The binding the runner builds is one `validate` now **refuses** (PRD
+///    resolved q60 ruling b), and that is the case on purpose: the run-time
+///    subtraction is the defence in depth an artifact an older compiler release
+///    built still depends on, so it is exercised against exactly the binding
+///    that release could have emitted;
+///  * **the approval mode** — a node that states no `permission_mode:` is handed
+///    the mode its `access:` level derives, which is the mapping resolved q57
+///    shipped; a node that states one supersedes that and nothing else. The two
+///    options that answer to the mode rather than to the preset — the flag
+///    `bypassPermissions` requires, and plan mode's body — are read with it, on
+///    a `full_access` node under `plan`, which is the pair that tells the two
+///    apart (PRD resolved q60 ruling a);
 ///  * **the lowering** — the schema the harness is handed is the composition's
 ///    projected through this harness's own table, with the stripped bound folded
 ///    into a `description`, while the binding's own schema is untouched (PRD
@@ -6273,6 +6285,12 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
             "movedModelSettings",
             "a different thinking budget, which is a different run (Decision D141)",
         ),
+        (
+            "statedPermissionMode",
+            "a `permission_mode:` where the recorded run had none — a run that auto-accepts its \
+             own edits and a run that denies anything not pre-approved are two different runs \
+             under one `access:` level (Decision D146)",
+        ),
         // The sharpest member of the family, because nothing else in the binding
         // says where a run's traffic went: the same node, the same prompt, the
         // same schema, and an answer that came from another endpoint (PRD
@@ -6386,6 +6404,67 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         json!("travels"),
         "an option this release cannot speak for did not travel, which is the \
          treadmill PRD resolved q30 refused (ruling e)"
+    );
+
+    // The approval axis inside that containment (grammar 8.9, Decision D146,
+    // PRD resolved q60 ruling a). Three options answer to the resolved mode and
+    // all three are read, because keying two of them off `run.access` is the
+    // shape that looks right and is not — it would arm the skip flag on a
+    // `full_access` node that asked for `plan`, and leave that same node running
+    // the vendor's default plan body instead of its own `prompt:`.
+    let modes = &answer["permissionMode"];
+    for (level, derived) in [
+        ("derivedReadOnly", "plan"),
+        ("derivedWorkspaceWrite", "acceptEdits"),
+        ("derivedFullAccess", "bypassPermissions"),
+    ] {
+        assert_eq!(
+            modes[level]["mode"],
+            json!(derived),
+            "a node that states no `permission_mode:` no longer gets the mode its `access:` \
+             level derives, so a composition written before that key existed changed meaning"
+        );
+    }
+    assert_eq!(
+        modes["derivedReadOnly"]["planBody"],
+        json!("Fix the failing test."),
+        "a `plan` run's body is the node's own `prompt:` rather than the mode's default \
+         code-implementation workflow (grammar 8.9's `read_only` row)"
+    );
+    assert_eq!(
+        modes["derivedReadOnly"]["skip"],
+        json!(null),
+        "a run that is not under `bypassPermissions` was armed with the flag that mode requires"
+    );
+    assert_eq!(
+        modes["derivedFullAccess"]["skip"],
+        json!(true),
+        "`bypassPermissions` reached the SDK without the flag it documents as required"
+    );
+    assert_eq!(
+        modes["statedDontAsk"]["mode"],
+        json!("dontAsk"),
+        "a stated `permission_mode:` did not supersede the mode `access:` derives, so the key \
+         reaches nothing — which is the gap PRD resolved q60 exists to close"
+    );
+    assert_eq!(
+        modes["statedDontAsk"]["skip"],
+        json!(null),
+        "a mode that is not `bypassPermissions` was armed with that mode's flag"
+    );
+    // The pair that says the three options read the **mode** rather than the
+    // level: one preset, two modes, two different objects.
+    assert_eq!(
+        modes["statedPlanUnderFullAccess"],
+        json!({ "mode": "plan", "skip": null, "planBody": "Fix the failing test." }),
+        "`access: full_access` with `permission_mode: plan` was handed the skip flag, or was \
+         left with the vendor's default plan body: both would be `access:` deciding an option \
+         the node's own mode states (Decision D146)"
+    );
+    assert_eq!(
+        modes["statedBypassUnderFullAccess"],
+        json!({ "mode": "bypassPermissions", "skip": true, "planBody": null }),
+        "writing out the mode a level already derives changed what the run is handed"
     );
 
     let codex = &answer["codexBound"];

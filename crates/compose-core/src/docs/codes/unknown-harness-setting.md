@@ -17,25 +17,24 @@ one compiler release later. The warning is the honest half of the bargain — it
 names exactly what could not be verified, so a typo does not look like working
 configuration, and it suggests the near miss when there is one.
 
-**With one bound: unchecked is not unbounded.** A key that spells an option the
-generated adapter owns is dropped rather than passed — the working directory, the
-permission mode or sandbox preset, the environment, the output schema, the system
-prompt, the tool allowlist, the abort signal, the model. Those are what
-`workspace:`, `access:`, `env:`, `output:`, `prompt:`, `allow_tools:`,
-`timeout:` and `model:` say, and `settings:` is not a second way to say them.
+**With one bound: unchecked is not unbounded**, and that bound is **not this
+code**. A key that spells an option the generated adapter owns is an *error* —
+`reserved-harness-setting`, which is where the whole reserved set and its repairs
+are written down. This warning is the other half: the keys the compiler cannot
+speak for, which travel.
 
-Nor does an option have to *spell* a bound to reach around one, so the dropped
-set is wider than that list. A harness SDK ships options that **contain** the
-bounds: extra command-line arguments, a settings file or object of permission
-rules, roots beside the working directory, sandbox configuration, MCP servers
-and agent definitions that put a tool — or a whole loop — within reach of a run
-whose `allow_tools:` never named it, hooks and permission handlers that move the
-decision elsewhere, a fallback model — which is the failover ladder that stops at
-the boundary, the provider's connection itself having crossed. Those are dropped
-too, and so is every option that resumes a previous session, for the other
-reason: harness-native resume is a named exclusion, because a machine-local
-session store is not the journal. The dropped set is per harness and audited
-against the SDK release this compiler pins.
+The line between the two is worth knowing while reading this page. An option the
+adapter owns is a bound the node already states somewhere a reader and `validate`
+can both see it — the working directory, the permission mode or sandbox preset,
+the environment, the output schema, the system prompt, the tool allowlist, the
+abort signal, the model — or one that *contains* such a bound without spelling
+it: extra command-line arguments, a settings file of permission rules, roots
+beside the working directory, MCP servers and agent definitions, the resume
+family, and a fallback model — which is the failover ladder that stops at the
+boundary, the provider's connection itself having crossed. `settings:` is not a
+second way to say any of those, and since those keys are refused rather than
+quietly removed, a setting that reaches this warning is one that really does
+travel to the SDK.
 
 ## A spec that triggers it
 

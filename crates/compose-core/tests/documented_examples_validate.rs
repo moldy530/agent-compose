@@ -174,6 +174,7 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "missing-callback-allowlist",
     "missing-capability",
     "missing-credential",
+    "reserved-harness-setting",
     "unbalanced-convergence",
     "undefined-channel",
     "unkeyed-map-write",
@@ -181,8 +182,10 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "unknown-server-tool",
     "unknown-server-tool-field",
     "unsupported-connection-fact",
+    "unsupported-permission-mode",
     "unsupported-provider-kind",
     "unsupported-server-tools",
+    "widening-permission-mode",
 ];
 
 /// The explanations whose failure lives in the **deploy layer**, and the codes

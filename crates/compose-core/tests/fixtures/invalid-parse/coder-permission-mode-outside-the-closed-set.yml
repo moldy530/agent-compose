@@ -1,0 +1,38 @@
+# rule: `permission_mode:` takes one of the pinned SDK's six modes, and a near
+# rule: miss is answered with the spelling it meant (grammar 8.9, D146)
+# code: unknown-variant
+# message: `acceptedits` is not a valid `permission_mode`
+# at: 31:26
+# help: did you mean `acceptEdits`?
+#
+# The one enum in this grammar written in a **vendor's** spelling, which is
+# Decision D146's own bargain: the alternative was three names of our own for
+# the Agent SDK's approval axis and a translation table nothing could be
+# verified against. The cost lands here, on the shape an author gets wrong first
+# — `acceptEdits` is camelCase where every other keyword in this grammar is
+# snake_case — so the parser answering with the near miss is the whole of what
+# makes that cost payable.
+#
+# The **union** over the harnesses that have the axis is what this reader
+# checks, because it is one value against a constant. Which harness has an axis
+# at all, and which of its modes a node's `access:` level admits, need the whole
+# composition and are `check/coder.rs`'s: `unsupported-permission-mode` and
+# `widening-permission-mode` respectively.
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        access: workspace_write
+        permission_mode: acceptedits
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

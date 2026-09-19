@@ -1,0 +1,47 @@
+# rule: a `coder:` node's `settings:` key reaching the permission mode is
+# rule: refused, naming `permission_mode:` as what states it (8.9, D146)
+# code: reserved-harness-setting
+# message: `permissionMode` of `flow.main` node `build` is a `harness: cc` option the generated adapter owns: it is what `permission_mode:` states
+# at: main.yml:41:11
+# label: main.yml:35:18 the harness is bound here
+# help: write `permission_mode:` on the node instead. A bound has to be readable off the construct that holds it, which is why `permission_mode:` is a key and not a setting, and two spellings of one option would leave a reader and `validate` disagreeing about which wins. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# The field report PRD resolved q60 was ratified from, written out as a spec.
+# The author needed the Agent SDK's `dontAsk` mode, found that `access:` reaches
+# three of the SDK's six, and went looking in the one surface this grammar
+# leaves open. Before resolved q60 that earned a warning and a silent run-time
+# drop: the value looked accepted, the run ignored it, and there was no way to
+# tell a setting that travelled from one that never arrived.
+#
+# Now it is refused where it is written, and the refusal names the key that
+# states the same bound — `permission_mode:`, which exists because this ask is
+# legitimate. The two rulings ship together for that reason: the refusal is a
+# redirection rather than a wall.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        access: workspace_write
+        prompt: Make the change and report.
+        settings:
+          permissionMode: dontAsk
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

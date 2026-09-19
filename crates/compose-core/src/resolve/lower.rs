@@ -377,12 +377,18 @@ fn node(source: &ast_flow::Node) -> Option<ir::flow::Node> {
 /// becomes a list in **declaration order** — a set of settings read by name,
 /// with the whole entry's span so a diagnostic about one underlines the key and
 /// its value together.
+///
+/// `permission_mode:` keeps its absence for the same reason and keeps its
+/// **span** as well, unlike `access:`: both refusals it earns are about the key
+/// itself rather than about the block, so the line to underline is the one the
+/// mode is written on (Decision D146).
 fn coder(source: &ast_flow::CoderBlock) -> Option<ir::flow::Coder> {
     Some(ir::flow::Coder {
         harness: source.harness.clone()?,
         model: source.model.clone()?,
         workspace: source.workspace.clone()?,
         access: source.access.as_ref().map(|access| access.value),
+        permission_mode: source.permission_mode.clone(),
         prompt: source.prompt.clone()?,
         input: optional(source.input.as_ref(), field_map)?,
         output: field_map(source.output.as_ref()?)?,

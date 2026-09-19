@@ -326,6 +326,7 @@ be hiding the one fact a reader most needs.
 | `connection` | array of [connection facts](#581-a-connection-fact-that-crosses) | when the node's provider declares a fact that crosses | The provider connection this run is given, and the **slot** each fact lands in under this harness (grammar §8.9, Decision D143). In provider-key order: `base_url`, `api_key`, then each header in declaration order. Absent where the provider declares none — which is a statement, not a gap: nothing about the connection reaches the run. |
 | `workspace` | string | always | `workspace:`, exactly as written — an `${ENV}` reference reaches this document unresolved like every other (§10). |
 | `access` | `"read_only"` \| `"workspace_write"` \| `"full_access"` | always | The containment preset, **with the default materialized**: a node that omits `access:` reads `"workspace_write"` here. This document answers the question rather than leaving it (§1), and it is a containment claim, so a reader should not have to know which way the grammar's default falls. |
+| `permission_mode` | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"dontAsk"` \| `"auto"` | when the bound harness has an approval axis | The mode the run's loop approves a call under, **resolved**: a node that writes `permission_mode:` reads that mode, and a node that writes none reads the one its `access` level derives — `access`'s own materialization, one axis along. Absent under a harness whose containment is a sandbox preset and which therefore has no such axis (`codex`), where a mode drawn here would be a second bound this document invented. It sits beside `tools_enforced` for that field's reason: two nodes whose `access` reads the same are not under the same bound when one of them states a mode (grammar §8.9, Decision D146). |
 | `prompt` | string | always | The run's instructions, verbatim. |
 | `allow_tools` | array of strings | when the node declares any | The harness tool names the run may use, in declaration order. Absent means the harness's own default set. |
 | `tools_enforced` | boolean | always | Whether this harness enforces `allow_tools` **inside its own loop** rather than bounding at its sandbox alone. It is a fact about the *harness* and is in no composition, which is why it is here: two nodes with identical lists are not under identical bounds, and PRD resolved q57 ruling c makes stating that this document's job. |
@@ -511,7 +512,7 @@ At a given `graph_version`, a reader MAY rely on:
   produces, and where a cell does not, the key is present only with something in
   it;
 * the vocabularies of the closed enumerations: `GraphNode.kind`,
-  `CoderView.harness`, `CoderView.access`,
+  `CoderView.harness`, `CoderView.access`, `CoderView.permission_mode`,
   `GraphEdge.class`, `SchemaView.source`, `ToolView.source` and `RetryView.level`
   — which `TimeoutView.level` and `OnErrorView.level` share — plus
   `InputView.form`, `OnErrorView.strategy`, `ItemErrorView.strategy`,
@@ -553,7 +554,12 @@ Compatible, and made **without** a version bump:
   worked example, added for PRD resolved q58 with no bump, because §9.3's list
   names nothing it touches: no field was removed or renamed, no type or meaning
   changed, no *existing* presence rule moved, no closed enumeration grew, no
-  fixed order changed, and nothing that used to be drawn is drawn differently;
+  fixed order changed, and nothing that used to be drawn is drawn differently.
+  `CoderView.permission_mode` arrived the same way for PRD resolved q60, and it
+  is worth naming because it looks like the one case §9.3 does cover: it carries
+  a **new** closed vocabulary rather than a member added to one §9.1 already
+  names, and a reader written against the previous version ignores a key it does
+  not recognize;
 * adding a new record type reachable from an existing one —
   [`ConnectionView`](#581-a-connection-fact-that-crosses), which arrived with it;
 * carrying a field in a case this document's presence column **already** names

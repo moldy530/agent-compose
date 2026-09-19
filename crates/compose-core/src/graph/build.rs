@@ -622,12 +622,15 @@ fn store_params(params: &StoreParams) -> Vec<BindingView> {
 // Agents: model resolution and the tool surface
 // ---------------------------------------------------------------------------
 
-/// One coder node's harness run, with the two defaults materialized.
+/// One coder node's harness run, with the three defaults materialized.
 ///
-/// `access:` and `inherit_env:` are written out even where the node omits them,
-/// which is this document answering a question rather than leaving it (§1): both
-/// are **containment** claims, and a reader of a picture should not have to know
-/// which way the grammar's default falls to read how far a harness may reach.
+/// `access:`, `permission_mode:` and `inherit_env:` are written out even where
+/// the node omits them, which is this document answering a question rather than
+/// leaving it (§1): all three are **containment** claims, and a reader of a
+/// picture should not have to know which way the grammar's default falls to read
+/// how far a harness may reach or how a call inside that reach is approved. The
+/// mode is the one exception with a presence rule: a harness with no approval
+/// axis has no mode to report, and the field is absent rather than invented.
 ///
 /// `tools_enforced` is not in the composition at all — it is a property of the
 /// harness, and PRD resolved q57 ruling c is what makes it belong here: the two
@@ -643,6 +646,11 @@ fn coder_view(ir: &Ir, coder: &Coder) -> CoderView {
             .unwrap_or(WorkspaceAccess::WorkspaceWrite)
             .as_str()
             .to_string(),
+        // …and the approval mode inside it, resolved: the one the node states,
+        // or the one its level derives. `None` where the bound harness has no
+        // such axis, which is the claims-least answer `tools_enforced` gives one
+        // field along (Decision D146).
+        permission_mode: crate::harness::resolved_mode(coder).map(|mode| mode.as_str().to_string()),
         prompt: coder.prompt.value.clone(),
         allow_tools: coder
             .allow_tools

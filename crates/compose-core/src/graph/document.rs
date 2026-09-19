@@ -740,6 +740,26 @@ pub struct CoderView {
     /// omitting the key is `workspace_write`, and a picture answers the
     /// question rather than leaving it.
     pub access: String,
+    /// The **approval mode** the run works under, with the default materialized
+    /// exactly as `access` is (grammar 8.9, Decision D146, PRD resolved q60
+    /// ruling a).
+    ///
+    /// The *resolved* mode rather than the key: a node that writes
+    /// `permission_mode:` reads that mode here, and a node that writes none
+    /// reads the one its `access:` level derives — because a reader of a picture
+    /// should not have to know the derivation to read how a call gets approved,
+    /// which is the argument `access` and `inherit_env` are materialized under.
+    ///
+    /// **Absent under a harness that has no approval axis**, which is `codex`:
+    /// its containment is the sandbox preset `access` already names, and a mode
+    /// drawn there would be a second bound this document invented. Additive
+    /// under §9.2 — a new field, no `graph_version` bump — and it sits beside
+    /// `tools_enforced` for that field's own reason: it is a fact about the
+    /// *harness* as much as about the composition, and two coder nodes whose
+    /// `access` reads the same are not under the same bound when one of them
+    /// states a mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     /// `prompt:` — the run's system instructions, verbatim.
     pub prompt: String,
     /// `allow_tools:` — the harness tool names the run may use, in declaration

@@ -2550,6 +2550,20 @@ fn coder_descriptor(
                 .as_str()
         )
     ));
+    // Emitted only where the node **states** one, unlike `access:` above, whose
+    // default is materialized here. The mode's default is the driver's own
+    // `access:` map — the mapping Decision D138 shipped and D146 leaves exactly
+    // alone — so a node that writes no `permission_mode:` emits the binding it
+    // emitted before this key existed, byte for byte, and the driver derives
+    // what it always derived. Materializing it here instead would move that
+    // mapping into every project's `src/graph.ts` and make an existing
+    // composition's output depend on a key nobody wrote.
+    if let Some(mode) = &coder.permission_mode {
+        text.push_str(&format!(
+            "  permissionMode: {},\n",
+            names::string(mode.value.as_str())
+        ));
+    }
     // Omitted where the node declared none, which is the harness's own default
     // set — and the *only* way this key is absent, because `allow_tools: []` is
     // refused at the parser (`parse::flow::allow_tools`). An empty list that
@@ -6494,6 +6508,88 @@ flow.f:
             "a provider with no `api_key:` emitted a credential key — resolved q25's posture is \
              that an absent key means no credential at all, and an empty one authenticates as \
              nobody:\n{keyless}"
+        );
+    }
+
+    /// **A node that states no `permission_mode:` emits what it always emitted,
+    /// and stating one adds exactly one line** (grammar 8.9, Decision D146, PRD
+    /// resolved q60 ruling a).
+    ///
+    /// The compatibility claim of the whole key, as bytes. `access:` is
+    /// materialized into the binding by this module and `permission_mode:` is
+    /// deliberately not: the mode an `access:` level derives is the *driver's*
+    /// mapping (`CC_PERMISSION` in `src/harness-cc.ts`), so an absent key leaves
+    /// the binding untouched and the driver answers exactly as it did before the
+    /// key existed. An emitter that materialized the default here instead would
+    /// rewrite the `src/graph.ts` of every project with a coder node in it, and
+    /// "existing compositions are untouched" would be a sentence in the PRD with
+    /// nothing holding it.
+    ///
+    /// Read as a **diff of one line**, which is stronger than either half on its
+    /// own: the absent form is compared byte for byte against the stated form
+    /// with that line removed, so a second field emitted beside it — or a
+    /// reordering — fails here rather than in a golden somebody re-blesses.
+    #[test]
+    fn a_node_that_states_no_permission_mode_emits_what_it_did_before() {
+        const COMPOSITION: &str = r#"version: "0.1"
+
+state:
+  summary: { type: string, default: "" }
+
+provider.p:
+  kind: anthropic
+  api_key: ${MODEL_KEY}
+
+model.smart:
+  provider: provider.p
+  id: some-model
+
+flow.f:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: /srv/checkout
+        access: workspace_write
+PERMISSION_MODE        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+"#;
+
+        let absent = emit(&COMPOSITION.replace("PERMISSION_MODE", ""));
+        let binding = declaration(&absent, "flowFNodeBuildCoder");
+        assert!(
+            binding.contains("  access: \"workspace_write\",\n"),
+            "`access:` is materialized into the binding:\n{binding}"
+        );
+        assert!(
+            !binding.contains("permissionMode"),
+            "a node that states no `permission_mode:` emitted one anyway, so every project with a \
+             coder node in it changed bytes over a key nobody wrote:\n{binding}"
+        );
+
+        // …and the stated form, which differs by exactly the one line. Written
+        // as `dontAsk` rather than as the mode this level derives on purpose: a
+        // value equal to the default would let an emitter that dropped the key
+        // whenever it matched the derivation pass this test.
+        let stated =
+            emit(&COMPOSITION.replace("PERMISSION_MODE", "        permission_mode: dontAsk\n"));
+        let with_mode = declaration(&stated, "flowFNodeBuildCoder");
+        assert!(
+            with_mode.contains("  permissionMode: \"dontAsk\",\n"),
+            "a stated mode reaches the binding:\n{with_mode}"
+        );
+        assert_eq!(
+            with_mode.replace("  permissionMode: \"dontAsk\",\n", ""),
+            binding,
+            "stating a `permission_mode:` changed more than the one line it adds"
         );
     }
 

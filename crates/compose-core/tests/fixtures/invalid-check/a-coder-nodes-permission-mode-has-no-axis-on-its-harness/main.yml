@@ -1,0 +1,49 @@
+# rule: `permission_mode:` on a harness with no approval axis is refused, naming the
+# rule: asymmetry (grammar 8.9, D146, PRD resolved q57 ruling c)
+# code: unsupported-permission-mode
+# message: `flow.main` node `review` binds `harness: codex`, which has no permission mode for `plan` to select
+# at: main.yml:42:26
+# label: main.yml:38:18 the harness is bound here
+# help: the two harnesses are not symmetrical here and this document says so rather than implying they are: `codex` contains a run with a sandbox preset, and its per-call approval axis belongs to an app server this release does not adopt — so there is nothing for a mode to choose and a faked one would be a bound nothing holds. `cc` carries the axis. Drop `permission_mode:` and let `access:` state the containment, which is the whole of what this harness holds a run to — or run the node under `cc` (grammar 8.9, Decision D146, PRD resolved q57 ruling c, q60 ruling a)
+#
+# The asymmetry stated out loud rather than papered over. `access:` is one axis
+# — how far a run may reach — and a permission mode is another: inside that
+# reach, how a call is approved. Only `cc` has the second one. `codex` contains
+# a run with the sandbox preset `access:` selects, and its per-call approval
+# tier belongs to an app server this release does not adopt (PRD resolved q57
+# ruling c), so there is nothing here for a mode to choose.
+#
+# Refused rather than mapped onto the nearest thing: a run that escalated out of
+# its sandbox to an approver nothing here answers for would be `access:` saying
+# one thing and the run doing another, and a slot invented to take the value
+# would be a bound this compiler claims and nothing holds. The mode written here
+# is `plan`, which is exactly what this node's `read_only` would derive under
+# the other harness — so even the value that changes nothing is refused, because
+# what is absent is the axis rather than the room.
+version: "0.1"
+provider.p:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+model.reviewer:
+  provider: provider.p
+  id: gpt-5-codex
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    review:
+      coder:
+        harness: codex
+        model: model.reviewer
+        workspace: ${REPO_ROOT}
+        access: read_only
+        permission_mode: plan
+        prompt: Read the tree and report.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

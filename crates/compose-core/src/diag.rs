@@ -459,12 +459,52 @@ pub enum DiagnosticCode {
     /// absent is a driver rather than a spelling, so the repair is a choice
     /// between the two harnesses v1 ships rather than a correction.
     UnsupportedHarness,
+    /// A `coder:` node states a `permission_mode:` and the harness it binds has
+    /// **no approval axis at all** (grammar 8.9, Decision D146, PRD resolved q60
+    /// ruling a).
+    ///
+    /// `codex`'s containment primitive is a sandbox preset, and its per-call
+    /// approval tier lives in an app server this release does not adopt
+    /// (resolved q57 ruling c) — so there is nothing on that harness for a mode
+    /// to select, and inventing one would be the faked slot
+    /// [`UnsupportedConnectionFact`](Self::UnsupportedConnectionFact) is refused
+    /// to avoid. Its own class rather than an
+    /// [`UnknownVariant`](Self::UnknownVariant), for
+    /// [`UnsupportedHarness`](Self::UnsupportedHarness)'s reason: the mode is
+    /// spelled correctly and what is absent is the axis.
+    UnsupportedPermissionMode,
+    /// A `coder:` node's `permission_mode:` is outside what its `access:` level
+    /// admits (grammar 8.9, Decision D146, PRD resolved q60 ruling a).
+    ///
+    /// **The widening bound**: a mode may never grant an operation the level's
+    /// own derived mode would refuse. Both values are legal on their own and
+    /// only the pair is wrong — the same shape as
+    /// [`UnsupportedProviderKind`](Self::UnsupportedProviderKind) — and what the
+    /// pair decides is how far a run may reach, so it is refused at `validate`
+    /// rather than discovered from what a run did (PRD G3).
+    WideningPermissionMode,
     /// **Warning.** A `coder:` node's `settings:` names a key the harness's
     /// curated table does not have, so nothing about its value could be verified
     /// — it travels to the SDK verbatim (grammar 8.9, Decision D140). The same
     /// two-tier posture, and the same warning shape, as
     /// [`UnknownServerTool`](Self::UnknownServerTool).
+    ///
+    /// The **reserved** keys are not this: they are
+    /// [`ReservedHarnessSetting`](Self::ReservedHarnessSetting), an error, since
+    /// PRD resolved q60 ruling b.
     UnknownHarnessSetting,
+    /// A `coder:` node's `settings:` names an option the generated adapter owns
+    /// — a bound this node already states, or one that contains it (grammar 8.9,
+    /// Decision D146, PRD resolved q60 ruling b).
+    ///
+    /// An **error**, where PRD resolved q57 shipped a warning and a silent
+    /// run-time drop. The hardening is resolved q58 ruling b's, one surface
+    /// along: where a dropped key would change what a run may do, failing at run
+    /// time — or not failing at all — instead of at compile time is the class
+    /// resolved q25 refused (PRD G3). The message names the first-class key that
+    /// answers the need where one does, which is what
+    /// [`crate::harness::Answered`] carries.
+    ReservedHarnessSetting,
     /// A `coder:` node's model resolves to a provider declaring a connection
     /// fact the bound harness has **no slot for** (grammar 8.9, Decision D143,
     /// PRD resolved q58 ruling b).
@@ -647,7 +687,10 @@ impl DiagnosticCode {
         Self::UnknownServerToolField,
         Self::MismatchedServerTools,
         Self::UnsupportedHarness,
+        Self::UnsupportedPermissionMode,
+        Self::WideningPermissionMode,
         Self::UnknownHarnessSetting,
+        Self::ReservedHarnessSetting,
         Self::UnsupportedConnectionFact,
         Self::UnsupportedProviderKind,
         Self::ConflictingConnectionVariable,
@@ -729,7 +772,10 @@ impl DiagnosticCode {
             Self::UnknownServerToolField => "unknown-server-tool-field",
             Self::MismatchedServerTools => "mismatched-server-tools",
             Self::UnsupportedHarness => "unsupported-harness",
+            Self::UnsupportedPermissionMode => "unsupported-permission-mode",
+            Self::WideningPermissionMode => "widening-permission-mode",
             Self::UnknownHarnessSetting => "unknown-harness-setting",
+            Self::ReservedHarnessSetting => "reserved-harness-setting",
             Self::UnsupportedConnectionFact => "unsupported-connection-fact",
             Self::UnsupportedProviderKind => "unsupported-provider-kind",
             Self::ConflictingConnectionVariable => "conflicting-connection-variable",

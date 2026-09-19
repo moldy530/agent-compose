@@ -687,6 +687,13 @@ const results = {};
     movedModelSettings: await resumeWith({
       modelSettings: { thinking: { budget_tokens: 32000 } },
     }),
+    // The approval mode: a run that auto-accepts its own edits and a run that
+    // denies anything not pre-approved are two different runs, even under one
+    // `access:` level — which is the whole reason the mode is a bound of its own
+    // (Decision D146). The recorded binding states none, so this is also the
+    // shape that says an *absent* key is part of the identity rather than
+    // nothing at all.
+    statedPermissionMode: await resumeWith({ permissionMode: "dontAsk" }),
     // The **connection** repointed: the same node, the same prompt, the same
     // schema, and a different endpoint — which is a different run in the one way
     // that matters most, because the answer came from somewhere else. The
@@ -1101,6 +1108,60 @@ const results = {};
     keylessInheritedCredentials: ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"].filter((name) =>
       Object.hasOwn(keylessInheritedClient.env ?? {}, name),
     ),
+  };
+}
+
+// --- 14. The approval mode inside the containment -------------------------
+//
+// PRD resolved q60 ruling a gives the Agent SDK's approval axis a key of its
+// own, and every claim about it is a **subtraction or a substitution inside the
+// options object** — invisible from a run's answer, exactly like case 11's
+// bound. So this reads what `query` would have been handed, three times over the
+// derived mapping and three times over a stated mode.
+//
+// Three options answer to the resolved mode and all three are read here,
+// because keying two of them off `run.access` instead is the shape that looks
+// right and is not:
+//
+//   * `permissionMode` itself — the node's, or the one its `access:` level
+//     derives, which is the mapping resolved q57 shipped and every composition
+//     written before this key existed still has;
+//   * `allowDangerouslySkipPermissions` — the flag the SDK documents
+//     `bypassPermissions` as *requiring*. Armed by the mode, so a `full_access`
+//     node that asked for `plan` is not handed it;
+//   * `planModeInstructions` — plan mode's body, replaced by the node's own
+//     `prompt:`. Filled by the mode, so a `full_access` node that asked for
+//     `plan` gets the node's instructions rather than the vendor's default
+//     code-implementation workflow.
+{
+  const modeOf = async (overrides) => {
+    const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+    await runtime.runCoder(binding(overrides), { goal: "fix it" }, context(), {
+      cc: stub.driver,
+    });
+    const options = harness.ccOptions(stub.runs[0], [], new Set());
+    return {
+      mode: options.permissionMode,
+      skip: options.allowDangerouslySkipPermissions ?? null,
+      planBody: options.planModeInstructions ?? null,
+    };
+  };
+
+  results["permissionMode"] = {
+    // The derived mapping, level by level: what a node that states no mode gets.
+    derivedReadOnly: await modeOf({ access: "read_only" }),
+    derivedWorkspaceWrite: await modeOf({ access: "workspace_write" }),
+    derivedFullAccess: await modeOf({ access: "full_access" }),
+    // …and a stated mode, which supersedes it and nothing else.
+    statedDontAsk: await modeOf({ access: "workspace_write", permissionMode: "dontAsk" }),
+    // The two cases the flags are the point of: `plan` under the widest level
+    // arms no skip flag and does fill the body, and `bypassPermissions` written
+    // out longhand behaves exactly as the level deriving it does.
+    statedPlanUnderFullAccess: await modeOf({ access: "full_access", permissionMode: "plan" }),
+    statedBypassUnderFullAccess: await modeOf({
+      access: "full_access",
+      permissionMode: "bypassPermissions",
+    }),
   };
 }
 
