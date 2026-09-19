@@ -58,10 +58,18 @@
 //! of `crates/compose-core/tests/generated_code_gates.rs` hands what this module
 //! emits to the parsers the two installers read these files with — Bun's own
 //! TOML parser over `bunfig.toml`, and the `ini` package out of npm's own
-//! installation over `.npmrc`, with `npm config get` asked what registry the
-//! file leaves a project on — and holds each answer to the `package_registry:`
-//! the deploy file declared, credential key included. The goldens pin these
-//! bytes; that gate is what says the two installers can read them.
+//! installation over `.npmrc` — and holds each answer to the `package_registry:`
+//! the deploy file declared.
+//!
+//! The credential key is the one claim a parse cannot settle, because it is
+//! derived rather than written down: an expectation computed with
+//! [`npm_auth_key`] would be this module held to itself, and a key npm never
+//! looks up would satisfy it. So the gate asks npm's own machinery instead —
+//! `npm config get` for the registry a project is left on, and
+//! `npm-registry-fetch`'s `getAuth` over `pacote`'s packument URL, the lookup
+//! every `npm install` spends a token through, for the credential it finds at
+//! each declared registry. The goldens pin these bytes; that gate is what says
+//! the two installers can read them.
 
 use std::fmt::Write as _;
 
@@ -208,6 +216,13 @@ fn token(reference: Option<&crate::diag::Spanned<crate::ast::common::EnvRef>>) -
 /// than no line at all: the install goes out unauthenticated while the
 /// `bunfig.toml` beside it authenticates, which is the one artifact / two answers
 /// divergence grammar 14.6 rule 5 exists to prevent.
+///
+/// The tests below are a reading of that source; they are not the only thing
+/// standing behind it. Gate 26b runs npm's real lookup — `npm-registry-fetch`'s
+/// `getAuth`, over the packument URL `pacote` builds for a package in the
+/// declared registry — against the emitted `.npmrc`, so a key derived here that
+/// npm would never walk up to comes back holding no credential and fails there
+/// rather than being agreed with.
 ///
 /// Two things follow, and they are the whole of what this function does:
 ///

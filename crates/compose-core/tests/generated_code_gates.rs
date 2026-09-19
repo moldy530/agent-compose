@@ -316,13 +316,17 @@
 //!     the `package_registry:` the deploy file declared, key by key. Its
 //!     **`26b`** half is the npm one and runs under Node for the reason gate 13
 //!     does — the reader in question is npm's: the `ini` package **out of the
-//!     npm installation on this machine** parses the emitted `.npmrc`, and
+//!     npm installation on this machine** parses the emitted `.npmrc`,
+//!     `npm-registry-fetch`'s `getAuth` is asked which credential npm finds for
+//!     a package fetched from each registry the file configures, and
 //!     `npm config get` is asked what registry that file leaves a project on. A
 //!     path character an ini value ends at or an ini line splits on — what
 //!     grammar 14.6 rule 1 refuses a `url:` over — therefore fails here rather
-//!     than in somebody's `npm install`. Hermetic on both sides: each parser
-//!     reads a file and prints what it read, and nothing installs from a
-//!     registry (PRD resolved q59 ruling e).
+//!     than in somebody's `npm install`, and so does a credential keyed at an
+//!     address npm's own lookup never walks up to, which no parse of the file
+//!     can see. Hermetic on both sides: the parsers read a file, the lookup
+//!     resolves a URL as a string, and nothing installs from a registry (PRD
+//!     resolved q59 ruling e).
 //!
 //! # The toolchain fixture
 //!
@@ -8545,12 +8549,19 @@ fn bun_reads(registry: &PackageRegistry) -> Value {
 /// with: one flat key per line, the credential keyed by the **address** npm
 /// derives from its own request.
 ///
-/// The expectation is built from `codegen::registry::npm_auth_key` on purpose.
-/// That function is what `parse::deploy` refuses a colliding pair over and what
-/// the emitter writes, so holding the parse to it is what says the key npm would
-/// look up survives the trip through the file — an `.npmrc` whose `_authToken`
-/// line an ini reader ends early carries a key npm never finds, and that failure
-/// is silent in the worst direction (grammar 14.6 rule 5).
+/// The credential key here is `codegen::registry::npm_auth_key` — the same
+/// function the emitter writes the line with — so what this half asserts is that
+/// the **line survived the file**: an `_authToken` an ini reader ends at a `;` or
+/// splits at an early `=` parses to neither that key nor that value, and the
+/// whole-map equality leaves no room for a credential line nobody declared.
+///
+/// It deliberately says nothing about whether npm would *look that key up*.
+/// That question cannot be put to a parse at all — the address is derived from
+/// the request npm is about to make rather than written anywhere in the file, so
+/// any key a test computes for it is the compiler's own answer restated, and a
+/// key naming somewhere npm never walks would satisfy both sides. It is put to
+/// npm instead, by [`npm_authenticates`] over the `auth` half of the same
+/// answer (grammar 14.6 rule 5).
 fn npm_reads(registry: &PackageRegistry) -> Value {
     fn reference(variable: &str) -> Value {
         json!(format!("${{{variable}}}"))
@@ -8577,6 +8588,54 @@ fn npm_reads(registry: &PackageRegistry) -> Value {
         }
     }
     Value::Object(keys)
+}
+
+/// What npm's own credential lookup must come back with for each registry the
+/// emitted `.npmrc` configures, read off the **declaration** alone.
+///
+/// Every value here is text the deploy file wrote: the registry's `url:` and the
+/// `${VAR}` its `token:` named. No address is derived, which is the whole point
+/// — the runner walks npm's real path to a credential (`pacote`'s packument URL
+/// for a package in that registry, through `npm-registry-fetch`'s `getAuth`),
+/// and holding *that* to the declaration is what says the emitted `_authToken`
+/// key is one npm reaches. A key npm never walks — a segment too many, a host
+/// npm spells differently, a path whose dot segments the request resolves away —
+/// comes back `null` here however confidently `npm_auth_key` derived it.
+///
+/// An entry that declares no `token:` expects `null`: it named no credential, so
+/// npm finding one would mean the file lends it another entry's, which is the
+/// leak `parse::deploy`'s `missing-registry-token` refuses at the spec. That
+/// refusal reasons about the addresses the compiler derives; this is where npm
+/// rather than the compiler gets to say whether the walk really stops.
+fn npm_authenticates(registry: &PackageRegistry) -> Value {
+    fn entry(url: &str, variable: Option<&str>) -> Value {
+        json!({
+            "registry": url,
+            "token": variable.map_or(Value::Null, |name| json!(format!("${{{name}}}"))),
+        })
+    }
+
+    let mut found = serde_json::Map::new();
+    found.insert(
+        "registry".to_string(),
+        entry(
+            &registry.url.value,
+            registry
+                .token
+                .as_ref()
+                .map(|token| token.value.name.as_str()),
+        ),
+    );
+    for scope in registry.scopes.values() {
+        found.insert(
+            format!("{}:registry", scope.name.value),
+            entry(
+                &scope.url.value,
+                scope.token.as_ref().map(|token| token.value.name.as_str()),
+            ),
+        );
+    }
+    Value::Object(found)
 }
 
 /// What `npm config get <key>` answers from inside a staged project.
@@ -8663,21 +8722,38 @@ fn the_emitted_bunfig_is_the_configuration_bun_parses_out_of_it() {
     }
 }
 
-/// Gate 26b: the emitted `.npmrc` is ini **npm** reads, it reads back as the
-/// `package_registry:` the deploy file declared, and it leaves a project on the
-/// registry that declaration named.
+/// Gate 26b: the emitted `.npmrc` is ini **npm** reads, npm's own credential
+/// lookup finds the credentials the deploy file declared where it wrote them,
+/// and the file leaves a project on the registry that declaration named.
 ///
-/// Two readers, because npm's answer is two questions. The `ini` package is the
-/// one npm parses `.npmrc` with, and it is resolved out of the npm installation
-/// on this machine rather than added to the fixture — a second copy of a parser
-/// is a second parser, and the point is the one npm uses. It is also the only
-/// reader that can be asked about the credential line at all: npm marks
-/// `_authToken` protected, so `npm config get` refuses it and `npm config list`
-/// omits it, and an `.npmrc` whose key an ini reader ends at a `;` or splits at
-/// an `=` would be invisible to the second half below while every `npm install`
-/// went out unauthenticated (grammar 14.6 rules 1 and 5). The second half is
-/// npm's whole configuration pipeline over the registry lines, which is the
-/// question the author asked: *what will this project install from*.
+/// Three questions, because that is how many npm's answer is.
+///
+/// **What the file parses to.** The `ini` package is the one npm parses
+/// `.npmrc` with, and it is resolved out of the npm installation on this machine
+/// rather than added to the fixture — a second copy of a parser is a second
+/// parser, and the point is the one npm uses. It is also the only reader that
+/// sees the credential line at all: npm marks `_authToken` protected, so
+/// `npm config get` refuses it and `npm config list` omits it, and a line an ini
+/// reader ends at a `;` or splits at an `=` would be invisible to the two halves
+/// below (grammar 14.6 rules 1 and 5).
+///
+/// **Which credential npm finds.** A parse cannot answer that, and this is the
+/// half that makes the answer npm's rather than the compiler's. An `.npmrc`
+/// credential is keyed by an address npm *derives* from the request it is about
+/// to make, so an expectation computed here would be
+/// `codegen::registry::npm_auth_key` held to itself: a key naming somewhere npm
+/// never walks would satisfy it, and the emitted artifact would install
+/// unauthenticated under npm while the `bunfig.toml` beside it authenticated —
+/// one artifact, two answers, which is what grammar 14.6 rule 5 exists to
+/// refuse. So npm is asked: the runner builds `pacote`'s own packument URL for a
+/// package in each configured registry and hands it to
+/// `npm-registry-fetch`'s `getAuth`, the lookup every `npm install` spends a
+/// token through, and [`npm_authenticates`] holds what comes back to the
+/// `${VAR}` the deploy file named — or to no credential at all where it named
+/// none.
+///
+/// **What the project installs from.** npm's whole configuration pipeline over
+/// the registry lines, which is the question the author asked.
 ///
 /// Under Node, and behind the same blocker as gates 13 and 15, for the reason
 /// they are: npm is the Node fallback's installer (PRD resolved q18, §9.18), so
@@ -8709,9 +8785,20 @@ fn the_emitted_npmrc_is_the_configuration_npm_reads_out_of_it() {
             answer["read"],
             npm_reads(&registry),
             "`{}/.npmrc` reads back as something other than the `package_registry:` its deploy \
-             file declares — a credential keyed at an address npm never looks up is an \
-             `npm install` that goes out unauthenticated while the `bun install` beside it \
-             succeeds (grammar 14.6 rule 5, PRD resolved q59)",
+             file declares — a line an ini reader ends early or splits somewhere else is one npm \
+             never sees the way it was written (grammar 14.6 rules 1 and 5, PRD resolved q59)",
+            golden.directory,
+        );
+
+        assert_eq!(
+            answer["auth"],
+            npm_authenticates(&registry),
+            "npm's own credential lookup does not answer `{}/.npmrc` with the credentials its \
+             deploy file declares — a `_authToken` keyed at an address npm never walks up to is \
+             an `npm install` that goes out unauthenticated while the `bun install` beside it \
+             succeeds, and one that reaches an entry declaring no `token:` is that entry \
+             spending a credential the spec scoped away from it (grammar 14.6 rule 5, PRD \
+             resolved q59)",
             golden.directory,
         );
 
