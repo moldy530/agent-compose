@@ -1,0 +1,48 @@
+# rule: a `coder:` node's `settings:` key spelling one of the block's own keys
+# rule: is refused under that spelling too, not only under the SDK's (8.9, D146)
+# code: reserved-harness-setting
+# message: `permission_mode` of `flow.main` node `build` is a key of the `coder:` block written inside `settings:`, where it states nothing: the bound it names is one the generated adapter owns
+# at: main.yml:42:11
+# label: main.yml:36:18 the harness is bound here
+# help: write `permission_mode:` on the node instead. A bound has to be readable off the construct that holds it, which is why `permission_mode:` is a key and not a setting, and two spellings of one option would leave a reader and `validate` disagreeing about which wins. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than passed on, because `harness: cc` declares no option of this name: the key would travel to the SDK unchanged, do nothing at all, and leave a node reading as though the bound were stated (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# The field report's mistake in the spelling this grammar teaches. `permissionMode`
+# is the Agent SDK's name for the option and is the key the reserved table is
+# sorted by; `permission_mode` is the name an author has read — in §8.9's key
+# table, three lines up on this very node, and in the shape the curated tier's
+# own settings are written in (`max_turns`, `max_budget_usd`).
+#
+# Under the SDK spelling alone, this key fell through to the second tier's
+# warning and travelled: the Agent SDK's `Options` declares no `permission_mode`,
+# so the run ignored it and the node read as though the mode were stated. The
+# refusal answers both spellings, and the repair is the one the other spelling
+# gets — write the key one level up, where a bound is readable off the construct
+# that holds it.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        access: workspace_write
+        prompt: Make the change and report.
+        settings:
+          permission_mode: dontAsk
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

@@ -1,0 +1,42 @@
+# rule: a `coder:` node's `settings:` key spelling a **required** key of the
+# rule: block is told to take the setting off, not to write it (8.9, D146)
+# code: reserved-harness-setting
+# message: `workspace` of `flow.main` node `build` is a key of the `coder:` block written inside `settings:`, where it states nothing: the bound it names is one the generated adapter owns
+# at: main.yml:36:11
+# label: main.yml:31:18 the harness is bound here
+# help: take the setting off: `workspace:` is required on every `coder:` block, so it is already on the node and already states this. A bound has to be readable off the construct that holds it, which is why `workspace:` is a key and not a setting, and two spellings of one option would leave a reader and `validate` disagreeing about which wins. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than passed on, because `harness: cc` declares no option of this name: the key would travel to the SDK unchanged, do nothing at all, and leave a node reading as though the bound were stated (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# The other repair sentence, under the grammar's spelling. `cwd` and
+# `workingDirectory` are the SDK names the reserved table is keyed by, and
+# `workspace` is the name §8.9 gives the same bound — a **required** key, so it
+# is already on the node two lines above the setting. "Write `workspace:`
+# instead" would name a line the author has written; the message says to delete
+# the setting, and it says so under either spelling because the key it names is
+# the same key.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Make the change and report.
+        settings:
+          workspace: /srv/other
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

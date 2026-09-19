@@ -7869,6 +7869,25 @@ export type HarnessName = "cc" | "codex";
 export type WorkspaceAccess = "read_only" | "workspace_write" | "full_access";
 
 /**
+ * How a harness approves a call **inside** that reach (grammar 8.9, D146).
+ *
+ * The second axis, and only one harness has one: these are the Claude Agent
+ * SDK's own six modes, and `codex` contains a run with the sandbox preset
+ * `access:` selects instead — `validate` refuses `permission_mode:` on a node
+ * bound to it rather than mapping the value onto an approval tier this release
+ * does not drive. Which modes an `access:` level admits is the widening bound
+ * the compiler enforces (grammar 8.9); by the time a driver sees one it is a
+ * mode that level allows.
+ */
+export type PermissionMode =
+  | "default"
+  | "acceptEdits"
+  | "bypassPermissions"
+  | "plan"
+  | "dontAsk"
+  | "auto";
+
+/**
  * One harness run, as the trace records it (`docs/trace.md` §7.6, PRD resolved
  * q57 ruling a).
  *
@@ -8021,6 +8040,22 @@ export interface HarnessBinding {
   readonly workspace: readonly Interpolation[];
   /** `access:` — with grammar 8.9's default already applied. */
   readonly access: WorkspaceAccess;
+  /**
+   * `permission_mode:` — **absent where the node states none**, unlike `access:`
+   * above (grammar 8.9, Decision D146).
+   *
+   * The two defaults live in two places on purpose. `access:` has one meaning
+   * whichever harness runs the node, so the compiler applies it; a permission
+   * mode is a *harness's* own vocabulary and the mode an `access:` level derives
+   * is that harness's mapping — `CC_PERMISSION` in `src/harness-cc.ts` — so an
+   * absent key is the driver's question to answer. It is also what keeps a node
+   * written before this key existed emitting the **binding** it always emitted:
+   * nothing is materialized into `src/graph.ts` where the key is absent. The
+   * claim is about that binding and not about a whole project — this file and
+   * the drivers carry the key's type and its mapping, so they move with the
+   * compiler release as they do on every release.
+   */
+  readonly permissionMode?: PermissionMode;
   /** `allow_tools:` — absent where the node declares none. */
   readonly allowTools?: readonly string[];
   /** `env:` — the declared environment, in declaration order. */
@@ -8098,6 +8133,11 @@ export interface HarnessRun {
   /** The resolved workspace root. */
   readonly workspace: string;
   readonly access: WorkspaceAccess;
+  /**
+   * The approval mode the node **stated**, where it stated one; a driver whose
+   * harness has the axis derives it from `access` otherwise (Decision D146).
+   */
+  readonly permissionMode?: PermissionMode;
   /** The tool allowlist, where the node declared one. */
   readonly allowTools?: readonly string[];
   /** The environment the harness runs with — scrubbed unless it inherits. */
@@ -8515,6 +8555,7 @@ export async function runCoder(
     settings: binding.settings,
     workspace,
     access: binding.access,
+    ...(binding.permissionMode === undefined ? {} : { permissionMode: binding.permissionMode }),
     ...(binding.allowTools === undefined ? {} : { allowTools: binding.allowTools }),
     env: environment,
     inheritEnv: binding.inheritEnv === true,
@@ -8557,6 +8598,12 @@ export async function runCoder(
     input: run.input,
     workspace: asWritten(binding.workspace),
     access: binding.access,
+    // …and the mode it runs under where the node states one, for `access`'s own
+    // reason: a run that approves its own edits and a run that is asked about
+    // each of them are two different runs, so a composition whose mode moved
+    // between a crash and its resume diverges rather than returning an answer
+    // the current binding would not have asked for (Decision D146).
+    ...(binding.permissionMode === undefined ? {} : { permissionMode: binding.permissionMode }),
     ...(binding.allowTools === undefined ? {} : { allowTools: binding.allowTools }),
     env: binding.env.map((entry) => ({ name: entry.name, value: asWritten(entry.value) })),
     inheritEnv: binding.inheritEnv === true,

@@ -1,0 +1,48 @@
+# rule: a `coder:` node's `settings:` key adding roots beside `workspace:` is
+# rule: refused, and no key of the block states it (grammar 8.9, D146)
+# code: reserved-harness-setting
+# message: `additionalDirectories` of `flow.main` node `review` is a `harness: codex` option the generated adapter owns, and no key of this block states it
+# at: main.yml:42:11
+# label: main.yml:36:18 the harness is bound here
+# help: there is no key to write instead: a second writable root beside `workspace:` is not that key widened but the containment statement undone — `workspace:` is one root, it is required, and `access:` bounds a run to the tree it names, so a run handed another is written where no line of the node reached. Neither harness offers a key for it, and a run that needs two trees is two nodes or one workspace holding both. Take the setting off — what `settings:` buys is the vendor's *other* options, never the ones this node already states. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# The reserved option that is *neither* a bound restated nor a bound widened.
+# `additionalDirectories` is roots **beside** the working directory, which both
+# drivers file under the options that contain a bound without spelling one — so
+# `workspace:` is not what it states, and answering it with `workspace:` would
+# be a refusal that says something false about the SDK option.
+#
+# It is also the case where no key can be offered. `workspace:` is required on
+# every `coder:` block — it is three lines above the refused setting — and takes
+# exactly one root, so an author asking for a second has asked for something
+# this grammar does not offer rather than for a key they forgot. `access:`
+# bounds the run to the tree `workspace:` names, which is the statement a second
+# writable root undoes.
+version: "0.1"
+provider.p:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+model.smart:
+  provider: provider.p
+  id: gpt-5-codex
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    review:
+      coder:
+        harness: codex
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: Read the tree and report.
+        settings:
+          additionalDirectories: ["/srv/other"]
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

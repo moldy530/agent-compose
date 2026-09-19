@@ -358,8 +358,17 @@ fn granted(change: ChangeKind, body: &DefinitionBody) -> Vec<FieldChange> {
 ///
 /// One field, and it is the same one for the same reason: *which capability
 /// arrived*. The bounds a coder node carries — its `workspace:`, its `access:`,
-/// its `allow_tools:` — are contents, and §3's rule that an arrival is not
-/// expanded into its contents holds here as it holds everywhere else.
+/// its `allow_tools:`, the approval mode `permission_mode:` states or `access:`
+/// derives — are contents, and §3's rule that an arrival is not expanded into
+/// its contents holds here as it holds everywhere else.
+///
+/// The **resolved permission mode** is the one worth naming, because PRD
+/// resolved q60 ruling a reads as though this report carried it. It does not,
+/// and neither does `tools_enforced`, which the same sentence pairs it with: the
+/// surface that draws both is the **graph document** `visualize` renders and
+/// `--format json` prints (`docs/graph.md` §5.8, Decision D146). A mode here
+/// would be §3's rule broken for one field, and a bound drawn in the one surface
+/// whose subject is the diff between two compositions rather than a composition.
 fn harness_granted(change: ChangeKind, node: &Node) -> Vec<FieldChange> {
     let NodeKind::Coder { coder } = &node.kind else {
         return Vec::new();

@@ -5,8 +5,8 @@ use crate::ast::common::Namespace;
 use crate::ast::definition::Settings;
 use crate::ast::flow::{
     CoderBlock, Edge, FlowContext, FlowDef, FlowNode, Harness, HumanBlock, ItemError, MapBlock,
-    MapDispatch, MapRoute, NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind, StoreNode, StoreOp,
-    StoreOpParams, StoreValue, WorkspaceAccess,
+    MapDispatch, MapRoute, NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind, PermissionMode,
+    StoreNode, StoreOp, StoreOpParams, StoreValue, WorkspaceAccess,
 };
 use crate::ast::policy::PolicyBlock;
 use crate::ast::schema::Surface;
@@ -896,6 +896,24 @@ const WORKSPACE_ACCESS: &[(&str, WorkspaceAccess)] = &[
     ("full_access", WorkspaceAccess::FullAccess),
 ];
 
+/// The approval modes a coder node's `permission_mode:` takes (Decision D146).
+///
+/// The **union** over the harnesses that have the axis at all, which today is
+/// `cc`'s six: this reader answers one value against a constant, and which
+/// harness has an axis — and which of its modes one `access:` level admits — is a
+/// whole-composition fact the tables in `crate::harness` hold and `check/coder.rs`
+/// reports. The split is D136's, one key along: a spelling nobody has is a
+/// misspelling and gets a suggestion, and a mode a *bound harness* cannot run is
+/// its own refusal naming the asymmetry.
+const PERMISSION_MODES: &[(&str, PermissionMode)] = &[
+    ("default", PermissionMode::Default),
+    ("acceptEdits", PermissionMode::AcceptEdits),
+    ("bypassPermissions", PermissionMode::BypassPermissions),
+    ("plan", PermissionMode::Plan),
+    ("dontAsk", PermissionMode::DontAsk),
+    ("auto", PermissionMode::Auto),
+];
+
 /// Read a `coder:` block (grammar 8.9, Decisions D136–D142, PRD resolved q57).
 ///
 /// The block carries the whole component, because a coder node has no
@@ -951,6 +969,14 @@ fn coder_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<CoderBlock> {
     let access = fields
         .take("access")
         .and_then(|node| lexical::keyword(node, "`access`", WORKSPACE_ACCESS, cx));
+    // The second axis, and it is read here and bounded there: `access:` says how
+    // far a run may reach and this says how its harness approves a call inside
+    // that reach. Which modes the node's own `access:` level admits is the
+    // widening bound `check/coder.rs` enforces against the table in
+    // `crate::harness` (Decision D146, PRD resolved q60 ruling a).
+    let permission_mode = fields
+        .take("permission_mode")
+        .and_then(|node| lexical::keyword(node, "`permission_mode`", PERMISSION_MODES, cx));
 
     let prompt = fields
         .require("prompt", cx)
@@ -1019,6 +1045,7 @@ fn coder_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<CoderBlock> {
         model,
         workspace,
         access,
+        permission_mode,
         prompt,
         input,
         output,

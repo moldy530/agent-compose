@@ -1,0 +1,46 @@
+# rule: a `coder:` node's `settings:` key reaching the sandbox `access:` selects is
+# rule: refused, and the repair is per harness (grammar 8.9, D146)
+# code: reserved-harness-setting
+# message: `sandboxMode` of `flow.main` node `review` is a `harness: codex` option the generated adapter owns: it is what `access:` states
+# at: main.yml:40:11
+# label: main.yml:34:18 the harness is bound here
+# help: write `access:` on the node instead. A bound has to be readable off the construct that holds it, which is why `access:` is a key and not a setting, and two spellings of one option would leave a reader and `validate` disagreeing about which wins. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# The same move on the other harness, and the one that shows the refusal is
+# about the *bound* rather than about one SDK's vocabulary: `sandboxMode` is
+# what `access:` maps onto under `codex`, so a `settings:` key spelling it would
+# state this node's containment twice — in the one place no check covers, and
+# with the looser of the two winning.
+#
+# `codex` is also the harness with no approval axis at all, which is why the
+# repair here is `access:` and not `permission_mode:`: the answer a refusal
+# gives is per option and per harness, read off the table beside the refusal
+# (grammar 8.9, Decision D146).
+version: "0.1"
+provider.p:
+  kind: openai
+  api_key: ${OPENAI_API_KEY}
+model.reviewer:
+  provider: provider.p
+  id: gpt-5-codex
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    review:
+      coder:
+        harness: codex
+        model: model.reviewer
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: Read the tree and report.
+        settings:
+          sandboxMode: danger-full-access
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

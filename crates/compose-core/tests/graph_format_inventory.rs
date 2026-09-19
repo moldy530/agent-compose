@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use compose_core::ast::flow::{Harness, WorkspaceAccess};
+use compose_core::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
 use compose_core::graph::{EdgeClass, NodeKind, PolicyLevel, SchemaSource, ToolSource};
 use compose_core::resolve;
 
@@ -160,9 +160,10 @@ fn every_record_type_is_specified() {
 /// `NodeKind::ALL` is held to the template's `KIND` table and `EdgeClass::ALL` to
 /// its `EDGE` table.
 ///
-/// **Two of them are not typed vocabularies on the view.** `CoderView.harness`
-/// and `CoderView.access` are `String` fields, filled from `Harness::as_str()`
-/// and `WorkspaceAccess::as_str()` — but §9.1 names them among the closed
+/// **Three of them are not typed vocabularies on the view.**
+/// `CoderView.harness`, `CoderView.access` and `CoderView.permission_mode` are
+/// `String` fields, filled from `Harness::as_str()`, `WorkspaceAccess::as_str()`
+/// and `PermissionMode::as_str()` — but §9.1 names them among the closed
 /// enumerations a reader may rely on all the same, so their members are read out
 /// of the *grammar's* enumerations rather than off the view's type. The harness
 /// list is filtered to what this release lowers: a reserved harness is a member
@@ -170,6 +171,11 @@ fn every_record_type_is_specified() {
 /// composition that binds one — so the day one of them ships, `ships_in_v1`
 /// turns over, this test demands the document name it, and §9.3's bump is owed
 /// before it can.
+///
+/// The mode list is **not** filtered, and the asymmetry is the tables': every
+/// mode `PermissionMode` spells is one some `access:` level admits, so every one
+/// of the six can reach a document. Which levels admit which is grammar 8.9's
+/// business, not this format's.
 #[test]
 fn every_closed_vocabulary_is_written_out() {
     let specification = specification();
@@ -194,6 +200,14 @@ fn every_closed_vocabulary_is_written_out() {
                 .iter()
                 .copied()
                 .map(|access| access.as_str().to_string())
+                .collect(),
+        ),
+        (
+            "CoderView.permission_mode",
+            PermissionMode::ALL
+                .iter()
+                .copied()
+                .map(|mode| mode.as_str().to_string())
                 .collect(),
         ),
     ];

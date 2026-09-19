@@ -1005,9 +1005,17 @@ function select(id) {
     html += "<h3>Harness</h3>" + pairs([
       ["harness", node.coder.harness],
       ["workspace", node.coder.workspace],
-      ["access", node.coder.access],
-      ["inherit_env", String(node.coder.inherit_env)]
-    ].concat(allowed.length
+      ["access", node.coder.access]
+    ].concat(node.coder.permission_mode
+      /* The approval axis, drawn beside the containment it sits inside and only
+       * where the bound harness has one: `access` says how far the run reaches
+       * and this says how a call inside that reach is approved (grammar 8.9,
+       * D146). Resolved, so the row reads the same whether the node stated the
+       * mode or took its level's. */
+      ? [["permission_mode", node.coder.permission_mode]]
+      : [])
+      .concat([["inherit_env", String(node.coder.inherit_env)]])
+      .concat(allowed.length
       ? [["allow_tools", allowed.join(", ") +
           (node.coder.tools_enforced ? " (enforced in-loop)" : " (sandbox bound only)")]]
       : [])

@@ -3036,6 +3036,7 @@ implement:
 | `model` | `model.*` ref | **yes** | — | the registry address, exactly as an agent node spells it (§12.2); a **route** is refused ([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)) |
 | `workspace` | string (non-empty, interpolable) | **yes** | — | the root this run works inside; §4.3 class 2 |
 | `access` | enum `read_only workspace_write full_access` | no | `workspace_write` | the containment preset ([D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)) |
+| `permission_mode` | enum `default acceptEdits bypassPermissions plan dontAsk auto` | no | the mode `access:` derives | the harness's **approval** axis inside that containment; `cc` only, and never wider than `access:` ([D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)) |
 | `prompt` | string (non-empty) | **yes** | — | the run's instructions; literal text, no templating ([D13](#d13-prompt-is-required-and-literal)) |
 | `input` | field map (input surface) | no | string-in | §5.3's rule, one construct along |
 | `output` | field map (result surface, §3.5) | **yes** | — | MUST have ≥ 1 property; the output gate parses it in full |
@@ -3112,6 +3113,53 @@ and that mode carries a workflow body of its own — so the adapter replaces tha
 body with the node's `prompt:`, and a `read_only` run under this harness is
 asked for what the node asked for rather than for a plan to implement
 something.
+
+**`permission_mode:` is the second axis, and only one harness has one.**
+`access:` says how far a run may reach; a permission mode says, *inside* that
+reach, how a call is approved. The two are not the same question, and the
+`access:` enum is the shape of the first: its three names are `codex`'s own
+sandbox presets, because that is the harness whose containment primitive is
+named ([D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)).
+The Agent SDK carries both axes, and mapping the three presets onto its modes
+left three of them reachable by no key at all — which is what this key is for
+([D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)).
+
+| harness | has an approval axis? |
+|---|---|
+| `cc` | **yes** — `default`, `acceptEdits`, `bypassPermissions`, `plan`, `dontAsk`, `auto`, which are the pinned SDK's own names |
+| `codex` | **no** — its containment is the sandbox preset `access:` selects, and its per-call approval tier belongs to an app server this release does not adopt. `permission_mode:` on a `codex` node is a compile error (`unsupported-permission-mode`) naming the asymmetry, never a value mapped onto something that would not hold |
+
+These are the **vendor's** spellings, unlike every other enum in this grammar,
+and the reason is the one D138 gives for taking `codex`'s three: a vocabulary
+invented here would be a translation nobody could verify against anything. The
+key is still a *bound* and not a passthrough — it is a key on the node, not a
+`settings:` entry, for the reason `access:` and `allow_tools:` are keys.
+
+**The invariant is the widening bound.** A mode may never grant an operation the
+node's `access:` level would refuse, so each level admits a closed set:
+
+| `access:` | derives, when `permission_mode:` is absent | admits |
+|---|---|---|
+| `read_only` | `plan` | `plan` |
+| `workspace_write` | `acceptEdits` | `default`, `acceptEdits`, `dontAsk`, `auto` |
+| `full_access` | `bypassPermissions` | `default`, `acceptEdits`, `bypassPermissions`, `plan`, `dontAsk`, `auto` |
+
+A mode outside its level's set is a compile error (`widening-permission-mode`)
+naming the mode, the level, and what the level admits. The two columns are two
+different statements: the middle one is what a level means **on its own**, so
+omitting the key is exactly the mapping in the `access:` table above and a
+composition written before this key existed is untouched; the right-hand one is
+the choice the key opens. `read_only` admits `plan` alone because `plan` is the
+one mode that executes no tool; `workspace_write` admits the four that still run
+the SDK's permission machinery and differ only in *who answers a prompt*; and
+`full_access` admits all six because it is the level that asks for no
+containment, so there is nothing left for a mode to widen.
+`bypassPermissions` — the mode that turns the machinery off — is therefore
+admitted at exactly the level whose own derived mode already is it.
+
+A `read_only` run under `plan` keeps everything the row above states, the
+replaced workflow body included: the mode is the one that level derives, and
+writing it out changes nothing.
 
 **`allow_tools:` is enforced by one harness and offered to the other**, and this
 document states the asymmetry rather than implying the two are equivalent:
@@ -3217,11 +3265,14 @@ That table is the whole of what crosses, and four rules come with it
   server-side — injects **no** credential into the run. Not an empty one: the
   same sentence §12.1 makes about the wire, one construct along;
 * **a declared fact the bound harness has no slot for is a compile error**
-  (`unsupported-connection-fact`) naming the fact and the harness. It is not
-  dropped with a warning the way an unverified `settings:` key is, and the
-  difference is what the value decides: an option nothing reads costs a feature,
-  and an endpoint or a credential that silently went missing costs a `401` on the
-  first live call, discovered in production;
+  (`unsupported-connection-fact`) naming the fact and the harness. An unverified
+  `settings:` key gets away with a warning because it still **travels** — it
+  reaches the SDK unchanged, and the cost of being wrong is one option nothing
+  reads. A fact with no slot has nowhere to travel to, so the only alternative to
+  an error is a value that silently went missing, and what this one decides is
+  where the traffic goes and whether it authenticates: an endpoint or a
+  credential quietly dropped costs a `401` on the first live call, discovered in
+  production;
 * **one spelling per fact.** A node `env:` entry naming a variable the table
   would set — or one the bound harness's own runtime reads for that same fact
   beside it, since `ANTHROPIC_AUTH_TOKEN` is a second identity on the same
@@ -3282,19 +3333,25 @@ q30 refused. `agent-compose explain unknown-harness-setting` names the keys each
 table holds.
 
 **Unchecked is not unbounded.** What `settings:` buys is the vendor's *other*
-options, never the ones this node already states: the generated adapter **drops**
-an unverified key that spells an SDK option it owns — the working directory, the
-permission mode or sandbox preset, the environment, the output schema, the
-system prompt, the tool allowlist and its callback, the abort signal, the model
-and the one model setting
+options, never the ones this node already states: a key that spells an SDK option
+the generated adapter owns is a **compile error**
+(`reserved-harness-setting`) — the working directory, the permission mode or
+sandbox preset, the environment, the output schema, the system prompt, the tool
+allowlist and its callback, the abort signal, the model and the one model setting
 [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)
-maps into it. Those are `workspace:`, `access:`, `env:`, `output:`, `prompt:`,
-`allow_tools:`, `timeout:` and `model:` respectively, and a key here cannot
-reach around the construct that states them. The curated keys of the tier above
-are mapped by name over the top for the same reason: two spellings of one option
-must not disagree about which wins.
+maps into it. Those are `workspace:`, `access:`, `permission_mode:`, `env:`,
+`output:`, `prompt:`, `allow_tools:`, `timeout:` and `model:` respectively, and a
+key here cannot reach around the construct that states them. The diagnostic names
+which one, so the refusal is a repair — and **which** repair follows from whether
+that key is required. `permission_mode:`, `access:`, `allow_tools:`, `env:` and
+`timeout:` are optional, so the message says to write one; `workspace:`,
+`model:`, `prompt:` and `output:` are required by the key table above, so the key
+is already on the node and the message says to take the *setting* off instead.
+Telling an author to write a line they have already written is not a repair. The
+curated keys of the tier above are mapped by name over the top for the same
+reason two spellings of one option must not disagree about which wins.
 
-An option does not have to *spell* a bound to reach around it, and the dropped
+An option does not have to *spell* a bound to reach around it, and the reserved
 set is the wider one. A harness SDK ships options that **contain** the bounds
 rather than naming them — extra command-line arguments, a settings file or
 object carrying permission rules, additional roots beside the working directory,
@@ -3305,15 +3362,36 @@ which is the failover ladder
 [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)
 stops at the boundary, the connection itself having crossed since
 [D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)
-— and each of those is dropped too. So is the option that says **which
+— and each of those is refused too. So is the option that says **which
 executable the harness itself is**, or what its language runtime
 loads before it: a key there does not widen one bound, it replaces or re-arms the
 program that enforces all of them, so every statement above it would be made
 about something else. So is every option that
 **resumes a previous session**, for a different reason: harness-native resume is
-a named exclusion (below), not a bound. The dropped set is per harness and
+a named exclusion (below), not a bound. The reserved set is per harness and
 audited against the SDK release this compiler pins, so a vendor's new option
 arrives with the pin rather than behind it.
+
+**An option in this wider half answers to no key, and the message says so** rather
+than naming the nearest one. Additional roots are the case worth spelling out:
+`workspace:` is *one* root and is required, and `access:` bounds a run to the tree
+it names, so a second writable root is not that key widened but the containment
+statement undone — a run written where no line of the node reached. Neither
+harness offers a key for it under any name, and a run that needs two trees is two
+nodes or one workspace holding both. Naming `workspace:` there would be a refusal
+that is wrong about the option *and* hands back a repair nobody can follow.
+
+**It is a refusal rather than a silent drop**, and that is a change from how this
+key first shipped: the adapter used to remove such a value on its way to the SDK
+under the warning above, which left an author unable to tell a setting that
+travelled from one that never arrived — the value looked accepted, the run
+ignored it, and the investigation went to the vendor's documentation. Where a
+dropped key would change what a run may do, failing at run time — or not failing
+at all — instead of at compile time is the class this grammar refuses (PRD G3).
+The generated adapter still subtracts the same names at run time, which is
+defence in depth for an artifact an older release built rather than the place the
+rule is made
+([D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)).
 
 #### What a run records, and what happens when one is interrupted
 
@@ -8949,14 +9027,24 @@ unchanged — what moved is **where** the credential is written.
 
 ### D140. Harness `settings:` is a second open object, checked in two tiers
 
-**PRD-extending** — see this appendix's preamble.
+**PRD-extending** — see this appendix's preamble. **Amended 2026-09-18** by
+[D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused),
+which is PRD resolved q60 ruling b: this entry originally said an unverified key
+spelling an adapter-owned option is **dropped**, and it is now a `validate`
+**error** (`reserved-harness-setting`) naming the option and the first-class key
+that states the same bound. What the entry is actually about is unchanged — the
+two tiers, the treadmill q30 refused, and the sentence that open is not
+unbounded; what moved is *where* the second half is enforced and what an author
+is told. The amended text follows; the superseded paragraph is quoted at the end
+so a reader of an older citation can see what changed.
 
 `settings:` inside a `coder:` block is an **open** object holding the harness's
 own configuration, checked the way a provider's `server_tools:` are
 ([D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers)): a key
 the harness's curated table knows is checked strictly, and anything else is a
 warning (`unknown-harness-setting`) naming what could not be verified, travelling
-to the SDK unchanged.
+to the SDK unchanged — unless it is on that harness's **reserved** list, which is
+refused.
 
 **This amends [D40](#d40-settings-is-the-only-open-object-in-the-logical-layer)**,
 which said `settings:` was *the* one open object in the logical layer. It is now
@@ -8975,21 +9063,28 @@ and no table at all would make a misspelled `max_turns` a silent no-op that cost
 a run its bound. The two tiers are the same trade q30 struck, with the warning as
 the honest half.
 
-**Open is not unbounded, and that is not a third tier.** An unverified key that
-spells an SDK option the generated adapter owns — the working directory, the
-permission mode or sandbox preset, the environment, the output schema, the tool
-allowlist, the abort signal, the model — is **dropped** rather than passed,
-because every one of them is a bound the node states somewhere a reader and
-`validate` can both see it (`workspace:`, `access:`, `env:`, `output:`,
-`allow_tools:`, `timeout:`, `model:`). Passing them would make `settings:` a
-second way to say those things and the only one no check covers, which turns the
-one deliberately open surface into the way around all the closed ones. The
-dropped set is the adapter's own key list rather than a grammar enum: it is not a
-statement about which options exist, it is the statement that this construct's
-bounds are not up for renegotiation from inside it.
+**Open is not unbounded, and that is not a third tier.** A key that spells an SDK
+option the generated adapter owns — the working directory, the permission mode or
+sandbox preset, the environment, the output schema, the tool allowlist, the abort
+signal, the model — is **refused**, because every one of them is a bound the node
+states somewhere a reader and `validate` can both see it (`workspace:`,
+`access:`, `permission_mode:`, `env:`, `output:`, `allow_tools:`, `timeout:`,
+`model:`). Passing them would make `settings:` a second way to say those things
+and the only one no check covers, which turns the one deliberately open surface
+into the way around all the closed ones. The reserved set is the adapter's own
+key list rather than a grammar enum: it is not a statement about which options
+exist, it is the statement that this construct's bounds are not up for
+renegotiation from inside it.
 
-**Status**: ratified — PRD resolved q57 ruling e. *PRD 5.9,
-resolved q30, q57; §8.9.*
+**What the amendment replaced**, verbatim: *"An unverified key that spells an SDK
+option the generated adapter owns … is **dropped** rather than passed"*, with the
+warning above saying which of the two happened. The list is the same list and the
+reason is the same reason; what changed is that a key on it now fails at
+`validate` and names the key to write instead
+([D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)).
+
+**Status**: ratified — PRD resolved q57 ruling e, amended by resolved q60 ruling
+b. *PRD 5.9, resolved q30, q57, q60; §8.9.*
 
 ### D141. A coder node's `model:` is a registry address, and the ladders stop at the boundary
 
@@ -9393,6 +9488,141 @@ variable is the environment manifest, which this credential joins on the hub's
 list **and** on every placement's, because every process installs. **Status**:
 shipped. *PRD resolved q15, q18, q27, q32, q40, q41, q47, q49, q50, q59; §4.3,
 §14.6.*
+
+---
+
+### D146. A coder node's permission mode is a key, bounded by `access:`, and a reserved setting is refused
+
+**PRD-extending** — see this appendix's preamble. Amends
+[D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers).
+
+Two rules, from one field report, and they are the two halves of one mistake.
+
+**1. `permission_mode:` is an optional key of the `coder:` block** taking, on
+`cc`, the pinned Agent SDK's own six modes — `default`, `acceptEdits`,
+`bypassPermissions`, `plan`, `dontAsk`, `auto`. On `codex` it is a compile error
+(`unsupported-permission-mode`) naming the asymmetry. Absent, it means the mode
+the node's `access:` level derives, which is the mapping
+[D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)
+already shipped. **The widening bound is the invariant**: `read_only` admits
+`plan`, `workspace_write` admits `default`, `acceptEdits`, `dontAsk` and `auto`,
+and `full_access` admits all six; a mode outside its level's set is a compile
+error (`widening-permission-mode`) naming the mode, the level and the set (§8.9).
+
+**2. A `settings:` key on the bound harness's reserved list is a compile error**
+(`reserved-harness-setting`) naming the key, the adapter-owned option it would
+reach, and the first-class key that states the same bound where one does —
+**under either of the two names a reserved row has**: the SDK's own spelling of
+the option (`permissionMode`, `cwd`, `sandboxMode`) and this grammar's spelling
+of the bound it states (`permission_mode`, `workspace`, `access`), which is the
+name §8.9's key table teaches and the shape the checked settings are written in.
+The repair is the row's either way; what differs is the reason the key is
+refused rather than let through, because a grammar spelling is not dropped by
+the driver at all — no SDK declares an option of that name, so it would travel
+unchanged, do nothing, and leave the node reading as though the bound were
+stated. The keys that state bounds are —
+`permission_mode:` for the modes, `access:` for the sandbox, `allow_tools:` for
+the toolset, `model:` and the `provider.*` behind it for the connection. **The
+repair depends on whether that key is required**: an optional key
+(`permission_mode:`, `access:`, `allow_tools:`, `env:`, `timeout:`) is one to
+write, and a required one (`workspace:`, `model:`, `prompt:`, `output:`) is
+already on the node, so the message says to take the setting off rather than
+telling an author to write a line they have written. Where a
+key **addresses** the value rather than holding it, the message names where it
+points instead of naming the key: the one model setting a harness takes — `cc`'s
+thinking budget, `codex`'s reasoning effort — is written in the `model.*`
+definition `model:` names (§12.2,
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)),
+and `model:` is required, so "write `model:`" would name a line already on the
+node. Where nothing states it, the message says so: the resume family is a named
+exclusion
+([D142](#d142-the-policy-chain-wraps-a-whole-harness-run-and-harness-native-resume-is-excluded)),
+`fallbackModel` is the ladder D141 stops, `approvalPolicy` is the app-server tier
+this release does not adopt, `extraArgs` is every bound at once, **roots beside
+the working directory** are the containment statement undone rather than
+`workspace:` widened — that key is one root and is required, so naming it would
+be wrong about the option and unfollowable besides — and the
+**process-spawn family** — which binary, which language runtime, what that
+runtime loads first, and the spawn function called in place of all three — is the
+program that enforces every bound rather than a bound to widen. `harness:` is not
+its answer: that key is required, takes `cc` or `codex`, and names which vendor's
+adapter runs, never which executable it is.
+
+**Rationale.**
+
+*Why a key rather than a setting.* A bound must be readable off the construct
+that holds it — the reason `access:` and `allow_tools:` are keys and not
+settings, and the reason
+[D135](#d135-a-builtin-binding-hands-the-model-the-program-and-says-so)'s trust
+statement is written where an author meets it. The alternative on offer was the
+one the field report found by itself: reach the mode through `settings:`, which
+is the one surface no check covers. D140's doctrine that `settings:` never
+reaches a bound another key states survives intact **because** the legitimate ask
+gets a key of its own, which is the whole shape of this entry: the two rules have
+to ship together or the second is a wall rather than a redirection.
+
+*Why the vendor's spellings.* Every other enum in this grammar is its own
+vocabulary, and D138 gives the reason it took `codex`'s three sandbox names
+rather than inventing: a translation nobody can verify against anything is worse
+than a vendor word. Read whole, that argument lands the same way here. There is
+no second harness to reconcile with — `codex` has no approval axis at all — so a
+name of our own would be a synonym for exactly one SDK's constant, with a mapping
+table nothing could check and a diagnostic that could not quote the vendor's own
+sentence back. The set is a curated per-harness table on
+[resolved q30's terms](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers),
+audited against the pinned release and re-opened by the pin, exactly as
+[D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)'s
+connection rows are.
+
+*Why the bound is stated as admissibility rather than as an ordering.* The three
+levels are not a chain: `plan` is narrower than everything and is admitted under
+`read_only` and `full_access` but not under `workspace_write`, because what
+`workspace_write` states is that edits under the workspace are the run's job and
+a mode that executes no tool is a different node. So the table is three explicit
+sets rather than a comparison, and it is written out in §8.9 and in the compiler
+table together — the same treatment `tools_enforced` gets, for the same reason: a
+reader comparing two coder nodes cannot derive it from anything else.
+
+*Why the refusal, and why now.* D140 shipped rule 2's list as a **warning plus a
+silent run-time drop**, which is the failure PRD resolved q60 was ratified from:
+an author who needed a mode `access:` could not reach wrote
+`settings: { permissionMode: … }`, was told the value was unverified, watched the
+run ignore it, and had no way to tell a key that travelled from a key that was
+removed. The hardening precedent is
+[D143](#d143-a-coder-nodes-provider-connection-crosses-through-a-per-harness-table)'s
+own: where a dropped value would change what a run may do, failing at run time —
+or not failing at all — instead of at compile time is the class PRD G3 refuses.
+The emitted drivers keep subtracting the same names, which is defence in depth
+for an artifact an older release built; a divergence between the compiler table
+and a driver's list is a test failure, held the way every bind in this appendix
+is.
+
+*What does not move.* `access:` is still the containment statement, still
+defaulted to `workspace_write`, and still the thing `plan` and `visualize` draw;
+the graph document gains the **resolved** mode beside `tools_enforced`, an
+additive field under `docs/graph.md` §9.2 with no `graph_version` bump. **That
+field is the graph document's alone**, which is where PRD resolved q60 ruling
+a's "`plan`/`visualize` show it beside `tools_enforced`" lands once the two
+surfaces are told apart: `visualize` renders that document and `--format json`
+prints it, so both carry the mode, while `plan` carries neither the mode nor
+`tools_enforced` and never has. A `plan` reports a coder node that arrived or
+left as the single field `coder.harness` — *which capability arrived* — and
+`docs/plan.md` §3 is explicit that the node's `workspace:`, `access:` and
+`allow_tools:` are **contents**, which an arrival is not expanded into. A
+resolved mode there would be that rule broken for one field and a bound drawn in
+the one surface whose subject is the diff rather than the composition. A node
+that writes no `permission_mode:` emits the **binding it always emitted**: the
+key is materialized into `src/graph.ts` only where it is stated, so an unchanged
+node's emitted lines are byte for byte what they were, and the mode the run works
+under is still the one `access:` derives, decided in the driver. That is a claim
+about the binding, not about a whole compiled project: the shared runtime and
+driver files carry this key's types and mapping, so they move with the compiler
+release — as they do on every release — and an artifact hash moves with them.
+**Status**: ratified — PRD resolved q60 rulings a and b. *PRD G3, resolved q25,
+q30, q54, q57, q58, q60; §8.9,
+[D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces),
+[D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers),
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary).*
 
 ## Appendix B — Editor integration
 

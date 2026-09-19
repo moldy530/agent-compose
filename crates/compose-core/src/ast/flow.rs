@@ -205,6 +205,94 @@ impl WorkspaceAccess {
     }
 }
 
+/// The **approval mode** a coder node's harness runs its own loop under
+/// (grammar 8.9, Decision D146, PRD resolved q60 ruling a).
+///
+/// The one place this grammar spells a vendor's vocabulary, and it is deliberate.
+/// [`WorkspaceAccess`] is *containment* — where a run may reach — and it is
+/// `codex`-shaped because that is the harness whose primitive is named; the Agent
+/// SDK carries a second, richer axis beside it, **how a call is approved**, whose
+/// six modes the `access:` enum flattened onto three. Inventing three more names
+/// of our own for the other half would be a translation with nothing to check it
+/// against, which is the argument Decision D138 already made for taking `codex`'s
+/// three; taken whole, the argument lands the other way here, so these are the
+/// pinned SDK's own spellings and the per-harness table in [`crate::harness`] is
+/// what says which harness has the axis at all.
+///
+/// **A mode is never a widening.** What a run may *do* is the node's `access:`,
+/// and a mode may only choose among the approvals that level already admits —
+/// which is the admissibility table in [`crate::harness::PERMISSION`], stated
+/// normatively in grammar 8.9 and enforced at `validate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PermissionMode {
+    /// Standard behaviour: the harness prompts for dangerous operations.
+    Default,
+    /// File edits are auto-accepted.
+    AcceptEdits,
+    /// Every permission check is bypassed.
+    BypassPermissions,
+    /// Planning: the loop reads and reports and executes no tool.
+    Plan,
+    /// Nothing is prompted for; anything not pre-approved is denied.
+    DontAsk,
+    /// A model classifier answers the permission prompts.
+    Auto,
+}
+
+impl PermissionMode {
+    /// Every mode, in the order the pinned Agent SDK's own `PermissionMode`
+    /// declares them.
+    ///
+    /// The SDK's order rather than an order of our own, because this list is an
+    /// audit of somebody else's type: a reader comparing the two reads them in
+    /// one order or reads them twice.
+    pub const ALL: &'static [Self] = &[
+        Self::Default,
+        Self::AcceptEdits,
+        Self::BypassPermissions,
+        Self::Plan,
+        Self::DontAsk,
+        Self::Auto,
+    ];
+
+    /// The keyword `permission_mode:` names it with, which is the SDK's own
+    /// spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::BypassPermissions => "bypassPermissions",
+            Self::Plan => "plan",
+            Self::DontAsk => "dontAsk",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// What the mode **does**, as the pinned SDK's own documentation states it —
+    /// the sentence a diagnostic quotes back when a mode is refused.
+    #[must_use]
+    pub const fn decides(self) -> &'static str {
+        match self {
+            Self::Default => "prompts for dangerous operations",
+            Self::AcceptEdits => "auto-accepts file edits",
+            Self::BypassPermissions => "bypasses every permission check",
+            Self::Plan => "plans, and executes no tool",
+            Self::DontAsk => "prompts for nothing and denies what is not pre-approved",
+            Self::Auto => "lets a model classifier answer the prompts",
+        }
+    }
+
+    /// The mode spelled `keyword`, if it is one.
+    #[must_use]
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|mode| mode.as_str() == keyword)
+    }
+}
+
 /// A `coder:` block: one run of a coding-agent harness (grammar 8.9,
 /// Decision D136, PRD resolved q57).
 ///
@@ -222,6 +310,9 @@ pub struct CoderBlock {
     pub workspace: Option<Spanned<Interpolated>>,
     /// `access:` — the containment preset; absent means `workspace_write`.
     pub access: Option<Spanned<WorkspaceAccess>>,
+    /// `permission_mode:` — the approval mode inside that containment; absent
+    /// means the mode `access:` derives (Decision D146).
+    pub permission_mode: Option<Spanned<PermissionMode>>,
     /// `prompt:` — required, literal text (Decision D13's rule, one surface on).
     pub prompt: Option<Spanned<String>>,
     /// `input:` — the declared input surface; absent means string-in (§5.3).

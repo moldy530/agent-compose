@@ -1551,14 +1551,15 @@ fn every_prd_question_the_project_cites_is_one_the_prd_resolved() {
     }
 }
 
-/// (e) The three copies of the **dropped `fallbackModel`** sentence agree about
+/// (e) The four copies of the **refused `fallbackModel`** sentence agree about
 /// what stops at a coder node's boundary (`docs/grammar.md` §8.9, Decisions
-/// D141 and D143, PRD resolved q58).
+/// D141, D143 and D146, PRD resolved q58, q60).
 ///
-/// One statement, written out three times because three audiences meet it in
-/// three places: §8.9's reserved-options paragraph, the
-/// `unknown-harness-setting` explanation an author reads after `settings: {
-/// fallbackModel: … }`, and the comment over `CC_RESERVED` in the emitted
+/// One statement, written out four times because four audiences meet it in four
+/// places: §8.9's reserved-options paragraph, the `reserved-harness-setting`
+/// explanation an author reads after `settings: { fallbackModel: … }`, the
+/// `unknown-harness-setting` explanation beside it that draws the line between
+/// the two tiers, and the comment over `CC_RESERVED` in the emitted
 /// driver. Before resolved q58 all three said the same true thing — the
 /// connection stops at the boundary — and after it the true thing is narrower:
 /// the **failover ladder** stops, and the connection crosses. The amendment
@@ -1582,6 +1583,10 @@ fn the_dropped_fallback_option_reads_as_the_ladder_in_every_copy() {
     // with — prose in two of them, the SDK's own key in the third.
     const COPIES: &[(&str, &str)] = &[
         ("docs/grammar.md", "a fallback model"),
+        (
+            "crates/compose-core/src/docs/codes/reserved-harness-setting.md",
+            "**`fallbackModel`**",
+        ),
         (
             "crates/compose-core/src/docs/codes/unknown-harness-setting.md",
             "a fallback model",

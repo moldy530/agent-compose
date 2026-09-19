@@ -108,9 +108,27 @@
 //! each row was read against, and
 //! `the_connection_table_is_audited_against_the_pinned_sdks` fails when the pin
 //! moves, so a vendor's new slot arrives with the bump rather than behind it.
+//!
+//! # Two more tables, on the same terms (PRD resolved q60)
+//!
+//! [`CONNECTION`] is the pattern, and two further tables copy it because they are
+//! the same kind of claim about the same pinned releases:
+//!
+//!  * [`PERMISSION`] — which harness has an **approval mode** axis at all, what
+//!    its modes are, which of them each `access:` level admits, and the mode a
+//!    level derives when `permission_mode:` is absent (grammar 8.9, Decision
+//!    D146, PRD resolved q60 ruling a);
+//!  * [`RESERVED`] — the options of each harness's own SDK surface that the
+//!    generated adapter owns, and the first-class key that states each of them
+//!    where one does. A `settings:` key spelling one is a `validate` **error**
+//!    since PRD resolved q60 ruling b, and the answer beside each row is what
+//!    makes that refusal a repair rather than a wall.
+//!
+//! Each records the release it was audited against, and each has an audit test
+//! that fails when the pin moves.
 
 use crate::ast::definition::ProviderKind;
-use crate::ast::flow::Harness;
+use crate::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
 use crate::ir::Ir;
 use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::Coder;
@@ -688,6 +706,758 @@ pub fn declared(provider: &Provider) -> Vec<ConnectionFact> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// The permission table (PRD resolved q60 ruling a)
+// ---------------------------------------------------------------------------
+
+/// What one `access:` level admits on one harness's approval axis.
+///
+/// Two answers per level, and they are different questions. `derived` is what
+/// the level means **on its own** — the mapping q57 shipped, which an absent
+/// `permission_mode:` still means exactly. `admits` is the **widening bound**:
+/// the modes this level may be moved to, which is what makes the key a choice
+/// inside a containment statement rather than a way around one.
+pub struct PermissionLevel {
+    /// The `access:` level this row answers for.
+    pub access: WorkspaceAccess,
+    /// The mode the level derives when the node states none.
+    ///
+    /// It is always a member of [`admits`](Self::admits) —
+    /// `a_levels_derived_mode_is_one_it_admits` holds that, because a default
+    /// the key could not be written out longhand would make the absent form mean
+    /// something the present form cannot say.
+    pub derived: PermissionMode,
+    /// Every mode this level admits, in [`PermissionMode::ALL`] order.
+    pub admits: &'static [PermissionMode],
+}
+
+/// One harness's approval-mode row: the SDK release it was read against, and a
+/// [`PermissionLevel`] per `access:` level.
+///
+/// **A harness with no row has no such axis**, which is `codex`: its containment
+/// primitive is a sandbox preset and its per-call approval tier lives in an app
+/// server this project does not adopt (PRD resolved q57 ruling c), so a
+/// `permission_mode:` on a node bound to it is refused rather than mapped onto
+/// something that would not hold. An empty row would have been a faked slot in
+/// the sense Decision D143 forbids by name.
+pub struct PermissionRow {
+    /// The harness this row is for.
+    pub harness: Harness,
+    /// The SDK version the modes were read out of (PRD 5.12).
+    pub audited: &'static str,
+    /// Each `access:` level's derived mode and admitted set, in
+    /// [`WorkspaceAccess::ALL`] order.
+    pub levels: &'static [PermissionLevel],
+}
+
+/// The approval-mode table (PRD resolved q60 ruling a).
+///
+/// # Where the modes were read
+///
+/// `@anthropic-ai/claude-agent-sdk@0.3.272`, `sdk.d.ts`:
+///
+/// ```text
+/// export declare type PermissionMode = 'default' | 'acceptEdits'
+///   | 'bypassPermissions' | 'plan' | 'dontAsk' | 'auto';
+/// ```
+///
+/// …with the release's own sentence for each, from the doc comment over that
+/// declaration: *"'default' - Standard behavior, prompts for dangerous
+/// operations. 'acceptEdits' - Auto-accept file edit operations.
+/// 'bypassPermissions' - Bypass all permission checks (requires
+/// allowDangerouslySkipPermissions). 'plan' - Planning mode, no actual tool
+/// execution. 'dontAsk' - Don't prompt for permissions, deny if not
+/// pre-approved. 'auto' - Use a model classifier to approve/deny permission
+/// prompts."* [`PermissionMode::decides`] is that list, one sentence per member,
+/// and `the_permission_table_is_audited_against_the_pinned_sdk` is what re-opens
+/// the reading when the pin moves.
+///
+/// # Why there is a `cc` row and no `codex` row
+///
+/// The gap PRD resolved q60 comes from: `access:` is codex-shaped — it maps
+/// one-to-one onto their three sandbox presets (Decision D138) — and the Agent
+/// SDK carries a second axis beside containment that those three flattened, so
+/// three of its six modes were unreachable by design rather than by intent.
+/// `codex` has nothing on the other side of that map: its own approval axis
+/// (`approvalPolicy`) is the app-server tier resolved q57 ruling c states this
+/// release does not adopt, and a run that escalated out of its sandbox to an
+/// approver nothing answers for would be `access:` saying one thing and the run
+/// doing another. So the key is **refused** on that harness, naming the
+/// asymmetry, rather than mapped onto a policy this project does not drive.
+///
+/// # The widening bound, level by level
+///
+/// The invariant is that a mode may never grant an operation the level's own
+/// derived mode would refuse, and the concrete sets are the ruling's:
+///
+///  * **`read_only` admits `plan` alone.** The level's sentence is "read the
+///    workspace, write nothing", and `plan` is the one mode of the six that
+///    executes no tool at all. Every other mode would let the loop reach a
+///    writing tool under a level that says it may not;
+///  * **`workspace_write` admits `acceptEdits`, `auto`, `default` and
+///    `dontAsk`.** Each of the four still runs the SDK's permission machinery —
+///    they differ in *who answers a prompt*, which is the axis — so the
+///    containment `workspace_write` states is the same under all four;
+///  * **`full_access` admits all six**, which is the level that asks for no
+///    containment: there is nothing left for a mode to widen.
+///
+/// `bypassPermissions` is the member worth naming twice: it turns the permission
+/// machinery **off**, so it is admitted at the one level whose own derived mode
+/// already is it, and refused everywhere else.
+pub const PERMISSION: &[PermissionRow] = &[PermissionRow {
+    harness: Harness::Cc,
+    audited: "0.3.272",
+    levels: &[
+        PermissionLevel {
+            access: WorkspaceAccess::ReadOnly,
+            derived: PermissionMode::Plan,
+            admits: &[PermissionMode::Plan],
+        },
+        PermissionLevel {
+            access: WorkspaceAccess::WorkspaceWrite,
+            derived: PermissionMode::AcceptEdits,
+            admits: &[
+                PermissionMode::Default,
+                PermissionMode::AcceptEdits,
+                PermissionMode::DontAsk,
+                PermissionMode::Auto,
+            ],
+        },
+        PermissionLevel {
+            access: WorkspaceAccess::FullAccess,
+            derived: PermissionMode::BypassPermissions,
+            admits: PermissionMode::ALL,
+        },
+    ],
+}];
+
+/// Whether one harness carries an approval-mode axis at all.
+#[must_use]
+pub fn has_permission_axis(harness: Harness) -> bool {
+    PERMISSION.iter().any(|row| row.harness == harness)
+}
+
+/// Every harness that carries one, in [`Harness::ALL`] order — what a refusal
+/// names as the place the key does belong.
+#[must_use]
+pub fn harnesses_with_a_permission_axis() -> Vec<Harness> {
+    Harness::ALL
+        .iter()
+        .copied()
+        .filter(|harness| has_permission_axis(*harness))
+        .collect()
+}
+
+/// One `access:` level's row under one harness, or `None` where the harness has
+/// no approval axis.
+#[must_use]
+pub fn permission_level(
+    harness: Harness,
+    access: WorkspaceAccess,
+) -> Option<&'static PermissionLevel> {
+    PERMISSION
+        .iter()
+        .find(|row| row.harness == harness)?
+        .levels
+        .iter()
+        .find(|level| level.access == access)
+}
+
+/// The modes one `access:` level admits under one harness, in
+/// [`PermissionMode::ALL`] order. Empty where the harness has no axis.
+#[must_use]
+pub fn admitted(harness: Harness, access: WorkspaceAccess) -> &'static [PermissionMode] {
+    permission_level(harness, access).map_or(&[], |level| level.admits)
+}
+
+/// The `access:` levels that admit one mode under one harness, in
+/// [`WorkspaceAccess::ALL`] order. Empty where the harness has no axis.
+///
+/// [`admitted`] read the other way, and the direction a **repair** needs. The
+/// three levels are not a chain (Decision D146): `plan` is admitted under
+/// `read_only` and under `full_access` and refused under the `workspace_write`
+/// between them, because what `workspace_write` states is that edits under the
+/// workspace are the run's job and a mode that executes no tool is a different
+/// node. So the level a refused mode belongs under is sometimes the **narrower**
+/// one, and a diagnostic that could only offer to raise `access:` would answer
+/// the most natural planning node with `full_access` — the widest containment
+/// this grammar grants — to reach the one mode that executes nothing.
+#[must_use]
+pub fn levels_admitting(harness: Harness, mode: PermissionMode) -> Vec<WorkspaceAccess> {
+    WorkspaceAccess::ALL
+        .iter()
+        .copied()
+        .filter(|access| admitted(harness, *access).contains(&mode))
+        .collect()
+}
+
+/// The mode one node **runs under**: the one it states, or the one its `access:`
+/// derives (PRD resolved q60 ruling a).
+///
+/// `None` where the bound harness has no approval axis, which is the answer that
+/// claims least: `codex` runs under a sandbox preset and there is no mode to
+/// report. A stated mode outside the level's admitted set has already been
+/// refused, so this function never reports one — it answers what the composition
+/// wrote, and `validate` is what decided the composition may say it.
+#[must_use]
+pub fn resolved_mode(coder: &Coder) -> Option<PermissionMode> {
+    let harness = coder.harness.value;
+    if !has_permission_axis(harness) {
+        return None;
+    }
+    if let Some(stated) = &coder.permission_mode {
+        return Some(stated.value);
+    }
+    permission_level(
+        harness,
+        coder.access.unwrap_or(WorkspaceAccess::WorkspaceWrite),
+    )
+    .map(|level| level.derived)
+}
+
+// ---------------------------------------------------------------------------
+// The reserved-option table (PRD resolved q60 ruling b)
+// ---------------------------------------------------------------------------
+
+/// What states, in the composition, the bound one reserved SDK option carries.
+///
+/// The half that makes PRD resolved q60 ruling b's refusal a **repair**. A key
+/// on a reserved list is refused because the construct's bounds are not up for
+/// renegotiation from inside `settings:` (Decision D140) — and an author who
+/// wrote one wanted something. Where a first-class key answers that want, the
+/// diagnostic names it; where nothing does, it says so rather than pointing at
+/// the nearest key and being wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// An **optional** key of the `coder:` block states this bound, written
+    /// without its colon — so the repair is to write it.
+    ///
+    /// Optional is the load-bearing word, and
+    /// [`a_reserved_answer_matches_how_grammar_89_requires_its_key`] holds it:
+    /// this variant's help is "write that key instead", which is a sentence only
+    /// about a key an author has *not* written. A required key gets
+    /// [`Already`](Self::Already).
+    By(&'static str),
+    /// A **required** key of the block states this bound, so it is already
+    /// written on the node: the repair is to take the setting off, not to write
+    /// a second spelling of a line that is three lines up.
+    ///
+    /// The variant exists for the reason [`Through`](Self::Through) exists, one
+    /// step less exotic. `workspace:`, `model:`, `prompt:` and `output:` are
+    /// **required** on every `coder:` block (grammar 8.9's key table), so an
+    /// author sent to one of them by [`By`](Self::By)'s sentence would be sent
+    /// to a line already on their node and told to write it — which reads as a
+    /// repair and is not one. What the author has to do is delete the setting;
+    /// the key beside it already says the thing.
+    Already(&'static str),
+    /// A key of the block **addresses** what states this bound: the key, written
+    /// without its colon, and where the value is actually written.
+    ///
+    /// The distinction earns its variant because [`By`](Self::By)'s repair is
+    /// "write that key instead", which is only true of a key an author has not
+    /// written. `model:` is **required** on every `coder:` block and is a
+    /// registry address (grammar 8.9, Decision D141): the thinking budget a
+    /// harness takes lives in the `model.*` definition it names, so an author
+    /// sent to `model:` alone would be sent to a line already on their node.
+    /// [`Already`](Self::Already) is the same objection where the value really
+    /// is on this block; this one is for where the value is not here at all.
+    Through(&'static str, &'static str),
+    /// Nothing states it: the option is **excluded** rather than restated, and
+    /// this is why.
+    Nothing(&'static str),
+}
+
+impl Answered {
+    /// The `coder:` block key this answer names, written without its colon.
+    ///
+    /// The row's **second** lookup name ([`reserved_reached`]): the grammar
+    /// spelling of the bound, which is the one an author reaching for it is
+    /// most likely to write. [`Nothing`](Self::Nothing) names none — the option
+    /// is excluded rather than restated, so there is no key to be written in
+    /// the wrong place.
+    #[must_use]
+    pub const fn key(self) -> Option<&'static str> {
+        match self {
+            Self::By(key) | Self::Already(key) | Self::Through(key, _) => Some(key),
+            Self::Nothing(_) => None,
+        }
+    }
+
+    /// Whether the key this answer names is **already** on the node.
+    ///
+    /// The two repair sentences, one bit apart: an optional key
+    /// ([`By`](Self::By)) is one to write, and a required one
+    /// ([`Already`](Self::Already), [`Through`](Self::Through)) is one already
+    /// three lines up, so the repair is to take the setting off. `None` where
+    /// no key is named at all.
+    #[must_use]
+    pub const fn key_is_required(self) -> Option<bool> {
+        match self {
+            Self::By(_) => Some(false),
+            Self::Already(_) | Self::Through(..) => Some(true),
+            Self::Nothing(_) => None,
+        }
+    }
+}
+
+/// One option the generated adapter owns, and what answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservedOption {
+    /// The option, spelled as the harness's own SDK surface spells it — which
+    /// is also the `settings:` key that would reach it.
+    pub option: &'static str,
+    /// The first-class key that states the same bound, or why none does.
+    pub answered: Answered,
+}
+
+/// One harness's reserved row.
+pub struct ReservedRow {
+    /// The harness this row is for.
+    pub harness: Harness,
+    /// The SDK release the option surface was read out of (PRD 5.12).
+    pub audited: &'static str,
+    /// Every option the adapter owns, sorted by name — the order the emitted
+    /// driver's own list is written in, because the two are one table.
+    pub options: &'static [ReservedOption],
+}
+
+/// The reserved-option table (PRD resolved q60 ruling b).
+///
+/// # Why this is a table here and not only a list in the driver
+///
+/// It was a list in the driver alone, read back out of the TypeScript by
+/// `validate` so a **warning** could say which half of Decision D140 a key landed
+/// in. PRD resolved q60 ruling b makes it an **error**, and an error is a
+/// statement this compiler makes rather than one the runtime performs: it names
+/// the option, the bound it would reach, and the key that answers the need. The
+/// answer is the part no list of strings could carry, and it is the part an
+/// author repairs against. The emitted drivers keep their own lists and keep
+/// subtracting at run time — defence in depth, against a binding this compiler
+/// release did not write — and `the_reserved_tables_are_one_table` holds the two
+/// copies together the way `the_connection_variable_tables_are_one_table` holds
+/// the other pair.
+///
+/// # What the two kinds of row are
+///
+/// The same two the drivers' own comments draw, and the split survives because
+/// it is what an author is told:
+///
+///  * an option that **spells** a bound another key states — `cwd` is
+///    `workspace:`, `permissionMode` is `permission_mode:` (which is the key PRD
+///    resolved q60 ruling a exists to give this answer), `sandboxMode` is
+///    `access:`, `outputFormat` is `output:`;
+///  * an option that **contains** one without spelling it — `extraArgs` is any
+///    CLI flag there is, `mcpServers`, `agents` and `skills` put a tool or a
+///    whole loop outside `allow_tools:`, `additionalDirectories` hands a run a
+///    second writable root beside the one `workspace:` names, the process-spawn
+///    family replaces the program that enforces every bound.
+///
+/// A row's [`Answered`] is what a reader should do **instead**, and the variants
+/// are that sentence rather than a taxonomy of options.
+/// [`Answered::By`] is the plain case — an *optional* key states the bound and
+/// the repair is to write it. Everything else exists because "write that key
+/// instead" would be false:
+///
+///  * [`Answered::Already`], where the key that states the bound is
+///    **required** on every block and is therefore already three lines up:
+///    `cwd` and `workingDirectory` are `workspace:`, `model` is `model:`,
+///    `outputFormat` is `output:`, `systemPrompt` and `planModeInstructions`
+///    are `prompt:`. The repair is to take the setting off;
+///  * [`Answered::Through`], where `model:` is an **address**, so the one model
+///    setting a harness takes — `cc`'s thinking budget, `codex`'s reasoning
+///    effort — is stated in the `model.*` definition it names rather than on
+///    this block (Decision D141);
+///  * [`Answered::Nothing`], for the five families no key of the block states.
+///    The resume family, which PRD resolved q57 ruling b excludes by name;
+///    `fallbackModel` and `approvalPolicy`, which are a ladder and a tier that
+///    stop at this boundary; `extraArgs`, which is not one bound to point at but
+///    all of them at once; **roots beside the workspace**, which `workspace:`
+///    cannot express because it is one root and required, so an author asking
+///    for a second has asked for something this grammar does not offer rather
+///    than for a key they forgot; and the **process-spawn family**, which is the
+///    one grammar 8.9 says does not widen a bound but replaces the program
+///    enforcing all of them — `harness:` is required on every block and names
+///    which vendor's adapter runs, never which executable that adapter spawns or
+///    what runtime spawns it, so pointing an author at it would name a key they
+///    have already written and that cannot say what they asked for.
+pub const RESERVED: &[ReservedRow] = &[
+    ReservedRow {
+        harness: Harness::Cc,
+        audited: "0.3.272",
+        options: CC_RESERVED,
+    },
+    ReservedRow {
+        harness: Harness::Codex,
+        audited: "0.154.0",
+        options: CODEX_RESERVED,
+    },
+];
+
+/// `cc`'s reserved options: `@anthropic-ai/claude-agent-sdk`'s `Options`.
+const CC_RESERVED: &[ReservedOption] = &[
+    ReservedOption {
+        option: "abortController",
+        answered: Answered::By("timeout"),
+    },
+    ReservedOption {
+        option: "additionalDirectories",
+        answered: Answered::Nothing(ROOTS),
+    },
+    ReservedOption {
+        option: "agent",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "agents",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // The flag the SDK requires beside `bypassPermissions`, which is the
+        // mode `permission_mode:` states and `access: full_access` derives.
+        option: "allowDangerouslySkipPermissions",
+        answered: Answered::By("permission_mode"),
+    },
+    ReservedOption {
+        option: "allowedTools",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "canUseTool",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "continue",
+        answered: Answered::Nothing(RESUME),
+    },
+    ReservedOption {
+        option: "cwd",
+        answered: Answered::Already("workspace"),
+    },
+    ReservedOption {
+        option: "env",
+        answered: Answered::By("env"),
+    },
+    ReservedOption {
+        option: "executable",
+        answered: Answered::Nothing(SPAWN),
+    },
+    ReservedOption {
+        option: "executableArgs",
+        answered: Answered::Nothing(SPAWN),
+    },
+    ReservedOption {
+        option: "extraArgs",
+        answered: Answered::Nothing(
+            "an arbitrary command-line flag is every bound at once — \
+             `dangerously-skip-permissions` and `add-dir` among them — so no one key answers it",
+        ),
+    },
+    ReservedOption {
+        option: "fallbackModel",
+        answered: Answered::Nothing(LADDER),
+    },
+    ReservedOption {
+        option: "forkSession",
+        answered: Answered::Nothing(RESUME),
+    },
+    ReservedOption {
+        option: "hooks",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "managedSettings",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "maxThinkingTokens",
+        answered: Answered::Through("model", THINKING),
+    },
+    ReservedOption {
+        option: "mcpServers",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "model",
+        answered: Answered::Already("model"),
+    },
+    ReservedOption {
+        option: "outputFormat",
+        answered: Answered::Already("output"),
+    },
+    ReservedOption {
+        option: "pathToClaudeCodeExecutable",
+        answered: Answered::Nothing(SPAWN),
+    },
+    ReservedOption {
+        // The key PRD resolved q60 ruling a exists to hand this row an answer:
+        // before it, the modes beyond the three `access:` derives were reachable
+        // through no key at all, and `settings:` was where authors went looking.
+        option: "permissionMode",
+        answered: Answered::By("permission_mode"),
+    },
+    ReservedOption {
+        option: "permissionPromptToolName",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "permissionPrompts",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // Plan mode's body, which the adapter fills from the node's own
+        // instructions (grammar 8.9's `read_only` row).
+        option: "planModeInstructions",
+        answered: Answered::Already("prompt"),
+    },
+    ReservedOption {
+        option: "plugins",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "resume",
+        answered: Answered::Nothing(RESUME),
+    },
+    ReservedOption {
+        option: "resumeDropsTurn",
+        answered: Answered::Nothing(RESUME),
+    },
+    ReservedOption {
+        option: "resumeSessionAt",
+        answered: Answered::Nothing(RESUME),
+    },
+    ReservedOption {
+        option: "sandbox",
+        answered: Answered::By("access"),
+    },
+    ReservedOption {
+        option: "sessionId",
+        answered: Answered::Nothing(RESUME),
+    },
+    ReservedOption {
+        option: "settingSources",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "settings",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // The SDK's single switch for turning skills on — and the one that says
+        // so: "you do not need to add `'Skill'` to `allowedTools` yourself when
+        // using this option". A loop's worth of instructions within reach of a
+        // run whose `allow_tools:` never named it, exactly as `plugins` (which
+        // carries skills among other things) and `agents` are.
+        option: "skills",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // The fourth member of the process-spawn family: a function called "in
+        // place of the default local spawn". From YAML it can only ever be a
+        // non-function, so a key spelling it would reach the SDK and die inside
+        // the vendor's own code rather than at `validate`.
+        option: "spawnClaudeCodeProcess",
+        answered: Answered::Nothing(SPAWN),
+    },
+    ReservedOption {
+        option: "systemPrompt",
+        answered: Answered::Already("prompt"),
+    },
+    ReservedOption {
+        option: "thinking",
+        answered: Answered::Through("model", THINKING),
+    },
+    ReservedOption {
+        option: "toolAliases",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        option: "tools",
+        answered: Answered::By("allow_tools"),
+    },
+];
+
+/// `codex`'s reserved options: `@openai/codex-sdk`'s `ThreadOptions`.
+const CODEX_RESERVED: &[ReservedOption] = &[
+    ReservedOption {
+        option: "additionalDirectories",
+        answered: Answered::Nothing(ROOTS),
+    },
+    ReservedOption {
+        // The per-call approval tier PRD resolved q57 ruling c does not adopt —
+        // and the reason `permission_mode:` is refused on this harness rather
+        // than mapped onto it (PRD resolved q60 ruling a).
+        option: "approvalPolicy",
+        answered: Answered::Nothing(
+            "a per-call approval tier belongs to an app server this release does not adopt, so a \
+             run that escalated out of its sandbox would reach an approver nothing here answers \
+             for",
+        ),
+    },
+    ReservedOption {
+        option: "model",
+        answered: Answered::Already("model"),
+    },
+    ReservedOption {
+        option: "modelReasoningEffort",
+        answered: Answered::Through("model", REASONING),
+    },
+    ReservedOption {
+        option: "sandboxMode",
+        answered: Answered::By("access"),
+    },
+    ReservedOption {
+        option: "workingDirectory",
+        answered: Answered::Already("workspace"),
+    },
+];
+
+/// Why the resume family answers to no key (PRD resolved q57 ruling b).
+const RESUME: &str = "harness-native resume is a named exclusion rather than a bound: a vendor's \
+                      session store is machine-local, and the journal is the complete hub state";
+
+/// …and why a fallback model does (Decision D141).
+const LADDER: &str = "a fallback model is the failover ladder, which does not reach inside a \
+                      harness run: the harness owns its client and its own retries, and this \
+                      compiler's `retry:` wraps whole runs";
+
+/// …and why roots beside the workspace do (grammar 8.9, PRD resolved q57 ruling
+/// c).
+///
+/// Not `Answered::By("workspace")`, which is the answer this option had and
+/// which was wrong twice over. It was wrong about the **option**:
+/// `additionalDirectories` is roots *beside* the working directory, not the
+/// working directory, and both drivers file it under the options that
+/// **contain** a bound without spelling it rather than the ones that spell one
+/// (`the_reserved_tables_are_one_table`'s two halves;
+/// `roots_beside_the_workspace_are_dropped_under_every_harness` is the guard
+/// named for it). And it was wrong about the **repair**: `workspace:` is
+/// required on every `coder:` block and takes exactly one root, so an author who
+/// asked for a second was sent to a key already on their node that cannot say
+/// what they asked for — the same unfollowable sentence [`SPAWN`] exists to
+/// avoid.
+const ROOTS: &str = "a second writable root beside `workspace:` is not that key widened but the \
+                     containment statement undone — `workspace:` is one root, it is required, and \
+                     `access:` bounds a run to the tree it names, so a run handed another is \
+                     written where no line of the node reached. Neither harness offers a key for \
+                     it, and a run that needs two trees is two nodes or one workspace holding \
+                     both";
+
+/// …and why the process-spawn family does (grammar 8.9, PRD resolved q57 ruling
+/// c).
+///
+/// Not `Answered::By("harness")`, which is the answer this family had and the
+/// one that cannot be followed: `harness:` is **required** on every `coder:`
+/// block and takes `cc` or `codex` — an author who asked for a different binary,
+/// a different JavaScript runtime, or a spawn function of their own would be
+/// sent to a key already on their node that cannot name any of those things.
+/// Grammar 8.9 puts this family in the other class in so many words: a key there
+/// "does not widen one bound, it replaces or re-arms the program that enforces
+/// all of them".
+const SPAWN: &str = "which program a run is — the binary, the runtime that spawns it, what that \
+                     runtime loads first — is not a bound to widen but the thing that enforces \
+                     every bound, so `tools`, `canUseTool` and `permissionMode` would be asked \
+                     of something the composition never named. `harness:` names which vendor's \
+                     adapter runs, never which executable it is";
+
+/// …and where the one model setting each harness takes is written instead — the
+/// [`Answered::Through`] rows (Decision D141).
+///
+/// Two strings rather than one because the `model.*` key is the harness's own:
+/// `thinking:` carries `cc`'s budget and `reasoning_effort:` carries `codex`'s
+/// effort, and a refusal that named the other harness's key would be the
+/// sends-you-to-a-second-diagnostic failure this whole answer exists to avoid.
+const THINKING: &str = "`model:` is a registry address, so the one model setting this harness \
+                        takes is written in the `model.*` definition it names — `thinking:` in \
+                        that definition's own `settings:`, where the provider plugin's schema \
+                        checks it (grammar 12.2, Decision D141)";
+
+/// …and `codex`'s half of it.
+const REASONING: &str = "`model:` is a registry address, so the one model setting this harness \
+                         takes is written in the `model.*` definition it names — \
+                         `reasoning_effort:` in that definition's own `settings:`, where the \
+                         provider plugin's schema checks it (grammar 12.2, Decision D141)";
+
+/// Every option one harness's adapter owns, in the table's order.
+#[must_use]
+pub fn reserved_of(harness: Harness) -> &'static [ReservedOption] {
+    RESERVED
+        .iter()
+        .find(|row| row.harness == harness)
+        .map_or(&[], |row| row.options)
+}
+
+/// The reserved row one `settings:` key would reach, if it reaches one.
+#[must_use]
+pub fn reserved_option(harness: Harness, key: &str) -> Option<&'static ReservedOption> {
+    reserved_of(harness)
+        .iter()
+        .find(|reserved| reserved.option == key)
+}
+
+/// Which of a reserved row's two spellings a `settings:` key was written in.
+///
+/// A row has two names, not one, and PRD resolved q60 ruling b's refusal is
+/// owed to both. The table is keyed on the **SDK's** spelling because that is
+/// the key that would reach the option; the key an author is *taught* is the
+/// grammar's — `permission_mode:`, `access:`, `allow_tools:` — and the field
+/// report the ruling was ratified from is an author looking for a bound in
+/// `settings:`. Keyed on the SDK spelling alone, `settings: { permission_mode: … }`
+/// — the spelling three lines up on the same node, and the shape the curated
+/// tier's own keys are written in — missed the redirection entirely and got the
+/// second tier's warning instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedSpelling {
+    /// The SDK's own name for the option (`permissionMode`), which is the key
+    /// that would reach it were `settings:` to travel unchanged.
+    Option,
+    /// The **grammar's** name for the bound (`permission_mode`) — a key this
+    /// block takes one level up, written a level down where no option answers
+    /// to it.
+    Key,
+}
+
+/// A `settings:` key that lands on a reserved row, and how it was spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservedHit {
+    /// The row the key reaches.
+    pub held: &'static ReservedOption,
+    /// Which of the row's two names the author wrote.
+    pub spelling: ReservedSpelling,
+}
+
+/// The reserved row one `settings:` key reaches, under **either** spelling.
+///
+/// The SDK spelling is answered first and exactly, so a row whose two names
+/// coincide (`model`, `env`) reads as the option it is. Only then is the key
+/// matched against the grammar key each row's [`Answered`] names, which is
+/// where `permission_mode`, `access`, `allow_tools`, `workspace`, `prompt`,
+/// `output` and `timeout` are caught.
+///
+/// Several rows can name one grammar key — every option that puts a tool inside
+/// a run answers to `allow_tools:` — and the row that wins is the first in table
+/// order. That choice is invisible in the diagnostic on purpose: a key written
+/// in the grammar's spelling is refused for naming a **bound**, not for spelling
+/// any one option, so the message quotes the key and the repair and never the
+/// row. [`a_grammar_key_reaches_one_repair_under_every_row_that_names_it`] holds
+/// the part that would otherwise depend on the choice — the rows naming one key
+/// agree about whether that key is already on the node.
+#[must_use]
+pub fn reserved_reached(harness: Harness, key: &str) -> Option<ReservedHit> {
+    if let Some(held) = reserved_option(harness, key) {
+        return Some(ReservedHit {
+            held,
+            spelling: ReservedSpelling::Option,
+        });
+    }
+    reserved_of(harness)
+        .iter()
+        .find(|held| held.answered.key() == Some(key))
+        .map(|held| ReservedHit {
+            held,
+            spelling: ReservedSpelling::Key,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,5 +1965,772 @@ mod tests {
             variables_set(Harness::Codex, &[ConnectionFact::Credential]),
             vec![(ConnectionFact::Credential, "CODEX_API_KEY")]
         );
+    }
+
+    /// `docs/grammar.md`, read at test time rather than embedded: the two
+    /// tables below are bound to what the section an author reads actually
+    /// says.
+    fn grammar() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/grammar.md"),
+        )
+        .expect("`docs/grammar.md` is readable")
+    }
+
+    /// **The approval-mode table is an audit of the pinned SDK's own type**
+    /// (grammar 8.9, Decision D146, PRD resolved q60 ruling a).
+    ///
+    /// [`the_connection_table_is_audited_against_the_pinned_sdks`]'s argument on
+    /// the other surface those releases own: a mode list is a claim about
+    /// somebody else's `.d.ts`, the release is what this repository pins, and a
+    /// claim whose ground moved has to be read again rather than carried
+    /// forward. A vendor that adds a seventh mode adds it in a release, so the
+    /// bump is what re-opens the reading.
+    #[test]
+    fn the_permission_table_is_audited_against_the_pinned_sdk() {
+        for row in PERMISSION {
+            assert_eq!(
+                version_of(row.harness),
+                row.audited,
+                "`{}`'s SDK is pinned at {} and its permission row was audited against {}: read \
+                 the release's own `PermissionMode` declaration and the sentence it documents \
+                 each member with, decide which `access:` level admits a new one, and move this \
+                 version up (grammar 8.9, Decision D146)",
+                row.harness.as_str(),
+                version_of(row.harness),
+                row.audited
+            );
+        }
+    }
+
+    /// **Every level answers, its derived mode is one it admits, and an admitted
+    /// set is a set** (grammar 8.9, Decision D146).
+    ///
+    /// Three ways a hand-written admissibility table goes wrong in silence, and
+    /// each costs something different:
+    ///
+    ///  1. a **missing level**. [`admitted`] answers the empty slice for a row
+    ///     it cannot find, and an empty admitted set refuses every mode — so a
+    ///     level left out of the table reads, at `validate`, as a level that
+    ///     admits nothing, with a message listing nothing;
+    ///  2. a **derived mode the level does not admit**. The absent key means the
+    ///     derived mode exactly (PRD resolved q60 ruling a), so a level whose
+    ///     own default could not be written out longhand would make the two
+    ///     forms mean different things — and refuse the composition that spells
+    ///     out what it already does;
+    ///  3. an **unordered or repeated** admitted set, which is only a message
+    ///     defect and is still a defect: the list a refusal prints is this one,
+    ///     and PRD G3 makes that a product surface.
+    #[test]
+    fn a_levels_derived_mode_is_one_it_admits() {
+        for row in PERMISSION {
+            let answered: Vec<WorkspaceAccess> =
+                row.levels.iter().map(|level| level.access).collect();
+            assert_eq!(
+                answered,
+                WorkspaceAccess::ALL.to_vec(),
+                "`{}`'s permission row does not answer every `access:` level, in order — an \
+                 unanswered level admits nothing at all",
+                row.harness.as_str()
+            );
+            for level in row.levels {
+                assert!(
+                    level.admits.contains(&level.derived),
+                    "`{}`'s `access: {}` derives `{}` and does not admit it, so a node spelling \
+                     out the mode it already runs under is refused",
+                    row.harness.as_str(),
+                    level.access.as_str(),
+                    level.derived.as_str()
+                );
+                let ordered: Vec<PermissionMode> = PermissionMode::ALL
+                    .iter()
+                    .copied()
+                    .filter(|mode| level.admits.contains(mode))
+                    .collect();
+                assert_eq!(
+                    level.admits.to_vec(),
+                    ordered,
+                    "`{}`'s `access: {}` lists its admitted modes out of `PermissionMode::ALL` \
+                     order or lists one twice, and that list is what a refusal prints (PRD G3)",
+                    row.harness.as_str(),
+                    level.access.as_str()
+                );
+            }
+        }
+    }
+
+    /// **The widening bound is the ruling's, level by level** (PRD resolved q60
+    /// ruling a).
+    ///
+    /// [`a_levels_derived_mode_is_one_it_admits`] holds the table's *shape*;
+    /// this holds its **content**, written out by name for the reason
+    /// `the_cc_row_claims_the_whole_endpoint_selection_family` is: a shape check
+    /// is satisfied by any well-formed table, and what the ruling fixed is these
+    /// three sets. The sharp member is `bypassPermissions` — the mode that turns
+    /// the permission machinery off — which a table drifting one entry would let
+    /// under `workspace_write`, where `validate` would then accept a node whose
+    /// `access:` says writes are bounded to the workspace and whose run is
+    /// bounded by nothing.
+    #[test]
+    fn each_access_level_admits_exactly_the_modes_the_ruling_names() {
+        for (access, derived, admits) in [
+            (
+                WorkspaceAccess::ReadOnly,
+                PermissionMode::Plan,
+                &[PermissionMode::Plan][..],
+            ),
+            (
+                WorkspaceAccess::WorkspaceWrite,
+                PermissionMode::AcceptEdits,
+                &[
+                    PermissionMode::Default,
+                    PermissionMode::AcceptEdits,
+                    PermissionMode::DontAsk,
+                    PermissionMode::Auto,
+                ][..],
+            ),
+            (
+                WorkspaceAccess::FullAccess,
+                PermissionMode::BypassPermissions,
+                PermissionMode::ALL,
+            ),
+        ] {
+            assert_eq!(
+                admitted(Harness::Cc, access),
+                admits,
+                "`access: {}` does not admit the set PRD resolved q60 ruling a names",
+                access.as_str()
+            );
+            assert_eq!(
+                permission_level(Harness::Cc, access).map(|level| level.derived),
+                Some(derived),
+                "`access: {}` does not derive the mode resolved q57 shipped, so an existing \
+                 composition that states no `permission_mode:` changed meaning",
+                access.as_str()
+            );
+        }
+        // …and the one refusal the sets exist for, named rather than derived: a
+        // level that bounds writes to the workspace does not admit the mode that
+        // bypasses the checks holding them there.
+        assert!(
+            !admitted(Harness::Cc, WorkspaceAccess::WorkspaceWrite)
+                .contains(&PermissionMode::BypassPermissions)
+        );
+        assert!(
+            !admitted(Harness::Cc, WorkspaceAccess::ReadOnly)
+                .contains(&PermissionMode::AcceptEdits)
+        );
+    }
+
+    /// **A harness with no approval axis claims nothing** (PRD resolved q60
+    /// ruling a, q57 ruling c).
+    ///
+    /// `codex`'s per-call approval tier is an app server this release does not
+    /// adopt, so the honest content of this table is a missing row — and a
+    /// missing row has to read as *refuse the key*, never as *admit none of it
+    /// quietly*. [`resolved_mode`] is the surface where that distinction is
+    /// visible: `None` is "this harness runs under a sandbox preset and there is
+    /// no mode to report", which is what the graph document draws and what
+    /// `validate` refuses a stated key against.
+    #[test]
+    fn a_harness_with_no_approval_axis_reports_no_mode() {
+        assert!(has_permission_axis(Harness::Cc));
+        for harness in [Harness::Codex, Harness::DeepAgents, Harness::Native] {
+            assert!(
+                !has_permission_axis(harness),
+                "`{}` claims an approval axis, so `permission_mode:` would be mapped onto \
+                 something this release does not drive",
+                harness.as_str()
+            );
+            for access in WorkspaceAccess::ALL {
+                assert!(admitted(harness, *access).is_empty());
+                assert!(permission_level(harness, *access).is_none());
+            }
+        }
+        assert_eq!(harnesses_with_a_permission_axis(), vec![Harness::Cc]);
+    }
+
+    /// **A stated mode is the mode the graph document reports** (PRD resolved
+    /// q60 ruling a, `docs/graph.md` §5.8).
+    ///
+    /// [`resolved_mode`] has two branches, and only one of them is in any
+    /// composition this repository commits: every example, golden and valid
+    /// fixture leaves `permission_mode:` out, so the `access:`-derived branch is
+    /// drawn everywhere and the **stated** branch — the one the ruling's
+    /// graph-document clause is about — would be drawn nowhere. Deleting it
+    /// would ship green, with `visualize` and `--format json` reporting
+    /// `acceptEdits` for a node written `permission_mode: dontAsk`: a document
+    /// stating a bound the run does not hold, which is the failure
+    /// [`the_permission_tables_are_one_table`] keeps off the compiler/driver
+    /// pair one surface along.
+    ///
+    /// So the node states `dontAsk` and writes no `access:`, which makes the
+    /// expected value one **no derivation produces** — grammar 8.9's default is
+    /// `workspace_write` and its derived mode is `acceptEdits`. A case that
+    /// stated `acceptEdits` would pass against a document that had ignored the
+    /// key entirely.
+    #[test]
+    fn a_stated_mode_is_the_mode_the_graph_document_reports() {
+        use crate::codegen::test_support::ir_of;
+
+        let composition = |stated: &str| {
+            format!(
+                "version: \"0.1\"\n\
+provider.p:\n  kind: anthropic\n  api_key: ${{K}}\n\
+model.m:\n  provider: provider.p\n  id: some-model\n\
+state:\n  summary: {{ type: string, default: \"\" }}\n\
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: /srv/checkout\n{stated}        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+            )
+        };
+        let drawn = |source: &str| {
+            let ir = ir_of(source);
+            let diagnostics = crate::check(&ir);
+            assert!(
+                diagnostics.is_empty(),
+                "a document is only drawn for a composition that validates: {diagnostics:#?}"
+            );
+            crate::graph::graph(&ir)
+                .flows
+                .iter()
+                .flat_map(|flow| &flow.nodes)
+                .find(|node| node.id == "build")
+                .expect("the flow draws its coder node")
+                .coder
+                .as_ref()
+                .expect("a coder node carries a coder view")
+                .permission_mode
+                .clone()
+        };
+
+        assert_eq!(
+            drawn(&composition("        permission_mode: dontAsk\n")),
+            Some("dontAsk".to_string()),
+            "the graph document reports a mode the node did not state, so `visualize` and \
+             `--format json` draw a bound the run does not hold (PRD resolved q60 ruling a)"
+        );
+        // …and the control, which is what says the assertion above is about the
+        // stated branch rather than about a field that happens to be filled:
+        // the same node with the key dropped is the derivation, and the two
+        // answers differ.
+        assert_eq!(
+            drawn(&composition("")),
+            Some("acceptEdits".to_string()),
+            "a node that states no `permission_mode:` is drawn with something other than the mode \
+             grammar 8.9's default level derives"
+        );
+    }
+
+    /// **The compiler's derived mapping and the driver's are one table**
+    /// (grammar 8.9, Decision D146, PRD resolved q60 ruling a).
+    ///
+    /// `CC_PERMISSION` in `src/harness-cc.ts` is what a run with no stated mode
+    /// is actually given; the `derived` column above is what `validate` admits
+    /// against, what the graph document draws and what `visualize` prints. Two
+    /// hand-maintained accounts of one mapping drift in silence, and this pair
+    /// drifts into the gap PRD resolved q60 ruling a is about: the document
+    /// would report one mode while the run took another, with every surface that
+    /// could have complained told the mapping was carried.
+    #[test]
+    fn the_permission_tables_are_one_table() {
+        const CC: &str = include_str!("codegen/js/harness-cc.ts");
+
+        let object = CC
+            .split_once("const CC_PERMISSION")
+            .expect("`src/harness-cc.ts` declares `CC_PERMISSION`")
+            .1;
+        let object = &object[..object.find("};").expect("…and closes the object it opened")];
+        for level in PERMISSION
+            .iter()
+            .find(|row| row.harness == Harness::Cc)
+            .expect("`cc` has a permission row")
+            .levels
+        {
+            let written = format!("{}: \"{}\"", level.access.as_str(), level.derived.as_str());
+            assert!(
+                object.contains(&written),
+                "`CC_PERMISSION` in `src/harness-cc.ts` does not map `{}` onto `{}`: the table \
+                 here and the driver's are two copies of one mapping, and a run whose derived \
+                 mode is not the one `validate` admitted against is a bound the graph document \
+                 reports and the run does not hold",
+                level.access.as_str(),
+                level.derived.as_str()
+            );
+        }
+    }
+
+    /// **The reserved table is an audit of the pinned SDKs' option surfaces**
+    /// (PRD resolved q60 ruling b).
+    ///
+    /// `a_reserved_list_is_audited_against_the_pinned_option_surface` in
+    /// `src/codegen/harness.rs` says the same thing about the emitted driver's
+    /// copy; this says it about the copy `validate` refuses a composition on. A
+    /// vendor's new reach-around arrives in a release, so the pin is what
+    /// re-opens both audits.
+    #[test]
+    fn the_reserved_table_is_audited_against_the_pinned_sdks() {
+        for row in RESERVED {
+            assert_eq!(
+                version_of(row.harness),
+                row.audited,
+                "`{}`'s SDK is pinned at {} and its reserved row was audited against {}: read the \
+                 release's own options, add every one that reaches around `workspace:`, \
+                 `access:`, `permission_mode:`, `env:`, `output:`, `prompt:`, `allow_tools:`, \
+                 `timeout:` or `model:`, answer each with the key that states it, and move this \
+                 version up (grammar 8.9, Decision D146)",
+                row.harness.as_str(),
+                version_of(row.harness),
+                row.audited
+            );
+        }
+        for harness in [Harness::DeepAgents, Harness::Native] {
+            assert!(
+                reserved_of(harness).is_empty(),
+                "a reserved harness has no SDK whose options an adapter could own"
+            );
+        }
+    }
+
+    /// **Each reserved row and its driver's own list are one table** (grammar
+    /// 8.9, Decision D146, PRD resolved q60 ruling b).
+    ///
+    /// `the_connection_variable_tables_are_one_table`'s argument, on the third
+    /// pair of hand-maintained copies this project keeps. The row above is what
+    /// `validate` **refuses** a `settings:` key against; `CC_RESERVED` and
+    /// `CODEX_RESERVED` in the emitted drivers are that same list declared again
+    /// for the runtime, where `passthrough` subtracts those names before the SDK
+    /// sees them. The two answer one question from opposite ends, and a name in
+    /// one and not the other is a hole with no diagnostic in it:
+    ///
+    ///  * a name the **table** holds and the driver does not scrub is one this
+    ///    release refuses at `validate` and an artifact built by an older one
+    ///    still carries — the run-time subtraction is the defence in depth PRD
+    ///    resolved q60 ruling b keeps for exactly that;
+    ///  * a name the **driver** scrubs and the table does not hold is worse: the
+    ///    composition compiles, `validate` says the key travels to the SDK
+    ///    unverified, and the run then silently drops it.
+    #[test]
+    fn the_reserved_tables_are_one_table() {
+        const CC: &str = include_str!("codegen/js/harness-cc.ts");
+        const CODEX: &str = include_str!("codegen/js/harness-codex.ts");
+
+        for (harness, file, driver, constant) in [
+            (Harness::Cc, "src/harness-cc.ts", CC, "CC_RESERVED"),
+            (
+                Harness::Codex,
+                "src/harness-codex.ts",
+                CODEX,
+                "CODEX_RESERVED",
+            ),
+        ] {
+            let opened = format!("const {constant}: readonly string[] = [");
+            let array = driver
+                .split_once(&opened)
+                .unwrap_or_else(|| panic!("`{file}` declares `{constant}`"))
+                .1;
+            let array = &array[..array.find("];").expect("…and closes the array it opened")];
+            let mut emitted: Vec<&str> = array.split('"').skip(1).step_by(2).collect();
+            emitted.sort_unstable();
+            let held: Vec<&str> = reserved_of(harness)
+                .iter()
+                .map(|reserved| reserved.option)
+                .collect();
+            assert_eq!(
+                emitted,
+                held,
+                "`{constant}` in `{file}` and the `{}` reserved row here are two copies of one \
+                 list and have parted company: a name the row holds and the driver does not \
+                 subtract is refused at compile time and carried at run time, and a name the \
+                 driver subtracts and the row does not hold is a key `validate` calls unverified \
+                 and the run then drops",
+                harness.as_str()
+            );
+        }
+    }
+
+    /// **The table's rows are sorted, and no option is listed twice.**
+    ///
+    /// [`the_reserved_tables_are_one_table`] sorts the driver's copy before
+    /// comparing — the driver groups its own list by *why* each name is on it,
+    /// which is worth reading there and is not an order this table can promise —
+    /// so the sort is what makes the two comparable, and a duplicate would
+    /// survive it silently on one side only.
+    #[test]
+    fn a_reserved_row_lists_each_option_once_and_in_order() {
+        for row in RESERVED {
+            let mut sorted: Vec<&str> = row.options.iter().map(|held| held.option).collect();
+            let listed = sorted.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                listed,
+                sorted,
+                "`{}`'s reserved row is not sorted by option name",
+                row.harness.as_str()
+            );
+            let unique: std::collections::BTreeSet<&str> = listed.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                listed.len(),
+                "`{}`'s reserved row lists an option twice, so one `settings:` key earns two \
+                 refusals",
+                row.harness.as_str()
+            );
+        }
+    }
+
+    /// **An answer names a key the `coder:` block really has** (PRD resolved q60
+    /// ruling b, resolved q23's binds).
+    ///
+    /// The refusal's whole worth is the repair it names, and a repair naming a
+    /// key the grammar does not have is worse than none: an author follows it,
+    /// writes the key, and earns `unknown-key` for their trouble. So the answers
+    /// are bound to the surface an author reads them on — grammar 8.9 — rather
+    /// than to a second list here that could agree with nothing.
+    ///
+    /// **All three answering variants are held.** [`Answered::By`] names the key
+    /// to write, [`Answered::Already`] names the required key already on the
+    /// node, and [`Answered::Through`] names the key that *addresses* where to
+    /// write it, and an author has to be able to find any of them in 8.9. What
+    /// this cannot see is a key that exists and cannot be *followed*: `harness:`
+    /// is a row of the table, so an answer naming it passes here while sending
+    /// an author to a required key that takes `cc` or `codex` and cannot name an
+    /// executable. So
+    /// [`the_options_the_ruling_names_are_answered_by_the_keys_it_names`] pins
+    /// the process-spawn family to [`Answered::Nothing`] by name, and
+    /// [`a_reserved_answer_matches_how_grammar_89_requires_its_key`] holds the
+    /// other half of "followable": whether the named key is one an author still
+    /// has to write.
+    ///
+    /// **Two spellings count**, because a coder node takes keys from two places
+    /// and 8.9 writes them two ways: its own are rows of the block's key table,
+    /// and the **common node keys** it inherits are named in the paragraph under
+    /// that table ("the whole §9.1 chain — `retry:`/`timeout:`/`on_error:` —
+    /// wraps the whole run"). `timeout:` is the answer for an abort controller
+    /// and is one of those, so a check reading the table alone would refuse the
+    /// truest answer in the row.
+    #[test]
+    fn a_reserved_options_answer_is_a_key_the_coder_block_takes() {
+        let grammar = grammar();
+        let section = grammar
+            .split_once("### 8.9 `coder`")
+            .expect("`docs/grammar.md` has the section")
+            .1;
+        let section = &section[..section
+            .find("\n### ")
+            .expect("…and the section ends where the next one opens")];
+        let table = &section[..section
+            .find("Additional keys are a compile error")
+            .expect("…and its key table closes with the unknown-key sentence")];
+        for row in RESERVED {
+            for held in row.options {
+                let (Answered::By(key) | Answered::Already(key) | Answered::Through(key, _)) =
+                    held.answered
+                else {
+                    continue;
+                };
+                assert!(
+                    table.contains(&format!("| `{key}` |"))
+                        || section.contains(&format!("`{key}:`")),
+                    "`{}`'s `{}` is answered by `{key}:`, and grammar 8.9 neither lists it in the \
+                     `coder:` block's key table nor names it as a common node key — a refusal \
+                     that names a key the block does not take sends an author from one diagnostic \
+                     to another",
+                    row.harness.as_str(),
+                    held.option
+                );
+            }
+        }
+    }
+
+    /// …and **the repair fits whether the key is already written** (grammar 8.9's
+    /// key table, PRD resolved q60 ruling b).
+    ///
+    /// [`a_reserved_options_answer_is_a_key_the_coder_block_takes`] holds that a
+    /// named key *exists*. This holds the other half of followable: that the
+    /// sentence the refusal makes about it is true. [`Answered::By`]'s help is
+    /// "write `X:` on the node instead", which is a repair only where `X:` is
+    /// **optional** — a key the author has not written. Where `X:` is required
+    /// it is already three lines up, and the same sentence tells an author to
+    /// write a line they have already written, which reads as a repair and is
+    /// not one; [`Answered::Already`] is the variant whose help is "take the
+    /// setting off" and is the one those rows take.
+    ///
+    /// So the two variants are bound to the **`Required` column** of 8.9's key
+    /// table rather than to a second list here — the same bind
+    /// [`a_reserved_options_answer_is_a_key_the_coder_block_takes`] makes, one
+    /// column along. A key promoted to required or relaxed to optional in the
+    /// grammar is exactly when every refusal naming it changes sentence, and
+    /// that edit is a table away from this file.
+    ///
+    /// A `By` key that has **no row** is a common node key (`timeout:`), which
+    /// the table cannot speak for and which is optional by construction — the
+    /// section names it in prose, which is what the sibling test reads.
+    /// `Already` is held to a row, because "required" is a claim only the table
+    /// makes.
+    #[test]
+    fn a_reserved_answer_matches_how_grammar_89_requires_its_key() {
+        let grammar = grammar();
+        let section = grammar
+            .split_once("### 8.9 `coder`")
+            .expect("`docs/grammar.md` has the section")
+            .1;
+        let table = &section[..section
+            .find("Additional keys are a compile error")
+            .expect("…and its key table closes with the unknown-key sentence")];
+        // One key's `Required` column, if the block's key table has a row for it
+        // at all: `| `key` | type | **yes** | … |`.
+        let required = |key: &str| -> Option<bool> {
+            let opened = format!("| `{key}` |");
+            let row = table.lines().find(|line| line.starts_with(&opened))?;
+            Some(row.split('|').nth(3).map(str::trim) == Some("**yes**"))
+        };
+        for row in RESERVED {
+            let harness = row.harness.as_str();
+            for held in row.options {
+                match held.answered {
+                    Answered::By(key) => assert_ne!(
+                        required(key),
+                        Some(true),
+                        "`{harness}`'s `{}` is answered by `{key}:` with \"write it instead\", and \
+                         grammar 8.9 makes `{key}:` **required** on every `coder:` block — so the \
+                         refusal sends an author to a line already on their node. The answer for \
+                         a required key is `Answered::Already`, whose repair is to take the \
+                         setting off",
+                        held.option
+                    ),
+                    Answered::Already(key) => assert_eq!(
+                        required(key),
+                        Some(true),
+                        "`{harness}`'s `{}` is answered by `{key}:` with \"take the setting off, \
+                         the key is already on the node\", and grammar 8.9's key table does not \
+                         make `{key}:` required — an author who never wrote it is told to delete \
+                         the only line stating the bound. The answer for an optional key is \
+                         `Answered::By`",
+                        held.option
+                    ),
+                    Answered::Through(..) | Answered::Nothing(_) => {}
+                }
+            }
+        }
+    }
+
+    /// …and the two answers PRD resolved q60 ruling b names out loud, pinned
+    /// (grammar 8.9, Decision D146).
+    ///
+    /// The entry names four repairs by hand — `permission_mode:` for the modes,
+    /// `access:` for the sandbox, `allow_tools:` for the toolset, `model:` for
+    /// the connection — and the first two are the ones the field report was
+    /// about: an author reached for `settings: { permissionMode: … }` because no
+    /// key answered, and a `codex` author reaching for `sandboxMode` is the same
+    /// move on the other harness. Spelled out rather than counted, because an
+    /// answer is a sentence and not a count.
+    ///
+    /// The families whose answer is **not** a plain "write this key" are pinned
+    /// here too — resume, the process-spawn family, roots beside the workspace,
+    /// and the thinking budget — for the reason the entry gives them a clause of
+    /// their own: a table tempted to point at the nearest key gets each of them
+    /// wrong, and the nearest key for the last three (`harness:`, `workspace:`,
+    /// `model:`) is a real row of grammar 8.9's table, so
+    /// [`a_reserved_options_answer_is_a_key_the_coder_block_takes`] passes green
+    /// on exactly the wrong answer.
+    ///
+    /// The entry's four repairs split in two here, which is the other thing this
+    /// pins: `permission_mode:` and `access:` are optional, so the repair is to
+    /// write them; `workspace:` and `model:` are required, so the repair is to
+    /// take the setting off. [`a_reserved_answer_matches_how_grammar_89_requires_its_key`]
+    /// holds the split for every row rather than these.
+    #[test]
+    fn the_options_the_ruling_names_are_answered_by_the_keys_it_names() {
+        for (harness, option, key) in [
+            (Harness::Cc, "permissionMode", "permission_mode"),
+            (Harness::Cc, "tools", "allow_tools"),
+            (Harness::Codex, "sandboxMode", "access"),
+        ] {
+            assert_eq!(
+                reserved_option(harness, option).map(|held| held.answered),
+                Some(Answered::By(key)),
+                "a `harness: {}` `settings:` key spelling `{option}` is not answered by \
+                 `{key}:`, which is the repair PRD resolved q60 ruling b names for it",
+                harness.as_str()
+            );
+        }
+        // …and the same repairs where the key the entry names is **required**,
+        // so the sentence is "take the setting off" rather than "write the key":
+        // the entry names `workspace:` and `model:` among its four answers, and
+        // both are required rows of grammar 8.9's key table.
+        for (harness, option, key) in [
+            (Harness::Cc, "cwd", "workspace"),
+            (Harness::Cc, "model", "model"),
+            (Harness::Cc, "outputFormat", "output"),
+            (Harness::Cc, "systemPrompt", "prompt"),
+            (Harness::Cc, "planModeInstructions", "prompt"),
+            (Harness::Codex, "model", "model"),
+            (Harness::Codex, "workingDirectory", "workspace"),
+        ] {
+            assert_eq!(
+                reserved_option(harness, option).map(|held| held.answered),
+                Some(Answered::Already(key)),
+                "a `harness: {}` `settings:` key spelling `{option}` is answered by `{key}:` as \
+                 though an author had not written it, and `{key}:` is required on every `coder:` \
+                 block — so the refusal would tell them to write a line already on their node",
+                harness.as_str()
+            );
+        }
+        // …and the family that answers to nothing, which a table tempted to
+        // point at the nearest key would get wrong: resume is a named exclusion
+        // rather than a bound stated elsewhere (PRD resolved q57 ruling b).
+        for option in ["resume", "continue", "forkSession", "sessionId"] {
+            assert!(
+                matches!(
+                    reserved_option(Harness::Cc, option).map(|held| held.answered),
+                    Some(Answered::Nothing(_))
+                ),
+                "`{option}` is answered by a key, and harness-native resume is excluded rather \
+                 than restated"
+            );
+        }
+        // …and the family that answers to nothing for the *other* reason, which
+        // a table pointing at the nearest key gets wrong in the one way this
+        // module's own guards cannot see: `harness:` is a real key of grammar
+        // 8.9, so `a_reserved_options_answer_is_a_key_the_coder_block_takes`
+        // passes green while the refusal sends an author to a **required** key
+        // that takes `cc` or `codex` and cannot name an executable, a runtime or
+        // a spawn function. Grammar 8.9 puts this family in the other class in
+        // so many words — it "does not widen one bound, it replaces or re-arms
+        // the program that enforces all of them" — which is `Answered::Nothing`.
+        for option in [
+            "pathToClaudeCodeExecutable",
+            "executable",
+            "executableArgs",
+            "spawnClaudeCodeProcess",
+        ] {
+            assert!(
+                matches!(
+                    reserved_option(Harness::Cc, option).map(|held| held.answered),
+                    Some(Answered::Nothing(_))
+                ),
+                "`{option}` is answered by a key of the block, and no key of the block can say \
+                 which program a run is: `harness:` is required, takes `cc` or `codex`, and \
+                 names which vendor's adapter runs rather than which executable it is"
+            );
+        }
+        // …and the option both harnesses drop for the *containment* reason,
+        // which is the third way the nearest key is the wrong one: `workspace:`
+        // is a row of grammar 8.9 and is required, so pointing at it passes
+        // `a_reserved_options_answer_is_a_key_the_coder_block_takes` while
+        // claiming `additionalDirectories` is the working directory — it is
+        // roots *beside* it, which is why both drivers file it under the options
+        // that contain a bound rather than the ones that spell one — and handing
+        // an author a repair they cannot follow, since `workspace:` takes
+        // exactly one root and is already on their node.
+        for harness in [Harness::Cc, Harness::Codex] {
+            assert!(
+                matches!(
+                    reserved_option(harness, "additionalDirectories").map(|held| held.answered),
+                    Some(Answered::Nothing(_))
+                ),
+                "a `harness: {}` `settings:` key spelling `additionalDirectories` is answered by \
+                 a key of the block, and no key states roots beside the workspace: `workspace:` \
+                 is one root, required, and the option is what puts a run outside it",
+                harness.as_str()
+            );
+        }
+        // …and the one that answers *through* a key rather than to one: the
+        // thinking budget is written in the `model.*` definition `model:` names
+        // (Decision D141), and `model:` is required, so "write `model:` instead"
+        // would name a line already on the node.
+        for (harness, option) in [
+            (Harness::Cc, "thinking"),
+            (Harness::Cc, "maxThinkingTokens"),
+            (Harness::Codex, "modelReasoningEffort"),
+        ] {
+            assert!(
+                matches!(
+                    reserved_option(harness, option).map(|held| held.answered),
+                    Some(Answered::Through("model", _))
+                ),
+                "a `harness: {}` `settings:` key spelling `{option}` is not answered through \
+                 `model:`, which is the address the one model setting a harness takes is written \
+                 behind",
+                harness.as_str()
+            );
+        }
+    }
+
+    /// Every key the block **teaches** reaches the refusal, and not only the
+    /// SDK's own spelling of it (PRD resolved q60 ruling b).
+    ///
+    /// The hole this closes is the one the ruling exists to close, one spelling
+    /// over. An author reaching for a bound in `settings:` writes the name they
+    /// have read — `permission_mode`, which is also the shape the curated tier's
+    /// own keys are written in (`max_turns`, `max_budget_usd`) — while the table
+    /// is keyed on `permissionMode`. Missed, that key drew the second tier's
+    /// warning, travelled to an SDK that declares no option of the name, did
+    /// nothing, and left the node reading as though the mode were stated: the
+    /// field report's own sequence, with the redirection three lines away.
+    #[test]
+    fn a_bound_is_refused_under_the_grammars_spelling_as_well_as_the_sdks() {
+        for row in RESERVED {
+            let harness = row.harness;
+            for held in row.options {
+                let Some(key) = held.answered.key() else {
+                    continue;
+                };
+                let hit = reserved_reached(harness, key).unwrap_or_else(|| {
+                    panic!(
+                        "a `harness: {}` `settings:` key spelling `{key}` — this grammar's own \
+                         name for the bound `{}` reaches — is not refused, so the redirection PRD \
+                         resolved q60 ruling b ships has a hole at the one spelling the grammar \
+                         teaches",
+                        harness.as_str(),
+                        held.option
+                    )
+                });
+                assert_eq!(
+                    hit.held.answered.key(),
+                    Some(key),
+                    "`{key}` under `harness: {}` reaches a row answered by a different key, so \
+                     the refusal would name a repair for a bound the author did not write",
+                    harness.as_str()
+                );
+            }
+        }
+    }
+
+    /// …and a key several rows name reaches **one** repair, whichever row wins.
+    ///
+    /// [`reserved_reached`] resolves a grammar spelling to the first row in
+    /// table order that names it, and a dozen options answer to `allow_tools:`.
+    /// The diagnostic never quotes the row — it is the *key* that is refused,
+    /// for naming a bound rather than for spelling an option — but it does quote
+    /// the repair, and the repair turns on one bit: whether the key is already
+    /// on the node. So the rows naming one key have to agree about that bit, or
+    /// the sentence an author reads would turn on an alphabetical accident in a
+    /// table they cannot see.
+    #[test]
+    fn a_grammar_key_reaches_one_repair_under_every_row_that_names_it() {
+        for row in RESERVED {
+            let mut sentence: std::collections::BTreeMap<&str, (bool, &str)> =
+                std::collections::BTreeMap::new();
+            for held in row.options {
+                let (Some(key), Some(required)) =
+                    (held.answered.key(), held.answered.key_is_required())
+                else {
+                    continue;
+                };
+                if let Some((first, option)) = sentence.insert(key, (required, held.option)) {
+                    assert_eq!(
+                        first,
+                        required,
+                        "`harness: {}` answers both `{option}` and `{}` with `{key}:`, and the \
+                         two disagree about whether that key is already on the node — so a \
+                         `settings:` key spelling `{key}` would be told to write a line it \
+                         already has, or to delete the only line stating the bound, depending on \
+                         which row the table happens to list first",
+                        row.harness.as_str(),
+                        held.option
+                    );
+                }
+            }
+        }
     }
 }

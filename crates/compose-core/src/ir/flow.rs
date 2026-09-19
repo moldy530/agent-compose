@@ -12,7 +12,7 @@ use crate::ast::common::{
     Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Interpolated, Literal,
     PathExpr,
 };
-use crate::ast::flow::{FlowContext, Harness, StoreOp, WorkspaceAccess};
+use crate::ast::flow::{FlowContext, Harness, PermissionMode, StoreOp, WorkspaceAccess};
 use crate::diag::{Span, Spanned};
 
 use super::binding::{Bindings, Exec, Http, InterpolatedEntry, NodeInput, Writes};
@@ -157,6 +157,15 @@ pub struct Coder {
     /// `access:` — absent means the default, `workspace_write`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access: Option<WorkspaceAccess>,
+    /// `permission_mode:` — the approval mode inside that containment; absent
+    /// means the mode `access:` derives (Decision D146, PRD resolved q60 ruling
+    /// a).
+    ///
+    /// Spanned, unlike `access:`, because the two refusals this key earns are
+    /// both about the key rather than about the block: a harness with no
+    /// approval axis, and a mode outside what the node's `access:` level admits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<Spanned<PermissionMode>>,
     /// `prompt:` — literal text; there is no interpolation (grammar 5.2).
     pub prompt: Spanned<String>,
     /// `input:` — the declared surface; absent means string-in (grammar 5.3).

@@ -1,21 +1,25 @@
-# rule: a `coder:` node's `settings:` key spelling an option the adapter owns is
-# rule: warned about and dropped, not carried (grammar 8.9, D140)
-# code: unknown-harness-setting
-# message: `extraArgs` is not a `harness: cc` setting this release can check, so its value is unverified
-# at: main.yml:40:11
-# label: main.yml:34:18 the harness is bound here
-# help: `extraArgs` is an option the generated adapter owns, so it is dropped rather than passed: what it would reach around is what `workspace:`, `access:`, `env:`, `output:`, `prompt:`, `allow_tools:`, `timeout:` and `model:` state, and the bound is the node's (grammar 8.9, Decision D140)
+# rule: a `coder:` node's `settings:` key that answers to no first-class key is
+# rule: refused, and the message says so instead (grammar 8.9, D146)
+# code: reserved-harness-setting
+# message: `extraArgs` of `flow.main` node `build` is a `harness: cc` option the generated adapter owns, and no key of this block states it
+# at: main.yml:44:11
+# label: main.yml:38:18 the harness is bound here
+# help: there is no key to write instead: an arbitrary command-line flag is every bound at once — `dangerously-skip-permissions` and `add-dir` among them — so no one key answers it. Take the setting off — what `settings:` buys is the vendor's *other* options, never the ones this node already states. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
 #
 # Decision D140's other half, and the one an author has to be told apart from
 # the first: unchecked is not unbounded. `extraArgs` is the Agent SDK's
 # arbitrary-CLI-flag option, so a key here would carry
 # `dangerously-skip-permissions` and an extra `add-dir` past the `access:` and
 # `workspace:` this very node states — through the one surface the grammar
-# leaves open. The adapter drops it, and the warning says which of the two
-# happened, because a key that never reached the SDK and a key that reached it
-# unchecked are different things to go looking for.
+# leaves open.
 #
-# The composition still builds: what the node asked for is what the node gets.
+# This is the **wider** half of the reserved set: an option that contains every
+# bound at once rather than spelling one, so unlike a key reaching the
+# permission mode or the sandbox there is no first-class key to be redirected
+# to, and the message says so instead of pointing at the nearest one. Before PRD
+# resolved q60 the composition still built and the adapter dropped the value at
+# run time, which left an author unable to tell a setting that travelled from
+# one that never arrived; it is now refused where it is written.
 version: "0.1"
 provider.p:
   kind: anthropic
