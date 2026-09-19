@@ -19,15 +19,27 @@ it can happen:
   is eight agents in one tree. That is an **error**.
 
   The per-dispatch scope is the dispatch's own `input.<field>`,
-  `execution.item_index`, **and** a `state` channel some node of the dispatched
-  instance writes. That last one is not a loophole: a dispatched flow instance is
-  a separate run with its own channel values (grammar §10.1), so an `exec:` step
-  inside the instance that runs `git worktree add` and writes the path to a
+  `execution.item_index`, **and** a `state` channel a node that runs *before* the
+  coder node writes. That last one is not a loophole: a dispatched flow instance
+  is a separate run with its own channel values (grammar §10.1), so an `exec:`
+  step inside the instance that runs `git worktree add` and writes the path to a
   channel is eight dispatches preparing eight directories — and since a coder
   node's `workspace:` cannot read another node's output, a channel is the only
-  way to hand it over. A channel *nothing* in the instance writes holds its
-  `default:` in every instance, which is one directory, and the message names the
-  channel and the flow that never writes it.
+  way to hand it over.
+
+  "Before" is exact, and it is the same word grammar §8.6 rule 11 uses of
+  `map.over`: every path from the flow's `start` to the coder node has to pass
+  through a node that writes the channel. Channel writes land when their writer
+  completes (§7.6.4), so a writer the coder node feeds rather than follows writes
+  a value no dispatch ever reads, and a writer on a guarded branch beside it may
+  not have run at all — in both cases every dispatch reads the channel's
+  `default:`, which is one directory. The message says which shape it is: it
+  names the flow that never writes the channel, or the nodes that write it
+  somewhere this one cannot read.
+
+  A **bracket** is a dot: `state['checkout']` is the same read as
+  `state.checkout`, and so is `input['worktree']`. A constant key names a member,
+  and the rule reads the name through either spelling.
 
   The bound read is the one the dispatch really runs under, which is not always
   the one its own map declares. A map **inside** a fan-out issues its dispatches
@@ -170,6 +182,9 @@ Four repairs, and each says something different about the graph.
   holds its own channel values, so this is one directory per dispatch — and it is
   the only shape available when the path is not known until the dispatch runs,
   since a coder node's `workspace:` cannot read another node's output directly.
+  Ahead of it on **every** path: if the step that writes the channel can be
+  skipped, or runs after the coder node, the node reads the channel's `default:`
+  and this is still the error.
 * **Take a directory per dispatch from the runtime.** `workspace: fresh`
   provisions one under `.agent-compose/workspaces/<execution>/<instance path>`,
   named by the instance path (grammar §9.4) and created clean at the start of

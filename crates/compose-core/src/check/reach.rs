@@ -846,6 +846,16 @@ pub(crate) fn reads_nothing(source: &str) -> bool {
 
 /// Whether one expression is item-derived: it references the item binding, the
 /// per-item index, or an `input.<field>` that is itself item-derived here.
+///
+/// A read that names no field is answered the way a rule this predicate
+/// *exempts* a composition from has to answer an unknown. A read of the whole
+/// `input` object embeds every field, so one derived field makes it derived; but
+/// an index whose key this compiler could not resolve — `input[state.which]` —
+/// names a field nobody here can name, and calling it derived would clear a
+/// store write (grammar 11.4) or a shared workspace (Decision D147) on the
+/// strength of a field nothing established. A **constant** index key is not one
+/// of those: `input['worktree']` is `input.worktree` written the other way
+/// round, and the CEL front-end resolves it to that name.
 pub(crate) fn is_item_derived(
     source: &str,
     item: Option<&str>,
@@ -861,10 +871,10 @@ pub(crate) fn is_item_derived(
             return true;
         }
         read.root == "input"
-            && read.path.first().map_or_else(
-                // A read of the whole `input` object embeds every field.
-                || derived.values().any(|value| *value),
-                |field| derived.get(field).copied().unwrap_or(false),
-            )
+            && match read.path.first() {
+                Some(field) => derived.get(field).copied().unwrap_or(false),
+                None if read.indexed => false,
+                None => derived.values().any(|value| *value),
+            }
     })
 }

@@ -1,0 +1,94 @@
+# rule: a channel read is a channel read however it is spelled: `state['ch']`
+# rule: names the same channel `state.ch` does (4.1, 10.1, 8.9, D147)
+# code: shared-workspace
+# message: `flow.fix` node `implement` is dispatched by the map `work` of `flow.main` with `max_concurrency: 4`, and its `workspace:` is one directory for every dispatch
+# at: main.yml:60:20
+# label: main.yml:83:7 the fan-out is issued here
+# help: a harness run is contained by its `workspace:`, so 4 dispatches sharing `state['checkout']` are 4 coding agents editing one checkout and overwriting each other's work. `checkout` is a channel no node of `flow.fix` writes, so every instance reads its `default:` — one directory for the whole fan-out. A channel the instance writes **itself** holds that instance's own value (grammar 10.1), which is how an upstream `exec:` or `tool.*` step that clones or worktrees per dispatch carries the path to this node. Two repairs, and each says something different about the graph: bind the item's own path — carry it on the dispatch (`input: { worktree: "item.worktree" }`) and read it here (`workspace: "input.worktree"`), or write `workspace: fresh` for a directory the runtime provisions per dispatch — or declare `max_concurrency: 1` on the map, which says these runs are serial. `workspace:` is evaluated in this node's input scope at every dispatch precisely so the first repair is writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# `a-state-channel-no-dispatch-writes-is-one-directory` with one character
+# changed, and the character is the spelling of the read. CEL indexes an object
+# by a constant key as the member selection it is — `state['checkout']` is
+# `state.checkout` written the other way round — so the refusal a rule states
+# over a **channel name** has to see the name through either spelling. A read
+# recorded as "a read of `state` naming no channel" would be answered by every
+# rule here at whichever default it holds, and this rule's permissive default is
+# the one that lets a race through: four `cc` runs in `/srv/one-and-only`, the
+# field report PRD resolved q61 was ratified from, with `validate` silent.
+#
+# The help names `checkout` for the same reason, so the sentence that tells an
+# author which channel their graph never writes survives the bracket too.
+#
+# The accepting direction is `check_accepts.rs`'s
+# `a_bracket_reads_the_per_dispatch_scope_the_dot_does`: the same bracketed
+# read, of a channel an upstream node does write, is four directories — and so
+# is `input['worktree']`, whose predicate is the store rule's (Decision D83).
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: List the goals that need a change.
+  output:
+    goals:
+      type: array
+      max_items: 10
+      items: { type: string }
+state:
+  checkout: { type: string, default: "/srv/one-and-only" }
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 10
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "state['checkout']"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  outputs:
+    summaries:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    work:
+      map:
+        over: plan.output.goals
+        as: goal
+        node: flow.fix
+        input:
+          goal: "goal"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }

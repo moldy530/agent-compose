@@ -71,6 +71,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Cel, Interpolated, Literal};
 use crate::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
+use crate::cel::Read;
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::harness::{
@@ -80,7 +81,7 @@ use crate::harness::{
     variables_set,
 };
 use crate::ir::definition::{DefinitionBody, Model, Provider};
-use crate::ir::flow::{Coder, Node};
+use crate::ir::flow::{Coder, Flow, Node};
 use crate::parse::reader::{article, list, suggest};
 
 use super::channels;
@@ -186,21 +187,21 @@ pub(crate) fn coder_node(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, node: &Node, coder:
 /// expression, and the directory it names is the runtime's to provision
 /// (ruling c).
 ///
-/// One thing is read before the front-end runs, and it is the **migration**:
-/// a value that is a path rather than an expression is what every composition
-/// written before resolved q61 holds, and it is answered with the rewrite
-/// rather than with a parse error naming a character
-/// ([`written_as_a_path`], PRD G3).
+/// One thing is decided around the front-end rather than by it, and it is the
+/// **migration**: a value that is a path rather than an expression is what every
+/// composition written before resolved q61 holds, and it is answered with the
+/// rewrite rather than with a message about the expression it was mistaken for
+/// ([`written_as_a_path`], [`a_bare_relative_path`], PRD G3).
 ///
 /// A value this refuses is **rejected** for the two rules stated over the same
 /// expression ([`dispatched_workspaces`], [`concurrent_workspaces`]), exactly as
 /// [`edge_guard`](super::expr::edge_guard) rejects a guard the routing analyses
 /// must not read again. Those two ask what the expression *depends on*, and
-/// `cel::analyze` answers "nothing" for a source it could not parse — so a
-/// `workspace:` already reported as malformed would come back a second time as
-/// one directory for every dispatch, telling an author to make a repair they
-/// have just been told to make, about an expression that has no reads because it
-/// has no parse (PRD G3, resolved q22).
+/// `cel::analyze` answers "nothing" — or a handful of roots nobody declared —
+/// for a source that is not one, so a `workspace:` already reported as a path
+/// would come back a second time as one directory for every dispatch, telling an
+/// author to make a repair they have just been told to make, about an expression
+/// they did not write (PRD G3, resolved q22).
 fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
     let Some(expression) = coder.workspace.value.expression() else {
         return;
@@ -212,7 +213,16 @@ fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
     }
     let written = Spanned::new(Cel::new(expression.as_str()), coder.workspace.span.clone());
     let scope = super::expr::flow_scope(ctx, cx, "a `coder:` node's `workspace:`");
-    let analysis = super::expr::analyze(ctx, &written, &scope);
+    // Run before anything is reported, because the second migration spelling is
+    // decided on what the front-end made of the value rather than on its first
+    // character ([`a_bare_relative_path`]).
+    let analysis = crate::cel::analyze(written.value.as_str(), &scope);
+    if a_bare_relative_path(expression.as_str(), &analysis) {
+        a_path_where_an_expression_goes(ctx, subject, coder, expression);
+        ctx.reject_workspace(&coder.workspace.span);
+        return;
+    }
+    super::expr::report(ctx, &written, &analysis);
     super::expr::expect(
         ctx,
         &written,
@@ -225,8 +235,9 @@ fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
     }
 }
 
-/// Whether a `workspace:` value is a **path** rather than an expression — the
-/// two spellings every composition written before PRD resolved q61 has.
+/// Whether a `workspace:` value is an **anchored** path rather than an
+/// expression — three of the four spellings every composition written before
+/// PRD resolved q61 has.
 ///
 /// Decided on the first character, and the set is the one CEL cannot start an
 /// expression with: `/` and `~` open an absolute path, `$` opens an env
@@ -236,12 +247,11 @@ fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
 /// is a path with certainty rather than by guess — which is what lets the
 /// refusal below say so and name the rewrite.
 ///
-/// **Both migration spellings land here**, and that is the point: an author
-/// upgrading `workspace: ${REPO_ROOT}` and one upgrading `workspace: /srv/repo`
-/// made the same mistake and get the same answer. A value that is not
-/// path-shaped and still does not parse is a *malformed expression* rather than
-/// a path, and the CEL front-end's own message — which names the character it
-/// stopped at — is the better one for it.
+/// **Every anchored migration spelling lands here**, and that is the point: an
+/// author upgrading `workspace: ${REPO_ROOT}` and one upgrading
+/// `workspace: /srv/repo` made the same mistake and get the same answer. The
+/// fourth spelling — a path anchored at nothing, `checkouts/main` — is legal CEL
+/// to the character and is decided by [`a_bare_relative_path`] instead.
 fn written_as_a_path(value: &str) -> bool {
     let mut characters = value.chars();
     match characters.next() {
@@ -249,6 +259,46 @@ fn written_as_a_path(value: &str) -> bool {
         Some('.') => !characters.next().is_some_and(|next| next.is_ascii_digit()),
         _ => false,
     }
+}
+
+/// Whether a `workspace:` value is an **un-anchored** relative path —
+/// `checkouts/main`, the pre-q61 spelling [`written_as_a_path`] cannot see.
+///
+/// This one is not a mistake the front-end stops at: `checkouts/main` is a legal
+/// CEL division of two identifiers, so it parses, and what comes back is one
+/// `unknown-root` per segment. That is the message resolved q22 exists to
+/// prevent — an author migrating a relative checkout root is told about roots
+/// they never wrote, twice, and the rewrite that would fix it is named nowhere.
+///
+/// So the value is read *through* what the front-end made of it, which is the
+/// only evidence that separates it from a real expression. Three things have to
+/// hold together, and each rules out a shape the first two would take:
+///
+/// * it holds a `/` — a path segment separator, and the operator a path is
+///   mistaken for;
+/// * **everything** the walk objected to is a root that does not exist. A
+///   genuine expression over the roots this surface exposes —
+///   `"'/srv/' + input.branch"`, or even a nonsensical `"input.a / input.b"` —
+///   objects about something else or about nothing, and keeps the front-end's
+///   own answer, which is the better one for it. So does a value with a real
+///   syntax error, which parses to nothing and objects about no root at all;
+/// * every path it reads is a **bare** root — no member selected off it, no
+///   index. This is the one that tells `checkouts/main` from a typo:
+///   `"stat.checkout + '/x'"` is an expression whose author meant `state`, and
+///   everything it objects to is an unknown root too, but it *selects a member*
+///   off that root, which no path segment does. Told apart the other way it
+///   would be answered with a rewrite that quotes the typo (PRD G3).
+fn a_bare_relative_path(value: &str, analysis: &crate::cel::Analysis) -> bool {
+    value.contains('/')
+        && !analysis.problems.is_empty()
+        && analysis
+            .problems
+            .iter()
+            .all(|problem| problem.code == DiagnosticCode::UnknownRoot)
+        && analysis
+            .reads
+            .iter()
+            .all(|read| read.path.is_empty() && !read.indexed)
 }
 
 /// The refusal [`written_as_a_path`] names, with the rewrite in it (PRD
@@ -1239,9 +1289,10 @@ fn check_shape(
 /// reads the dispatch's own `execution.item_index`, or an `input.<field>` the
 /// map bound from the item.
 ///
-/// # A `state` channel is per-dispatch exactly when the instance writes it
+/// # A `state` channel is per-dispatch exactly when the reader can observe a
+/// write of it
 ///
-/// The second test is [`channels::written_within`], and it is the half a store
+/// The second test is [`channels::writers_within`], and it is the half a store
 /// key does not need. A dispatched flow instance is a separate run of a separate
 /// compiled graph: the channel set is composition-global in *shape* and
 /// per-instance in *value*, seeded at each channel's `default:` with nothing
@@ -1250,27 +1301,41 @@ fn check_shape(
 /// about the instance, and the rule reads that fact rather than assuming either
 /// answer:
 ///
-/// * a channel **some node of the instance writes** holds that instance's own
-///   value, produced by that instance's own run. `prepare` — an `exec:` node
-///   running `git worktree add` — writing `checkout`, and `implement` reading
-///   `workspace: "state.checkout"` beside it, is four dispatches preparing four
-///   directories, and it is the supported shape ruling c names in as many
-///   words: "an upstream `exec:`/`tool.*` step cloning or worktree-ing into
-///   per-item paths". Refusing it would refuse the repair, and there is no
-///   in-instance way around the refusal — a coder node's `workspace:` cannot
-///   read another node's output (Decision D42), so a channel is the only way to
-///   carry that answer to it.
-/// * a channel **no node of the instance writes** holds its `default:` in every
-///   instance, which is one directory for the whole fan-out as surely as a
-///   literal path is.
+/// * a channel **a node that dominates this one writes** holds that instance's
+///   own value, produced by that instance's own run, and holds it by the time
+///   this node runs. `prepare` — an `exec:` node running `git worktree add` —
+///   writing `checkout`, and `implement` reading `workspace: "state.checkout"`
+///   downstream of it, is four dispatches preparing four directories, and it is
+///   the supported shape ruling c names in as many words: "an upstream
+///   `exec:`/`tool.*` step cloning or worktree-ing into per-item paths".
+///   Refusing it would refuse the repair, and there is no in-instance way around
+///   the refusal — a coder node's `workspace:` cannot read another node's output
+///   (Decision D42), so a channel is the only way to carry that answer to it.
+/// * a channel **nothing upstream of this node writes** holds its `default:`
+///   here, which is one directory for the whole fan-out as surely as a literal
+///   path is. Three shapes land in it and they are one fact: no node of the
+///   instance writes the channel at all; the only writer runs *after* this node,
+///   so every dispatch reads the `default:` and the write is a record nobody in
+///   the instance ever reads back; or the only writer sits on a branch this node
+///   may reach `start` without passing through.
 ///
-/// Whether two instances that each write a channel write the *same* string is a
-/// runtime fact, and it is the same one ruling b already declines to refuse over
-/// where it withholds the error from [`concurrent_workspaces`]: this compiler
-/// states what it can see rather than pretending to see more.
+/// **Upstream is dominance, and it is dominance because the value's existence has
+/// to be a guarantee rather than a hope.** Channel values are ordered by step
+/// (grammar 7.6.4), so the question "does this node see this instance's own
+/// value" is the question grammar 8.6 rule 11 asks of `map.over`, answered the
+/// way Decision D76 answers it: every path from `start` to the reader passes
+/// through a writer. Mere path-existence would accept a writer on a guarded
+/// sibling branch that did not run, and a rule that accepted it would be
+/// exempting a composition from a *race refusal* on the strength of a write that
+/// may never have happened.
 ///
-/// Everything left — a literal path, an `${ENV}` reference, a channel the
-/// instance never writes — is one directory for the whole fan-out, which is the
+/// Whether two instances that each observe a write of a channel write the *same*
+/// string is a runtime fact, and it is the same one ruling b already declines to
+/// refuse over where it withholds the error from [`concurrent_workspaces`]: this
+/// compiler states what it can see rather than pretending to see more.
+///
+/// Everything left — a literal path, an `${ENV}` reference, a channel nothing
+/// upstream writes — is one directory for the whole fan-out, which is the
 /// field report this ruling comes from: the dispatches clobber each other's
 /// checkout and `max_concurrency` was a lie.
 ///
@@ -1310,16 +1375,16 @@ fn check_shape(
 /// [`concurrent_workspaces`] states for its own quadratic, kept here: the frame
 /// that speaks is the one with the **loosest** bound, which is the worst case the
 /// author has to answer for.
-pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
+pub(crate) fn dispatched_workspaces<'a>(ctx: &mut Ctx<'a>) {
     // Keyed by the node and the position of its `workspace:` — one key per line
     // an author would have to edit.
     let mut reported: BTreeMap<(String, String, usize), Shared> = BTreeMap::new();
-    // Which channels an instance of each flow holds a value of its own for
-    // ([`channels::written_within`]). A property of the flow rather than of the
-    // site, and one flow is commonly a dispatch target several times over, so it
-    // is answered once per address: `validate` is held to a millisecond budget
-    // over a frame count nothing bounds (`tests/check_scale.rs`).
-    let mut instance_writes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // What an instance of each flow holds for a channel name, at each of its
+    // nodes ([`Instance`]). A property of the flow rather than of the site, and
+    // one flow is commonly a dispatch target several times over, so it is
+    // answered once per address: `validate` is held to a millisecond budget over
+    // a frame count nothing bounds (`tests/check_scale.rs`).
+    let mut instances: BTreeMap<String, Instance<'a>> = BTreeMap::new();
     for frame in reach::frames(ctx) {
         // A serial dispatch is a statement the author made, and it is the
         // second repair this rule's message offers: one run at a time is one
@@ -1327,7 +1392,7 @@ pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
         if frame.concurrency <= 1 {
             continue;
         }
-        for node in &frame.flow.nodes {
+        for (at, node) in frame.flow.nodes.iter().enumerate() {
             let crate::ir::flow::NodeKind::Coder { coder } = &node.kind else {
                 continue;
             };
@@ -1343,12 +1408,22 @@ pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
             if reach::is_item_derived(expression.as_str(), None, &frame.derived) {
                 continue;
             }
-            let written = instance_writes
-                .entry(frame.address.clone())
-                .or_insert_with(|| channels::written_within(ctx, frame.flow));
-            if reads_an_instance_channel(expression.as_str(), written) {
-                continue;
-            }
+            // The instance is consulted only where the expression reads
+            // `state` at all, which is what keeps the dominance walks off the
+            // clock for the `'${ROOT}'` shape the refusal is mostly about:
+            // `validate` is held to a millisecond budget (`tests/check_scale.rs`).
+            let reads = state_reads(expression.as_str());
+            let unobserved = if reads.is_empty() {
+                None
+            } else {
+                let instance = instances
+                    .entry(frame.address.clone())
+                    .or_insert_with(|| Instance::of(ctx, frame.flow));
+                if reads_an_instance_channel(&reads, instance.observed_at(at)) {
+                    continue;
+                }
+                instance.unobserved(&reads, at)
+            };
             let subject = format!("`{}` node `{}`", frame.address, node.id.value);
             let key = (
                 subject.clone(),
@@ -1358,7 +1433,7 @@ pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
             let shared = Shared {
                 subject,
                 flow: frame.address.clone(),
-                unwritten: unwritten_channel(expression.as_str(), written),
+                unobserved,
                 at: coder.workspace.span.clone(),
                 dispatcher: frame.dispatcher.clone(),
                 dispatched_at: frame.span.clone(),
@@ -1383,45 +1458,138 @@ pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// Whether one `workspace:` expression reads a channel the dispatched instance
-/// **writes** — a value that instance's own run produced, and so a directory of
-/// its own (grammar 10.1, PRD resolved q61 ruling b).
+/// One dispatched flow instance, as the channel half of the rule reads it: its
+/// graph, who writes what in it, and what each of its nodes can therefore
+/// observe (grammar 10.1, 7.6.4, PRD resolved q61 ruling b).
+///
+/// Built once per flow address and memoized per node, because one flow is
+/// commonly a dispatch target several times over and dominance costs a walk
+/// each time it is asked (`tests/check_scale.rs`).
+struct Instance<'a> {
+    /// The instance's graph, which is where "can this node observe that write"
+    /// is decided.
+    graph: Graph<'a>,
+    /// Every channel a node of it writes, paired with the nodes that write it
+    /// ([`channels::writers_within`]).
+    writers: BTreeMap<String, Vec<usize>>,
+    /// Per node, the channels that node reads this instance's **own** value of.
+    observed: BTreeMap<usize, BTreeSet<String>>,
+}
+
+impl<'a> Instance<'a> {
+    fn of(ctx: &Ctx<'a>, flow: &'a Flow) -> Self {
+        Self {
+            graph: Graph::new(flow),
+            writers: channels::writers_within(ctx, flow),
+            observed: BTreeMap::new(),
+        }
+    }
+
+    /// The channels one node of this instance reads the instance's own value of:
+    /// those a node that **dominates** it writes (Decision D76's reading of the
+    /// same question, grammar 8.6 rule 11).
+    ///
+    /// A node's own write is not one of them, and that is the ordering rather
+    /// than a special case: a node's outputs land in its channels when it
+    /// completes, so what it reads while it runs is what entered its step
+    /// (grammar 7.6.4).
+    fn observed_at(&mut self, at: usize) -> &BTreeSet<String> {
+        let graph = &self.graph;
+        let writers = &self.writers;
+        self.observed.entry(at).or_insert_with(|| {
+            writers
+                .iter()
+                .filter(|(_, wrote)| {
+                    wrote
+                        .iter()
+                        .any(|writer| *writer != at && graph.dominates(*writer, at))
+                })
+                .map(|(channel, _)| channel.clone())
+                .collect()
+        })
+    }
+
+    /// The first channel a `workspace:` expression reads that the node at `at`
+    /// does **not** observe this instance's own value of — the fact that decided
+    /// the refusal where a `state` read is what it turned on, and the one the
+    /// help has to state.
+    ///
+    /// A read that names no channel — the whole `state` object, or an index whose
+    /// key this compiler could not resolve — answers nothing here: there is no
+    /// channel to point an author at, and the general repairs are the whole of
+    /// what can be offered.
+    fn unobserved(&mut self, reads: &[Read], at: usize) -> Option<Unobserved> {
+        let named: Vec<String> = reads
+            .iter()
+            .filter_map(|read| read.path.first().cloned())
+            .collect();
+        let observed = self.observed_at(at);
+        let channel = named.into_iter().find(|name| !observed.contains(name))?;
+        Some(match self.writers.get(&channel) {
+            None => Unobserved::NeverWritten { channel },
+            Some(wrote) => Unobserved::NotUpstream {
+                writers: wrote
+                    .iter()
+                    .map(|writer| self.graph.id(*writer).to_string())
+                    .collect(),
+                channel,
+            },
+        })
+    }
+}
+
+/// Why a `state` channel a refused `workspace:` reads holds one value for the
+/// whole fan-out — the two shapes, because they take two different repairs.
+enum Unobserved {
+    /// No node of the dispatched flow writes the channel at all, so every
+    /// instance reads its `default:`.
+    NeverWritten { channel: String },
+    /// Some node writes it, and none of them dominates the reader: the write
+    /// lands after this node runs, or on a branch it can reach `start` without.
+    NotUpstream {
+        channel: String,
+        /// The nodes that do write it, in declaration order.
+        writers: Vec<String>,
+    },
+}
+
+/// Every `state` path one `workspace:` expression reads, which is the whole of
+/// what the channel half of the rule looks at.
+///
+/// Walked against an **empty** scope, as [`reach::is_item_derived`] is: the
+/// question is what the expression depends on rather than what it evaluates to,
+/// and the surface's own scope has already answered the second one
+/// ([`workspace`]).
+fn state_reads(source: &str) -> Vec<Read> {
+    crate::cel::analyze(source, &crate::cel::Scope::default())
+        .reads
+        .into_iter()
+        .filter(|read| read.root == "state")
+        .collect()
+}
+
+/// Whether one `workspace:` expression reads a channel this node observes the
+/// dispatched instance's **own** value of — a value that instance's own run
+/// produced before this node ran, and so a directory of its own (grammar 10.1,
+/// PRD resolved q61 ruling b).
 ///
 /// Any such read is enough, exactly as [`reach::is_item_derived`] takes any
 /// item-derived read: an expression over one per-instance value is per-instance
 /// however the rest of it is written, and `state.checkout + '/pkg'` is the same
 /// four directories `state.checkout` is.
-fn reads_an_instance_channel(source: &str, written: &BTreeSet<String>) -> bool {
-    crate::cel::analyze(source, &crate::cel::Scope::default())
-        .reads
-        .iter()
-        .any(|read| {
-            read.root == "state"
-                && read
-                    .path
-                    .first()
-                    // A read of the whole `state` object embeds every channel,
-                    // so one the instance writes is one it carries.
-                    .map_or_else(|| !written.is_empty(), |channel| written.contains(channel))
-        })
-}
-
-/// The first channel a `workspace:` expression reads that the dispatched
-/// instance does **not** write — the fact that decided the refusal where a
-/// `state` read is what it turned on, and the one the help has to state.
 ///
-/// A read of the whole `state` object names no channel, so it answers `None`:
-/// there is nothing to point an author at, and the general repairs are the whole
-/// of what this compiler can offer there.
-fn unwritten_channel(source: &str, written: &BTreeSet<String>) -> Option<String> {
-    crate::cel::analyze(source, &crate::cel::Scope::default())
-        .reads
-        .iter()
-        .filter(|read| read.root == "state")
-        .find_map(|read| {
-            let channel = read.path.first()?;
-            (!written.contains(channel)).then(|| channel.to_string())
-        })
+/// A read that names **no** channel is answered the way a refusal has to answer
+/// an unknown: a read of the whole `state` object embeds every channel, so one
+/// the instance observes is one it carries; but an index whose key this compiler
+/// could not resolve — `state[input.which]` — names a channel nobody here can
+/// name, and admitting it would exempt a composition from a race refusal on the
+/// strength of a fact nothing established.
+fn reads_an_instance_channel(reads: &[Read], observed: &BTreeSet<String>) -> bool {
+    reads.iter().any(|read| match read.path.first() {
+        Some(channel) => observed.contains(channel),
+        None if read.indexed => false,
+        None => !observed.is_empty(),
+    })
 }
 
 /// One refusal [`dispatched_workspaces`] has decided on, before it is worded.
@@ -1431,9 +1599,10 @@ struct Shared {
     /// The dispatched flow's address, for the half of the help that is about
     /// the instance rather than about the node.
     flow: String,
-    /// A channel the expression reads and the instance never writes, where the
-    /// expression reads one ([`unwritten_channel`]).
-    unwritten: Option<String>,
+    /// A channel the expression reads and this node does not observe the
+    /// instance's own value of, where the expression names one
+    /// ([`Instance::unobserved`]).
+    unobserved: Option<Unobserved>,
     /// Its `workspace:`, which is the line the refusal anchors at.
     at: Span,
     /// How the dispatching map is named.
@@ -1455,7 +1624,7 @@ impl Shared {
         let Self {
             subject,
             flow,
-            unwritten,
+            unobserved,
             at,
             dispatcher,
             dispatched_at,
@@ -1495,18 +1664,29 @@ impl Shared {
             ),
         };
         // Where a `state` read is what the refusal turned on, the fact that
-        // decided it is said: a channel is per-dispatch exactly when the
-        // instance writes it, and an author whose graph already has the
-        // upstream step would otherwise be sent to restructure a composition one
-        // `writes:` destination away from legal (grammar 10.1, PRD G3).
-        let instance = unwritten.map_or_else(String::new, |channel| {
-            format!(
+        // decided it is said, and the two shapes are said apart: a channel is
+        // per-dispatch exactly when a node **upstream of this one** writes it,
+        // so an author whose graph already has the upstream step would otherwise
+        // be sent to restructure a composition one `writes:` destination — or
+        // one edge — away from legal (grammar 10.1, 7.6.4, PRD G3).
+        let instance = unobserved.map_or_else(String::new, |unobserved| match unobserved {
+            Unobserved::NeverWritten { channel } => format!(
                 " `{channel}` is a channel no node of `{flow}` writes, so every instance reads its \
                  `default:` — one directory for the whole fan-out. A channel the instance writes \
                  **itself** holds that instance's own value (grammar 10.1), which is how an \
                  upstream `exec:` or `tool.*` step that clones or worktrees per dispatch carries \
                  the path to this node."
-            )
+            ),
+            Unobserved::NotUpstream { channel, writers } => format!(
+                " `{channel}` is written by {} of `{flow}`, but not by a node this one runs after \
+                 on every path from `start`: a channel's writes land when their writer completes \
+                 (grammar 7.6.4), so what this node reads is still the `default:` every instance \
+                 starts at — one directory for the whole fan-out. The write has to **dominate** \
+                 this node the way `map.over`'s producer dominates its map (grammar 8.6 rule 11), \
+                 which is what an upstream `exec:` or `tool.*` step that clones or worktrees per \
+                 dispatch does.",
+                list(&writers)
+            ),
         });
         let mut diagnostic = Diagnostic::error(DiagnosticCode::SharedWorkspace, at, message)
             .with_label(dispatched_at, "the fan-out is issued here");

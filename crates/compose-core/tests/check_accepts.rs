@@ -2686,6 +2686,129 @@ flow.main:
     );
 }
 
+/// The same two per-dispatch reads written with a **bracket** (grammar 4.1,
+/// 8.9, Decisions D83, D147).
+///
+/// CEL indexes an object by a constant key as the member selection it is, so
+/// `state['checkout']` is `state.checkout` and `input['worktree']` is
+/// `input.worktree` — one value, two spellings, and a rule stated over a channel
+/// or field *name* has to read the name through either. The refusing direction
+/// is `tests/fixtures/invalid-check/an-indexed-state-channel-no-dispatch-writes-is-one-directory`;
+/// this is the direction a rule that answered an unnamed read conservatively
+/// would break, which is the failure a negative corpus cannot catch: the shapes
+/// ruling b exists to make writable, refused for the bracket their author
+/// happened to type.
+///
+/// Both halves are here because they are two predicates —
+/// `check::coder::reads_an_instance_channel` over the instance's own channels,
+/// and `check::reach::is_item_derived` over the dispatch's bound fields — and a
+/// resolution that reached only one of them would leave the other refusing.
+#[test]
+fn a_bracket_reads_the_per_dispatch_scope_the_dot_does() {
+    accepts(
+        "coder-bracketed-per-dispatch-workspaces",
+        r#"
+state:
+  checkout: { type: string, default: "" }
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    prepare:
+      exec:
+        command: git
+        args: ["worktree", "add", "--detach"]
+        output:
+          stdout: { type: string }
+      input: { goal: "input.goal" }
+      writes: { stdout: checkout }
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "state['checkout']"
+        prompt: Work in the checkout this instance made for itself.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: prepare }
+    - { from: prepare, to: implement }
+    - { from: implement, to: end }
+flow.carry:
+  inputs:
+    worktree: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "input['worktree']"
+        prompt: Work in the checkout this item names.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  inputs:
+    goals:
+      type: array
+      max_items: 4
+      items: { type: string }
+    tasks:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          worktree: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+  nodes:
+    prepared:
+      map:
+        over: input.goals
+        as: goal
+        node: flow.fix
+        input:
+          goal: "goal"
+        max_concurrency: 4
+        writes: { summary: summaries }
+    carried:
+      map:
+        over: input.tasks
+        as: task
+        node: flow.carry
+        input:
+          worktree: "task.worktree"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: prepared }
+    - { from: prepared, to: carried }
+    - { from: carried, to: end }
+"#,
+    );
+}
+
 /// Two `map` steps on concurrent branches whose dispatched runs take a
 /// directory per item (grammar 7.6.1, 8.9, Decision D147).
 ///

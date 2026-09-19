@@ -19,7 +19,7 @@
 //! 7.5, Decision D111). Both directions are the same relation pointed opposite
 //! ways, which is why they share [`satisfies`](super::model).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use crate::ast::common::Address;
 use crate::ast::document::Reduce;
@@ -174,8 +174,9 @@ pub(crate) fn effective<'a>(
     effective
 }
 
-/// Every channel a node of one flow writes — which is every channel an
-/// **instance** of that flow holds a value of its own for (grammar 10.1).
+/// Every channel a node of one flow writes, paired with **which** of its nodes
+/// write it — the two facts a reader inside that flow needs about a channel
+/// name (grammar 10.1).
 ///
 /// The channel set is composition-global in shape and per-instance in value: a
 /// dispatched instance is a separate run of a separate compiled graph, seeded
@@ -187,6 +188,18 @@ pub(crate) fn effective<'a>(
 /// writes holds its `default:` in every instance and is therefore one value for
 /// the whole fan-out.
 ///
+/// **Which** node writes it is the second half, and it is the half a *reader*
+/// cannot do without. Channel values are ordered by step — the values entering
+/// step *k+1* are a function of the values entering step *k* and the outputs of
+/// step *k*'s nodes (grammar 7.6.4) — so a node reads this instance's own value
+/// only where a node that wrote it has certainly already run. That is dominance,
+/// and it is the same reading grammar 8.6 rule 11 gives `map.over` for the same
+/// question (Decision D76): a writer on a guarded sibling branch, or one
+/// downstream of the reader, leaves the reader with the `default:` every
+/// instance shares. The node indexes returned here index [`Flow::nodes`], which
+/// is what [`Graph`](super::graph::Graph) indexes too, so a caller can ask
+/// [`Graph::dominates`](super::graph::Graph::dominates) about them directly.
+///
 /// Read by [the shared-workspace
 /// refusal](super::coder::dispatched_workspaces), which is the rule that has to
 /// know the difference (PRD resolved q61 ruling b).
@@ -195,14 +208,21 @@ pub(crate) fn effective<'a>(
 /// of its own ([`Ctx::node_output`] answers `None` for one), so those are read
 /// here as [`maps`](super::maps) reads them: each dispatch's own `writes:`
 /// against its target's result schema, which for a routed map is one per route.
-pub(crate) fn written_within(ctx: &Ctx<'_>, flow: &Flow) -> BTreeSet<String> {
-    let mut written = BTreeSet::new();
-    let mut record = |output: &FieldMap, writes: Option<&Writes>, fallback: &Span| {
-        for entry in effective(ctx, output, writes, fallback) {
-            written.insert(entry.channel.name.value.to_string());
-        }
-    };
-    for node in &flow.nodes {
+pub(crate) fn writers_within(ctx: &Ctx<'_>, flow: &Flow) -> BTreeMap<String, Vec<usize>> {
+    let mut writers: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (at, node) in flow.nodes.iter().enumerate() {
+        let mut record = |output: &FieldMap, writes: Option<&Writes>, fallback: &Span| {
+            for entry in effective(ctx, output, writes, fallback) {
+                let wrote = writers
+                    .entry(entry.channel.name.value.to_string())
+                    .or_default();
+                // A routed map reaches one channel from several routes, and it
+                // is one writer however many of them do.
+                if !wrote.contains(&at) {
+                    wrote.push(at);
+                }
+            }
+        };
         match &node.kind {
             NodeKind::Map { map } => {
                 for (target, writes) in map_writes(&map.dispatch) {
@@ -218,7 +238,7 @@ pub(crate) fn written_within(ctx: &Ctx<'_>, flow: &Flow) -> BTreeSet<String> {
             }
         }
     }
-    written
+    writers
 }
 
 /// Each dispatch of a `map` block paired with the `writes:` remap it carries,

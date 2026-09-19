@@ -299,14 +299,21 @@ two runs concurrent branches can have in flight at once writing the same
 inside an instance a `flow:` node starts or a `map` node dispatches, so factoring
 work into a subflow or fanning it out reads the same as two nodes written out.
 
-The per-dispatch scope includes a `state` channel the dispatched instance
-**itself** writes, because an instance holds its own channel values: the upstream
-`exec:` step that makes the checkout can run *inside* the dispatch and hand the
-path over on a channel, which is the shape a coder node's `workspace:` has no
-other way to reach. A channel nothing in the instance writes is its `default:`
-everywhere, which is one directory and stays an error.
+The per-dispatch scope includes a `state` channel a node **upstream of the coder
+node** writes, because an instance holds its own channel values: the `exec:` step
+that makes the checkout can run *inside* the dispatch and hand the path over on a
+channel, which is the shape a coder node's `workspace:` has no other way to
+reach. Upstream means every path from `start` to the coder node goes through the
+writer — a channel written on a branch beside it, or by a node it feeds rather
+than follows, is still the `default:` when the run begins, which is one directory
+and stays an error. So is a channel nothing in the instance writes at all.
 `agent-compose explain shared-workspace` is the whole rule, including why the
 second one is a warning.
+
+A path where the expression goes is the one migration this key has, and it is
+answered with the rewrite rather than with a parse error: `workspace: /srv/repo`,
+`workspace: ${REPO_ROOT}` and `workspace: checkouts/main` were all legal before
+the key became an expression, and each is now told to quote itself.
 
 **Read the containment paragraph before you write one.** What bounds a harness
 run is the `workspace:`, the `access:` preset, the declared `env:`, and the

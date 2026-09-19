@@ -3185,17 +3185,21 @@ with (`shared-workspace`, PRD resolved q61 ruling b):
 * a coder node a `map` dispatches whose `workspace:` expression does **not**
   read the per-dispatch scope is a **compile error** unless the map declares
   `max_concurrency: 1`. That scope is the dispatch's own `input.<field>`,
-  `execution.item_index`, and a `state` channel **some node of the dispatched
-  instance writes** — an instance holds its own channel values (§10.1), so a
-  checkout an upstream `exec:` step prepares inside the instance is one directory
-  per dispatch, while a channel nothing there writes holds its `default:` in
-  every instance and is one directory for the whole fan-out. The message names
-  both repairs: bind the item's own path (or take `fresh`), or say the runs are
-  serial. A map **inside** a fan-out is read at the looser of that fan-out's
-  bound and its own, because it issues its dispatches once per concurrent
-  instance of the flow that holds it — so `max_concurrency: 1` on a map an outer
-  map fans four ways is four runs in the directory, and the refusal names the
-  outer map as the one to serialise;
+  `execution.item_index`, and a `state` channel **a node that dominates the coder
+  node writes** — an instance holds its own channel values (§10.1), so a checkout
+  an upstream `exec:` step prepares inside the instance is one directory per
+  dispatch, while a channel nothing upstream of the node writes holds its
+  `default:` there and is one directory for the whole fan-out. Dominance rather
+  than mere path-existence, and for the reason §8.6 rule 11 gives `map.over`
+  ([D76](#d76-mapover-reads-a-node-that-dominates-the-map-node)): channel values
+  are ordered by step (§7.6.4), so a writer that runs *after* the coder node, or
+  on a guarded branch beside it, leaves the node reading the `default:` every
+  instance shares. The message names both repairs: bind the item's own path (or
+  take `fresh`), or say the runs are serial. A map **inside** a fan-out is read at
+  the looser of that fan-out's bound and its own, because it issues its dispatches
+  once per concurrent instance of the flow that holds it — so
+  `max_concurrency: 1` on a map an outer map fans four ways is four runs in the
+  directory, and the refusal names the outer map as the one to serialise;
 * two harness runs that statically-concurrent branches (§7.6.1) can have in
   flight at once whose `workspace:` values are **written identically** draw a
   **warning** naming both. The branches are read over the runs a *step* contains,
@@ -9799,23 +9803,30 @@ something it cannot know, and silence would hide the half it can.
 
 *What the per-dispatch scope is.* The dispatch's own `input.<field>` and
 `execution.item_index`, which is D83's predicate exactly — **and** a `state`
-channel some node of the dispatched instance writes, which is the half a store
-key does not need. An instance is a separate run of a separate compiled graph:
-the channel set is composition-global in shape and per-instance in value, seeded
-at each `default:` with nothing crossing but `inputs:` (§10.1, §7.6.4 rules 2 and
-3). So `prepare` — an `exec:` step running `git worktree add` — writing
-`checkout` inside the instance, and the coder node beside it reading
-`workspace: "state.checkout"`, is four dispatches preparing four directories, and
-it is the shape rule 3's closing paragraph sends an author to; a coder node's
-`workspace:` cannot read another node's output
+channel a node that **dominates** the coder node writes, which is the half a
+store key does not need. An instance is a separate run of a separate compiled
+graph: the channel set is composition-global in shape and per-instance in value,
+seeded at each `default:` with nothing crossing but `inputs:` (§10.1, §7.6.4
+rules 2 and 3). So `prepare` — an `exec:` step running `git worktree add` —
+writing `checkout` inside the instance, and the coder node *downstream of it*
+reading `workspace: "state.checkout"`, is four dispatches preparing four
+directories, and it is the shape rule 3's closing paragraph sends an author to; a
+coder node's `workspace:` cannot read another node's output
 ([D42](#d42-node-outputs-are-readable-only-from-edge-guards-and-mapover)), so
-a channel is the only way to carry that answer to it. A channel **no** node of
-the instance writes holds its `default:` in every instance and is one directory
-for the whole fan-out as surely as a literal path is, which is the case the
-refusal keeps — and its message names the channel and the flow that never writes
-it. Whether two instances that each write a channel write the same *string* is a
-launch fact of exactly the kind the warning above exists for, and it is stated
-rather than pretended.
+a channel is the only way to carry that answer to it. A channel **nothing
+upstream of the node** writes holds its `default:` there and is one directory for
+the whole fan-out as surely as a literal path is, which is the case the refusal
+keeps — and its message says which of the two shapes it is, naming the flow that
+never writes the channel, or the nodes that write it somewhere this one cannot
+read. The reading is dominance and not path-existence because channel values are
+ordered by step: a writer that runs *after* the coder node writes a value no
+dispatch of it ever sees, and a writer on a guarded branch beside it may not run
+at all — the same thing
+[D76](#d76-mapover-reads-a-node-that-dominates-the-map-node) says about
+`map.over`, and a race refusal cannot be lifted by a write that may never have
+happened. Whether two instances that each observe a write of a channel write the
+same *string* is a launch fact of exactly the kind the warning above exists for,
+and it is stated rather than pretended.
 
 *Two runs, not two coder nodes.* A branch is concurrent with another whatever
 construct it holds, so the warning is stated over the runs a **step** contains:

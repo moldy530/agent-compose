@@ -1,0 +1,50 @@
+# rule: a `coder:` node's `workspace:` written as a bare relative path is
+# rule: answered with the rewrite too (grammar 4.1, 8.9, D147, PRD G3)
+# code: invalid-expression
+# message: `workspace: checkouts/main` of `flow.main` node `build` is a path where an expression is written
+# at: main.yml:42:20
+# help: `workspace:` is evaluated in this node's input scope at each dispatch, so a path has to be written as one: `workspace: "'checkouts/main'"` is that same directory as a CEL string. What the expression buys is the dispatch — `workspace: "'checkouts/main/' + input.branch"` gives a map item its own checkout, and `workspace: fresh` takes one the runtime provisions per dispatch (grammar 4.1, 8.9, Decision D147, PRD resolved q61 ruling a)
+#
+# The third pre-q61 spelling, and the one the other two migration fixtures
+# cannot cover: `/srv/checkout` and `${REPO_ROOT}` are decided on their first
+# character, because neither `/` nor `$` opens any CEL expression this grammar
+# admits. `checkouts/main` opens one — it is a legal division of two
+# identifiers — so it parses, and what the front-end hands back is one
+# `unknown-root` per segment: two errors about roots the author never wrote,
+# neither of which names the rewrite.
+#
+# That is the failure mode resolved q22 is about, arriving through the one door
+# the first-character test leaves open, so this spelling is decided on what the
+# walk *made* of the value instead: it holds a `/`, and everything the walk
+# objected to is a root that does not exist. A real expression over the roots
+# this surface exposes keeps the front-end's own answer, which is the better one
+# for it — `check_accepts.rs`'s
+# `a_fan_out_over_a_coder_node_takes_a_directory_per_dispatch` holds
+# `workspace: "'${ROOT}/' + input.branch"`, a `/` inside an expression that
+# names its roots, and it is accepted.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: checkouts/main
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
