@@ -350,6 +350,7 @@ pub fn readme(ir: &Ir, partition: &super::env::Partition) -> super::GeneratedFil
     contents.push_str(&human_waits(ir, partition));
     contents.push_str(&store_data(ir));
     contents.push_str(&builtin_workspaces(ir));
+    contents.push_str(&fresh_workspaces(ir));
     contents.push_str(&route_timeouts(ir));
     contents.push_str(&host_functions(ir));
     contents.push_str(README_PINS);
@@ -1014,6 +1015,61 @@ built-in of that execution that took the default, and **removed when the run
 settles** — kept only while the execution's journal row stays open, so that a
 `resume` finds the files the run had written. A `workspace:` you named is never
 removed by this project.
+"#;
+
+/// The section a composition holding a `workspace: fresh` coder node gets
+/// (grammar §8.9, PRD resolved q61 ruling c).
+///
+/// [`builtin_workspaces`]' reason, one construct along and for a directory that
+/// is not the same directory: a run writes into this one, nothing in the spec
+/// names it, and something has to say where it is and what is safe to delete.
+/// The two sections are separate because the compositions are — a project may
+/// hold either, both, or neither — and because what the reader is told differs:
+/// a built-in's default workspace is one per *execution* and a `fresh` one is
+/// one per *dispatch*, remade at every attempt.
+fn fresh_workspaces(ir: &Ir) -> String {
+    let held = ir.definitions.values().any(|definition| {
+        let crate::ir::definition::DefinitionBody::Flow(flow) = &definition.body else {
+            return false;
+        };
+        flow.nodes.iter().any(|node| match &node.kind {
+            crate::ir::flow::NodeKind::Coder { coder } => {
+                coder.workspace.value.expression().is_none()
+            }
+            _ => false,
+        })
+    });
+    if !held {
+        return String::new();
+    }
+    String::from(FRESH_WORKSPACES)
+}
+
+const FRESH_WORKSPACES: &str = r#"
+## Where a `workspace: fresh` harness run works
+
+A `coder:` node names the directory its run is contained by, and one of this
+composition's writes `workspace: fresh` — which asks this project for a
+directory instead of naming one. It is made here:
+
+```text
+.agent-compose/workspaces/<execution id>/<instance path>/
+```
+
+The instance path is the node's own address inside the run — the node id, its
+traversal ordinal, and a frame for every `flow:` node and `map` dispatch above
+it — so **two dispatches of one node are two directories**, which is what makes
+a fan-out over a coding agent safe to run concurrently.
+
+It is **emptied and remade at the start of every attempt**, so a `retry:` never
+meets what the attempt it is retrying left behind, and it is removed when the
+run settles, exactly as the built-in workspace above it is — kept only while the
+execution's journal row stays open, so a `resume` finds what the run had
+written.
+
+What it does **not** contain is a checkout: this project makes the directory and
+nothing else. A run that needs source control needs a step in the graph that
+puts it there.
 "#;
 
 /// The section a composition declaring a `store.*` gets.
@@ -1857,6 +1913,75 @@ tool.sandbox:
         assert!(
             configured.contains("## Where a built-in tool works"),
             "{configured}"
+        );
+    }
+
+    /// A composition holding a `workspace: fresh` coder node is told where that
+    /// directory is (grammar §8.9, PRD resolved q61 ruling c).
+    ///
+    /// The built-in section's reason for a directory that is not the same
+    /// directory: this one is per **dispatch** rather than per execution and is
+    /// remade at every attempt, and a reader of the project has no other way to
+    /// learn either — the spec says `fresh` and nothing else. A coder node that
+    /// names its own workspace gets no section, because the composition named
+    /// the directory and its lifetime is the composition's.
+    #[test]
+    fn a_composition_taking_a_fresh_workspace_is_told_where_it_is() {
+        let coder = |workspace: &str| {
+            format!(
+                r#"version: "0.1"
+
+provider.p:
+  kind: anthropic
+  api_key: ${{K}}
+
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+
+flow.main:
+  outputs:
+    summary: {{ type: string }}
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: {workspace}
+        prompt: Do the work.
+        output:
+          summary: {{ type: string }}
+      input: "'go'"
+  edges:
+    - {{ from: start, to: build }}
+    - {{ from: build, to: end }}
+"#
+            )
+        };
+
+        let named = readme_of(&ir_of(&coder("\"'/srv/checkout'\""))).contents;
+        assert!(
+            !named.contains("## Where a `workspace: fresh` harness run works"),
+            "a node that named its own directory is not told about one this \
+             project makes: {named}"
+        );
+
+        let provisioned = readme_of(&ir_of(&coder("fresh"))).contents;
+        assert!(
+            provisioned.contains(".agent-compose/workspaces/<execution id>/<instance path>/"),
+            "the directory `fresh` derives: {provisioned}"
+        );
+        assert!(
+            provisioned.contains("two dispatches of one node are two directories"),
+            "…and the property that makes a fan-out safe: {provisioned}"
+        );
+        assert!(
+            provisioned.contains("emptied and remade at the start of every attempt"),
+            "…and what a retry finds there: {provisioned}"
+        );
+        assert!(
+            provisioned.contains("does **not** contain is a checkout"),
+            "…and the thing it deliberately does not do: {provisioned}"
         );
     }
 

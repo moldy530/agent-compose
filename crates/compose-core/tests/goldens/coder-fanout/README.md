@@ -247,6 +247,31 @@ script — so bun, npm and pnpm all resolve it to the same versions. The lockfil
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
 
+## Where a `workspace: fresh` harness run works
+
+A `coder:` node names the directory its run is contained by, and one of this
+composition's writes `workspace: fresh` — which asks this project for a
+directory instead of naming one. It is made here:
+
+```text
+.agent-compose/workspaces/<execution id>/<instance path>/
+```
+
+The instance path is the node's own address inside the run — the node id, its
+traversal ordinal, and a frame for every `flow:` node and `map` dispatch above
+it — so **two dispatches of one node are two directories**, which is what makes
+a fan-out over a coding agent safe to run concurrently.
+
+It is **emptied and remade at the start of every attempt**, so a `retry:` never
+meets what the attempt it is retrying left behind, and it is removed when the
+run settles, exactly as the built-in workspace above it is — kept only while the
+execution's journal row stays open, so a `resume` finds what the run had
+written.
+
+What it does **not** contain is a checkout: this project makes the directory and
+nothing else. A run that needs source control needs a step in the graph that
+puts it there.
+
 ## Pinned versions
 
 A compiler release targets one LangGraph release (PRD 5.12). Upgrading is a
