@@ -1,0 +1,144 @@
+# A `map` over a coder node, and a coder node that takes a directory of its own
+# (grammar 8.9, PRD resolved q61).
+#
+# This is the shape resolved q61 was ratified from: fan out over a list of
+# checkouts, run a coding agent in each, join the answers. Before the ruling it
+# could not be written — `workspace:` was one path for the whole fan-out, so
+# `max_concurrency` above 1 was a data race on a directory — and the two ways it
+# is written now are both here:
+#
+#   * `flow.fix`'s `implement` reads `input.worktree`, which the map binds from
+#     each item, so each dispatch is contained by the checkout its own item
+#     names;
+#   * `summarise` writes `workspace: fresh` and is handed a directory the
+#     runtime provisions for it, under the execution's scratch and named by the
+#     §9.4 instance path — created clean at the start of every attempt, which is
+#     what its `retry:` is here to exercise.
+#
+# It is deliberately model-free apart from the harness runs: `over:` reads the
+# flow's own `inputs:`, so there is no agent node and nothing here needs a
+# provider endpoint to reach. The harness runs reach a scripted driver through
+# the seam `registerHarnessDriver` opens, which is what a coding harness's own
+# wire makes necessary (PRD resolved q57).
+version: "0.1"
+
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+
+state:
+  # What one dispatched instance's own coder node writes, inside that instance.
+  summary:
+    description: What one implementing run says it changed.
+    type: string
+    default: ""
+  # …and where the dispatch site lands them, which must be reduced: the
+  # instances are concurrent writers (grammar 8.6 rule 5).
+  summaries:
+    description: One entry per dispatched run, in source-item order.
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+  survey:
+    description: The note the summarising run wrote in its own directory.
+    type: string
+    default: ""
+
+# The dispatched module: one harness run, contained by the checkout its item
+# named.
+flow.fix:
+  description: Make one change in one checkout.
+  inputs:
+    goal: { type: string }
+    worktree: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        # The ruling, written out: an expression over this node's input scope,
+        # evaluated at each dispatch. `worktree` is the item's own field, bound
+        # into this instance by the map below (grammar 4.1, 8.9, D147).
+        workspace: "input.worktree"
+        access: workspace_write
+        prompt: |
+          Make the smallest change that satisfies the goal in the checkout you
+          have been given, and report what you touched.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+        allow_tools: [Bash, Edit, Read, Write]
+        env:
+          PATH: "/usr/bin:/bin"
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+      timeout: 20m
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+
+flow.batch:
+  description: Fan a coding agent out over a list of checkouts.
+  inputs:
+    tasks:
+      description: One entry per checkout, each carrying the directory it is.
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          goal: { type: string }
+          worktree: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+    survey: { type: string }
+  nodes:
+    work:
+      map:
+        over: input.tasks
+        as: task
+        node: flow.fix
+        input:
+          goal: "task.goal"
+          worktree: "task.worktree"
+        # Real, now: two dispatches are two directories, so the bound is a
+        # bound rather than a lie (PRD resolved q61 ruling a).
+        max_concurrency: 4
+        writes: { summary: summaries }
+
+    # …and the other spelling: no checkout of its own to work in, so the
+    # runtime makes one. The `retry:` is what reads the "clean per attempt"
+    # half of ruling c — a second attempt starts in an empty directory,
+    # whatever the first one left there.
+    summarise:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: fresh
+        access: workspace_write
+        prompt: |
+          Write a short note about the batch that just ran, in the directory
+          you have been given.
+        output:
+          note: { type: string }
+      input: "'summarise the batch'"
+      writes: { note: survey }
+      retry: { max: 1, backoff: 1ms }
+      timeout: 5m
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: summarise }
+    - { from: summarise, to: end }
