@@ -46,6 +46,15 @@ pub struct Golden {
 /// composition uses" is a claim about a *set*, and a golden with one harness in
 /// it would read identically whether the rule were per-harness or all-or-nothing.
 ///
+/// `coder-fanout` is the sixth, and it is `patch-pipeline`'s other half: that
+/// one binds both harnesses in one composition, and this one binds one harness
+/// in both spellings of `workspace:` (PRD resolved q61). A `map` dispatches a
+/// flow whose coder node reads the item's own checkout out of its input scope,
+/// and a second coder node takes `workspace: fresh` under a `retry:`. Each
+/// lowers to a different `HarnessBinding.workspace` — an expression, and the
+/// keyword — and the pair is what makes "the emitted binding carries the key as
+/// written" a claim about a *set* rather than about one spelling.
+///
 /// `placed-nodes` is the fourth composition and the mesh one. `triage-fanout`'s
 /// `staging` target already places a component, so a mesh reaches the corpus
 /// either way; what this adds is the **three shapes a placed component is
@@ -78,6 +87,11 @@ pub const GOLDENS: &[Golden] = &[
     Golden {
         directory: "patch-pipeline",
         project: "examples/patch-pipeline",
+        target: "local",
+    },
+    Golden {
+        directory: "coder-fanout",
+        project: "crates/compose-core/tests/projects/coder-fanout",
         target: "local",
     },
     Golden {

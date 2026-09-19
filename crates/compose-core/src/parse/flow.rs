@@ -4,9 +4,9 @@ use crate::ast::binding::NodeInput;
 use crate::ast::common::Namespace;
 use crate::ast::definition::Settings;
 use crate::ast::flow::{
-    CoderBlock, Edge, FlowContext, FlowDef, FlowNode, Harness, HumanBlock, ItemError, MapBlock,
-    MapDispatch, MapRoute, NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind, PermissionMode,
-    StoreNode, StoreOp, StoreOpParams, StoreValue, WorkspaceAccess,
+    CoderBlock, CoderWorkspace, Edge, FlowContext, FlowDef, FlowNode, Harness, HumanBlock,
+    ItemError, MapBlock, MapDispatch, MapRoute, NODE_KIND_KEYS, Node as FlowNodeAst, NodeKind,
+    PermissionMode, StoreNode, StoreOp, StoreOpParams, StoreValue, WorkspaceAccess,
 };
 use crate::ast::policy::PolicyBlock;
 use crate::ast::schema::Surface;
@@ -940,32 +940,15 @@ fn coder_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<CoderBlock> {
         .require("model", cx)
         .and_then(|node| lexical::reference(node, "`model`", &[Namespace::Model], cx));
 
-    // **Required**, unlike a `builtin:` binding's, and interpolable for the same
-    // reason (grammar 4.3 class 2): which directory a harness may author and run
-    // a program in is a property of the machine running it, and there is no
-    // per-execution default that would be a *containment* bound for a construct
-    // whose whole point is to work on a checkout somebody already has
-    // (Decision D138).
+    // **Required**, unlike a `builtin:` binding's, and a *runtime* binding
+    // rather than a class-2 string since PRD resolved q61: which directory a
+    // harness may author and run a program in is a property of the machine
+    // running it **and** of the dispatch, so the key takes an expression this
+    // node's input scope is evaluated against — which is what lets a map item
+    // carry its own checkout (Decisions D138, D147).
     let workspace = fields
         .require("workspace", cx)
-        .and_then(|node| lexical::interpolated(node, "`workspace`", cx))
-        .filter(|workspace| {
-            if !workspace.value.as_str().is_empty() {
-                return true;
-            }
-            cx.push(
-                Diagnostic::error(
-                    DiagnosticCode::InvalidValue,
-                    workspace.span.clone(),
-                    format!("`workspace` in {context} must not be empty"),
-                )
-                .with_help(
-                    "name the directory this run works inside; an empty one would bound the \
-                     harness to wherever the runtime was started instead (grammar 8.9)",
-                ),
-            );
-            false
-        });
+        .and_then(|node| workspace(node, &context, cx));
     let access = fields
         .take("access")
         .and_then(|node| lexical::keyword(node, "`access`", WORKSPACE_ACCESS, cx));
@@ -1055,6 +1038,50 @@ fn coder_block(node: &Node, subject: &str, cx: &mut Cx) -> Option<CoderBlock> {
         settings,
         span: node.span.clone(),
     })
+}
+
+/// Read `workspace:` — the directory one dispatch of this run works inside
+/// (grammar 8.9, Decision D147, PRD resolved q61 ruling a).
+///
+/// Two forms, told apart by one comparison. The word `fresh` is the runtime's
+/// own per-dispatch directory; everything else is an **expression**, kept raw
+/// the way every other CEL value is, because which roots are in scope and what
+/// the result has to be are the validator's questions and not one file's
+/// (`check::coder`).
+///
+/// What survives from Decision D138 is the emptiness refusal, and its reason
+/// moved with the key: `workspace: ""` used to be a path naming nothing, and is
+/// now an expression that is not one. It is the last thing this reader can say
+/// about the value — after PRD resolved q61 `validate` inspects the
+/// expression's well-formedness and never the path's text, which is the trade
+/// every runtime binding makes (grammar 4.1).
+fn workspace(node: &Node, context: &str, cx: &mut Cx) -> Option<Spanned<CoderWorkspace>> {
+    let text = expect_string(node, "`workspace`", cx)?;
+    if text.value.trim().is_empty() {
+        cx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidValue,
+                text.span.clone(),
+                format!("`workspace` in {context} must not be empty"),
+            )
+            .with_help(
+                "`workspace:` is an expression evaluated in this node's input scope at each \
+                 dispatch, and an empty one names no directory: write the path the run works \
+                 inside as a CEL string (`workspace: \"'${REPO_ROOT}'\"`), bind the dispatch's \
+                 own (`workspace: \"input.worktree\"`), or write `workspace: fresh` for a \
+                 directory per dispatch (grammar 8.9, Decision D147)",
+            ),
+        );
+        return None;
+    }
+    if text.value == CoderWorkspace::FRESH {
+        return Some(Spanned::new(CoderWorkspace::Fresh, text.span));
+    }
+    let expression = lexical::interpolate(text, "`workspace`", cx);
+    Some(Spanned::new(
+        CoderWorkspace::Expression(expression.value),
+        expression.span,
+    ))
 }
 
 /// Read `allow_tools:` — the harness tool names one run may use (Decision D138).

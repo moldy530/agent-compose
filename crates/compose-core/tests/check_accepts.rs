@@ -2233,7 +2233,7 @@ flow.f:
       coder:
         harness: cc
         model: model.m
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: full_access
         prompt: Do the work.
         output:
@@ -2245,7 +2245,7 @@ flow.f:
       coder:
         harness: cc
         model: model.m
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: read_only
         prompt: Read the work and report on it.
         output:
@@ -2256,7 +2256,7 @@ flow.f:
       coder:
         harness: codex
         model: model.o
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: read_only
         prompt: Read the work.
         output:
@@ -2266,7 +2266,7 @@ flow.f:
       coder:
         harness: codex
         model: model.o
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: full_access
         prompt: Do the work outside the sandbox.
         output:
@@ -2276,7 +2276,7 @@ flow.f:
       coder:
         harness: codex
         model: model.o
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: workspace_write
         prompt: Edit inside the checkout.
         output:
@@ -2286,7 +2286,7 @@ flow.f:
       coder:
         harness: cc
         model: model.m
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         prompt: Take the default preset.
         output:
           note: { type: string }
@@ -2299,6 +2299,617 @@ flow.f:
     - { from: broad, to: writing }
     - { from: writing, to: middle }
     - { from: middle, to: end }
+"#,
+    );
+}
+
+/// The **accepting** half of PRD resolved q61's unwritable race (grammar 8.9,
+/// Decision D147).
+///
+/// The negative corpus pins both refusals — a map-dispatched coder whose
+/// `workspace:` reads nothing per-dispatch, and two concurrent coder nodes
+/// writing one value. Over-rejection is what a negative corpus cannot see, and
+/// this rule has three legal shapes it would be easy to refuse by accident:
+///
+///  * a fan-out whose dispatched coder takes the item's own path **whole**
+///    (`workspace: "input.worktree"`), which is the repair the error names and
+///    therefore the one shape that must never be refused;
+///  * a fan-out whose coder reads an item-derived field **inside a larger
+///    expression** (`"'${ROOT}/' + input.branch"`). The predicate is about what
+///    the expression reads rather than about its shape, and an implementation
+///    that matched the whole value against a binding would accept the first
+///    shape and refuse this one;
+///  * a fan-out whose map declares `max_concurrency: 1`, which is the second
+///    repair: one run at a time is one run in the directory at a time, whatever
+///    the expression says.
+///
+/// `workspace: fresh` rides along, since a keyword that stopped parsing — or an
+/// emitter that could not write it — would fail here rather than at a golden.
+#[test]
+fn a_fan_out_over_a_coder_node_takes_a_directory_per_dispatch() {
+    accepts(
+        "coder-per-dispatch-workspaces",
+        r#"
+state:
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+flow.carried:
+  inputs:
+    worktree: { type: string }
+    branch: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "input.worktree"
+        prompt: Work in the checkout you were given.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+flow.branched:
+  inputs:
+    worktree: { type: string }
+    branch: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "'${ROOT}/' + input.branch"
+        prompt: Work under the root, in the directory this item's branch names.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+flow.serial:
+  inputs:
+    worktree: { type: string }
+    branch: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "'${ROOT}'"
+        prompt: Work in the one checkout, one dispatch at a time.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+flow.main:
+  inputs:
+    worktrees:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          worktree: { type: string }
+          branch: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+  nodes:
+    carried:
+      map:
+        over: input.worktrees
+        as: task
+        node: flow.carried
+        max_concurrency: 4
+        writes: { summary: summaries }
+    branched:
+      map:
+        over: input.worktrees
+        as: task
+        node: flow.branched
+        max_concurrency: 4
+        writes: { summary: summaries }
+    serial:
+      map:
+        over: input.worktrees
+        as: task
+        node: flow.serial
+        max_concurrency: 1
+        writes: { summary: summaries }
+    provisioned:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: fresh
+        prompt: Work in the directory the runtime made.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: carried }
+    - { from: carried, to: branched }
+    - { from: branched, to: serial }
+    - { from: serial, to: provisioned }
+    - { from: provisioned, to: end }
+"#,
+    );
+}
+
+/// A `map` **inside** a fan-out, accepted at the bound it really runs under
+/// (grammar 8.9, 8.6 rule 1, Decision D147).
+///
+/// `tests/fixtures/invalid-check/a-map-inside-a-fan-out-runs-at-the-outer-bound`
+/// pins the refusal: a serial inner map inside a concurrent outer one is still
+/// four harness runs in one directory, so the frame carries the looser bound.
+/// The direction that corpus cannot see is the one where reading the outer bound
+/// makes a legal composition unwritable, and there are two of those:
+///
+///  * **the fan-out is serial the whole way down.** Both maps declare
+///    `max_concurrency: 1`, so one run is in the directory at a time however
+///    deeply the dispatch is nested, and an implementation that raised every
+///    nested map to the composition's loosest bound rather than to its own
+///    enclosing one would refuse it;
+///  * **both items carry the directory.** The outer map fans four ways, the
+///    inner map fans four ways inside each of those, and the dispatched coder
+///    reads a path built from the *enclosing* item's root and the inner map's
+///    own item at once. That is the repair at depth, and it is two halves
+///    because the race is: the inner item tells one instance's dispatches
+///    apart, and the outer root tells the four instances apart — `README.md`
+///    under two repositories is one directory if only the first half is
+///    written, which is what
+///    `tests/fixtures/invalid-check/a-nested-dispatch-repeats-its-items-across-instances`
+///    pins. An implementation that carried only the bound inward and left
+///    derivation re-rooted at the inner item would accept that, and one that
+///    required the enclosing root *instead of* the inner item would refuse this.
+#[test]
+fn a_nested_fan_out_is_read_at_the_bound_it_runs_under() {
+    accepts(
+        "coder-nested-fan-out-workspaces",
+        r#"
+flow.edit:
+  inputs:
+    file: { type: string }
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "'${ROOT}'"
+        prompt: Work in the one checkout, one run at a time.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.per_file:
+  inputs:
+    dir: { type: string }
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "input.dir"
+        prompt: Work in the checkout this item names.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.serial_repo:
+  inputs:
+    files:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    each_file:
+      map:
+        over: input.files
+        as: file
+        max_concurrency: 1
+        node: flow.edit
+        input:
+          file: "file"
+  edges:
+    - { from: start, to: each_file }
+    - { from: each_file, to: end }
+flow.carried_repo:
+  inputs:
+    root: { type: string }
+    files:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs: {}
+  nodes:
+    each_file:
+      map:
+        over: input.files
+        as: file
+        max_concurrency: 4
+        node: flow.per_file
+        input:
+          dir: "input.root + '/' + file"
+  edges:
+    - { from: start, to: each_file }
+    - { from: each_file, to: end }
+flow.main:
+  inputs:
+    repos:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          root: { type: string }
+          files:
+            type: array
+            max_items: 4
+            items: { type: string }
+  outputs: {}
+  nodes:
+    serially:
+      map:
+        over: input.repos
+        as: repo
+        max_concurrency: 1
+        node: flow.serial_repo
+        input:
+          files: "repo.files"
+    carried:
+      map:
+        over: input.repos
+        as: repo
+        max_concurrency: 4
+        node: flow.carried_repo
+        input:
+          root: "repo.root"
+          files: "repo.files"
+  edges:
+    - { from: start, to: serially }
+    - { from: serially, to: carried }
+    - { from: carried, to: end }
+"#,
+    );
+}
+
+/// A checkout the dispatched instance **prepares for itself**, carried to the
+/// coder node on a state channel (grammar 10.1, PRD resolved q61 rulings b, c).
+///
+/// The shape ruling c names in as many words — "an upstream `exec:`/`tool.*`
+/// step cloning or worktree-ing into per-item paths" — written the way the
+/// grammar leaves open: a coder node's `workspace:` cannot read another node's
+/// output (Decision D42), so a channel is the only way to carry `prepare`'s
+/// answer to `implement`.
+///
+/// It is legal because a dispatched flow instance is a **separate run of a
+/// separate compiled graph**: the channel set is composition-global in shape and
+/// per-instance in value, seeded at each `default:` with nothing crossing but
+/// `inputs:` (grammar 7.6.4 rules 2 and 3). Four dispatches are therefore four
+/// `checkout` channels, written by four `prepare` nodes, and four directories.
+/// An implementation that read every `state.*` as one value for the whole
+/// fan-out would refuse this — and there is no in-instance way around such a
+/// refusal, so the author would be sent to restructure the graph around a rule
+/// that was wrong about the runtime.
+///
+/// The **other** direction is what
+/// `tests/fixtures/invalid-check/a-map-dispatched-coder-works-in-one-directory`
+/// and its `state` sibling pin: a channel no node of the instance writes holds
+/// its `default:` in every instance, which is one directory for the whole
+/// fan-out as surely as a literal path is.
+#[test]
+fn a_checkout_the_instance_prepares_is_a_directory_per_dispatch() {
+    accepts(
+        "coder-instance-prepared-workspace",
+        r#"
+state:
+  checkout: { type: string, default: "" }
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    prepare:
+      exec:
+        command: git
+        args: ["worktree", "add", "--detach"]
+        output:
+          stdout: { type: string }
+      input: { goal: "input.goal" }
+      writes: { stdout: checkout }
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "state.checkout"
+        prompt: Work in the checkout this instance made for itself.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: prepare }
+    - { from: prepare, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  inputs:
+    goals:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+  nodes:
+    work:
+      map:
+        over: input.goals
+        as: goal
+        node: flow.fix
+        input:
+          goal: "goal"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#,
+    );
+}
+
+/// The same two per-dispatch reads written with a **bracket** (grammar 4.1,
+/// 8.9, Decisions D83, D147).
+///
+/// CEL indexes an object by a constant key as the member selection it is, so
+/// `state['checkout']` is `state.checkout` and `input['worktree']` is
+/// `input.worktree` — one value, two spellings, and a rule stated over a channel
+/// or field *name* has to read the name through either. The refusing direction
+/// is `tests/fixtures/invalid-check/an-indexed-state-channel-no-dispatch-writes-is-one-directory`;
+/// this is the direction a rule that answered an unnamed read conservatively
+/// would break, which is the failure a negative corpus cannot catch: the shapes
+/// ruling b exists to make writable, refused for the bracket their author
+/// happened to type.
+///
+/// Both halves are here because they are two predicates —
+/// `check::coder::reads_an_instance_channel` over the instance's own channels,
+/// and `check::reach::is_item_derived` over the dispatch's bound fields — and a
+/// resolution that reached only one of them would leave the other refusing.
+#[test]
+fn a_bracket_reads_the_per_dispatch_scope_the_dot_does() {
+    accepts(
+        "coder-bracketed-per-dispatch-workspaces",
+        r#"
+state:
+  checkout: { type: string, default: "" }
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    prepare:
+      exec:
+        command: git
+        args: ["worktree", "add", "--detach"]
+        output:
+          stdout: { type: string }
+      input: { goal: "input.goal" }
+      writes: { stdout: checkout }
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "state['checkout']"
+        prompt: Work in the checkout this instance made for itself.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: prepare }
+    - { from: prepare, to: implement }
+    - { from: implement, to: end }
+flow.carry:
+  inputs:
+    worktree: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "input['worktree']"
+        prompt: Work in the checkout this item names.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  inputs:
+    goals:
+      type: array
+      max_items: 4
+      items: { type: string }
+    tasks:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          worktree: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+  nodes:
+    prepared:
+      map:
+        over: input.goals
+        as: goal
+        node: flow.fix
+        input:
+          goal: "goal"
+        max_concurrency: 4
+        writes: { summary: summaries }
+    carried:
+      map:
+        over: input.tasks
+        as: task
+        node: flow.carry
+        input:
+          worktree: "task.worktree"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: prepared }
+    - { from: prepared, to: carried }
+    - { from: carried, to: end }
+"#,
+    );
+}
+
+/// Two `map` steps on concurrent branches whose dispatched runs take a
+/// directory per item (grammar 7.6.1, 8.9, Decision D147).
+///
+/// `tests/fixtures/invalid-check/a-serial-map-beside-a-coder-node-shares-one-workspace`
+/// pins the refusing half: a `map` is a step that contains harness runs, so the
+/// runs it dispatches collide with a sibling branch's. The direction that corpus
+/// cannot see is the one where reading a `map` as such a step makes the
+/// **repair** unwritable, and it is the shape this ruling exists to make
+/// writable: two concurrent fan-outs, each dispatching a coder node that reads
+/// its own item's path.
+///
+/// Two instances are not one scope (grammar 10.1), which is what keeps this
+/// quiet: a run reached through a dispatch is compared to another only where its
+/// expression reads *nothing*, and `workspace: "input.worktree"` reads the
+/// dispatch it is evaluated in. An implementation that compared the two
+/// expressions as written — they are byte-identical here — would warn about
+/// eight directories and call them one.
+#[test]
+fn two_concurrent_fan_outs_take_a_directory_per_item() {
+    accepts(
+        "coder-concurrent-fan-out-workspaces",
+        r#"
+state:
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+flow.work:
+  inputs:
+    worktree: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "input.worktree"
+        prompt: Work in the checkout this item names.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+flow.main:
+  inputs:
+    left:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          worktree: { type: string }
+    right:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          worktree: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+  nodes:
+    fan_left:
+      map:
+        over: input.left
+        as: task
+        node: flow.work
+        input:
+          worktree: "task.worktree"
+        max_concurrency: 4
+        writes: { summary: summaries }
+    fan_right:
+      map:
+        over: input.right
+        as: task
+        node: flow.work
+        input:
+          worktree: "task.worktree"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: fan_left }
+    - { from: start, to: fan_right }
+    - { from: fan_left, to: end }
+    - { from: fan_right, to: end }
 "#,
     );
 }

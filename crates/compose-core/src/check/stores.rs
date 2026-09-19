@@ -283,7 +283,7 @@ pub(crate) fn check_map_writes(ctx: &mut Ctx) {
             let read = params
                 .key
                 .as_ref()
-                .map(|key| input_fields(key.value.as_str()))
+                .map(|key| reach::input_fields(key.value.as_str()))
                 .unwrap_or_default();
             for field in read {
                 if frame.derived.get(&field) == Some(&false)
@@ -311,29 +311,6 @@ pub(crate) fn check_map_writes(ctx: &mut Ctx) {
             );
         }
     }
-}
-
-/// The `input.<field>` names one expression reads, first occurrence first and
-/// each named once.
-///
-/// This is the read half of what [`reach::is_item_derived`] decides: that
-/// function answers *whether* an expression is item-derived, and a diagnostic
-/// that has to name the binding responsible needs *which* fields it went
-/// through (grammar 11.4, Decision D83).
-fn input_fields(source: &str) -> Vec<String> {
-    let mut fields: Vec<String> = Vec::new();
-    for read in crate::cel::analyze(source, &crate::cel::Scope::default()).reads {
-        if read.root != "input" {
-            continue;
-        }
-        let Some(field) = read.path.first() else {
-            continue;
-        };
-        if !fields.iter().any(|seen| seen == field) {
-            fields.push(field.clone());
-        }
-    }
-    fields
 }
 
 /// A trigger whose flow reaches a `session`-scoped store supplies a session

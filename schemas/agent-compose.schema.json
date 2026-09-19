@@ -1214,7 +1214,7 @@
               "$ref": "#/$defs/modelRef"
             },
             "workspace": {
-              "description": "The root this run works inside. Required, and there is no default: a coder node works on a checkout somebody already has, so a defaulted root would be a bound nobody wrote. Interpolable (grammar 4.3 class 2, Decision D138).",
+              "description": "The root THIS DISPATCH works inside. Required, and there is no default: a coder node works on a checkout somebody already has, so a defaulted root would be a bound nobody wrote (Decision D138). It is a CEL expression evaluated in the node's input scope - `input`, `state`, `execution` - at each dispatch, which is what lets a map item carry its own checkout: `workspace: \"input.worktree\"` (grammar 4.1, Decision D147). Interpolable too, and this is the one surface that is both: the ${ENV} refs resolve into the expression's source at process start and the result is evaluated per dispatch, so a reference belongs inside a string literal - `\"'${REPO_ROOT}/' + input.branch\"`. The word `fresh` is the one keyword: a directory per dispatch that the runtime provisions under .agent-compose/workspaces/<execution>/<instance path>, created clean at the start of every attempt. Which roots the expression may read, and that it answers a string, are another file's facts, so `validate` decides them - as is whether a map-dispatched node reads the per-dispatch scope at all (`shared-workspace`).",
               "allOf": [{ "$ref": "#/$defs/interpolatedString" }, { "minLength": 1 }]
             },
             "access": {

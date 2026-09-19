@@ -301,7 +301,21 @@
 //!     node's entry and the flow answers what the last implementing run wrote,
 //!     and the `on_error: { fallback: end }`, where the failed run's record
 //!     reaches the entry through the error it rode out on.
-//! 26. **The two files an installer reads** — `bunfig.toml` and `.npmrc`
+//! 26. **A fan-out of them, and a directory the runtime made** — the
+//!     `coder-fanout` golden's `runFlow`, out of `coder-fanout.mjs`. Gate 25
+//!     runs two coder nodes that each name one directory for the whole process,
+//!     which is every coder composition this project could write before PRD
+//!     resolved q61 and says nothing about the ruling. This runs the two shapes
+//!     the ruling added: a `map` whose dispatched flow reads `input.worktree`,
+//!     so two dispatches are two checkouts and `max_concurrency` is a bound
+//!     rather than a lie, and a `workspace: fresh` node under a `retry:`, whose
+//!     directory is the §9.4 instance path under the execution's scratch and is
+//!     **empty at the start of every attempt** — the first attempt leaves a file
+//!     in it and fails, and the second finds nothing. Each run's resolved
+//!     directory is read back off its `HarnessRecord`, which is the field
+//!     resolved q61 added to the trace because a composition's own text stopped
+//!     answering the question.
+//! 27. **The two files an installer reads** — `bunfig.toml` and `.npmrc`
 //!     (grammar 14.6, PRD resolved q59), handed to the parsers their own
 //!     installers read them with, out of `installer-config.mjs`. Every other
 //!     emitted format is gated by the tool that consumes it: the modules and
@@ -314,7 +328,7 @@
 //!     comparison the next contributor re-blesses. So Bun's own TOML parser
 //!     reads the emitted `bunfig.toml`, and what it parsed is compared against
 //!     the `package_registry:` the deploy file declared, key by key. Its
-//!     **`26b`** half is the npm one and runs under Node for the reason gate 13
+//!     **`27b`** half is the npm one and runs under Node for the reason gate 13
 //!     does — the reader in question is npm's: the `ini` package **out of the
 //!     npm installation on this machine** parses the emitted `.npmrc`,
 //!     `npm-registry-fetch`'s `getAuth` is asked which credential npm finds for
@@ -981,6 +995,25 @@ const REDUCTIONS: &[Reduction] = &[
         expected: r#"{
             "summary": "second pass",
             "feedback": "tighten it",
+            "messages": []
+        }"#,
+    },
+    Reduction {
+        // The fan-out one: `summaries` is the `append` channel a map's
+        // dispatched instances write into, `summary` is the `last_wins` one an
+        // instance writes inside itself, and `survey` is the summarising run's.
+        // Two rounds of writes say the append accumulates and the other two do
+        // not, which is what makes the dispatch order `runMap` imposes readable
+        // (grammar 8.6 rule 5, 10.2).
+        golden: "coder-fanout",
+        writes: r#"[
+            { "summaries": "changed alpha", "summary": "one", "survey": "draft" },
+            { "summaries": "changed beta", "summary": "two" }
+        ]"#,
+        expected: r#"{
+            "summaries": ["changed alpha", "changed beta"],
+            "summary": "two",
+            "survey": "draft",
             "messages": []
         }"#,
     },
@@ -5887,6 +5920,174 @@ fn a_compiled_graphs_coder_nodes_record_route_and_write() {
     );
 }
 
+/// Gate 26: the two shapes PRD resolved q61 added, through a compiled graph
+/// (grammar 8.9, Decision D147).
+///
+/// Gate 25's composition names one directory per node, fixed for the process.
+/// That is what a coder node *was*, and running it proves nothing about the
+/// ruling that changed it: `workspace:` is an expression evaluated in the
+/// node's input scope at each dispatch, and no adapter-level test reaches the
+/// two places that matters.
+///
+/// Four claims, and each needs a real graph:
+///
+///  * **two dispatches, two directories.** The map binds each item's own
+///    `worktree` into the instance it dispatches and the coder node inside reads
+///    `input.worktree`, so what contains a run is a property of the dispatch.
+///    The drivers are handed the two paths the items named, and each writes into
+///    the one it was given — so a run handed the wrong checkout fails on the
+///    file rather than on the string;
+///  * **both recorded.** Each run's `HarnessRecord.workspace` is the directory
+///    that run really held. It is the one field of the trace derived from a
+///    resolved value, and the reason is this composition: the text says
+///    `input.worktree` for both dispatches (`docs/trace.md` §7.6, §11.1);
+///  * **`fresh` is the §9.4 instance path under the execution's scratch.** The
+///    summarising node's directory is `<data>/workspaces/<execution>/summarise/0`
+///    — derived, not chosen, which is what makes two dispatches of one node two
+///    directories by construction;
+///  * **`fresh` is clean per attempt.** The node carries `retry: { max: 1 }`;
+///    the first attempt writes a file into its own directory and then fails, and
+///    the second attempt finds the directory **empty**. That is ruling c's own
+///    sentence — a retry gets an empty directory, because a half-clobbered
+///    workspace is routinely why the attempt being retried failed — and it is
+///    unreachable from gate 24, where a directory is the caller's to make.
+#[test]
+fn a_fanned_out_coder_works_per_item_and_a_fresh_one_starts_empty() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("coder-fanout"), root, "coder-fanout");
+    let scratch = root.join("projects").join("coder-fanout").join("scratch");
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).expect("the scratch area is writable");
+
+    let output = runner("coder-fanout.mjs")
+        .arg(&project)
+        .arg(&scratch)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the coder fan-out runner failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let answer: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    // --- Two dispatches, two directories ----------------------------------
+    let worktrees: Vec<String> = answer["worktrees"]
+        .as_array()
+        .expect("the runner reports the checkouts it made")
+        .iter()
+        .map(|value| value.as_str().expect("a path").to_string())
+        .collect();
+    let dispatched: Vec<&Value> = answer["handed"]
+        .as_array()
+        .expect("the runner reports what each run was handed")
+        .iter()
+        .filter(|held| held["node"] == json!("flow.fix.implement"))
+        .collect();
+    assert_eq!(dispatched.len(), 2, "the map dispatched twice");
+    let mut given: Vec<String> = dispatched
+        .iter()
+        .map(|held| held["workspace"].as_str().expect("a path").to_string())
+        .collect();
+    given.sort();
+    let mut wanted = worktrees.clone();
+    wanted.sort();
+    assert_eq!(
+        given, wanted,
+        "each dispatch was contained by the checkout its own item named, which is \
+         `workspace:` being evaluated in the dispatched instance's input scope \
+         (grammar 8.9, Decision D147)"
+    );
+
+    // …and the files prove the paths rather than the strings: a run handed the
+    // other item's checkout would have written into it.
+    for worktree in &worktrees {
+        assert!(
+            std::path::Path::new(worktree).join("touched.txt").is_file(),
+            "the run given `{worktree}` worked in it"
+        );
+    }
+
+    // --- Both recorded ----------------------------------------------------
+    let records = &answer["dispatched"];
+    assert_eq!(
+        records,
+        &json!([
+            {
+                "index": 0,
+                "entries": [{
+                    "node": "implement",
+                    "harness": [{ "outcome": "completed", "workspace": worktrees[0] }]
+                }]
+            },
+            {
+                "index": 1,
+                "entries": [{
+                    "node": "implement",
+                    "harness": [{ "outcome": "completed", "workspace": worktrees[1] }]
+                }]
+            }
+        ]),
+        "each dispatched run's record carries the directory that run held, in \
+         source-item order (`docs/trace.md` §7.6)"
+    );
+
+    // --- `fresh`: the name, and the retry ---------------------------------
+    let fresh = &answer["fresh"];
+    let expected = fresh["expected"].as_str().expect("the derived path");
+    assert_eq!(
+        answer["summarise"]["harness"],
+        json!([
+            { "outcome": "failed", "workspace": expected },
+            { "outcome": "completed", "workspace": expected }
+        ]),
+        "both attempts ran in the directory the instance path names, and the \
+         failed one is on the entry beside the one that answered (grammar 9.4, \
+         `docs/trace.md` §7.6)"
+    );
+    assert_eq!(
+        answer["summarise"]["attempts"],
+        json!(2),
+        "the node's `retry:` ran a second attempt"
+    );
+    assert_eq!(
+        fresh["found"],
+        json!([
+            { "attempt": 1, "entries": [], "wrote": true },
+            { "attempt": 2, "entries": [], "wrote": true }
+        ]),
+        "the directory is empty at the start of **every** attempt: the first one \
+         really did leave `leftover-1.txt` in it — `wrote` is that file read back \
+         — and the second found nothing at all, which is a retry getting an empty \
+         directory (PRD resolved q61 ruling c)"
+    );
+    assert_eq!(
+        fresh["standing"],
+        json!(false),
+        "and the directory goes when the execution's scratch goes, which is the \
+         lifetime it inherits by sitting under it rather than beside it — the \
+         same sweep a built-in's defaulted workspace is under (grammar 5.5)"
+    );
+    assert!(
+        !std::path::Path::new(expected).exists(),
+        "read off the disk here as well as reported, since the claim is about \
+         what a settled run leaves behind"
+    );
+
+    assert_eq!(
+        answer["outputs"],
+        json!({
+            "summaries": ["changed alpha", "changed beta"],
+            "survey": "two changes"
+        }),
+        "the dispatched answers reduced in source-item order and the summarising \
+         run's answer landed in its channel (grammar 8.6 rule 5, 8.0)"
+    );
+}
+
 /// What `coder-runs.mjs` has to come back with.
 fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
     // --- The config map (grammar 8.9, Decisions D138, D139) ----------------
@@ -6706,6 +6907,32 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         json!(["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN"]),
         "a provider with no `api_key:` claims no credential name at all — resolved q25's keyless \
          posture — so an over-eager scrub would leave a keyless run with no way to authenticate"
+    );
+
+    // --- The directory is the directory (grammar §4.3, PRD resolved q61) ---
+    //
+    // `workspace:` is the one surface in both env-ref classes: the reference
+    // resolves into the expression's **source**, inside the string literal §4.3
+    // puts it in, and the result is lexed. So a directory holding a backslash,
+    // a quote or a line break is a value the lexer reads as something else —
+    // `C:\repos\thing` as `C:` + CR + `epos` + TAB + `hing` — and neither
+    // `validate` (where the token is still literal text) nor the author (who
+    // cannot see the machine's value) can do anything about it. The spelling
+    // being mangled here is `workspace: "'${REPO_ROOT}'"`, which is the
+    // migration the grammar and the docs teach.
+    let awkward = &answer["awkwardWorkspace"];
+    assert_eq!(
+        awkward["handed"],
+        json!({ "windows": true, "tab": true, "quote": true, "double": true }),
+        "a `${{ENV}}` directory holding a backslash, a quote or a `\\t` sequence did not reach \
+         the harness as itself: substituting into CEL source without escaping for the literal \
+         hands a coding agent a directory nobody named (grammar §4.3, PRD resolved q61 ruling a)"
+    );
+    assert_eq!(
+        awkward["joined"],
+        json!("C:\\repos\\thing/topic"),
+        "the per-item spelling the ruling exists for — a reference inside one literal of a \
+         larger expression — stopped composing once the reference was escaped"
     );
 }
 
@@ -8749,7 +8976,7 @@ fn npm_config(project: &Path, key: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Gate 26: the emitted `bunfig.toml` is TOML **Bun** parses, and what Bun reads
+/// Gate 27: the emitted `bunfig.toml` is TOML **Bun** parses, and what Bun reads
 /// out of it is the `package_registry:` the deploy file declared.
 ///
 /// The gate this file was missing. Every other emitted format has the tool that
@@ -8801,7 +9028,7 @@ fn the_emitted_bunfig_is_the_configuration_bun_parses_out_of_it() {
     }
 }
 
-/// Gate 26b: the emitted `.npmrc` is ini **npm** reads, npm's own credential
+/// Gate 27b: the emitted `.npmrc` is ini **npm** reads, npm's own credential
 /// lookup finds the credentials the deploy file declared where it wrote them,
 /// and the file leaves a project on the registry that declaration named.
 ///

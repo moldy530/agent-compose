@@ -157,7 +157,7 @@
                 "value": "${TEAM_NAME}"
               }
             ],
-            "workspace": "${REPO_ROOT}",
+            "workspace": "'${REPO_ROOT}'",
             "access": "workspace_write",
             "permission_mode": "acceptEdits",
             "prompt": "You are implementing one change in a repository you have been given.\nMake the smallest change that satisfies the goal, run the test suite,\nand report what you touched.\n",
@@ -290,7 +290,7 @@
                 "value": "${OPENAI_API_KEY}"
               }
             ],
-            "workspace": "${REPO_ROOT}",
+            "workspace": "'${REPO_ROOT}'",
             "access": "read_only",
             "prompt": "You are reviewing a change somebody else just made in this repository.\nRead the working tree, decide whether it satisfies the goal, and say\nwhat would have to change if it does not.\n",
             "allow_tools": [

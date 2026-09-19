@@ -621,6 +621,7 @@ Referencing anything else is a compile error.
 | `map.over` | `<node>.output` for any node that **dominates** the map node (§8.6 rule 11), `input`, `state` | list (path expression only, §4.2) |
 | `map.input` / `map.routes.<tag>.input` / `map.default.input` values | `<as-name>` (the item), `input`, `state`, `execution` | field-typed, or a single scalar for a string-in target (§8.6 rule 12) |
 | node `input:` bindings | `input`, `state`, `execution` | field-typed |
+| a `coder:` node's `workspace:` (§8.9) | `input`, `state`, `execution` — the node's own input scope | string (a path) |
 | store-op `key`, `value`, `query`, `prefix`, `filter`, `metadata` values | `input`, `state`, `execution` | per §11.4 |
 | inline `http` node `query` / `body` values | `input`, `state`, `execution` | field-typed |
 | `tool.<t>` `http:` binding `query` / `body` values | `input` **only** (the tool's own input object) | field-typed |
@@ -774,12 +775,14 @@ surface is left to an implementer's judgement.
 | Class | Surfaces | Rule |
 |---|---|---|
 | **1. Env-ref value only** | the secret and connection fields tabulated above | the whole string is one `${NAME}` reference; a literal is a compile error |
-| **2. Interpolable** | `http` node and `http:` tool-binding `url` and `headers` values; the whole `exec:` surface — `command`, every entry of `args`, `cwd`, and `env` values, on both the tool binding (§6.1) and the inline node (§8.2); provider `headers` values and the non-secret provider keys of §12.1 (`region`, `location`, `project`, `organization`, `profile`, `api_version`); non-secret `storage_backends` and `event_sources` config values (§14.3, §14.4) | embedded `${NAME}` tokens are substituted at process start |
+| **2. Interpolable** | `http` node and `http:` tool-binding `url` and `headers` values; the whole `exec:` surface — `command`, every entry of `args`, `cwd`, and `env` values, on both the tool binding (§6.1) and the inline node (§8.2); a `builtin:` binding's `workspace:` and `env:` values (§6.1); a `coder:` node's `env:` values and its `workspace:` **expression** (§8.9, below); provider `headers` values and the non-secret provider keys of §12.1 (`region`, `location`, `project`, `organization`, `profile`, `api_version`); non-secret `storage_backends` and `event_sources` config values (§14.3, §14.4) | embedded `${NAME}` tokens are substituted at process start |
 | **3. No refs** | **everything else** | an unescaped `${NAME}` token is a **compile error** naming the field |
 
 Class 3 therefore covers, among others: prompts; every `description:`; every
 part of a schema (`enum` members, `pattern`, `format`, `default:` literals); CEL
-expressions on every surface; model `id` and every value inside `settings:`;
+expressions on every surface **but one**, the exception being the `coder:`
+node's `workspace:` named in class 2 above and stated below; model `id` and
+every value inside `settings:`;
 `embed.model` (§11.2); every identifier and reference position (node ids,
 channel names, typed addresses, a store's `backend:` alias, a tool's
 `function.name`, an event trigger's `source:`); `version:`; `imports:` entries;
@@ -795,7 +798,7 @@ rather than text that silently survives into the output — the author who wrote
 it expected a substitution. The `$${` escape (above) is how a literal `${NAME}`
 is written where one is genuinely wanted.
 
-Two boundaries are worth stating outright, because they are the ones an author
+Three boundaries are worth stating outright, because they are the ones an author
 is most likely to guess at:
 
 - **The `exec:` block is interpolable end to end.** A process invocation is the
@@ -814,6 +817,26 @@ is most likely to guess at:
   start is a value neither `validate` nor a diff can see. `settings:` is in this
   class for PRD 5.9's reason — every LLM configuration in a project stays
   greppable in one file.
+- **One surface is in both classes, and the order the two rules run in is what
+  makes that coherent.** A `coder:` node's `workspace:` is a CEL expression
+  (§4.1's table above, §8.9) *and* is interpolable, which no other expression
+  surface is. The refs resolve **first**, into the expression's source, at
+  process start as class 2 says; what results is then evaluated against the
+  node's roots at each dispatch, as §4.1 says. So a reference belongs inside a
+  string literal, where the expression parses with the token still in it and
+  `validate` can read the whole expression before any environment exists:
+  `workspace: "'${REPO_ROOT}/' + input.branch"`. A reference written outside one
+  is a syntax error rather than a substitution, and a path with nothing
+  computed in it is still an expression —  `workspace: "'${REPO_ROOT}'"`, the
+  quotes being CEL's. Because the reference belongs inside a literal, the value
+  is substituted **escaped for that literal**: a directory holding a backslash
+  or a quote — `C:\repos\thing`, `/srv/o'brien` — is the directory it is rather
+  than a mangled path or a parse error, which is the one thing an author cannot
+  fix from the composition, the value being on the machine. A raw literal
+  (`r'…'`) has no escapes to use, so a value that would close one is refused by
+  name at launch instead. The key is the one place this grammar asks for a value
+  that is a machine fact *and* a dispatch fact at once (Decision
+  [D147](#d147-a-coder-nodes-workspace-is-a-runtime-binding-and-the-shared-workspace-race-is-unwritable)).
 
 Env refs **survive unresolved into the IR**. `validate` and `build` check
 syntax only — an artifact is buildable anywhere, including environments holding
@@ -3006,7 +3029,7 @@ implement:
   coder:
     harness: cc
     model: model.implementer
-    workspace: "${REPO_ROOT}"
+    workspace: "'${REPO_ROOT}'"
     access: workspace_write
     prompt: |
       Make the smallest change that satisfies the goal, run the tests,
@@ -3034,7 +3057,7 @@ implement:
 |---|---|---|---|---|
 | `harness` | enum `cc codex deepagents native` | **yes** | — | which harness runs it; the last two are RESERVED (§15) |
 | `model` | `model.*` ref | **yes** | — | the registry address, exactly as an agent node spells it (§12.2); a **route** is refused ([D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)) |
-| `workspace` | string (non-empty, interpolable) | **yes** | — | the root this run works inside; §4.3 class 2 |
+| `workspace` | CEL expression over `input`/`state`/`execution` evaluating to a string, interpolable; or the word `fresh` | **yes** | — | the root **this dispatch** works inside, evaluated at each one ([D147](#d147-a-coder-nodes-workspace-is-a-runtime-binding-and-the-shared-workspace-race-is-unwritable)); §4.1's own row, and §4.3's one surface in both classes |
 | `access` | enum `read_only workspace_write full_access` | no | `workspace_write` | the containment preset ([D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces)) |
 | `permission_mode` | enum `default acceptEdits bypassPermissions plan dontAsk auto` | no | the mode `access:` derives | the harness's **approval** axis inside that containment; `cc` only, and never wider than `access:` ([D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)) |
 | `prompt` | string (non-empty) | **yes** | — | the run's instructions; literal text, no templating ([D13](#d13-prompt-is-required-and-literal)) |
@@ -3091,10 +3114,126 @@ nothing could check.
 **`workspace:` is required**, unlike a built-in's (§6.1), and there is no
 default. A built-in works in a directory this runtime makes for the execution; a
 coder node works on a checkout somebody already has, so a defaulted root would
-be a bound nobody wrote. It is interpolable for the built-in's reason — which
-directory a graph may work in is a property of the machine — and
-`workspace: ""`, or a `${VAR}` that resolves empty, is refused: an empty path is
-the directory the runtime happened to be started in.
+be a bound nobody wrote.
+
+**It is an expression, evaluated at each dispatch** — §4.1's own row, over
+`input`, `state` and `execution`, which is the scope this node's `input:`
+bindings read. That is what makes a `map` over a coder node fan out: the
+directory is a property of the dispatch rather than of the process, so a map
+item carries its own checkout.
+
+```yaml
+workspace: "input.worktree"                 # the item's own, bound at the map
+workspace: "'${REPO_ROOT}/' + input.branch" # a machine root plus a dispatch fact
+workspace: "'${REPO_ROOT}'"                 # one directory, written as a literal
+workspace: fresh                            # one the runtime makes per dispatch
+```
+
+The refs still resolve, and §4.3 says when: into the expression's **source**, at
+process start, before any of it is evaluated — so a reference belongs inside a
+string literal and its value is a path. Which directory a graph may work in is a
+property of the machine *and* of the dispatch, and this is the one key that has
+to be both.
+
+`fresh` is the fourth line and the one **word** this surface reads. There is no
+ambiguity in spelling it bare: a lone `fresh` names no root, so it could never
+have been an expression this grammar evaluates; a directory really called
+`fresh` is `workspace: "'fresh'"`.
+
+**What `validate` can still say about it is the expression, not the path.** The
+roots it reads, the constructs it uses, and that it evaluates to a string are
+all checked; the text of the directory is not, because there is no longer one
+text. That is the trade every runtime binding makes (§4.1), it is the whole of
+what moving this key cost, and it is stated here rather than discovered. An
+empty expression (`workspace: ""`) is still refused, and a value that resolves
+to an empty path fails the run: an empty path is the directory the runtime
+happened to be started in, and a bound nobody wrote is not a bound.
+
+#### `workspace: fresh`
+
+The runtime provisions one directory **per dispatch**, under the execution's own
+scratch and named by this node's instance path (§9.4):
+
+```
+.agent-compose/workspaces/<execution id>/<instance path>/
+```
+
+Deterministic, distinct per dispatch by construction — an instance path names
+one dispatch of one node — and **created clean at the start of every attempt**:
+a `retry:` gets an empty directory, because a half-clobbered workspace is
+routinely why the attempt being retried failed. Nothing about the journal moves
+with it; a run's recorded answer is its structured output
+([D142](#d142-the-policy-chain-wraps-a-whole-harness-run-and-harness-native-resume-is-excluded))
+and the directory's contents were never the record, so a replay neither empties
+it nor needs it. It goes when the execution's scratch goes, which is the
+lifetime a built-in's defaulted workspace already has (§5.5).
+
+**A second traversal is a second directory**, and it follows from the path
+rather than from this key. A node's frame is `<node id>/<traversal ordinal>`
+(§9.4), so a coder node on a bounded cycle (§7.4) resolves `fresh` to
+`…/implement/0` on the first pass and `…/implement/1` on the second: a new
+directory, created empty, with the first pass's work left behind in the one
+before it. A `retry:` is exactly the case this is *not*, for the same reason —
+re-running an attempt does not advance the ordinal, which is why the paragraph
+above is about attempts and this one is about traversals. So a review loop
+shaped `implement` → `review` → `implement` hands its coding agent an empty
+tree on every pass under `fresh`, and a loop that means the second pass to build
+on the first names a directory that does not move with the ordinal instead —
+any of the expression forms above, `workspace: "state.checkout"` off a step
+outside the loop being the usual one. Which of the two a loop wants is the
+author's call, so this states it rather than choosing.
+
+**What `fresh` does not do is provision a checkout.** It hands the run an empty
+directory, and a coding task that needs source control still prepares it: an
+upstream `exec:` or `tool.*` step that clones or `git worktree add`s into
+per-item paths the map's items then carry into the expression form above.
+Provisioning source control is a step a graph author writes, not a guess a
+harness adapter makes.
+
+#### Two runs, one directory
+
+A harness run is contained by its `workspace:`, so two runs that can be in
+flight at once and resolve to one directory are two coding agents editing one
+checkout. Both halves of that are refused, at the strength each can be decided
+with (`shared-workspace`, PRD resolved q61 ruling b):
+
+* a coder node a `map` dispatches whose `workspace:` expression does **not**
+  read the per-dispatch scope is a **compile error** unless the map declares
+  `max_concurrency: 1`. That scope is the dispatch's own `input.<field>`,
+  `execution.item_index`, and a `state` channel **a node that dominates the coder
+  node writes** — an instance holds its own channel values (§10.1), so a checkout
+  an upstream `exec:` step prepares inside the instance is one directory per
+  dispatch, while a channel nothing upstream of the node writes holds its
+  `default:` there and is one directory for the whole fan-out. Dominance rather
+  than mere path-existence, and for the reason §8.6 rule 11 gives `map.over`
+  ([D76](#d76-mapover-reads-a-node-that-dominates-the-map-node)): channel values
+  are ordered by step (§7.6.4), so a writer that runs *after* the coder node, or
+  on a guarded branch beside it, leaves the node reading the `default:` every
+  instance shares. The message names both repairs: bind the item's own path (or
+  take `fresh`), or say the runs are serial. A map **inside** a fan-out is read at
+  the looser of that fan-out's bound and its own, because it issues its dispatches
+  once per concurrent instance of the flow that holds it — so
+  `max_concurrency: 1` on a map an outer map fans four ways is four runs in the
+  directory, and the refusal names the outer map as the one to serialise. Raising
+  the bound is **not** the whole of what nesting changes: such a dispatch's
+  `workspace:` has to tell the enclosing fan-out's instances apart as well as its
+  own map's dispatches, and the map's own item does not do that — an item is a
+  value drawn from a list, and four instances drawing from four lists can draw the
+  same one, so `workspace: "input.file"` bound from the inner map's item puts two
+  runs in one directory the moment two checkouts both hold that file name. What
+  carries the distinction inward is an `input.<field>` the enclosing instance
+  itself varies, which is why the repair at depth is both halves at once
+  (`input: { dir: "input.root + '/' + file" }` at the inner map). The refusal says
+  which of the two questions failed, because the two are different edits;
+* two harness runs that statically-concurrent branches (§7.6.1) can have in
+  flight at once whose `workspace:` values are **written identically** draw a
+  **warning** naming both. The branches are read over the runs a *step* contains,
+  so a `flow:` node and a `map` node count as much as a `coder:` node does. Not
+  an error, and the reason is stated rather than papered over: what decides it is
+  whether the two resolve to one directory, and a value bearing a `${ENV}`
+  reference resolves at launch — so two values this grammar reads as different
+  may be one path on the machine that runs them, and two it reads as the same is
+  the half it can see.
 
 **`access:` selects the harness's own containment primitive**, and the mapping is
 the adapter's rather than the author's:
@@ -3713,6 +3852,16 @@ belong to the two carrying constructs — `detach: true` under a checkpointed
 target (§8.6 rule 7) and the map-write keying rule (§11.4). Nor is the key
 writable in CEL: `execution.item_index` exposes only the innermost enclosing
 map's index (§4.1), while a key needs every one of them.
+
+**The instance path has a third reader**, and it is not a key: a
+`workspace: fresh` coder node's directory is named by the frames above, under
+the execution's own scratch —
+`.agent-compose/workspaces/<execution id>/<instance path>/` (§8.9, Decision
+[D147](#d147-a-coder-nodes-workspace-is-a-runtime-binding-and-the-shared-workspace-race-is-unwritable)).
+It is the same derivation read for the property that makes it useful there:
+distinct dispatches get distinct paths, so a fan-out's runs get distinct
+directories by construction. The second property above is what a retry reads —
+one attempt derives one path, and the directory is remade empty at each of them.
 
 ---
 
@@ -9624,6 +9773,182 @@ q30, q54, q57, q58, q60; §8.9,
 [D140](#d140-harness-settings-is-a-second-open-object-checked-in-two-tiers),
 [D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary).*
 
+---
+
+### D147. A coder node's `workspace:` is a runtime binding, and the shared-workspace race is unwritable
+
+**PRD-extending** — see this appendix's preamble. Amends
+[D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces),
+in the binding class of one key and in nothing else.
+
+Three rules, from one field report: a PR-review graph fanned a `map` over a
+coder node, the dispatches clobbered each other's checkout, and the author was
+left running them serially. The diagnosis is the whole entry — `workspace:`
+shipped as a §4.3 class-2 binding, literal or `${ENV}`, fixed for the process,
+so it could not read a per-dispatch value while an `exec:` step's working
+directory could. A map's `max_concurrency` was a lie for coding.
+
+**1. `workspace:` moves to the runtime binding class.** It is an expression
+evaluated in the node's input scope — `input`, `state`, `execution`, §4.1's own
+row — at **each dispatch**, so `workspace: "input.worktree"` gives a map item its
+own checkout. Everything downstream of the value is untouched: the resolved path
+feeds the same per-harness containment mapping D138 shipped (a `codex` sandbox
+preset's root, `cc`'s working directory and permission surface), the key is
+still required, and `References::of` still walks it, so the environment manifests
+(PRD resolved q41) and the launch check (resolved q15) keep holding.
+
+*What is given up, stated rather than discovered.* `validate` can no longer
+inspect the path's **text** — only the expression's well-formedness, its roots,
+and that it evaluates to a string. That is the same trade every runtime binding
+in this grammar already makes (§4.1), and it is the one cost of the move.
+
+*Why the key is in two §4.3 classes at once.* Which directory a graph may work in
+is a property of the machine **and** of the dispatch, and no other value in this
+grammar is both. So the two rules compose in the order §4.3 and §4.1 already
+state them: the refs substitute into the expression's source at process start,
+and the result is evaluated per dispatch. A reference therefore lives inside a
+CEL string literal, where `validate` reads the whole expression with the token
+still in it, and the substituted value is **escaped for that literal** so a
+directory holding a backslash or a quote survives the lexer as itself (§4.3).
+The alternative — dropping `${ENV}` from the key — would have made a
+machine-dependent root unwritable, which is a second thing given up that this
+ruling does not give up.
+
+**2. The race is unwritable**, which is
+[resolved q45](#d94-a-detached-dispatch-is-resolved-at-dispatch)'s posture read
+for the filesystem, and it is refused at the strength each half can be decided
+with. A coder node a `map` dispatches whose `workspace:` does not read the
+per-dispatch scope is a compile error (`shared-workspace`) **unless** the map
+declares `max_concurrency: 1`, and the message names both repairs. Two harness
+runs that statically-concurrent branches (§7.6.1) can have in flight at once
+whose `workspace:` values are written identically draw a **warning** naming both.
+An error is withheld there on purpose: equality of `${ENV}`-bearing values is a
+launch fact, not a compile fact, so a refusal would be this compiler claiming
+something it cannot know, and silence would hide the half it can.
+
+*What the per-dispatch scope is.* The dispatch's own `input.<field>` and
+`execution.item_index`, which is D83's predicate exactly — **and** a `state`
+channel a node that **dominates** the coder node writes, which is the half a
+store key does not need. An instance is a separate run of a separate compiled
+graph: the channel set is composition-global in shape and per-instance in value,
+seeded at each `default:` with nothing crossing but `inputs:` (§10.1, §7.6.4
+rules 2 and 3). So `prepare` — an `exec:` step running `git worktree add` —
+writing `checkout` inside the instance, and the coder node *downstream of it*
+reading `workspace: "state.checkout"`, is four dispatches preparing four
+directories, and it is the shape rule 3's closing paragraph sends an author to; a
+coder node's `workspace:` cannot read another node's output
+([D42](#d42-node-outputs-are-readable-only-from-edge-guards-and-mapover)), so
+a channel is the only way to carry that answer to it. A channel **nothing
+upstream of the node** writes holds its `default:` there and is one directory for
+the whole fan-out as surely as a literal path is, which is the case the refusal
+keeps — and its message says which of the two shapes it is, naming the flow that
+never writes the channel, or the nodes that write it somewhere this one cannot
+read. The reading is dominance and not path-existence because channel values are
+ordered by step: a writer that runs *after* the coder node writes a value no
+dispatch of it ever sees, and a writer on a guarded branch beside it may not run
+at all — the same thing
+[D76](#d76-mapover-reads-a-node-that-dominates-the-map-node) says about
+`map.over`, and a race refusal cannot be lifted by a write that may never have
+happened. Whether two instances that each observe a write of a channel write the
+same *string* is a launch fact of exactly the kind the warning above exists for,
+and it is stated rather than pretended.
+
+*Two runs, not two coder nodes.* A branch is concurrent with another whatever
+construct it holds, so the warning is stated over the runs a **step** contains:
+a `coder:` node of the flow, and every coder node inside an instance a `flow:`
+node starts or a `map` node dispatches, transitively. One subflow instantiated
+twice on two branches is two runs of one coder node, and an author who factors
+work into a reusable flow gets the same reading as one who wrote the nodes out.
+A `map` counts for the same reason and for one more: the dispatch half above
+decides a map's dispatches against *each other* and passes over any fan-out
+bounded at 1, and `max_concurrency: 1` is a repair it offers — a bound that holds
+**within** the map and says nothing about the branch beside it, so reading a map
+step as holding no runs would let that repair silence a collision it does not
+fix. Two *instances* are not one scope, though (§10.1), so a run reached through
+a `flow:` or `map` node is compared only where its expression reads **nothing** —
+no `input`, no `state`, no `execution`. `workspace: "input.worktree"` in a flow
+instantiated twice is two directories exactly when the two instantiations bind
+two paths, which is the repair this ruling exists for, and warning about it would
+be warning about the fix; the same expression under a map is per-item for the
+same reason, and decided by the dispatch half instead.
+
+The dispatch half is decided over the same relation grammar §11.4's store keys
+are ([D83](#d83-a-map-written-store-key-is-derived-from-the-item)): frames of a
+flow instance inside a fan-out, with the item-derivation of each of its input
+fields, carried inward through `flow:` nodes and stopping at an agent's `flow.*`
+tool — because a model decides whether and when to call one of those, and no
+static rule can put that call inside a dispatch.
+
+*The bound is the one the dispatch really runs under*, which is not always the
+one its map declares, and it is read that way two ways. Where a routed map names
+one flow from **several** routes ([D28](#d28-max_concurrency-is-required-on-the-map-node-routes-may-only-tighten-it)),
+the bound is the loosest of theirs: a route tightening its own
+`max_concurrency` says nothing about its sibling's, and reading the first would
+let one serial route silence the refusal for every other route into the same
+directory. And where the dispatching map is itself **inside** a fan-out — a
+`map` in a flow another map dispatches, directly or through `flow:` nodes — the
+bound is the looser of that fan-out's and its own: a map declaring
+`max_concurrency: 1` inside a flow an outer map fans four ways issues its
+dispatches serially *within each of four concurrent instances*, so four harness
+runs are in the directory at once and the inner 1 says nothing about the other
+three. A refusal naming an enclosing fan-out quotes
+both numbers, because the map's own is the key it declares and the fan-out's is
+how many runs the directory really holds — and it names the *enclosing* map as
+the place to write `max_concurrency: 1`, since the inner one already says it.
+
+*The bound is not the only thing nesting changes*, and the other half is
+item-derivation. §11.4's reading of it is untouched — a nested map re-roots
+derivation at the item it declares (D83), because a store key derived from the
+item the write belongs to is what keeps N items' content out of one slot whatever
+the map runs inside. What that does not answer is the question *this* rule asks,
+and the two part exactly at a nested dispatch: an item is a value drawn from a
+list, so `workspace: "input.file"` bound from the inner map's own item is a
+directory per dispatch *within one instance* and says nothing about the three
+beside it — four instances each stepping their own files serially put two `cc`
+runs in one directory the moment two checkouts both hold `README.md`. That is the
+field report's race one construct deeper, reached through the repair this
+ruling's own message names, so reading the bound inward and leaving derivation
+behind would have made the race writable again by telling the author how to write
+it. A dispatch inside a fan-out therefore has to separate **both**: the
+dispatches of its own map, and the instances issuing them. What separates the
+second is a value the enclosing instance was handed and itself varies — an
+`input.<field>` of it — which the inner map's bindings read to carry the
+distinction in (`input: { dir: "input.root + '/' + file" }`). The map's item is
+deliberately not one of those, however that item was produced, and neither is
+`execution.item_index`, which exposes the *innermost* dispatch's index and so
+repeats across outer items (§4.1, D115). A refusal that turned on this half says
+so and offers the half that is missing, because the other one is a line the
+author already wrote correctly (G3).
+
+**3. `workspace: fresh` is the batteries-included spelling.** The runtime
+provisions a per-dispatch directory under the execution's scratch, named by §9.4
+instance path, **created clean at the start of every attempt** — a retry gets an
+empty directory, because a half-clobbered workspace is routinely why the attempt
+being retried failed. The journal's discipline is untouched: a run's record is
+its structured output (D142), the directory's contents never were, so a replay
+neither empties one nor needs one. It satisfies rule 2 by construction. What
+`fresh` does **not** do is provision a checkout, and that is stated where an
+author meets it (§8.9): source control is a step a graph writes, not a guess an
+adapter makes.
+
+*The word, not an expression.* `fresh` is bare because a bare `fresh` names no
+root and so was never an expression this grammar could evaluate; a directory of
+that name is `"'fresh'"`. One reserved word beats a second key whose absence
+would have to mean something.
+
+*Surfaces.* The graph document's coder view shows the workspace **as written** —
+the expression, or `fresh` — which is the field it always carried with its
+contents one class along, so `graph_version` stays 2 (`docs/graph.md` §9.2). The
+`HarnessRecord` gains the **resolved** path (`docs/trace.md` §7.6), which is
+additive under §10.2 and is that format's one derived value: after this entry the
+composition's text no longer answers "which directory did this run hold", and for
+a map over a coder node every dispatch answers differently. `docs/trace.md` §11.1
+names it as the exception it is. **Status**: ratified — PRD resolved q61 rulings
+a, b and c. *PRD 5.6, G3, resolved q15, q22, q23, q41, q45, q54, q57, q58, q61;
+§4.1, §4.3, §8.6, §8.9, §9.4,
+[D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces),
+[D142](#d142-the-policy-chain-wraps-a-whole-harness-run-and-harness-native-resume-is-excluded).*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -9875,7 +10200,7 @@ model.<name>:    { route: [model.<a>, model.<b>], route_on: [...] }
                      # scalar input: only for a string-in agent
 { coder: { harness: cc|codex,          # deepagents|native are RESERVED (15)
            model: model.<m>,           # direct only — never a route (D141)
-           workspace: <interpolable>,  # required; no default (D138)
+           workspace: <expr> | fresh,  # required; per dispatch (D138, D147)
            access?: read_only|workspace_write|full_access,
            prompt: <text>,             # literal, like an agent's (D13)
            input?: <field map>,        # omitted = string-in (5.3)

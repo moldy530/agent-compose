@@ -9,10 +9,11 @@
 use serde::Serialize;
 
 use crate::ast::common::{
-    Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Interpolated, Literal,
-    PathExpr,
+    Address, Cel, ControlTarget, Duration, EdgeSource, EdgeTarget, Ident, Literal, PathExpr,
 };
-use crate::ast::flow::{FlowContext, Harness, PermissionMode, StoreOp, WorkspaceAccess};
+use crate::ast::flow::{
+    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreOp, WorkspaceAccess,
+};
 use crate::diag::{Span, Spanned};
 
 use super::binding::{Bindings, Exec, Http, InterpolatedEntry, NodeInput, Writes};
@@ -152,8 +153,10 @@ pub struct Coder {
     pub harness: Spanned<Harness>,
     /// `model:` — the registry address, resolved to an id by the adapter.
     pub model: Spanned<Address>,
-    /// `workspace:` — the root the run works inside.
-    pub workspace: Spanned<Interpolated>,
+    /// `workspace:` — the root the run works inside, per dispatch: an
+    /// expression this node's input scope is evaluated against, or `fresh`
+    /// (grammar 8.9, Decision D147, PRD resolved q61 ruling a).
+    pub workspace: Spanned<CoderWorkspace>,
     /// `access:` — absent means the default, `workspace_write`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access: Option<WorkspaceAccess>,

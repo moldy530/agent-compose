@@ -24,10 +24,14 @@ flow.patch:
       coder:
         harness: cc
         model: model.implementer
-        # Interpolable, and required: which directory a graph may author and run
-        # a program in is a property of the machine running it, and there is no
-        # default that would be a containment bound (grammar 8.9, D138).
-        workspace: ${REPO_ROOT}
+        # Required, and an **expression** evaluated in this node's input scope
+        # at each dispatch (grammar 8.9, D138, D147). One directory here, so it
+        # is a CEL string literal with the machine's own root inside it: which
+        # directory a graph may author and run a program in is a property of the
+        # machine, and there is no default that would be a containment bound.
+        # A graph that fanned out would read the item's path instead —
+        # `workspace: "input.worktree"` — or take `workspace: fresh`.
+        workspace: "'${REPO_ROOT}'"
         access: workspace_write
         prompt: |
           You are implementing one change in a repository you have been given.
@@ -73,7 +77,7 @@ flow.patch:
       coder:
         harness: codex
         model: model.reviewer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: read_only
         prompt: |
           You are reviewing a change somebody else just made in this repository.

@@ -1,0 +1,92 @@
+# rule: a shared-workspace refusal names the binding that fixed the value, even
+# rule: where that is a `flow:` node between the map and the coder node (D147)
+# code: shared-workspace
+# message: `flow.inner` node `implement` is dispatched by the map `work` of `flow.main` with `max_concurrency: 4`, and its `workspace:` is one directory for every dispatch
+# at: main.yml:50:20
+# label: main.yml:81:7 the fan-out is issued here
+# label: main.yml:70:14 `dir` is bound here, to a value every dispatch shares
+# help: a harness run is contained by its `workspace:`, so 4 dispatches sharing `input.dir` are 4 coding agents editing one checkout and overwriting each other's work. Two repairs, and each says something different about the graph: bind the item's own path — carry it on the dispatch (`input: { worktree: "item.worktree" }`) and read it here (`workspace: "input.worktree"`), or write `workspace: fresh` for a directory the runtime provisions per dispatch — or declare `max_concurrency: 1` on the map, which says these runs are serial. The line that repair edits is the binding labelled above (`dir`): that is where the value this `workspace:` reads is fixed, however many dispatches read it. `workspace:` is evaluated in this node's input scope at every dispatch precisely so the first repair is writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# Grammar 11.4's "third site" for the sibling rule, read here: the coder node
+# and the map are both innocent. `flow.inner`'s `workspace:` reads
+# `input.dir`, which is exactly the shape the first repair asks for, and
+# `work` binds its own `input:` from the item — so an author sent to either
+# line would find nothing to change. The value is fixed one construct between
+# them, at `flow.fix`'s `flow:` node, and that is the line the refusal labels.
+#
+# Two flows deep rather than one because a depth of one is the map's own
+# `input:` entry, which a reader already has under their cursor. The frames
+# carry the binding inward through a `flow:` node (`check::reach`), so the
+# span the label draws is the one the author has to edit however many
+# instantiations stand between the dispatch and the run.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: List the checkouts that need a change.
+  output:
+    tasks:
+      type: array
+      max_items: 10
+      items:
+        type: object
+        properties:
+          goal: { type: string }
+          worktree: { type: string }
+flow.inner:
+  inputs:
+    dir: { type: string }
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "input.dir"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          dir: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        dir: "input.dir"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.fix:
+  inputs:
+    goal: { type: string }
+    worktree: { type: string }
+  outputs: {}
+  nodes:
+    edit:
+      flow: flow.inner
+      input:
+        dir: "'/srv/fixed'"
+  edges:
+    - { from: start, to: edit }
+    - { from: edit, to: end }
+flow.main:
+  outputs: {}
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    work:
+      map:
+        over: plan.output.tasks
+        as: task
+        max_concurrency: 4
+        node: flow.fix
+        input:
+          goal: "task.goal"
+          worktree: "task.worktree"
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }

@@ -761,20 +761,32 @@ impl References {
                             NodeKind::Http { http } => {
                                 references.http(http, &format!("{address}.node.{id}.http"));
                             }
-                            // A coder node's `workspace:` is grammar 4.3 class 2
-                            // like an `exec:`'s `cwd:`, and its `env:` is that
-                            // block's `env:` exactly — which is PRD resolved
-                            // q54 ruling b applied one construct along
-                            // (Decision D139). Filed under the **node**, the
-                            // way an inline `exec:` node's are, because the
+                            // A coder node's `workspace:` carries `${ENV}`
+                            // references like an `exec:`'s `cwd:`, and its
+                            // `env:` is that block's `env:` exactly — which is
+                            // PRD resolved q54 ruling b applied one construct
+                            // along (Decision D139). Filed under the **node**,
+                            // the way an inline `exec:` node's are, because the
                             // node is where the whole component is declared:
                             // there is no definition address to file them
                             // under.
+                            //
+                            // The key became an **expression** at PRD resolved
+                            // q61, and this walk is what that ruling keeps:
+                            // the references live inside the expression's
+                            // string literals, they are resolved into its
+                            // source before it is evaluated, and so they are
+                            // spent wherever this node runs exactly as they
+                            // were when the whole value was one path. A
+                            // `workspace: fresh` names none — the runtime
+                            // provisions that directory itself (ruling c).
                             NodeKind::Coder { coder } => {
-                                references.text(
-                                    &coder.workspace.value,
-                                    &format!("{address}.node.{id}.workspace"),
-                                );
+                                if let Some(expression) = coder.workspace.value.expression() {
+                                    references.text(
+                                        expression,
+                                        &format!("{address}.node.{id}.workspace"),
+                                    );
+                                }
                                 references
                                     .entries_of(&coder.env, &format!("{address}.node.{id}.env"));
                             }
@@ -1212,7 +1224,7 @@ provider.gateway:\n  kind: anthropic\n  base_url: ${GATEWAY_URL}\n  api_key: ${G
 model.smart:\n  provider: provider.gateway\n  id: some-model\n\
 agent.signer:\n  model: model.smart\n  prompt: Sign what you are given.\n  input: { path: { type: string } }\n  output: { verdict: { type: string } }\n\
 state:\n  summary: { type: string, default: \"\" }\n\
-flow.release:\n  inputs:\n    path: { type: string }\n  outputs:\n    summary: { type: string }\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.smart\n        workspace: /srv/checkout\n        prompt: Build it.\n        output:\n          summary: { type: string }\n      input: \"input.path\"\n    sign:\n      agent: agent.signer\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: sign }\n    - { from: sign, to: end }\n",
+flow.release:\n  inputs:\n    path: { type: string }\n  outputs:\n    summary: { type: string }\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.smart\n        workspace: \"'/srv/checkout'\"\n        prompt: Build it.\n        output:\n          summary: { type: string }\n      input: \"input.path\"\n    sign:\n      agent: agent.signer\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: sign }\n    - { from: sign, to: end }\n",
             "version: \"0.1\"\n\
 hub:\n  join_token: ${MESH_TOKEN}\n\
 placements:\n  mac:\n    members: [agent.signer]\n",
@@ -1337,7 +1349,7 @@ placements:\n  mac:\n    members: [agent.outer]\n",
             "version: \"0.1\"\n\
 provider.vendor:\n  kind: anthropic\n  api_key: ${VENDOR_KEY}\n\
 model.smart:\n  provider: provider.vendor\n  id: some-model\n\
-flow.patch:\n  description: Patch one thing.\n  inputs:\n    goal: { type: string }\n  outputs: {}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.smart\n        workspace: ${CODER_REPO_ROOT}\n        prompt: Do the work.\n        output:\n          summary: { type: string }\n        env:\n          CODER_SECRET: ${CODER_SECRET}\n      input: \"input.goal\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: end }\n\
+flow.patch:\n  description: Patch one thing.\n  inputs:\n    goal: { type: string }\n  outputs: {}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.smart\n        workspace: \"'${CODER_REPO_ROOT}'\"\n        prompt: Do the work.\n        output:\n          summary: { type: string }\n        env:\n          CODER_SECRET: ${CODER_SECRET}\n      input: \"input.goal\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: end }\n\
 agent.signer:\n  model: model.smart\n  prompt: Ask for a patch.\n  tools: [flow.patch]\n  input: { goal: { type: string } }\n  output: { verdict: { type: string } }\n\
 flow.release:\n  inputs:\n    goal: { type: string }\n  outputs: {}\n  nodes:\n    sign:\n      agent: agent.signer\n      input:\n        goal: \"input.goal\"\n  edges:\n    - { from: start, to: sign }\n    - { from: sign, to: end }\n",
             "version: \"0.1\"\n\

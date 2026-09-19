@@ -82,7 +82,7 @@ flow.patch:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: workspace_write
         prompt: Make the smallest change that satisfies the goal.
         output:
@@ -184,7 +184,7 @@ flow.patch:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: workspace_write
         permission_mode: dontAsk
         prompt: Make the smallest change that satisfies the goal.

@@ -77,6 +77,7 @@ if (project === undefined || scratch === undefined) {
 const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts")).href);
 const harness = await import(pathToFileURL(path.resolve(project, "src/harness.ts")).href);
 const journal = await import(pathToFileURL(path.resolve(project, "src/journal.ts")).href);
+const cel = await import(pathToFileURL(path.resolve(project, "src/cel.ts")).href);
 
 fs.mkdirSync(scratch, { recursive: true });
 const workspace = path.join(scratch, "checkout");
@@ -91,6 +92,40 @@ function context(overrides = {}) {
     harnessRuns: [],
     ...overrides,
   };
+}
+
+// The node view the adapter reads: `workspace:` is an expression evaluated
+// against this node's roots at each dispatch, and a `workspace: fresh`
+// directory is named by the §9.4 instance path — both of them the view's
+// (grammar 4.1, 8.9, PRD resolved q61).
+function view(overrides = {}) {
+  const {
+    roots = {},
+    execution = "exec_coder",
+    path: instance = [],
+    traversals = {},
+  } = overrides;
+  return {
+    state: {},
+    run: {
+      execution: { id: execution, session_key: "", item_index: undefined },
+      path: instance,
+      traversals,
+      step: 0,
+      outputs: {},
+    },
+    roots,
+  };
+}
+
+/** One `input` root, bound the way `runNode` binds it. */
+function inputRoot(value) {
+  return { input: cel.bind(value) };
+}
+
+/** `runtime.runCoder`, with this case's view between the context and the drivers. */
+function runCoder(binding, input, context, drivers, overrides = {}) {
+  return runtime.runCoder(binding, input, context, view(overrides), drivers);
 }
 
 /** The emitted Zod for the answer these runs are gated against. */
@@ -137,6 +172,7 @@ const SCHEMA = {
 function binding(overrides = {}) {
   return {
     node: "flow.patch.implement",
+    id: "implement",
     harness: "cc",
     model: "model.implementer",
     modelId: "claude-sonnet-4-5",
@@ -153,7 +189,9 @@ function binding(overrides = {}) {
       ],
     },
     prompt: "Fix the failing test.",
-    workspace: [{ env: "CODER_WORKSPACE", site: "flow.patch.node.implement.workspace" }],
+    workspace: {
+      expression: ["'", { env: "CODER_WORKSPACE", site: "flow.patch.node.implement.workspace" }, "'"],
+    },
     access: "workspace_write",
     allowTools: ["Bash", "Read"],
     env: [
@@ -223,7 +261,7 @@ const results = {};
   process.env["CODER_TEAM"] = "platform";
   const stub = harness.scriptedDriver("cc", script({ summary: "done", touched: ["a.ts"] }));
   const held = context();
-  const answer = await runtime.runCoder(binding(), { goal: "fix it" }, held, { cc: stub.driver });
+  const answer = await runCoder(binding(), { goal: "fix it" }, held, { cc: stub.driver });
   const run = stub.runs[0];
   const record = answer.harness[0];
   results["configMap"] = {
@@ -287,7 +325,7 @@ const results = {};
   const held = context();
   let failure;
   try {
-    await runtime.runCoder(binding(), { goal: "fix it" }, held, { cc: stub.driver });
+    await runCoder(binding(), { goal: "fix it" }, held, { cc: stub.driver });
   } catch (error) {
     failure = error;
   }
@@ -317,7 +355,7 @@ const results = {};
   ]);
   let failure;
   try {
-    await runtime.runCoder(binding(), { goal: "fix it" }, context(), { cc: stub.driver });
+    await runCoder(binding(), { goal: "fix it" }, context(), { cc: stub.driver });
   } catch (error) {
     failure = error;
   }
@@ -336,7 +374,7 @@ const results = {};
   ]);
   let failure;
   try {
-    await runtime.runCoder(
+    await runCoder(
       binding({ harness: "codex" }),
       { goal: "fix it" },
       context(),
@@ -360,7 +398,7 @@ const results = {};
 {
   let failure;
   try {
-    await runtime.runCoder(binding({ harness: "codex" }), {}, context(), {});
+    await runCoder(binding({ harness: "codex" }), {}, context(), {});
   } catch (error) {
     failure = error;
   }
@@ -377,8 +415,10 @@ const results = {};
   const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
   let failure;
   try {
-    await runtime.runCoder(
-      binding({ workspace: [{ env: "EMPTY_WORKSPACE", site: "…workspace" }] }),
+    await runCoder(
+      binding({
+        workspace: { expression: ["'", { env: "EMPTY_WORKSPACE", site: "…workspace" }, "'"] },
+      }),
       {},
       context(),
       { cc: stub.driver },
@@ -397,7 +437,7 @@ const results = {};
 // --- 7. `inherit_env: true` is the opt-in ----------------------------------
 {
   const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(binding({ inheritEnv: true }), {}, context(), { cc: stub.driver });
+  await runCoder(binding({ inheritEnv: true }), {}, context(), { cc: stub.driver });
   const run = stub.runs[0];
   results["inherited"] = {
     inheritEnv: run.inheritEnv,
@@ -419,12 +459,12 @@ const results = {};
   ]);
   let first;
   try {
-    await runtime.runCoder(binding(), { goal: "fix it" }, held, { cc: failing.driver });
+    await runCoder(binding(), { goal: "fix it" }, held, { cc: failing.driver });
   } catch (error) {
     first = error;
   }
   const answering = harness.scriptedDriver("cc", script({ summary: "second", touched: [] }));
-  const answer = await runtime.runCoder(binding(), { goal: "fix it" }, held, {
+  const answer = await runCoder(binding(), { goal: "fix it" }, held, {
     cc: answering.driver,
   });
   results["ladder"] = {
@@ -453,7 +493,7 @@ const results = {};
     execution: { id: "exec_journal" },
     effects: journal.recorderFor("exec_journal", "flow.patch/implement/0"),
   });
-  const written = await runtime.runCoder(binding(), { goal: "fix it" }, live, {
+  const written = await runCoder(binding(), { goal: "fix it" }, live, {
     cc: first.driver,
   });
   journal.closeSession("exec_journal");
@@ -468,7 +508,7 @@ const results = {};
     execution: { id: "exec_journal" },
     effects: journal.recorderFor("exec_journal", "flow.patch/implement/0"),
   });
-  const replayed = await runtime.runCoder(binding(), { goal: "fix it" }, resumed, {
+  const replayed = await runCoder(binding(), { goal: "fix it" }, resumed, {
     cc: second.driver,
   });
   journal.closeSession("exec_journal");
@@ -530,7 +570,7 @@ const results = {};
   });
   let liveFailure;
   try {
-    await runtime.runCoder(binding(), { goal: "fix it" }, live, { cc: first.driver });
+    await runCoder(binding(), { goal: "fix it" }, live, { cc: first.driver });
   } catch (error) {
     liveFailure = error;
   }
@@ -546,7 +586,7 @@ const results = {};
   });
   let replayedFailure;
   try {
-    await runtime.runCoder(binding(), { goal: "fix it" }, resumed, { cc: second.driver });
+    await runCoder(binding(), { goal: "fix it" }, resumed, { cc: second.driver });
   } catch (error) {
     replayedFailure = error;
   }
@@ -619,7 +659,7 @@ const results = {};
 
   journal.openSession("exec_identity", held, false);
   const live = harness.scriptedDriver("cc", script(answer));
-  await runtime.runCoder(
+  await runCoder(
     binding(),
     { goal: "fix it" },
     context({
@@ -637,7 +677,7 @@ const results = {};
     let failure;
     let output;
     try {
-      const replayed = await runtime.runCoder(
+      const replayed = await runCoder(
         binding(overrides),
         { goal: "fix it" },
         context({
@@ -763,7 +803,7 @@ const results = {};
     vendorOptionShippedTomorrow: "travels",
   };
   const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(binding({ settings: reserved }), { goal: "fix it" }, context(), {
+  await runCoder(binding({ settings: reserved }), { goal: "fix it" }, context(), {
     cc: stub.driver,
   });
   // The run the **adapter** built, handed to the real driver's own option
@@ -799,7 +839,7 @@ const results = {};
   // own: a bound stated per harness is a bound each harness holds (PRD resolved
   // q57 ruling c).
   const codexStub = harness.scriptedDriver("codex", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(
+  await runCoder(
     binding({
       harness: "codex",
       access: "read_only",
@@ -860,7 +900,7 @@ const results = {};
 
   // `cc`, with every fact declared.
   const ccStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(binding(), { goal: "fix it" }, context(), { cc: ccStub.driver });
+  await runCoder(binding(), { goal: "fix it" }, context(), { cc: ccStub.driver });
   const ccRun = ccStub.runs[0];
   const ccFull = harness.ccOptions(ccRun, [], new Set());
 
@@ -870,7 +910,7 @@ const results = {};
     baseUrl: [{ env: "CODER_GATEWAY_URL", site: "provider.gateway.base_url" }],
   };
   const ccKeylessStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(
+  await runCoder(
     binding({ connection: keylessConnection }),
     { goal: "fix it" },
     context(),
@@ -890,7 +930,7 @@ const results = {};
   // (`docs/trace.md` §11.1).
   process.env["CODER_TEAM"] = "platform\nx-api-key: someone-elses-key";
   const forgedStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(binding(), { goal: "fix it" }, context(), { cc: forgedStub.driver });
+  await runCoder(binding(), { goal: "fix it" }, context(), { cc: forgedStub.driver });
   let forged = null;
   try {
     harness.ccOptions(forgedStub.runs[0], [], new Set());
@@ -914,7 +954,7 @@ const results = {};
   process.env["CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"] = "7";
   process.env["HOST_ONLY"] = "inherited-and-kept";
   const inheritedStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(
+  await runCoder(
     binding({ inheritEnv: true }),
     { goal: "fix it" },
     context(),
@@ -927,7 +967,7 @@ const results = {};
   // name at all — resolved q25's posture — so the inherited bearer stays, while
   // the endpoint family it does claim still goes.
   const keylessInheritedStub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(
+  await runCoder(
     binding({ inheritEnv: true, connection: keylessConnection }),
     { goal: "fix it" },
     context(),
@@ -992,7 +1032,7 @@ const results = {};
 
   // `codex`, whose surface is its client's options rather than an environment.
   const codexStub = harness.scriptedDriver("codex", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(
+  await runCoder(
     binding({
       harness: "codex",
       modelId: "gpt-5-codex",
@@ -1013,7 +1053,7 @@ const results = {};
   const client = harness.codexClient(codexStub.runs[0]);
 
   const codexKeylessStub = harness.scriptedDriver("codex", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(
+  await runCoder(
     binding({
       harness: "codex",
       modelId: "gpt-5-codex",
@@ -1039,7 +1079,7 @@ const results = {};
   process.env["CODEX_ACCESS_TOKEN"] = "someone-elses-token";
   process.env["HOST_ONLY"] = "inherited-and-kept";
   const codexInheritedStub = harness.scriptedDriver("codex", script({ summary: "x", touched: [] }));
-  await runtime.runCoder(
+  await runCoder(
     binding({
       harness: "codex",
       modelId: "gpt-5-codex",
@@ -1065,7 +1105,7 @@ const results = {};
     "codex",
     script({ summary: "x", touched: [] }),
   );
-  await runtime.runCoder(
+  await runCoder(
     binding({
       harness: "codex",
       modelId: "gpt-5-codex",
@@ -1136,7 +1176,7 @@ const results = {};
 {
   const modeOf = async (overrides) => {
     const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
-    await runtime.runCoder(binding(overrides), { goal: "fix it" }, context(), {
+    await runCoder(binding(overrides), { goal: "fix it" }, context(), {
       cc: stub.driver,
     });
     const options = harness.ccOptions(stub.runs[0], [], new Set());
@@ -1162,6 +1202,67 @@ const results = {};
       access: "full_access",
       permissionMode: "bypassPermissions",
     }),
+  };
+}
+
+// --- 15. An `${ENV}` directory that is not CEL-shaped ----------------------
+//
+// Grammar §4.3's one surface in both classes: a `workspace:` reference resolves
+// into the expression's **source**, inside the string literal §4.3 puts it in,
+// and what results is lexed. So the value is read back as literal text — and a
+// directory holding a backslash, a quote or a line break would be read as
+// something else entirely: `C:\repos\thing` as `C:` + CR + `epos` + TAB +
+// `hing`, `/srv/o'brien` as an unterminated literal. Neither is anything
+// `validate` could warn about (the token is still literal text there) and
+// neither is anything an author can escape, because the value is on the machine
+// rather than in the composition.
+//
+// Every one of these is a directory somebody has, and what the harness is
+// handed has to be the directory itself — which is what makes this a claim
+// about the **path**, not about a string: the run is given `run.workspace` and
+// the assertion is that it equals the environment's own value.
+{
+  const awkward = {
+    windows: "C:\\repos\\thing",
+    tab: "/srv/a\\tb",
+    quote: "/srv/o'brien",
+    double: '/srv/say"hi"',
+  };
+  const handed = {};
+  for (const [name, value] of Object.entries(awkward)) {
+    process.env["AWKWARD_WORKSPACE"] = value;
+    const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+    await runCoder(
+      binding({
+        workspace: {
+          expression: ["'", { env: "AWKWARD_WORKSPACE", site: "…workspace" }, "'"],
+        },
+      }),
+      {},
+      context(),
+      { cc: stub.driver },
+    );
+    handed[name] = stub.runs[0].workspace === value;
+  }
+  // …and the per-item spelling the ruling exists for, whose literal is only
+  // part of the expression: the reference is escaped and the concatenation
+  // beside it still runs.
+  process.env["AWKWARD_WORKSPACE"] = awkward.windows;
+  const joining = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+  await runCoder(
+    binding({
+      workspace: {
+        expression: ["'", { env: "AWKWARD_WORKSPACE", site: "…workspace" }, "/' + input.goal"],
+      },
+    }),
+    { goal: "topic" },
+    context(),
+    { cc: joining.driver },
+    { roots: inputRoot({ goal: "topic" }) },
+  );
+  results["awkwardWorkspace"] = {
+    handed,
+    joined: joining.runs[0].workspace,
   };
 }
 

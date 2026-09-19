@@ -505,6 +505,20 @@ pub enum DiagnosticCode {
     /// answers the need where one does, which is what
     /// [`crate::harness::Answered`] carries.
     ReservedHarnessSetting,
+    /// Two harness runs that can be in flight at once are contained by one
+    /// directory (grammar 8.9, Decision D147, PRD resolved q61 ruling b).
+    ///
+    /// **One rule at two sites, and only one of them is decidable.** A `coder:`
+    /// node a `map` dispatches whose `workspace:` expression does not read the
+    /// per-dispatch scope names one directory for every item of the fan-out, so
+    /// `max_concurrency` above 1 is a data race on a checkout — an **error**,
+    /// with the two repairs named. Two coder nodes on statically-concurrent
+    /// branches whose `workspace:` values are statically equal are the same
+    /// collision one construct along, and a **warning**: what decides it is
+    /// whether the two resolve to one directory, and a value bearing an
+    /// `${ENV}` reference resolves at launch, so an error there would be this
+    /// compiler claiming a fact it does not have.
+    SharedWorkspace,
     /// A `coder:` node's model resolves to a provider declaring a connection
     /// fact the bound harness has **no slot for** (grammar 8.9, Decision D143,
     /// PRD resolved q58 ruling b).
@@ -691,6 +705,7 @@ impl DiagnosticCode {
         Self::WideningPermissionMode,
         Self::UnknownHarnessSetting,
         Self::ReservedHarnessSetting,
+        Self::SharedWorkspace,
         Self::UnsupportedConnectionFact,
         Self::UnsupportedProviderKind,
         Self::ConflictingConnectionVariable,
@@ -776,6 +791,7 @@ impl DiagnosticCode {
             Self::WideningPermissionMode => "widening-permission-mode",
             Self::UnknownHarnessSetting => "unknown-harness-setting",
             Self::ReservedHarnessSetting => "reserved-harness-setting",
+            Self::SharedWorkspace => "shared-workspace",
             Self::UnsupportedConnectionFact => "unsupported-connection-fact",
             Self::UnsupportedProviderKind => "unsupported-provider-kind",
             Self::ConflictingConnectionVariable => "conflicting-connection-variable",

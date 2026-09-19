@@ -33,6 +33,18 @@ use super::{Ctx, FlowCx, text};
 /// against the expression's own span.
 pub(crate) fn analyze(ctx: &mut Ctx, expression: &Spanned<Cel>, scope: &Scope) -> Analysis {
     let analysis = crate::cel::analyze(expression.value.as_str(), scope);
+    report(ctx, expression, &analysis);
+    analysis
+}
+
+/// Report everything the front-end found, against the expression's own span.
+///
+/// Split out of [`analyze`] for the one surface that has to *read* what the
+/// front-end found before deciding whether to report it: a `coder:` node's
+/// `workspace:`, where a value that is a bare relative path answers with the
+/// migration rewrite instead of with the roots it was mistaken for
+/// ([`coder`](super::coder), PRD resolved q61 ruling a, G3).
+pub(crate) fn report(ctx: &mut Ctx, expression: &Spanned<Cel>, analysis: &Analysis) {
     for problem in &analysis.problems {
         ctx.push(
             Diagnostic::error(
@@ -43,7 +55,6 @@ pub(crate) fn analyze(ctx: &mut Ctx, expression: &Spanned<Cel>, scope: &Scope) -
             .with_optional_help(problem.help.clone()),
         );
     }
-    analysis
 }
 
 /// Require an expression's result to be of a fixed type.

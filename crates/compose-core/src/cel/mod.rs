@@ -660,10 +660,19 @@ impl Path {
 
     /// The [`Read`] this path names.
     ///
-    /// A read is a *root-anchored* path, so it stops at the first index: what
-    /// lies beyond one is a member of a value the composition cannot name
-    /// statically, and the two rules that consume reads (Decisions D83, D117)
-    /// ask only whether the path was read *through*.
+    /// A read is a *root-anchored* path, so it stops at the first index whose
+    /// key this walk could not resolve: what lies beyond one is a member of a
+    /// value the composition cannot name statically, and the rules that consume
+    /// reads (Decisions D83, D117, D147) ask only whether the path was read
+    /// *through*.
+    ///
+    /// An index whose key **is** resolved is not such a stop. `state['ch']` is
+    /// `state.ch` written the other way round — the same member of the same
+    /// object — so it contributes the member name and the path continues
+    /// through it. The rules that decide a race or a fan-out key off a channel
+    /// or field *name* (Decisions D83, D147), and a spelling that dropped the
+    /// name would hand them "a read of no channel at all" for an expression
+    /// that names one exactly.
     fn read(&self) -> Read {
         Read {
             root: self.root.clone(),
@@ -671,14 +680,14 @@ impl Path {
                 .segments
                 .iter()
                 .map_while(|segment| match segment {
-                    Segment::Member(name) => Some(name.clone()),
-                    Segment::Index(_) => None,
+                    Segment::Member(name) | Segment::Index(Some(name)) => Some(name.clone()),
+                    Segment::Index(None) => None,
                 })
                 .collect(),
             indexed: self
                 .segments
                 .iter()
-                .any(|segment| matches!(segment, Segment::Index(_))),
+                .any(|segment| matches!(segment, Segment::Index(None))),
         }
     }
 }
@@ -1287,14 +1296,29 @@ impl Walk<'_> {
             return (Type::Dyn, None);
         };
         let (container_ty, path) = self.expr(container);
+        let key = call.args.get(1);
+        // Whether this index *names* a member is decided before the read is
+        // recorded rather than after, because the recorded read is what the
+        // rules stated over a channel or field name consume (Decisions D83,
+        // D147): `state['ch']` is a read of `state.ch`, and recording it as a
+        // read of `state` with no member would hand those rules an expression
+        // that names no channel where it names one exactly.
+        //
+        // Decided on the **key** alone and not on the container's type, because
+        // those rules walk the expression against an empty scope — they ask what
+        // it depends on, not what it evaluates to — and a resolution that needed
+        // the container to have been typed as an object would be a resolution
+        // they never get. A constant string key names the same member of a map
+        // as it does of an object, so nothing is assumed by taking it there too;
+        // an integer index is no member name at all and is left as one.
+        let named = key.and_then(constant_key);
         let mut path = path.map(|mut path| {
-            path.segments.push(Segment::Index(None));
+            path.segments.push(Segment::Index(named));
             path
         });
         // Recorded before the key is walked, so the reads stay in the order
         // the expression puts them in.
         self.record(path.as_ref());
-        let key = call.args.get(1);
         let key_ty = key.map_or(Type::Dyn, |key| self.value(key));
         let ty = match &container_ty {
             Type::Dyn => Type::Dyn,
@@ -1412,6 +1436,20 @@ fn describe(origin: &Origin) -> String {
         Origin::Execution => "the execution object".to_string(),
         Origin::Node { id, .. } => format!("the node `{id}`"),
         Origin::Payload(kind) => format!("the `{kind}` trigger payload"),
+    }
+}
+
+/// The member name an index key names outright: the body of a string constant,
+/// and nothing else.
+///
+/// Read *before* the key is walked, which is why it is a syntactic test rather
+/// than a look at the key's type. A key that is a constant only after the walk
+/// folds it — the type lattice's [`Type::StringLiteral`] — is resolved by the
+/// `Type::Object` arm of [`Walk::index`] instead, where the fold has happened.
+fn constant_key(key: &IdedExpr) -> Option<String> {
+    match &key.expr {
+        Expr::Literal(LiteralValue::String(text)) => Some(text.inner().to_string()),
+        _ => None,
     }
 }
 
@@ -1852,6 +1890,58 @@ mod tests {
         let analysis = analyze("input.doc_id", &Scope::default());
         assert_eq!(analysis.reads.len(), 1);
         assert_eq!(analysis.reads[0].spelling(), "input.doc_id");
+    }
+
+    /// An index by a **constant** key is the member selection it is, and the
+    /// read carries the name (Decisions D83, D147).
+    ///
+    /// The rules that consume reads key off a channel or field *name*: an
+    /// item-derived store key (grammar 11.4) and the shared-workspace refusal
+    /// (grammar 8.9). A read of `state['checkout']` recorded as "a read of
+    /// `state` naming no channel" is answered by each of them at whatever
+    /// default it holds for an unknown, so the bracket spelling would escape —
+    /// or trip — a rule the dot spelling is decided by. It resolves against an
+    /// **empty** scope too, because that is the scope those rules walk: what the
+    /// expression depends on is not a question about its type.
+    #[test]
+    fn a_constant_index_key_is_read_as_the_member_it_names() {
+        for scope in [&guard_scope(), &Scope::default()] {
+            let analysis = analyze("state['draft']", scope);
+            assert_eq!(analysis.reads.len(), 1);
+            assert_eq!(analysis.reads[0].path, ["draft"]);
+            assert!(!analysis.reads[0].indexed);
+            assert_eq!(analysis.reads[0].spelling(), "state.draft");
+        }
+        // Through the index as well, and either spelling of either step. The
+        // index records the sub-path it closes before the selection that
+        // follows it is walked, so the whole path is the last read rather than
+        // the only one.
+        let analysis = analyze("review['output'].feedback", &Scope::default());
+        let whole = analysis.reads.last().expect("the path is read");
+        assert_eq!(whole.path, ["output", "feedback"]);
+        assert!(whole.reads_through("review", "output"));
+    }
+
+    /// A key the walk cannot resolve names nothing, and the read says so rather
+    /// than naming the wrong member or none.
+    ///
+    /// This is the half the rules above answer *conservatively*: an integer
+    /// index names no member at all, and a computed key names one this compiler
+    /// cannot see. Both stop the path, which is what marks the read as one no
+    /// name can be read off.
+    #[test]
+    fn an_unresolved_index_key_stops_the_path() {
+        // An integer index: the path reaches the list and stops at the item.
+        let analysis = analyze("state.patches[0]", &Scope::default());
+        assert_eq!(analysis.reads[0].path, ["patches"]);
+        assert!(analysis.reads[0].indexed);
+        assert_eq!(analysis.reads[0].spelling(), "state.patches[…]");
+
+        // A computed key: the path names the root and nothing under it.
+        let analysis = analyze("state[input.goal]", &Scope::default());
+        assert!(analysis.reads[0].path.is_empty());
+        assert!(analysis.reads[0].indexed);
+        assert_eq!(analysis.reads[0].spelling(), "state[…]");
     }
 
     /// Nesting is counted over the three bracket kinds together, and never

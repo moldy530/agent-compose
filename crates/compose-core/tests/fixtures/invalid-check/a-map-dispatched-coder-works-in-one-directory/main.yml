@@ -1,0 +1,96 @@
+# rule: a `map`-dispatched `coder:` node whose `workspace:` does not read the
+# rule: per-dispatch scope is refused unless the map is serial (grammar 8.9, D147)
+# code: shared-workspace
+# message: `flow.fix` node `implement` is dispatched by the map `work` of `flow.main` with `max_concurrency: 4`, and its `workspace:` is one directory for every dispatch
+# at: main.yml:61:20
+# label: main.yml:84:7 the fan-out is issued here
+# help: a harness run is contained by its `workspace:`, so 4 dispatches sharing `'${REPO_ROOT}'` are 4 coding agents editing one checkout and overwriting each other's work. Two repairs, and each says something different about the graph: bind the item's own path — carry it on the dispatch (`input: { worktree: "item.worktree" }`) and read it here (`workspace: "input.worktree"`), or write `workspace: fresh` for a directory the runtime provisions per dispatch — or declare `max_concurrency: 1` on the map, which says these runs are serial. `workspace:` is evaluated in this node's input scope at every dispatch precisely so the first repair is writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# The race PRD resolved q61 was ratified from, minimised. The item already
+# carries the directory — `task.worktree` is bound into the instance as
+# `input.worktree` — and the coder node reads neither it nor the per-item
+# index, so four dispatches resolve `workspace:` to one path and four coding
+# agents edit one checkout. Nothing else about the composition is wrong, which
+# is the point: it validates, it builds, it runs, and what comes out is four
+# runs' work in one tree with both runs reporting success.
+#
+# The refusal is an **error** rather than a warning because nothing here is a
+# launch fact: the compiler is not comparing two values, it is reading one
+# expression and asking whether it depends on the dispatch at all, and that
+# question is answered by the composition. The other half of the rule — two
+# coder nodes on concurrent branches — is the warning, and its fixture is
+# `two-concurrent-coder-nodes-name-one-workspace`.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: List the checkouts that need a change.
+  output:
+    tasks:
+      type: array
+      max_items: 10
+      items:
+        type: object
+        properties:
+          goal: { type: string }
+          worktree: { type: string }
+state:
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 10
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+    worktree: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  outputs:
+    summaries:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    work:
+      map:
+        over: plan.output.tasks
+        as: task
+        node: flow.fix
+        input:
+          goal: "task.goal"
+          worktree: "task.worktree"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }

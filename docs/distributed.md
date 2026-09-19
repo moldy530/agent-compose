@@ -1504,8 +1504,9 @@ Which gives, concretely:
 - a variable reachable in two processes belongs to both. Two placed agents
   attaching one unplaced tool is the ordinary case, and the tool's secrets go to
   both placements;
-- a variable a **`coder:` node** declares — its `workspace:`, and every value of
-  its `env:` (grammar §8.9, PRD resolved q57) — belongs to the manifest of every
+- a variable a **`coder:` node** declares — every reference inside its
+  `workspace:` expression, and every value of its `env:` (grammar §8.9, PRD
+  resolved q57, q61) — belongs to the manifest of every
   process that runs the node's **flow**. That is the hub's, always and
   unconditionally, because every flow a composition declares is startable on the
   hub (grammar Decision D64); and it is **also** the manifest of every placement

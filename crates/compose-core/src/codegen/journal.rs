@@ -561,14 +561,27 @@ mod tests {
         }
     }
 
-    /// The seven journaled seams, by the name each is declared under.
-    const SEAMS: [&str; 7] = [
+    /// The journaled seams the walk below starts from, by the name each is
+    /// declared under.
+    ///
+    /// A subset of the nine sites the inventory above enumerates, and the
+    /// subset is what this test needs rather than a second opinion about what
+    /// a seam is: a site earns a place here when something it reaches calls
+    /// the world. `callModule` hands a composition's own file the effects it
+    /// makes, which are that file's rather than this runtime's, and so reaches
+    /// no primitive of these modules. `runCoder` earned one at PRD resolved
+    /// q61: a `workspace: fresh` run has the runtime make its directory, which
+    /// is a call on the world inside the coder adapter for the first time —
+    /// the harness SDKs having always made theirs behind the driver seam, in a
+    /// module this test does not read.
+    const SEAMS: [&str; 8] = [
         "callModel",
         "runExec",
         "runBuiltin",
         "runHttp",
         "callFunction",
         "runHuman",
+        "runCoder",
         "runStoreOp",
     ];
 

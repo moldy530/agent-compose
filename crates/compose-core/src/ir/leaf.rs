@@ -71,7 +71,9 @@ use crate::ast::definition::{
 };
 use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue, TraceSinkFormat};
 use crate::ast::document::Reduce;
-use crate::ast::flow::{FlowContext, Harness, PermissionMode, StoreOp, WorkspaceAccess};
+use crate::ast::flow::{
+    CoderWorkspace, FlowContext, Harness, PermissionMode, StoreOp, WorkspaceAccess,
+};
 use crate::ast::schema::{Number, ScalarKind, StringFormat, Surface};
 use crate::ast::trigger::{HmacAlgorithm, Respond, SignatureEncoding, TriggerMethod};
 use crate::diag::{Position, Span, Spanned};
@@ -260,6 +262,23 @@ impl Serialize for Interpolated {
             state.serialize_field("env_refs", &self.references)?;
         }
         state.end()
+    }
+}
+
+/// A coder node's `workspace:`: the keyword `"fresh"`, or the expression in
+/// [`Interpolated`]'s own shape above (grammar 8.9, Decision D147).
+///
+/// Written as one value rather than as a tagged object, because it is one
+/// value: `fresh` is a word this surface reads and everything else is an
+/// expression, and the two are told apart by the same test the compiler uses —
+/// a string against the keyword. A reader of the artifact sees exactly what the
+/// composition wrote, which is what every other lexical leaf here promises.
+impl Serialize for CoderWorkspace {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Fresh => serializer.serialize_str(Self::FRESH),
+            Self::Expression(expression) => expression.serialize(serializer),
+        }
     }
 }
 

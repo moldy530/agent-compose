@@ -16,7 +16,7 @@ flow.main:
       coder:
         harness: cc
         model: model.smart
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Do the work.
         output:
           summary: { type: string }

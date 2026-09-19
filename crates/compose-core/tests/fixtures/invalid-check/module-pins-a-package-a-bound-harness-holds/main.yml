@@ -59,7 +59,7 @@ flow.main:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: workspace_write
         prompt: Make the change.
         output:
@@ -71,7 +71,7 @@ flow.main:
       coder:
         harness: codex
         model: model.reviewer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: read_only
         prompt: Read the tree and report.
         input:

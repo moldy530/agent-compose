@@ -130,6 +130,7 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::ReservedHarnessSetting => {
             include_str!("codes/reserved-harness-setting.md")
         }
+        DiagnosticCode::SharedWorkspace => include_str!("codes/shared-workspace.md"),
         DiagnosticCode::UnsupportedConnectionFact => {
             include_str!("codes/unsupported-connection-fact.md")
         }

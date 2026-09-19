@@ -1,0 +1,89 @@
+# rule: two concurrent `flow:` nodes instantiating one coder node that names one
+# rule: directory draw the warning too (grammar 7.6.1, 8.9, D147)
+# code: shared-workspace
+# message: `flow.work` node `implement` instantiated by `left` and `flow.work` node `implement` instantiated by `right` can run concurrently and their `workspace:` is written the same way
+# at: main.yml:54:20
+# label: main.yml:75:7 one of the two runs is inside this step
+# label: main.yml:80:7 and the other is inside this one
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent — and two harness runs inside one directory edit each other's files. `'${REPO_ROOT}'` reads nothing from either run's own scope, so it is one path however the instances are bound. Give one of them a directory of its own: carry it in on the `input:` of the step that starts the instance — a `flow:` node or a map dispatch — and read it here (`workspace: "input.worktree"`), or write `workspace: fresh` on each for a directory the runtime provisions per dispatch. A **warning** rather than a refusal because equality here is a launch fact: a value bearing an `${ENV}` reference resolves on the machine that runs it, so two values this compiler reads as different may still be one directory, and two it reads as the same is the half it can see (grammar 7.6.1, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# The concurrent half of PRD resolved q61 ruling b read over the runs a **step**
+# contains rather than over the coder nodes a flow declares. `triage` forks to
+# `left` and `right` on two unguarded edges, both instantiate `flow.work`, and
+# the one coder node inside it names one directory — so two `cc` runs work in
+# `${REPO_ROOT}` at the same time and overwrite each other, which is the same
+# graph as `two-concurrent-coder-nodes-name-one-workspace` with the work
+# factored into a reusable flow. An author who factors gets the same reading as
+# one who writes the nodes out.
+#
+# The two runs are one coder node, so the `workspace:` the warning anchors at is
+# one line. What tells them apart is the **step** each is inside, which is why
+# both labels name a `flow:` node rather than repeating the one directory.
+#
+# The compared expression reads nothing — no `input`, no `state`, no
+# `execution` — and that is the condition, not an accident of the example: two
+# instances are not one scope (grammar 10.1), so `workspace: "input.worktree"`
+# here would be two directories exactly when the two instantiations bind two
+# paths, which is the repair this ruling exists for.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.triage:
+  model: model.implementer
+  prompt: Decide what the change needs.
+  output:
+    note: { type: string }
+state:
+  summary: { type: string, default: "" }
+  parser: { type: string, default: "" }
+  lexer: { type: string, default: "" }
+flow.work:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  outputs:
+    parser: { type: string }
+    lexer: { type: string }
+  nodes:
+    triage:
+      agent: agent.triage
+      input: "'the failing tests'"
+    left:
+      flow: flow.work
+      input:
+        goal: "'fix the parser'"
+      writes: { summary: parser }
+    right:
+      flow: flow.work
+      input:
+        goal: "'fix the lexer'"
+      writes: { summary: lexer }
+  edges:
+    - { from: start, to: triage }
+    - { from: triage, to: left }
+    - { from: triage, to: right }
+    - { from: left, to: end }
+    - { from: right, to: end }

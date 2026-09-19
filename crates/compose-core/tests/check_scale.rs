@@ -177,6 +177,93 @@ fn a_deeply_nested_composition_is_checked_without_recursing() {
     assert_eq!(checked, 0, "the generated project checks cleanly");
 }
 
+/// `flow.f0` runs a `coder:` node and then instantiates `flow.f1`, which does
+/// the same — one chain, `depth` deep, spread over ten imported files.
+///
+/// The depth shape the fan-out cases cannot reach, and the one the
+/// shared-workspace rules are answered over. Each flow's graph holds **two**
+/// steps that can contain a harness run — the coder node and the `flow:` node —
+/// so a rule that enumerates the runs inside every step before asking whether
+/// any two of them are concurrent walks the whole composition below every link
+/// and is quadratic in the depth (`check/coder.rs`, grammar 7.6.1, D147). The
+/// chain is strictly sequential and holds no `map`, so nothing here is
+/// concurrent with anything, nothing is dispatched, and the whole cost is the
+/// walking: the analysis has no pair to answer about and must not pay to find
+/// that out.
+fn nested_coder_project(dir: &Path, depth: usize) {
+    /// The one harness run each flow of the chain holds.
+    const RUN: &str = r#"    work:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "'/srv/one'"
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+"#;
+    let files = 10;
+    let per = depth.div_ceil(files);
+    let mut names = Vec::new();
+    for (at, start) in (0..depth).step_by(per).enumerate() {
+        let name = format!("coders{at}.yml");
+        let mut text = String::new();
+        for index in start..(start + per).min(depth) {
+            // One directory named the same way the whole chain down, which is
+            // what a rule comparing two written values has to read: the runs
+            // are sequential, so it is legal, and every pair of them would
+            // collide if any pair were concurrent.
+            let run = RUN;
+            if index + 1 < depth {
+                text.push_str(&format!(
+                    "flow.f{index}:\n  outputs: {{}}\n  nodes:\n{run}    step: {{ flow: flow.f{} \
+                     }}\n  edges:\n    - {{ from: start, to: work }}\n    - {{ from: work, to: \
+                     step }}\n    - {{ from: step, to: end }}\n",
+                    index + 1
+                ));
+            } else {
+                text.push_str(&format!(
+                    "flow.f{index}:\n  outputs: {{}}\n  nodes:\n{run}  edges:\n    - {{ from: \
+                     start, to: work }}\n    - {{ from: work, to: end }}\n"
+                ));
+            }
+        }
+        fs::write(dir.join(&name), text).expect("can write a flow file");
+        names.push(name);
+    }
+    let imports: String = names
+        .iter()
+        .map(|name| format!("  - {name}\n"))
+        .collect::<Vec<_>>()
+        .concat();
+    fs::write(
+        dir.join("main.yml"),
+        format!("version: \"0.1\"\nimports:\n{imports}{BACKEND}"),
+    )
+    .expect("can write the entrypoint");
+}
+
+/// A chain of harness runs deeper than any rule may walk once per link.
+///
+/// 2,000 flows, each holding a coder node and the instantiation of the next, is
+/// 2,000 steps whose contained runs a rule could ask for and 2,001,000 flows'
+/// worth of walking if it asks per link. Enumerating the runs of every step
+/// before asking whether any two are concurrent cost 4.4 s at a depth of 2,000
+/// and 19.8 s at 4,000, against a command whose budget is milliseconds
+/// (PRD 5.12) — and the suite stayed green, because no test held the rule to a
+/// time. This one does.
+#[test]
+fn a_deep_chain_of_harness_runs_is_checked_in_proportion_to_its_depth() {
+    let dir = scratch("coders");
+    nested_coder_project(&dir, 2_000);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "2,000 nested coder runs", 0);
+    assert!(
+        fastest < budget,
+        "checking a 2,000-deep chain of coder nodes took {fastest:?}, and the budget is {budget:?}"
+    );
+}
+
 /// One `hub` node with `width` unconditional out-edges, each starting a chain of
 /// six nodes to `end`. Every pair of those edges is co-takeable, so the fork
 /// analysis sees `width * (width - 1) / 2` pairs (grammar 7.6.1).
@@ -568,6 +655,88 @@ fn a_guarded_fork_reads_each_guard_once_rather_than_once_per_pair() {
         fastest < budget,
         "checking a 240-branch guarded fork took {fastest:?}, and the budget is {budget:?}"
     );
+}
+
+/// The same guarded fork with a **coder node** on every arm, which is the only
+/// shape that puts the shared-workspace warning's half of the fork analysis on
+/// the clock at all.
+///
+/// `check/coder.rs`'s `concurrent_workspaces` asks `convergence::concurrent_among`
+/// which of a flow's coder, `flow:` and `map` steps can be in flight at once
+/// (PRD resolved q61 ruling b), and that question short-circuits on fewer than
+/// two such steps — so every other shape in this file, built from `agent:` nodes
+/// alone, returns before the fork enumeration is reached and a cost paid there
+/// is invisible to all of them. Here 241 of the 242 nodes are steps of interest,
+/// so the rule crosses the whole fan: 240 guarded edges are 28,680 co-takeable
+/// pairs, every arm's coder run is compared against every other's, and the
+/// per-edge guard reading the fork analysis is built around
+/// (`convergence::possible`) is entered at full width.
+///
+/// The budget is the file's usual one and guards what a budget can guard:
+/// anything this rule *walks* or *reads off a guard* per pair, which is the
+/// 10.2 s-against-1.06 s pass the test above exists for, entered here through a
+/// second caller. What it deliberately does **not** guard is the constant
+/// factor of enumerating the fork pairs twice — the warning adds no pair of its
+/// own, and deriving them a second time rather than taking the ones
+/// `convergence::check` just produced cost this shape 2.49 s against 1.73 s — a
+/// 44 % regression no budget several times the true cost can see. That one is
+/// held by the signature instead: `concurrent_among` takes the pairs and has no
+/// way to derive them.
+///
+/// Every arm names a directory of its own, so the report is empty and the clock
+/// is on the analysis alone — the collision half of the rule is what
+/// `tests/fixtures/invalid-check/two-concurrent-coder-nodes-name-one-workspace`
+/// pins.
+#[test]
+fn a_wide_fork_of_coder_nodes_enumerates_its_forks_once() {
+    let dir = scratch("guarded-coders");
+    guarded_coder_fork_project(&dir, 240, 19);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "240-branch guarded fork of coder nodes", 0);
+    assert!(
+        fastest < budget,
+        "checking a 240-branch guarded fork of coder nodes took {fastest:?}, and the budget is \
+         {budget:?}"
+    );
+}
+
+/// [`guarded_fork_project`]'s fork with every leaf a `coder:` node working in a
+/// directory of its own.
+///
+/// The guards, the conjuncts and the five enum fields are that project's
+/// exactly — this varies the one thing the shared-workspace warning reads, which
+/// is what the leaves *are*. `workspace:` is a distinct literal per arm, so the
+/// rule crosses all 28,680 pairs and reports nothing.
+fn guarded_coder_fork_project(dir: &Path, width: usize, conjuncts: usize) {
+    let mut nodes = String::from("    r: { agent: agent.g, input: \"'r'\" }\n");
+    let mut edges = String::from("    - { from: start, to: r }\n");
+    let leaf = |at: usize| {
+        format!(
+            "    t{at}:\n      coder:\n        harness: cc\n        model: model.m\n        \
+             workspace: \"'/srv/w{at}'\"\n        prompt: Work.\n        output:\n          \
+             summary: {{ type: string }}\n      input: \"'t'\"\n"
+        )
+    };
+    for at in 0..width {
+        nodes.push_str(&leaf(at));
+        let rest: String = (0..conjuncts - 1)
+            .map(|term| format!(" && size(state.seen) > {}", at + term))
+            .collect();
+        edges.push_str(&format!(
+            "    - {{ from: r, to: t{at}, when: \"r.output.outcome == 'approve'{rest}\" }}\n"
+        ));
+        edges.push_str(&format!("    - {{ from: t{at}, to: end }}\n"));
+    }
+    nodes.push_str(&leaf(width));
+    edges.push_str(&format!("    - {{ from: r, to: t{width}, else: true }}\n"));
+    edges.push_str(&format!("    - {{ from: t{width}, to: end }}\n"));
+    fs::write(
+        dir.join("main.yml"),
+        format!(
+            "version: \"0.1\"\n{GUARDED}flow.f:\n  outputs: {{}}\n  nodes:\n{nodes}  edges:\n{edges}"
+        ),
+    )
+    .expect("can write the entrypoint");
 }
 
 /// A fan of branches that all race one channel, which is where anything

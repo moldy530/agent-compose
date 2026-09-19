@@ -2179,7 +2179,7 @@ mod tests {
 provider.p:\n  kind: anthropic\n  api_key: ${{K}}\n\
 model.m:\n  provider: provider.p\n  id: some-model\n\
 state:\n  summary: {{ type: string, default: \"\" }}\n\
-flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: /srv/checkout\n{stated}        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: \"'/srv/checkout'\"\n{stated}        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
             )
         };
         let drawn = |source: &str| {

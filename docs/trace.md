@@ -277,7 +277,7 @@ retries are attempts at one execution, and `attempts` is where they are recorded
 | `inner` | array of entries | `flow:` nodes that ran an instance | The trace of the subflow instance this node ran (grammar §8.5). Absent on a `flow:` node that ran none — one whose *input* could not be built — and on one whose own `timeout:` abandoned its instance mid-flight, which leaves no trace to carry. A **dispatched** instance is never here: a `map`'s items report under their own dispatch records (§5), including the item whose failure ended the map node. See §8. |
 | `stores` | array of [store records](#6-store-records) | when the node performed any | Every store op this node performed, in the order it performed them (PRD 5.8). Never empty: a node that performed none carries no key. See §6. |
 | `models` | array of [model calls](#7-model-calls) | when the node made any | Every model call this node execution made (PRD 5.9). Never empty: a node that made none carries no key. See §7. |
-| `harness` | array of [harness runs](#76-a-harness-run) | `coder` nodes that started a run | Every coding-harness run this node execution made (grammar §8.9, PRD resolved q57). A coder node makes **one run per attempt**, so what an entry carries across a `retry:` ladder is one record per attempt, in the order they were made — the same set rule `models` is under, and for the same reason: a run that failed on the first attempt really ran. Never empty: a node that started none carries no key. A node whose *input* could not be built is one such entry — `attempts: 0`, exactly as that leaves `inner` off a `flow:` node — but it is not the only one: an attempt that failed *before* the run began starts nothing either, which is what a bound harness this process has no driver for, a `workspace:` that resolved empty, and an `${ENV}` the environment did not hold all produce. Those report `attempts` of one or more with no record to show for them. **The absence is a statement about runs started, not about attempts made**; read `attempts` for that. A node that is not a `coder` node never carries it. See §7.6. |
+| `harness` | array of [harness runs](#76-a-harness-run) | `coder` nodes that started a run | Every coding-harness run this node execution made (grammar §8.9, PRD resolved q57). A coder node makes **one run per attempt**, so what an entry carries across a `retry:` ladder is one record per attempt, in the order they were made — the same set rule `models` is under, and for the same reason: a run that failed on the first attempt really ran. Never empty: a node that started none carries no key. A node whose *input* could not be built is one such entry — `attempts: 0`, exactly as that leaves `inner` off a `flow:` node — but it is not the only one: an attempt that failed *before* the run began starts nothing either, which is what a bound harness this process has no driver for, an `${ENV}` the environment did not hold, and a `workspace:` the node's input scope could not answer — an expression that read an absent value, evaluated to something that is not a string, or resolved to an empty path — all produce. Those report `attempts` of one or more with no record to show for them. **The absence is a statement about runs started, not about attempts made**; read `attempts` for that. A node that is not a `coder` node never carries it. See §7.6. |
 | `human` | [a pause](#34-a-human-nodes-pause) | `human` nodes that began a wait | What the wait did: when it began, how long it had, and how it ended (grammar §8.7). On every entry of a `human` node that got as far as pausing, which is all three ways one ends — an answer, an expiry, and a run that ended holding it — told apart *inside* the record rather than by its absence. The key is absent on the one `human` entry with no wait behind it: a node whose *input* could not be built, which fails the execution before the activity runs (`attempts: 0`), exactly as it leaves `inner` off a `flow:` node. A node that is not a `human` node never carries it. **What the human answered is not in it**, and that is a rule of this format rather than an omission — see §11. |
 | `error` | string | `"skipped"`, `"failed"` | What went wrong, as `<error name>: <message>` — the failure's class and its text, in that one shape on **every** entry that carries the field, whether the node aborted the run, took a `fallback:`, or had its failure absorbed by `on_error: skip`. On both of those outcomes without exception — including both shapes of `"failed"`, the one that ended the run and the one that took a `fallback:` — and never on `"completed"`: an outcome says what became of a failure, not whether there was one to describe (§3.2). Written for a person: §10.1 makes the text something a reader must not parse, and it can quote what the other side of an activity answered — §11.1 is what it may and may not hold. |
 | `fallback` | string | when a declared control transfer replaced this node's own edges | The node id control went to instead, and there are two keys that declare one: `on_error: { fallback: … }` after a failure (grammar §9.2), and a `human` node's `on_timeout:` after its wait ran out (grammar §8.7, which gives it §9.2's targets). `"__end__"` for the terminal pseudo-node. Read `human` to tell the two apart on an entry that could be either. |
@@ -886,6 +886,7 @@ it.
 | `sdk` | string | always | The SDK package this compiler release reached it through and the version it pinned, as `<package>@<version>`. It is what joins a trace to the `package.json` of the project that produced it. |
 | `model` | string | always | The `model.*` the composition named (grammar §12.2). |
 | `modelId` | string | always | The provider-native model id that address resolved to, which is what the harness was actually handed (grammar §8.9, Decision D141). |
+| `workspace` | string | always | **The directory this run was contained by, resolved** (grammar §8.9, Decision D147, PRD resolved q61). A `coder:` node's `workspace:` is an expression evaluated at each dispatch, so the composition's own text no longer answers which directory a run held — and for a `map` over a coder node, where the whole point is that every dispatch holds a different one, that is the first question a reader of this record has. A `workspace: fresh` run reads the directory the runtime provisioned for it, under `.agent-compose/workspaces/<execution id>/<instance path>/`. This is the **one** field of this format derived from a resolved value rather than from what the composition wrote; [§11.1](#111-secrets) names it as the exception it is. |
 | `outcome` | `"completed"` \| `"failed"` | always | Whether the run produced an answer this node went on with. `"completed"` means the answer also passed the node's `output:` gate; a run whose answer the gate refused is `"failed"`, because what the node got was not an answer it could use. There is no third member: a harness's own refusals are inside its loop and are `toolCalls` entries, not outcomes of the run. |
 | `turns` | array of [turns](#761-a-turn), possibly empty | always | The run's **top-level** turns, in the order the harness took them. Empty on a run that failed before its first turn — a harness that could not start. |
 | `toolCalls` | array of [tool events](#763-a-tool-event) | when the run made any | Its top-level tool events, in the order it made them. Never empty: a run that called nothing carries no key. |
@@ -1436,9 +1437,9 @@ The version number alone is a promise; two tests make it a checkable one:
 
 ### 11.1 Secrets
 
-**No resolved `${ENV}` value appears in this format.** Grammar §4.3 classifies
-every string surface of a composition, and the two classes that can hold one are
-kept out for different reasons.
+**No resolved `${ENV}` value appears in this format, with one named exception
+below.** Grammar §4.3 classifies every string surface of a composition, and the
+two classes that can hold one are kept out for different reasons.
 
 **Class 1 — env-ref only.** A provider's `api_key:`, a backend's `url:`, `dsn:`
 or `token:`: the whole value is one `${NAME}` reference, and nothing here is
@@ -1499,6 +1500,33 @@ opens by promising. `ToolCallRecord.program` is a third field carried verbatim
 and is in the table above rather than here, because the party that fills it is
 the **model** rather than the composition — the reason it is untrusted text and
 these two are not.
+
+**The exception, named rather than left to be found.**
+[`HarnessRecord.workspace`](#76-a-harness-run) carries a **resolved** path —
+the one field of this format that does. PRD resolved q61 made a coder node's
+`workspace:` an expression evaluated at each dispatch (grammar §8.9, Decision
+D147), and three things follow that make this the right field to bend the
+promise for and the only one:
+
+* **the composition's text stopped answering the question.** Before q61 a
+  reader with the spec in front of them knew which directory a run held; after
+  it, a map over a coder node holds a different one per dispatch, and which
+  directory a harness was contained by is the first thing a reader of a coder
+  run needs. `asWritten` would print the expression, which is in the journal's
+  replay identity already and answers something else;
+* **it is a containment bound, not a connection.** What §11.1 keeps out is where
+  traffic goes and how it authenticates — the class-1 fields, whose whole value
+  is one reference. A workspace is a directory on the machine that ran the
+  graph; an `${ENV}` inside the expression that names it is a machine root, not
+  a credential, and the secret-bearing fields of grammar §4.3's class-1 table
+  stay out of this format entirely;
+* **nothing else moved.** The journal's effect request still records the
+  workspace **as written** (`docs/durability.md` §3.9), the two restated
+  failures of §11.2 still quote the expression rather than its answer, and every
+  other field of this record is the composition's own text.
+
+A reader who ships traces somewhere a directory layout should not go has one
+field to redact, and it is named here.
 
 ### 11.2 Where a resolved value would otherwise have escaped
 

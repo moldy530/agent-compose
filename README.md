@@ -148,7 +148,7 @@ implement:
   coder:
     harness: cc                 # or `codex`
     model: model.smart
-    workspace: "${REPO_ROOT}"
+    workspace: "'${REPO_ROOT}'" # an expression; this one is a literal path
     access: workspace_write
     prompt: Fix the failing test, then say what you changed.
     output:
@@ -162,6 +162,14 @@ same thing, which is what keeps a composition free of anybody's SDK. The run is
 one journaled effect — a resume consumes the recorded answer and the harness
 never runs twice — and the trace carries its turns, its tool calls and what it
 cost.
+
+`workspace:` is the directory **one dispatch** works in: an expression over the
+node's input scope, evaluated at each dispatch. The quotes above are CEL's — one
+directory written as a literal — and a `map` over a coder node writes
+`workspace: "input.worktree"` instead, so every item gets its own checkout and
+`max_concurrency` means what it says. `workspace: fresh` takes a directory the
+runtime provisions per dispatch instead, and two runs that could share one are
+refused or warned about rather than left to clobber each other.
 
 `model:` is the same registry address an agent node writes, and the provider
 behind it points the harness: its `base_url:`, its credential and its `headers:`

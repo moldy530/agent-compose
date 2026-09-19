@@ -1,0 +1,50 @@
+# rule: a `coder:` node's `workspace:` written as a path is answered with the
+# rule: rewrite rather than a parse error (grammar 4.1, 8.9, D147, PRD G3)
+# code: invalid-expression
+# message: `workspace: /srv/checkout` of `flow.main` node `build` is a path where an expression is written
+# at: main.yml:42:20
+# help: `workspace:` is evaluated in this node's input scope at each dispatch, so a path has to be written as one: `workspace: "'/srv/checkout'"` is that same directory as a CEL string. What the expression buys is the dispatch — `workspace: "'/srv/checkout/' + input.branch"` gives a map item its own checkout, and `workspace: fresh` takes one the runtime provisions per dispatch (grammar 4.1, 8.9, Decision D147, PRD resolved q61 ruling a)
+#
+# The migration PRD resolved q61 makes every existing composition do, at the
+# spelling most of them have: `workspace:` was a path until the key moved into
+# the expression class, and a bare directory is now a value CEL cannot read.
+#
+# What the corpus pins is that the answer is the **rewrite**. The CEL
+# front-end's own message for this value names the character its parser stopped
+# at and lists the tokens it would have accepted, which is a true sentence an
+# author cannot act on — the failure mode resolved q22 is about. The two
+# spellings a pre-q61 composition holds, a bare path and a whole-value `${ENV}`
+# reference, are one mistake and get one answer; the env-ref half is
+# `a-coder-nodes-workspace-is-an-env-ref-not-an-expression`.
+#
+# The decision is on the first character and nothing else: `/` starts no CEL
+# expression this grammar admits, so the value is a path with certainty rather
+# than by guess. A value that is *not* path-shaped and still does not parse is a
+# malformed expression, and the front-end's message — which names the character
+# — is the better one for it.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: /srv/checkout
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

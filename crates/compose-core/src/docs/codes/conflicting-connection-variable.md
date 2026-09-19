@@ -91,7 +91,7 @@ flow.fix:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Fix the failing test, then say what you changed.
         env:
           PATH: /usr/bin:/bin
@@ -146,7 +146,7 @@ flow.fix:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Fix the failing test, then say what you changed.
         env:
           PATH: /usr/bin:/bin
