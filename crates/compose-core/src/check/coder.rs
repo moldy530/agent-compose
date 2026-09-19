@@ -71,9 +71,10 @@ use crate::ast::common::Literal;
 use crate::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::harness::{
-    Answered, ConnectionFact, Slot, admitted, declared, harnesses_with_a_permission_axis,
-    has_permission_axis, kinds_of, levels_admitting, permission_level, provider_of,
-    reserved_option, slot_of, speaks, variables_read, variables_set,
+    Answered, ConnectionFact, ReservedHit, ReservedSpelling, Slot, admitted, declared,
+    harnesses_with_a_permission_axis, has_permission_axis, kinds_of, levels_admitting,
+    permission_level, provider_of, reserved_reached, slot_of, speaks, variables_read,
+    variables_set,
 };
 use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::{Coder, Node};
@@ -794,14 +795,22 @@ fn model_is_direct(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
 /// because the middle answer is the one that changed: it was a warning and a
 /// silent run-time drop, and a dropped key that would have changed what a run
 /// may do is the class PRD G3 refuses to discover from a run's behaviour.
+///
+/// The reserved question is asked of **both** spellings a row has — the SDK's
+/// name for the option and the grammar's name for the bound it states — because
+/// the second is the one an author reaches for. `settings: { permission_mode: … }`
+/// is the field report's own mistake written in the spelling this grammar
+/// teaches, and keyed on `permissionMode` alone it fell through to the warning
+/// and travelled to an SDK that has no such option
+/// ([`crate::harness::reserved_reached`]).
 fn settings(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
     let harness = coder.harness.value;
     let known = table(harness);
     for setting in &coder.settings {
         let key = setting.key.value.as_str();
         let Some((_, shape)) = known.iter().find(|(name, _)| *name == key) else {
-            if let Some(held) = reserved_option(harness, key) {
-                reserved_setting(ctx, subject, coder, &setting.key, held.answered);
+            if let Some(hit) = reserved_reached(harness, key) {
+                reserved_setting(ctx, subject, coder, &setting.key, hit);
                 continue;
             }
             let names: Vec<&str> = known.iter().map(|(name, _)| *name).collect();
@@ -848,16 +857,29 @@ fn settings(ctx: &mut Ctx<'_>, subject: &str, coder: &Coder) {
 ///
 /// Anchored at the **key** rather than the value, because the value is not the
 /// mistake: no value of this key reaches the SDK.
+///
+/// # Two spellings, one refusal
+///
+/// A row is reachable under the SDK's name for the option and under the
+/// grammar's name for the bound it states, and both are refused
+/// ([`crate::harness::reserved_reached`]). The *repair* is the row's, either
+/// way — it is the same bound and the same key answers it. What the two say
+/// differently is the **first sentence and the last**: an SDK spelling is an
+/// option the adapter owns and would have been dropped, while a grammar
+/// spelling is a key of this block written one level too low, which no option
+/// answers to at all — it would have travelled to the harness and done nothing.
+/// Saying "silently removed" about a key that was never removed would send an
+/// author looking for a subtraction that is not there.
 fn reserved_setting(
     ctx: &mut Ctx<'_>,
     subject: &str,
     coder: &Coder,
     key: &Spanned<String>,
-    answered: Answered,
+    hit: ReservedHit,
 ) {
     let harness = coder.harness.value.as_str();
     let held = key.value.as_str();
-    let (message, repair) = match answered {
+    let (owned, repair) = match hit.held.answered {
         Answered::By(first_class) => (
             format!(
                 "`{held}` of {subject} is a `harness: {harness}` option the generated adapter \
@@ -905,6 +927,25 @@ fn reserved_setting(
             ),
         ),
     };
+    let (message, why_refused) = match hit.spelling {
+        ReservedSpelling::Option => (
+            owned,
+            "Refused rather than dropped, because a key silently removed leaves a run doing \
+             something no line of the composition says"
+                .to_string(),
+        ),
+        ReservedSpelling::Key => (
+            format!(
+                "`{held}` of {subject} is a key of the `coder:` block written inside `settings:`, \
+                 where it states nothing: the bound it names is one the generated adapter owns"
+            ),
+            format!(
+                "Refused rather than passed on, because `harness: {harness}` declares no option \
+                 of this name: the key would travel to the SDK unchanged, do nothing at all, and \
+                 leave a node reading as though the bound were stated"
+            ),
+        ),
+    };
     ctx.push(
         Diagnostic::error(
             DiagnosticCode::ReservedHarnessSetting,
@@ -916,9 +957,7 @@ fn reserved_setting(
             "{repair}. `settings:` is open so that a harness option the vendor ships tomorrow is \
              usable the day it ships — it is not a second way to state this construct's own \
              bounds, and a key here that reached one would be the only one no check covers. \
-             Refused rather than dropped, because a key silently removed leaves a run doing \
-             something no line of the composition says (grammar 8.9, Decision D146, PRD resolved \
-             q60 ruling b)"
+             {why_refused} (grammar 8.9, Decision D146, PRD resolved q60 ruling b)"
         )),
     );
 }

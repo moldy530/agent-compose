@@ -302,7 +302,12 @@ option the generated adapter owns is refused, and the message names the key to
 write instead: `permission_mode:` for a mode, `access:` for a sandbox,
 `allow_tools:` for a tool set, `model:` for the model
 (`agent-compose explain reserved-harness-setting`). A bound belongs where a
-reader sees it.
+reader sees it. The refusal answers the bound's **two** names — the SDK's
+spelling of the option (`permissionMode`) and this grammar's spelling of the
+bound (`permission_mode`) — because the second is the one you have read, and
+written in `settings:` it reaches no option at all: it would travel to an SDK
+that declares nothing of the name and leave the node reading as though the mode
+were stated.
 
 **One run is one journaled effect.** A resume consumes the recorded answer and
 the harness never runs twice; a crash mid-run is an attempt failure and the

@@ -9512,6 +9512,15 @@ error (`widening-permission-mode`) naming the mode, the level and the set (§8.9
 **2. A `settings:` key on the bound harness's reserved list is a compile error**
 (`reserved-harness-setting`) naming the key, the adapter-owned option it would
 reach, and the first-class key that states the same bound where one does —
+**under either of the two names a reserved row has**: the SDK's own spelling of
+the option (`permissionMode`, `cwd`, `sandboxMode`) and this grammar's spelling
+of the bound it states (`permission_mode`, `workspace`, `access`), which is the
+name §8.9's key table teaches and the shape the checked settings are written in.
+The repair is the row's either way; what differs is the reason the key is
+refused rather than let through, because a grammar spelling is not dropped by
+the driver at all — no SDK declares an option of that name, so it would travel
+unchanged, do nothing, and leave the node reading as though the bound were
+stated. The keys that state bounds are —
 `permission_mode:` for the modes, `access:` for the sandbox, `allow_tools:` for
 the toolset, `model:` and the `provider.*` behind it for the connection. **The
 repair depends on whether that key is required**: an optional key
@@ -9591,7 +9600,17 @@ is.
 *What does not move.* `access:` is still the containment statement, still
 defaulted to `workspace_write`, and still the thing `plan` and `visualize` draw;
 the graph document gains the **resolved** mode beside `tools_enforced`, an
-additive field under `docs/graph.md` §9.2 with no `graph_version` bump. A node
+additive field under `docs/graph.md` §9.2 with no `graph_version` bump. **That
+field is the graph document's alone**, which is where PRD resolved q60 ruling
+a's "`plan`/`visualize` show it beside `tools_enforced`" lands once the two
+surfaces are told apart: `visualize` renders that document and `--format json`
+prints it, so both carry the mode, while `plan` carries neither the mode nor
+`tools_enforced` and never has. A `plan` reports a coder node that arrived or
+left as the single field `coder.harness` — *which capability arrived* — and
+`docs/plan.md` §3 is explicit that the node's `workspace:`, `access:` and
+`allow_tools:` are **contents**, which an arrival is not expanded into. A
+resolved mode there would be that rule broken for one field and a bound drawn in
+the one surface whose subject is the diff rather than the composition. A node
 that writes no `permission_mode:` emits the **binding it always emitted**: the
 key is materialized into `src/graph.ts` only where it is stated, so an unchanged
 node's emitted lines are byte for byte what they were, and the mode the run works

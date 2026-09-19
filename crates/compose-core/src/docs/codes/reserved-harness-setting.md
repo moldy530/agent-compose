@@ -44,6 +44,18 @@ behind it. The emitted driver subtracts the same names at run time as well; that
 is defence in depth for an artifact an older release built, not the place the
 rule is made.
 
+**Both spellings of a bound are refused**, and the second is the one most
+authors write. A row has two names — the SDK's name for the option
+(`permissionMode`, `cwd`, `sandboxMode`) and this grammar's name for the bound it
+states (`permission_mode`, `workspace`, `access`) — and the grammar's is the one
+in §8.9's key table, three lines up on the node itself, and in the shape the
+checked settings are written in (`max_turns`, `max_budget_usd`). A key here
+spelling the grammar's name is not dropped by the driver at all: no SDK declares
+an option of that name, so it would travel unchanged, do nothing, and leave the
+node reading as though the bound were stated. The message says so, and names the
+same repair the SDK spelling gets — it is the same bound and the same key
+answers it.
+
 ## A spec that triggers it
 
 ```yaml triggers

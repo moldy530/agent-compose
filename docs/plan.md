@@ -193,7 +193,13 @@ arriving.
 
 Both stay **one field**: what a built-in's bounds are — its `workspace:`, its
 `timeout:` — and what a coder node's are — its `workspace:`, its `access:`, its
-`allow_tools:` — is contents, and an arrival is not expanded into its contents.
+`allow_tools:`, the approval mode its `permission_mode:` states or its `access:`
+derives — is contents, and an arrival is not expanded into its contents. The
+resolved mode in particular is a bound rather than a capability that arrived,
+and the surface that draws it beside `tools_enforced` is the **graph document**
+that `agent-compose visualize` renders and `--format json` prints
+(`docs/graph.md` §5.8, `docs/grammar.md` Decision D146). This report names the
+harness and stops.
 
 `FieldChange` is one field of one subject:
 

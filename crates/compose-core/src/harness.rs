@@ -967,6 +967,39 @@ pub enum Answered {
     Nothing(&'static str),
 }
 
+impl Answered {
+    /// The `coder:` block key this answer names, written without its colon.
+    ///
+    /// The row's **second** lookup name ([`reserved_reached`]): the grammar
+    /// spelling of the bound, which is the one an author reaching for it is
+    /// most likely to write. [`Nothing`](Self::Nothing) names none — the option
+    /// is excluded rather than restated, so there is no key to be written in
+    /// the wrong place.
+    #[must_use]
+    pub const fn key(self) -> Option<&'static str> {
+        match self {
+            Self::By(key) | Self::Already(key) | Self::Through(key, _) => Some(key),
+            Self::Nothing(_) => None,
+        }
+    }
+
+    /// Whether the key this answer names is **already** on the node.
+    ///
+    /// The two repair sentences, one bit apart: an optional key
+    /// ([`By`](Self::By)) is one to write, and a required one
+    /// ([`Already`](Self::Already), [`Through`](Self::Through)) is one already
+    /// three lines up, so the repair is to take the setting off. `None` where
+    /// no key is named at all.
+    #[must_use]
+    pub const fn key_is_required(self) -> Option<bool> {
+        match self {
+            Self::By(_) => Some(false),
+            Self::Already(_) | Self::Through(..) => Some(true),
+            Self::Nothing(_) => None,
+        }
+    }
+}
+
 /// One option the generated adapter owns, and what answers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReservedOption {
@@ -1359,6 +1392,70 @@ pub fn reserved_option(harness: Harness, key: &str) -> Option<&'static ReservedO
     reserved_of(harness)
         .iter()
         .find(|reserved| reserved.option == key)
+}
+
+/// Which of a reserved row's two spellings a `settings:` key was written in.
+///
+/// A row has two names, not one, and PRD resolved q60 ruling b's refusal is
+/// owed to both. The table is keyed on the **SDK's** spelling because that is
+/// the key that would reach the option; the key an author is *taught* is the
+/// grammar's — `permission_mode:`, `access:`, `allow_tools:` — and the field
+/// report the ruling was ratified from is an author looking for a bound in
+/// `settings:`. Keyed on the SDK spelling alone, `settings: { permission_mode: … }`
+/// — the spelling three lines up on the same node, and the shape the curated
+/// tier's own keys are written in — missed the redirection entirely and got the
+/// second tier's warning instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReservedSpelling {
+    /// The SDK's own name for the option (`permissionMode`), which is the key
+    /// that would reach it were `settings:` to travel unchanged.
+    Option,
+    /// The **grammar's** name for the bound (`permission_mode`) — a key this
+    /// block takes one level up, written a level down where no option answers
+    /// to it.
+    Key,
+}
+
+/// A `settings:` key that lands on a reserved row, and how it was spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReservedHit {
+    /// The row the key reaches.
+    pub held: &'static ReservedOption,
+    /// Which of the row's two names the author wrote.
+    pub spelling: ReservedSpelling,
+}
+
+/// The reserved row one `settings:` key reaches, under **either** spelling.
+///
+/// The SDK spelling is answered first and exactly, so a row whose two names
+/// coincide (`model`, `env`) reads as the option it is. Only then is the key
+/// matched against the grammar key each row's [`Answered`] names, which is
+/// where `permission_mode`, `access`, `allow_tools`, `workspace`, `prompt`,
+/// `output` and `timeout` are caught.
+///
+/// Several rows can name one grammar key — every option that puts a tool inside
+/// a run answers to `allow_tools:` — and the row that wins is the first in table
+/// order. That choice is invisible in the diagnostic on purpose: a key written
+/// in the grammar's spelling is refused for naming a **bound**, not for spelling
+/// any one option, so the message quotes the key and the repair and never the
+/// row. [`a_grammar_key_reaches_one_repair_under_every_row_that_names_it`] holds
+/// the part that would otherwise depend on the choice — the rows naming one key
+/// agree about whether that key is already on the node.
+#[must_use]
+pub fn reserved_reached(harness: Harness, key: &str) -> Option<ReservedHit> {
+    if let Some(held) = reserved_option(harness, key) {
+        return Some(ReservedHit {
+            held,
+            spelling: ReservedSpelling::Option,
+        });
+    }
+    reserved_of(harness)
+        .iter()
+        .find(|held| held.answered.key() == Some(key))
+        .map(|held| ReservedHit {
+            held,
+            spelling: ReservedSpelling::Key,
+        })
 }
 
 #[cfg(test)]
@@ -2556,6 +2653,84 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
                  behind",
                 harness.as_str()
             );
+        }
+    }
+
+    /// Every key the block **teaches** reaches the refusal, and not only the
+    /// SDK's own spelling of it (PRD resolved q60 ruling b).
+    ///
+    /// The hole this closes is the one the ruling exists to close, one spelling
+    /// over. An author reaching for a bound in `settings:` writes the name they
+    /// have read — `permission_mode`, which is also the shape the curated tier's
+    /// own keys are written in (`max_turns`, `max_budget_usd`) — while the table
+    /// is keyed on `permissionMode`. Missed, that key drew the second tier's
+    /// warning, travelled to an SDK that declares no option of the name, did
+    /// nothing, and left the node reading as though the mode were stated: the
+    /// field report's own sequence, with the redirection three lines away.
+    #[test]
+    fn a_bound_is_refused_under_the_grammars_spelling_as_well_as_the_sdks() {
+        for row in RESERVED {
+            let harness = row.harness;
+            for held in row.options {
+                let Some(key) = held.answered.key() else {
+                    continue;
+                };
+                let hit = reserved_reached(harness, key).unwrap_or_else(|| {
+                    panic!(
+                        "a `harness: {}` `settings:` key spelling `{key}` — this grammar's own \
+                         name for the bound `{}` reaches — is not refused, so the redirection PRD \
+                         resolved q60 ruling b ships has a hole at the one spelling the grammar \
+                         teaches",
+                        harness.as_str(),
+                        held.option
+                    )
+                });
+                assert_eq!(
+                    hit.held.answered.key(),
+                    Some(key),
+                    "`{key}` under `harness: {}` reaches a row answered by a different key, so \
+                     the refusal would name a repair for a bound the author did not write",
+                    harness.as_str()
+                );
+            }
+        }
+    }
+
+    /// …and a key several rows name reaches **one** repair, whichever row wins.
+    ///
+    /// [`reserved_reached`] resolves a grammar spelling to the first row in
+    /// table order that names it, and a dozen options answer to `allow_tools:`.
+    /// The diagnostic never quotes the row — it is the *key* that is refused,
+    /// for naming a bound rather than for spelling an option — but it does quote
+    /// the repair, and the repair turns on one bit: whether the key is already
+    /// on the node. So the rows naming one key have to agree about that bit, or
+    /// the sentence an author reads would turn on an alphabetical accident in a
+    /// table they cannot see.
+    #[test]
+    fn a_grammar_key_reaches_one_repair_under_every_row_that_names_it() {
+        for row in RESERVED {
+            let mut sentence: std::collections::BTreeMap<&str, (bool, &str)> =
+                std::collections::BTreeMap::new();
+            for held in row.options {
+                let (Some(key), Some(required)) =
+                    (held.answered.key(), held.answered.key_is_required())
+                else {
+                    continue;
+                };
+                if let Some((first, option)) = sentence.insert(key, (required, held.option)) {
+                    assert_eq!(
+                        first,
+                        required,
+                        "`harness: {}` answers both `{option}` and `{}` with `{key}:`, and the \
+                         two disagree about whether that key is already on the node — so a \
+                         `settings:` key spelling `{key}` would be told to write a line it \
+                         already has, or to delete the only line stating the bound, depending on \
+                         which row the table happens to list first",
+                        row.harness.as_str(),
+                        held.option
+                    );
+                }
+            }
         }
     }
 }
