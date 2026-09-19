@@ -17,10 +17,21 @@ it can happen:
   can have a checkout of its own. A node whose expression reads nothing from that
   scope resolves to one directory for the whole fan-out, so `max_concurrency: 8`
   is eight agents in one tree. That is an **error**.
-* **Two coder nodes on concurrent branches.** Two edges of one fork that are not
+* **Two harness runs on concurrent branches.** Two edges of one fork that are not
   provably exclusive can both fire, so the branches they start run side by side
-  (grammar §7.6.1) — and if both nodes write the same `workspace:`, both runs are
-  in one directory. That is a **warning**, and the difference is stated below.
+  (grammar §7.6.1) — and if both runs write the same `workspace:`, both are in one
+  directory. That is a **warning**, and the difference is stated below.
+
+  A branch is concurrent with another whatever construct it holds, so this is
+  read over the runs a **step** contains rather than over the coder nodes a flow
+  declares: a `coder:` node, and every coder node inside the instance a `flow:`
+  node starts. One subflow instantiated twice on two branches is two runs of one
+  coder node, and factoring work into a reusable flow reads the same as writing
+  the nodes out. Two instances are not one scope, though, so a run reached
+  through a `flow:` node is compared only where its expression reads **nothing**
+  — `workspace: "input.worktree"` in a flow instantiated twice is two
+  directories exactly when the two instantiations bind two paths, which is the
+  repair rather than the collision.
 
 ## A spec that triggers it
 
@@ -226,7 +237,7 @@ flow.main:
 
 ## Why the second site is a warning
 
-Two coder nodes on concurrent branches whose `workspace:` values are written
+Two runs on concurrent branches whose `workspace:` values are written
 identically get a warning naming both, not a refusal. The rule the compiler
 would have to decide is "do these two resolve to one directory", and that is not
 a compile fact: a `${ENV}` reference resolves on the machine that runs the graph,

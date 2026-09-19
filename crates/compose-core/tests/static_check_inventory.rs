@@ -563,7 +563,7 @@ const GRAMMAR: &[Check] = &[
         // composition and refused, and the concurrent-pair half is decided from
         // two written values and warned about, since equality of `${ENV}`-bearing
         // values is a launch fact.
-        rule: "two harness runs that can be in flight at once are not contained by one directory: a `map`-dispatched `coder:` node's `workspace:` reads the per-dispatch scope or the map is serial, and two coder nodes on concurrent branches do not write one workspace (8.9, 8.6, D147)",
+        rule: "two harness runs that can be in flight at once are not contained by one directory: a `map`-dispatched `coder:` node's `workspace:` reads the per-dispatch scope or the map is serial, and two runs concurrent branches contain — a `coder:` node, or one inside a flow a `flow:` node instantiates — do not write one workspace (8.9, 8.6, 7.6.1, D147)",
         pass: "check/coder.rs, over check/reach.rs and check/convergence.rs",
         codes: &["shared-workspace"],
         evidence: Evidence::Fixture,

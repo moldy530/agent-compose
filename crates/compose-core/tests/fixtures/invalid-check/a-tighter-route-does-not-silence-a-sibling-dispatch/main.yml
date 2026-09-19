@@ -1,0 +1,103 @@
+# rule: a routed map reaching one flow from several routes is read at the
+# rule: loosest of their bounds, not the first declared (grammar 8.6 rule 1, D147)
+# code: shared-workspace
+# message: `flow.fix` node `implement` is dispatched by the map `work` of `flow.main` with `max_concurrency: 4`, and its `workspace:` is one directory for every dispatch
+# at: main.yml:62:20
+# label: main.yml:85:7 the fan-out is issued here
+#
+# The dispatch half of PRD resolved q61 ruling b under the one map shape that
+# names a flow **twice**. Both routes dispatch `flow.fix` with the same
+# bindings, so the two sites are one site as far as every rule stated over them
+# is concerned — except for the bound, which is the one part of a dispatch that
+# is not a property of the flow it names: `slow:` is declared first and tightens
+# itself to one run at a time, and `fast:` takes the map's four.
+#
+# Reading the first route's bound and dropping the second's is how a
+# concurrent fan-out into one directory validates clean, which is the field
+# report this ruling was ratified from arriving through a different door. So
+# the refusal names four, and it names four whichever order the two routes are
+# written in — `max_concurrency: 1` on one route is a statement about that
+# route and about nothing else (grammar 8.6 rule 1, Decision D28).
+#
+# Everything else about the composition is deliberately clean: the item carries
+# no directory, the coder node reads none, and the only thing wrong is the one
+# thing the corpus is pinning.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: Sort the failing tests into the ones worth a long run and the ones worth a short one.
+  output:
+    tasks:
+      type: array
+      max_items: 10
+      items:
+        discriminator: kind
+        variants:
+          slow: { goal: { type: string } }
+          fast: { goal: { type: string } }
+state:
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 10
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  outputs:
+    summaries:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    work:
+      map:
+        over: plan.output.tasks
+        as: step
+        route_by: kind
+        routes:
+          slow:
+            node: flow.fix
+            max_concurrency: 1
+            input: { goal: "step.goal" }
+            writes: { summary: summaries }
+          fast:
+            node: flow.fix
+            input: { goal: "step.goal" }
+            writes: { summary: summaries }
+        max_concurrency: 4
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }

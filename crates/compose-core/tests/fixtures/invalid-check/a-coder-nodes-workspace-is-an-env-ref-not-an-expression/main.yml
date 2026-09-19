@@ -1,0 +1,43 @@
+# rule: a `coder:` node's `workspace:` written as a whole-value `${ENV}` path is
+# rule: answered with the same rewrite (grammar 4.1, 4.3, 8.9, D147, PRD G3)
+# code: invalid-expression
+# message: `workspace: ${REPO_ROOT}` of `flow.main` node `build` is a path where an expression is written
+# at: main.yml:35:20
+# help: `workspace:` is evaluated in this node's input scope at each dispatch, so a path has to be written as one: `workspace: "'${REPO_ROOT}'"` is that same directory as a CEL string, and the reference still resolves from the environment. What the expression buys is the dispatch — `workspace: "'${REPO_ROOT}/' + input.branch"` gives a map item its own checkout, and `workspace: fresh` takes one the runtime provisions per dispatch (grammar 4.1, 8.9, Decision D147, PRD resolved q61 ruling a)
+#
+# The other half of the migration, and the corpus holds both because the two
+# used to get very different answers: this one a message naming the rewrite and
+# its sibling a parse dump. `${REPO_ROOT}` is the spelling almost every
+# composition in this repository had before resolved q61 — grammar 4.3 class 2,
+# resolved at process start — and after it the key is an expression that
+# reference belongs *inside*, quotes and all.
+#
+# The one sentence this message carries that its sibling does not is the one
+# about the environment: the rewrite keeps the reference, so an author is told
+# the machine-dependent root is still writable and has not been taken away.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        prompt: Do the work.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

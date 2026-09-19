@@ -9772,19 +9772,36 @@ for the filesystem, and it is refused at the strength each half can be decided
 with. A coder node a `map` dispatches whose `workspace:` does not read the
 per-dispatch scope — the dispatch's own `input.<field>`, or
 `execution.item_index` — is a compile error (`shared-workspace`) **unless** the
-map declares `max_concurrency: 1`, and the message names both repairs. Two coder
-nodes on statically-concurrent branches (§7.6.1) whose `workspace:` values are
-written identically draw a **warning** naming both nodes. An error is withheld
-there on purpose: equality of `${ENV}`-bearing values is a launch fact, not a
-compile fact, so a refusal would be this compiler claiming something it cannot
-know, and silence would hide the half it can.
+map declares `max_concurrency: 1`, and the message names both repairs. Two
+harness runs that statically-concurrent branches (§7.6.1) can have in flight at
+once whose `workspace:` values are written identically draw a **warning** naming
+both. An error is withheld there on purpose: equality of `${ENV}`-bearing values
+is a launch fact, not a compile fact, so a refusal would be this compiler
+claiming something it cannot know, and silence would hide the half it can.
+
+*Two runs, not two coder nodes.* A branch is concurrent with another whatever
+construct it holds, so the warning is stated over the runs a **step** contains:
+a `coder:` node of the flow, and every coder node inside the instance a `flow:`
+node starts, transitively. One subflow instantiated twice on two branches is two
+runs of one coder node, and an author who factors work into a reusable flow gets
+the same reading as one who wrote the nodes out. Two *instances* are not one
+scope, though (§10.1), so a run reached through a `flow:` node is compared only
+where its expression reads **nothing** — no `input`, no `state`, no `execution`.
+`workspace: "input.worktree"` in a flow instantiated twice is two directories
+exactly when the two instantiations bind two paths, which is the repair this
+ruling exists for, and warning about it would be warning about the fix.
 
 The dispatch half is decided over the same relation grammar §11.4's store keys
 are ([D83](#d83-a-map-written-store-key-is-derived-from-the-item)): frames of a
 flow instance inside a fan-out, with the item-derivation of each of its input
 fields, carried inward through `flow:` nodes and stopping at an agent's `flow.*`
 tool — because a model decides whether and when to call one of those, and no
-static rule can put that call inside a dispatch.
+static rule can put that call inside a dispatch. Where a routed map names one
+flow from **several** routes ([D28](#d28-max_concurrency-is-required-on-the-map-node-routes-may-only-tighten-it)),
+the bound read is the loosest of theirs: a route tightening its own
+`max_concurrency` says nothing about its sibling's, and reading the first would
+let one serial route silence the refusal for every other route into the same
+directory.
 
 **3. `workspace: fresh` is the batteries-included spelling.** The runtime
 provisions a per-dispatch directory under the execution's scratch, named by §9.4

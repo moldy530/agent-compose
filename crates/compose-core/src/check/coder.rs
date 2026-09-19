@@ -69,7 +69,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ast::common::{Cel, Literal};
+use crate::ast::common::{Cel, Interpolated, Literal};
 use crate::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
 use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
@@ -184,39 +184,18 @@ pub(crate) fn coder_node(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, node: &Node, coder:
 /// `workspace: fresh` is checked by nothing here. It is a word rather than an
 /// expression, and the directory it names is the runtime's to provision
 /// (ruling c).
+///
+/// One thing is read before the front-end runs, and it is the **migration**:
+/// a value that is a path rather than an expression is what every composition
+/// written before resolved q61 holds, and it is answered with the rewrite
+/// rather than with a parse error naming a character
+/// ([`written_as_a_path`], PRD G3).
 fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
     let Some(expression) = coder.workspace.value.expression() else {
         return;
     };
-    // The one spelling every composition written before resolved q61 has, and
-    // the one the CEL front-end could only report as a syntax error: an
-    // env-ref **value** — `workspace: ${REPO_ROOT}` — is not an expression, it
-    // is the path that expression would have to produce. Answered with the
-    // repair rather than with a parse error naming a character, because a
-    // message an author cannot act on is the failure mode resolved q22 is
-    // about (PRD G3).
-    if let [name] = expression.references.as_slice()
-        && expression.as_str() == format!("${{{name}}}")
-    {
-        ctx.push(
-            Diagnostic::error(
-                DiagnosticCode::InvalidExpression,
-                coder.workspace.span.clone(),
-                format!(
-                    "`workspace: ${{{name}}}` of {subject} is a path where an expression \
-                     is written"
-                ),
-            )
-            .with_help(format!(
-                "`workspace:` is evaluated in this node's input scope at each dispatch, so a \
-                 path has to be written as one: `workspace: \"'${{{name}}}'\"` is that same \
-                 directory as a CEL string, and the reference still resolves from the \
-                 environment. What the expression buys is the dispatch — \
-                 `workspace: \"'${{{name}}}/' + input.branch\"` gives a map item its own \
-                 checkout, and `workspace: fresh` takes one the runtime provisions per \
-                 dispatch (grammar 4.1, 8.9, Decision D147, PRD resolved q61 ruling a)"
-            )),
-        );
+    if written_as_a_path(expression.as_str()) {
+        a_path_where_an_expression_goes(ctx, subject, coder, expression);
         return;
     }
     let written = Spanned::new(Cel::new(expression.as_str()), coder.workspace.span.clone());
@@ -229,6 +208,83 @@ fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
         &Type::String,
         &format!("`workspace:` of {subject}"),
     );
+}
+
+/// Whether a `workspace:` value is a **path** rather than an expression — the
+/// two spellings every composition written before PRD resolved q61 has.
+///
+/// Decided on the first character, and the set is the one CEL cannot start an
+/// expression with: `/` and `~` open an absolute path, `$` opens an env
+/// reference (`${REPO_ROOT}`, `${REPO_ROOT}/sub`), `\` opens a Windows one, and
+/// a `.` that starts no number opens a relative path. Nothing in that set is
+/// the beginning of any expression this grammar admits, so a value holding one
+/// is a path with certainty rather than by guess — which is what lets the
+/// refusal below say so and name the rewrite.
+///
+/// **Both migration spellings land here**, and that is the point: an author
+/// upgrading `workspace: ${REPO_ROOT}` and one upgrading `workspace: /srv/repo`
+/// made the same mistake and get the same answer. A value that is not
+/// path-shaped and still does not parse is a *malformed expression* rather than
+/// a path, and the CEL front-end's own message — which names the character it
+/// stopped at — is the better one for it.
+fn written_as_a_path(value: &str) -> bool {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some('/' | '~' | '$' | '\\') => true,
+        Some('.') => !characters.next().is_some_and(|next| next.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+/// The refusal [`written_as_a_path`] names, with the rewrite in it (PRD
+/// resolved q61 ruling a, G3).
+///
+/// The CEL front-end could only report either spelling as a syntax error naming
+/// a character, and a message an author cannot act on is the failure mode
+/// resolved q22 is about. So the three spellings the key now has are named
+/// instead — the same directory as a CEL string, the per-dispatch form the
+/// ruling exists for, and `fresh` — and the first is built out of the path the
+/// author already wrote, escaped for the literal it is being put inside.
+fn a_path_where_an_expression_goes(
+    ctx: &mut Ctx<'_>,
+    subject: &str,
+    coder: &Coder,
+    expression: &Interpolated,
+) {
+    let path = expression.as_str();
+    let quoted = format!("'{}'", cel_literal(path));
+    let per_item = format!("'{}/'", cel_literal(path.trim_end_matches('/')));
+    // Only a value that *has* references can carry one through the rewrite, and
+    // a sentence about the environment on a value with none would be noise.
+    let environment = if expression.references.is_empty() {
+        String::new()
+    } else {
+        ", and the reference still resolves from the environment".to_string()
+    };
+    ctx.push(
+        Diagnostic::error(
+            DiagnosticCode::InvalidExpression,
+            coder.workspace.span.clone(),
+            format!("`workspace: {path}` of {subject} is a path where an expression is written"),
+        )
+        .with_help(format!(
+            "`workspace:` is evaluated in this node's input scope at each dispatch, so a path \
+             has to be written as one: `workspace: \"{quoted}\"` is that same directory as a \
+             CEL string{environment}. What the expression buys is the dispatch — \
+             `workspace: \"{per_item} + input.branch\"` gives a map item its own checkout, and \
+             `workspace: fresh` takes one the runtime provisions per dispatch (grammar 4.1, \
+             8.9, Decision D147, PRD resolved q61 ruling a)"
+        )),
+    );
+}
+
+/// One string as the body of a single-quoted CEL literal.
+///
+/// A path holding a quote or a backslash is a path, and a rewrite this compiler
+/// suggests has to be one an author can paste: `'/srv/o\'brien'` is that
+/// directory and `'/srv/o'brien'` is a syntax error with our name on it.
+fn cel_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 /// The approval mode the run's loop works under (PRD resolved q60 ruling a,
@@ -1184,7 +1240,8 @@ fn check_shape(
 /// `flow.*` tool**, because a model decides whether and when to call one and no
 /// static rule can put that call inside a dispatch. A coder node reached only
 /// that way is outside this rule, exactly as a store node reached only that way
-/// is outside grammar 11.4's.
+/// is outside grammar 11.4's — and outside
+/// [`concurrent_workspaces`]'s as well, which draws the same boundary.
 ///
 /// And a **nested** map re-roots the computation at its own item, which is the
 /// property that makes a map's frames the same wherever the map's own flow is
@@ -1275,83 +1332,190 @@ pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
 /// bury it. The pair that names it is the one whose nodes come first in
 /// declaration order; every pair is still *decided*, because a pair a later one
 /// repeats is still what proves the collision (PRD G3).
+///
+/// **A concurrent step is a `flow:` node as well as a coder node**, which is
+/// what [`reach::coders_within`] is for. An author who splits work across two
+/// coder nodes and one who factors the same work into a subflow and instantiates
+/// it twice have written the same graph — two harness runs in flight at once —
+/// and the second used to get silence. So the relation is stated over the runs a
+/// step *contains* rather than over the coder nodes a flow declares, and one
+/// coder node instantiated twice is two runs.
+///
+/// Two instances are not one scope, though, and the rule says so: a run reached
+/// through a `flow:` node is compared only where its expression reads **nothing**
+/// ([`reach::reads_nothing`]). `workspace: "input.worktree"` in a subflow
+/// instantiated twice is two directories exactly when the two instantiations bind
+/// two paths — which is the repair this ruling exists for — and warning about it
+/// would be warning about the fix. A closed expression is where that difference
+/// cannot arise, and it is also the shape the field report had.
 pub(crate) fn concurrent_workspaces(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, graph: &Graph<'_>) {
-    let coders: Vec<usize> = (0..graph.nodes().len())
-        .filter(|at| {
-            matches!(&graph.node(*at).kind,
-                crate::ir::flow::NodeKind::Coder { coder }
-                    if coder.workspace.value.expression().is_some())
-        })
+    let runs: Vec<Vec<Run>> = (0..graph.nodes().len())
+        .map(|at| runs_of(ctx, cx, graph, at))
         .collect();
-    let mut collided: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for (one, other) in super::convergence::concurrent_among(ctx, graph, &coders) {
-        let (Some(first), Some(second)) = (coder_of(graph.node(one)), coder_of(graph.node(other)))
-        else {
-            continue;
-        };
-        if first.workspace.value != second.workspace.value {
-            continue;
-        }
-        let written = first.workspace.value.as_str().to_string();
-        match collided.get(&written) {
-            Some(held) if *held <= (one, other) => {}
-            _ => {
-                collided.insert(written, (one, other));
+    let of_interest: Vec<usize> = (0..graph.nodes().len())
+        .filter(|at| !runs[*at].is_empty())
+        .collect();
+    // The chosen pair per directory, ordered by the two steps and then by the
+    // two runs inside them, so which repetition is reported is a property of
+    // the composition rather than of this loop.
+    let mut collided: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
+    for (one, other) in super::convergence::concurrent_among(ctx, graph, &of_interest) {
+        for (first, run) in runs[one].iter().enumerate() {
+            for (second, against) in runs[other].iter().enumerate() {
+                if run.written != against.written {
+                    continue;
+                }
+                // Two runs of one flow's own graph share that flow's scope;
+                // anything reached through a `flow:` node does not, so there
+                // the expressions have to read nothing to be one directory.
+                let one_scope = run.local && against.local;
+                let closed = run.closed && against.closed;
+                if !one_scope && !closed {
+                    continue;
+                }
+                let at = (one, other, first, second);
+                match collided.get(&run.written) {
+                    Some(held) if *held <= at => {}
+                    _ => {
+                        collided.insert(run.written.clone(), at);
+                    }
+                }
             }
         }
     }
-    let reported: Vec<(String, String, Span, Span, String)> = collided
-        .into_iter()
-        .map(|(expression, (one, other))| {
-            let hold = |at: usize| {
-                coder_of(graph.node(at))
-                    .expect("a collided node is a coder node")
-                    .workspace
-                    .span
-                    .clone()
-            };
-            (
-                graph.id(one).to_string(),
-                graph.id(other).to_string(),
-                hold(one),
-                hold(other),
-                expression,
+    for (expression, (one, other, first, second)) in collided {
+        let run = &runs[one][first];
+        let against = &runs[other][second];
+        let local = run.local && against.local;
+        let message = if local {
+            format!(
+                "nodes `{}` and `{}` of `{}` can run concurrently and their `workspace:` is \
+                 written the same way",
+                graph.id(one),
+                graph.id(other),
+                cx.address
             )
-        })
-        .collect();
-    for (one, other, first, second, expression) in reported {
-        ctx.push(
-            Diagnostic::warning(
-                DiagnosticCode::SharedWorkspace,
-                second,
-                format!(
-                    "nodes `{one}` and `{other}` of `{}` can run concurrently and their \
-                     `workspace:` is written the same way",
-                    cx.address
-                ),
+        } else {
+            format!(
+                "{} and {} can run concurrently and their `workspace:` is written the same way",
+                run.subject, against.subject
             )
-            .with_label(first, "the other run is contained here")
-            .with_help(format!(
-                "two edges of one fork that are not provably exclusive can both fire, so the \
+        };
+        // What the two runs share, said for the shape they are: one scope where
+        // both are this flow's own nodes, and no scope at all where one is
+        // inside an instance — which is the condition that admitted the pair.
+        let shared = if local {
+            format!(
+                "`{expression}` is one expression over one scope, so both runs resolve it to one path"
+            )
+        } else {
+            format!(
+                "`{expression}` reads nothing from either run's own scope, so it is one path \
+                 however the instances are bound"
+            )
+        };
+        // …and the repair the same way: a run inside an instance has a place to
+        // take a directory *from* that a node of this flow's own graph has not.
+        let repair = if local {
+            "Give one of them a directory of its own".to_string()
+        } else {
+            "Give one of them a directory of its own: carry it in on the instantiation's \
+             `input:` and read it here (`workspace: \"input.worktree\"`)"
+                .to_string()
+        };
+        let mut diagnostic = Diagnostic::warning(
+            DiagnosticCode::SharedWorkspace,
+            against.span.clone(),
+            message,
+        );
+        // One `workspace:` instantiated twice is one span, and a second label
+        // on it would say the same thing twice about the same line. The two
+        // **steps** are always two, so a pair the node ids cannot tell apart is
+        // told apart by where each run is reached.
+        if run.span != against.span {
+            diagnostic = diagnostic.with_label(run.span.clone(), "the other run is contained here");
+        }
+        if !local {
+            diagnostic = diagnostic
+                .with_label(run.step.clone(), "one of the two runs is inside this step")
+                .with_label(against.step.clone(), "and the other is inside this one");
+        }
+        ctx.push(diagnostic.with_help(format!(
+            "two edges of one fork that are not provably exclusive can both fire, so the \
                  branches they start are concurrent — and two harness runs inside one directory \
-                 edit each other's files. `{expression}` is one expression over one scope, so \
-                 both runs resolve it to one path. Give one of them a directory of its own, or \
-                 write `workspace: fresh` on each for a directory the runtime provisions per \
+                 edit each other's files. {shared}. {repair}, or write \
+                 `workspace: fresh` on each for a directory the runtime provisions per \
                  dispatch. A **warning** rather than a refusal because equality here is a \
                  launch fact: a value bearing an `${{ENV}}` reference resolves on the machine \
                  that runs it, so two values this compiler reads as different may still be one \
                  directory, and two it reads as the same is the half it can see (grammar 7.6.1, \
                  8.9, Decision D147, PRD resolved q61 ruling b)"
-            )),
-        );
+        )));
     }
 }
 
-/// The `coder:` block of a node, where the node is one.
-fn coder_of(node: &Node) -> Option<&Coder> {
+/// One harness run a step of this flow's graph can contain
+/// ([`concurrent_workspaces`]).
+struct Run {
+    /// The `workspace:` expression as written.
+    written: String,
+    /// Where it is written, which is the site a diagnostic anchors at.
+    span: Span,
+    /// The step of *this* flow's graph the run is inside: the coder node
+    /// itself, or the `flow:` node that starts the instance holding it. Two
+    /// runs of one pair always have two of these, which one `workspace:`
+    /// instantiated twice does not.
+    step: Span,
+    /// How a diagnostic names the run, for a pair this flow's own node ids
+    /// cannot name on their own.
+    subject: String,
+    /// Whether the expression reads no root at all ([`reach::reads_nothing`]).
+    closed: bool,
+    /// Whether this is a coder node of *this* flow, as against one inside an
+    /// instance a `flow:` node starts.
+    local: bool,
+}
+
+/// The runs one step of this flow's graph contains, in declaration order.
+fn runs_of(ctx: &Ctx<'_>, cx: &FlowCx<'_>, graph: &Graph<'_>, at: usize) -> Vec<Run> {
+    let node = graph.node(at);
     match &node.kind {
-        crate::ir::flow::NodeKind::Coder { coder } => Some(coder),
-        _ => None,
+        crate::ir::flow::NodeKind::Coder { coder } => coder
+            .workspace
+            .value
+            .expression()
+            .map(|expression| Run {
+                written: expression.as_str().to_string(),
+                span: coder.workspace.span.clone(),
+                step: node.span.clone(),
+                subject: format!("`{}` node `{}`", cx.address, graph.id(at)),
+                closed: reach::reads_nothing(expression.as_str()),
+                local: true,
+            })
+            .into_iter()
+            .collect(),
+        crate::ir::flow::NodeKind::Flow { flow, .. } => {
+            reach::coders_within(ctx, &flow.value.to_string())
+                .into_iter()
+                .filter_map(|held| {
+                    let expression = held.coder.workspace.value.expression()?;
+                    Some(Run {
+                        written: expression.as_str().to_string(),
+                        span: held.coder.workspace.span.clone(),
+                        step: node.span.clone(),
+                        subject: format!(
+                            "`{}` node `{}` instantiated by `{}`",
+                            held.address,
+                            held.node.id.value,
+                            graph.id(at)
+                        ),
+                        closed: reach::reads_nothing(expression.as_str()),
+                        local: false,
+                    })
+                })
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 

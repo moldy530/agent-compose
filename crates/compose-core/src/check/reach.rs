@@ -59,7 +59,7 @@ use crate::diag::{Span, Spanned};
 use crate::ir::Ir;
 use crate::ir::binding::NodeInput;
 use crate::ir::definition::{Agent, DefinitionBody};
-use crate::ir::flow::{Flow, Map, MapDispatch, NodeKind};
+use crate::ir::flow::{Coder, Flow, Map, MapDispatch, Node, NodeKind};
 
 use super::Ctx;
 
@@ -369,6 +369,64 @@ pub(crate) fn targets(dispatch: &MapDispatch) -> Vec<&Spanned<Address>> {
     }
 }
 
+/// One `coder:` node a flow contains, with the flow that declares it.
+pub(crate) struct Contained<'a> {
+    /// The address of the flow the node is declared in — this flow, or one
+    /// below it.
+    pub(crate) address: String,
+    /// The node itself.
+    pub(crate) node: &'a Node,
+    /// Its `coder:` block.
+    pub(crate) coder: &'a Coder,
+}
+
+/// Every `coder:` node one flow **contains**: its own, and those of the flows
+/// its `flow:` nodes instantiate, transitively.
+///
+/// This is the containment a *step* of the enclosing graph has. A `flow:` node
+/// is one node of its flow's graph (grammar 7.6.1) and every harness run inside
+/// the instance it starts happens while that node is in flight, which is what
+/// the concurrent half of PRD resolved q61 ruling b is stated over: two harness
+/// runs that can be in flight at once.
+///
+/// **The boundary is the `flow:` node and nothing else.** A `map` is not walked
+/// — its dispatches are [`frames`]' relation, where the per-dispatch scope is
+/// carried and the *refusal* is decided — and neither is an agent's `flow.*`
+/// tool, because a model decides whether and when to call one and no static
+/// rule can put that call beside another node. Both are the boundaries
+/// [`frames`] already draws, drawn here again rather than differently.
+pub(crate) fn coders_within<'a>(ctx: &Ctx<'a>, address: &str) -> Vec<Contained<'a>> {
+    let mut found = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![address.to_string()];
+    while let Some(address) = pending.pop() {
+        if !seen.insert(address.clone()) {
+            continue;
+        }
+        let Some(flow) = ctx.flow_named(&address) else {
+            continue;
+        };
+        let mut nested = Vec::new();
+        for node in &flow.nodes {
+            match &node.kind {
+                NodeKind::Coder { coder } => found.push(Contained {
+                    address: address.clone(),
+                    node,
+                    coder,
+                }),
+                NodeKind::Flow { flow, .. } => nested.push(flow.value.to_string()),
+                _ => {}
+            }
+        }
+        // Reversed onto the stack, so the walk is the depth-first,
+        // declaration-order one a recursive one would make and the order a
+        // diagnostic picks a run out of is a property of the composition.
+        nested.reverse();
+        pending.extend(nested);
+    }
+    found
+}
+
 /// One flow instance running inside a fan-out.
 pub(crate) struct Frame<'a> {
     /// The dispatched flow's address.
@@ -399,6 +457,10 @@ pub(crate) struct Frame<'a> {
     /// once per dispatch of the outermost, so the bound that decides whether
     /// two of *it* overlap is the dispatch's (grammar 8.6 rule 1, PRD resolved
     /// q61 ruling b).
+    ///
+    /// Where one map reaches one flow from **several** routes, this is the
+    /// loosest of their bounds rather than the first one walked: see
+    /// [`push_frame`], which merges it.
     pub(crate) concurrency: i64,
 }
 
@@ -467,6 +529,19 @@ enum Step<'a> {
 /// once per repetition. The dedup reads the derivation itself and not
 /// [`Frame::bound_at`], which only says where the same answer was written.
 ///
+/// **[`Frame::concurrency`] is merged rather than deduplicated**, because it is
+/// the one part of a frame that is not a property of the site: a routed map may
+/// name one flow from two routes (grammar 8.6 rule 1), and a route that
+/// tightens its own `max_concurrency:` says nothing whatever about its
+/// sibling's. Collapsing the two frames onto the first route's bound would let
+/// `max_concurrency: 1` on any one route silence [the shared-workspace
+/// refusal](super::coder::dispatched_workspaces) for every other route onto the
+/// same flow — a concurrent fan-out into one directory validating clean, which
+/// is exactly what PRD resolved q61 ruling b makes unwritable. So a repeat
+/// raises the recorded bound to the **loosest** of the two and, when it really
+/// raised it, goes on to walk the nested flows again: those were recorded with
+/// the tighter bound and carry it inward.
+///
 /// The worklist is a stack and each frame's nested flows go onto it in reverse,
 /// so the order frames are recorded in is the depth-first, declaration-order one
 /// a recursive walk would produce — which is what makes *which* repetition the
@@ -486,12 +561,19 @@ fn push_frame<'a>(
                 continue;
             }
         };
-        if frames.iter().any(|recorded| {
+        let repeat = frames.iter().position(|recorded| {
             recorded.address == frame.address
                 && recorded.dispatcher == frame.dispatcher
                 && recorded.derived == frame.derived
-        }) {
-            continue;
+        });
+        if let Some(at) = repeat {
+            // The same site with a bound no looser than the one already
+            // recorded is the same site said twice, and there is nothing left
+            // to carry inward.
+            if frames[at].concurrency >= frame.concurrency {
+                continue;
+            }
+            frames[at].concurrency = frame.concurrency;
         }
         // A flow that reaches itself is refused by the graph pass's recursion
         // check; guarding the path here keeps this traversal finite meanwhile.
@@ -504,7 +586,9 @@ fn push_frame<'a>(
         let dispatcher = frame.dispatcher.clone();
         let span = frame.span.clone();
         let concurrency = frame.concurrency;
-        frames.push(frame);
+        if repeat.is_none() {
+            frames.push(frame);
+        }
         pending.push(Step::Leave(address));
         let mut nested_frames = Vec::new();
         for node in &flow.nodes {
@@ -588,6 +672,22 @@ fn seed(
         derived.insert(name, value);
     }
     (derived, bound_at)
+}
+
+/// Whether one expression reads **no root at all** — no `input`, no `state`,
+/// no `execution` — so that every scope it is ever evaluated in answers it the
+/// same way.
+///
+/// The property that makes two *instances* comparable. Two coder nodes of one
+/// flow share one scope, so two values written identically are one directory
+/// however they read it; two instances of a flow do not (grammar 10.1), and
+/// `workspace: "input.worktree"` is the repair the ruling is about rather than
+/// a collision. A closed expression is the case where the difference cannot
+/// matter (PRD resolved q61 ruling b).
+pub(crate) fn reads_nothing(source: &str) -> bool {
+    crate::cel::analyze(source, &Scope::default())
+        .reads
+        .is_empty()
 }
 
 /// Whether one expression is item-derived: it references the item binding, the
