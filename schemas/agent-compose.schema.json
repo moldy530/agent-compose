@@ -1221,6 +1221,10 @@
               "description": "The containment preset, mapped down to each harness's own primitive - a codex sandbox, an Agent SDK permission mode. Absent means `workspace_write` (Decision D138).",
               "enum": ["read_only", "workspace_write", "full_access"]
             },
+            "permission_mode": {
+              "description": "The approval axis INSIDE that containment: how the harness's own loop approves a call. The pinned Agent SDK's six modes, in its own spelling - the one vendor vocabulary this grammar takes, because a translation of somebody else's constants could be verified against nothing. `cc` only: `codex` contains a run with the sandbox `access` selects and its per-call approval tier belongs to an app server this release does not adopt, so the key is refused there (`unsupported-permission-mode`). Absent means the mode `access` derives - read_only plan, workspace_write acceptEdits, full_access bypassPermissions. WHICH modes a level admits is the widening bound and needs the node's `access` beside the value, so `validate` decides it (`widening-permission-mode`): read_only admits plan; workspace_write admits default, acceptEdits, dontAsk and auto; full_access admits all six (Decision D146).",
+              "enum": ["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]
+            },
             "prompt": {
               "description": "The run's instructions. Literal text with no templating, exactly as an agent's prompt is (Decision D13).",
               "type": "string",
@@ -1252,7 +1256,7 @@
               "type": "boolean"
             },
             "settings": {
-              "description": "Harness config, in the vendor's own vocabulary. The second open object in the logical layer: the compiler checks the keys its per-harness curated table knows and carries anything else with a warning, so an option the vendor ships tomorrow is usable the day it ships (Decision D140, amending D40).",
+              "description": "Harness config, in the vendor's own vocabulary. The second open object in the logical layer: the compiler checks the keys its per-harness curated table knows and carries anything else with a warning, so an option the vendor ships tomorrow is usable the day it ships (Decision D140, amending D40). Open is not unbounded: a key spelling an SDK option the generated adapter owns - the working directory, the permission mode or sandbox preset, the environment, the output schema, the system prompt, the tool allowlist, the abort signal, the model, or one that CONTAINS such a bound - is refused by `validate`, which names the first-class key that states it instead (`reserved-harness-setting`). The reserved set is per harness and audited against the SDK release this compiler pins, so it is not an enum this file could carry (Decision D146).",
               "type": "object"
             }
           },

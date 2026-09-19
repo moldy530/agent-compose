@@ -559,6 +559,82 @@ fn the_published_schema_accepts_a_keyless_provider_that_names_its_endpoint() {
     }
 }
 
+/// **The published schema takes every `permission_mode:` the grammar spells,
+/// and no other** (grammar 8.9, Decision D146, PRD resolved q60 ruling a).
+///
+/// The one surface this key could have shipped broken with the whole suite
+/// green. `coderNode` closes its properties, so a key the compiler learned and
+/// this file did not is correct YAML an editor underlines in red — and a reader
+/// following a diagnostic that says *write `permission_mode:` instead* would be
+/// sent from a compile error to a squiggle. The direction is what makes it
+/// silent: nothing in the Rust workspace reads this document, and the
+/// `invalid-schema/` corpus can only pin refusals.
+///
+/// The members are **derived** from the grammar's own enumeration rather than
+/// listed here, for the reason the provider-kind test above derives its kinds: a
+/// seventh mode arriving with an SDK pin has to reach this file too, and a
+/// hardcoded six would let that ship with an editor refusing the new spelling.
+/// The refusing direction is asserted beside it, because an `enum` silently
+/// widened to a bare `string` would pass every assertion above.
+#[test]
+fn the_published_schema_takes_every_permission_mode_the_grammar_spells() {
+    use compose_core::ast::flow::PermissionMode;
+
+    let validator = compile_schema();
+    let node = |mode: Option<&str>| {
+        let mut coder = serde_json::Map::new();
+        coder.insert("harness".to_string(), json!("cc"));
+        coder.insert("model".to_string(), json!("model.smart"));
+        coder.insert("workspace".to_string(), json!("${REPO_ROOT}"));
+        coder.insert("access".to_string(), json!("full_access"));
+        if let Some(mode) = mode {
+            coder.insert("permission_mode".to_string(), json!(mode));
+        }
+        coder.insert("prompt".to_string(), json!("Do the work."));
+        coder.insert(
+            "output".to_string(),
+            json!({ "summary": { "type": "string" } }),
+        );
+        json!({
+            "version": "0.1",
+            "flow.main": {
+                "outputs": { "summary": { "type": "string" } },
+                "nodes": { "build": { "coder": coder, "input": "'go'" } },
+                "edges": [
+                    { "from": "start", "to": "build" },
+                    { "from": "build", "to": "end" },
+                ],
+            },
+        })
+    };
+
+    // `full_access` admits all six, so every member is a legal instance of this
+    // one node — which is what keeps this a statement about the *schema* rather
+    // than about the widening bound `validate` owns.
+    for mode in PermissionMode::ALL {
+        let instance = node(Some(mode.as_str()));
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema refuses `permission_mode: {}`, which grammar 8.9 spells — an \
+             editor would underline correct YAML, and the `reserved-harness-setting` diagnostic \
+             sends authors to exactly this key:\n{}",
+            mode.as_str(),
+            errors.join("\n")
+        );
+    }
+    // …and the key is optional, which is what every composition written before
+    // it existed relies on.
+    assert!(validation_errors(&validator, &node(None)).is_empty());
+    // …and closed, or the enum would be a `string` and this test would be
+    // asserting nothing.
+    assert!(
+        !validation_errors(&validator, &node(Some("acceptedits"))).is_empty(),
+        "the published schema takes a `permission_mode:` outside the closed set, so an author's \
+         editor accepts a spelling the parser answers with `unknown-variant`"
+    );
+}
+
 /// Grammar 13.3's authentication surface in the direction the negative corpus
 /// cannot reach: the shapes the schema must **accept**.
 ///
