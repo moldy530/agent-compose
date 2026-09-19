@@ -2,15 +2,22 @@
 # rule: values are written identically draw a warning (grammar 8.9, 7.6.1, D147)
 # code: shared-workspace
 # message: nodes `implement` and `document` of `flow.main` can run concurrently and their `workspace:` is written the same way
-# at: main.yml:60:20
-# label: main.yml:50:20 the other run is contained here
+# at: main.yml:68:20
+# label: main.yml:58:20 the other run is contained here
 # help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent — and two harness runs inside one directory edit each other's files. `'${REPO_ROOT}'` is one expression over one scope, so both runs resolve it to one path. Give one of them a directory of its own, or write `workspace: fresh` on each for a directory the runtime provisions per dispatch. A **warning** rather than a refusal because equality here is a launch fact: a value bearing an `${ENV}` reference resolves on the machine that runs it, so two values this compiler reads as different may still be one directory, and two it reads as the same is the half it can see (grammar 7.6.1, 8.9, Decision D147, PRD resolved q61 ruling b)
 #
 # The second site of PRD resolved q61 ruling b, and a **warning** rather than a
-# refusal. `triage` forks to both coder nodes on two unguarded edges, so both
-# always fire and grammar 7.6.1 reads the branches they start as concurrent —
-# and both nodes name the same directory, so both harness runs would be editing
+# refusal. `triage` forks to three coder nodes on three unguarded edges, so all
+# of them fire and grammar 7.6.1 reads the branches they start as concurrent —
+# and all three name the same directory, so three harness runs would be editing
 # one checkout.
+#
+# Three rather than two, because the report is **one diagnostic per directory
+# rather than one per colliding pair**: three nodes collide three ways and are
+# one mistake, and the default `count: 1` above is what holds that. The pair
+# the message names is the one whose nodes come first in declaration order,
+# which is the policy the concurrent-write rule states for its own quadratic
+# (grammar 10.2).
 #
 # An error is withheld, and the entry says why rather than pretending
 # otherwise: what decides this is whether the two expressions resolve to one
@@ -36,6 +43,7 @@ agent.triage:
 state:
   summary: { type: string, default: "" }
   notes: { type: string, default: "" }
+  polish: { type: string, default: "" }
 flow.main:
   outputs:
     summary: { type: string }
@@ -63,9 +71,21 @@ flow.main:
           notes: { type: string }
       input: "'document it'"
       writes: { notes: notes }
+    tidy:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Tidy whatever the change left behind.
+        output:
+          polish: { type: string }
+      input: "'tidy it'"
+      writes: { polish: polish }
   edges:
     - { from: start, to: triage }
     - { from: triage, to: implement }
     - { from: triage, to: document }
+    - { from: triage, to: tidy }
     - { from: implement, to: end }
     - { from: document, to: end }
+    - { from: tidy, to: end }

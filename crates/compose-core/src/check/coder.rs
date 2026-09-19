@@ -67,6 +67,8 @@
 //! `plan` report, and the graph document's `tools_enforced`) rather than warning
 //! about a composition that is doing exactly what its author wrote.
 
+use std::collections::BTreeMap;
+
 use crate::ast::common::{Cel, Literal};
 use crate::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
 use crate::cel::ty::Type;
@@ -1264,6 +1266,15 @@ pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
 /// directory it names is the §9.4 instance path, and two nodes of one flow have
 /// two node ids, so two `fresh` nodes are two directories by construction
 /// (ruling c).
+///
+/// **One diagnostic per directory, not per pair of nodes that collide on it**,
+/// which is the policy [`convergence`](super::convergence) states for its own
+/// quadratic and keeps for the same reason: a fan of *w* concurrent coder nodes
+/// writing one value collides w(w-1)/2 ways and is one mistake, and a report
+/// that repeated the same sentence about the same directory once per pair would
+/// bury it. The pair that names it is the one whose nodes come first in
+/// declaration order; every pair is still *decided*, because a pair a later one
+/// repeats is still what proves the collision (PRD G3).
 pub(crate) fn concurrent_workspaces(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, graph: &Graph<'_>) {
     let coders: Vec<usize> = (0..graph.nodes().len())
         .filter(|at| {
@@ -1272,7 +1283,7 @@ pub(crate) fn concurrent_workspaces(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, graph: &
                     if coder.workspace.value.expression().is_some())
         })
         .collect();
-    let mut reported = Vec::new();
+    let mut collided: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for (one, other) in super::convergence::concurrent_among(ctx, graph, &coders) {
         let (Some(first), Some(second)) = (coder_of(graph.node(one)), coder_of(graph.node(other)))
         else {
@@ -1281,14 +1292,33 @@ pub(crate) fn concurrent_workspaces(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, graph: &
         if first.workspace.value != second.workspace.value {
             continue;
         }
-        reported.push((
-            graph.id(one).to_string(),
-            graph.id(other).to_string(),
-            first.workspace.span.clone(),
-            second.workspace.span.clone(),
-            first.workspace.value.as_str().to_string(),
-        ));
+        let written = first.workspace.value.as_str().to_string();
+        match collided.get(&written) {
+            Some(held) if *held <= (one, other) => {}
+            _ => {
+                collided.insert(written, (one, other));
+            }
+        }
     }
+    let reported: Vec<(String, String, Span, Span, String)> = collided
+        .into_iter()
+        .map(|(expression, (one, other))| {
+            let hold = |at: usize| {
+                coder_of(graph.node(at))
+                    .expect("a collided node is a coder node")
+                    .workspace
+                    .span
+                    .clone()
+            };
+            (
+                graph.id(one).to_string(),
+                graph.id(other).to_string(),
+                hold(one),
+                hold(other),
+                expression,
+            )
+        })
+        .collect();
     for (one, other, first, second, expression) in reported {
         ctx.push(
             Diagnostic::warning(
