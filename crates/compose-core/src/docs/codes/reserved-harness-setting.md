@@ -93,13 +93,22 @@ bound, so it is written on the node.
 |---|---|
 | a permission mode, or the flag one requires | `permission_mode:` |
 | a sandbox preset, or sandbox configuration | `access:` |
-| a working directory, or roots beside it | `workspace:` |
+| a working directory | `workspace:` |
 | a tool set, an allowlist, a permission callback, an MCP server, a subagent, a skill set | `allow_tools:` |
 | the environment | `env:` |
 | the output format | `output:` |
 | the system prompt, or plan mode's body | `prompt:` |
 | the abort signal | `timeout:` |
 | the model | `model:` |
+
+**Where the key is required, the repair is to delete the setting.**
+`workspace:`, `model:`, `prompt:` and `output:` are required on every `coder:`
+block, so a key spelling one of those bounds is a *second* spelling of a line
+already on the node — "write `prompt:` instead" would name a line three above
+the setting. The message says to take the setting off for those, and to write
+the key for the optional ones (`permission_mode:`, `access:`, `allow_tools:`,
+`env:`, `timeout:`), because only one of those two sentences is a repair at a
+time.
 
 One answer is a key that **addresses** the value rather than holding it. The one
 model setting a harness takes — `thinking` and `maxThinkingTokens` under `cc`,
@@ -109,7 +118,7 @@ schema checks it (`docs/grammar.md` §12.2, Decision D141). `model:` is required
 on every `coder:` block, so the message says *where it points* rather than
 telling an author to write a key they already have.
 
-Four families answer to no key at all, and the message says so rather than
+Five families answer to no key at all, and the message says so rather than
 pointing at the nearest one:
 
 * the **resume** family — `resume`, `continue`, `forkSession`, `sessionId` and
@@ -122,6 +131,12 @@ pointing at the nearest one:
 * **`extraArgs`** and `approvalPolicy`: the first is every bound at once, and the
   second is a per-call approval tier belonging to an app server this release does
   not adopt;
+* **`additionalDirectories`**, which is roots *beside* the working directory
+  rather than the working directory itself. `workspace:` is not the answer: it is
+  **required**, so it is already on the node, and it takes exactly one root — a
+  second writable root is not that key widened but the containment statement
+  undone, since `access:` bounds a run to the tree `workspace:` names. A node
+  that needs two trees is two nodes, or one workspace that contains both;
 * the **process-spawn** family — `pathToClaudeCodeExecutable`, `executable`,
   `executableArgs`, `spawnClaudeCodeProcess`. `harness:` is not the answer here,
   and pointing at it would be worse than pointing nowhere: it is a **required**

@@ -3265,11 +3265,14 @@ That table is the whole of what crosses, and four rules come with it
   server-side — injects **no** credential into the run. Not an empty one: the
   same sentence §12.1 makes about the wire, one construct along;
 * **a declared fact the bound harness has no slot for is a compile error**
-  (`unsupported-connection-fact`) naming the fact and the harness. It is not
-  dropped with a warning the way an unverified `settings:` key is, and the
-  difference is what the value decides: an option nothing reads costs a feature,
-  and an endpoint or a credential that silently went missing costs a `401` on the
-  first live call, discovered in production;
+  (`unsupported-connection-fact`) naming the fact and the harness. An unverified
+  `settings:` key gets away with a warning because it still **travels** — it
+  reaches the SDK unchanged, and the cost of being wrong is one option nothing
+  reads. A fact with no slot has nowhere to travel to, so the only alternative to
+  an error is a value that silently went missing, and what this one decides is
+  where the traffic goes and whether it authenticates: an endpoint or a
+  credential quietly dropped costs a `401` on the first live call, discovered in
+  production;
 * **one spelling per fact.** A node `env:` entry naming a variable the table
   would set — or one the bound harness's own runtime reads for that same fact
   beside it, since `ANTHROPIC_AUTH_TOKEN` is a second identity on the same
@@ -3339,9 +3342,14 @@ allowlist and its callback, the abort signal, the model and the one model settin
 maps into it. Those are `workspace:`, `access:`, `permission_mode:`, `env:`,
 `output:`, `prompt:`, `allow_tools:`, `timeout:` and `model:` respectively, and a
 key here cannot reach around the construct that states them. The diagnostic names
-which one, so the refusal is a repair. The curated keys of the tier above are
-mapped by name over the top for the same reason two spellings of one option must
-not disagree about which wins.
+which one, so the refusal is a repair — and **which** repair follows from whether
+that key is required. `permission_mode:`, `access:`, `allow_tools:`, `env:` and
+`timeout:` are optional, so the message says to write one; `workspace:`,
+`model:`, `prompt:` and `output:` are required by the key table above, so the key
+is already on the node and the message says to take the *setting* off instead.
+Telling an author to write a line they have already written is not a repair. The
+curated keys of the tier above are mapped by name over the top for the same
+reason two spellings of one option must not disagree about which wins.
 
 An option does not have to *spell* a bound to reach around it, and the reserved
 set is the wider one. A harness SDK ships options that **contain** the bounds
@@ -3363,6 +3371,15 @@ about something else. So is every option that
 a named exclusion (below), not a bound. The reserved set is per harness and
 audited against the SDK release this compiler pins, so a vendor's new option
 arrives with the pin rather than behind it.
+
+**An option in this wider half answers to no key, and the message says so** rather
+than naming the nearest one. Additional roots are the case worth spelling out:
+`workspace:` is *one* root and is required, and `access:` bounds a run to the tree
+it names, so a second writable root is not that key widened but the containment
+statement undone — a run written where no line of the node reached. Neither
+harness offers a key for it under any name, and a run that needs two trees is two
+nodes or one workspace holding both. Naming `workspace:` there would be a refusal
+that is wrong about the option *and* hands back a repair nobody can follow.
 
 **It is a refusal rather than a silent drop**, and that is a change from how this
 key first shipped: the adapter used to remove such a value on its way to the SDK
@@ -9496,7 +9513,12 @@ error (`widening-permission-mode`) naming the mode, the level and the set (§8.9
 (`reserved-harness-setting`) naming the key, the adapter-owned option it would
 reach, and the first-class key that states the same bound where one does —
 `permission_mode:` for the modes, `access:` for the sandbox, `allow_tools:` for
-the toolset, `model:` and the `provider.*` behind it for the connection. Where a
+the toolset, `model:` and the `provider.*` behind it for the connection. **The
+repair depends on whether that key is required**: an optional key
+(`permission_mode:`, `access:`, `allow_tools:`, `env:`, `timeout:`) is one to
+write, and a required one (`workspace:`, `model:`, `prompt:`, `output:`) is
+already on the node, so the message says to take the setting off rather than
+telling an author to write a line they have written. Where a
 key **addresses** the value rather than holding it, the message names where it
 points instead of naming the key: the one model setting a harness takes — `cc`'s
 thinking budget, `codex`'s reasoning effort — is written in the `model.*`
@@ -9507,7 +9529,10 @@ node. Where nothing states it, the message says so: the resume family is a named
 exclusion
 ([D142](#d142-the-policy-chain-wraps-a-whole-harness-run-and-harness-native-resume-is-excluded)),
 `fallbackModel` is the ladder D141 stops, `approvalPolicy` is the app-server tier
-this release does not adopt, `extraArgs` is every bound at once, and the
+this release does not adopt, `extraArgs` is every bound at once, **roots beside
+the working directory** are the containment statement undone rather than
+`workspace:` widened — that key is one root and is required, so naming it would
+be wrong about the option and unfollowable besides — and the
 **process-spawn family** — which binary, which language runtime, what that
 runtime loads first, and the spawn function called in place of all three — is the
 program that enforces every bound rather than a bound to widen. `harness:` is not

@@ -870,6 +870,19 @@ fn reserved_setting(
                  disagreeing about which wins"
             ),
         ),
+        Answered::Already(first_class) => (
+            format!(
+                "`{held}` of {subject} is a `harness: {harness}` option the generated adapter \
+                 owns: it is what `{first_class}:` states"
+            ),
+            format!(
+                "take the setting off: `{first_class}:` is required on every `coder:` block, so \
+                 it is already on the node and already states this. A bound has to be readable \
+                 off the construct that holds it, which is why `{first_class}:` is a key and not \
+                 a setting, and two spellings of one option would leave a reader and `validate` \
+                 disagreeing about which wins"
+            ),
+        ),
         Answered::Through(first_class, site) => (
             format!(
                 "`{held}` of {subject} is a `harness: {harness}` option the generated adapter \

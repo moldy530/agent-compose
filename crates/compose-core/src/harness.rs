@@ -929,8 +929,27 @@ pub fn resolved_mode(coder: &Coder) -> Option<PermissionMode> {
 /// the nearest key and being wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Answered {
-    /// A key of the `coder:` block states this bound, written without its colon.
+    /// An **optional** key of the `coder:` block states this bound, written
+    /// without its colon — so the repair is to write it.
+    ///
+    /// Optional is the load-bearing word, and
+    /// [`a_reserved_answer_matches_how_grammar_89_requires_its_key`] holds it:
+    /// this variant's help is "write that key instead", which is a sentence only
+    /// about a key an author has *not* written. A required key gets
+    /// [`Already`](Self::Already).
     By(&'static str),
+    /// A **required** key of the block states this bound, so it is already
+    /// written on the node: the repair is to take the setting off, not to write
+    /// a second spelling of a line that is three lines up.
+    ///
+    /// The variant exists for the reason [`Through`](Self::Through) exists, one
+    /// step less exotic. `workspace:`, `model:`, `prompt:` and `output:` are
+    /// **required** on every `coder:` block (grammar 8.9's key table), so an
+    /// author sent to one of them by [`By`](Self::By)'s sentence would be sent
+    /// to a line already on their node and told to write it — which reads as a
+    /// repair and is not one. What the author has to do is delete the setting;
+    /// the key beside it already says the thing.
+    Already(&'static str),
     /// A key of the block **addresses** what states this bound: the key, written
     /// without its colon, and where the value is actually written.
     ///
@@ -940,6 +959,8 @@ pub enum Answered {
     /// registry address (grammar 8.9, Decision D141): the thinking budget a
     /// harness takes lives in the `model.*` definition it names, so an author
     /// sent to `model:` alone would be sent to a line already on their node.
+    /// [`Already`](Self::Already) is the same objection where the value really
+    /// is on this block; this one is for where the value is not here at all.
     Through(&'static str, &'static str),
     /// Nothing states it: the option is **excluded** rather than restated, and
     /// this is why.
@@ -994,25 +1015,38 @@ pub struct ReservedRow {
 ///    `access:`, `outputFormat` is `output:`;
 ///  * an option that **contains** one without spelling it — `extraArgs` is any
 ///    CLI flag there is, `mcpServers`, `agents` and `skills` put a tool or a
-///    whole loop outside `allow_tools:`, the process-spawn family replaces the
-///    program that enforces every bound.
+///    whole loop outside `allow_tools:`, `additionalDirectories` hands a run a
+///    second writable root beside the one `workspace:` names, the process-spawn
+///    family replaces the program that enforces every bound.
 ///
-/// A row's [`Answered`] is which key a reader should write **instead**, and four
-/// families answer to nothing: the resume family, which PRD resolved q57 ruling b
-/// excludes by name; `fallbackModel` and `approvalPolicy`, which are a ladder and
-/// a tier that stop at this boundary; `extraArgs`, which is not one bound to
-/// point at but all of them at once; and the **process-spawn family**, which is
-/// the one grammar 8.9 says does not widen a bound but replaces the program
-/// enforcing all of them — `harness:` is required on every block and names which
-/// vendor's adapter runs, never which executable that adapter spawns or what
-/// runtime spawns it, so pointing an author at it would name a key they have
-/// already written and that cannot say what they asked for.
+/// A row's [`Answered`] is what a reader should do **instead**, and the variants
+/// are that sentence rather than a taxonomy of options.
+/// [`Answered::By`] is the plain case — an *optional* key states the bound and
+/// the repair is to write it. Everything else exists because "write that key
+/// instead" would be false:
 ///
-/// A fifth answer is [`Answered::Through`]: `model:` is an **address**, so the
-/// one model setting a harness takes — `cc`'s thinking budget, `codex`'s
-/// reasoning effort — is stated in the `model.*` definition it names rather than
-/// on this block (Decision D141). The key is real and is already on the node,
-/// which is exactly why "write it instead" would be the wrong sentence.
+///  * [`Answered::Already`], where the key that states the bound is
+///    **required** on every block and is therefore already three lines up:
+///    `cwd` and `workingDirectory` are `workspace:`, `model` is `model:`,
+///    `outputFormat` is `output:`, `systemPrompt` and `planModeInstructions`
+///    are `prompt:`. The repair is to take the setting off;
+///  * [`Answered::Through`], where `model:` is an **address**, so the one model
+///    setting a harness takes — `cc`'s thinking budget, `codex`'s reasoning
+///    effort — is stated in the `model.*` definition it names rather than on
+///    this block (Decision D141);
+///  * [`Answered::Nothing`], for the five families no key of the block states.
+///    The resume family, which PRD resolved q57 ruling b excludes by name;
+///    `fallbackModel` and `approvalPolicy`, which are a ladder and a tier that
+///    stop at this boundary; `extraArgs`, which is not one bound to point at but
+///    all of them at once; **roots beside the workspace**, which `workspace:`
+///    cannot express because it is one root and required, so an author asking
+///    for a second has asked for something this grammar does not offer rather
+///    than for a key they forgot; and the **process-spawn family**, which is the
+///    one grammar 8.9 says does not widen a bound but replaces the program
+///    enforcing all of them — `harness:` is required on every block and names
+///    which vendor's adapter runs, never which executable that adapter spawns or
+///    what runtime spawns it, so pointing an author at it would name a key they
+///    have already written and that cannot say what they asked for.
 pub const RESERVED: &[ReservedRow] = &[
     ReservedRow {
         harness: Harness::Cc,
@@ -1034,7 +1068,7 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "additionalDirectories",
-        answered: Answered::By("workspace"),
+        answered: Answered::Nothing(ROOTS),
     },
     ReservedOption {
         option: "agent",
@@ -1064,7 +1098,7 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "cwd",
-        answered: Answered::By("workspace"),
+        answered: Answered::Already("workspace"),
     },
     ReservedOption {
         option: "env",
@@ -1111,11 +1145,11 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "model",
-        answered: Answered::By("model"),
+        answered: Answered::Already("model"),
     },
     ReservedOption {
         option: "outputFormat",
-        answered: Answered::By("output"),
+        answered: Answered::Already("output"),
     },
     ReservedOption {
         option: "pathToClaudeCodeExecutable",
@@ -1140,7 +1174,7 @@ const CC_RESERVED: &[ReservedOption] = &[
         // Plan mode's body, which the adapter fills from the node's own
         // instructions (grammar 8.9's `read_only` row).
         option: "planModeInstructions",
-        answered: Answered::By("prompt"),
+        answered: Answered::Already("prompt"),
     },
     ReservedOption {
         option: "plugins",
@@ -1193,7 +1227,7 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "systemPrompt",
-        answered: Answered::By("prompt"),
+        answered: Answered::Already("prompt"),
     },
     ReservedOption {
         option: "thinking",
@@ -1213,7 +1247,7 @@ const CC_RESERVED: &[ReservedOption] = &[
 const CODEX_RESERVED: &[ReservedOption] = &[
     ReservedOption {
         option: "additionalDirectories",
-        answered: Answered::By("workspace"),
+        answered: Answered::Nothing(ROOTS),
     },
     ReservedOption {
         // The per-call approval tier PRD resolved q57 ruling c does not adopt —
@@ -1228,7 +1262,7 @@ const CODEX_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "model",
-        answered: Answered::By("model"),
+        answered: Answered::Already("model"),
     },
     ReservedOption {
         option: "modelReasoningEffort",
@@ -1240,7 +1274,7 @@ const CODEX_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "workingDirectory",
-        answered: Answered::By("workspace"),
+        answered: Answered::Already("workspace"),
     },
 ];
 
@@ -1252,6 +1286,28 @@ const RESUME: &str = "harness-native resume is a named exclusion rather than a b
 const LADDER: &str = "a fallback model is the failover ladder, which does not reach inside a \
                       harness run: the harness owns its client and its own retries, and this \
                       compiler's `retry:` wraps whole runs";
+
+/// …and why roots beside the workspace do (grammar 8.9, PRD resolved q57 ruling
+/// c).
+///
+/// Not `Answered::By("workspace")`, which is the answer this option had and
+/// which was wrong twice over. It was wrong about the **option**:
+/// `additionalDirectories` is roots *beside* the working directory, not the
+/// working directory, and both drivers file it under the options that
+/// **contain** a bound without spelling it rather than the ones that spell one
+/// (`the_reserved_tables_are_one_table`'s two halves;
+/// `roots_beside_the_workspace_are_dropped_under_every_harness` is the guard
+/// named for it). And it was wrong about the **repair**: `workspace:` is
+/// required on every `coder:` block and takes exactly one root, so an author who
+/// asked for a second was sent to a key already on their node that cannot say
+/// what they asked for — the same unfollowable sentence [`SPAWN`] exists to
+/// avoid.
+const ROOTS: &str = "a second writable root beside `workspace:` is not that key widened but the \
+                     containment statement undone — `workspace:` is one root, it is required, and \
+                     `access:` bounds a run to the tree it names, so a run handed another is \
+                     written where no line of the node reached. Neither harness offers a key for \
+                     it, and a run that needs two trees is two nodes or one workspace holding \
+                     both";
 
 /// …and why the process-spawn family does (grammar 8.9, PRD resolved q57 ruling
 /// c).
@@ -2233,15 +2289,19 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
     /// are bound to the surface an author reads them on — grammar 8.9 — rather
     /// than to a second list here that could agree with nothing.
     ///
-    /// **Both answering variants are held.** [`Answered::By`] names the key to
-    /// write and [`Answered::Through`] names the key that *addresses* where to
-    /// write it, and an author has to be able to find either one in 8.9. What
+    /// **All three answering variants are held.** [`Answered::By`] names the key
+    /// to write, [`Answered::Already`] names the required key already on the
+    /// node, and [`Answered::Through`] names the key that *addresses* where to
+    /// write it, and an author has to be able to find any of them in 8.9. What
     /// this cannot see is a key that exists and cannot be *followed*: `harness:`
     /// is a row of the table, so an answer naming it passes here while sending
     /// an author to a required key that takes `cc` or `codex` and cannot name an
     /// executable. So
     /// [`the_options_the_ruling_names_are_answered_by_the_keys_it_names`] pins
-    /// the process-spawn family to [`Answered::Nothing`] by name.
+    /// the process-spawn family to [`Answered::Nothing`] by name, and
+    /// [`a_reserved_answer_matches_how_grammar_89_requires_its_key`] holds the
+    /// other half of "followable": whether the named key is one an author still
+    /// has to write.
     ///
     /// **Two spellings count**, because a coder node takes keys from two places
     /// and 8.9 writes them two ways: its own are rows of the block's key table,
@@ -2265,7 +2325,9 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
             .expect("…and its key table closes with the unknown-key sentence")];
         for row in RESERVED {
             for held in row.options {
-                let (Answered::By(key) | Answered::Through(key, _)) = held.answered else {
+                let (Answered::By(key) | Answered::Already(key) | Answered::Through(key, _)) =
+                    held.answered
+                else {
                     continue;
                 };
                 assert!(
@@ -2282,6 +2344,78 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
         }
     }
 
+    /// …and **the repair fits whether the key is already written** (grammar 8.9's
+    /// key table, PRD resolved q60 ruling b).
+    ///
+    /// [`a_reserved_options_answer_is_a_key_the_coder_block_takes`] holds that a
+    /// named key *exists*. This holds the other half of followable: that the
+    /// sentence the refusal makes about it is true. [`Answered::By`]'s help is
+    /// "write `X:` on the node instead", which is a repair only where `X:` is
+    /// **optional** — a key the author has not written. Where `X:` is required
+    /// it is already three lines up, and the same sentence tells an author to
+    /// write a line they have already written, which reads as a repair and is
+    /// not one; [`Answered::Already`] is the variant whose help is "take the
+    /// setting off" and is the one those rows take.
+    ///
+    /// So the two variants are bound to the **`Required` column** of 8.9's key
+    /// table rather than to a second list here — the same bind
+    /// [`a_reserved_options_answer_is_a_key_the_coder_block_takes`] makes, one
+    /// column along. A key promoted to required or relaxed to optional in the
+    /// grammar is exactly when every refusal naming it changes sentence, and
+    /// that edit is a table away from this file.
+    ///
+    /// A `By` key that has **no row** is a common node key (`timeout:`), which
+    /// the table cannot speak for and which is optional by construction — the
+    /// section names it in prose, which is what the sibling test reads.
+    /// `Already` is held to a row, because "required" is a claim only the table
+    /// makes.
+    #[test]
+    fn a_reserved_answer_matches_how_grammar_89_requires_its_key() {
+        let grammar = grammar();
+        let section = grammar
+            .split_once("### 8.9 `coder`")
+            .expect("`docs/grammar.md` has the section")
+            .1;
+        let table = &section[..section
+            .find("Additional keys are a compile error")
+            .expect("…and its key table closes with the unknown-key sentence")];
+        // One key's `Required` column, if the block's key table has a row for it
+        // at all: `| `key` | type | **yes** | … |`.
+        let required = |key: &str| -> Option<bool> {
+            let opened = format!("| `{key}` |");
+            let row = table.lines().find(|line| line.starts_with(&opened))?;
+            Some(row.split('|').nth(3).map(str::trim) == Some("**yes**"))
+        };
+        for row in RESERVED {
+            let harness = row.harness.as_str();
+            for held in row.options {
+                match held.answered {
+                    Answered::By(key) => assert_ne!(
+                        required(key),
+                        Some(true),
+                        "`{harness}`'s `{}` is answered by `{key}:` with \"write it instead\", and \
+                         grammar 8.9 makes `{key}:` **required** on every `coder:` block — so the \
+                         refusal sends an author to a line already on their node. The answer for \
+                         a required key is `Answered::Already`, whose repair is to take the \
+                         setting off",
+                        held.option
+                    ),
+                    Answered::Already(key) => assert_eq!(
+                        required(key),
+                        Some(true),
+                        "`{harness}`'s `{}` is answered by `{key}:` with \"take the setting off, \
+                         the key is already on the node\", and grammar 8.9's key table does not \
+                         make `{key}:` required — an author who never wrote it is told to delete \
+                         the only line stating the bound. The answer for an optional key is \
+                         `Answered::By`",
+                        held.option
+                    ),
+                    Answered::Through(..) | Answered::Nothing(_) => {}
+                }
+            }
+        }
+    }
+
     /// …and the two answers PRD resolved q60 ruling b names out loud, pinned
     /// (grammar 8.9, Decision D146).
     ///
@@ -2294,27 +2428,53 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
     /// answer is a sentence and not a count.
     ///
     /// The families whose answer is **not** a plain "write this key" are pinned
-    /// here too — resume, the process-spawn family, and the thinking budget — for
-    /// the reason the entry gives them a clause of their own: a table tempted to
-    /// point at the nearest key gets each of them wrong, and the nearest key for
-    /// the last two (`harness:`, `model:`) is a real row of grammar 8.9's table,
-    /// so [`a_reserved_options_answer_is_a_key_the_coder_block_takes`] passes
-    /// green on exactly the wrong answer.
+    /// here too — resume, the process-spawn family, roots beside the workspace,
+    /// and the thinking budget — for the reason the entry gives them a clause of
+    /// their own: a table tempted to point at the nearest key gets each of them
+    /// wrong, and the nearest key for the last three (`harness:`, `workspace:`,
+    /// `model:`) is a real row of grammar 8.9's table, so
+    /// [`a_reserved_options_answer_is_a_key_the_coder_block_takes`] passes green
+    /// on exactly the wrong answer.
+    ///
+    /// The entry's four repairs split in two here, which is the other thing this
+    /// pins: `permission_mode:` and `access:` are optional, so the repair is to
+    /// write them; `workspace:` and `model:` are required, so the repair is to
+    /// take the setting off. [`a_reserved_answer_matches_how_grammar_89_requires_its_key`]
+    /// holds the split for every row rather than these.
     #[test]
     fn the_options_the_ruling_names_are_answered_by_the_keys_it_names() {
         for (harness, option, key) in [
             (Harness::Cc, "permissionMode", "permission_mode"),
-            (Harness::Cc, "cwd", "workspace"),
             (Harness::Cc, "tools", "allow_tools"),
-            (Harness::Cc, "model", "model"),
             (Harness::Codex, "sandboxMode", "access"),
-            (Harness::Codex, "workingDirectory", "workspace"),
         ] {
             assert_eq!(
                 reserved_option(harness, option).map(|held| held.answered),
                 Some(Answered::By(key)),
                 "a `harness: {}` `settings:` key spelling `{option}` is not answered by \
                  `{key}:`, which is the repair PRD resolved q60 ruling b names for it",
+                harness.as_str()
+            );
+        }
+        // …and the same repairs where the key the entry names is **required**,
+        // so the sentence is "take the setting off" rather than "write the key":
+        // the entry names `workspace:` and `model:` among its four answers, and
+        // both are required rows of grammar 8.9's key table.
+        for (harness, option, key) in [
+            (Harness::Cc, "cwd", "workspace"),
+            (Harness::Cc, "model", "model"),
+            (Harness::Cc, "outputFormat", "output"),
+            (Harness::Cc, "systemPrompt", "prompt"),
+            (Harness::Cc, "planModeInstructions", "prompt"),
+            (Harness::Codex, "model", "model"),
+            (Harness::Codex, "workingDirectory", "workspace"),
+        ] {
+            assert_eq!(
+                reserved_option(harness, option).map(|held| held.answered),
+                Some(Answered::Already(key)),
+                "a `harness: {}` `settings:` key spelling `{option}` is answered by `{key}:` as \
+                 though an author had not written it, and `{key}:` is required on every `coder:` \
+                 block — so the refusal would tell them to write a line already on their node",
                 harness.as_str()
             );
         }
@@ -2354,6 +2514,27 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
                 "`{option}` is answered by a key of the block, and no key of the block can say \
                  which program a run is: `harness:` is required, takes `cc` or `codex`, and \
                  names which vendor's adapter runs rather than which executable it is"
+            );
+        }
+        // …and the option both harnesses drop for the *containment* reason,
+        // which is the third way the nearest key is the wrong one: `workspace:`
+        // is a row of grammar 8.9 and is required, so pointing at it passes
+        // `a_reserved_options_answer_is_a_key_the_coder_block_takes` while
+        // claiming `additionalDirectories` is the working directory — it is
+        // roots *beside* it, which is why both drivers file it under the options
+        // that contain a bound rather than the ones that spell one — and handing
+        // an author a repair they cannot follow, since `workspace:` takes
+        // exactly one root and is already on their node.
+        for harness in [Harness::Cc, Harness::Codex] {
+            assert!(
+                matches!(
+                    reserved_option(harness, "additionalDirectories").map(|held| held.answered),
+                    Some(Answered::Nothing(_))
+                ),
+                "a `harness: {}` `settings:` key spelling `additionalDirectories` is answered by \
+                 a key of the block, and no key states roots beside the workspace: `workspace:` \
+                 is one root, required, and the option is what puts a run outside it",
+                harness.as_str()
             );
         }
         // …and the one that answers *through* a key rather than to one: the
