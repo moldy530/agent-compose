@@ -579,6 +579,160 @@ export function interpolate(parts: readonly Interpolation[]): string {
 }
 
 /**
+ * Where a substitution lands in CEL source: inside a string literal, inside a
+ * comment, or in the expression itself ([`interpolateExpression`]).
+ */
+type CelContext =
+  | { readonly kind: "code" }
+  | { readonly kind: "comment" }
+  | { readonly kind: "string"; readonly quote: string; readonly terminator: string; readonly raw: boolean };
+
+/** Outside everything, which is where an expression's source begins. */
+const CEL_CODE: CelContext = { kind: "code" };
+
+/**
+ * Read a piece of CEL source and say what the text **after** it is inside.
+ *
+ * A lexer's string rule and nothing else: the escape handling is
+ * `src/cel.ts`'s, the `r`/`b` prefixes are the ones it reads, and a `//`
+ * comment runs to the end of its line. It is deliberately not a tokenizer —
+ * the one question asked of it is which of the three contexts a given offset
+ * sits in.
+ */
+function celContextAfter(held: CelContext, text: string): CelContext {
+  let state = held;
+  let cursor = 0;
+  while (cursor < text.length) {
+    if (state.kind === "comment") {
+      const end = text.indexOf("\n", cursor);
+      if (end < 0) return state;
+      state = CEL_CODE;
+      cursor = end + 1;
+      continue;
+    }
+    if (state.kind === "string") {
+      if (!state.raw && text[cursor] === "\\") {
+        cursor += 2;
+        continue;
+      }
+      if (text.startsWith(state.terminator, cursor)) {
+        cursor += state.terminator.length;
+        state = CEL_CODE;
+        continue;
+      }
+      cursor += 1;
+      continue;
+    }
+    if (text.startsWith("//", cursor)) {
+      state = { kind: "comment" };
+      cursor += 2;
+      continue;
+    }
+    const opened = celStringAt(text, cursor);
+    if (opened !== undefined) {
+      state = opened.state;
+      cursor = opened.next;
+      continue;
+    }
+    cursor += 1;
+  }
+  return state;
+}
+
+/**
+ * The string literal opening at this offset, with its prefixes and its
+ * terminator — or nothing, where one does not.
+ */
+function celStringAt(
+  text: string,
+  at: number,
+): { readonly state: CelContext; readonly next: number } | undefined {
+  // `b` and `r` are prefixes only where they start a token: `render'x'` is not
+  // a raw string, and the character before decides.
+  if (at > 0 && /[A-Za-z0-9_]/.test(text[at - 1] ?? "")) return undefined;
+  let cursor = at;
+  let raw = false;
+  if (/[bB]/.test(text[cursor] ?? "") && /[rR'"]/.test(text[cursor + 1] ?? "")) cursor += 1;
+  if (/[rR]/.test(text[cursor] ?? "") && /['"]/.test(text[cursor + 1] ?? "")) {
+    raw = true;
+    cursor += 1;
+  }
+  const quote = text[cursor];
+  if (quote !== "'" && quote !== '"') return undefined;
+  const triple = text[cursor + 1] === quote && text[cursor + 2] === quote;
+  const terminator = triple ? quote.repeat(3) : quote;
+  return { state: { kind: "string", quote, terminator, raw }, next: cursor + terminator.length };
+}
+
+/**
+ * Substitute a class-2 string's references into **CEL source** — grammar 4.3's
+ * one surface that is in both classes, which is a `coder:` node's `workspace:`
+ * (§4.3, §8.9, Decision D147, PRD resolved q61 ruling a).
+ *
+ * [`interpolate`] hands a value to whatever reads the string; this hands it to
+ * a **lexer**, and the two are not the same thing. §4.3 puts an env reference
+ * inside a string literal — `workspace: "'${REPO_ROOT}'"` is the migration
+ * spelling the grammar and the docs teach — so the substituted value is read
+ * back as literal text, and a directory holding a backslash or a quote would be
+ * read as something else entirely: `C:\repos\thing` would arrive at the harness
+ * as `C:` + CR + `epos` + TAB + `hing`, and `/srv/o'brien` would end the literal
+ * and fail to parse. Neither is anything `validate` could have warned about —
+ * the token is still literal text there — and neither is anything an author can
+ * escape, because the value is on the machine and not in the composition.
+ *
+ * So the value is escaped **for the literal it lands in**, which is the only
+ * place §4.3 admits a reference. A raw literal (`r'…'`) has no escapes by
+ * definition, so a value that would close one is refused by name instead of
+ * silently reinterpreted. A reference outside a literal is substituted as it
+ * always was and re-read as source: `validate` refuses that spelling before a
+ * composition can hold it (a `${` is a syntax error wherever CEL admits an
+ * expression), so this arm is what a composition that got past it would do,
+ * rather than a second behaviour anything relies on.
+ */
+export function interpolateExpression(parts: readonly Interpolation[], subject: string): string {
+  let state: CelContext = CEL_CODE;
+  let source = "";
+  for (const part of parts) {
+    if (typeof part === "string") {
+      state = celContextAfter(state, part);
+      source += part;
+      continue;
+    }
+    const value = environmentValue(part.env, part.site);
+    if (state.kind === "code") {
+      source += value;
+      state = celContextAfter(state, value);
+      continue;
+    }
+    source += escapedForCel(value, state, part.env, subject);
+  }
+  return source;
+}
+
+/**
+ * One environment value as the body of the literal it was substituted into.
+ *
+ * The escapes are `src/cel.ts`'s own table — `\\`, `\'`, `\"`, `\n`, `\r` —
+ * which is the pinned `cel` crate's, so what the evaluator reads back is the
+ * value byte for byte. A comment is not read at all, and takes only the line
+ * breaks out so a value cannot end it and become source.
+ */
+function escapedForCel(value: string, state: CelContext, name: string, subject: string): string {
+  if (state.kind === "comment") return value.replace(/[\n\r]/g, " ");
+  if (state.kind !== "string") return value;
+  if (state.raw) {
+    const breaks = state.terminator.length === 1 && /[\n\r]/.test(value);
+    if (value.includes(state.quote) || breaks) {
+      throw new Error(
+        `${subject} substitutes \`${name}\` into a raw string literal (\`${state.quote === "'" ? "r'…'" : 'r"…"'}\`), and its value holds ${breaks ? "a line break" : `a \`${state.quote}\``}, which a raw literal has no escape for — write the literal without the \`r\` prefix`,
+      );
+    }
+    return value;
+  }
+  return value.replace(/[\\'"]/g, (character) => `\\${character}`).replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+}
+
+/**
  * The same string **as its author wrote it**: `${NAME}` where a reference is,
  * rather than what the reference resolved to.
  *
@@ -8506,7 +8660,9 @@ export function harnessRecordOf(error: unknown): HarnessRecord | undefined {
  *
  *  1. the `${ENV}` references substitute into the expression's **source**,
  *     which is class 2's own rule ("substituted at process start") reaching a
- *     value that happens to be an expression;
+ *     value that happens to be an expression — escaped for the literal §4.3
+ *     puts them inside, so a directory holding a quote or a backslash is the
+ *     directory it is ([`interpolateExpression`]);
  *  2. the result is evaluated against this node's roots — `input`, `state`,
  *     `execution`, already bound by [`runNode`] — which is what makes the
  *     answer a property of the *dispatch* rather than of the process.
@@ -8538,7 +8694,17 @@ function resolveHarnessWorkspace(binding: HarnessBinding, view: NodeView): strin
     );
   }
   const written = asWritten(binding.workspace.expression);
-  const answer = evaluate(interpolate(binding.workspace.expression), view.roots);
+  const subject = `\`${binding.node}\`'s \`workspace:\` (\`${written}\`)`;
+  // Every failure between here and the path is this node's `workspace:`, and
+  // says so: a CEL error carries no idea which of a composition's expressions
+  // raised it, and "an unterminated string literal" reaching an operator with
+  // nothing else attached is a message about nothing (`docs/trace.md` §11.1).
+  let answer: CelValue;
+  try {
+    answer = evaluate(interpolateExpression(binding.workspace.expression, subject), view.roots);
+  } catch (error) {
+    throw new Error(`${subject} could not be resolved: ${describe(error)}`, { cause: error });
+  }
   if (typeof answer !== "string") {
     throw new Error(
       `\`${binding.node}\`'s \`workspace:\` (\`${written}\`) answered a ${typeof answer} rather than a path`,

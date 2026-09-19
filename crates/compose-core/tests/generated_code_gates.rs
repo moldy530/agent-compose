@@ -6908,6 +6908,32 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         "a provider with no `api_key:` claims no credential name at all — resolved q25's keyless \
          posture — so an over-eager scrub would leave a keyless run with no way to authenticate"
     );
+
+    // --- The directory is the directory (grammar §4.3, PRD resolved q61) ---
+    //
+    // `workspace:` is the one surface in both env-ref classes: the reference
+    // resolves into the expression's **source**, inside the string literal §4.3
+    // puts it in, and the result is lexed. So a directory holding a backslash,
+    // a quote or a line break is a value the lexer reads as something else —
+    // `C:\repos\thing` as `C:` + CR + `epos` + TAB + `hing` — and neither
+    // `validate` (where the token is still literal text) nor the author (who
+    // cannot see the machine's value) can do anything about it. The spelling
+    // being mangled here is `workspace: "'${REPO_ROOT}'"`, which is the
+    // migration the grammar and the docs teach.
+    let awkward = &answer["awkwardWorkspace"];
+    assert_eq!(
+        awkward["handed"],
+        json!({ "windows": true, "tab": true, "quote": true, "double": true }),
+        "a `${{ENV}}` directory holding a backslash, a quote or a `\\t` sequence did not reach \
+         the harness as itself: substituting into CEL source without escaping for the literal \
+         hands a coding agent a directory nobody named (grammar §4.3, PRD resolved q61 ruling a)"
+    );
+    assert_eq!(
+        awkward["joined"],
+        json!("C:\\repos\\thing/topic"),
+        "the per-item spelling the ruling exists for — a reference inside one literal of a \
+         larger expression — stopped composing once the reference was escaped"
+    );
 }
 
 /// Gate 23: the wire schema is the lowering's image of the schema the parse

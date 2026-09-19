@@ -1205,4 +1205,65 @@ const results = {};
   };
 }
 
+// --- 15. An `${ENV}` directory that is not CEL-shaped ----------------------
+//
+// Grammar §4.3's one surface in both classes: a `workspace:` reference resolves
+// into the expression's **source**, inside the string literal §4.3 puts it in,
+// and what results is lexed. So the value is read back as literal text — and a
+// directory holding a backslash, a quote or a line break would be read as
+// something else entirely: `C:\repos\thing` as `C:` + CR + `epos` + TAB +
+// `hing`, `/srv/o'brien` as an unterminated literal. Neither is anything
+// `validate` could warn about (the token is still literal text there) and
+// neither is anything an author can escape, because the value is on the machine
+// rather than in the composition.
+//
+// Every one of these is a directory somebody has, and what the harness is
+// handed has to be the directory itself — which is what makes this a claim
+// about the **path**, not about a string: the run is given `run.workspace` and
+// the assertion is that it equals the environment's own value.
+{
+  const awkward = {
+    windows: "C:\\repos\\thing",
+    tab: "/srv/a\\tb",
+    quote: "/srv/o'brien",
+    double: '/srv/say"hi"',
+  };
+  const handed = {};
+  for (const [name, value] of Object.entries(awkward)) {
+    process.env["AWKWARD_WORKSPACE"] = value;
+    const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+    await runCoder(
+      binding({
+        workspace: {
+          expression: ["'", { env: "AWKWARD_WORKSPACE", site: "…workspace" }, "'"],
+        },
+      }),
+      {},
+      context(),
+      { cc: stub.driver },
+    );
+    handed[name] = stub.runs[0].workspace === value;
+  }
+  // …and the per-item spelling the ruling exists for, whose literal is only
+  // part of the expression: the reference is escaped and the concatenation
+  // beside it still runs.
+  process.env["AWKWARD_WORKSPACE"] = awkward.windows;
+  const joining = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+  await runCoder(
+    binding({
+      workspace: {
+        expression: ["'", { env: "AWKWARD_WORKSPACE", site: "…workspace" }, "/' + input.goal"],
+      },
+    }),
+    { goal: "topic" },
+    context(),
+    { cc: joining.driver },
+    { roots: inputRoot({ goal: "topic" }) },
+  );
+  results["awkwardWorkspace"] = {
+    handed,
+    joined: joining.runs[0].workspace,
+  };
+}
+
 process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);

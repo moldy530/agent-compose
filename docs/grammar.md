@@ -828,7 +828,13 @@ is most likely to guess at:
   `workspace: "'${REPO_ROOT}/' + input.branch"`. A reference written outside one
   is a syntax error rather than a substitution, and a path with nothing
   computed in it is still an expression —  `workspace: "'${REPO_ROOT}'"`, the
-  quotes being CEL's. The key is the one place this grammar asks for a value
+  quotes being CEL's. Because the reference belongs inside a literal, the value
+  is substituted **escaped for that literal**: a directory holding a backslash
+  or a quote — `C:\repos\thing`, `/srv/o'brien` — is the directory it is rather
+  than a mangled path or a parse error, which is the one thing an author cannot
+  fix from the composition, the value being on the machine. A raw literal
+  (`r'…'`) has no escapes to use, so a value that would close one is refused by
+  name at launch instead. The key is the one place this grammar asks for a value
   that is a machine fact *and* a dispatch fact at once (Decision
   [D147](#d147-a-coder-nodes-workspace-is-a-runtime-binding-and-the-shared-workspace-race-is-unwritable)).
 
@@ -9762,7 +9768,9 @@ grammar is both. So the two rules compose in the order §4.3 and §4.1 already
 state them: the refs substitute into the expression's source at process start,
 and the result is evaluated per dispatch. A reference therefore lives inside a
 CEL string literal, where `validate` reads the whole expression with the token
-still in it. The alternative — dropping `${ENV}` from the key — would have made a
+still in it, and the substituted value is **escaped for that literal** so a
+directory holding a backslash or a quote survives the lexer as itself (§4.3).
+The alternative — dropping `${ENV}` from the key — would have made a
 machine-dependent root unwritable, which is a second thing given up that this
 ruling does not give up.
 
