@@ -59,7 +59,7 @@ use crate::diag::{Span, Spanned};
 use crate::ir::Ir;
 use crate::ir::binding::NodeInput;
 use crate::ir::definition::{Agent, DefinitionBody};
-use crate::ir::flow::{Flow, MapDispatch, NodeKind};
+use crate::ir::flow::{Flow, Map, MapDispatch, NodeKind};
 
 use super::Ctx;
 
@@ -322,14 +322,22 @@ pub(crate) struct Dispatch<'a> {
     pub(crate) target: &'a Address,
     /// The per-item binding, absent where the whole item is the input.
     pub(crate) input: Option<&'a NodeInput>,
+    /// `max_concurrency:` as this dispatch really has it: the route's where the
+    /// route tightens it, the map's otherwise (grammar 8.6 rule 1).
+    ///
+    /// The **effective** value rather than the map's, because the rule that
+    /// reads it is about how many of this dispatch can be in flight at once
+    /// (PRD resolved q61 ruling b) — and a route may only tighten.
+    pub(crate) concurrency: i64,
 }
 
 /// Every dispatch of a `map` block, in declaration order.
-pub(crate) fn dispatches(dispatch: &MapDispatch) -> Vec<Dispatch<'_>> {
-    match dispatch {
+pub(crate) fn dispatches(map: &Map) -> Vec<Dispatch<'_>> {
+    match &map.dispatch {
         MapDispatch::Homogeneous { node, input, .. } => vec![Dispatch {
             target: &node.value,
             input: input.as_ref(),
+            concurrency: map.max_concurrency,
         }],
         MapDispatch::Routed {
             routes, default, ..
@@ -339,6 +347,7 @@ pub(crate) fn dispatches(dispatch: &MapDispatch) -> Vec<Dispatch<'_>> {
             .map(|route| Dispatch {
                 target: &route.node.value,
                 input: route.input.as_ref(),
+                concurrency: route.max_concurrency.unwrap_or(map.max_concurrency),
             })
             .collect(),
     }
@@ -384,6 +393,13 @@ pub(crate) struct Frame<'a> {
     pub(crate) dispatcher: String,
     /// The dispatching map node's span.
     pub(crate) span: Span,
+    /// How many of this dispatch may be in flight at once
+    /// ([`Dispatch::concurrency`]), carried inward unchanged through the
+    /// `flow:` nodes below it: an instance nested inside a dispatched one runs
+    /// once per dispatch of the outermost, so the bound that decides whether
+    /// two of *it* overlap is the dispatch's (grammar 8.6 rule 1, PRD resolved
+    /// q61 ruling b).
+    pub(crate) concurrency: i64,
 }
 
 /// Every flow instance any `map` in the composition dispatches, directly or
@@ -403,7 +419,7 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
                 .item_binding
                 .as_ref()
                 .map_or("item", |binding| binding.value.as_str());
-            for dispatch in dispatches(&map.dispatch) {
+            for dispatch in dispatches(map) {
                 if dispatch.target.namespace != Namespace::Flow {
                     continue;
                 }
@@ -424,6 +440,7 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
                         bound_at,
                         dispatcher: dispatcher.clone(),
                         span: node.span.clone(),
+                        concurrency: dispatch.concurrency,
                     },
                 );
             }
@@ -486,6 +503,7 @@ fn push_frame<'a>(
         let derived = frame.derived.clone();
         let dispatcher = frame.dispatcher.clone();
         let span = frame.span.clone();
+        let concurrency = frame.concurrency;
         frames.push(frame);
         pending.push(Step::Leave(address));
         let mut nested_frames = Vec::new();
@@ -525,6 +543,7 @@ fn push_frame<'a>(
                 bound_at,
                 dispatcher: dispatcher.clone(),
                 span: span.clone(),
+                concurrency,
             }));
         }
         nested_frames.reverse();

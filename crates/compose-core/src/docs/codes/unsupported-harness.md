@@ -40,7 +40,7 @@ flow.fix:
       coder:
         harness: deepagents
         model: model.smart
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Fix the failing test, then say what you changed.
         output:
           summary: { type: string }

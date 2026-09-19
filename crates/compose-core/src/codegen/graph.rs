@@ -120,7 +120,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::common::{Address, ControlTarget, EdgeSource, EdgeTarget, Interpolated, Literal};
 use crate::ast::definition::{Builtin, ProviderKind};
-use crate::ast::flow::{FlowContext, Harness, WorkspaceAccess};
+use crate::ast::flow::{CoderWorkspace, FlowContext, Harness, WorkspaceAccess};
 // The SCC decomposition grammar 7.4 is checked over, reused rather than
 // reimplemented: the ceiling below is sized from the same clause-1 reading the
 // validator applies, and two readings of one rule is how they come to disagree.
@@ -2341,8 +2341,12 @@ fn activity(
         // reaches the vendor's SDK through, handed in rather than imported so
         // `src/runtime.ts` stays byte-identical in a project with no coder node
         // (grammar 8.9, PRD resolved q57).
+        // …and `view` beside them since PRD resolved q61: `workspace:` is an
+        // expression evaluated in this node's input scope at each dispatch, and
+        // a `workspace: fresh` directory is named by the §9.4 instance path —
+        // both of which the view is what carries (Decision D147).
         NodeKind::Coder { .. } => format!(
-            "  run: async (input, context) =>\n    runtime.runCoder({}, input, context, harness.DRIVERS),\n",
+            "  run: async (input, context, view) =>\n    runtime.runCoder({}, input, context, view, harness.DRIVERS),\n",
             names.value(&format!("{address}.node.{id}.coder"))
         ),
         // The result is **not** parsed against the emitted Zod for the derived
@@ -2497,6 +2501,11 @@ fn coder_descriptor(
         names.value(&format!("{site}.coder"))
     ));
     text.push_str(&format!("  node: {},\n", names::string(&address_of_node)));
+    // …and the flow-local id beside it, which is a different string with a
+    // different job: `node` is what a message quotes and this is the frame a
+    // §9.4 instance path ends with, which is what names a `workspace: fresh`
+    // directory (Decision D147, PRD resolved q61 ruling c).
+    text.push_str(&format!("  id: {},\n", names::string(id)));
     text.push_str(&format!(
         "  harness: {},\n",
         names::string(harness.as_str())
@@ -2537,9 +2546,21 @@ fn coder_descriptor(
         "  prompt: {},\n",
         names::string(&coder.prompt.value)
     ));
+    // The **runtime binding** PRD resolved q61 made it: `fresh`, or the
+    // expression with its `${ENV}` references still in place. Both halves are
+    // the adapter's to finish — the references resolve into the expression's
+    // source and the result is evaluated against this node's own roots, at
+    // every dispatch — so what is emitted here is what the composition wrote
+    // and nothing derived from it (Decision D147).
     text.push_str(&format!(
         "  workspace: {},\n",
-        interpolation(&coder.workspace.value, &format!("{site}.workspace"))
+        match &coder.workspace.value {
+            CoderWorkspace::Fresh => "{ fresh: true }".to_string(),
+            CoderWorkspace::Expression(expression) => format!(
+                "{{ expression: {} }}",
+                interpolation(expression, &format!("{site}.workspace"))
+            ),
+        }
     ));
     text.push_str(&format!(
         "  access: {},\n",
@@ -6456,7 +6477,7 @@ flow.f:
       coder:
         harness: cc
         model: model.smart
-        workspace: /srv/checkout
+        workspace: "'/srv/checkout'"
         prompt: Do the work.
         output:
           summary: { type: string }
@@ -6552,7 +6573,7 @@ flow.f:
       coder:
         harness: cc
         model: model.smart
-        workspace: /srv/checkout
+        workspace: "'/srv/checkout'"
         access: workspace_write
 PERMISSION_MODE        prompt: Do the work.
         output:

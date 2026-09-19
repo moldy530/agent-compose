@@ -63,7 +63,7 @@ flow.review:
       coder:
         harness: codex
         model: model.reviewer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: read_only
         prompt: Read the working tree and report what it does.
         output:
@@ -125,7 +125,7 @@ flow.review:
       coder:
         harness: codex
         model: model.reviewer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: read_only
         prompt: Read the working tree and report what it does.
         output:

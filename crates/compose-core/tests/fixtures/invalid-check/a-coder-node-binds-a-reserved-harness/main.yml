@@ -28,7 +28,7 @@ flow.main:
       coder:
         harness: deepagents
         model: model.smart
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Do the work.
         output:
           summary: { type: string }

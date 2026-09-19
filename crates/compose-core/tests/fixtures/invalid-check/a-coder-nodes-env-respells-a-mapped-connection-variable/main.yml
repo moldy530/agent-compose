@@ -33,7 +33,7 @@ flow.main:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Fix the failing test.
         env:
           PATH: /usr/bin:/bin

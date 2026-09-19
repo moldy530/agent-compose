@@ -772,6 +772,15 @@ had done to the workspace before the crash stays done, and the second run meets
 it. That is the same statement §3.2 makes about a subprocess that wrote a file
 before its host died, one agent loop larger.
 
+**`workspace: fresh` is the one node that does not pay it**, and paying it is
+the reason: the runtime remakes that directory **empty** at the start of every
+attempt (PRD resolved q61 ruling c), because a half-clobbered workspace is
+routinely why the attempt being retried failed. Nothing about this section moves
+with it — a run's record is its structured output and its payload, and the
+directory's contents never were — so a replay neither empties the directory nor
+needs it: the emptying happens inside the effect's own slot, which a replay does
+not enter.
+
 **Harness-native resume is a named exclusion** (PRD resolved q57 ruling b). Both
 v1 harnesses can resume their *own* sessions from a store each vendor keeps, and
 this runtime does not use one. Two invariants forbid it and both are §12's
@@ -788,9 +797,20 @@ harness, the `model.*`, the id it resolved to, the model `settings:` that crosse
 into the harness and the **connection** behind that model — its provider's
 address, its `base_url:`, its credential and its `headers:`, each as written;
 the run's instructions and its rendered input; the workspace **as the author
-wrote it**; the access preset, the tool allowlist, the declared `env:` — names
-and values **as written** — and whether the run inherits the process
+wrote it** — which since PRD resolved q61 is the *expression* the directory is
+evaluated from, or the word `fresh`, rather than a path (`docs/grammar.md` §8.9,
+Decision D147); the access preset, the tool allowlist, the declared `env:` —
+names and values **as written** — and whether the run inherits the process
 environment; the harness `settings:`; and the node's `output:` schema.
+
+The workspace being the expression rather than its answer is the right identity
+for the same reason the `env:` values are: a node repointed at another checkout
+between a crash and its resume is a different run and diverges, while the same
+expression resolving to a different directory on a different machine is not —
+and a resume returns the recorded answer without re-entering the directory at
+all. A `workspace: fresh` node is the clearest case: the directory it names is
+derived from the instance path, so the dispatches a replay is catching up on are
+told apart by the effect key rather than by anything in this request.
 
 The connection is in the list for the same reason the schema below it is, one
 turn sharper: a harness run pointed at a gateway and the same run pointed at the

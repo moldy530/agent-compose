@@ -157,6 +157,67 @@ impl Harness {
     }
 }
 
+/// A `coder:` node's `workspace:` — a **runtime** binding (grammar 8.9, 4.1,
+/// Decision D147, PRD resolved q61 ruling a).
+///
+/// The key shipped as a grammar 4.3 class-2 binding — literal or `${ENV}`,
+/// fixed for the whole process — which is why a `map` over a coder node could
+/// not actually fan out: every dispatch of it named one directory, and
+/// `max_concurrency` above 1 was a data race on that directory. It is an
+/// **expression** instead, evaluated in the node's input scope at each
+/// dispatch, so a map item carries its own checkout.
+///
+/// The env refs stay, and they are resolved **first**: a value's `${NAME}`
+/// tokens are substituted into the expression's source, and what results is
+/// what CEL evaluates (grammar 4.3, and see the class table's one row that is
+/// both). That is what keeps a machine-dependent root writable —
+/// `"'${REPO_ROOT}/' + item.name"` — and what keeps `References::of` walking
+/// this key for the environment manifests (PRD resolved q41) and the launch
+/// check (q15).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CoderWorkspace {
+    /// `workspace: fresh` — one directory per dispatch, provisioned by the
+    /// runtime under the execution's scratch and named by the §9.4 instance
+    /// path (PRD resolved q61 ruling c).
+    ///
+    /// The one **word** this surface reads rather than an expression, and
+    /// there is no ambiguity in that: a bare `fresh` is not an expression this
+    /// grammar could evaluate — it names no root — so the spelling was free.
+    /// A directory really called `fresh` is the string literal `'fresh'`.
+    Fresh,
+    /// Everything else: the expression, as written.
+    Expression(Interpolated),
+}
+
+impl CoderWorkspace {
+    /// The word `fresh`, which is the whole of this surface's keyword
+    /// vocabulary.
+    pub const FRESH: &'static str = "fresh";
+
+    /// The value as the composition wrote it — `fresh`, or the expression's
+    /// own text with its `${NAME}` references unresolved.
+    ///
+    /// What every surface that quotes this key prints: a diagnostic, the graph
+    /// document (`docs/graph.md` §5.8), `plan`, and the journal's replay
+    /// identity.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Fresh => Self::FRESH,
+            Self::Expression(expression) => expression.as_str(),
+        }
+    }
+
+    /// The expression, where the value is one.
+    #[must_use]
+    pub const fn expression(&self) -> Option<&Interpolated> {
+        match self {
+            Self::Fresh => None,
+            Self::Expression(expression) => Some(expression),
+        }
+    }
+}
+
 /// What a coder node's harness may do inside its workspace (grammar 8.9,
 /// Decision D138).
 ///
@@ -305,9 +366,10 @@ pub struct CoderBlock {
     pub harness: Option<Spanned<Harness>>,
     /// `model:` — a `model.*` address, exactly as an agent node spells it.
     pub model: Option<Spanned<Address>>,
-    /// `workspace:` — the root the run works inside. **Required**, and
-    /// interpolable (grammar 4.3 class 2).
-    pub workspace: Option<Spanned<Interpolated>>,
+    /// `workspace:` — the root the run works inside. **Required**, and a
+    /// runtime binding: an expression evaluated per dispatch, or `fresh`
+    /// (grammar 4.1, 8.9, Decision D147).
+    pub workspace: Option<Spanned<CoderWorkspace>>,
     /// `access:` — the containment preset; absent means `workspace_write`.
     pub access: Option<Spanned<WorkspaceAccess>>,
     /// `permission_mode:` — the approval mode inside that containment; absent

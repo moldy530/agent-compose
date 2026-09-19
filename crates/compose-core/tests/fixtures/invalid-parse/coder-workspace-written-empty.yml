@@ -1,15 +1,24 @@
-# rule: a `coder:` node's `workspace:` is required and may not be empty (grammar 8.9, D138)
+# rule: a `coder:` node's `workspace:` is required and may not be empty (grammar 8.9, D138, D147)
 # code: invalid-value
 # message: `workspace` in the `coder` block of node `build` must not be empty
-# at: 21:20
-# help: name the directory this run works inside; an empty one would bound the harness to wherever the runtime was started instead (grammar 8.9)
+# at: 30:20
+# help: `workspace:` is an expression evaluated in this node's input scope at each dispatch, and an empty one names no directory: write the path the run works inside as a CEL string (`workspace: "'${REPO_ROOT}'"`), bind the dispatch's own (`workspace: "input.worktree"`), or write `workspace: fresh` for a directory per dispatch (grammar 8.9, Decision D147)
 #
 # The containment bound, written as no bound at all. `workspace:` is the one
-# directory a harness may author and run a program in, and an empty path is
-# whichever directory the runtime happened to be started in — so the emptiest
-# value of the key is again its most permissive, which is the shape D138
-# refuses. The runtime makes the same refusal for a `${VAR}` that resolves
-# empty; this is the literal the parser can catch first.
+# directory a harness may author and run a program in, and after PRD resolved
+# q61 it is an *expression* that names one per dispatch — so an empty value is
+# not an empty path any more, it is an expression with nothing in it. The
+# refusal survives the move and its reason moves with it: what the emptiest
+# value of the key used to mean was the most permissive one, whichever
+# directory the runtime happened to be started in, which is the shape D138
+# refuses; what it means now is a value the validator could not read as an
+# expression at all.
+#
+# This is the last thing the *parser* can say about the key. Everything else —
+# the roots it reads, and that it answers a string — is `check/coder.rs`'s,
+# because after D147 `validate` inspects the expression rather than the path's
+# text. The runtime makes the third refusal, on an expression that resolves to
+# an empty path.
 flow.main:
   outputs:
     summary: { type: string }

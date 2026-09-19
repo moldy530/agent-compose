@@ -66,7 +66,7 @@ flow.patch:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: workspace_write
         permission_mode: bypassPermissions
         prompt: Make the smallest change that satisfies the goal.
@@ -110,7 +110,7 @@ flow.patch:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         permission_mode: plan
         prompt: Read the tree and report what the change would take.
         output:
@@ -174,7 +174,7 @@ flow.patch:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: workspace_write
         permission_mode: auto
         prompt: Make the smallest change that satisfies the goal.
@@ -213,7 +213,7 @@ flow.patch:
       coder:
         harness: cc
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         access: read_only
         permission_mode: plan
         prompt: Read the tree and report what the change would take.

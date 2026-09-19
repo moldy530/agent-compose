@@ -886,6 +886,7 @@ it.
 | `sdk` | string | always | The SDK package this compiler release reached it through and the version it pinned, as `<package>@<version>`. It is what joins a trace to the `package.json` of the project that produced it. |
 | `model` | string | always | The `model.*` the composition named (grammar §12.2). |
 | `modelId` | string | always | The provider-native model id that address resolved to, which is what the harness was actually handed (grammar §8.9, Decision D141). |
+| `workspace` | string | always | **The directory this run was contained by, resolved** (grammar §8.9, Decision D147, PRD resolved q61). A `coder:` node's `workspace:` is an expression evaluated at each dispatch, so the composition's own text no longer answers which directory a run held — and for a `map` over a coder node, where the whole point is that every dispatch holds a different one, that is the first question a reader of this record has. A `workspace: fresh` run reads the directory the runtime provisioned for it, under `.agent-compose/workspaces/<execution id>/<instance path>/`. This is the **one** field of this format derived from a resolved value rather than from what the composition wrote; [§11.1](#111-secrets) names it as the exception it is. |
 | `outcome` | `"completed"` \| `"failed"` | always | Whether the run produced an answer this node went on with. `"completed"` means the answer also passed the node's `output:` gate; a run whose answer the gate refused is `"failed"`, because what the node got was not an answer it could use. There is no third member: a harness's own refusals are inside its loop and are `toolCalls` entries, not outcomes of the run. |
 | `turns` | array of [turns](#761-a-turn), possibly empty | always | The run's **top-level** turns, in the order the harness took them. Empty on a run that failed before its first turn — a harness that could not start. |
 | `toolCalls` | array of [tool events](#763-a-tool-event) | when the run made any | Its top-level tool events, in the order it made them. Never empty: a run that called nothing carries no key. |
@@ -1436,9 +1437,9 @@ The version number alone is a promise; two tests make it a checkable one:
 
 ### 11.1 Secrets
 
-**No resolved `${ENV}` value appears in this format.** Grammar §4.3 classifies
-every string surface of a composition, and the two classes that can hold one are
-kept out for different reasons.
+**No resolved `${ENV}` value appears in this format, with one named exception
+below.** Grammar §4.3 classifies every string surface of a composition, and the
+two classes that can hold one are kept out for different reasons.
 
 **Class 1 — env-ref only.** A provider's `api_key:`, a backend's `url:`, `dsn:`
 or `token:`: the whole value is one `${NAME}` reference, and nothing here is
@@ -1499,6 +1500,33 @@ opens by promising. `ToolCallRecord.program` is a third field carried verbatim
 and is in the table above rather than here, because the party that fills it is
 the **model** rather than the composition — the reason it is untrusted text and
 these two are not.
+
+**The exception, named rather than left to be found.**
+[`HarnessRecord.workspace`](#76-a-harness-run) carries a **resolved** path —
+the one field of this format that does. PRD resolved q61 made a coder node's
+`workspace:` an expression evaluated at each dispatch (grammar §8.9, Decision
+D147), and three things follow that make this the right field to bend the
+promise for and the only one:
+
+* **the composition's text stopped answering the question.** Before q61 a
+  reader with the spec in front of them knew which directory a run held; after
+  it, a map over a coder node holds a different one per dispatch, and which
+  directory a harness was contained by is the first thing a reader of a coder
+  run needs. `asWritten` would print the expression, which is in the journal's
+  replay identity already and answers something else;
+* **it is a containment bound, not a connection.** What §11.1 keeps out is where
+  traffic goes and how it authenticates — the class-1 fields, whose whole value
+  is one reference. A workspace is a directory on the machine that ran the
+  graph; an `${ENV}` inside the expression that names it is a machine root, not
+  a credential, and the secret-bearing fields of grammar §4.3's class-1 table
+  stay out of this format entirely;
+* **nothing else moved.** The journal's effect request still records the
+  workspace **as written** (`docs/durability.md` §3.9), the two restated
+  failures of §11.2 still quote the expression rather than its answer, and every
+  other field of this record is the composition's own text.
+
+A reader who ships traces somewhere a directory layout should not go has one
+field to redact, and it is named here.
 
 ### 11.2 Where a resolved value would otherwise have escaped
 

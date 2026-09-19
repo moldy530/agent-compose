@@ -40,7 +40,7 @@ flow.main:
       coder:
         harness: codex
         model: model.implementer
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Fix the failing test, then say what you changed.
         output:
           summary: { type: string }

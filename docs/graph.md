@@ -324,7 +324,7 @@ be hiding the one fact a reader most needs.
 | `harness` | `"cc"` \| `"codex"` | always | Which harness runs it. The two reserved names of grammar §15 are not members: `visualize` validates first, and `validate` refuses a composition that binds one. |
 | `model` | [model](#8-agents) | always | The `model.*` resolved exactly as an agent's is. It is always the **direct** form here: a route is refused at this position (grammar §12.2, Decision D141). |
 | `connection` | array of [connection facts](#581-a-connection-fact-that-crosses) | when the node's provider declares a fact that crosses | The provider connection this run is given, and the **slot** each fact lands in under this harness (grammar §8.9, Decision D143). In provider-key order: `base_url`, `api_key`, then each header in declaration order. Absent where the provider declares none — which is a statement, not a gap: nothing about the connection reaches the run. |
-| `workspace` | string | always | `workspace:`, exactly as written — an `${ENV}` reference reaches this document unresolved like every other (§10). |
+| `workspace` | string | always | `workspace:`, exactly as written: the **expression** the run's directory is evaluated from at each dispatch, or the word `fresh` (grammar §8.9, Decision D147). An `${ENV}` reference inside it reaches this document unresolved like every other (§10), and so does the expression around it — a document drawn from a composition says what the composition says, and which directory one dispatch held is a run's fact that [`docs/trace.md`](trace.md) §7.6 answers. `fresh` is the one value that is a word rather than an expression: the runtime provisions a directory per dispatch, named by the §9.4 instance path. |
 | `access` | `"read_only"` \| `"workspace_write"` \| `"full_access"` | always | The containment preset, **with the default materialized**: a node that omits `access:` reads `"workspace_write"` here. This document answers the question rather than leaving it (§1), and it is a containment claim, so a reader should not have to know which way the grammar's default falls. |
 | `permission_mode` | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"dontAsk"` \| `"auto"` | when the bound harness has an approval axis | The mode the run's loop approves a call under, **resolved**: a node that writes `permission_mode:` reads that mode, and a node that writes none reads the one its `access` level derives — `access`'s own materialization, one axis along. Absent under a harness whose containment is a sandbox preset and which therefore has no such axis (`codex`), where a mode drawn here would be a second bound this document invented. It sits beside `tools_enforced` for that field's reason: two nodes whose `access` reads the same are not under the same bound when one of them states a mode (grammar §8.9, Decision D146). |
 | `prompt` | string | always | The run's instructions, verbatim. |
@@ -565,6 +565,21 @@ Compatible, and made **without** a version bump:
 * carrying a field in a case this document's presence column **already** names
   and the compiler was not carrying — a bug in the implementation of this format
   rather than a change to it;
+* **the grammar of a key this document carries *as written* widening**, which is
+  a case worth stating because it looks like §9.3's "the meaning of its value"
+  and is not. [`CoderView.workspace`](#58-a-harness-run) is the worked example:
+  PRD resolved q61 made a coder node's `workspace:` an expression evaluated per
+  dispatch rather than an interpolable path (grammar §8.9, Decision D147), and
+  this field went on doing exactly what its row always said — carry that key,
+  verbatim, unresolved. A reader written against the previous version is told
+  the same thing about the same key and reads the same type; what changed is
+  what the *composition* may write there, which is the grammar's fact and not
+  one this format fixes. The distinction is the same one that keeps an
+  `${ENV}`-bearing value from being a version event: this document promises the
+  text, never what the text resolves to or what it is a text *of*. A reader that
+  had been treating the string as a filesystem path was reading a promise this
+  format never made — [`docs/trace.md`](trace.md) §7.6 is where a directory a
+  run really held is answered;
 * improving the text of a summarized field.
 
 ### 9.2.1 What version `2` changed

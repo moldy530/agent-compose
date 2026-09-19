@@ -130,6 +130,7 @@ const modelReviewer: runtime.ModelBinding = {
  */
 const flowPatchNodeImplementCoder: runtime.HarnessBinding = {
   node: "flow.patch.implement",
+  id: "implement",
   harness: "cc",
   model: "model.implementer",
   modelId: "claude-sonnet-4-5",
@@ -145,7 +146,7 @@ const flowPatchNodeImplementCoder: runtime.HarnessBinding = {
     ],
   },
   prompt: "You are implementing one change in a repository you have been given.\nMake the smallest change that satisfies the goal, run the test suite,\nand report what you touched.\n",
-  workspace: [{ env: "REPO_ROOT", site: "flow.patch.node.implement.workspace" }],
+  workspace: { expression: ["'", { env: "REPO_ROOT", site: "flow.patch.node.implement.workspace" }, "'"] },
   access: "workspace_write",
   allowTools: ["Bash", "Edit", "Glob", "Grep", "Read", "Write"],
   env: [
@@ -200,8 +201,8 @@ const flowPatchNodeImplement: runtime.NodeDescriptor = {
     "goal": runtime.toJson(runtime.evaluate("input.goal", roots)),
     "feedback": runtime.toJson(runtime.evaluate("state.feedback", roots)),
   }),
-  run: async (input, context) =>
-    runtime.runCoder(flowPatchNodeImplementCoder, input, context, harness.DRIVERS),
+  run: async (input, context, view) =>
+    runtime.runCoder(flowPatchNodeImplementCoder, input, context, view, harness.DRIVERS),
   writes: [
     { field: "summary", channel: "summary", reduce: "set" },
   ],
@@ -215,6 +216,7 @@ const flowPatchNodeImplement: runtime.NodeDescriptor = {
  */
 const flowPatchNodeReviewCoder: runtime.HarnessBinding = {
   node: "flow.patch.review",
+  id: "review",
   harness: "codex",
   model: "model.reviewer",
   modelId: "gpt-5-codex",
@@ -227,7 +229,7 @@ const flowPatchNodeReviewCoder: runtime.HarnessBinding = {
     credential: [{ env: "OPENAI_API_KEY", site: "provider.openai.api_key" }],
   },
   prompt: "You are reviewing a change somebody else just made in this repository.\nRead the working tree, decide whether it satisfies the goal, and say\nwhat would have to change if it does not.\n",
-  workspace: [{ env: "REPO_ROOT", site: "flow.patch.node.review.workspace" }],
+  workspace: { expression: ["'", { env: "REPO_ROOT", site: "flow.patch.node.review.workspace" }, "'"] },
   access: "read_only",
   allowTools: ["command_execution"],
   env: [
@@ -276,8 +278,8 @@ const flowPatchNodeReview: runtime.NodeDescriptor = {
     "goal": runtime.toJson(runtime.evaluate("input.goal", roots)),
     "summary": runtime.toJson(runtime.evaluate("state.summary", roots)),
   }),
-  run: async (input, context) =>
-    runtime.runCoder(flowPatchNodeReviewCoder, input, context, harness.DRIVERS),
+  run: async (input, context, view) =>
+    runtime.runCoder(flowPatchNodeReviewCoder, input, context, view, harness.DRIVERS),
   writes: [
     { field: "feedback", channel: "feedback", reduce: "set" },
   ],

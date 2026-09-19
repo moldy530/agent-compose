@@ -558,6 +558,17 @@ const GRAMMAR: &[Check] = &[
         evidence: Evidence::Fixture,
     },
     Check {
+        // PRD resolved q61 ruling b, and the row is one rule at two strengths
+        // because the ruling is: the dispatch half is decided from the
+        // composition and refused, and the concurrent-pair half is decided from
+        // two written values and warned about, since equality of `${ENV}`-bearing
+        // values is a launch fact.
+        rule: "two harness runs that can be in flight at once are not contained by one directory: a `map`-dispatched `coder:` node's `workspace:` reads the per-dispatch scope or the map is serial, and two coder nodes on concurrent branches do not write one workspace (8.9, 8.6, D147)",
+        pass: "check/coder.rs, over check/reach.rs and check/convergence.rs",
+        codes: &["shared-workspace"],
+        evidence: Evidence::Fixture,
+    },
+    Check {
         rule: "every CEL surface: roots, paths, constructs, and result type (4.1)",
         pass: "cel/mod.rs, over check/expr.rs",
         codes: &[

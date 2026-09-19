@@ -208,6 +208,68 @@ pub(crate) fn check<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>) {
     concurrent(ctx, cx, graph, &pairs);
 }
 
+/// Which of a handful of nodes can run **concurrently** with which
+/// (grammar 7.6.1).
+///
+/// [`concurrent`] below asks this question of every pair of *writers* and is
+/// written for that scale — a bitset over the writers, an examined-pair matrix,
+/// one cross per branch pair. This answers it for a named few instead, and the
+/// caller is PRD resolved q61 ruling b's second half: two `coder:` nodes that
+/// may be in flight at once and name one workspace are two harnesses in one
+/// directory. A flow has a handful of coder nodes and no bound on its writers,
+/// so the two callers want different shapes of the same relation, and the
+/// relation is stated once — here, beside the rule it was written for.
+///
+/// The pairs come back keyed by node index, ascending, which is the order a
+/// diagnostic names two nodes in whichever branch each was found in.
+pub(crate) fn concurrent_among<'a>(
+    ctx: &Ctx<'a>,
+    graph: &Graph<'a>,
+    of_interest: &[usize],
+) -> BTreeSet<(usize, usize)> {
+    let mut found = BTreeSet::new();
+    if of_interest.len() < 2 {
+        return found;
+    }
+    let interest: BTreeSet<usize> = of_interest.iter().copied().collect();
+    let mut held: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut crossed: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for pair in pairs(ctx, graph) {
+        let Some((near, far)) = branches(graph, &pair) else {
+            continue;
+        };
+        if !crossed.insert((near.min(far), near.max(far))) {
+            continue;
+        }
+        // The two **entries** run in one step whatever else is true of them,
+        // which is [`entries_race`]'s rule read for this relation: grammar
+        // 7.6's step rule puts the targets of every edge taken in step *k* into
+        // step *k+1* together, so the reachability test below cannot say
+        // otherwise about the pair the fork itself scheduled.
+        if interest.contains(&near) && interest.contains(&far) {
+            found.insert((near.min(far), near.max(far)));
+        }
+        for entry in [near, far] {
+            held.entry(entry).or_insert_with(|| {
+                graph
+                    .reachable_through(entry)
+                    .into_iter()
+                    .filter(|node| interest.contains(node))
+                    .collect()
+            });
+        }
+        for one in &held[&near] {
+            for other in &held[&far] {
+                if one == other || sequential(graph, *one, *other) {
+                    continue;
+                }
+                found.insert(((*one).min(*other), (*one).max(*other)));
+            }
+        }
+    }
+    found
+}
+
 /// Every co-takeable pair of every fork (grammar 7.6.1, Decision D99).
 fn pairs<'a>(ctx: &Ctx<'a>, graph: &Graph<'a>) -> Vec<Pair> {
     let mut pairs = Vec::new();

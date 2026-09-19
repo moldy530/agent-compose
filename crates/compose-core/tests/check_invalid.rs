@@ -98,6 +98,7 @@ const CHECK_CODES: &[&str] = &[
     "widening-permission-mode",
     "unknown-harness-setting",
     "reserved-harness-setting",
+    "shared-workspace",
     "unsupported-connection-fact",
     "unsupported-provider-kind",
     "conflicting-connection-variable",

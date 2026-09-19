@@ -67,8 +67,9 @@
 //! `plan` report, and the graph document's `tools_enforced`) rather than warning
 //! about a composition that is doing exactly what its author wrote.
 
-use crate::ast::common::Literal;
+use crate::ast::common::{Cel, Literal};
 use crate::ast::flow::{Harness, PermissionMode, WorkspaceAccess};
+use crate::cel::ty::Type;
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::harness::{
     Answered, ConnectionFact, ReservedHit, ReservedSpelling, Slot, admitted, declared,
@@ -80,6 +81,8 @@ use crate::ir::definition::{DefinitionBody, Model, Provider};
 use crate::ir::flow::{Coder, Node};
 use crate::parse::reader::{article, list, suggest};
 
+use super::graph::Graph;
+use super::reach;
 use super::{Ctx, FlowCx};
 
 /// What one curated `settings:` key may hold (Decision D140's first tier).
@@ -151,6 +154,11 @@ const fn table(harness: Harness) -> &'static [(&'static str, Shape)] {
 /// Check one `coder:` node.
 pub(crate) fn coder_node(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, node: &Node, coder: &Coder) {
     let subject = format!("`{}` node `{}`", cx.address, node.id.value);
+    // Before the harness, because it is about neither: `workspace:` is an
+    // expression over this node's own input scope, and whether it reads what it
+    // has to is a question about the flow rather than about the SDK behind the
+    // node (Decision D147, PRD resolved q61 ruling a).
+    workspace(ctx, cx, &subject, coder);
     if !harness_ships(ctx, &subject, coder) {
         return;
     }
@@ -158,6 +166,67 @@ pub(crate) fn coder_node(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, node: &Node, coder:
     connection(ctx, &subject, coder);
     permission_mode(ctx, &subject, coder);
     settings(ctx, &subject, coder);
+}
+
+/// The directory one dispatch of this run works inside (PRD resolved q61
+/// ruling a, Decision D147).
+///
+/// The key is a **runtime binding** since resolved q61: an expression the
+/// node's own input scope is evaluated against, which is grammar 4.1's
+/// "node `input:` bindings" row read for a key that is not an input binding.
+/// What is left to check is what is left to check of any expression — its roots,
+/// its constructs, and that it evaluates to a **string**, because a path is one
+/// — and that is the whole of it: `validate` no longer inspects the path's
+/// text, which is the trade every runtime binding makes (grammar 4.1).
+///
+/// `workspace: fresh` is checked by nothing here. It is a word rather than an
+/// expression, and the directory it names is the runtime's to provision
+/// (ruling c).
+fn workspace(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, subject: &str, coder: &Coder) {
+    let Some(expression) = coder.workspace.value.expression() else {
+        return;
+    };
+    // The one spelling every composition written before resolved q61 has, and
+    // the one the CEL front-end could only report as a syntax error: an
+    // env-ref **value** — `workspace: ${REPO_ROOT}` — is not an expression, it
+    // is the path that expression would have to produce. Answered with the
+    // repair rather than with a parse error naming a character, because a
+    // message an author cannot act on is the failure mode resolved q22 is
+    // about (PRD G3).
+    if let [name] = expression.references.as_slice()
+        && expression.as_str() == format!("${{{name}}}")
+    {
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::InvalidExpression,
+                coder.workspace.span.clone(),
+                format!(
+                    "`workspace: ${{{name}}}` of {subject} is a path where an expression \
+                     is written"
+                ),
+            )
+            .with_help(format!(
+                "`workspace:` is evaluated in this node's input scope at each dispatch, so a \
+                 path has to be written as one: `workspace: \"'${{{name}}}'\"` is that same \
+                 directory as a CEL string, and the reference still resolves from the \
+                 environment. What the expression buys is the dispatch — \
+                 `workspace: \"'${{{name}}}/' + input.branch\"` gives a map item its own \
+                 checkout, and `workspace: fresh` takes one the runtime provisions per \
+                 dispatch (grammar 4.1, 8.9, Decision D147, PRD resolved q61 ruling a)"
+            )),
+        );
+        return;
+    }
+    let written = Spanned::new(Cel::new(expression.as_str()), coder.workspace.span.clone());
+    let scope = super::expr::flow_scope(ctx, cx, "a `coder:` node's `workspace:`");
+    let analysis = super::expr::analyze(ctx, &written, &scope);
+    super::expr::expect(
+        ctx,
+        &written,
+        &analysis,
+        &Type::String,
+        &format!("`workspace:` of {subject}"),
+    );
 }
 
 /// The approval mode the run's loop works under (PRD resolved q60 ruling a,
@@ -1080,6 +1149,169 @@ fn check_shape(
     }
 }
 
+/// The race PRD resolved q61 ruling b makes unwritable: a coder node a `map`
+/// dispatches concurrently whose `workspace:` names one directory for every
+/// item.
+///
+/// A coder node lives inside a `flow.*` (grammar 8.9), so it is inside a
+/// fan-out exactly when that flow is a dispatch target — directly or through
+/// the `flow:` nodes below one — which is the relation [`reach::frames`]
+/// already computes for grammar 11.4's store keys. What a frame carries is what
+/// this rule needs twice over: which of the instance's input fields are
+/// **item-derived** at that site, and how many dispatches of it may be in
+/// flight at once.
+///
+/// The test is [`reach::is_item_derived`], the same predicate a store key is
+/// held to (Decision D83): an expression reads the per-dispatch scope when it
+/// reads the dispatch's own `execution.item_index`, or an `input.<field>` the
+/// map bound from the item. Everything else — a literal path, an `${ENV}`
+/// reference, a `state` channel every instance shares — is one directory for
+/// the whole fan-out, which is the field report this ruling comes from: the
+/// dispatches clobber each other's checkout and `max_concurrency` was a lie.
+///
+/// Two ways out of the rule, and both are statements rather than escapes.
+/// `max_concurrency: 1` says the runs are serial, and the refusal lifts because
+/// there is no longer a race to have. `workspace: fresh` satisfies it by
+/// construction — the runtime provisions a directory per dispatch — and never
+/// reaches this check at all, having no expression to read.
+///
+/// **The boundary is [`reach::frames`]'s own**: derivation travels inward
+/// through `flow:` nodes and stops at an agent's `flow.*` tool, because a model
+/// decides whether and when to call one and no static rule can put that call
+/// inside a dispatch. A coder node reached only that way is outside this rule,
+/// exactly as a store node reached only that way is outside grammar 11.4's.
+pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
+    let mut reported = Vec::new();
+    for frame in reach::frames(ctx) {
+        // A serial dispatch is a statement the author made, and it is the
+        // second repair this rule's message offers: one run at a time is one
+        // run in the directory at a time (grammar 8.6 rule 1).
+        if frame.concurrency <= 1 {
+            continue;
+        }
+        for node in &frame.flow.nodes {
+            let crate::ir::flow::NodeKind::Coder { coder } = &node.kind else {
+                continue;
+            };
+            let Some(expression) = coder.workspace.value.expression() else {
+                continue;
+            };
+            if reach::is_item_derived(expression.as_str(), None, &frame.derived) {
+                continue;
+            }
+            reported.push((
+                format!("`{}` node `{}`", frame.address, node.id.value),
+                coder.workspace.span.clone(),
+                frame.dispatcher.clone(),
+                frame.span.clone(),
+                frame.concurrency,
+                expression.as_str().to_string(),
+            ));
+        }
+    }
+    for (subject, at, dispatcher, dispatched_at, concurrency, expression) in reported {
+        ctx.push(
+            Diagnostic::error(
+                DiagnosticCode::SharedWorkspace,
+                at,
+                format!(
+                    "{subject} is dispatched by {dispatcher} with `max_concurrency: \
+                     {concurrency}`, and its `workspace:` is one directory for every dispatch"
+                ),
+            )
+            .with_label(dispatched_at, "the fan-out is issued here")
+            .with_help(format!(
+                "a harness run is contained by its `workspace:`, so {concurrency} dispatches \
+                 sharing `{expression}` are {concurrency} coding agents editing one checkout \
+                 and overwriting each other's work. Two repairs, and each says something \
+                 different about the graph: bind the item's own path — carry it on the \
+                 dispatch (`input: {{ worktree: \"item.worktree\" }}`) and read it here \
+                 (`workspace: \"input.worktree\"`), or write `workspace: fresh` for a directory \
+                 the runtime provisions per dispatch — or declare `max_concurrency: 1` on the \
+                 map, which says these runs are serial. `workspace:` is evaluated in this \
+                 node's input scope at every dispatch precisely so the first repair is \
+                 writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 ruling b)"
+            )),
+        );
+    }
+}
+
+/// The same collision one construct along: two coder nodes that may be in
+/// flight at once and name one directory (PRD resolved q61 ruling b).
+///
+/// A **warning**, and the entry says why rather than pretending otherwise:
+/// what decides this is whether the two expressions resolve to one directory,
+/// and a value bearing an `${ENV}` reference resolves at launch. Two values
+/// that differ statically may be one path on the machine that runs them, and
+/// this compiler cannot see that — so what it can see, two values that are
+/// **written** identically, is reported as the thing it is: a collision worth a
+/// second look rather than a fact worth refusing a build over.
+///
+/// `workspace: fresh` is never one of these, and not by exemption: the
+/// directory it names is the §9.4 instance path, and two nodes of one flow have
+/// two node ids, so two `fresh` nodes are two directories by construction
+/// (ruling c).
+pub(crate) fn concurrent_workspaces(ctx: &mut Ctx<'_>, cx: &FlowCx<'_>, graph: &Graph<'_>) {
+    let coders: Vec<usize> = (0..graph.nodes().len())
+        .filter(|at| {
+            matches!(&graph.node(*at).kind,
+                crate::ir::flow::NodeKind::Coder { coder }
+                    if coder.workspace.value.expression().is_some())
+        })
+        .collect();
+    let mut reported = Vec::new();
+    for (one, other) in super::convergence::concurrent_among(ctx, graph, &coders) {
+        let (Some(first), Some(second)) = (coder_of(graph.node(one)), coder_of(graph.node(other)))
+        else {
+            continue;
+        };
+        if first.workspace.value != second.workspace.value {
+            continue;
+        }
+        reported.push((
+            graph.id(one).to_string(),
+            graph.id(other).to_string(),
+            first.workspace.span.clone(),
+            second.workspace.span.clone(),
+            first.workspace.value.as_str().to_string(),
+        ));
+    }
+    for (one, other, first, second, expression) in reported {
+        ctx.push(
+            Diagnostic::warning(
+                DiagnosticCode::SharedWorkspace,
+                second,
+                format!(
+                    "nodes `{one}` and `{other}` of `{}` can run concurrently and their \
+                     `workspace:` is written the same way",
+                    cx.address
+                ),
+            )
+            .with_label(first, "the other run is contained here")
+            .with_help(format!(
+                "two edges of one fork that are not provably exclusive can both fire, so the \
+                 branches they start are concurrent — and two harness runs inside one directory \
+                 edit each other's files. `{expression}` is one expression over one scope, so \
+                 both runs resolve it to one path. Give one of them a directory of its own, or \
+                 write `workspace: fresh` on each for a directory the runtime provisions per \
+                 dispatch. A **warning** rather than a refusal because equality here is a \
+                 launch fact: a value bearing an `${{ENV}}` reference resolves on the machine \
+                 that runs it, so two values this compiler reads as different may still be one \
+                 directory, and two it reads as the same is the half it can see (grammar 7.6.1, \
+                 8.9, Decision D147, PRD resolved q61 ruling b)"
+            )),
+        );
+    }
+}
+
+/// The `coder:` block of a node, where the node is one.
+fn coder_of(node: &Node) -> Option<&Coder> {
+    match &node.kind {
+        crate::ir::flow::NodeKind::Coder { coder } => Some(coder),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DiagnosticCode, Harness, table};
@@ -1153,7 +1385,7 @@ mod tests {
 provider.p:\n  kind: anthropic\n  api_key: ${{K}}\n\
 model.m:\n  provider: provider.p\n  id: some-model\n\
 state:\n  summary: {{ type: string, default: \"\" }}\n\
-flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: /srv/checkout\n        access: {access}\n        permission_mode: {mode}\n        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: \"'/srv/checkout'\"\n        access: {access}\n        permission_mode: {mode}\n        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
             )
         };
 
@@ -1247,7 +1479,7 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
 {provider}\
 model.m:\n  provider: provider.p\n  id: some-model\n\
 state:\n  summary: {{ type: string, default: \"\" }}\n\
-flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: {harness}\n        model: model.m\n        workspace: /srv/checkout\n        prompt: Do the work.\n        env:\n          {variable}: ${{HELD}}\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: {harness}\n        model: model.m\n        workspace: \"'/srv/checkout'\"\n        prompt: Do the work.\n        env:\n          {variable}: ${{HELD}}\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
             )
         };
 
@@ -1354,7 +1586,7 @@ flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n 
 provider.gateway:\n  kind: anthropic\n  base_url: ${GATEWAY_URL}\n  api_key: ${GATEWAY_KEY}\n\
 model.m:\n  provider: provider.gateway\n  id: some-model\n\
 state:\n  summary: { type: string, default: \"\" }\n\
-flow.main:\n  outputs:\n    summary: { type: string }\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: /srv/checkout\n        prompt: Do the work.\n        env:\n          PATH: /usr/bin:/bin\n          ANTHROPIC_AUTH_TOKEN: ${SOMEONE_ELSES_TOKEN}\n          CLAUDE_CODE_USE_BEDROCK: \"1\"\n          ANTHROPIC_BEDROCK_BASE_URL: ${ELSEWHERE}\n        output:\n          summary: { type: string }\n      input: \"'go'\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: end }\n";
+flow.main:\n  outputs:\n    summary: { type: string }\n  nodes:\n    build:\n      coder:\n        harness: cc\n        model: model.m\n        workspace: \"'/srv/checkout'\"\n        prompt: Do the work.\n        env:\n          PATH: /usr/bin:/bin\n          ANTHROPIC_AUTH_TOKEN: ${SOMEONE_ELSES_TOKEN}\n          CLAUDE_CODE_USE_BEDROCK: \"1\"\n          ANTHROPIC_BEDROCK_BASE_URL: ${ELSEWHERE}\n        output:\n          summary: { type: string }\n      input: \"'go'\"\n  edges:\n    - { from: start, to: build }\n    - { from: build, to: end }\n";
 
         let held = crate::check(&ir_of(composition));
         assert_eq!(
@@ -1436,7 +1668,7 @@ flow.main:\n  outputs:\n    summary: { type: string }\n  nodes:\n    build:\n   
 {provider}\
 model.m:\n  provider: provider.p\n  id: some-model\n\
 state:\n  summary: {{ type: string, default: \"\" }}\n\
-flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: {harness}\n        model: model.m\n        workspace: /srv/checkout\n        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
+flow.main:\n  outputs:\n    summary: {{ type: string }}\n  nodes:\n    build:\n      coder:\n        harness: {harness}\n        model: model.m\n        workspace: \"'/srv/checkout'\"\n        prompt: Do the work.\n        output:\n          summary: {{ type: string }}\n      input: \"'go'\"\n  edges:\n    - {{ from: start, to: build }}\n    - {{ from: build, to: end }}\n"
                 );
                 let held = crate::check(&ir_of(&composition));
                 assert_eq!(held.len(), 1, "{kind} under {harness}: {held:#?}");

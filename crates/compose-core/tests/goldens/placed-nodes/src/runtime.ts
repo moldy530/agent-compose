@@ -7869,6 +7869,28 @@ export type HarnessName = "cc" | "codex";
 export type WorkspaceAccess = "read_only" | "workspace_write" | "full_access";
 
 /**
+ * Where one dispatch of a harness run works (grammar 8.9, Decision D147, PRD
+ * resolved q61 ruling a).
+ *
+ * A **runtime binding**, which is the whole of ruling a: the key used to be a
+ * class-2 string fixed for the process, so every dispatch of a `map` over a
+ * coder node named one directory and `max_concurrency` above 1 was a race on a
+ * checkout. Two forms now, and [`resolveHarnessWorkspace`] is where each is
+ * turned into a path:
+ *
+ *  * `expression` — the composition's own text, with its `${ENV}` references
+ *    still in place. They resolve into the expression's **source** and the
+ *    result is evaluated against this node's roots, at each dispatch, so
+ *    `"'${REPO_ROOT}/' + input.branch"` is a directory per item;
+ *  * `fresh` — no expression at all: the runtime provisions one per dispatch
+ *    under the execution's own scratch, named by the §9.4 instance path
+ *    (ruling c).
+ */
+export type HarnessWorkspace =
+  | { readonly fresh: true }
+  | { readonly expression: readonly Interpolation[] };
+
+/**
  * How a harness approves a call **inside** that reach (grammar 8.9, D146).
  *
  * The second axis, and only one harness has one: these are the Claude Agent
@@ -7919,6 +7941,18 @@ export interface HarnessRecord {
   readonly model: string;
   /** The provider-native model id the adapter handed the harness. */
   readonly modelId: string;
+  /**
+   * The directory this run was contained by, **resolved** (PRD resolved q61).
+   *
+   * The one field of this format derived from a value the run time produced,
+   * and the ruling says why: after resolved q61 a `workspace:` is an expression
+   * evaluated per dispatch, so the composition's own text no longer answers
+   * "which directory did this run hold" — and for a map over a coder node,
+   * where every dispatch holds a different one, that is the first question a
+   * reader of the trace has. `docs/trace.md` §11.1 names it as the exception it
+   * is.
+   */
+  readonly workspace: string;
   /** How the run ended. */
   readonly outcome: "completed" | "failed";
   /** The run's **top-level** turns, in the order the harness took them. */
@@ -8034,10 +8068,20 @@ export interface HarnessBinding {
    * and each driver maps them into its own SDK's connection surface.
    */
   readonly connection: HarnessConnectionBinding;
+  /**
+   * The node's **flow-local id**, which is the frame its §9.4 instance path
+   * ends with ([`instancePath`]).
+   *
+   * [`node`] above is `<flow address>.<node id>` and is what a message quotes;
+   * this is the id on its own, because a `workspace: fresh` directory is named
+   * by the instance path and an instance path is built from frames rather than
+   * from an address (PRD resolved q61 ruling c).
+   */
+  readonly id: string;
   /** `prompt:` — the run's instructions, literal (grammar 5.2). */
   readonly prompt: string;
-  /** `workspace:` — interpolable, resolved at the call (grammar 4.3 class 2). */
-  readonly workspace: readonly Interpolation[];
+  /** `workspace:` — the runtime binding of PRD resolved q61 ruling a. */
+  readonly workspace: HarnessWorkspace;
   /** `access:` — with grammar 8.9's default already applied. */
   readonly access: WorkspaceAccess;
   /**
@@ -8459,6 +8503,89 @@ export function harnessRecordOf(error: unknown): HarnessRecord | undefined {
   return undefined;
 }
 
+/**
+ * The directory **this dispatch** of a harness run works in (grammar 8.9,
+ * Decision D147, PRD resolved q61).
+ *
+ * Two forms, and the order the first one resolves in is the whole of how
+ * grammar 4.3 and grammar 4.1 compose on the one surface that is both:
+ *
+ *  1. the `${ENV}` references substitute into the expression's **source**,
+ *     which is class 2's own rule ("substituted at process start") reaching a
+ *     value that happens to be an expression;
+ *  2. the result is evaluated against this node's roots — `input`, `state`,
+ *     `execution`, already bound by [`runNode`] — which is what makes the
+ *     answer a property of the *dispatch* rather than of the process.
+ *
+ * `fresh` is the other form and takes neither step: the directory is the
+ * execution's own scratch plus this node's §9.4 instance path, which is
+ * deterministic, distinct per dispatch by construction, and swept with the rest
+ * of the execution's scratch when the run settles ([`releaseWorkspaces`]).
+ *
+ * The two refusals are the ones a `builtin:` workspace already makes, moved one
+ * step later: a value that is not a string at all, and one that is empty. An
+ * empty path is the directory the runtime happened to be started in, and a
+ * bound nobody wrote is not a bound. Both quote the expression **as written**,
+ * never as it resolved (`docs/trace.md` §11.1).
+ */
+function resolveHarnessWorkspace(binding: HarnessBinding, view: NodeView): string {
+  if ("fresh" in binding.workspace) {
+    // The layout ruling c names, computed and not created:
+    // `.agent-compose/workspaces/<execution>/<instance path>`. Deciding the
+    // path touches nothing, which is what lets it happen out here where the
+    // run is assembled; the directory itself is made inside the journaled slot
+    // ([`provisionFreshWorkspace`]), because making one is an effect and a
+    // replay performs none.
+    return path.join(
+      dataRoot(),
+      "workspaces",
+      view.run.execution.id,
+      ...instancePath(view, binding.id),
+    );
+  }
+  const written = asWritten(binding.workspace.expression);
+  const answer = evaluate(interpolate(binding.workspace.expression), view.roots);
+  if (typeof answer !== "string") {
+    throw new Error(
+      `\`${binding.node}\`'s \`workspace:\` (\`${written}\`) answered a ${typeof answer} rather than a path`,
+    );
+  }
+  if (answer === "") {
+    throw new Error(
+      `\`${binding.node}\`'s \`workspace:\` (\`${written}\`) resolved to an empty path, which is not a directory a harness run can be contained by`,
+    );
+  }
+  return answer;
+}
+
+/** A coder node's `workspace:` as the composition wrote it (see [`asWritten`]). */
+function harnessWorkspaceAsWritten(workspace: HarnessWorkspace): string {
+  return "fresh" in workspace ? "fresh" : asWritten(workspace.expression);
+}
+
+/**
+ * Make a `workspace: fresh` directory, **empty**, for one attempt (PRD resolved
+ * q61 ruling c).
+ *
+ * Removed and remade rather than merely created, and that is the ruling's own
+ * word: a retry gets an empty directory, because a half-clobbered workspace is
+ * routinely why the attempt it is retrying failed. Nothing about the journal
+ * moves with it — the workspace's contents were never the effect record, which
+ * is the structured output (resolved q57 ruling b) — so a directory emptied
+ * here costs a replay nothing.
+ */
+async function provisionFreshWorkspace(execution: string, directory: string): Promise<void> {
+  // The execution's own scratch root first, which is what puts this directory
+  // under a lifetime somebody owns: [`sharedWorkspace`] registers the
+  // execution, and [`releaseWorkspaces`] sweeps the whole tree when the run
+  // settles — the same lifetime a built-in's defaulted workspace has, and the
+  // reason ruling c puts a `fresh` directory *under* the execution's scratch
+  // rather than beside it.
+  await sharedWorkspace(execution);
+  await fs.promises.rm(directory, { recursive: true, force: true });
+  await fs.promises.mkdir(directory, { recursive: true });
+}
+
 /** The drivers a host registered, ahead of the ones `src/harness.ts` emits. */
 const HOSTED_HARNESS_DRIVERS = new Map<HarnessName, HarnessDriver>();
 
@@ -8521,6 +8648,7 @@ export async function runCoder(
   binding: HarnessBinding,
   input: unknown,
   context: RunContext,
+  view: NodeView,
   drivers: HarnessDrivers,
 ): Promise<{ output: unknown; harness: readonly HarnessRecord[] }> {
   const driver = HOSTED_HARNESS_DRIVERS.get(binding.harness) ?? drivers[binding.harness];
@@ -8531,16 +8659,7 @@ export async function runCoder(
       "this project emitted no driver for it",
     );
   }
-  const workspace = interpolate(binding.workspace);
-  if (workspace === "") {
-    // The refusal a `builtin:` workspace makes on an `${ENV}` that resolved
-    // empty, for the same reason: an empty path is the directory the runtime
-    // happened to be started in, and a bound nobody wrote is not a bound
-    // (grammar 8.9). Quoted **as written**, never resolved (§11.1).
-    throw new Error(
-      `\`${binding.node}\`'s \`workspace:\` (\`${asWritten(binding.workspace)}\`) resolved to an empty path, which is not a directory a harness run can be contained by`,
-    );
-  }
+  const workspace = resolveHarnessWorkspace(binding, view);
   const environment: Record<string, string> =
     binding.inheritEnv === true ? { ...(process.env as Record<string, string>) } : {};
   for (const entry of binding.env) environment[entry.name] = interpolate(entry.value);
@@ -8596,7 +8715,14 @@ export async function runCoder(
     connection: connectionAsWritten(binding.connection),
     instructions: binding.prompt,
     input: run.input,
-    workspace: asWritten(binding.workspace),
+    // …and the workspace **as written**, which after PRD resolved q61 is the
+    // expression rather than a path (or the word `fresh`). What identifies the
+    // effect is the composition's text, exactly as it is for `env:` above: a
+    // node repointed at another checkout between a crash and its resume
+    // diverges, while the same expression resolving to another directory on
+    // another machine does not — a resume replays an answer and never re-enters
+    // the directory (`docs/durability.md` §3.9).
+    workspace: harnessWorkspaceAsWritten(binding.workspace),
     access: binding.access,
     // …and the mode it runs under where the node states one, for `access`'s own
     // reason: a run that approves its own edits and a run that is asked about
@@ -8627,6 +8753,17 @@ export async function runCoder(
     request,
     async (): Promise<JournaledHarnessRun> => {
       try {
+        // **Inside the slot**, which is what keeps a replay off the disk: a
+        // resumed execution that finds this effect recorded returns the held
+        // answer without entering this closure at all, so the directory a
+        // completed run left is not emptied under a graph that is only
+        // catching up. And inside it means **per attempt**, which is ruling
+        // c's own word: a retry gets an empty directory, because a
+        // half-clobbered workspace is routinely why the attempt failed (PRD
+        // resolved q61 ruling c).
+        if ("fresh" in binding.workspace) {
+          await provisionFreshWorkspace(view.run.execution.id, run.workspace);
+        }
         return await performHarnessRun(binding, driver, run, stream);
       } catch (error) {
         // Kept as a **value** rather than through the slot's error path, which
@@ -8699,6 +8836,10 @@ async function performHarnessRun(
     sdk: `${driver.sdk}@${driver.version}`,
     model: binding.model,
     modelId: binding.modelId,
+    // The path the driver was handed, which is the one the run really held:
+    // the expression's answer for this dispatch, or the directory `fresh`
+    // provisioned (PRD resolved q61).
+    workspace: run.workspace,
     outcome,
     turns,
     ...(toolCalls.length === 0 ? {} : { toolCalls }),

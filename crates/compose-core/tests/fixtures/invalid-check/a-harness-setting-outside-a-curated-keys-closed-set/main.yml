@@ -31,7 +31,7 @@ flow.main:
       coder:
         harness: codex
         model: model.smart
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Do the work.
         settings:
           web_search: sometimes

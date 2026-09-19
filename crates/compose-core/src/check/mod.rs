@@ -121,6 +121,11 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
     triggers::check(&mut ctx);
     stores::check_session_scope(&mut ctx);
     stores::check_map_writes(&mut ctx);
+    // The unwritable race (PRD resolved q61 ruling b): stated over the dispatch
+    // sites `reach::frames` enumerates, which is the same relation the store
+    // rule above reads and for the same reason — whether a construct is inside
+    // a fan-out is a property of the whole composition.
+    coder::dispatched_workspaces(&mut ctx);
     placements::check(&mut ctx);
     placements::check_stores(&mut ctx);
     components::check(&mut ctx);
@@ -149,6 +154,10 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
         routing::check(&mut ctx, &cx, &graph);
         cycles::check(&mut ctx, &cx, &graph);
         convergence::check(&mut ctx, &cx, &graph);
+        // …and the other half of that race, which needs the same fork analysis
+        // the line above runs: two coder nodes that may be in flight at once
+        // and name one directory (PRD resolved q61 ruling b).
+        coder::concurrent_workspaces(&mut ctx, &cx, &graph);
         fanout::check(&mut ctx, &cx, &graph);
     }
 

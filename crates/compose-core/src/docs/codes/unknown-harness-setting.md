@@ -62,7 +62,7 @@ flow.fix:
       coder:
         harness: cc
         model: model.smart
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Fix the failing test, then say what you changed.
         settings:
           max_turn: 40
@@ -119,7 +119,7 @@ flow.fix:
       coder:
         harness: cc
         model: model.smart
-        workspace: ${REPO_ROOT}
+        workspace: "'${REPO_ROOT}'"
         prompt: Fix the failing test, then say what you changed.
         settings:
           max_turns: 40

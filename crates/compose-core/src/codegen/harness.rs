@@ -982,7 +982,7 @@ flow.f:
       coder:
         harness: {}
         model: model.m
-        workspace: /srv/checkout
+        workspace: \"'/srv/checkout'\"
         access: full_access
         prompt: Do the work.
         output:

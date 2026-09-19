@@ -386,6 +386,9 @@ fn coder(source: &ast_flow::CoderBlock) -> Option<ir::flow::Coder> {
     Some(ir::flow::Coder {
         harness: source.harness.clone()?,
         model: source.model.clone()?,
+        // The expression, or `fresh`, exactly as the reader decided it: which
+        // roots it may read and what it has to evaluate to are `check::coder`'s
+        // questions, on the scope the node sits in (Decision D147).
         workspace: source.workspace.clone()?,
         access: source.access.as_ref().map(|access| access.value),
         permission_mode: source.permission_mode.clone(),

@@ -1,0 +1,71 @@
+# rule: two coder nodes on statically-concurrent branches whose `workspace:`
+# rule: values are written identically draw a warning (grammar 8.9, 7.6.1, D147)
+# code: shared-workspace
+# message: nodes `implement` and `document` of `flow.main` can run concurrently and their `workspace:` is written the same way
+# at: main.yml:60:20
+# label: main.yml:50:20 the other run is contained here
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent — and two harness runs inside one directory edit each other's files. `'${REPO_ROOT}'` is one expression over one scope, so both runs resolve it to one path. Give one of them a directory of its own, or write `workspace: fresh` on each for a directory the runtime provisions per dispatch. A **warning** rather than a refusal because equality here is a launch fact: a value bearing an `${ENV}` reference resolves on the machine that runs it, so two values this compiler reads as different may still be one directory, and two it reads as the same is the half it can see (grammar 7.6.1, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# The second site of PRD resolved q61 ruling b, and a **warning** rather than a
+# refusal. `triage` forks to both coder nodes on two unguarded edges, so both
+# always fire and grammar 7.6.1 reads the branches they start as concurrent —
+# and both nodes name the same directory, so both harness runs would be editing
+# one checkout.
+#
+# An error is withheld, and the entry says why rather than pretending
+# otherwise: what decides this is whether the two expressions resolve to one
+# directory, and a value bearing a `${ENV}` reference resolves at launch. Two
+# values this compiler reads as different may be one path on the machine that
+# runs them, so refusing on the half it can see would be claiming a fact it
+# does not have — and saying nothing would be hiding the half it does.
+#
+# The composition is otherwise clean, which is what makes the warning the whole
+# of the report: it builds, it runs, and a reader is told where to look.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.triage:
+  model: model.implementer
+  prompt: Decide what the change needs.
+  output:
+    note: { type: string }
+state:
+  summary: { type: string, default: "" }
+  notes: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    triage:
+      agent: agent.triage
+      input: "'the failing test'"
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the smallest change that satisfies the goal.
+        output:
+          summary: { type: string }
+      input: "'implement it'"
+      writes: { summary: summary }
+    document:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Bring the documentation in line with the change.
+        output:
+          notes: { type: string }
+      input: "'document it'"
+      writes: { notes: notes }
+  edges:
+    - { from: start, to: triage }
+    - { from: triage, to: implement }
+    - { from: triage, to: document }
+    - { from: implement, to: end }
+    - { from: document, to: end }

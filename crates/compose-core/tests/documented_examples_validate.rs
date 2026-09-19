@@ -175,6 +175,7 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "missing-capability",
     "missing-credential",
     "reserved-harness-setting",
+    "shared-workspace",
     "unbalanced-convergence",
     "undefined-channel",
     "unkeyed-map-write",

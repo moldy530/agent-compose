@@ -244,7 +244,7 @@ implement:
   coder:
     harness: cc                 # or `codex`
     model: model.smart          # the same registry address an agent names
-    workspace: "${REPO_ROOT}"   # required — no default
+    workspace: "'${REPO_ROOT}'" # required — an expression, per dispatch
     access: workspace_write     # read_only | workspace_write | full_access
     prompt: |
       Make the smallest change that satisfies the goal, run the tests,
@@ -268,6 +268,33 @@ they are equivalent: `access: read_only` is a sandbox under one and a permission
 mode under the other, and `prompt:` joins the harness's own instructions rather
 than replacing them either way. `deepagents` and `native` are reserved and
 refused today; `agent-compose explain unsupported-harness` is the whole story.
+
+**`workspace:` is an expression, and the quotes in the example are CEL's.** It
+is evaluated in the node's input scope — `input`, `state`, `execution` — at
+**each dispatch**, which is what makes a `map` over a coder node fan out for
+real: give the dispatch the item's own path and read it here.
+
+```yaml
+workspace: "input.worktree"                 # the item's own checkout
+workspace: "'${REPO_ROOT}/' + input.branch" # a machine root plus a dispatch fact
+workspace: "'${REPO_ROOT}'"                 # one directory, written as a literal
+workspace: fresh                            # one the runtime makes per dispatch
+```
+
+`${ENV}` still works and resolves first, into the expression's source — so put a
+reference inside a string literal and its value is a path. `fresh` is the one
+bare word: the runtime provisions
+`.agent-compose/workspaces/<execution>/<instance path>/`, empty at the start of
+every attempt, and sweeps it with the rest of the run's scratch. What `fresh`
+does *not* do is clone anything — a task that needs a checkout still has an
+upstream step that makes one.
+
+Two harness runs in one directory edit each other's files, so that is refused
+where it can be seen: a map-dispatched coder whose `workspace:` does not read
+the per-dispatch scope is an error unless the map says `max_concurrency: 1`, and
+two coder nodes on concurrent branches writing the same `workspace:` draw a
+warning naming both. `agent-compose explain shared-workspace` is the whole rule,
+including why the second one is a warning.
 
 **Read the containment paragraph before you write one.** What bounds a harness
 run is the `workspace:`, the `access:` preset, the declared `env:`, and the

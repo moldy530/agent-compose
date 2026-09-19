@@ -2233,7 +2233,7 @@ flow.f:
       coder:
         harness: cc
         model: model.m
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: full_access
         prompt: Do the work.
         output:
@@ -2245,7 +2245,7 @@ flow.f:
       coder:
         harness: cc
         model: model.m
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: read_only
         prompt: Read the work and report on it.
         output:
@@ -2256,7 +2256,7 @@ flow.f:
       coder:
         harness: codex
         model: model.o
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: read_only
         prompt: Read the work.
         output:
@@ -2266,7 +2266,7 @@ flow.f:
       coder:
         harness: codex
         model: model.o
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: full_access
         prompt: Do the work outside the sandbox.
         output:
@@ -2276,7 +2276,7 @@ flow.f:
       coder:
         harness: codex
         model: model.o
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         access: workspace_write
         prompt: Edit inside the checkout.
         output:
@@ -2286,7 +2286,7 @@ flow.f:
       coder:
         harness: cc
         model: model.m
-        workspace: ${ROOT}
+        workspace: "'${ROOT}'"
         prompt: Take the default preset.
         output:
           note: { type: string }
