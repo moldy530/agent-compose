@@ -40,6 +40,15 @@
 //! `map` nodes as well as `flow:` nodes, and a nested map's frames are recorded
 //! at the **looser** of its own bound and the one carried in.
 //!
+//! **Nor is what those concurrent instances tell apart**, which is the same
+//! observation about derivation and travels beside the bound rather than instead
+//! of it ([`Frame::per_instance`]). Item-derivation above is one map's
+//! dispatches against each other, which is all §11.4 asks of a store key; a rule
+//! about *concurrency* also has to ask whether two instances of the map can
+//! reach one value, and an item drawn from a list says nothing about that. So a
+//! nested map's frames carry both answers, and the rules that are about
+//! concurrency read both (Decision D147).
+//!
 //! Detachment needs no walk of its own. A dispatched flow instance holds its
 //! own channel values (grammar 10.1), so nothing a node inside it writes
 //! reaches the state of the flow that dispatched it; what crosses is the
@@ -476,14 +485,24 @@ pub(crate) fn coders_within<'a>(
 /// [`coders_within`]'s answers, held across the flows one pass walks.
 pub(crate) type Coders<'a> = BTreeMap<String, Rc<Vec<Contained<'a>>>>;
 
-/// The fan-out a dispatch is itself inside, where that fan-out is the looser of
-/// the two (Decision D147, PRD resolved q61 ruling b).
+/// The fan-out a dispatch is itself inside, where that fan-out runs more than
+/// one instance at a time (Decision D147, PRD resolved q61 ruling b).
 ///
 /// Carried so a diagnostic about the inner dispatch can name the bound it is
 /// really read at, and the map that states it: a message quoting
 /// `max_concurrency: 1` off the inner map while refusing it over four
 /// concurrent runs would be pointing at the line the author already wrote
 /// correctly (PRD G3).
+///
+/// Recorded whenever the enclosing fan-out is concurrent, and **not** only where
+/// it is looser than the dispatch's own bound. Two things are asked of it and
+/// they part at exactly that case: how many runs the directory holds, which the
+/// looser of the two answers ([`Frame::concurrency`]), and whether a value told
+/// apart per dispatch is told apart *between* those instances, which the
+/// enclosing bound answers however tight or loose it is
+/// ([`Frame::per_instance`]). A map fanning four ways inside a flow another map
+/// fans four ways raises nothing, and its dispatches still overlap across four
+/// concurrent instances of it.
 #[derive(Clone)]
 pub(crate) struct Enclosing {
     /// How the enclosing map is named in a diagnostic.
@@ -503,7 +522,38 @@ pub(crate) struct Frame<'a> {
     pub(crate) flow: &'a Flow,
     /// Which of this instance's input fields are item-derived at this site
     /// (Decision D83).
+    ///
+    /// **The dispatching map's own item, and nothing outside it.** A nested map
+    /// re-roots this at the item it declares, which is what grammar 11.4 asks of
+    /// a store key: a key derived from the item the write belongs to is what
+    /// keeps N items' content out of one slot, whatever fan-out the map itself
+    /// runs inside. What that leaves unanswered — whether the value differs
+    /// between two *instances* of the map — is [`Frame::per_instance`]'s
+    /// question, asked by the rules that are about concurrency.
     pub(crate) derived: BTreeMap<String, bool>,
+    /// Which of this instance's input fields take a distinct value across the
+    /// instances the **enclosing** fan-out runs, as against across the dispatches
+    /// of the map that issues this one ([`Frame::derived`]).
+    ///
+    /// The two are different questions and a nested map answers them
+    /// differently, which is the whole of why both are carried. `input: { file:
+    /// "f" }` off a map's own item is per-dispatch and says nothing at all about
+    /// the instance around it: four instances of the enclosing flow each stepping
+    /// their own files serially still put two runs in one directory the moment
+    /// two of them draw the same file name, and `src/main.rs` under two
+    /// repositories is that. A binding reading an `input.<field>` the enclosing
+    /// instance itself varies is what separates them, and it is the shape a
+    /// nested dispatch's repair takes: `input: { dir: "input.root + '/' + f" }`
+    /// (Decision D147, PRD resolved q61 ruling b).
+    ///
+    /// Every field is `true` where nothing encloses the dispatching map, and
+    /// that is the answer rather than an absence of one: with a single instance
+    /// there is nothing for a value to be distinct *between*, so no field can
+    /// fail to be. It is what lets [`push_frame`] merge two routes onto one site
+    /// by conjunction — the route that reaches a map from outside a fan-out
+    /// contributes nothing, and the one that reaches it from inside contributes
+    /// what it really found.
+    pub(crate) per_instance: BTreeMap<String, bool>,
     /// Where each of those fields was bound, for the fields a binding decided:
     /// the `input:` entry at the dispatch, or at the `flow:` node that carried
     /// derivation inward. A dispatch that passes the whole item, and a field
@@ -540,10 +590,58 @@ pub(crate) struct Frame<'a> {
     /// names that map's key, as against [`Frame::concurrency`], which is what a
     /// rule tests.
     pub(crate) declared: i64,
-    /// The fan-out this dispatch is itself inside, where that fan-out is looser
-    /// than the dispatch's own bound — which is exactly when
-    /// [`Frame::concurrency`] is not [`Frame::declared`].
+    /// The fan-out this dispatch is itself inside, where that fan-out runs more
+    /// than one instance at a time ([`Enclosing`]).
     pub(crate) enclosing: Option<Enclosing>,
+}
+
+impl Frame<'_> {
+    /// How many instances of the fan-out enclosing this dispatch can be in
+    /// flight at once — 1 where nothing encloses it, which is where
+    /// [`Frame::per_instance`] has nothing to decide.
+    pub(crate) fn instances(&self) -> i64 {
+        self.enclosing.as_ref().map_or(1, |outer| outer.concurrency)
+    }
+
+    /// Whether more than one instance of this dispatch can be in flight at
+    /// once — the condition [`Frame::per_instance`] is a real question under.
+    fn nested(&self) -> bool {
+        self.instances() > 1
+    }
+
+    /// Which of this instance's input fields take a distinct value in **every
+    /// pair of runs of it that can overlap** — the two questions above, read
+    /// together.
+    ///
+    /// Two runs of this instance differ in which dispatch of its map they are,
+    /// in which instance of the enclosing fan-out issued them, or in both — so a
+    /// field separates every such pair only when it separates both, which is the
+    /// conjunction below.
+    ///
+    /// It is read as a conjunction even where one of the two axes has a single
+    /// value on it, and deliberately: [`Frame::declared`] is one route's bound
+    /// and a site merged from several routes keeps the tightest of them, so
+    /// "this map's dispatches are serial" is not a fact this frame holds.
+    /// Answering the stricter question costs the caller nothing it is entitled
+    /// to — a field the map's own item does not derive is one the author has a
+    /// repair for either way — while answering the looser one off a bound that
+    /// belongs to a sibling route would exempt a composition from a race
+    /// refusal on a number written somewhere else (grammar 8.6 rule 1,
+    /// Decision D28).
+    ///
+    /// This is what a `map` **nested in this instance** measures its own
+    /// bindings against: the instances enclosing that map are the overlapping
+    /// runs of this frame, and what tells those apart is what its dispatches can
+    /// inherit (Decision D147, PRD resolved q61 ruling b).
+    fn varies(&self) -> BTreeMap<String, bool> {
+        self.derived
+            .iter()
+            .map(|(name, derived)| {
+                let by_instance = self.per_instance.get(name).copied().unwrap_or(false);
+                (name.clone(), *derived && by_instance)
+            })
+            .collect()
+    }
 }
 
 /// Every flow instance any `map` in the composition dispatches, directly or
@@ -561,8 +659,9 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
             // Seeded at the map's own bound and nothing else, because this scan
             // has no idea what the map's flow is instantiated inside. Where that
             // is a fan-out, the walk below reaches the same map from the outer
-            // dispatch and merges the looser bound onto these frames.
-            for frame in seeded(ctx, address, node, map, None) {
+            // dispatch and merges the looser bound — and what varies across that
+            // fan-out's instances — onto these frames.
+            for frame in seeded(ctx, address, node, map, None, None) {
                 let mut path = BTreeSet::new();
                 push_frame(ctx, &mut frames, &mut path, frame);
             }
@@ -576,21 +675,37 @@ pub(crate) fn frames<'a>(ctx: &Ctx<'a>) -> Vec<Frame<'a>> {
 ///
 /// Stated once and read twice — by [`frames`]'s scan over every definition, and
 /// by [`push_frame`] where the walk reaches a map *inside* a dispatched
-/// instance — so the two cannot seed a site differently. Derivation is the map
-/// block's own either way (Decision D83); the bound is not, and `enclosing` is
-/// where the difference lives.
+/// instance — so the two cannot seed a site differently. Item-derivation is the
+/// map block's own either way (Decision D83); the bound is not, and neither is
+/// what the enclosing fan-out varies, which is what `enclosing` and `within`
+/// carry in.
+///
+/// `within` is the enclosing instance's [`Frame::varies`] — which of *its* input
+/// fields separate every pair of its runs that can overlap — or `None` where
+/// nothing encloses this map, in which case every field of the dispatch is
+/// recorded as separating instances there are none of. A binding of this map's
+/// that reads a varying field separates the instances too, and that is the only
+/// way a dispatch inside a fan-out inherits the distinction: this map's own item
+/// does not have it, because two instances drawing from two lists can draw one
+/// and the same value (Decision D147, PRD resolved q61 ruling b).
 fn seeded<'a>(
     ctx: &Ctx<'a>,
     address: &str,
     node: &Node,
     map: &Map,
     enclosing: Option<&Enclosing>,
+    within: Option<&BTreeMap<String, bool>>,
 ) -> Vec<Frame<'a>> {
     let dispatcher = format!("the map `{}` of `{address}`", node.id.value);
     let item = map
         .item_binding
         .as_ref()
         .map_or("item", |binding| binding.value.as_str());
+    // A fan-out of one is a fan-out nothing overlaps inside, so it is not one a
+    // frame has to carry: the dispatch is read at its own bound and its bindings
+    // have nothing to be distinct *between*.
+    let outer = enclosing.filter(|outer| outer.concurrency > 1);
+    let within = outer.and(within);
     let mut seeded = Vec::new();
     for dispatch in dispatches(map) {
         if dispatch.target.namespace != Namespace::Flow {
@@ -600,22 +715,22 @@ fn seeded<'a>(
         let Some(dispatched) = ctx.flow_named(&dispatched_at) else {
             continue;
         };
-        let (derived, bound_at) = seed(dispatched, dispatch.input, item);
-        // The enclosing fan-out is recorded only where it is the **looser** of
-        // the two, because that is the only case a diagnostic has to say
-        // anything about: a map bounded more loosely than what it sits inside
-        // is read at its own bound and reads exactly as it would anywhere.
-        let raised = enclosing.filter(|outer| outer.concurrency > dispatch.concurrency);
+        let (derived, per_instance, bound_at) = seed(dispatched, dispatch.input, item, within);
         seeded.push(Frame {
             address: dispatched_at,
             flow: dispatched,
             derived,
+            per_instance,
             bound_at,
             dispatcher: dispatcher.clone(),
             span: node.span.clone(),
-            concurrency: raised.map_or(dispatch.concurrency, |outer| outer.concurrency),
+            // The looser of the two: a map bounded more tightly than what it
+            // sits inside still has one run per concurrent instance in flight.
+            concurrency: outer.map_or(dispatch.concurrency, |outer| {
+                outer.concurrency.max(dispatch.concurrency)
+            }),
             declared: dispatch.concurrency,
-            enclosing: raised.cloned(),
+            enclosing: outer.cloned(),
         });
     }
     seeded
@@ -654,6 +769,15 @@ enum Step<'a> {
 /// raised it, goes on to walk the nested flows again: those were recorded with
 /// the tighter bound and carry it inward.
 ///
+/// [`Frame::per_instance`] is merged the other way round and for the same
+/// reason: a field one route cannot tell its enclosing instances apart by is a
+/// field the rule cannot read as per-dispatch, whatever the sibling route
+/// happens to bind it from. The recorded answer is therefore the **tightest** of
+/// the two, and tightening it re-walks the nested flows exactly as raising the
+/// bound does — a loosest bound with a tightest derivation is the worst case the
+/// author has to answer for, and a route that really does carry the distinction
+/// in is not what excuses the one that does not.
+///
 /// **A `map` node inside a dispatched instance is followed too**, and that is
 /// the other half of the bound not being a property of the map block. A map runs
 /// once per dispatch of the fan-out above it, so a map declaring
@@ -678,7 +802,7 @@ fn push_frame<'a>(
 ) {
     let mut pending = vec![Step::Enter(Box::new(frame))];
     while let Some(step) = pending.pop() {
-        let frame = match step {
+        let mut frame = match step {
             Step::Enter(frame) => *frame,
             Step::Leave(address) => {
                 path.remove(&address);
@@ -691,17 +815,46 @@ fn push_frame<'a>(
                 && recorded.derived == frame.derived
         });
         if let Some(at) = repeat {
+            let looser = frame.concurrency > frames[at].concurrency;
+            // The enclosing fan-out is merged on **its own** bound and not on
+            // the frame's, which are two different numbers the moment a map is
+            // as loose as what it sits inside. A route reaching this map from
+            // outside every fan-out carries none, and a merge that let that
+            // silence stand would read a site dispatched inside a four-way
+            // fan-out as a site nothing encloses — and with it drop the whole
+            // per-instance question.
+            let widened = frame.instances() > frames[at].instances();
+            let tightened: BTreeMap<String, bool> = frames[at]
+                .per_instance
+                .iter()
+                .map(|(name, held)| {
+                    let value = *held && frame.per_instance.get(name).copied().unwrap_or(false);
+                    (name.clone(), value)
+                })
+                .collect();
             // The same site with a bound no looser than the one already
-            // recorded is the same site said twice, and there is nothing left
+            // recorded, no wider a fan-out around it, and nothing newly
+            // indistinct is the same site said twice, and there is nothing left
             // to carry inward.
-            if frames[at].concurrency >= frame.concurrency {
+            if !looser && !widened && tightened == frames[at].per_instance {
                 continue;
             }
-            frames[at].concurrency = frame.concurrency;
-            // …and the fan-out that *raised* it travels with it, or the
-            // diagnostic would quote a bound and name a map that does not
-            // state it.
-            frames[at].enclosing.clone_from(&frame.enclosing);
+            if looser {
+                frames[at].concurrency = frame.concurrency;
+            }
+            if widened {
+                // …and the fan-out travels with its own bound, or the
+                // diagnostic would quote a number and name a map that does not
+                // state it.
+                frames[at].enclosing.clone_from(&frame.enclosing);
+            }
+            frames[at].per_instance.clone_from(&tightened);
+            // The walk below carries the **merged** frame inward, not this
+            // route's own: the nested flows were recorded against the answers
+            // that have just changed.
+            frame.concurrency = frames[at].concurrency;
+            frame.enclosing.clone_from(&frames[at].enclosing);
+            frame.per_instance = tightened;
         }
         // A flow that reaches itself is refused by the graph pass's recursion
         // check; guarding the path here keeps this traversal finite meanwhile.
@@ -711,19 +864,27 @@ fn push_frame<'a>(
         }
         let flow = frame.flow;
         let derived = frame.derived.clone();
+        let per_instance = frame.per_instance.clone();
+        let enclosed = frame.nested();
         let dispatcher = frame.dispatcher.clone();
         let span = frame.span.clone();
         let concurrency = frame.concurrency;
         let declared = frame.declared;
         // The fan-out this frame's bound *is* — the enclosing one where that
-        // raised it, this frame's own dispatch otherwise. Either way its
+        // supplies it, this frame's own dispatch otherwise. Either way its
         // `concurrency` is the frame's, which is what a map below it is read
         // against.
-        let widest = frame.enclosing.clone().unwrap_or_else(|| Enclosing {
-            dispatcher: dispatcher.clone(),
-            concurrency,
-            span: span.clone(),
-        });
+        let widest = match &frame.enclosing {
+            Some(outer) if outer.concurrency >= concurrency => outer.clone(),
+            _ => Enclosing {
+                dispatcher: dispatcher.clone(),
+                concurrency,
+                span: span.clone(),
+            },
+        };
+        // …and what tells that fan-out's instances apart, which is what a map
+        // below can bind its own dispatches from.
+        let varies = frame.varies();
         let enclosing = frame.enclosing.clone();
         if repeat.is_none() {
             frames.push(frame);
@@ -738,6 +899,7 @@ fn push_frame<'a>(
                         continue;
                     };
                     let mut inner = BTreeMap::new();
+                    let mut instance = BTreeMap::new();
                     let mut bound_at = BTreeMap::new();
                     if let Some(inputs) = &nested.inputs {
                         for field in &inputs.fields {
@@ -752,19 +914,34 @@ fn push_frame<'a>(
                             let value = binding.is_some_and(|binding| {
                                 is_item_derived(binding.value.value.as_str(), None, &derived)
                             });
+                            // The same binding read against the other question:
+                            // both travel inward through a `flow:` node, because
+                            // both are properties of the one dispatch this
+                            // instance belongs to. Where nothing encloses the
+                            // dispatch there is nothing to be distinct between,
+                            // and every field says so.
+                            let between = !enclosed
+                                || binding.is_some_and(|binding| {
+                                    reads_a_varying_field(
+                                        binding.value.value.as_str(),
+                                        &per_instance,
+                                    )
+                                });
                             if let Some(binding) = binding {
                                 bound_at.insert(name.clone(), binding.value.span.clone());
                             }
-                            inner.insert(name, value);
+                            inner.insert(name.clone(), value);
+                            instance.insert(name, between);
                         }
                     }
                     // One instance of the same dispatch, so everything the site
                     // is travels unchanged: the bound, the map that states it,
-                    // and the fan-out that raised it.
+                    // and the fan-out it is inside.
                     nested_frames.push(Step::Enter(Box::new(Frame {
                         address,
                         flow: nested,
                         derived: inner,
+                        per_instance: instance,
                         bound_at,
                         dispatcher: dispatcher.clone(),
                         span: span.clone(),
@@ -774,10 +951,12 @@ fn push_frame<'a>(
                     })));
                 }
                 // A new site rather than the same one carried inward: its
-                // derivation is re-rooted at this map's own item, and its bound
-                // is the looser of this map's and the fan-out it is inside.
+                // item-derivation is re-rooted at this map's own item, its bound
+                // is the looser of this map's and the fan-out it is inside, and
+                // what that fan-out's instances *vary* is what its bindings can
+                // inherit the distinction from.
                 NodeKind::Map { map } => nested_frames.extend(
-                    seeded(ctx, &address, node, map, Some(&widest))
+                    seeded(ctx, &address, node, map, Some(&widest), Some(&varies))
                         .into_iter()
                         .map(|frame| Step::Enter(Box::new(frame))),
                 ),
@@ -789,24 +968,41 @@ fn push_frame<'a>(
     }
 }
 
-/// Which input fields of a dispatched flow are item-derived at one site, and
-/// where each answer was written (Decision D83).
+/// Which input fields of a dispatched flow are item-derived at one site, which
+/// of them the **enclosing** fan-out tells apart, and where each answer was
+/// written (Decisions D83, D147).
+///
+/// The two answers come off the same binding and part on what they read of it.
+/// Item-derivation is the map's own item, its index, and nothing else; the
+/// enclosing question is `input.<field>` alone — of the fields `within` says the
+/// instance around this map varies. The map's item is deliberately not one of
+/// them, however that item was produced: two instances iterating two lists can
+/// iterate onto one and the same value, and `execution.item_index` is the
+/// *innermost* dispatch's index, which nested maps repeat across outer items
+/// (grammar 4.1, D115).
 fn seed(
     flow: &Flow,
     input: Option<&NodeInput>,
     item: &str,
-) -> (BTreeMap<String, bool>, BTreeMap<String, Span>) {
+    within: Option<&BTreeMap<String, bool>>,
+) -> (
+    BTreeMap<String, bool>,
+    BTreeMap<String, bool>,
+    BTreeMap<String, Span>,
+) {
     let mut derived = BTreeMap::new();
+    let mut per_instance = BTreeMap::new();
     let mut bound_at = BTreeMap::new();
     let Some(inputs) = &flow.inputs else {
-        return (derived, bound_at);
+        return (derived, per_instance, bound_at);
     };
     for field in &inputs.fields {
         let name = field.name.value.to_string();
-        let value = match input {
+        let (value, between) = match input {
             // The whole item is the instance's input, so every field is
-            // item-derived — and no binding was written to point at.
-            None => true,
+            // item-derived — and no binding was written to point at, nor one
+            // that could have carried the enclosing instance's own value in.
+            None => (true, false),
             Some(NodeInput::Fields { bindings }) => {
                 let binding = bindings
                     .entries
@@ -815,17 +1011,56 @@ fn seed(
                 if let Some(binding) = binding {
                     bound_at.insert(name.clone(), binding.value.span.clone());
                 }
-                binding.is_some_and(|binding| {
-                    is_item_derived(binding.value.value.as_str(), Some(item), &BTreeMap::new())
-                })
+                (
+                    binding.is_some_and(|binding| {
+                        is_item_derived(binding.value.value.as_str(), Some(item), &BTreeMap::new())
+                    }),
+                    binding.is_some_and(|binding| {
+                        within.is_some_and(|within| {
+                            reads_a_varying_field(binding.value.value.as_str(), within)
+                        })
+                    }),
+                )
             }
             // The scalar form binds a string-in agent, and an agent contains no
             // store nodes (grammar 11.4).
-            Some(NodeInput::Scalar { .. }) => false,
+            Some(NodeInput::Scalar { .. }) => (false, false),
         };
-        derived.insert(name, value);
+        derived.insert(name.clone(), value);
+        // Nothing encloses this map, so there is no second instance for a value
+        // to fail to be distinct from ([`Frame::per_instance`]).
+        per_instance.insert(name, within.is_none() || between);
     }
-    (derived, bound_at)
+    (derived, per_instance, bound_at)
+}
+
+/// Whether one expression reads an `input.<field>` its own scope's caller tells
+/// apart — the fields `varying` marks true ([`Frame::varies`]).
+///
+/// [`is_item_derived`]'s question asked of the *enclosing* fan-out rather than of
+/// the dispatching map, and with neither of that predicate's two non-`input`
+/// roots: the map's item is a value drawn from a list, and two instances
+/// iterating two lists can iterate onto the same one, while
+/// `execution.item_index` is the innermost enclosing dispatch's index, which
+/// nested maps repeat across outer items (grammar 4.1, Decisions D115, D147).
+/// What carries a distinction inward is a value the instance was handed, and
+/// that is an `input.<field>` of it.
+///
+/// An unresolved index — `input[state.which]` — names a field nobody here can
+/// name and is read as carrying nothing, which is the answer a refusal has to
+/// give an unknown (PRD resolved q61 ruling b).
+pub(crate) fn reads_a_varying_field(source: &str, varying: &BTreeMap<String, bool>) -> bool {
+    crate::cel::analyze(source, &Scope::default())
+        .reads
+        .iter()
+        .any(|read| {
+            read.root == "input"
+                && match read.path.first() {
+                    Some(field) => varying.get(field).copied().unwrap_or(false),
+                    None if read.indexed => false,
+                    None => varying.values().any(|value| *value),
+                }
+        })
 }
 
 /// Whether one expression reads **no root at all** — no `input`, no `state`,

@@ -3199,7 +3199,17 @@ with (`shared-workspace`, PRD resolved q61 ruling b):
   the looser of that fan-out's bound and its own, because it issues its dispatches
   once per concurrent instance of the flow that holds it — so
   `max_concurrency: 1` on a map an outer map fans four ways is four runs in the
-  directory, and the refusal names the outer map as the one to serialise;
+  directory, and the refusal names the outer map as the one to serialise. Raising
+  the bound is **not** the whole of what nesting changes: such a dispatch's
+  `workspace:` has to tell the enclosing fan-out's instances apart as well as its
+  own map's dispatches, and the map's own item does not do that — an item is a
+  value drawn from a list, and four instances drawing from four lists can draw the
+  same one, so `workspace: "input.file"` bound from the inner map's item puts two
+  runs in one directory the moment two checkouts both hold that file name. What
+  carries the distinction inward is an `input.<field>` the enclosing instance
+  itself varies, which is why the repair at depth is both halves at once
+  (`input: { dir: "input.root + '/' + file" }` at the inner map). The refusal says
+  which of the two questions failed, because the two are different edits;
 * two harness runs that statically-concurrent branches (§7.6.1) can have in
   flight at once whose `workspace:` values are **written identically** draw a
   **warning** naming both. The branches are read over the runs a *step* contains,
@@ -9866,13 +9876,34 @@ bound is the looser of that fan-out's and its own: a map declaring
 `max_concurrency: 1` inside a flow an outer map fans four ways issues its
 dispatches serially *within each of four concurrent instances*, so four harness
 runs are in the directory at once and the inner 1 says nothing about the other
-three. Item-derivation is **not** read that way and a nested map re-roots it at
-its own item (D83): the bound is the one thing a map's frames carry in from
-outside, which is why `workspace: "input.file"` bound from the inner map's own
-item is the repair at any depth. A refusal naming an enclosing fan-out quotes
+three. A refusal naming an enclosing fan-out quotes
 both numbers, because the map's own is the key it declares and the fan-out's is
 how many runs the directory really holds — and it names the *enclosing* map as
 the place to write `max_concurrency: 1`, since the inner one already says it.
+
+*The bound is not the only thing nesting changes*, and the other half is
+item-derivation. §11.4's reading of it is untouched — a nested map re-roots
+derivation at the item it declares (D83), because a store key derived from the
+item the write belongs to is what keeps N items' content out of one slot whatever
+the map runs inside. What that does not answer is the question *this* rule asks,
+and the two part exactly at a nested dispatch: an item is a value drawn from a
+list, so `workspace: "input.file"` bound from the inner map's own item is a
+directory per dispatch *within one instance* and says nothing about the three
+beside it — four instances each stepping their own files serially put two `cc`
+runs in one directory the moment two checkouts both hold `README.md`. That is the
+field report's race one construct deeper, reached through the repair this
+ruling's own message names, so reading the bound inward and leaving derivation
+behind would have made the race writable again by telling the author how to write
+it. A dispatch inside a fan-out therefore has to separate **both**: the
+dispatches of its own map, and the instances issuing them. What separates the
+second is a value the enclosing instance was handed and itself varies — an
+`input.<field>` of it — which the inner map's bindings read to carry the
+distinction in (`input: { dir: "input.root + '/' + file" }`). The map's item is
+deliberately not one of those, however that item was produced, and neither is
+`execution.item_index`, which exposes the *innermost* dispatch's index and so
+repeats across outer items (§4.1, D115). A refusal that turned on this half says
+so and offers the half that is missing, because the other one is a line the
+author already wrote correctly (G3).
 
 **3. `workspace: fresh` is the batteries-included spelling.** The runtime
 provisions a per-dispatch directory under the execution's scratch, named by §9.4

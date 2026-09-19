@@ -293,7 +293,8 @@ Two harness runs in one directory edit each other's files, so that is refused
 where it can be seen: a map-dispatched coder whose `workspace:` does not read
 the per-dispatch scope is an error unless the map says `max_concurrency: 1` —
 and a map *inside* another map's fan-out is read at the outer bound, since it
-runs once per concurrent instance — and
+runs once per concurrent instance, and has to tell those instances apart as well
+as its own dispatches, since its own item repeats across them — and
 two runs concurrent branches can have in flight at once writing the same
 `workspace:` draw a warning naming both — a `coder:` node of the flow, or one
 inside an instance a `flow:` node starts or a `map` node dispatches, so factoring

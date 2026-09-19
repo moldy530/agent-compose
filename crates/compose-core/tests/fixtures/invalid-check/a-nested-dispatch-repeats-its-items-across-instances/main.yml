@@ -1,0 +1,114 @@
+# rule: a nested dispatch's `workspace:` has to tell the enclosing fan-out's
+# rule: instances apart as well as its own map's dispatches (grammar 8.9, D147)
+# code: shared-workspace
+# message: `flow.edit` node `implement` is dispatched by the map `each_file` of `flow.repo`, and `workspace:` tells that map's own dispatches apart but not the 4 instances of it the map `each_repo` of `flow.main` runs at once
+# at: main.yml:66:20
+# label: main.yml:86:7 the fan-out is issued here
+# label: main.yml:104:7 and that dispatch is inside this one
+# help: a harness run is contained by its `workspace:`, and `input.file` is a directory per dispatch **within one instance** only: the 4 instances running beside this one evaluate it over items of their own, and two of them reaching the same value — the same file name under two repositories — are two coding agents editing one checkout. Two repairs: carry the enclosing item's own directory in alongside this map's item, so the expression reads a value the outer fan-out makes distinct (bind it at the map `each_file` of `flow.repo` — `input: { dir: "input.root + '/' + item.path" }` — and read it here as `workspace: "input.dir"`), or write `workspace: fresh` for a directory the runtime provisions per dispatch — or declare `max_concurrency: 1` on the map `each_repo` of `flow.main`, which leaves this map's own dispatches the only runs that overlap — and `input.file` already tells those apart. An item is a value drawn from a list, and two instances drawing from two lists can draw the same one, which is why the map's own item does not settle this (grammar 8.6, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# The repair for the fixture beside this one, written the way a reader of that
+# refusal writes it — and still the same race. `flow.edit`'s `workspace:` is
+# `input.file`, bound from the inner map's own item, so it really is a
+# directory per dispatch: `each_file` steps its files one at a time and no two
+# of *its* runs share a path.
+#
+# What that says nothing about is the fan-out around it. `flow.repo` is
+# dispatched four ways, so four instances of `each_file` run side by side, each
+# over a file list of its own — and a file name two checkouts both have,
+# `src/main.rs` or `README.md`, is one directory holding two `cc` runs. An item
+# is a value drawn from a list, and two instances drawing from two lists can
+# draw the same one; item-derivation is a statement about one map's dispatches
+# and carries no further.
+#
+# So the two questions are asked apart, and the message says which one failed:
+# the expression is per-dispatch, the author already bound the item's path, and
+# sending them to bind it again would be sending them to the line they wrote
+# correctly (PRD G3). The repair is the other half — carry the enclosing item's
+# own root in beside the file (`input: { dir: "input.root + '/' + file" }`),
+# which `check_accepts.rs`'s `a_nested_fan_out_is_read_at_the_bound_it_runs_under`
+# pins as legal — or `workspace: fresh`, or `max_concurrency: 1` on the outer
+# map.
+#
+# Nothing else about the composition is wrong.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: List the checkouts that need a change.
+  output:
+    repos:
+      type: array
+      max_items: 10
+      items: { type: string }
+agent.splitter:
+  model: model.implementer
+  prompt: List the files in this checkout that need a change.
+  output:
+    files:
+      type: array
+      max_items: 10
+      items: { type: string }
+flow.edit:
+  inputs:
+    file: { type: string }
+  outputs: {}
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "input.file"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          file: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        file: "input.file"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.repo:
+  inputs:
+    repo: { type: string }
+  outputs: {}
+  nodes:
+    split:
+      agent: agent.splitter
+      input: "input.repo"
+    each_file:
+      map:
+        over: split.output.files
+        as: file
+        max_concurrency: 1
+        node: flow.edit
+        input:
+          file: "file"
+  edges:
+    - { from: start, to: split }
+    - { from: split, to: each_file }
+    - { from: each_file, to: end }
+flow.main:
+  outputs: {}
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    each_repo:
+      map:
+        over: plan.output.repos
+        as: repo
+        max_concurrency: 4
+        node: flow.repo
+        input:
+          repo: "repo"
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: each_repo }
+    - { from: each_repo, to: end }

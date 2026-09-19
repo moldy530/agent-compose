@@ -47,6 +47,19 @@ it can happen:
   `max_concurrency: 1` inside a flow an outer map fans four ways still has four
   harness runs in flight — and the refusal quotes both numbers and sends you to
   the outer map, because the inner one already says `max_concurrency: 1`.
+
+  Nesting changes what counts as per-dispatch as well as how many runs there
+  are, and this is the half that surprises people. A map's item is a value drawn
+  from a list, so it tells that map's *own* dispatches apart and nothing else:
+  four instances each stepping their own file list serially put two agents in
+  `/srv/README.md` the moment two checkouts hold that file. So inside a fan-out
+  the expression has to separate the enclosing instances too, and what does that
+  is an `input.<field>` the enclosing instance itself varies — carried in at the
+  inner map (`input: { dir: "input.root + '/' + file" }`) and read here as
+  `workspace: "input.dir"`. `execution.item_index` is not a way round it: it
+  holds the innermost dispatch's index, which nested maps repeat across outer
+  items. The message says which of the two questions failed, so a refusal never
+  sends you back to the line you already wrote correctly.
 * **Two harness runs on concurrent branches.** Two edges of one fork that are not
   provably exclusive can both fire, so the branches they start run side by side
   (grammar §7.6.1) — and if both runs write the same `workspace:`, both are in one
@@ -175,7 +188,10 @@ Four repairs, and each says something different about the graph.
   by the directory its own item names. Something upstream has to *make* those
   directories: a `git worktree add` in an `exec:` node or a `tool.*` before the
   map, because provisioning source control is a step in the graph rather than a
-  guess the harness adapter makes.
+  guess the harness adapter makes. Where the map is itself inside a fan-out, the
+  path has to be built from the enclosing item as well as this map's — the item
+  alone repeats across instances — which is one expression at the inner map's
+  `input:` rather than a second repair.
 * **Let each dispatch make its own.** That upstream step can live *inside* the
   dispatched flow instead, ahead of the coder node, writing the path it made to a
   state channel the node then reads: `workspace: "state.checkout"`. The instance

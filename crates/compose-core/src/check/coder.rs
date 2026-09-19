@@ -1365,6 +1365,22 @@ fn check_shape(
 /// because `max_concurrency: 1` is already written on the line a message quoting
 /// four would send the author to.
 ///
+/// **The bound is not the only thing nesting changes**, and the second half is
+/// what makes the first half honest. Item-derivation is one map's dispatches
+/// against each other: `input.file` bound from the inner map's item is a
+/// directory per dispatch *within one instance*, and the other three instances
+/// iterate lists of their own — so a file name two checkouts share is one
+/// directory holding two runs, which is the very race read at the outer bound to
+/// catch. A dispatch inside a fan-out therefore answers for both axes: this
+/// map's dispatches ([`reach::is_item_derived`] over [`reach::Frame::derived`]),
+/// and the instances issuing them ([`reach::reads_a_varying_field`] over
+/// [`reach::Frame::per_instance`], which carries inward what the enclosing
+/// instance itself varies). Neither the item nor `execution.item_index` settles
+/// the second — the index is the innermost dispatch's and repeats across outer
+/// items (grammar 4.1, Decision D115) — and the refusal says which of the two
+/// failed, because sending an author who bound the item's path to bind it again
+/// is sending them to the line they wrote correctly (PRD G3).
+///
 /// # One diagnostic per `workspace:`
 ///
 /// A node is reported **once**, whatever number of frames reach it. A routed map
@@ -1405,13 +1421,31 @@ pub(crate) fn dispatched_workspaces<'a>(ctx: &mut Ctx<'a>) {
             if !ctx.workspace_type_checked(&coder.workspace.span) {
                 continue;
             }
-            if reach::is_item_derived(expression.as_str(), None, &frame.derived) {
+            // The two axes a dispatch can be concurrent along, and the value has
+            // to tell the runs on both of them apart (grammar 8.6 rule 1,
+            // Decision D147): whether it distinguishes this map's own
+            // dispatches, and — where the map is itself inside a fan-out —
+            // whether it distinguishes the instances issuing them. `input.file`
+            // off the inner map's item answers the first and not the second:
+            // four instances stepping their own files serially still put two
+            // runs in `/srv/README.md` the moment two of them name that file.
+            let per_dispatch = reach::is_item_derived(expression.as_str(), None, &frame.derived);
+            let instances_of_it = frame.instances();
+            let by_instance = instances_of_it <= 1
+                || reach::reads_a_varying_field(expression.as_str(), &frame.per_instance);
+            if per_dispatch && by_instance {
                 continue;
             }
             // The instance is consulted only where the expression reads
             // `state` at all, which is what keeps the dominance walks off the
             // clock for the `'${ROOT}'` shape the refusal is mostly about:
             // `validate` is held to a millisecond budget (`tests/check_scale.rs`).
+            //
+            // A channel the instance writes **itself** answers both axes at
+            // once, which is why it is asked whichever of the two failed: a
+            // dispatched instance is a separate run of a separate compiled graph
+            // (grammar 10.1), so its own `prepare` step's answer is that
+            // dispatch's and no other's, in whatever fan-out it is nested.
             let reads = state_reads(expression.as_str());
             let unobserved = if reads.is_empty() {
                 None
@@ -1424,6 +1458,12 @@ pub(crate) fn dispatched_workspaces<'a>(ctx: &mut Ctx<'a>) {
                 }
                 instance.unobserved(&reads, at)
             };
+            // Which of the two decided it, because the repairs differ: an
+            // expression the enclosing fan-out cannot tell apart is one whose
+            // author already bound the item's own path, and sending them to bind
+            // it again would be sending them to the line they wrote correctly
+            // (PRD G3).
+            let per_dispatch_only = per_dispatch && !by_instance;
             let subject = format!("`{}` node `{}`", frame.address, node.id.value);
             let key = (
                 subject.clone(),
@@ -1433,12 +1473,17 @@ pub(crate) fn dispatched_workspaces<'a>(ctx: &mut Ctx<'a>) {
             let shared = Shared {
                 subject,
                 flow: frame.address.clone(),
-                unobserved,
+                // A channel is not what decided a refusal the item-derivation
+                // already satisfied, and naming one there would point a reader
+                // at a second subject.
+                unobserved: if per_dispatch_only { None } else { unobserved },
                 at: coder.workspace.span.clone(),
                 dispatcher: frame.dispatcher.clone(),
                 dispatched_at: frame.span.clone(),
                 declared: frame.declared,
                 concurrency: frame.concurrency,
+                instances: instances_of_it,
+                per_dispatch_only,
                 enclosing: frame.enclosing.clone(),
                 expression: expression.as_str().to_string(),
             };
@@ -1613,7 +1658,15 @@ struct Shared {
     declared: i64,
     /// How many runs can really be in flight at once.
     concurrency: i64,
-    /// The fan-out that raised the one above the other, where one did.
+    /// How many instances of the enclosing fan-out issue those runs — 1 where
+    /// nothing encloses the dispatching map.
+    instances: i64,
+    /// Whether the expression *is* per-dispatch and it is the enclosing
+    /// fan-out's instances it cannot tell apart, which is a different mistake
+    /// with a different repair.
+    per_dispatch_only: bool,
+    /// The fan-out this dispatch is inside, where it runs more than one instance
+    /// at a time.
     enclosing: Option<reach::Enclosing>,
     /// The `workspace:` expression as written.
     expression: String,
@@ -1630,13 +1683,32 @@ impl Shared {
             dispatched_at,
             declared,
             concurrency,
+            instances,
+            per_dispatch_only,
             enclosing,
             expression,
         } = self;
-        let message = match &enclosing {
-            None => format!(
-                "{subject} is dispatched by {dispatcher} with `max_concurrency: {concurrency}`, \
-                 and its `workspace:` is one directory for every dispatch"
+        // The per-instance half can only have decided a refusal where there is
+        // an enclosing fan-out to have instances of, and the three places it is
+        // worded below all name that fan-out — so the two facts are tied here
+        // rather than left to agree.
+        let per_dispatch_only = per_dispatch_only && enclosing.is_some();
+        // The enclosing fan-out is named where it is what the refusal is about:
+        // because it **raised** the bound the map declares, or because it is the
+        // axis the expression failed on. A fan-out no tighter than the map
+        // inside it, over an expression that is not per-dispatch at all, is a
+        // sentence about the map alone.
+        let outer = enclosing
+            .as_ref()
+            .filter(|outer| per_dispatch_only || outer.concurrency > declared);
+        let message = match outer {
+            // The expression tells the map's own dispatches apart and the
+            // runs that overlap are not only those: the subject is the fan-out
+            // around it, so that is what the sentence is about.
+            Some(outer) if per_dispatch_only => format!(
+                "{subject} is dispatched by {dispatcher}, and `workspace:` tells that map's own \
+                 dispatches apart but not the {instances} instances of it {} runs at once",
+                outer.dispatcher
             ),
             // The map's own bound *and* the one it really runs under, because
             // quoting either alone misreads the composition: the first says
@@ -1648,20 +1720,29 @@ impl Shared {
                  `workspace:` is one directory for up to {concurrency} runs at once",
                 outer.concurrency, outer.dispatcher
             ),
+            None => format!(
+                "{subject} is dispatched by {dispatcher} with `max_concurrency: {concurrency}`, \
+                 and its `workspace:` is one directory for every dispatch"
+            ),
         };
         // Two repairs where the map's own bound is the whole of it, and the same
         // two where it is not — but the serial one moves to the map that states
         // the bound, because the inner map already says `max_concurrency: 1`
         // and saying it again is not an edit.
-        let serial = match &enclosing {
-            None => "or declare `max_concurrency: 1` on the map, which says these runs are serial"
-                .to_string(),
+        let serial = match outer {
+            Some(outer) if per_dispatch_only => format!(
+                "or declare `max_concurrency: 1` on {}, which leaves this map's own dispatches \
+                 the only runs that overlap — and `{expression}` already tells those apart",
+                outer.dispatcher
+            ),
             Some(outer) => format!(
                 "or declare `max_concurrency: 1` on {} as well, which says the whole fan-out is \
                  serial — the bound on {dispatcher} holds inside one instance and says nothing \
                  about the others",
                 outer.dispatcher
             ),
+            None => "or declare `max_concurrency: 1` on the map, which says these runs are serial"
+                .to_string(),
         };
         // Where a `state` read is what the refusal turned on, the fact that
         // decided it is said, and the two shapes are said apart: a channel is
@@ -1690,9 +1771,26 @@ impl Shared {
         });
         let mut diagnostic = Diagnostic::error(DiagnosticCode::SharedWorkspace, at, message)
             .with_label(dispatched_at, "the fan-out is issued here");
-        if let Some(outer) = &enclosing {
+        if let Some(outer) = outer {
             diagnostic =
                 diagnostic.with_label(outer.span.clone(), "and that dispatch is inside this one");
+        }
+        if per_dispatch_only {
+            return diagnostic.with_help(format!(
+                "a harness run is contained by its `workspace:`, and `{expression}` is a \
+                 directory per dispatch **within one instance** only: the {instances} instances \
+                 running beside this one evaluate it over items of their own, and two of them \
+                 reaching the same value — the same file name under two repositories — are two \
+                 coding agents editing one checkout. Two repairs: carry the enclosing item's own \
+                 directory in alongside this map's item, so the expression reads a value the \
+                 outer fan-out makes distinct (bind it at {dispatcher} — `input: {{ dir: \
+                 \"input.root + '/' + item.path\" }}` — and read it here as \
+                 `workspace: \"input.dir\"`), or write `workspace: fresh` for a directory the \
+                 runtime provisions per dispatch — {serial}. An item is a value drawn from a \
+                 list, and two instances drawing from two lists can draw the same one, which is \
+                 why the map's own item does not settle this (grammar 8.6, 8.9, Decision D147, \
+                 PRD resolved q61 ruling b)"
+            ));
         }
         diagnostic.with_help(format!(
             "a harness run is contained by its `workspace:`, so {concurrency} dispatches sharing \

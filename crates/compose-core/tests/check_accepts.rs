@@ -2469,14 +2469,18 @@ flow.main:
 ///    deeply the dispatch is nested, and an implementation that raised every
 ///    nested map to the composition's loosest bound rather than to its own
 ///    enclosing one would refuse it;
-///  * **the inner item carries the directory.** The outer map fans four ways,
-///    the inner map fans four ways inside each of those, and the dispatched
-///    coder reads the *inner* map's own item. Derivation is re-rooted at the
-///    nested map's item (Decision D83) and the bound is the only thing carried
-///    inward, so this is the repair the refusal names, written one construct
-///    deeper — and an implementation that carried the outer frame's derivation
-///    inward instead of re-seeding would read `input.file` as not item-derived
-///    and refuse the fix.
+///  * **both items carry the directory.** The outer map fans four ways, the
+///    inner map fans four ways inside each of those, and the dispatched coder
+///    reads a path built from the *enclosing* item's root and the inner map's
+///    own item at once. That is the repair at depth, and it is two halves
+///    because the race is: the inner item tells one instance's dispatches
+///    apart, and the outer root tells the four instances apart — `README.md`
+///    under two repositories is one directory if only the first half is
+///    written, which is what
+///    `tests/fixtures/invalid-check/a-nested-dispatch-repeats-its-items-across-instances`
+///    pins. An implementation that carried only the bound inward and left
+///    derivation re-rooted at the inner item would accept that, and one that
+///    required the enclosing root *instead of* the inner item would refuse this.
 #[test]
 fn a_nested_fan_out_is_read_at_the_bound_it_runs_under() {
     accepts(
@@ -2501,14 +2505,14 @@ flow.edit:
     - { from: implement, to: end }
 flow.per_file:
   inputs:
-    file: { type: string }
+    dir: { type: string }
   outputs: {}
   nodes:
     implement:
       coder:
         harness: cc
         model: model.m
-        workspace: "input.file"
+        workspace: "input.dir"
         prompt: Work in the checkout this item names.
         output:
           summary: { type: string }
@@ -2537,6 +2541,7 @@ flow.serial_repo:
     - { from: each_file, to: end }
 flow.carried_repo:
   inputs:
+    root: { type: string }
     files:
       type: array
       max_items: 4
@@ -2550,7 +2555,7 @@ flow.carried_repo:
         max_concurrency: 4
         node: flow.per_file
         input:
-          file: "file"
+          dir: "input.root + '/' + file"
   edges:
     - { from: start, to: each_file }
     - { from: each_file, to: end }
@@ -2562,6 +2567,7 @@ flow.main:
       items:
         type: object
         properties:
+          root: { type: string }
           files:
             type: array
             max_items: 4
@@ -2583,6 +2589,7 @@ flow.main:
         max_concurrency: 4
         node: flow.carried_repo
         input:
+          root: "repo.root"
           files: "repo.files"
   edges:
     - { from: start, to: serially }
