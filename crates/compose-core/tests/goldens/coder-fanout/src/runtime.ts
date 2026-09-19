@@ -8619,17 +8619,19 @@ export function registerHarnessDriver(harness: HarnessName, driver: HarnessDrive
  *
  * Four steps, in this order, and each is somebody else's rule kept here:
  *
- *  1. **the config map** — the workspace and the environment resolve their
- *     `${ENV}` references now (grammar 4.3 class 2), the environment is scrubbed
- *     unless the node opted into inheriting (q54 ruling b), and the declared
- *     `output:` is projected through this harness's lowering table (q55 ruling
- *     a);
+ *  1. **the config map** — the workspace is decided for *this dispatch*
+ *     ([`resolveHarnessWorkspace`], q61 ruling a), the environment resolves its
+ *     `${ENV}` references now (grammar 4.3 class 2) and is scrubbed unless the
+ *     node opted into inheriting (q54 ruling b), and the declared `output:` is
+ *     projected through this harness's lowering table (q55 ruling a);
  *  2. **the driver invocation** — one journaled effect, `kind: "harness"`, whose
  *     recorded answer is the gated output and whose payload is the whole stream
  *     (q57 ruling b, `docs/durability.md` §3.9). A resume consumes the answer
  *     and the harness never runs again; a crash mid-run left no record at all,
  *     so the node's `retry:` re-runs the whole thing, which is an attempt
- *     failure like any other;
+ *     failure like any other. A `workspace: fresh` directory is **made here**,
+ *     inside the slot and so once per attempt and never on a replay (q61 ruling
+ *     c);
  *  3. **the stream tap** — one pass, building the trace record out of the
  *     top-level turns and tool events and the payload out of everything;
  *  4. **the output gate** — [`parseResult`] against the **full** declared

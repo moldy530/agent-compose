@@ -1175,11 +1175,24 @@ fn check_shape(
 /// construction — the runtime provisions a directory per dispatch — and never
 /// reaches this check at all, having no expression to read.
 ///
-/// **The boundary is [`reach::frames`]'s own**: derivation travels inward
-/// through `flow:` nodes and stops at an agent's `flow.*` tool, because a model
-/// decides whether and when to call one and no static rule can put that call
-/// inside a dispatch. A coder node reached only that way is outside this rule,
-/// exactly as a store node reached only that way is outside grammar 11.4's.
+/// **The boundary is [`reach::frames`]'s own**, and it has two edges worth
+/// naming rather than leaving to be found.
+///
+/// Derivation travels inward through `flow:` nodes and **stops at an agent's
+/// `flow.*` tool**, because a model decides whether and when to call one and no
+/// static rule can put that call inside a dispatch. A coder node reached only
+/// that way is outside this rule, exactly as a store node reached only that way
+/// is outside grammar 11.4's.
+///
+/// And a **nested** map re-roots the computation at its own item, which is the
+/// property that makes a map's frames the same wherever the map's own flow is
+/// instantiated. What that gives up here is the outer bound: a map declaring
+/// `max_concurrency: 1` inside a flow that an *outer* map fans four ways runs
+/// serially within each of four concurrent instances, and this reads only the
+/// inner 1. The rule PRD resolved q61 ruling b states is the one this
+/// implements — the dispatching map's own bound — and the shape it does not
+/// reach is named here rather than claimed. `workspace: fresh` closes it
+/// whatever the nesting, because an instance path holds every frame.
 pub(crate) fn dispatched_workspaces(ctx: &mut Ctx<'_>) {
     let mut reported = Vec::new();
     for frame in reach::frames(ctx) {

@@ -2302,3 +2302,155 @@ flow.f:
 "#,
     );
 }
+
+/// The **accepting** half of PRD resolved q61's unwritable race (grammar 8.9,
+/// Decision D147).
+///
+/// The negative corpus pins both refusals — a map-dispatched coder whose
+/// `workspace:` reads nothing per-dispatch, and two concurrent coder nodes
+/// writing one value. Over-rejection is what a negative corpus cannot see, and
+/// this rule has three legal shapes it would be easy to refuse by accident:
+///
+///  * a fan-out whose dispatched coder takes the item's own path **whole**
+///    (`workspace: "input.worktree"`), which is the repair the error names and
+///    therefore the one shape that must never be refused;
+///  * a fan-out whose coder reads an item-derived field **inside a larger
+///    expression** (`"'${ROOT}/' + input.branch"`). The predicate is about what
+///    the expression reads rather than about its shape, and an implementation
+///    that matched the whole value against a binding would accept the first
+///    shape and refuse this one;
+///  * a fan-out whose map declares `max_concurrency: 1`, which is the second
+///    repair: one run at a time is one run in the directory at a time, whatever
+///    the expression says.
+///
+/// `workspace: fresh` rides along, since a keyword that stopped parsing — or an
+/// emitter that could not write it — would fail here rather than at a golden.
+#[test]
+fn a_fan_out_over_a_coder_node_takes_a_directory_per_dispatch() {
+    accepts(
+        "coder-per-dispatch-workspaces",
+        r#"
+state:
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+flow.carried:
+  inputs:
+    worktree: { type: string }
+    branch: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "input.worktree"
+        prompt: Work in the checkout you were given.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+flow.branched:
+  inputs:
+    worktree: { type: string }
+    branch: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "'${ROOT}/' + input.branch"
+        prompt: Work under the root, in the directory this item's branch names.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+flow.serial:
+  inputs:
+    worktree: { type: string }
+    branch: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "'${ROOT}'"
+        prompt: Work in the one checkout, one dispatch at a time.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+flow.main:
+  inputs:
+    worktrees:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          worktree: { type: string }
+          branch: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+  nodes:
+    carried:
+      map:
+        over: input.worktrees
+        as: task
+        node: flow.carried
+        max_concurrency: 4
+        writes: { summary: summaries }
+    branched:
+      map:
+        over: input.worktrees
+        as: task
+        node: flow.branched
+        max_concurrency: 4
+        writes: { summary: summaries }
+    serial:
+      map:
+        over: input.worktrees
+        as: task
+        node: flow.serial
+        max_concurrency: 1
+        writes: { summary: summaries }
+    provisioned:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: fresh
+        prompt: Work in the directory the runtime made.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: carried }
+    - { from: carried, to: branched }
+    - { from: branched, to: serial }
+    - { from: serial, to: provisioned }
+    - { from: provisioned, to: end }
+"#,
+    );
+}
