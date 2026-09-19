@@ -279,6 +279,31 @@ to `codex` — named in the run's instructions, with the sandbox as the thing th
 actually holds; a `plan` report and a `visualize` canvas both say which of the
 two a node is.
 
+**`permission_mode:` is the second axis, on the one harness that has one.**
+`access:` says how far a run may reach; a permission mode says how a call inside
+that reach gets approved, and the Agent SDK has six of them —
+`default`, `acceptEdits`, `bypassPermissions`, `plan`, `dontAsk`, `auto`. Omit
+the key and a node gets the mode its level derives (`read_only` → `plan`,
+`workspace_write` → `acceptEdits`, `full_access` → `bypassPermissions`), which is
+what every composition written before the key existed already had. Write one and
+it may only choose **inside** the level: `read_only` admits `plan`,
+`workspace_write` admits `default`, `acceptEdits`, `dontAsk` and `auto`, and
+`full_access` admits all six — anything else is
+`agent-compose explain widening-permission-mode`. `codex` has no such axis at
+all, its per-call approval tier belonging to an app server this release does not
+adopt, so the key is refused there by name
+(`agent-compose explain unsupported-permission-mode`).
+
+**`settings:` is the vendor's *other* options, and only those.** The block is
+open — a harness option the vendor ships tomorrow is usable the day it ships,
+under a warning naming what could not be verified
+(`agent-compose explain unknown-harness-setting`) — but a key that spells an
+option the generated adapter owns is refused, and the message names the key to
+write instead: `permission_mode:` for a mode, `access:` for a sandbox,
+`allow_tools:` for a tool set, `model:` for the model
+(`agent-compose explain reserved-harness-setting`). A bound belongs where a
+reader sees it.
+
 **One run is one journaled effect.** A resume consumes the recorded answer and
 the harness never runs twice; a crash mid-run is an attempt failure and the
 node's `retry:` re-runs the whole thing. The trace carries the run's turns, its
