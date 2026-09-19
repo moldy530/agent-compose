@@ -390,9 +390,11 @@ mod tests {
     /// the run — a root, a mode, a tool set — and the two audits above can at
     /// least argue about it from the driver. This family is the run's own
     /// executable: `pathToClaudeCodeExecutable` is which binary is spawned,
-    /// `executable` is the JavaScript runtime that spawns it, and
-    /// `executableArgs` is what that runtime is handed first (`--import` among
-    /// them). A key here does not widen a bound — it replaces or re-arms the
+    /// `executable` is the JavaScript runtime that spawns it, `executableArgs`
+    /// is what that runtime is handed first (`--import` among them), and
+    /// `spawnClaudeCodeProcess` is a function the SDK calls **instead of** the
+    /// default local spawn — the same reach by the shortest route. A key here
+    /// does not widen a bound — it replaces or re-arms the
     /// program that *enforces* every bound, so `options.tools`,
     /// `options.canUseTool` and `permissionMode` would be asked of something
     /// else entirely while `enforcesTools`, the graph document's
@@ -416,7 +418,12 @@ mod tests {
         const SPAWN: &[(Harness, &[&str])] = &[
             (
                 Harness::Cc,
-                &["pathToClaudeCodeExecutable", "executable", "executableArgs"],
+                &[
+                    "pathToClaudeCodeExecutable",
+                    "executable",
+                    "executableArgs",
+                    "spawnClaudeCodeProcess",
+                ],
             ),
             (Harness::Codex, &[]),
         ];
@@ -734,6 +741,8 @@ mod tests {
                     "sessionId",
                     "settingSources",
                     "settings",
+                    "skills",
+                    "spawnClaudeCodeProcess",
                     "systemPrompt",
                     "thinking",
                     "toolAliases",

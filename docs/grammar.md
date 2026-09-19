@@ -9496,11 +9496,23 @@ error (`widening-permission-mode`) naming the mode, the level and the set (§8.9
 (`reserved-harness-setting`) naming the key, the adapter-owned option it would
 reach, and the first-class key that states the same bound where one does —
 `permission_mode:` for the modes, `access:` for the sandbox, `allow_tools:` for
-the toolset, `model:` and the `provider.*` behind it for the connection. Where
-nothing states it, the message says so: the resume family is a named exclusion
+the toolset, `model:` and the `provider.*` behind it for the connection. Where a
+key **addresses** the value rather than holding it, the message names where it
+points instead of naming the key: the one model setting a harness takes — `cc`'s
+thinking budget, `codex`'s reasoning effort — is written in the `model.*`
+definition `model:` names (§12.2,
+[D141](#d141-a-coder-nodes-model-is-a-registry-address-and-the-ladders-stop-at-the-boundary)),
+and `model:` is required, so "write `model:`" would name a line already on the
+node. Where nothing states it, the message says so: the resume family is a named
+exclusion
 ([D142](#d142-the-policy-chain-wraps-a-whole-harness-run-and-harness-native-resume-is-excluded)),
 `fallbackModel` is the ladder D141 stops, `approvalPolicy` is the app-server tier
-this release does not adopt, and `extraArgs` is every bound at once.
+this release does not adopt, `extraArgs` is every bound at once, and the
+**process-spawn family** — which binary, which language runtime, what that
+runtime loads first, and the spawn function called in place of all three — is the
+program that enforces every bound rather than a bound to widen. `harness:` is not
+its answer: that key is required, takes `cc` or `codex`, and names which vendor's
+adapter runs, never which executable it is.
 
 **Rationale.**
 
@@ -9554,8 +9566,14 @@ is.
 *What does not move.* `access:` is still the containment statement, still
 defaulted to `workspace_write`, and still the thing `plan` and `visualize` draw;
 the graph document gains the **resolved** mode beside `tools_enforced`, an
-additive field under `docs/graph.md` §9.2 with no `graph_version` bump. A
-composition that writes no `permission_mode:` compiles to byte-identical output.
+additive field under `docs/graph.md` §9.2 with no `graph_version` bump. A node
+that writes no `permission_mode:` emits the **binding it always emitted**: the
+key is materialized into `src/graph.ts` only where it is stated, so an unchanged
+node's emitted lines are byte for byte what they were, and the mode the run works
+under is still the one `access:` derives, decided in the driver. That is a claim
+about the binding, not about a whole compiled project: the shared runtime and
+driver files carry this key's types and mapping, so they move with the compiler
+release — as they do on every release — and an artifact hash moves with them.
 **Status**: ratified — PRD resolved q60 rulings a and b. *PRD G3, resolved q25,
 q30, q54, q57, q58, q60; §8.9,
 [D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces),

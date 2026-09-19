@@ -8048,9 +8048,12 @@ export interface HarnessBinding {
    * whichever harness runs the node, so the compiler applies it; a permission
    * mode is a *harness's* own vocabulary and the mode an `access:` level derives
    * is that harness's mapping — `CC_PERMISSION` in `src/harness-cc.ts` — so an
-   * absent key is the driver's question to answer. It is also what keeps a
-   * composition written before this key existed compiling to the bytes it
-   * always did.
+   * absent key is the driver's question to answer. It is also what keeps a node
+   * written before this key existed emitting the **binding** it always emitted:
+   * nothing is materialized into `src/graph.ts` where the key is absent. The
+   * claim is about that binding and not about a whole project — this file and
+   * the drivers carry the key's type and its mapping, so they move with the
+   * compiler release as they do on every release.
    */
   readonly permissionMode?: PermissionMode;
   /** `allow_tools:` — absent where the node declares none. */

@@ -1,0 +1,44 @@
+# rule: a `coder:` node's `settings:` key reaching the thinking budget is
+# rule: refused, naming where `model:` points rather than `model:` (8.9, D141)
+# code: reserved-harness-setting
+# message: `thinking` of `flow.main` node `build` is a `harness: cc` option the generated adapter owns: it is what `model:` resolves to
+# at: main.yml:38:11
+# label: main.yml:32:18 the harness is bound here
+# help: `model:` is already on the node and is an address, so the value is written where it points, not here: `model:` is a registry address, so the one model setting this harness takes is written in the `model.*` definition it names — `thinking:` in that definition's own `settings:`, where the provider plugin's schema checks it (grammar 12.2, Decision D141). `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# The answer that is a key the author has **already written**. `model:` is
+# required on every `coder:` block and is a registry address (§12.2, D141): the
+# one model setting this harness takes is `thinking:` inside the `model.*`
+# definition it names, where the provider plugin's own schema checks it. So the
+# refusal cannot say "write `model:` on the node instead" — that names a line
+# three rows above the one being refused — and says where the address points.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+  settings:
+    thinking: { budget_tokens: 4000 }
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: Read the tree and report.
+        settings:
+          thinking: { budget_tokens: 8000 }
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

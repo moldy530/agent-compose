@@ -910,6 +910,16 @@ pub fn resolved_mode(coder: &Coder) -> Option<PermissionMode> {
 pub enum Answered {
     /// A key of the `coder:` block states this bound, written without its colon.
     By(&'static str),
+    /// A key of the block **addresses** what states this bound: the key, written
+    /// without its colon, and where the value is actually written.
+    ///
+    /// The distinction earns its variant because [`By`](Self::By)'s repair is
+    /// "write that key instead", which is only true of a key an author has not
+    /// written. `model:` is **required** on every `coder:` block and is a
+    /// registry address (grammar 8.9, Decision D141): the thinking budget a
+    /// harness takes lives in the `model.*` definition it names, so an author
+    /// sent to `model:` alone would be sent to a line already on their node.
+    Through(&'static str, &'static str),
     /// Nothing states it: the option is **excluded** rather than restated, and
     /// this is why.
     Nothing(&'static str),
@@ -962,15 +972,26 @@ pub struct ReservedRow {
 ///    resolved q60 ruling a exists to give this answer), `sandboxMode` is
 ///    `access:`, `outputFormat` is `output:`;
 ///  * an option that **contains** one without spelling it — `extraArgs` is any
-///    CLI flag there is, `mcpServers` and `agents` put a tool or a whole loop
-///    outside `allow_tools:`, the process-spawn family replaces the program that
-///    enforces every bound.
+///    CLI flag there is, `mcpServers`, `agents` and `skills` put a tool or a
+///    whole loop outside `allow_tools:`, the process-spawn family replaces the
+///    program that enforces every bound.
 ///
-/// A row's [`Answered`] is which key a reader should write **instead**, and three
+/// A row's [`Answered`] is which key a reader should write **instead**, and four
 /// families answer to nothing: the resume family, which PRD resolved q57 ruling b
 /// excludes by name; `fallbackModel` and `approvalPolicy`, which are a ladder and
-/// a tier that stop at this boundary; and `extraArgs`, which is not one bound to
-/// point at but all of them at once.
+/// a tier that stop at this boundary; `extraArgs`, which is not one bound to
+/// point at but all of them at once; and the **process-spawn family**, which is
+/// the one grammar 8.9 says does not widen a bound but replaces the program
+/// enforcing all of them — `harness:` is required on every block and names which
+/// vendor's adapter runs, never which executable that adapter spawns or what
+/// runtime spawns it, so pointing an author at it would name a key they have
+/// already written and that cannot say what they asked for.
+///
+/// A fifth answer is [`Answered::Through`]: `model:` is an **address**, so the
+/// one model setting a harness takes — `cc`'s thinking budget, `codex`'s
+/// reasoning effort — is stated in the `model.*` definition it names rather than
+/// on this block (Decision D141). The key is real and is already on the node,
+/// which is exactly why "write it instead" would be the wrong sentence.
 pub const RESERVED: &[ReservedRow] = &[
     ReservedRow {
         harness: Harness::Cc,
@@ -1030,11 +1051,11 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "executable",
-        answered: Answered::By("harness"),
+        answered: Answered::Nothing(SPAWN),
     },
     ReservedOption {
         option: "executableArgs",
-        answered: Answered::By("harness"),
+        answered: Answered::Nothing(SPAWN),
     },
     ReservedOption {
         option: "extraArgs",
@@ -1061,7 +1082,7 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "maxThinkingTokens",
-        answered: Answered::By("model"),
+        answered: Answered::Through("model", THINKING),
     },
     ReservedOption {
         option: "mcpServers",
@@ -1077,7 +1098,7 @@ const CC_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "pathToClaudeCodeExecutable",
-        answered: Answered::By("harness"),
+        answered: Answered::Nothing(SPAWN),
     },
     ReservedOption {
         // The key PRD resolved q60 ruling a exists to hand this row an answer:
@@ -1133,12 +1154,29 @@ const CC_RESERVED: &[ReservedOption] = &[
         answered: Answered::By("allow_tools"),
     },
     ReservedOption {
+        // The SDK's single switch for turning skills on — and the one that says
+        // so: "you do not need to add `'Skill'` to `allowedTools` yourself when
+        // using this option". A loop's worth of instructions within reach of a
+        // run whose `allow_tools:` never named it, exactly as `plugins` (which
+        // carries skills among other things) and `agents` are.
+        option: "skills",
+        answered: Answered::By("allow_tools"),
+    },
+    ReservedOption {
+        // The fourth member of the process-spawn family: a function called "in
+        // place of the default local spawn". From YAML it can only ever be a
+        // non-function, so a key spelling it would reach the SDK and die inside
+        // the vendor's own code rather than at `validate`.
+        option: "spawnClaudeCodeProcess",
+        answered: Answered::Nothing(SPAWN),
+    },
+    ReservedOption {
         option: "systemPrompt",
         answered: Answered::By("prompt"),
     },
     ReservedOption {
         option: "thinking",
-        answered: Answered::By("model"),
+        answered: Answered::Through("model", THINKING),
     },
     ReservedOption {
         option: "toolAliases",
@@ -1173,7 +1211,7 @@ const CODEX_RESERVED: &[ReservedOption] = &[
     },
     ReservedOption {
         option: "modelReasoningEffort",
-        answered: Answered::By("model"),
+        answered: Answered::Through("model", REASONING),
     },
     ReservedOption {
         option: "sandboxMode",
@@ -1193,6 +1231,41 @@ const RESUME: &str = "harness-native resume is a named exclusion rather than a b
 const LADDER: &str = "a fallback model is the failover ladder, which does not reach inside a \
                       harness run: the harness owns its client and its own retries, and this \
                       compiler's `retry:` wraps whole runs";
+
+/// …and why the process-spawn family does (grammar 8.9, PRD resolved q57 ruling
+/// c).
+///
+/// Not `Answered::By("harness")`, which is the answer this family had and the
+/// one that cannot be followed: `harness:` is **required** on every `coder:`
+/// block and takes `cc` or `codex` — an author who asked for a different binary,
+/// a different JavaScript runtime, or a spawn function of their own would be
+/// sent to a key already on their node that cannot name any of those things.
+/// Grammar 8.9 puts this family in the other class in so many words: a key there
+/// "does not widen one bound, it replaces or re-arms the program that enforces
+/// all of them".
+const SPAWN: &str = "which program a run is — the binary, the runtime that spawns it, what that \
+                     runtime loads first — is not a bound to widen but the thing that enforces \
+                     every bound, so `tools`, `canUseTool` and `permissionMode` would be asked \
+                     of something the composition never named. `harness:` names which vendor's \
+                     adapter runs, never which executable it is";
+
+/// …and where the one model setting each harness takes is written instead — the
+/// [`Answered::Through`] rows (Decision D141).
+///
+/// Two strings rather than one because the `model.*` key is the harness's own:
+/// `thinking:` carries `cc`'s budget and `reasoning_effort:` carries `codex`'s
+/// effort, and a refusal that named the other harness's key would be the
+/// sends-you-to-a-second-diagnostic failure this whole answer exists to avoid.
+const THINKING: &str = "`model:` is a registry address, so the one model setting this harness \
+                        takes is written in the `model.*` definition it names — `thinking:` in \
+                        that definition's own `settings:`, where the provider plugin's schema \
+                        checks it (grammar 12.2, Decision D141)";
+
+/// …and `codex`'s half of it.
+const REASONING: &str = "`model:` is a registry address, so the one model setting this harness \
+                         takes is written in the `model.*` definition it names — \
+                         `reasoning_effort:` in that definition's own `settings:`, where the \
+                         provider plugin's schema checks it (grammar 12.2, Decision D141)";
 
 /// Every option one harness's adapter owns, in the table's order.
 #[must_use]
@@ -2069,6 +2142,16 @@ mod tests {
     /// are bound to the surface an author reads them on — grammar 8.9 — rather
     /// than to a second list here that could agree with nothing.
     ///
+    /// **Both answering variants are held.** [`Answered::By`] names the key to
+    /// write and [`Answered::Through`] names the key that *addresses* where to
+    /// write it, and an author has to be able to find either one in 8.9. What
+    /// this cannot see is a key that exists and cannot be *followed*: `harness:`
+    /// is a row of the table, so an answer naming it passes here while sending
+    /// an author to a required key that takes `cc` or `codex` and cannot name an
+    /// executable. So
+    /// [`the_options_the_ruling_names_are_answered_by_the_keys_it_names`] pins
+    /// the process-spawn family to [`Answered::Nothing`] by name.
+    ///
     /// **Two spellings count**, because a coder node takes keys from two places
     /// and 8.9 writes them two ways: its own are rows of the block's key table,
     /// and the **common node keys** it inherits are named in the paragraph under
@@ -2091,7 +2174,7 @@ mod tests {
             .expect("…and its key table closes with the unknown-key sentence")];
         for row in RESERVED {
             for held in row.options {
-                let Answered::By(key) = held.answered else {
+                let (Answered::By(key) | Answered::Through(key, _)) = held.answered else {
                     continue;
                 };
                 assert!(
@@ -2118,6 +2201,14 @@ mod tests {
     /// key answered, and a `codex` author reaching for `sandboxMode` is the same
     /// move on the other harness. Spelled out rather than counted, because an
     /// answer is a sentence and not a count.
+    ///
+    /// The families whose answer is **not** a plain "write this key" are pinned
+    /// here too — resume, the process-spawn family, and the thinking budget — for
+    /// the reason the entry gives them a clause of their own: a table tempted to
+    /// point at the nearest key gets each of them wrong, and the nearest key for
+    /// the last two (`harness:`, `model:`) is a real row of grammar 8.9's table,
+    /// so [`a_reserved_options_answer_is_a_key_the_coder_block_takes`] passes
+    /// green on exactly the wrong answer.
     #[test]
     fn the_options_the_ruling_names_are_answered_by_the_keys_it_names() {
         for (harness, option, key) in [
@@ -2147,6 +2238,51 @@ mod tests {
                 ),
                 "`{option}` is answered by a key, and harness-native resume is excluded rather \
                  than restated"
+            );
+        }
+        // …and the family that answers to nothing for the *other* reason, which
+        // a table pointing at the nearest key gets wrong in the one way this
+        // module's own guards cannot see: `harness:` is a real key of grammar
+        // 8.9, so `a_reserved_options_answer_is_a_key_the_coder_block_takes`
+        // passes green while the refusal sends an author to a **required** key
+        // that takes `cc` or `codex` and cannot name an executable, a runtime or
+        // a spawn function. Grammar 8.9 puts this family in the other class in
+        // so many words — it "does not widen one bound, it replaces or re-arms
+        // the program that enforces all of them" — which is `Answered::Nothing`.
+        for option in [
+            "pathToClaudeCodeExecutable",
+            "executable",
+            "executableArgs",
+            "spawnClaudeCodeProcess",
+        ] {
+            assert!(
+                matches!(
+                    reserved_option(Harness::Cc, option).map(|held| held.answered),
+                    Some(Answered::Nothing(_))
+                ),
+                "`{option}` is answered by a key of the block, and no key of the block can say \
+                 which program a run is: `harness:` is required, takes `cc` or `codex`, and \
+                 names which vendor's adapter runs rather than which executable it is"
+            );
+        }
+        // …and the one that answers *through* a key rather than to one: the
+        // thinking budget is written in the `model.*` definition `model:` names
+        // (Decision D141), and `model:` is required, so "write `model:` instead"
+        // would name a line already on the node.
+        for (harness, option) in [
+            (Harness::Cc, "thinking"),
+            (Harness::Cc, "maxThinkingTokens"),
+            (Harness::Codex, "modelReasoningEffort"),
+        ] {
+            assert!(
+                matches!(
+                    reserved_option(harness, option).map(|held| held.answered),
+                    Some(Answered::Through("model", _))
+                ),
+                "a `harness: {}` `settings:` key spelling `{option}` is not answered through \
+                 `model:`, which is the address the one model setting a harness takes is written \
+                 behind",
+                harness.as_str()
             );
         }
     }

@@ -1,0 +1,49 @@
+# rule: a `coder:` node's `settings:` key choosing which program the run is
+# rule: answers to no key, and `harness:` is not offered (8.9, D146)
+# code: reserved-harness-setting
+# message: `pathToClaudeCodeExecutable` of `flow.main` node `build` is a `harness: cc` option the generated adapter owns, and no key of this block states it
+# at: main.yml:43:11
+# label: main.yml:37:18 the harness is bound here
+# help: there is no key to write instead: which program a run is — the binary, the runtime that spawns it, what that runtime loads first — is not a bound to widen but the thing that enforces every bound, so `tools`, `canUseTool` and `permissionMode` would be asked of something the composition never named. `harness:` names which vendor's adapter runs, never which executable it is. Take the setting off — what `settings:` buys is the vendor's *other* options, never the ones this node already states. `settings:` is open so that a harness option the vendor ships tomorrow is usable the day it ships — it is not a second way to state this construct's own bounds, and a key here that reached one would be the only one no check covers. Refused rather than dropped, because a key silently removed leaves a run doing something no line of the composition says (grammar 8.9, Decision D146, PRD resolved q60 ruling b)
+#
+# The process-spawn family, which is the one class of reserved option where
+# pointing at the nearest key would be worse than pointing nowhere. `harness:`
+# is a real row of grammar 8.9's key table — so a guard that only asks whether
+# an answer names a key the block takes passes green on it — but it is
+# **required**, takes `cc` or `codex`, and says which vendor's adapter runs
+# rather than which executable that adapter is. An author sent there would be
+# sent to a line already on their node that cannot name a path.
+#
+# What the option reaches is every bound at once and by the shortest route:
+# `pathToClaudeCodeExecutable` is the binary spawned, so `tools`, `canUseTool`
+# and the `permissionMode` this node's `access:` derives would all be asked of a
+# program the composition never named, while `enforcesTools` and the graph
+# document's `tools_enforced` went on saying the list holds.
+version: "0.1"
+provider.p:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.smart:
+  provider: provider.p
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.smart
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: Read the tree and report.
+        settings:
+          pathToClaudeCodeExecutable: /opt/claude/cli
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }

@@ -798,6 +798,16 @@ fn reserved_setting(
                  disagreeing about which wins"
             ),
         ),
+        Answered::Through(first_class, site) => (
+            format!(
+                "`{held}` of {subject} is a `harness: {harness}` option the generated adapter \
+                 owns: it is what `{first_class}:` resolves to"
+            ),
+            format!(
+                "`{first_class}:` is already on the node and is an address, so the value is \
+                 written where it points, not here: {site}"
+            ),
+        ),
         Answered::Nothing(why) => (
             format!(
                 "`{held}` of {subject} is a `harness: {harness}` option the generated adapter \
@@ -1005,7 +1015,8 @@ mod tests {
     /// checked refused with the code that says why. That second half is what
     /// makes this a statement about the bound rather than about three examples —
     /// the negative corpus pins one refusal's wording, and this pins that there
-    /// are exactly fourteen of them.
+    /// are exactly seven of them: eighteen pairings, eleven admitted (one, four
+    /// and six, level by level), and the rest refused.
     #[test]
     fn each_access_level_takes_every_mode_it_admits_and_no_other() {
         use crate::ast::flow::{PermissionMode, WorkspaceAccess};

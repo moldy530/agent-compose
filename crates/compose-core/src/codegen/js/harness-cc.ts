@@ -44,16 +44,20 @@ const CC_SETTINGS: readonly string[] = [
  *    `add-dir` among them — so it is every bound at once. `settings`,
  *    `managedSettings` and `settingSources` carry permission rules;
  *    `additionalDirectories` carries roots beside `workspace:`; `sandbox`
- *    carries containment; `mcpServers`, `agents`, `agent` and `toolAliases`
- *    each put a tool or a whole loop outside `allow_tools:` within reach —
- *    `agent` also carrying its own model and prompt — and `plugins` carries
- *    hooks, agents and skills together; `hooks`, `permissionPrompts` and
+ *    carries containment; `mcpServers`, `agents`, `agent`, `skills` and
+ *    `toolAliases` each put a tool or a whole loop outside `allow_tools:`
+ *    within reach — `agent` also carrying its own model and prompt, and
+ *    `skills` being the SDK's own single switch for turning skills on, which
+ *    its documentation says needs no `'Skill'` entry in `allowedTools` beside
+ *    it — and `plugins` carries hooks, agents and skills together; `hooks`,
+ *    `permissionPrompts` and
  *    `permissionPromptToolName` each move or silence the decision `canUseTool`
  *    makes; and `fallbackModel` is the failover ladder D141 stops at the
  *    boundary. The **process-spawn family** — `pathToClaudeCodeExecutable`,
- *    `executable` and `executableArgs` — contains *every* bound at once and for
- *    the worst reason: those three choose which program runs and what the
- *    runtime loads before it, so a key among them replaces or re-arms the very
+ *    `executable`, `executableArgs` and `spawnClaudeCodeProcess` — contains
+ *    *every* bound at once and for the worst reason: those four choose which
+ *    program runs and what the runtime loads before it, so a key among them
+ *    replaces or re-arms the very
  *    harness that is supposed to be enforcing `tools`, `canUseTool` and
  *    `permissionMode`. An adapter never assigns them — it wants the SDK's own
  *    executable — which is exactly why a list read off the driver could not
@@ -108,6 +112,8 @@ const CC_RESERVED: readonly string[] = [
   "sessionId",
   "settingSources",
   "settings",
+  "skills",
+  "spawnClaudeCodeProcess",
   "toolAliases",
 ];
 

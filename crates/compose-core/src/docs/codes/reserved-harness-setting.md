@@ -21,12 +21,13 @@ deliberately open surface into the way around all the closed ones.
 
 An option does not have to *spell* a bound to reach around it, and the reserved
 set is the wider one. `extraArgs` is any command-line flag there is —
-`dangerously-skip-permissions` and `add-dir` among them. `mcpServers`, `agents`
-and `plugins` put a tool or a whole loop within reach of a run whose
+`dangerously-skip-permissions` and `add-dir` among them. `mcpServers`, `agents`,
+`skills` and `plugins` put a tool or a whole loop within reach of a run whose
 `allow_tools:` never mentioned it. `additionalDirectories` is sandbox roots
-beside `workspace:`. `pathToClaudeCodeExecutable`, `executable` and
-`executableArgs` choose which program the run *is*, so a key among them does not
-widen one bound — it replaces the program enforcing all of them.
+beside `workspace:`. `pathToClaudeCodeExecutable`, `executable`,
+`executableArgs` and `spawnClaudeCodeProcess` choose which program the run *is*,
+so a key among them does not widen one bound — it replaces the program enforcing
+all of them.
 
 **This is an error rather than a dropped value with a warning**, and that is a
 deliberate change from how the key behaved when coder nodes first shipped. A key
@@ -93,15 +94,22 @@ bound, so it is written on the node.
 | a permission mode, or the flag one requires | `permission_mode:` |
 | a sandbox preset, or sandbox configuration | `access:` |
 | a working directory, or roots beside it | `workspace:` |
-| a tool set, an allowlist, a permission callback, an MCP server, a subagent | `allow_tools:` |
+| a tool set, an allowlist, a permission callback, an MCP server, a subagent, a skill set | `allow_tools:` |
 | the environment | `env:` |
 | the output format | `output:` |
 | the system prompt, or plan mode's body | `prompt:` |
 | the abort signal | `timeout:` |
-| the model, or a model setting the harness takes | `model:` |
-| which executable the harness is | `harness:` |
+| the model | `model:` |
 
-Three families answer to no key at all, and the message says so rather than
+One answer is a key that **addresses** the value rather than holding it. The one
+model setting a harness takes — `thinking` and `maxThinkingTokens` under `cc`,
+`modelReasoningEffort` under `codex` — is written in the `model.*` definition
+`model:` names, in that definition's own `settings:`, where the provider plugin's
+schema checks it (`docs/grammar.md` §12.2, Decision D141). `model:` is required
+on every `coder:` block, so the message says *where it points* rather than
+telling an author to write a key they already have.
+
+Four families answer to no key at all, and the message says so rather than
 pointing at the nearest one:
 
 * the **resume** family — `resume`, `continue`, `forkSession`, `sessionId` and
@@ -113,7 +121,13 @@ pointing at the nearest one:
   this compiler's `retry:` wraps whole runs;
 * **`extraArgs`** and `approvalPolicy`: the first is every bound at once, and the
   second is a per-call approval tier belonging to an app server this release does
-  not adopt.
+  not adopt;
+* the **process-spawn** family — `pathToClaudeCodeExecutable`, `executable`,
+  `executableArgs`, `spawnClaudeCodeProcess`. `harness:` is not the answer here,
+  and pointing at it would be worse than pointing nowhere: it is a **required**
+  key taking `cc` or `codex`, so it is already written on the node and names
+  which vendor's adapter runs — never which executable that adapter is, which
+  runtime spawns it, or what that runtime loads first.
 
 ## The fix, applied
 
