@@ -1464,6 +1464,33 @@ pub(crate) fn dispatched_workspaces<'a>(ctx: &mut Ctx<'a>) {
             // it again would be sending them to the line they wrote correctly
             // (PRD G3).
             let per_dispatch_only = per_dispatch && !by_instance;
+            // The coder node and the map are both innocent: the edit is at the
+            // binding that fed this `workspace:` a value the failing axis cannot
+            // tell apart, which may be several instantiations away from either —
+            // a `flow:` node between them, or the map's own `input:` entry. Name
+            // it, for each `input.<field>` the expression reads, exactly as the
+            // sibling rule over these frames does (`check::stores`, grammar 11.4's
+            // worked example, PRD G3).
+            //
+            // **Of the axis that decided the refusal**, because the two answer
+            // for different fields and the wrong one would label a line that is
+            // correct: a field the map's item derives is a value per dispatch,
+            // and four concurrent instances of that map still share it.
+            let answers = if per_dispatch_only {
+                &frame.per_instance
+            } else {
+                &frame.derived
+            };
+            let bound = reach::input_fields(expression.as_str())
+                .into_iter()
+                .filter_map(|field| {
+                    if answers.get(&field) != Some(&false) {
+                        return None;
+                    }
+                    let at = frame.bound_at.get(&field)?;
+                    Some((field, at.clone()))
+                })
+                .collect();
             let subject = format!("`{}` node `{}`", frame.address, node.id.value);
             let key = (
                 subject.clone(),
@@ -1478,6 +1505,7 @@ pub(crate) fn dispatched_workspaces<'a>(ctx: &mut Ctx<'a>) {
                 // at a second subject.
                 unobserved: if per_dispatch_only { None } else { unobserved },
                 at: coder.workspace.span.clone(),
+                bound,
                 dispatcher: frame.dispatcher.clone(),
                 dispatched_at: frame.span.clone(),
                 declared: frame.declared,
@@ -1650,6 +1678,10 @@ struct Shared {
     unobserved: Option<Unobserved>,
     /// Its `workspace:`, which is the line the refusal anchors at.
     at: Span,
+    /// The `input:` entries that fed the expression a value the failing axis
+    /// cannot tell apart, paired with the field each one binds — the line an
+    /// author actually edits, which is neither this node nor the map.
+    bound: Vec<(String, Span)>,
     /// How the dispatching map is named.
     dispatcher: String,
     /// That map node's span.
@@ -1679,6 +1711,7 @@ impl Shared {
             flow,
             unobserved,
             at,
+            bound,
             dispatcher,
             dispatched_at,
             declared,
@@ -1775,6 +1808,34 @@ impl Shared {
             diagnostic =
                 diagnostic.with_label(outer.span.clone(), "and that dispatch is inside this one");
         }
+        // The line that actually has to change, where the value arrived through
+        // an `input.<field>`: neither this node nor the map, but the `input:`
+        // entry that fixed the field — which at depth is a `flow:` node's own,
+        // several instantiations from either (grammar 11.4's worked example,
+        // PRD G3). The two axes are labelled apart because they are two claims:
+        // a field the map's item derives is per-dispatch and still one value all
+        // of the enclosing instances share.
+        let carried = list(bound.iter().map(|(field, _)| field));
+        for (field, at) in bound {
+            let shares = if per_dispatch_only {
+                "to a value every instance of this map shares"
+            } else {
+                "to a value every dispatch shares"
+            };
+            diagnostic = diagnostic.with_label(at, format!("`{field}` is bound here, {shares}"));
+        }
+        // Named in the help as well as labelled, because the repair sentences
+        // below quote an `input:` entry as the shape of the edit and a reader
+        // has to know *which* entry theirs is: with a `flow:` node between the
+        // map and this node, it is that node's, not the map's.
+        let at_the_binding = if carried.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " The line that repair edits is the binding labelled above ({carried}): that is \
+                 where the value this `workspace:` reads is fixed, however many dispatches read it."
+            )
+        };
         if per_dispatch_only {
             return diagnostic.with_help(format!(
                 "a harness run is contained by its `workspace:`, and `{expression}` is a \
@@ -1786,7 +1847,7 @@ impl Shared {
                  outer fan-out makes distinct (bind it at {dispatcher} — `input: {{ dir: \
                  \"input.root + '/' + item.path\" }}` — and read it here as \
                  `workspace: \"input.dir\"`), or write `workspace: fresh` for a directory the \
-                 runtime provisions per dispatch — {serial}. An item is a value drawn from a \
+                 runtime provisions per dispatch — {serial}.{at_the_binding} An item is a value drawn from a \
                  list, and two instances drawing from two lists can draw the same one, which is \
                  why the map's own item does not settle this (grammar 8.6, 8.9, Decision D147, \
                  PRD resolved q61 ruling b)"
@@ -1798,10 +1859,10 @@ impl Shared {
              each other's work.{instance} Two repairs, and each says something different about \
              the graph: bind the item's own path — carry it on the dispatch (`input: {{ worktree: \
              \"item.worktree\" }}`) and read it here (`workspace: \"input.worktree\"`), or write \
-             `workspace: fresh` for a directory the runtime provisions per dispatch — {serial}. \
-             `workspace:` is evaluated in this node's input scope at every dispatch precisely so \
-             the first repair is writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 \
-             ruling b)"
+             `workspace: fresh` for a directory the runtime provisions per dispatch — {serial}.\
+             {at_the_binding} `workspace:` is evaluated in this node's input scope at every \
+             dispatch precisely so the first repair is writable (grammar 8.6, 8.9, Decision \
+             D147, PRD resolved q61 ruling b)"
         ))
     }
 }

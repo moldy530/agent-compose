@@ -289,6 +289,14 @@ every attempt, and sweeps it with the rest of the run's scratch. What `fresh`
 does *not* do is clone anything — a task that needs a checkout still has an
 upstream step that makes one.
 
+An instance path carries each node's **traversal ordinal**, so a coder node on a
+bounded cycle gets a *different* `fresh` directory on the second pass, created
+empty: a review loop that sends the agent round again under `fresh` asks it to
+start over rather than to fix up what it wrote. A `retry:` is not that — it
+re-runs the same attempt at the same ordinal. A loop whose second pass needs the
+first pass's tree names a path that stays put instead, `workspace:
+"state.checkout"` off a step outside the loop being the usual one.
+
 Two harness runs in one directory edit each other's files, so that is refused
 where it can be seen: a map-dispatched coder whose `workspace:` does not read
 the per-dispatch scope is an error unless the map says `max_concurrency: 1` —

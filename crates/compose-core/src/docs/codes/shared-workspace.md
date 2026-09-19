@@ -41,6 +41,14 @@ it can happen:
   `state.checkout`, and so is `input['worktree']`. A constant key names a member,
   and the rule reads the name through either spelling.
 
+  **The refusal labels the line that has to change**, which is often neither the
+  coder node nor the map. Where the expression reads an `input.<field>`, the
+  message labels the `input:` entry that bound that field — the map's own where
+  the map dispatches the coder node's flow directly, and a `flow:` node's where
+  one stands between them. That third site is the edit: the `workspace:` reads a
+  dispatch fact the way the repair asks, the map binds its item the way the
+  repair asks, and the value every dispatch shares was fixed in the middle.
+
   The bound read is the one the dispatch really runs under, which is not always
   the one its own map declares. A map **inside** a fan-out issues its dispatches
   once per concurrent instance of the flow that holds it, so a map saying
@@ -206,7 +214,13 @@ Four repairs, and each says something different about the graph.
   named by the instance path (grammar §9.4) and created clean at the start of
   every attempt. It satisfies this rule by construction. What it does not do is
   put a checkout in it: a run that needs source control still needs the step
-  above.
+  above. An instance path also carries each node's **traversal ordinal**, so a
+  coder node on a bounded cycle gets a *different*, empty `fresh` directory on
+  the second pass — a review loop that sends the agent round again under `fresh`
+  is asking it to start over, not to fix up what it wrote. A `retry:` is not
+  that: it re-runs the same attempt at the same ordinal. A loop whose second
+  pass needs the first pass's tree takes one of the repairs above instead, with
+  the channel written by a step **outside** the loop.
 * **Say the runs are serial.** `max_concurrency: 1` on the map is a statement
   rather than a workaround — one dispatch at a time is one run in the directory
   at a time — and it is the honest spelling of what a shared-workspace fan-out

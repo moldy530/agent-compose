@@ -1113,3 +1113,31 @@ pub(crate) fn is_item_derived(
             }
     })
 }
+
+/// The `input.<field>` names one expression reads, first occurrence first and
+/// each named once.
+///
+/// This is the read half of what [`is_item_derived`] and
+/// [`reads_a_varying_field`] decide: those answer *whether* an expression is
+/// told apart along an axis, and a diagnostic that has to name the binding
+/// responsible needs *which* fields it went through — which is then looked up
+/// in [`Frame::bound_at`]. Both rules built on these frames name that binding,
+/// because the edit is neither at the reading node nor at the map: it is at the
+/// entry that fed the field a value the axis cannot separate, which may be
+/// several instantiations away from either (grammar 11.4's worked example,
+/// Decisions D83, D147).
+pub(crate) fn input_fields(source: &str) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+    for read in crate::cel::analyze(source, &Scope::default()).reads {
+        if read.root != "input" {
+            continue;
+        }
+        let Some(field) = read.path.first() else {
+            continue;
+        };
+        if !fields.iter().any(|seen| seen == field) {
+            fields.push(field.clone());
+        }
+    }
+    fields
+}

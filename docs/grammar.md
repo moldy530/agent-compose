@@ -3168,6 +3168,21 @@ and the directory's contents were never the record, so a replay neither empties
 it nor needs it. It goes when the execution's scratch goes, which is the
 lifetime a built-in's defaulted workspace already has (§5.5).
 
+**A second traversal is a second directory**, and it follows from the path
+rather than from this key. A node's frame is `<node id>/<traversal ordinal>`
+(§9.4), so a coder node on a bounded cycle (§7.4) resolves `fresh` to
+`…/implement/0` on the first pass and `…/implement/1` on the second: a new
+directory, created empty, with the first pass's work left behind in the one
+before it. A `retry:` is exactly the case this is *not*, for the same reason —
+re-running an attempt does not advance the ordinal, which is why the paragraph
+above is about attempts and this one is about traversals. So a review loop
+shaped `implement` → `review` → `implement` hands its coding agent an empty
+tree on every pass under `fresh`, and a loop that means the second pass to build
+on the first names a directory that does not move with the ordinal instead —
+any of the expression forms above, `workspace: "state.checkout"` off a step
+outside the loop being the usual one. Which of the two a loop wants is the
+author's call, so this states it rather than choosing.
+
 **What `fresh` does not do is provision a checkout.** It hands the run an empty
 directory, and a coding task that needs source control still prepares it: an
 upstream `exec:` or `tool.*` step that clones or `git worktree add`s into

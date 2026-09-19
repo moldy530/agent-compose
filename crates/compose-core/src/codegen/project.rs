@@ -1067,6 +1067,13 @@ run settles, exactly as the built-in workspace above it is — kept only while t
 execution's journal row stays open, so a `resume` finds what the run had
 written.
 
+The traversal ordinal is in that path, so **a second pass round a cycle is a
+second directory**: a coder node a loop sends back to gets `.../0` on the first
+traversal and an empty `.../1` on the second, with the first pass's work left in
+the directory before it. A `retry:` is not that — it re-runs one attempt at one
+ordinal. A loop whose second pass has to build on the first names a directory of
+its own instead of taking `fresh`.
+
 What it does **not** contain is a checkout: this project makes the directory and
 nothing else. A run that needs source control needs a step in the graph that
 puts it there.
@@ -1978,6 +1985,11 @@ flow.main:
         assert!(
             provisioned.contains("emptied and remade at the start of every attempt"),
             "…and what a retry finds there: {provisioned}"
+        );
+        assert!(
+            provisioned.contains("a second pass round a cycle is"),
+            "…and what a *cycle* finds there, which is the other reading of the \
+             same path and the one a review loop meets: {provisioned}"
         );
         assert!(
             provisioned.contains("does **not** contain is a checkout"),
