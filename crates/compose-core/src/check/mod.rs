@@ -165,11 +165,14 @@ pub fn check(ir: &Ir) -> Vec<Diagnostic> {
         reachable::check(&mut ctx, &cx, &graph);
         routing::check(&mut ctx, &cx, &graph);
         cycles::check(&mut ctx, &cx, &graph);
-        convergence::check(&mut ctx, &cx, &graph);
+        let forks = convergence::check(&mut ctx, &cx, &graph);
         // …and the other half of that race, which needs the same fork analysis
         // the line above runs: two coder nodes that may be in flight at once
-        // and name one directory (PRD resolved q61 ruling b).
-        coder::concurrent_workspaces(&mut ctx, &cx, &graph, &mut contained);
+        // and name one directory (PRD resolved q61 ruling b). It is handed the
+        // pairs that analysis already enumerated rather than enumerating them
+        // again, because re-deriving them re-reads every guard of every fork
+        // (`tests/check_scale.rs`).
+        coder::concurrent_workspaces(&mut ctx, &cx, &graph, &forks, &mut contained);
         fanout::check(&mut ctx, &cx, &graph);
     }
 

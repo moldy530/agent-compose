@@ -1763,6 +1763,7 @@ pub(crate) fn concurrent_workspaces<'a>(
     ctx: &mut Ctx<'a>,
     cx: &FlowCx<'_>,
     graph: &Graph<'_>,
+    forks: &[super::convergence::Pair],
     memo: &mut reach::Coders<'a>,
 ) {
     // The steps that *could* hold a run, decided on the node's kind alone —
@@ -1783,7 +1784,12 @@ pub(crate) fn concurrent_workspaces<'a>(
             )
         })
         .collect();
-    let concurrent = super::convergence::concurrent_among(ctx, graph, &of_interest);
+    // The fork enumeration is the one `convergence::check` just ran over this
+    // same graph, handed in rather than repeated: this rule contributes no pair
+    // of its own, and re-deriving them would re-read every guard of every fork
+    // — the per-edge pass `convergence::possible` exists to avoid
+    // (`tests/check_scale.rs`, PRD 5.12).
+    let concurrent = super::convergence::concurrent_among(graph, forks, &of_interest);
     // …so the walk happens for the steps a pair actually named, once each.
     let mut runs: BTreeMap<usize, Vec<Run>> = BTreeMap::new();
     for (one, other) in &concurrent {

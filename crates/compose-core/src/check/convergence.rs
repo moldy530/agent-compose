@@ -194,18 +194,32 @@ use super::{Ctx, FlowCx, channels, guards};
 type Skew = Option<(usize, usize, usize)>;
 
 /// One pair of sibling out-edges that may both fire.
-struct Pair {
+///
+/// Opaque outside this module: what a caller does with these is ask
+/// [`concurrent_among`] a question about them, and the enumeration itself is
+/// this file's business (grammar 7.6.1).
+pub(crate) struct Pair {
     /// The fork they leave.
     source: Vertex,
     /// The two edge indexes, in declaration order.
     edges: (usize, usize),
 }
 
-/// Check one flow's forks.
-pub(crate) fn check<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>) {
+/// Check one flow's forks, and hand back the co-takeable pairs they came from.
+///
+/// The pairs are returned rather than dropped because the shared-workspace
+/// warning asks a second question of the **same** enumeration
+/// ([`concurrent_among`], PRD resolved q61 ruling b), and enumerating them again
+/// would re-read every guard of every fork with it: [`possible`] is hoisted out
+/// of the pair loop precisely because a 240-branch guarded fork costs 10.2 s the
+/// naive way, and a second pass pays that cost over again for a rule that adds
+/// no pair of its own. One enumeration per flow, two rules stated over it
+/// (`tests/check_scale.rs`, PRD 5.12).
+pub(crate) fn check<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>) -> Vec<Pair> {
     let pairs = pairs(ctx, graph);
     balanced(ctx, cx, graph, &pairs);
     concurrent(ctx, cx, graph, &pairs);
+    pairs
 }
 
 /// Which of a handful of nodes can run **concurrently** with which
@@ -222,9 +236,14 @@ pub(crate) fn check<'a>(ctx: &mut Ctx<'a>, cx: &FlowCx<'a>, graph: &Graph<'a>) {
 ///
 /// The pairs come back keyed by node index, ascending, which is the order a
 /// diagnostic names two nodes in whichever branch each was found in.
-pub(crate) fn concurrent_among<'a>(
-    ctx: &Ctx<'a>,
-    graph: &Graph<'a>,
+///
+/// The fork enumeration is the caller's to supply, and it is [`check`]'s own:
+/// this rule reads the co-takeable pairs and adds none, so re-deriving them here
+/// would re-read every guard of every fork for nothing
+/// (`tests/check_scale.rs`).
+pub(crate) fn concurrent_among(
+    graph: &Graph<'_>,
+    pairs: &[Pair],
     of_interest: &[usize],
 ) -> BTreeSet<(usize, usize)> {
     let mut found = BTreeSet::new();
@@ -234,8 +253,8 @@ pub(crate) fn concurrent_among<'a>(
     let interest: BTreeSet<usize> = of_interest.iter().copied().collect();
     let mut held: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     let mut crossed: BTreeSet<(usize, usize)> = BTreeSet::new();
-    for pair in pairs(ctx, graph) {
-        let Some((near, far)) = branches(graph, &pair) else {
+    for pair in pairs {
+        let Some((near, far)) = branches(graph, pair) else {
             continue;
         };
         if !crossed.insert((near.min(far), near.max(far))) {

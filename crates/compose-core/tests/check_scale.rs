@@ -657,6 +657,88 @@ fn a_guarded_fork_reads_each_guard_once_rather_than_once_per_pair() {
     );
 }
 
+/// The same guarded fork with a **coder node** on every arm, which is the only
+/// shape that puts the shared-workspace warning's half of the fork analysis on
+/// the clock at all.
+///
+/// `check/coder.rs`'s `concurrent_workspaces` asks `convergence::concurrent_among`
+/// which of a flow's coder, `flow:` and `map` steps can be in flight at once
+/// (PRD resolved q61 ruling b), and that question short-circuits on fewer than
+/// two such steps — so every other shape in this file, built from `agent:` nodes
+/// alone, returns before the fork enumeration is reached and a cost paid there
+/// is invisible to all of them. Here 241 of the 242 nodes are steps of interest,
+/// so the rule crosses the whole fan: 240 guarded edges are 28,680 co-takeable
+/// pairs, every arm's coder run is compared against every other's, and the
+/// per-edge guard reading the fork analysis is built around
+/// (`convergence::possible`) is entered at full width.
+///
+/// The budget is the file's usual one and guards what a budget can guard:
+/// anything this rule *walks* or *reads off a guard* per pair, which is the
+/// 10.2 s-against-1.06 s pass the test above exists for, entered here through a
+/// second caller. What it deliberately does **not** guard is the constant
+/// factor of enumerating the fork pairs twice — the warning adds no pair of its
+/// own, and deriving them a second time rather than taking the ones
+/// `convergence::check` just produced cost this shape 2.49 s against 1.73 s — a
+/// 44 % regression no budget several times the true cost can see. That one is
+/// held by the signature instead: `concurrent_among` takes the pairs and has no
+/// way to derive them.
+///
+/// Every arm names a directory of its own, so the report is empty and the clock
+/// is on the analysis alone — the collision half of the rule is what
+/// `tests/fixtures/invalid-check/two-concurrent-coder-nodes-name-one-workspace`
+/// pins.
+#[test]
+fn a_wide_fork_of_coder_nodes_enumerates_its_forks_once() {
+    let dir = scratch("guarded-coders");
+    guarded_coder_fork_project(&dir, 240, 19);
+    let budget = Duration::from_secs(6);
+    let fastest = fastest_check(&artifact(&dir), "240-branch guarded fork of coder nodes", 0);
+    assert!(
+        fastest < budget,
+        "checking a 240-branch guarded fork of coder nodes took {fastest:?}, and the budget is \
+         {budget:?}"
+    );
+}
+
+/// [`guarded_fork_project`]'s fork with every leaf a `coder:` node working in a
+/// directory of its own.
+///
+/// The guards, the conjuncts and the five enum fields are that project's
+/// exactly — this varies the one thing the shared-workspace warning reads, which
+/// is what the leaves *are*. `workspace:` is a distinct literal per arm, so the
+/// rule crosses all 28,680 pairs and reports nothing.
+fn guarded_coder_fork_project(dir: &Path, width: usize, conjuncts: usize) {
+    let mut nodes = String::from("    r: { agent: agent.g, input: \"'r'\" }\n");
+    let mut edges = String::from("    - { from: start, to: r }\n");
+    let leaf = |at: usize| {
+        format!(
+            "    t{at}:\n      coder:\n        harness: cc\n        model: model.m\n        \
+             workspace: \"'/srv/w{at}'\"\n        prompt: Work.\n        output:\n          \
+             summary: {{ type: string }}\n      input: \"'t'\"\n"
+        )
+    };
+    for at in 0..width {
+        nodes.push_str(&leaf(at));
+        let rest: String = (0..conjuncts - 1)
+            .map(|term| format!(" && size(state.seen) > {}", at + term))
+            .collect();
+        edges.push_str(&format!(
+            "    - {{ from: r, to: t{at}, when: \"r.output.outcome == 'approve'{rest}\" }}\n"
+        ));
+        edges.push_str(&format!("    - {{ from: t{at}, to: end }}\n"));
+    }
+    nodes.push_str(&leaf(width));
+    edges.push_str(&format!("    - {{ from: r, to: t{width}, else: true }}\n"));
+    edges.push_str(&format!("    - {{ from: t{width}, to: end }}\n"));
+    fs::write(
+        dir.join("main.yml"),
+        format!(
+            "version: \"0.1\"\n{GUARDED}flow.f:\n  outputs: {{}}\n  nodes:\n{nodes}  edges:\n{edges}"
+        ),
+    )
+    .expect("can write the entrypoint");
+}
+
 /// A fan of branches that all race one channel, which is where anything
 /// **reported** per pair shows.
 ///
