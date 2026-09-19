@@ -465,6 +465,39 @@ pub enum DiagnosticCode {
     /// two-tier posture, and the same warning shape, as
     /// [`UnknownServerTool`](Self::UnknownServerTool).
     UnknownHarnessSetting,
+    /// A `coder:` node's model resolves to a provider declaring a connection
+    /// fact the bound harness has **no slot for** (grammar 8.9, Decision D143,
+    /// PRD resolved q58 ruling b).
+    ///
+    /// An **error** rather than the warn-and-drop resolved q30 gives a server
+    /// tool, and the difference is what the fact decides: where the traffic goes
+    /// and whether it authenticates. A `headers:` silently dropped on the way
+    /// into a harness run is a gateway token that never reaches the wire, found
+    /// on the first live call rather than at `validate` — which is the class
+    /// resolved q25 refused (PRD G3).
+    UnsupportedConnectionFact,
+    /// A `coder:` node's model resolves through a `provider.*` whose `kind:`
+    /// speaks a wire the bound harness's connection surface does not (grammar
+    /// 8.9, Decision D143, PRD resolved q58 ruling b).
+    ///
+    /// A slot is an endpoint and a credential **on one wire**: `cc` carries a
+    /// connection into `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`, `codex`
+    /// into its client's OpenAI base URL and key. Mapping an `openai` provider
+    /// through the first, or an `anthropic` one through the second, writes one
+    /// vendor's endpoint and key where the other's are read — the same class as
+    /// [`UnsupportedConnectionFact`](Self::UnsupportedConnectionFact), one level
+    /// up, and refused for the same reason: it decides where the traffic goes.
+    UnsupportedProviderKind,
+    /// A `coder:` node's `env:` names a variable the connection map would set
+    /// from its model's provider (grammar 8.9, Decision D143, PRD resolved q58
+    /// ruling c).
+    ///
+    /// **One spelling per fact**: the node and the provider would each be
+    /// writing one name, and neither a silent shadowing nor a precedence rule to
+    /// memorize is an answer. An author who wants one node on a different
+    /// endpoint defines another provider, which is the cheap move resolved q30
+    /// already leans on.
+    ConflictingConnectionVariable,
 
     // --- graph analyses (grammar 7.4–7.8, 8.6, 13.3) ----------------------
     /// A node has a pass on which its branch takes no outgoing edge: it has
@@ -596,6 +629,9 @@ impl DiagnosticCode {
         Self::MismatchedServerTools,
         Self::UnsupportedHarness,
         Self::UnknownHarnessSetting,
+        Self::UnsupportedConnectionFact,
+        Self::UnsupportedProviderKind,
+        Self::ConflictingConnectionVariable,
         Self::DeadEnd,
         Self::UnboundedCycle,
         Self::UnbalancedConvergence,
@@ -673,6 +709,9 @@ impl DiagnosticCode {
             Self::MismatchedServerTools => "mismatched-server-tools",
             Self::UnsupportedHarness => "unsupported-harness",
             Self::UnknownHarnessSetting => "unknown-harness-setting",
+            Self::UnsupportedConnectionFact => "unsupported-connection-fact",
+            Self::UnsupportedProviderKind => "unsupported-provider-kind",
+            Self::ConflictingConnectionVariable => "conflicting-connection-variable",
             Self::DeadEnd => "dead-end",
             Self::UnboundedCycle => "unbounded-cycle",
             Self::UnbalancedConvergence => "unbalanced-convergence",

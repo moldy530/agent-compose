@@ -1,0 +1,55 @@
+# rule: a second spelling of a connection fact — a node `env:` entry naming a
+# rule: variable the harness reads beside the slot — is refused (grammar 8.9,
+# rule: D143, PRD resolved q58 rulings a and c)
+# code: conflicting-connection-variable
+# message: `ANTHROPIC_AUTH_TOKEN` is a second spelling of `api_key:` for `flow.main` node `implement`: `harness: cc` reads it beside the `ANTHROPIC_API_KEY` this `env:` entry does not name, and `provider.gateway` already declares the fact
+# at: main.yml:49:11
+# label: main.yml:31:12 `api_key:` is declared here, and `harness: cc` carries it as `ANTHROPIC_API_KEY`
+# label: main.yml:44:16 the connection is bound here
+# help: one spelling per fact, and a fact has more than one: `ANTHROPIC_AUTH_TOKEN` is a name `harness: cc` reads for how a connection authenticates, so this entry decides it a second time beside the connection the node's `model:` already carries — the run would authenticate as somebody else, or leave for an endpoint nothing in this composition names, while the graph document and the journal's record of the run both still report `ANTHROPIC_API_KEY`. Drop the `env:` entry — it is for what the *program* needs — and a node that really has to decide how a connection authenticates for itself binds a `model.*` on another `provider.*` (grammar 8.9, 12.1, Decision D143, PRD resolved q58 rulings a and c)
+#
+# The half of ruling c that the mapped names alone do not reach. `cc`'s
+# connection surface is not three variables — it is the whole environment
+# contract the SDK's bundled runtime reads, and PRD resolved q58 ruling a names
+# it that way: *"its base-URL, API-key/auth-token, and custom-header variables"*.
+#
+# `ANTHROPIC_AUTH_TOKEN` is the sharpest of them because it does not read like a
+# collision at all: the bundled client takes it at construction beside the
+# `ANTHROPIC_API_KEY` this connection's `api_key:` sets, and sends both — an
+# `X-Api-Key` from the composition and an `Authorization: Bearer` from the node —
+# so a gateway keying off the bearer authenticates as whoever this entry names
+# while `visualize` and the journal's request identity both go on reporting the
+# mapped pair. Two sources for one fact, and the composition never spells the
+# variable they share.
+#
+# `PATH` is what an `env:` is for and stays: the bound is what the *program*
+# needs, and the connection is what the model's provider says.
+version: "0.1"
+provider.gateway:
+  kind: anthropic
+  base_url: ${LLM_GATEWAY_URL}
+  api_key: ${GATEWAY_KEY}
+model.implementer:
+  provider: provider.gateway
+  id: claude-sonnet-4-5
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: ${REPO_ROOT}
+        prompt: Fix the failing test, then say what you changed.
+        env:
+          PATH: /usr/bin:/bin
+          ANTHROPIC_AUTH_TOKEN: ${SOMEONE_ELSES_TOKEN}
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }

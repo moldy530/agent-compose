@@ -60,12 +60,14 @@ use crate::ir::schema::{FieldMap, TypeForm, TypeNode};
 use crate::ir::trigger::TriggerKind;
 use crate::ir::{Ir, Section};
 
+use crate::harness::{ConnectionFact, Slot};
+
 use super::document::{
-    AgentView, BindingView, CoderView, DispatchView, EdgeClass, ExecView, FlowGraph, GRAPH_VERSION,
-    GraphDocument, GraphEdge, GraphNode, HttpView, HumanView, InputView, InstancePolicyView,
-    ItemErrorView, MapView, ModelView, NodeKind, OnErrorView, PolicyLevel, PolicyView,
-    ProviderView, RetryView, RouteView, SchemaSource, SchemaView, SchemasView, SettingView,
-    StoreView, SubflowView, TimeoutView, ToolSource, ToolView, TriggerView, WriteView,
+    AgentView, BindingView, CoderView, ConnectionView, DispatchView, EdgeClass, ExecView,
+    FlowGraph, GRAPH_VERSION, GraphDocument, GraphEdge, GraphNode, HttpView, HumanView, InputView,
+    InstancePolicyView, ItemErrorView, MapView, ModelView, NodeKind, OnErrorView, PolicyLevel,
+    PolicyView, ProviderView, RetryView, RouteView, SchemaSource, SchemaView, SchemasView,
+    SettingView, StoreView, SubflowView, TimeoutView, ToolSource, ToolView, TriggerView, WriteView,
 };
 use super::summary;
 
@@ -648,6 +650,7 @@ fn coder_view(ir: &Ir, coder: &Coder) -> CoderView {
             .map(|name| name.value.clone())
             .collect(),
         tools_enforced: enforces_tool_allowlist(coder.harness.value),
+        connection: connection_views(ir, coder),
         env: interpolated_views(&coder.env),
         inherit_env: coder.inherit_env.unwrap_or(false),
         settings: coder
@@ -659,6 +662,71 @@ fn coder_view(ir: &Ir, coder: &Coder) -> CoderView {
             })
             .collect(),
     }
+}
+
+/// The provider connection that crosses into one harness run, and the slot each
+/// fact lands in (grammar 8.9, Decision D143, PRD resolved q58).
+///
+/// The **map** rather than the connection: what the provider declares is already
+/// on this node's `model.provider.config`, and what a reader cannot derive from
+/// it is which of those facts the bound harness carries and under what name. The
+/// two harnesses answer differently — `cc` carries all three as environment
+/// variables of the process it spawns, `codex` carries two as options of its own
+/// client and has no slot for a header at all — so a document that drew both
+/// nodes the same way would be asserting a connection one of them does not make.
+///
+/// Empty where the provider declares nothing that crosses, which is the same
+/// shape a vendor-endpoint connection with a key has under a harness that reads
+/// its own auth: nothing is mapped, and the field is absent rather than empty
+/// (`docs/graph.md` §5.8).
+///
+/// A fact **with no slot** cannot reach here: `validate` refuses that
+/// composition (`unsupported-connection-fact`), and a graph document is only
+/// drawn for one that validates. Where a slot is somehow absent the fact is left
+/// out rather than drawn with an invented one — the same claims-least answer
+/// [`enforces_tool_allowlist`] gives a harness that never reaches it.
+fn connection_views(ir: &Ir, coder: &Coder) -> Vec<ConnectionView> {
+    let Some((_, provider)) = crate::harness::provider_of(ir, coder) else {
+        return Vec::new();
+    };
+    let harness = coder.harness.value;
+    let config = &provider.config;
+    let mut held = Vec::new();
+    let mut push = |fact: ConnectionFact, name: String, value: String| {
+        let Some(slot) = crate::harness::slot_of(harness, fact) else {
+            return;
+        };
+        held.push(ConnectionView {
+            fact: name,
+            slot: match slot {
+                Slot::Variable(variable) => variable.to_string(),
+                Slot::Option { name, .. } => name.to_string(),
+            },
+            value,
+        });
+    };
+    if let Some(reference) = config.base_url.as_ref() {
+        push(
+            ConnectionFact::BaseUrl,
+            "base_url".to_string(),
+            reference.value.as_str().to_string(),
+        );
+    }
+    if let Some(reference) = config.api_key.as_ref() {
+        push(
+            ConnectionFact::Credential,
+            "api_key".to_string(),
+            reference.value.as_str().to_string(),
+        );
+    }
+    for header in &config.headers {
+        push(
+            ConnectionFact::Headers,
+            format!("headers.{}", header.name.value),
+            header.value.value.as_str().to_string(),
+        );
+    }
+    held
 }
 
 /// Whether a harness enforces the node's `allow_tools:` **inside its own loop**

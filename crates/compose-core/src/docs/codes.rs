@@ -121,6 +121,15 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
         DiagnosticCode::UnknownHarnessSetting => {
             include_str!("codes/unknown-harness-setting.md")
         }
+        DiagnosticCode::UnsupportedConnectionFact => {
+            include_str!("codes/unsupported-connection-fact.md")
+        }
+        DiagnosticCode::UnsupportedProviderKind => {
+            include_str!("codes/unsupported-provider-kind.md")
+        }
+        DiagnosticCode::ConflictingConnectionVariable => {
+            include_str!("codes/conflicting-connection-variable.md")
+        }
         DiagnosticCode::DeadEnd => include_str!("codes/dead-end.md"),
         DiagnosticCode::UnboundedCycle => include_str!("codes/unbounded-cycle.md"),
         DiagnosticCode::UnbalancedConvergence => include_str!("codes/unbalanced-convergence.md"),

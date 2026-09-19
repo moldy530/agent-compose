@@ -2,10 +2,12 @@
 # it: the address is what the composition names, and the adapter maps it down to
 # the provider-native id in harness config.
 #
-# One key of each block crosses the boundary and the rest does not, which is the
-# exemption grammar 12.2 states where PRD 5.9 promises failover: `thinking:` is
-# the Agent SDK's thinking budget, `reasoning_effort:` is the Codex SDK's, and
-# `max_tokens:` configures a provider *connection* that a harness never opens.
+# One key of each `settings:` block crosses the boundary and the rest does not:
+# `thinking:` is the Agent SDK's thinking budget, `reasoning_effort:` is the
+# Codex SDK's, and `max_tokens:` shapes a *request* this runtime composes, which
+# is not a request a harness run ever makes. The block that crosses whole is the
+# **connection** behind `provider:` — see `providers.yml` (grammar 8.9, 12.2,
+# D141, D143).
 model.implementer:
   provider: provider.anthropic
   id: claude-sonnet-4-5

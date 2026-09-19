@@ -55,6 +55,14 @@ fs.mkdirSync(workspace, { recursive: true });
 process.env["REPO_ROOT"] = workspace;
 process.env["ANTHROPIC_API_KEY"] = "harness-key-anthropic";
 process.env["OPENAI_API_KEY"] = "harness-key-openai";
+// The gateway the two connections name, and the header one of them sends. They
+// are *provider* references rather than node ones, and this project needs them
+// because its coder nodes do: the launch check reads every reference the
+// composition makes (PRD resolved q15), and a coder node's `model:` reaches its
+// provider's connection (resolved q58 ruling d). Leaving either out is how this
+// script learns that — the barrel below refuses to load, naming the provider key.
+process.env["LLM_GATEWAY_URL"] = "https://gateway.invalid/v1";
+process.env["TEAM_NAME"] = "platform";
 process.env["AGENT_COMPOSE_DATA"] = path.join(scratch, "data");
 
 const runtime = await import(pathToFileURL(path.resolve(project, "src/runtime.ts")).href);

@@ -988,7 +988,7 @@
         },
         "url": { "description": "Request URL; may embed ${ENV} references.", "$ref": "#/$defs/interpolatedString" },
         "headers": {
-          "description": "Request headers; values may embed ${ENV} references.",
+          "description": "Request headers; values may embed ${ENV} references. A value is written onto the request as it stands, so `agent-compose validate` refuses one carrying any control character other than a tab: a carriage return or a newline ends this field and begins another, forging a header the composition never declared. Grammar 8.3, 12.1 / Decision D144.",
           "type": "object",
           "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
           "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
@@ -1318,7 +1318,7 @@
             "method": { "description": "HTTP method.", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] },
             "url": { "description": "Request URL; may embed ${ENV} references.", "$ref": "#/$defs/interpolatedString" },
             "headers": {
-              "description": "Request headers.",
+              "description": "Request headers; values may embed ${ENV} references. A value is written onto the request as it stands, so `agent-compose validate` refuses one carrying any control character other than a tab: a carriage return or a newline ends this field and begins another, forging a header the composition never declared. Grammar 8.3, 12.1 / Decision D144.",
               "type": "object",
               "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
               "additionalProperties": { "$ref": "#/$defs/interpolatedString" }
@@ -2373,7 +2373,7 @@
         "session_token": { "description": "AWS session token, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
         "credentials_json": { "description": "GCP credentials JSON, as an ${ENV} reference.", "$ref": "#/$defs/envRef" },
         "headers": {
-          "description": "Extra request headers; values may embed ${ENV} references.",
+          "description": "Extra request headers; values may embed ${ENV} references. A value is written onto the request as it stands - and, where a `coder:` node's `model:` carries this connection into a `cc` run, into the newline-delimited ANTHROPIC_CUSTOM_HEADERS - so `agent-compose validate` refuses one carrying any control character other than a tab: a carriage return or a newline ends this field and begins another, forging a header the composition never declared. Grammar 12.1 / Decisions D143, D144.",
           "type": "object",
           "propertyNames": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
           "additionalProperties": { "$ref": "#/$defs/interpolatedString" }

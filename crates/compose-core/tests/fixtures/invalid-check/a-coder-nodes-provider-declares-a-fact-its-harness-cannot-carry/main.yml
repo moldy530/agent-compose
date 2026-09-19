@@ -1,0 +1,50 @@
+# rule: a connection fact the bound harness has no slot for is refused, not
+# rule: dropped (grammar 8.9, 12.1, D143, PRD resolved q58 ruling b)
+# code: unsupported-connection-fact
+# message: `flow.main` node `review` binds `harness: codex`, and `provider.gateway` declares `headers:`, which that harness has nowhere to carry
+# at: main.yml:41:16
+# label: main.yml:28:5 `headers:` is declared here
+# label: main.yml:40:18 the harness is bound here
+# help: a coder node's `model:` carries its provider's connection into the run, mapped by a curated table per harness: `harness: codex` carries `base_url:` as the SDK's `baseUrl` option, `api_key:` as the SDK's `apiKey` option, and no other. A fact with no slot is refused rather than dropped, because a key deciding what a connection sends with every request must not go missing quietly and be found on the first live call. Bind a `model.*` on a `provider.*` declaring only what this harness carries — providers are cheap — or run the node under a harness with a slot for it (grammar 8.9, 12.1, Decision D143, PRD resolved q58 ruling b)
+#
+# The half of the connection map that is an **error** rather than a warning, and
+# the reason is what the fact decides. An unverified `settings:` key travels to
+# the SDK and is warned about, because being wrong there costs one option nobody
+# reads. `headers:` decides whether the request authenticates — and the Codex
+# SDK's connection surface is an API key and a base URL, with nothing on it a
+# header could be written to. A faked slot would have meant synthesizing a
+# `model_providers.*` table out of `--config` overrides this composition never
+# wrote, so the table says it carries two facts and `validate` refuses the third.
+#
+# `base_url:` and `api_key:` are declared here on purpose: both cross without
+# comment, so the one diagnostic is about the fact that has no slot rather than
+# about a gateway-shaped provider reaching a harness at all.
+version: "0.1"
+provider.gateway:
+  kind: openai
+  base_url: ${LLM_GATEWAY_URL}
+  api_key: ${GATEWAY_KEY}
+  headers:
+    x-team: platform
+model.reviewer:
+  provider: provider.gateway
+  id: gpt-5-codex
+state:
+  summary: { type: string, default: "" }
+flow.main:
+  outputs:
+    summary: { type: string }
+  nodes:
+    review:
+      coder:
+        harness: codex
+        model: model.reviewer
+        workspace: ${REPO_ROOT}
+        access: read_only
+        prompt: Read the tree and report.
+        output:
+          summary: { type: string }
+      input: "'go'"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: end }

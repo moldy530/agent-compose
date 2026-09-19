@@ -719,6 +719,21 @@ pub struct CoderView {
     pub harness: String,
     /// `model:` — the registry address the adapter maps down to a model id.
     pub model: ModelView,
+    /// The provider connection that crosses into the run, and the slot each
+    /// fact lands in under **this** harness (grammar 8.9, Decision D143).
+    ///
+    /// Additive, and it is the one part of the model resolution a reader cannot
+    /// derive from what is already here. `model.provider.config` shows what the
+    /// connection *declares*; this shows what the bound harness *carries* and
+    /// under which name — which is a fact about the harness, in no composition,
+    /// and different for the two of them. The same argument `tools_enforced` is
+    /// here under.
+    ///
+    /// Absent where the provider declares no connection fact at all, which is
+    /// also the keyless-vendor shape: nothing crosses, and the document says so
+    /// by not saying anything.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connection: Vec<ConnectionView>,
     /// `workspace:` — the root the run works inside, exactly as written.
     pub workspace: String,
     /// `access:` — the containment preset, with the default materialized:
@@ -753,6 +768,26 @@ pub struct CoderView {
     /// (`env`, `allow_tools`) rather than leaving a consumer to infer it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub settings: Vec<SettingView>,
+}
+
+/// One connection fact crossing into a harness run (grammar 8.9, Decision D143).
+///
+/// The **map**, not the connection: `fact` is the provider key it comes from and
+/// `slot` is what the bound harness carries it as — an environment variable for
+/// `cc`, an SDK client option for `codex`. A reader comparing two coder nodes on
+/// one provider learns from this pair the one thing neither composition says.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConnectionView {
+    /// The provider key: `base_url`, `api_key`, or `headers.<name>` — spelled
+    /// exactly as [`ProviderView::config`] spells it, so the two join.
+    pub fact: String,
+    /// What this harness carries it as: an environment variable's name, or an
+    /// SDK client option's. Every header of one provider shares one `cc` slot,
+    /// because that variable carries them all.
+    pub slot: String,
+    /// The value, **exactly as written** — an `${ENV}` reference reaches this
+    /// document unresolved like every other (§10).
+    pub value: String,
 }
 
 /// A `map:` node's fan-out (grammar 8.6, PRD 5.6).

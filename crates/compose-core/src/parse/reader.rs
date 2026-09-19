@@ -340,6 +340,19 @@ pub(crate) fn suggest<'k>(actual: &str, candidates: &[&'k str]) -> Option<&'k st
         .map(|(_, candidate)| candidate)
 }
 
+/// `a` or `an`, so a sentence a compiler composes reads like one.
+///
+/// Read off the word's first letter, which is all a vocabulary this compiler
+/// owns needs: every word it reaches for is a keyword of the grammar
+/// (`openai_compatible`, `azure_openai`, `bedrock`), never English at large.
+pub(crate) fn article(word: &str) -> &'static str {
+    if word.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    }
+}
+
 /// Format a closed vocabulary for a diagnostic: ``` `a`, `b`, `c` ```.
 pub(crate) fn list(values: impl IntoIterator<Item = impl AsRef<str>>) -> String {
     values

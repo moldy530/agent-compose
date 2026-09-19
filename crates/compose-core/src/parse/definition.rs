@@ -738,7 +738,7 @@ fn provider(fields: &mut Fields<'_>, subject: &str, cx: &mut Cx) -> ProviderDef 
     let profile = plain_field(fields, "profile", kind_ref, subject, cx);
 
     let headers = provider_key(fields, "headers", kind_ref, subject, cx)
-        .map(|node| binding::interpolated_map(node, "`headers`", binding::NameForm::HeaderLike, cx))
+        .map(|node| binding::header_map(node, "`headers`", cx))
         .unwrap_or_default();
     let server_tools = server_tools(fields, kind_ref, subject, cx);
     let description = description(fields, cx);

@@ -784,11 +784,20 @@ another host cannot answer. The vendors' stores are debugging backstops.
 
 **What the request identity holds**, which is what §7 compares on a resume: the
 **whole binding**, as §3.2 means that word about an `exec:` call. The node, the
-harness, the `model.*`, the id it resolved to and the model `settings:` that
-crossed into the harness; the run's instructions and its rendered input; the
-workspace **as the author wrote it**; the access preset, the tool allowlist, the
-declared `env:` — names and values **as written** — and whether the run inherits
-the process environment; the harness `settings:`; and the node's `output:` schema.
+harness, the `model.*`, the id it resolved to, the model `settings:` that crossed
+into the harness and the **connection** behind that model — its provider's
+address, its `base_url:`, its credential and its `headers:`, each as written;
+the run's instructions and its rendered input; the workspace **as the author
+wrote it**; the access preset, the tool allowlist, the declared `env:` — names
+and values **as written** — and whether the run inherits the process
+environment; the harness `settings:`; and the node's `output:` schema.
+
+The connection is in the list for the same reason the schema below it is, one
+turn sharper: a harness run pointed at a gateway and the same run pointed at the
+vendor are two different runs, and nothing else in the binding says which one
+happened. Repointing `providers.yml` between a crash and its resume therefore
+diverges rather than returning an answer from an endpoint this build no longer
+calls (`docs/grammar.md` §8.9, Decision D143).
 
 The **resolved** environment is deliberately absent: those are the values
 `docs/trace.md` §11.1 keeps out of every artifact this project writes, and the

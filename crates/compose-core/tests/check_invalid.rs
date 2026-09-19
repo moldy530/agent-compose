@@ -95,6 +95,9 @@ const CHECK_CODES: &[&str] = &[
     "io-error",
     "unsupported-harness",
     "unknown-harness-setting",
+    "unsupported-connection-fact",
+    "unsupported-provider-kind",
+    "conflicting-connection-variable",
 ];
 
 struct Anchor {

@@ -7787,7 +7787,8 @@ function decode(
 }
 
 // ---------------------------------------------------------------------------
-// The coding-agent harness (grammar 8.9, Decisions D136–D142, PRD resolved q57)
+// The coding-agent harness (grammar 8.9, Decisions D136–D143, PRD resolved q57,
+// q58)
 // ---------------------------------------------------------------------------
 //
 // # What a coder node is, from in here
@@ -7832,17 +7833,34 @@ function decode(
 // so the asymmetry is a value a reader can read rather than a paragraph they
 // have to remember.
 //
-// # What does not reach inside a run
+// # What crosses into a run, and what stops at the boundary
 //
-// The provider *connection*. A coder node's `model:` is the registry address an
-// agent node spells (grammar 12.2), and the adapter maps it down to the model id
-// plus the small subset of that model's `settings:` the harness has a place for
-// ([`HARNESS_MODEL_SETTINGS`]). `provider.*`'s base URL, its headers and its
-// credentials, a route's failover ladder, and the mechanism ladder of PRD
-// resolved q53 all stop at this boundary: the harness owns its client, its auth
-// and its internal retries, and this runtime's `retry:` wraps whole runs. The
-// exemption is stated in `docs/grammar.md` 12.2, where PRD 5.9's failover
-// promise is made.
+// A coder node's `model:` is the registry address an agent node spells (grammar
+// 12.2), and the adapter maps it down to three things: the provider-native model
+// id, the small subset of that model's `settings:` the harness has a place for
+// ([`HARNESS_MODEL_SETTINGS`]), and the **connection facts** of the `provider.*`
+// behind it — its base URL, its credential and its headers.
+//
+// **Those three cross** (PRD resolved q58, grammar Decision D143).
+// [`HarnessConnectionBinding`] carries them as the composition wrote them,
+// [`harnessConnection`] resolves them at the call, and each driver maps them
+// into its own SDK's connection surface: `cc` into the environment variables the
+// bundled runtime reads, `codex` into the options its client takes. Two things
+// never reach here, because `validate` refused the composition first — a fact
+// the bound harness has no slot for (`unsupported-connection-fact`), and a
+// provider whose `kind:` speaks a wire that harness's slots do not
+// (`unsupported-provider-kind`). A fact the provider never declared maps to
+// nothing at all rather than to an empty value, which is the keyless-gateway
+// posture surviving the crossing.
+//
+// **What stops here is every ladder.** A route's failover chain does not cross —
+// a route on a coder node is a compile error — and neither does the wire
+// mechanism ladder of PRD resolved q53: the harness owns its client, composes
+// its own request, asks for its own output format and drives its own retries,
+// and this runtime's `retry:` wraps whole runs. Nor does the rest of a model's
+// `settings:`, which is a *request's* vocabulary and a harness composes no
+// request this runtime wrote. The exemption is stated in `docs/grammar.md` 12.2,
+// where PRD 5.9's failover promise is made.
 
 /** Which harness serves a coder node (grammar 8.9, Decision D136). */
 export type HarnessName = "cc" | "codex";
@@ -7987,6 +8005,16 @@ export interface HarnessBinding {
    * whole block with a filter applied out of sight.
    */
   readonly modelSettings: Readonly<Record<string, unknown>>;
+  /**
+   * The **connection** that model resolves through (PRD resolved q58).
+   *
+   * The facts a harness client can be pointed with — where it goes, how it
+   * authenticates, what it sends with every request — carried as the composition
+   * wrote them, with their `${ENV}` references intact so a build holds no
+   * credential (grammar 4.3, PRD 5.9). [`runCoder`] resolves them at the call
+   * and each driver maps them into its own SDK's connection surface.
+   */
+  readonly connection: HarnessConnectionBinding;
   /** `prompt:` — the run's instructions, literal (grammar 5.2). */
   readonly prompt: string;
   /** `workspace:` — interpolable, resolved at the call (grammar 4.3 class 2). */
@@ -8011,6 +8039,43 @@ export interface HarnessBinding {
   readonly result: ResultSchema<unknown>;
 }
 
+/**
+ * One coder node's provider connection, unresolved (PRD resolved q58 ruling a).
+ *
+ * The three facts of a `provider.*` that say where a client goes and how it
+ * authenticates (`docs/grammar.md` §12.1), carried across the boundary a
+ * `coder:` node's `model:` opens. Each is **absent** where the provider declares
+ * none, and the credential's absence is the load-bearing one: resolved q25's
+ * keyless-gateway posture is that a connection with no key injects **no
+ * credential at all**, never an empty one, and an optional field is how that
+ * survives the crossing.
+ *
+ * Which of them a given harness can carry is a curated table per harness, and
+ * `validate` has already refused a node whose provider declares a fact its
+ * harness has no slot for — so a driver below maps what it has a place for and
+ * never has to decide what to do about the rest.
+ */
+export interface HarnessConnectionBinding {
+  /** The `provider.*` these facts belong to, for a message and for the journal. */
+  readonly provider: string;
+  /** `base_url:` — the endpoint, where the provider names one. */
+  readonly baseUrl?: readonly Interpolation[];
+  /** `api_key:` — the credential. Absent is absent. */
+  readonly credential?: readonly Interpolation[];
+  /** `headers:` — in declaration order, values interpolable. */
+  readonly headers?: readonly {
+    readonly name: string;
+    readonly value: readonly Interpolation[];
+  }[];
+}
+
+/** The same connection, resolved — what a driver maps (see [`runCoder`]). */
+export interface HarnessConnection {
+  readonly baseUrl?: string;
+  readonly credential?: string;
+  readonly headers?: Readonly<Record<string, string>>;
+}
+
 /** What the adapter hands a driver: one run, fully resolved. */
 export interface HarnessRun {
   /** The node this run belongs to, for a message. */
@@ -8023,6 +8088,11 @@ export interface HarnessRun {
   readonly model: string;
   /** The model settings this harness accepts. */
   readonly modelSettings: Readonly<Record<string, unknown>>;
+  /**
+   * The provider connection, resolved — each fact present only where the
+   * provider declared it (PRD resolved q58, q25).
+   */
+  readonly connection: HarnessConnection;
   /** The harness config the composition declared (Decision D140). */
   readonly settings: Readonly<Record<string, unknown>>;
   /** The resolved workspace root. */
@@ -8217,6 +8287,55 @@ export function harnessLoweredAway(harness: HarnessName): readonly string[] {
 }
 
 /**
+ * One coder node's provider connection, resolved at the call (PRD resolved q58).
+ *
+ * The `${ENV}` references reach the artifact unresolved and are read here, in
+ * the same step and for the same reason the workspace and the node's `env:` are
+ * (grammar 4.3): a build carries no credential, and a variable that is not set
+ * fails naming the provider key that referenced it.
+ *
+ * **A fact the provider did not declare produces no key at all**, which is
+ * resolved q25's keyless-gateway posture surviving the crossing. A driver below
+ * asks `connection.credential === undefined`, and the answer is the difference
+ * between a harness that authenticates and one that lets a gateway do it — never
+ * an empty string, which every SDK here would send as a credential.
+ */
+function harnessConnection(binding: HarnessConnectionBinding): HarnessConnection {
+  const headers: Record<string, string> = {};
+  for (const entry of binding.headers ?? []) headers[entry.name] = interpolate(entry.value);
+  return {
+    ...(binding.baseUrl === undefined ? {} : { baseUrl: interpolate(binding.baseUrl) }),
+    ...(binding.credential === undefined ? {} : { credential: interpolate(binding.credential) }),
+    ...(binding.headers === undefined ? {} : { headers }),
+  };
+}
+
+/**
+ * …and the same connection **as the composition wrote it**, for the journal.
+ *
+ * `${GATEWAY_KEY}`, never what it resolved to — the rule `docs/trace.md` §11.1
+ * puts on every artifact this project writes, and the rule the node's own `env:`
+ * is already journaled under. What goes into a request identity is the
+ * composition's text, so one composition derives one identity whatever machine
+ * it runs on.
+ */
+function connectionAsWritten(binding: HarnessConnectionBinding): Record<string, unknown> {
+  return {
+    provider: binding.provider,
+    ...(binding.baseUrl === undefined ? {} : { baseUrl: asWritten(binding.baseUrl) }),
+    ...(binding.credential === undefined ? {} : { credential: asWritten(binding.credential) }),
+    ...(binding.headers === undefined
+      ? {}
+      : {
+          headers: binding.headers.map((entry) => ({
+            name: entry.name,
+            value: asWritten(entry.value),
+          })),
+        }),
+  };
+}
+
+/**
  * The `settings:` keys of a `model.*` each harness has a place for (PRD resolved
  * q57 ruling d).
  *
@@ -8392,6 +8511,7 @@ export async function runCoder(
     input: typeof input === "string" ? input : JSON.stringify(input),
     model: binding.modelId,
     modelSettings: binding.modelSettings,
+    connection: harnessConnection(binding.connection),
     settings: binding.settings,
     workspace,
     access: binding.access,
@@ -8427,6 +8547,12 @@ export async function runCoder(
     model: binding.model,
     modelId: binding.modelId,
     modelSettings: binding.modelSettings,
+    // …and the **connection** that model resolves through, as written: a run
+    // pointed at a gateway and the same run pointed at the vendor are two
+    // different runs, so a composition repointed between a crash and its resume
+    // diverges rather than returning an answer the current binding would not
+    // have asked for (PRD resolved q58 ruling a, `docs/durability.md` §3.9).
+    connection: connectionAsWritten(binding.connection),
     instructions: binding.prompt,
     input: run.input,
     workspace: asWritten(binding.workspace),

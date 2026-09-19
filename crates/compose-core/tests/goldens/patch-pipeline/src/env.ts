@@ -31,14 +31,19 @@ export const environmentReferences: readonly EnvironmentReference[] = [
   {
     name: "ANTHROPIC_API_KEY",
     sites: [
-      "flow.patch.node.implement.env.ANTHROPIC_API_KEY",
       "provider.anthropic.api_key",
+    ],
+  },
+  {
+    name: "LLM_GATEWAY_URL",
+    sites: [
+      "provider.anthropic.base_url",
+      "provider.openai.base_url",
     ],
   },
   {
     name: "OPENAI_API_KEY",
     sites: [
-      "flow.patch.node.review.env.OPENAI_API_KEY",
       "provider.openai.api_key",
     ],
   },
@@ -47,6 +52,12 @@ export const environmentReferences: readonly EnvironmentReference[] = [
     sites: [
       "flow.patch.node.implement.workspace",
       "flow.patch.node.review.workspace",
+    ],
+  },
+  {
+    name: "TEAM_NAME",
+    sites: [
+      "provider.anthropic.headers.x-agent-compose-team",
     ],
   },
 ];

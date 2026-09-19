@@ -4,7 +4,7 @@
 # message: `model.either` is a failover route, and `flow.main` node `build` runs a harness
 # at: main.yml:36:16
 # label: main.yml:25:1 `model.either` is defined here, with 2 members
-# help: the provider connection does not reach inside a harness run: the harness owns its client, its auth and its own retries, and this compiler's `retry:` wraps whole runs. A route here would be a failover policy with nothing to apply it to, so bind a direct `model.*` and let the node's `retry:` be the ladder (grammar 8.9, 12.2, PRD resolved q57 ruling d)
+# help: a failover ladder does not reach inside a harness run: the harness owns its client and its own retries, and this compiler's `retry:` wraps whole runs. A route here would be a failover policy with nothing to apply it to, so bind a direct `model.*` — whose connection *does* cross (Decision D143) — and let the node's `retry:` be the ladder (grammar 8.9, 12.2, PRD resolved q57 ruling d as q58 amends it)
 #
 # Not decidable in one file: what the node writes is a `model.*` address like
 # any other, and whether that definition is direct or a route is written

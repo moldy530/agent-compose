@@ -30,11 +30,12 @@ bounds: extra command-line arguments, a settings file or object of permission
 rules, roots beside the working directory, sandbox configuration, MCP servers
 and agent definitions that put a tool — or a whole loop — within reach of a run
 whose `allow_tools:` never named it, hooks and permission handlers that move the
-decision elsewhere, a fallback model where the connection was supposed to stop.
-Those are dropped too, and so is every option that resumes a previous session,
-for the other reason: harness-native resume is a named exclusion, because a
-machine-local session store is not the journal. The dropped set is per harness
-and audited against the SDK release this compiler pins.
+decision elsewhere, a fallback model — which is the failover ladder that stops at
+the boundary, the provider's connection itself having crossed. Those are dropped
+too, and so is every option that resumes a previous session, for the other
+reason: harness-native resume is a named exclusion, because a machine-local
+session store is not the journal. The dropped set is per harness and audited
+against the SDK release this compiler pins.
 
 ## A spec that triggers it
 

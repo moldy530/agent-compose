@@ -169,6 +169,7 @@ const TOPICS_WITHOUT_A_RUNNABLE_EXAMPLE: &[(&str, &str)] = &[
 /// did — the report simply goes quiet — so the repaired spec is the only thing
 /// that says which edit produces the quiet report.
 const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
+    "conflicting-connection-variable",
     "invalid-path-expression",
     "missing-callback-allowlist",
     "missing-capability",
@@ -179,6 +180,8 @@ const EXPLANATIONS_WITH_A_CORRECTED_EXAMPLE: &[&str] = &[
     "unknown-harness-setting",
     "unknown-server-tool",
     "unknown-server-tool-field",
+    "unsupported-connection-fact",
+    "unsupported-provider-kind",
     "unsupported-server-tools",
 ];
 

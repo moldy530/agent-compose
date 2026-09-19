@@ -129,6 +129,48 @@ provider.gcp:
     );
 }
 
+/// A tab inside a `headers:` value, in **both** positions that take one
+/// (grammar 8.3, 12.1, Decision D144).
+///
+/// The value rule refuses the control characters that end a field or truncate
+/// the variable the `cc` crossing encodes into — and a tab is neither. RFC 9110
+/// 5.5's `field-content` admits `SP` and `HTAB` between visible characters, so a
+/// tab is content a header value carries: `fetch` sends it, and
+/// `ANTHROPIC_CUSTOM_HEADERS` — split on newlines, then on each line's first
+/// colon — never sees it. A predicate written one character too wide here makes
+/// a legal composition unwritable, which is exactly the failure this file
+/// exists for, and a negative corpus cannot catch it.
+#[test]
+fn a_tab_inside_a_header_value_in_both_positions_that_take_one() {
+    accepts(
+        "header-value-with-a-tab.yml",
+        r#"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  base_url: ${LLM_GATEWAY_URL}
+  headers:
+    x-note: "batch\tnightly"
+
+flow.demo:
+  outputs:
+    done: { type: boolean }
+  nodes:
+    notify:
+      http:
+        method: POST
+        url: "https://${HOOKS_HOST}/notify"
+        headers:
+          x-note: "batch\tnightly"
+      input:
+        title: "state.title"
+  edges:
+    - { from: start, to: notify }
+    - { from: notify, to: end }
+"#,
+    );
+}
+
 /// A field genuinely *named* `discriminator` is not a union, and a union in a
 /// legal position still parses.
 #[test]
