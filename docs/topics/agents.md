@@ -296,9 +296,17 @@ and a map *inside* another map's fan-out is read at the outer bound, since it
 runs once per concurrent instance — and
 two runs concurrent branches can have in flight at once writing the same
 `workspace:` draw a warning naming both — a `coder:` node of the flow, or one
-inside a flow a `flow:` node instantiates, so a subflow instantiated twice reads
-the same as two nodes written out. `agent-compose explain shared-workspace` is
-the whole rule, including why the second one is a warning.
+inside an instance a `flow:` node starts or a `map` node dispatches, so factoring
+work into a subflow or fanning it out reads the same as two nodes written out.
+
+The per-dispatch scope includes a `state` channel the dispatched instance
+**itself** writes, because an instance holds its own channel values: the upstream
+`exec:` step that makes the checkout can run *inside* the dispatch and hand the
+path over on a channel, which is the shape a coder node's `workspace:` has no
+other way to reach. A channel nothing in the instance writes is its `default:`
+everywhere, which is one directory and stays an error.
+`agent-compose explain shared-workspace` is the whole rule, including why the
+second one is a warning.
 
 **Read the containment paragraph before you write one.** What bounds a harness
 run is the `workspace:`, the `access:` preset, the declared `env:`, and the

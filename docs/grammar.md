@@ -3183,17 +3183,24 @@ checkout. Both halves of that are refused, at the strength each can be decided
 with (`shared-workspace`, PRD resolved q61 ruling b):
 
 * a coder node a `map` dispatches whose `workspace:` expression does **not**
-  read the per-dispatch scope — neither the dispatch's own `input.<field>` nor
-  `execution.item_index` — is a **compile error** unless the map declares
-  `max_concurrency: 1`. The message names both repairs: bind the item's own path
-  (or take `fresh`), or say the runs are serial. A map **inside** a fan-out is
-  read at the looser of that fan-out's bound and its own, because it issues its
-  dispatches once per concurrent instance of the flow that holds it — so
-  `max_concurrency: 1` on a map an outer map fans four ways is four runs in the
-  directory, and the refusal names the outer map as the one to serialise;
-* two coder nodes on statically-concurrent branches (§7.6.1) whose `workspace:`
-  values are **written identically** draw a **warning** naming both. Not an
-  error, and the reason is stated rather than papered over: what decides it is
+  read the per-dispatch scope is a **compile error** unless the map declares
+  `max_concurrency: 1`. That scope is the dispatch's own `input.<field>`,
+  `execution.item_index`, and a `state` channel **some node of the dispatched
+  instance writes** — an instance holds its own channel values (§10.1), so a
+  checkout an upstream `exec:` step prepares inside the instance is one directory
+  per dispatch, while a channel nothing there writes holds its `default:` in
+  every instance and is one directory for the whole fan-out. The message names
+  both repairs: bind the item's own path (or take `fresh`), or say the runs are
+  serial. A map **inside** a fan-out is read at the looser of that fan-out's
+  bound and its own, because it issues its dispatches once per concurrent
+  instance of the flow that holds it — so `max_concurrency: 1` on a map an outer
+  map fans four ways is four runs in the directory, and the refusal names the
+  outer map as the one to serialise;
+* two harness runs that statically-concurrent branches (§7.6.1) can have in
+  flight at once whose `workspace:` values are **written identically** draw a
+  **warning** naming both. The branches are read over the runs a *step* contains,
+  so a `flow:` node and a `map` node count as much as a `coder:` node does. Not
+  an error, and the reason is stated rather than papered over: what decides it is
   whether the two resolve to one directory, and a value bearing a `${ENV}`
   reference resolves at launch — so two values this grammar reads as different
   may be one path on the machine that runs them, and two it reads as the same is
@@ -9782,26 +9789,52 @@ ruling does not give up.
 [resolved q45](#d94-a-detached-dispatch-is-resolved-at-dispatch)'s posture read
 for the filesystem, and it is refused at the strength each half can be decided
 with. A coder node a `map` dispatches whose `workspace:` does not read the
-per-dispatch scope — the dispatch's own `input.<field>`, or
-`execution.item_index` — is a compile error (`shared-workspace`) **unless** the
-map declares `max_concurrency: 1`, and the message names both repairs. Two
-harness runs that statically-concurrent branches (§7.6.1) can have in flight at
-once whose `workspace:` values are written identically draw a **warning** naming
-both. An error is withheld there on purpose: equality of `${ENV}`-bearing values
-is a launch fact, not a compile fact, so a refusal would be this compiler
-claiming something it cannot know, and silence would hide the half it can.
+per-dispatch scope is a compile error (`shared-workspace`) **unless** the map
+declares `max_concurrency: 1`, and the message names both repairs. Two harness
+runs that statically-concurrent branches (§7.6.1) can have in flight at once
+whose `workspace:` values are written identically draw a **warning** naming both.
+An error is withheld there on purpose: equality of `${ENV}`-bearing values is a
+launch fact, not a compile fact, so a refusal would be this compiler claiming
+something it cannot know, and silence would hide the half it can.
+
+*What the per-dispatch scope is.* The dispatch's own `input.<field>` and
+`execution.item_index`, which is D83's predicate exactly — **and** a `state`
+channel some node of the dispatched instance writes, which is the half a store
+key does not need. An instance is a separate run of a separate compiled graph:
+the channel set is composition-global in shape and per-instance in value, seeded
+at each `default:` with nothing crossing but `inputs:` (§10.1, §7.6.4 rules 2 and
+3). So `prepare` — an `exec:` step running `git worktree add` — writing
+`checkout` inside the instance, and the coder node beside it reading
+`workspace: "state.checkout"`, is four dispatches preparing four directories, and
+it is the shape rule 3's closing paragraph sends an author to; a coder node's
+`workspace:` cannot read another node's output
+([D42](#d42-node-outputs-are-readable-only-from-edge-guards-and-mapover)), so
+a channel is the only way to carry that answer to it. A channel **no** node of
+the instance writes holds its `default:` in every instance and is one directory
+for the whole fan-out as surely as a literal path is, which is the case the
+refusal keeps — and its message names the channel and the flow that never writes
+it. Whether two instances that each write a channel write the same *string* is a
+launch fact of exactly the kind the warning above exists for, and it is stated
+rather than pretended.
 
 *Two runs, not two coder nodes.* A branch is concurrent with another whatever
 construct it holds, so the warning is stated over the runs a **step** contains:
-a `coder:` node of the flow, and every coder node inside the instance a `flow:`
-node starts, transitively. One subflow instantiated twice on two branches is two
-runs of one coder node, and an author who factors work into a reusable flow gets
-the same reading as one who wrote the nodes out. Two *instances* are not one
-scope, though (§10.1), so a run reached through a `flow:` node is compared only
-where its expression reads **nothing** — no `input`, no `state`, no `execution`.
-`workspace: "input.worktree"` in a flow instantiated twice is two directories
-exactly when the two instantiations bind two paths, which is the repair this
-ruling exists for, and warning about it would be warning about the fix.
+a `coder:` node of the flow, and every coder node inside an instance a `flow:`
+node starts or a `map` node dispatches, transitively. One subflow instantiated
+twice on two branches is two runs of one coder node, and an author who factors
+work into a reusable flow gets the same reading as one who wrote the nodes out.
+A `map` counts for the same reason and for one more: the dispatch half above
+decides a map's dispatches against *each other* and passes over any fan-out
+bounded at 1, and `max_concurrency: 1` is a repair it offers — a bound that holds
+**within** the map and says nothing about the branch beside it, so reading a map
+step as holding no runs would let that repair silence a collision it does not
+fix. Two *instances* are not one scope, though (§10.1), so a run reached through
+a `flow:` or `map` node is compared only where its expression reads **nothing** —
+no `input`, no `state`, no `execution`. `workspace: "input.worktree"` in a flow
+instantiated twice is two directories exactly when the two instantiations bind
+two paths, which is the repair this ruling exists for, and warning about it would
+be warning about the fix; the same expression under a map is per-item for the
+same reason, and decided by the dispatch half instead.
 
 The dispatch half is decided over the same relation grammar §11.4's store keys
 are ([D83](#d83-a-map-written-store-key-is-derived-from-the-item)): frames of a

@@ -1,0 +1,114 @@
+# rule: a `map` node is a concurrent step like any other, so the runs it
+# rule: dispatches collide with a sibling branch's (grammar 7.6.1, 8.6, D147)
+# code: shared-workspace
+# message: `flow.work` node `implement` dispatched by `left` and `flow.main` node `right` can run concurrently and their `workspace:` is written the same way
+# at: main.yml:100:20
+# label: main.yml:65:20 the other run is contained here
+# label: main.yml:88:7 one of the two runs is inside this step
+# label: main.yml:97:7 and the other is inside this one
+# help: two edges of one fork that are not provably exclusive can both fire, so the branches they start are concurrent — and two harness runs inside one directory edit each other's files. `'${REPO_ROOT}'` reads nothing from either run's own scope, so it is one path however the instances are bound. Give one of them a directory of its own: carry it in on the `input:` of the step that starts the instance — a `flow:` node or a map dispatch — and read it here (`workspace: "input.worktree"`), or write `workspace: fresh` on each for a directory the runtime provisions per dispatch. A **warning** rather than a refusal because equality here is a launch fact: a value bearing an `${ENV}` reference resolves on the machine that runs it, so two values this compiler reads as different may still be one directory, and two it reads as the same is the half it can see (grammar 7.6.1, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# The concurrent half of PRD resolved q61 ruling b read over a **`map`** step.
+# `triage` forks to `left` and `right` on two unguarded edges: `left` fans
+# `flow.work` out over the triaged goals and `right` is a coder node of
+# `flow.main` itself, and both runs name `${REPO_ROOT}`. Two harness agents are
+# in one checkout, and the map's `max_concurrency: 1` does nothing about it —
+# that bound holds *within* the map and says nothing whatever about the branch
+# beside it.
+#
+# Which is why this fixture is a serial map rather than a concurrent one: the
+# other half of the rule, `a-map-dispatched-coder-works-in-one-directory`,
+# refuses a fan-out that shares a directory with **itself**, and its own help
+# offers `max_concurrency: 1` as the repair. A rule that read a `map` step as
+# holding no runs would let that repair silence this collision, which it does
+# not fix — the author would take the compiler's advice and keep the race.
+#
+# The compared expression reads nothing — no `input`, no `state`, no
+# `execution` — and that is the condition rather than an accident of the
+# example: a dispatched instance is not the dispatching flow's scope (grammar
+# 10.1), so `workspace: "input.worktree"` under the map is one directory per
+# item, which is the repair this ruling exists for.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.triage:
+  model: model.implementer
+  prompt: List the goals the failing tests imply.
+  output:
+    goals:
+      type: array
+      max_items: 10
+      items: { type: string }
+state:
+  summary: { type: string, default: "" }
+  lexer: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 10
+    items: { type: string }
+    reduce: append
+    default: []
+flow.work:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  outputs:
+    summaries:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    triage:
+      agent: agent.triage
+      input: "'the failing tests'"
+    left:
+      map:
+        over: triage.output.goals
+        as: goal
+        node: flow.work
+        input:
+          goal: "goal"
+        max_concurrency: 1
+        writes: { summary: summaries }
+    right:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "'${REPO_ROOT}'"
+        prompt: Fix the lexer while the goals are worked through.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "'fix the lexer'"
+      writes: { summary: lexer }
+  edges:
+    - { from: start, to: triage }
+    - { from: triage, to: left }
+    - { from: triage, to: right }
+    - { from: left, to: end }
+    - { from: right, to: end }

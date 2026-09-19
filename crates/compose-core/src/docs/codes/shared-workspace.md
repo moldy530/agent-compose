@@ -18,6 +18,17 @@ it can happen:
   scope resolves to one directory for the whole fan-out, so `max_concurrency: 8`
   is eight agents in one tree. That is an **error**.
 
+  The per-dispatch scope is the dispatch's own `input.<field>`,
+  `execution.item_index`, **and** a `state` channel some node of the dispatched
+  instance writes. That last one is not a loophole: a dispatched flow instance is
+  a separate run with its own channel values (grammar §10.1), so an `exec:` step
+  inside the instance that runs `git worktree add` and writes the path to a
+  channel is eight dispatches preparing eight directories — and since a coder
+  node's `workspace:` cannot read another node's output, a channel is the only
+  way to hand it over. A channel *nothing* in the instance writes holds its
+  `default:` in every instance, which is one directory, and the message names the
+  channel and the flow that never writes it.
+
   The bound read is the one the dispatch really runs under, which is not always
   the one its own map declares. A map **inside** a fan-out issues its dispatches
   once per concurrent instance of the flow that holds it, so a map saying
@@ -31,14 +42,23 @@ it can happen:
 
   A branch is concurrent with another whatever construct it holds, so this is
   read over the runs a **step** contains rather than over the coder nodes a flow
-  declares: a `coder:` node, and every coder node inside the instance a `flow:`
-  node starts. One subflow instantiated twice on two branches is two runs of one
-  coder node, and factoring work into a reusable flow reads the same as writing
-  the nodes out. Two instances are not one scope, though, so a run reached
-  through a `flow:` node is compared only where its expression reads **nothing**
-  — `workspace: "input.worktree"` in a flow instantiated twice is two
-  directories exactly when the two instantiations bind two paths, which is the
-  repair rather than the collision.
+  declares: a `coder:` node, and every coder node inside an instance a `flow:`
+  node starts or a `map` node dispatches. One subflow instantiated twice on two
+  branches is two runs of one coder node, and factoring work into a reusable flow
+  — or fanning it out of a map — reads the same as writing the nodes out.
+
+  The `map` case is the one the first site cannot reach. That refusal decides a
+  map's dispatches against *each other* and passes over any fan-out bounded at 1
+  — and `max_concurrency: 1` is a repair it offers. That bound holds **inside**
+  the map and says nothing about the branch beside it, so a serial map and a
+  sibling coder node naming one directory are still two agents in one checkout,
+  and this is the warning that says so.
+
+  Two instances are not one scope, though, so a run reached through a `flow:` or
+  `map` node is compared only where its expression reads **nothing** —
+  `workspace: "input.worktree"` in a flow instantiated twice is two directories
+  exactly when the two instantiations bind two paths, which is the repair rather
+  than the collision, and under a map it is one directory per item.
 
 ## A spec that triggers it
 
@@ -135,7 +155,7 @@ tree.
 
 ## The fix
 
-Three repairs, and each says something different about the graph.
+Four repairs, and each says something different about the graph.
 
 * **Bind the dispatch's own path.** Carry it on the map's `input:` and read it on
   the node: `workspace: "input.worktree"`. This is the repair the ruling exists
@@ -144,6 +164,12 @@ Three repairs, and each says something different about the graph.
   directories: a `git worktree add` in an `exec:` node or a `tool.*` before the
   map, because provisioning source control is a step in the graph rather than a
   guess the harness adapter makes.
+* **Let each dispatch make its own.** That upstream step can live *inside* the
+  dispatched flow instead, ahead of the coder node, writing the path it made to a
+  state channel the node then reads: `workspace: "state.checkout"`. The instance
+  holds its own channel values, so this is one directory per dispatch — and it is
+  the only shape available when the path is not known until the dispatch runs,
+  since a coder node's `workspace:` cannot read another node's output directly.
 * **Take a directory per dispatch from the runtime.** `workspace: fresh`
   provisions one under `.agent-compose/workspaces/<execution>/<instance path>`,
   named by the instance path (grammar §9.4) and created clean at the start of

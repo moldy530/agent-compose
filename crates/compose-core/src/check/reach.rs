@@ -392,20 +392,28 @@ pub(crate) struct Contained<'a> {
 }
 
 /// Every `coder:` node one flow **contains**: its own, and those of the flows
-/// its `flow:` nodes instantiate, transitively.
+/// its `flow:` nodes instantiate and its `map` nodes dispatch, transitively.
 ///
 /// This is the containment a *step* of the enclosing graph has. A `flow:` node
-/// is one node of its flow's graph (grammar 7.6.1) and every harness run inside
-/// the instance it starts happens while that node is in flight, which is what
-/// the concurrent half of PRD resolved q61 ruling b is stated over: two harness
-/// runs that can be in flight at once.
+/// and a `map` node are each one node of their flow's graph (grammar 7.6.1) and
+/// every harness run inside an instance they start happens while that node is in
+/// flight, which is what the concurrent half of PRD resolved q61 ruling b is
+/// stated over: two harness runs that can be in flight at once.
 ///
-/// **The boundary is the `flow:` node and nothing else.** A `map` is not walked
-/// — its dispatches are [`frames`]' relation, where the per-dispatch scope is
-/// carried and the *refusal* is decided — and neither is an agent's `flow.*`
-/// tool, because a model decides whether and when to call one and no static
-/// rule can put that call beside another node. Both are the boundaries
-/// [`frames`] already draws, drawn here again rather than differently.
+/// **A `map` is walked, and it has to be.** [`frames`] carries the per-dispatch
+/// scope and decides the *refusal*, but it decides it only where a fan-out has
+/// two dispatches in flight — [`dispatched_workspaces`](super::coder) skips
+/// every frame bounded at 1 — and `max_concurrency: 1` is the repair that
+/// refusal's own help offers. A serial map beside a sibling branch is two
+/// harness runs in one directory with nothing serialising them: the map's bound
+/// holds *within* the map and says nothing about the branch next to it. Reading
+/// the boundary the other way let the recommended repair silence the collision
+/// it does not fix.
+///
+/// **The boundary that stays is the agent's `flow.*` tool**, because a model
+/// decides whether and when to call one and no static rule can put that call
+/// beside another node — which is the boundary [`frames`] draws too, drawn here
+/// again rather than differently.
 ///
 /// **Answered out of a memo the caller carries across flows** ([`Coders`]),
 /// because the relation is transitive and the rule reading it asks it of steps
@@ -443,6 +451,14 @@ pub(crate) fn coders_within<'a>(
                     coder,
                 }),
                 NodeKind::Flow { flow, .. } => nested.push(flow.value.to_string()),
+                // A dispatch target that is not a `flow.*` holds no coder node:
+                // an agent has none, and neither does a tool (grammar 8.9).
+                NodeKind::Map { map } => nested.extend(
+                    targets(&map.dispatch)
+                        .into_iter()
+                        .filter(|target| target.value.namespace == Namespace::Flow)
+                        .map(|target| target.value.to_string()),
+                ),
                 _ => {}
             }
         }

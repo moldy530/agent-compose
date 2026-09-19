@@ -2591,3 +2591,195 @@ flow.main:
 "#,
     );
 }
+
+/// A checkout the dispatched instance **prepares for itself**, carried to the
+/// coder node on a state channel (grammar 10.1, PRD resolved q61 rulings b, c).
+///
+/// The shape ruling c names in as many words — "an upstream `exec:`/`tool.*`
+/// step cloning or worktree-ing into per-item paths" — written the way the
+/// grammar leaves open: a coder node's `workspace:` cannot read another node's
+/// output (Decision D42), so a channel is the only way to carry `prepare`'s
+/// answer to `implement`.
+///
+/// It is legal because a dispatched flow instance is a **separate run of a
+/// separate compiled graph**: the channel set is composition-global in shape and
+/// per-instance in value, seeded at each `default:` with nothing crossing but
+/// `inputs:` (grammar 7.6.4 rules 2 and 3). Four dispatches are therefore four
+/// `checkout` channels, written by four `prepare` nodes, and four directories.
+/// An implementation that read every `state.*` as one value for the whole
+/// fan-out would refuse this — and there is no in-instance way around such a
+/// refusal, so the author would be sent to restructure the graph around a rule
+/// that was wrong about the runtime.
+///
+/// The **other** direction is what
+/// `tests/fixtures/invalid-check/a-map-dispatched-coder-works-in-one-directory`
+/// and its `state` sibling pin: a channel no node of the instance writes holds
+/// its `default:` in every instance, which is one directory for the whole
+/// fan-out as surely as a literal path is.
+#[test]
+fn a_checkout_the_instance_prepares_is_a_directory_per_dispatch() {
+    accepts(
+        "coder-instance-prepared-workspace",
+        r#"
+state:
+  checkout: { type: string, default: "" }
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    prepare:
+      exec:
+        command: git
+        args: ["worktree", "add", "--detach"]
+        output:
+          stdout: { type: string }
+      input: { goal: "input.goal" }
+      writes: { stdout: checkout }
+    implement:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "state.checkout"
+        prompt: Work in the checkout this instance made for itself.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: prepare }
+    - { from: prepare, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  inputs:
+    goals:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+  nodes:
+    work:
+      map:
+        over: input.goals
+        as: goal
+        node: flow.fix
+        input:
+          goal: "goal"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: work }
+    - { from: work, to: end }
+"#,
+    );
+}
+
+/// Two `map` steps on concurrent branches whose dispatched runs take a
+/// directory per item (grammar 7.6.1, 8.9, Decision D147).
+///
+/// `tests/fixtures/invalid-check/a-serial-map-beside-a-coder-node-shares-one-workspace`
+/// pins the refusing half: a `map` is a step that contains harness runs, so the
+/// runs it dispatches collide with a sibling branch's. The direction that corpus
+/// cannot see is the one where reading a `map` as such a step makes the
+/// **repair** unwritable, and it is the shape this ruling exists to make
+/// writable: two concurrent fan-outs, each dispatching a coder node that reads
+/// its own item's path.
+///
+/// Two instances are not one scope (grammar 10.1), which is what keeps this
+/// quiet: a run reached through a dispatch is compared to another only where its
+/// expression reads *nothing*, and `workspace: "input.worktree"` reads the
+/// dispatch it is evaluated in. An implementation that compared the two
+/// expressions as written — they are byte-identical here — would warn about
+/// eight directories and call them one.
+#[test]
+fn two_concurrent_fan_outs_take_a_directory_per_item() {
+    accepts(
+        "coder-concurrent-fan-out-workspaces",
+        r#"
+state:
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 4
+    items: { type: string }
+    reduce: append
+    default: []
+flow.work:
+  inputs:
+    worktree: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    build:
+      coder:
+        harness: cc
+        model: model.m
+        workspace: "input.worktree"
+        prompt: Work in the checkout this item names.
+        output:
+          summary: { type: string }
+      input: "'go'"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: build }
+    - { from: build, to: end }
+flow.main:
+  inputs:
+    left:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          worktree: { type: string }
+    right:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          worktree: { type: string }
+  outputs:
+    summaries:
+      type: array
+      max_items: 4
+      items: { type: string }
+  nodes:
+    fan_left:
+      map:
+        over: input.left
+        as: task
+        node: flow.work
+        input:
+          worktree: "task.worktree"
+        max_concurrency: 4
+        writes: { summary: summaries }
+    fan_right:
+      map:
+        over: input.right
+        as: task
+        node: flow.work
+        input:
+          worktree: "task.worktree"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: fan_left }
+    - { from: start, to: fan_right }
+    - { from: fan_left, to: end }
+    - { from: fan_right, to: end }
+"#,
+    );
+}

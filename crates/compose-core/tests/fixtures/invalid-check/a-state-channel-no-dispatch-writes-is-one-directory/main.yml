@@ -1,0 +1,106 @@
+# rule: a `state` channel no node of the dispatched instance writes holds its
+# rule: `default:` in every instance, so it is one workspace (10.1, 8.9, D147)
+# code: shared-workspace
+# message: `flow.fix` node `implement` is dispatched by the map `work` of `flow.main` with `max_concurrency: 4`, and its `workspace:` is one directory for every dispatch
+# at: main.yml:71:20
+# label: main.yml:95:7 the fan-out is issued here
+# help: a harness run is contained by its `workspace:`, so 4 dispatches sharing `state.checkout` are 4 coding agents editing one checkout and overwriting each other's work. `checkout` is a channel no node of `flow.fix` writes, so every instance reads its `default:` — one directory for the whole fan-out. A channel the instance writes **itself** holds that instance's own value (grammar 10.1), which is how an upstream `exec:` or `tool.*` step that clones or worktrees per dispatch carries the path to this node. Two repairs, and each says something different about the graph: bind the item's own path — carry it on the dispatch (`input: { worktree: "item.worktree" }`) and read it here (`workspace: "input.worktree"`), or write `workspace: fresh` for a directory the runtime provisions per dispatch — or declare `max_concurrency: 1` on the map, which says these runs are serial. `workspace:` is evaluated in this node's input scope at every dispatch precisely so the first repair is writable (grammar 8.6, 8.9, Decision D147, PRD resolved q61 ruling b)
+#
+# The `state` half of PRD resolved q61 ruling b's refusal. A dispatched flow
+# instance is a separate run of a separate compiled graph: the channel set is
+# composition-global in shape and per-instance in value, seeded at each
+# `default:` with nothing crossing the boundary but `inputs:` (grammar 10.1,
+# 7.6.4 rules 2 and 3). So `state.<channel>` is per-dispatch exactly when the
+# instance **writes** it — and `flow.fix` writes `noise`, not `checkout`.
+#
+# `checkout` therefore holds its `default:` in all four instances, which is one
+# directory for the whole fan-out as surely as a literal path is: four coding
+# agents in one checkout, overwriting each other, with `max_concurrency: 4`
+# reading as a lie exactly as the field report said.
+#
+# The accepting direction is `check_accepts.rs`'s
+# `a_checkout_the_instance_prepares_is_a_directory_per_dispatch`: move the
+# `writes:` remap below from `noise` to `checkout` and the same composition is
+# four `git worktree add` runs preparing four directories, which is the shape
+# ruling c names. One character of this fixture decides which it is, and that is
+# the point — the rule reads the instance rather than the root of the
+# expression.
+version: "0.1"
+provider.anthropic:
+  kind: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+model.implementer:
+  provider: provider.anthropic
+  id: claude-sonnet-4-5
+agent.planner:
+  model: model.implementer
+  prompt: List the goals that need a change.
+  output:
+    goals:
+      type: array
+      max_items: 10
+      items: { type: string }
+state:
+  checkout: { type: string, default: "" }
+  noise: { type: string, default: "" }
+  summary: { type: string, default: "" }
+  summaries:
+    type: array
+    max_items: 10
+    items: { type: string }
+    reduce: append
+    default: []
+flow.fix:
+  inputs:
+    goal: { type: string }
+  outputs:
+    summary: { type: string }
+  nodes:
+    prepare:
+      exec:
+        command: git
+        args: ["worktree", "add", "--detach"]
+        output:
+          stdout: { type: string }
+      input: { goal: "input.goal" }
+      writes: { stdout: noise }
+    implement:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "state.checkout"
+        prompt: Make the smallest change that satisfies the goal.
+        input:
+          goal: { type: string }
+        output:
+          summary: { type: string }
+      input:
+        goal: "input.goal"
+      writes: { summary: summary }
+  edges:
+    - { from: start, to: prepare }
+    - { from: prepare, to: implement }
+    - { from: implement, to: end }
+flow.main:
+  outputs:
+    summaries:
+      type: array
+      max_items: 10
+      items: { type: string }
+  nodes:
+    plan:
+      agent: agent.planner
+      input: "'every failing test'"
+    work:
+      map:
+        over: plan.output.goals
+        as: goal
+        node: flow.fix
+        input:
+          goal: "goal"
+        max_concurrency: 4
+        writes: { summary: summaries }
+  edges:
+    - { from: start, to: plan }
+    - { from: plan, to: work }
+    - { from: work, to: end }
