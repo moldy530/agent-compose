@@ -80,6 +80,8 @@ pub mod harness;
 pub mod ir;
 pub mod parse;
 pub mod plan;
+#[cfg(test)]
+mod prose;
 pub mod resolve;
 pub mod yaml;
 

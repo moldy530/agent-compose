@@ -112,10 +112,13 @@ unconditionally. Four consequences:
 
 - `deploy/local.yml` is **optional**, and `--target local` with no file is the
   zero-config path, not an error.
-- When present it may declare `hub:`, `placements:`, `trace_sink:` and
-  `event_sources:`. The first two are live grammar checked under every target — a
-  `local` mesh is the hub and its workers on one machine, which is how you
-  develop one — `trace_sink:` is live here too, because a laptop's `run` settles
+- When present it may declare `hub:`, `placements:`, `package_registry:`,
+  `trace_sink:` and `event_sources:`. The first two are live grammar checked
+  under every target — a `local` mesh is the hub and its workers on one machine,
+  which is how you develop one. `package_registry:` is live here as well, for the
+  plainest version of the same reason: a project built on the laptop is a project
+  somebody runs `bun install` in, and the network that mandates a mirror mandates
+  it there too. `trace_sink:` is live here because a laptop's `run` settles
   executions like any other target, and `event_sources:` is reserved grammar
   carried into the IR.
 - It **must not** declare `storage_backends:`. That section is *active* grammar
