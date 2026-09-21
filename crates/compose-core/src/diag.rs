@@ -1068,7 +1068,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::MissingRegistryToken as usize + 1,
+            DiagnosticCode::UnsupportedJournalKey as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

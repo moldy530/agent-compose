@@ -297,19 +297,33 @@ mod tests {
     /// the settled dispatch row and asks a second time. The hub's writer is
     /// handed in as `keep` for exactly that ordering, and a write that throws
     /// fails the node rather than hanging it.
+    ///
+    /// The write **answers a promise** since the journal became a deploy-target
+    /// slot with backends that dial out (PRD resolved q62), so the ordering is
+    /// now a *chain* rather than two statements: what this reads is that the
+    /// resolve is inside the write's own continuation, which is the same claim
+    /// one turn of the event loop along. A second `resolve(settled)` anywhere
+    /// would be a path out of the wait that does not go through the journal,
+    /// which is the failure either shape has.
     #[test]
     fn a_remote_pauses_answer_is_journaled_before_its_promise_resolves() {
         let held = function_body("export async function holdRemotePause(");
         let kept = held
-            .find("keep(settled);")
+            .find("void keep(settled).then(")
             .expect("`holdRemotePause` writes the record through the caller's `keep`");
         let resolved = held
-            .find("resolve(settled);")
+            .find("() => resolve(settled),")
             .expect("`holdRemotePause` resolves with the record it wrote");
         assert!(
             kept < resolved,
             "the record is written after the promise resolves, so the `202` the resume route \
              answers can precede the write it acknowledges: {held}"
+        );
+        assert_eq!(
+            held.matches("resolve(settled)").count(),
+            1,
+            "a second `resolve(settled)` is a path out of this wait that does not go through \
+             the journal: {held}"
         );
     }
 

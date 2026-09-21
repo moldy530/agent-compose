@@ -151,8 +151,14 @@ function park(execution, instancePath, fields = {}, effects = undefined) {
  * and the refusal happens at the settlement rather than at the claim.
  *
  * It is a stub rather than a real journal because what is under test is what
- * `runHuman` does with a throw, and a real one made to throw on command would be
- * the same stub with a database behind it.
+ * `runHuman` does with a refused write, and a real one made to refuse on command
+ * would be the same stub with a database behind it.
+ *
+ * The refusal is a **rejected promise** rather than a throw because that is what
+ * the interface it stands in for answers: every `Journal` verb returns one since
+ * the backend became the deploy target's to choose (PRD resolved q62), and a
+ * driver that has already dialled a server cannot fail any other way — the
+ * refusal arrives from the far end, a turn of the loop after the call.
  */
 function refusing(error) {
   return {
@@ -163,10 +169,8 @@ function refusing(error) {
       kind: "human",
       ordinal: 0,
       held: undefined,
-      keep: () => {
-        throw error;
-      },
-      fail: () => {},
+      keep: () => Promise.reject(error),
+      fail: () => Promise.resolve(),
     }),
   };
 }
@@ -826,7 +830,14 @@ const observed = {};
 // the turn; abandoned when the run ends; and settled into exactly the record a
 // local pause writes through `slot.keep`, which is what the redispatch replays.
 
-/** A recorder that holds nothing, so a claim lands at the frontier. */
+/**
+ * A recorder that holds nothing, so a claim lands at the frontier.
+ *
+ * `keep` answers the record it was handed, wrapped, because that is the shape a
+ * real slot's answers have: the journal's verbs return promises, and `runHuman`
+ * chains the pause's own resolve onto the write rather than sequencing it after
+ * (`docs/durability.md` §3.4).
+ */
 function claiming(key, site) {
   return {
     child: () => claiming(key, site),
@@ -837,8 +848,8 @@ function claiming(key, site) {
       ordinal: 0,
       request: '{"node":"sign"}',
       held: undefined,
-      keep: (value) => value,
-      fail: () => {},
+      keep: (value) => Promise.resolve(value),
+      fail: () => Promise.resolve(),
     }),
   };
 }
@@ -871,9 +882,23 @@ function remote(fields = {}) {
  * record was written **before** the answer was acknowledged
  * (`docs/durability.md` §3.4).
  */
+/**
+ * A writer for the arms where the record is not what is being observed.
+ *
+ * Still a promise, because `holdRemotePause` chains the pause's resolve onto
+ * what this answers: a writer that returned nothing would be a hub whose resume
+ * route acknowledges an answer no journal was asked to hold.
+ */
+const unwatched = () => Promise.resolve();
+
 function writer(wrote) {
   return (record) => {
     wrote.push({ kept: record });
+    // The hub's real writer is `journal.append`, which answers a promise, and
+    // `holdRemotePause` chains the resume route's resolve onto it. The push
+    // above is synchronous, so what this still shows is the **order**: the
+    // record is handed over before anything the promise resolves can run.
+    return Promise.resolve();
   };
 }
 
@@ -993,7 +1018,7 @@ runtime.registerHumanNodes({
     node: "confirm",
     expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
   });
-  const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, unwatched));
   await settle();
   const seen = { settled_while_the_budget_runs: held.state };
   // …and the deadline a reader is shown is the one this hub will fire, derived
@@ -1035,7 +1060,7 @@ runtime.registerHumanNodes({
     expiresAt: new Date(Date.parse(asked) + 60_000).toISOString(),
   });
   const planted = Date.now();
-  const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, unwatched));
   await settle();
   const shown = runtime.humanWaits(execution)[0];
   const seen = {
@@ -1077,7 +1102,7 @@ runtime.registerHumanNodes({
   const execution = "exec_remote_unbounded";
   runtime.openHumanWaits(execution, true);
   const dated = remote({ expiresAt: new Date(Date.now() + 3_600_000).toISOString() });
-  const held = outcomeOf(runtime.holdRemotePause(execution, dated, () => {}));
+  const held = outcomeOf(runtime.holdRemotePause(execution, dated, unwatched));
   await settle();
   observed.remote_unbounded = {
     settled: held.state,
@@ -1098,7 +1123,7 @@ runtime.registerHumanNodes({
   const execution = "exec_remote_unregistered";
   runtime.openHumanWaits(execution, true);
   const gone = outcomeOf(
-    runtime.holdRemotePause(execution, remote({ node: "withdrawn" }), () => {}),
+    runtime.holdRemotePause(execution, remote({ node: "withdrawn" }), unwatched),
   );
   await settle();
   observed.remote_unregistered = {
@@ -1121,10 +1146,10 @@ runtime.registerHumanNodes({
   const execution = "exec_remote_replanted";
   runtime.openHumanWaits(execution, true);
   const pause = remote({ node: "decide" });
-  const first = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  const first = outcomeOf(runtime.holdRemotePause(execution, pause, unwatched));
   await until(() => first.state !== "pending");
   const replanted = Date.now();
-  const again = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  const again = outcomeOf(runtime.holdRemotePause(execution, pause, unwatched));
   await until(() => again.state !== "pending");
   observed.remote_replanted = {
     first: first.state,
@@ -1141,21 +1166,21 @@ runtime.registerHumanNodes({
   // The two settlements that are the run's own shape, not the composition's.
   const abandoned = "exec_remote_abandoned";
   runtime.openHumanWaits(abandoned, true);
-  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote(), () => {}));
+  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote(), unwatched));
   await settle();
   runtime.releaseHumanWaits(abandoned);
   await settle();
 
   const withdrawn = "exec_remote_withdrawn";
   runtime.openHumanWaits(withdrawn, true);
-  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote(), () => {}));
+  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote(), unwatched));
   await settle();
   runtime.closeHumanWaits(withdrawn);
   await settle();
 
   const unanswerable = "exec_remote_unanswerable";
   runtime.openHumanWaits(unanswerable, false);
-  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote(), () => {}));
+  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote(), unwatched));
   await settle();
 
   observed.remote_unsettled = {

@@ -498,7 +498,7 @@ const results = {};
   });
   journal.closeSession("exec_journal");
 
-  const records = held.effectsUnder("exec_journal", "flow.patch/implement/0");
+  const records = await held.effectsUnder("exec_journal", "flow.patch/implement/0");
   const harnessRecords = records.filter((record) => record.kind === "harness");
 
   // …and the resumed one: same site, same ordinal, no driver run.
@@ -592,7 +592,9 @@ const results = {};
   }
   journal.closeSession("exec_failed");
 
-  const records = held.effectsUnder("exec_failed", site).filter((one) => one.kind === "harness");
+  const records = (await held.effectsUnder("exec_failed", site)).filter(
+    (one) => one.kind === "harness",
+  );
   const payload = records[0]?.outcome?.kind === "value" ? records[0].outcome.value : null;
   const replayedRecord = runtime.harnessRecordOf(replayedFailure);
   results["failedReplay"] = {

@@ -49,7 +49,7 @@ const journalModule = await import(pathToFileURL(path.resolve(project, "src/jour
 const journal = await journalModule.openJournal();
 
 const execution = `exec_board_${Date.now()}`;
-journal.begin({
+await journal.begin({
   id: execution,
   flow: "flow.release",
   trigger: "manual",
@@ -66,7 +66,11 @@ const parkedAt = new Date().toISOString();
 const wanted = [];
 for (let ordinal = 0; ordinal < 12; ordinal += 1) {
   wanted.push(`sign/${ordinal}`);
-  journal.park({
+  // Awaited one at a time, which is what makes the burst below an *insertion*
+  // order rather than a race: the board's tiebreak is the order the rows went
+  // in, so a harness that started twelve writes at once would be asserting on
+  // whichever order the driver happened to finish them in.
+  await journal.park({
     execution,
     wait: `sign/${ordinal}`,
     id: `dsp_board_${ordinal}`,
@@ -79,48 +83,54 @@ for (let ordinal = 0; ordinal < 12; ordinal += 1) {
   });
 }
 
-const order = journal
-  .unsettledDispatches()
+const order = (await journal.unsettledDispatches())
   .filter((row) => row.execution === execution)
   .map((row) => row.wait);
 
 // The same question of the per-execution read, which `dispatchesOf`'s own
 // contract calls park order too.
-const ofExecution = journal.dispatchesOf(execution).map((row) => row.wait);
+const ofExecution = (await journal.dispatchesOf(execution)).map((row) => row.wait);
 
-// §3.4's two verbs, through the answer the contract gives each.
-const first = journal.settleDispatch("dsp_board_0", { kind: "value", value: { signature: "s" } });
-const again = journal.settleDispatch("dsp_board_0", { kind: "value", value: { signature: "t" } });
-const held = journal.dispatchOf("dsp_board_0");
+// §3.4's two verbs, through the answer the contract gives each. Awaited in turn,
+// because "did *this* call settle it" is a question about two calls in sequence:
+// two settles started together would be two readers of the same unsettled row.
+const first = await journal.settleDispatch("dsp_board_0", {
+  kind: "value",
+  value: { signature: "s" },
+});
+const again = await journal.settleDispatch("dsp_board_0", {
+  kind: "value",
+  value: { signature: "t" },
+});
+const held = await journal.dispatchOf("dsp_board_0");
 
-journal.supersedeDispatch("dsp_board_1", "the session holding it went quiet");
-const afterSupersede = journal.settleDispatch("dsp_board_1", {
+await journal.supersedeDispatch("dsp_board_1", "the session holding it went quiet");
+const afterSupersede = await journal.settleDispatch("dsp_board_1", {
   kind: "value",
   value: { signature: "u" },
 });
 
-const unknown = journal.settleDispatch("dsp_board_nothing", { kind: "value", value: {} });
+const unknown = await journal.settleDispatch("dsp_board_nothing", { kind: "value", value: {} });
 
 // §7's at-least-once, from the journal's side: a claim, and the exact inverse of
 // it. `dsp_board_5` is picked out of the middle of the queue so that "back in
 // its own place" is a different answer from "back at either end".
-const claimed = journal.claimDispatch("dsp_board_5", "wrk_one");
-const releasedByAnother = journal.releaseDispatch("dsp_board_5", "wrk_two");
-const released = journal.releaseDispatch("dsp_board_5", "wrk_one");
-const afterRelease = journal.dispatchOf("dsp_board_5");
-const orderAfterRelease = journal
-  .unsettledDispatches()
+const claimed = await journal.claimDispatch("dsp_board_5", "wrk_one");
+const releasedByAnother = await journal.releaseDispatch("dsp_board_5", "wrk_two");
+const released = await journal.releaseDispatch("dsp_board_5", "wrk_one");
+const afterRelease = await journal.dispatchOf("dsp_board_5");
+const orderAfterRelease = (await journal.unsettledDispatches())
   .filter((row) => row.execution === execution)
   .map((row) => row.wait);
 // …and the two rows that have moved on. Neither may be handed back, whoever
 // asks: one holds a worker's result and the other a hub's supersede, and a
 // release that took either would put work back on the board that the execution
 // has already gone past.
-const releasedSettled = journal.releaseDispatch("dsp_board_0", "wrk_one");
-const releasedSuperseded = journal.releaseDispatch("dsp_board_1", "wrk_one");
+const releasedSettled = await journal.releaseDispatch("dsp_board_0", "wrk_one");
+const releasedSuperseded = await journal.releaseDispatch("dsp_board_1", "wrk_one");
 
 // §3.2's OPTIONAL payload fields, journaled beside `inputs` and read back.
-journal.park({
+await journal.park({
   execution,
   wait: "conversation/0",
   id: "dsp_board_payload",
@@ -134,7 +144,17 @@ journal.park({
   status: "parked",
   parkedAt,
 });
-const payload = journal.dispatchOf("dsp_board_payload");
+const payload = await journal.dispatchOf("dsp_board_payload");
+
+// The rows the report below reads twice, read once here: every journal verb
+// answers a promise now, and an `await` inside the object literal would be a
+// read whose place in the sequence is harder to see than its value is worth.
+const settledRow = await journal.dispatchOf("dsp_board_0");
+const supersededRow = await journal.dispatchOf("dsp_board_1");
+const plainRow = await journal.dispatchOf("dsp_board_2");
+const insertion = (await journal.unsettledDispatches())
+  .filter((row) => row.execution === execution)
+  .map((row) => row.order ?? null);
 
 process.stdout.write(
   `${JSON.stringify({
@@ -142,14 +162,11 @@ process.stdout.write(
       wanted,
       order,
       ofExecution,
-      // The tiebreak itself, carried on the row: `rowid`, which is what
-      // `ORDER BY parked_at ASC, rowid ASC` breaks a shared instant with and
-      // what a synchronous reader of these rows has to sort by to agree with
-      // the queue it is reporting on.
-      insertion: journal
-        .unsettledDispatches()
-        .filter((row) => row.execution === execution)
-        .map((row) => row.order ?? null),
+      // The tiebreak itself, carried on the row: the backend's insertion-order
+      // column, which is what `ORDER BY parked_at ASC, insertion_order ASC`
+      // breaks a shared instant with and what a reader of these rows has to
+      // sort by to agree with the queue it is reporting on.
+      insertion,
     },
     release: {
       claimed: claimed?.status ?? null,
@@ -162,16 +179,16 @@ process.stdout.write(
       orderAfterRelease,
       wantedAfterRelease: wanted.slice(2),
       releasedSettled,
-      settledStatus: journal.dispatchOf("dsp_board_0")?.status ?? null,
+      settledStatus: settledRow?.status ?? null,
       releasedSuperseded,
-      supersededStatusAfter: journal.dispatchOf("dsp_board_1")?.status ?? null,
+      supersededStatusAfter: supersededRow?.status ?? null,
     },
     settlement: {
       first,
       again,
       outcome: held?.outcome ?? null,
       afterSupersede,
-      supersededStatus: journal.dispatchOf("dsp_board_1")?.status ?? null,
+      supersededStatus: supersededRow?.status ?? null,
       unknown,
     },
     payload: {
@@ -181,9 +198,9 @@ process.stdout.write(
       // A row parked without them carries none, which is what lets `taken()`
       // omit the keys §3.2 makes optional rather than send `null`.
       absent: {
-        itemIndex: journal.dispatchOf("dsp_board_2")?.itemIndex ?? "absent",
-        history: journal.dispatchOf("dsp_board_2")?.history ?? "absent",
-        policy: journal.dispatchOf("dsp_board_2")?.policy ?? "absent",
+        itemIndex: plainRow?.itemIndex ?? "absent",
+        history: plainRow?.history ?? "absent",
+        policy: plainRow?.policy ?? "absent",
       },
     },
   })}\n`,
