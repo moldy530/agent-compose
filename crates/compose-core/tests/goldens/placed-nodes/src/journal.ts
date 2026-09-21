@@ -1858,6 +1858,17 @@ function executionOf(row: Row): ExecutionRow {
  * whatever this string says — so a guard keyed per project would let two hubs
  * write one set of rows while each believed it was alone. One database, one
  * journal, one writer (`docs/durability.md` §2).
+ *
+ * **One *database*, though, and not one server**, which is the other half of the
+ * same sentence and the half only one of the two arms gets for free. Two
+ * deployments — a `staging` and a `prod` — routinely live in two databases of one
+ * managed server, and they share no table: each is a journal of its own and each
+ * must have a writer of its own. Postgres' advisory locks are scoped to the
+ * database the session connected to, so this name is already per-database there.
+ * MySQL's user-level locks are **server-wide** — the name alone is the key — so
+ * the MySQL arm qualifies this string with the schema it is connected to
+ * ([`journal-mysql.ts`]'s `MYSQL_GUARD_NAME`) rather than locking `staging` out
+ * of `prod`'s journal.
  */
 const WRITER_GUARD = "agent-compose:journal";
 

@@ -207,6 +207,20 @@ project's journal, and that a `serve` which is up has already recovered every
 execution it holds open, so one is finished through its
 `POST /executions/:id/resume` route rather than beside it.
 
+**The guard is per database, which is the same scope as the journal itself.** A
+journal is the tables in one database, and everything pointed at that database
+shares them — so the lock is taken under one constant name rather than under
+anything derived from the project. It is *not* per server: `staging` and `prod`
+routinely live in two databases of one managed instance, they share no table, and
+neither has any business refusing the other. Postgres gives that for free, since
+an advisory lock is scoped to the database the session connected to. MySQL's
+user-level locks are keyed on the name alone across the whole server, so the
+MySQL arm qualifies the name with the schema it is connected to — a digest of
+`DATABASE()`, because MySQL refuses a lock name over 64 characters and a database
+name may be 64 by itself. A `mysql://` URL that names no database is refused at
+open for that reason among others: there is no schema to hold the tables or to
+scope the guard to.
+
 **They are the right primitive for the same reason SQLite's lock is the wrong
 one: the server drops them when the session ends.** A hub killed on a machine
 that is still running leaves nothing holding its journal — the kernel closes its

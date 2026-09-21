@@ -438,26 +438,50 @@ fn every_journal_backend_answers_the_same_contract() {
 /// direction: `IS_USED_LOCK` of a name nobody took answers `NULL`, the runner
 /// reports the dead-owner case as unavailable, and the suite goes green having
 /// checked the one thing it was added for in neither direction.
+///
+/// **Both halves of the name**, because MySQL's is two. User-level locks are
+/// keyed on the name alone across the whole server — unlike Postgres' advisory
+/// locks, which the server already scopes to the database — so the arm takes its
+/// guard under `WRITER_GUARD` qualified with the schema it is connected to
+/// (`MYSQL_GUARD_NAME`), and a runner that asked for either half alone would
+/// find nothing.
 #[test]
 fn the_runner_and_the_module_take_one_writer_guard() {
     const MODULE: &str = include_str!("../src/codegen/js/journal.ts");
+    const ARM: &str = include_str!("../src/codegen/js/journal-mysql.ts");
     const RUNNER: &str = include_str!("toolchain/journal-contract.mjs");
-    let named = |source: &str, whose: &str| -> String {
+    let literal = |source: &str, declaration: &str, whose: &str| -> String {
         source
-            .split_once("const WRITER_GUARD = \"")
-            .unwrap_or_else(|| panic!("{whose} declares the writer guard's name"))
+            .split_once(&format!("const {declaration} = \""))
+            .unwrap_or_else(|| panic!("{whose} declares `{declaration}`"))
             .1
             .split('"')
             .next()
-            .unwrap_or_else(|| panic!("{whose} declares it as a string literal"))
+            .unwrap_or_else(|| panic!("{whose} declares `{declaration}` as a string literal"))
             .to_string()
     };
     assert_eq!(
-        named(MODULE, "`src/codegen/js/journal.ts`"),
-        named(RUNNER, "`tests/toolchain/journal-contract.mjs`"),
+        literal(MODULE, "WRITER_GUARD", "`src/codegen/js/journal.ts`"),
+        literal(
+            RUNNER,
+            "WRITER_GUARD",
+            "`tests/toolchain/journal-contract.mjs`"
+        ),
         "the journal takes its MySQL guard under one name and the conformance runner looks for \
          another, so the dead-owner case finds nothing holding a lock and reports itself \
          unavailable on a server that is working perfectly (PRD resolved q62)"
+    );
+    assert_eq!(
+        literal(ARM, "MYSQL_GUARD_NAME", "`src/codegen/js/journal-mysql.ts`"),
+        literal(
+            RUNNER,
+            "MYSQL_GUARD_NAME",
+            "`tests/toolchain/journal-contract.mjs`"
+        ),
+        "the journal qualifies its MySQL guard's name with one expression and the conformance \
+         runner asks `IS_USED_LOCK` for another, so the dead-owner case finds nothing holding a \
+         lock and reports itself unavailable on a server that is working perfectly \
+         (`docs/durability.md` §2.3)"
     );
 }
 

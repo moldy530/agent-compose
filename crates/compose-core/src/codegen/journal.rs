@@ -286,11 +286,18 @@ mod tests {
                  {statement}"
             );
         }
+        // …and the setting is read off the **statement** `openMysql` sends, not
+        // off the file: the arm's own doc comment names `ANSI_QUOTES` too, so a
+        // `MYSQL.contains` here stayed green with the functional
+        // `SET SESSION sql_mode` replaced by a no-op — a false guarantee in the
+        // one test that claims to hold the dependency a reader cannot see from
+        // either file alone.
+        let opening = function_code(MYSQL, "openMysql");
         assert!(
-            MYSQL.contains("ANSI_QUOTES"),
-            "the MySQL arm no longer sets `ANSI_QUOTES`, so every shared statement naming \
-             `\"key\"` compares against a three-letter string rather than against the column, \
-             and the journal answers nothing for every effect it holds"
+            opening.contains("SET SESSION sql_mode") && opening.contains("'ANSI_QUOTES'"),
+            "`openMysql` no longer sets `ANSI_QUOTES` on its session, so every shared statement \
+             naming `\"key\"` compares against a three-letter string rather than against the \
+             column, and the journal answers nothing for every effect it holds"
         );
         assert!(
             !POSTGRES.contains("ANSI_QUOTES"),
@@ -321,8 +328,8 @@ mod tests {
             (
                 MYSQL,
                 "journal-mysql.ts",
-                "GET_LOCK(?, 0)",
-                "GET_LOCK(?, -1)",
+                "GET_LOCK(${MYSQL_GUARD_NAME}, 0)",
+                "GET_LOCK(${MYSQL_GUARD_NAME}, -1)",
             ),
         ] {
             assert!(
@@ -367,6 +374,62 @@ mod tests {
         }
     }
 
+    /// How the MySQL arm spells the name it takes its guard under.
+    ///
+    /// Read by the two tests below, and spelled a third time by
+    /// `tests/toolchain/journal-contract.mjs` — which
+    /// `the_runner_and_the_module_take_one_writer_guard` holds to this one,
+    /// because a runner asking `IS_USED_LOCK` for another name finds nothing
+    /// holding the lock and reports the dead-owner case unavailable against a
+    /// server that is working perfectly.
+    const MYSQL_GUARD_NAME: &str = "CONCAT(?, ':', LEFT(SHA2(DATABASE(), 256), 32))";
+
+    /// **One database, one journal, one writer — on MySQL too**
+    /// (`docs/durability.md` §2.3, PRD resolved q62).
+    ///
+    /// The guard's name is a constant because the *tables* are shared by
+    /// everything pointed at one database, which is the reasoning
+    /// [`WRITER_GUARD`]'s doc comment gives and which Postgres makes true for
+    /// free: `pg_try_advisory_lock` is scoped to the database the session
+    /// connected to, so `staging` and `prod` in two databases of one cluster
+    /// take two locks under one name.
+    ///
+    /// **MySQL's user-level locks are server-wide.** The name alone is the key,
+    /// with no schema component anywhere in it — so the same two deployments on
+    /// one managed MySQL server would take the *same* lock, and the second
+    /// `serve` to start would be refused by [`guardHeld`] with advice that
+    /// cannot come true: the message says a vanished host's guard is released
+    /// within `GUARD_REAP_SECONDS`, and this one is held by a healthy,
+    /// unrelated deployment that will hold it for as long as it is up. No
+    /// conformance case can see it either — one suite run drives one database on
+    /// one server — so the asymmetry is bound here, where the two arms sit side
+    /// by side.
+    #[test]
+    fn the_mysql_guard_is_scoped_to_the_schema_the_postgres_one_gets_for_free() {
+        assert!(
+            MYSQL.contains(&format!("const MYSQL_GUARD_NAME = \"{MYSQL_GUARD_NAME}\";")),
+            "the MySQL arm no longer qualifies its writer guard with `DATABASE()`, so a lock \
+             name MySQL keys server-wide is shared by every deployment on the server: two \
+             journals in two databases of one instance lock each other out, and the refusal \
+             tells the second operator to wait out a host loss that never happened \
+             (`docs/durability.md` §2.3)"
+        );
+        assert!(
+            function_code(MYSQL, "openMysql").contains("GET_LOCK(${MYSQL_GUARD_NAME}, 0)"),
+            "the MySQL arm declares a qualified guard name and takes its lock under something \
+             else"
+        );
+        // …and the Postgres arm does not reach for one: the key it locks on is
+        // `WRITER_GUARD_KEYS`, and the database it locked in is the one it
+        // connected to.
+        assert!(
+            !POSTGRES.contains("DATABASE()") && !POSTGRES.contains("current_database()"),
+            "the Postgres arm qualifies its advisory lock by database, which the server already \
+             does — two deployments in two databases of one cluster hold two locks under one \
+             key"
+        );
+    }
+
     /// **A guard nobody is holding is given back in minutes, not in hours**
     /// (`docs/durability.md` §2.3, PRD resolved q62).
     ///
@@ -387,6 +450,15 @@ mod tests {
     /// So each arm shortens the window for its own session and keeps a heartbeat
     /// on it, and both halves are read here: a shortened window with no heartbeat
     /// reaps a `serve` that is merely idle, which is worse than the bug.
+    ///
+    /// **Every assertion below reads the statement rather than the identifier**,
+    /// and that is the difference between this test and the one it replaced. A
+    /// setting is only a bound once it is *sent*: `arm.contains("…idle")` is
+    /// satisfied by the constant's own declaration and by the paragraph above it,
+    /// so deleting the `query(POSTGRES_KEEPALIVES)` line left the suite green
+    /// with the window back at Linux's two hours and nothing else in the project
+    /// observing it — the live conformance case ends the guard session by
+    /// *killing* the backend, so no test waits out a reap.
     #[test]
     fn each_remote_arm_bounds_how_long_a_lost_host_holds_the_guard() {
         assert!(
@@ -395,26 +467,57 @@ mod tests {
             "the window and the heartbeat are one pair of numbers for both arms, stated in the \
              invariant half beside the guard they are about (`docs/durability.md` §2.3)"
         );
-        for (arm, name, shortens) in [
-            (POSTGRES, "journal-postgres.ts", "tcp_keepalives_idle"),
-            (MYSQL, "journal-mysql.ts", "SET SESSION wait_timeout"),
+        for (arm, name, open, setting, shortens) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "openPostgres",
+                "POSTGRES_KEEPALIVES",
+                "tcp_keepalives_idle",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "openMysql",
+                "MYSQL_WAIT_TIMEOUT",
+                "SET SESSION wait_timeout",
+            ),
         ] {
+            let declared = declaration(arm, setting);
             assert!(
-                arm.contains(shortens),
-                "`{name}` leaves its server's reap window at the default, so a host that \
-                 vanished holds this journal's writer guard for hours and the takeover \
-                 `serve` is refused for all of them (`docs/durability.md` §2.3)"
+                declared.contains(shortens),
+                "`{name}`'s `{setting}` no longer says `{shortens}`, so a host that vanished \
+                 holds this journal's writer guard for hours and the takeover `serve` is \
+                 refused for all of them (`docs/durability.md` §2.3)"
             );
             assert!(
-                arm.contains("GUARD_REAP_SECONDS"),
+                code(arm).contains("GUARD_REAP_SECONDS"),
                 "`{name}` shortens the window to a number of its own, so the two backends \
                  promise different bounds while §2.3 states one"
             );
+            // …and it is **applied**, in the function that takes the guard the
+            // window is about. A setting declared and never sent is the
+            // server's default with a constant beside it.
             assert!(
-                arm.contains("GUARD_HEARTBEAT_MS") && arm.contains("clearInterval("),
-                "`{name}` shortens the window and never says it is alive, so a `serve` that \
-                 journals nothing for an afternoon is reaped mid-deployment — or it heartbeats \
-                 and never stops, and a finished `run` does not exit"
+                function_code(arm, open).contains(&format!("query({setting})")),
+                "`{name}` declares `{setting}` and never sends it from `{open}`, so the server \
+                 reaps a silent session on its own schedule — two hours, or eight — while \
+                 `docs/durability.md` §2.3's table and `guardHeld`'s \
+                 `${{GUARD_REAP_SECONDS}}s` both promise five minutes \
+                 (`docs/durability.md` §2.3)"
+            );
+            // …and the heartbeat that keeps the shortened window off a hub which
+            // is merely idle is a timer with that period, not a keepalive option
+            // that happens to name the constant.
+            assert!(
+                code(arm).contains("}, GUARD_HEARTBEAT_MS);"),
+                "`{name}` shortens the window and never says it is alive on a timer of that \
+                 period, so a `serve` that journals nothing for an afternoon is reaped \
+                 mid-deployment"
+            );
+            assert!(
+                code(arm).contains("clearInterval(this.#heartbeat);"),
+                "`{name}` heartbeats and never stops, so a finished `run` does not exit"
             );
         }
     }
@@ -509,7 +612,7 @@ mod tests {
                 MYSQL,
                 "journal-mysql.ts",
                 "openMysql",
-                "GET_LOCK(?, 0)",
+                "GET_LOCK(${MYSQL_GUARD_NAME}, 0)",
                 "MYSQL_SCHEMA",
             ),
         ] {
@@ -1617,6 +1720,41 @@ mod tests {
         }
         found.push((name, body));
         found
+    }
+
+    /// One top-level declaration's own lines, by name.
+    ///
+    /// [`declarations`] partitions a module at its column-zero declarations and
+    /// drops the prose, so this is what a `const` really says rather than what
+    /// the paragraph above it describes.
+    fn declaration(source: &str, name: &str) -> String {
+        declarations(source)
+            .into_iter()
+            .find(|(declared, _)| declared == name)
+            .unwrap_or_else(|| panic!("the emitted module declares `{name}`"))
+            .1
+    }
+
+    /// An emitted module's code, with its prose taken out.
+    ///
+    /// The difference between a rule that binds a statement and a rule its own
+    /// doc comment satisfies. Two of the tests above were the latter — one was
+    /// green with the `SET SESSION sql_mode` that makes every `"key"` a column
+    /// replaced by a no-op, the other with the statement that shortens the
+    /// guard's reap window deleted — because the identifier they matched on was
+    /// still there, in the paragraph explaining why the deleted line mattered.
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !is_comment(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// …and of one function of it, which is the pairing most of these rules
+    /// want: a statement is sent from somewhere, and *where* is half the rule.
+    fn function_code(source: &str, name: &str) -> String {
+        code(&function_body(source, name))
     }
 
     /// Whether this line is comment or documentation rather than code.

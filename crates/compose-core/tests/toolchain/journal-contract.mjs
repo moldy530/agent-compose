@@ -51,6 +51,17 @@ const CASED = ["cased/0", "CASED/0"];
  */
 const WRITER_GUARD = "agent-compose:journal";
 
+/**
+ * …and how the MySQL arm qualifies it with the schema it is connected to.
+ *
+ * The same expression `MYSQL_GUARD_NAME` spells in `js/journal-mysql.ts`, for
+ * the same reason the name above is duplicated and by the same drift test:
+ * MySQL's user-level locks are keyed on the name alone across the whole server,
+ * so the arm takes its guard under `<name>:<digest of DATABASE()>` and a reader
+ * looking for the holder has to ask for exactly that.
+ */
+const MYSQL_GUARD_NAME = "CONCAT(?, ':', LEFT(SHA2(DATABASE(), 256), 32))";
+
 const results = {};
 let handle;
 
@@ -339,8 +350,18 @@ async function endTheGuardSession(provider, url) {
   const { createConnection } = await import("mysql2/promise");
   const connection = await createConnection({ uri: url });
   try {
-    // `IS_USED_LOCK` answers the connection id holding the named lock, or NULL.
-    const [rows] = await connection.query("SELECT IS_USED_LOCK(?) AS holder", [WRITER_GUARD]);
+    // `IS_USED_LOCK` answers the connection id holding the named lock, or NULL —
+    // and the name is the journal's, schema and all. MySQL's user-level locks
+    // are server-wide, so the arm qualifies `WRITER_GUARD` with the database it
+    // is connected to (`MYSQL_GUARD_NAME` in `js/journal-mysql.ts`); asking for
+    // the bare name here would find nothing holding it and report the
+    // dead-owner case unavailable against a server that is working perfectly.
+    // The two spell the expression identically, held so by
+    // `the_runner_and_the_module_take_one_writer_guard`.
+    const [rows] = await connection.query(
+      `SELECT IS_USED_LOCK(${MYSQL_GUARD_NAME}) AS holder`,
+      [WRITER_GUARD],
+    );
     const holder = rows[0]?.holder;
     if (holder === null || holder === undefined) return 0;
     // `KILL` takes no placeholder, so the id goes in as the number it is.

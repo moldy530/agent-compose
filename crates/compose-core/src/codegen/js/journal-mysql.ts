@@ -179,6 +179,43 @@ const MYSQL_DIALECT: Dialect = {
  */
 const MYSQL_WAIT_TIMEOUT = `SET SESSION wait_timeout = ${GUARD_REAP_SECONDS}`;
 
+/**
+ * [`WRITER_GUARD`], qualified with the schema this connection is addressing.
+ *
+ * **MySQL's user-level locks are server-wide**, and that is the one place this
+ * arm cannot read the Postgres one and translate. `pg_try_advisory_lock` is
+ * scoped to the database the session connected to, so two deployments in two
+ * databases of one cluster take two different locks under one name; `GET_LOCK`
+ * is keyed on the name **alone**, so the same two on one MySQL server would take
+ * the *same* lock — and a `staging` hub that is up and well would refuse `prod`'s
+ * `serve` with [`guardHeld`]'s advice to wait five minutes for a host that never
+ * vanished. One database, one journal, one writer (`docs/durability.md` §2.3) is
+ * the rule on both backends; here the name has to say so.
+ *
+ * `DATABASE()` rather than anything parsed out of the URL, because it is what
+ * every statement below will really address — a schema the connection was
+ * redirected to is one this guard still covers.
+ *
+ * **A digest rather than the schema's own name**, and that is arithmetic rather
+ * than obfuscation: MySQL refuses a lock name longer than 64 characters, a
+ * database name may be 64 characters by itself, and a guard that failed to open
+ * on a long schema name would be a deployment refused for how it was spelled.
+ * The first 128 bits of a SHA-256 are 32 characters, which leaves this name 55
+ * and no way to grow. `SHA2` rather than `MD5` because a server in FIPS mode
+ * refuses the latter. An operator looking for the holder reads it back the way
+ * `tests/toolchain/journal-contract.mjs` does — `IS_USED_LOCK` of this same
+ * expression, which the two spell identically under a drift test
+ * (`the_runner_and_the_module_take_one_writer_guard`).
+ */
+const MYSQL_GUARD_NAME = "CONCAT(?, ':', LEFT(SHA2(DATABASE(), 256), 32))";
+
+/** What an address with no database on it is refused with. See [`openMysql`]. */
+function noDatabaseNamed(): Error {
+  return new Error(
+    `this project's journal is ${journalLocation()}, and that address names no database: a \`mysql://\` URL carries the schema as its path (\`mysql://user:pass@host:3306/agent_compose\`), and this one stops at the host. The journal's tables live in a schema and its writer guard is taken under the one this connection is addressing (\`docs/durability.md\` §2.3), so there is nothing to open until the variable names it (grammar §14.7)`,
+  );
+}
+
 /** The journal as a MySQL database, on one connection this process holds. */
 class MysqlDriver implements JournalDriver {
   readonly dialect = MYSQL_DIALECT;
@@ -241,7 +278,9 @@ class MysqlDriver implements JournalDriver {
  *
  * `GET_LOCK(name, 0)` rather than a timeout: a second opener is told what is
  * happening ([`guardHeld`]) rather than left blocking on a connection that may
- * be a `serve` which will hold it for days.
+ * be a `serve` which will hold it for days. The name is [`MYSQL_GUARD_NAME`],
+ * which carries the schema, so the journal of one database on a shared server
+ * locks out nothing but its own second writer.
  *
  * **The guard is taken before the schema is created**, and the order is load
  * bearing rather than tidy: two processes opening one fresh journal at the same
@@ -287,9 +326,20 @@ async function openMysql(): Promise<JournalDriver> {
     // Best effort, and said out loud where it does not take: see
     // [`guardWindowUnshortened`].
     await connection.query(MYSQL_WAIT_TIMEOUT).catch(guardWindowUnshortened);
-    const [rows] = await connection.query<RowDataPacket[]>("SELECT GET_LOCK(?, 0) AS taken", [
-      WRITER_GUARD,
-    ]);
+    // The schema has to be there before the guard is taken under it: a URL that
+    // names none leaves `DATABASE()` `NULL`, which makes [`MYSQL_GUARD_NAME`]
+    // `NULL` and `GET_LOCK` of it an error or a nothing — and a nothing reads
+    // here as a guard somebody else is holding, which is the one wrong thing to
+    // tell an operator whose address is simply short a path. The DDL below would
+    // fail on the same URL with MySQL's own "No database selected", so this is
+    // the same refusal, made first and by name.
+    const [scoped] = await connection.query<RowDataPacket[]>("SELECT DATABASE() AS db");
+    const database = scoped[0]?.["db"];
+    if (typeof database !== "string" || database === "") throw noDatabaseNamed();
+    const [rows] = await connection.query<RowDataPacket[]>(
+      `SELECT GET_LOCK(${MYSQL_GUARD_NAME}, 0) AS taken`,
+      [WRITER_GUARD],
+    );
     // `GET_LOCK` answers `1` when it took the lock, `0` when it timed out, and
     // `NULL` when something went wrong — and only the first is this process
     // holding the journal.
