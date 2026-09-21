@@ -113,10 +113,13 @@ export {
   JOURNAL_VERSION,
   ReplayDivergence,
   canonical,
+  journalBinding,
   journalExists,
+  journalLocation,
   journalPath,
   latchedDivergence,
   openJournal,
+  releaseJournal,
 } from "./journal.ts";
 export type {
   CallbackIntent,
@@ -129,6 +132,8 @@ export type {
   EffectKind,
   ExecutionRow,
   Journal,
+  JournalBinding,
+  JournalProvider,
   JournalRecord,
 } from "./journal.ts";
 
@@ -2110,7 +2115,7 @@ export async function callModel(
   // — an older journal still replays, and `JOURNAL_VERSION` does not move
   // (`docs/durability.md` §11.2, §11.3).
   const suites = ladder(selection).map((member) => member.provider.serverTools ?? []);
-  const slot = recorder.claim("model", {
+  const slot = await recorder.claim("model", {
     model: selection.address,
     system: request.system,
     turns: request.turns,
@@ -2159,19 +2164,19 @@ export async function callModel(
     // carries it verbatim — so a generation that went on with a differently
     // ordered copy of it would be reported as divergent by its own successor
     // (`docs/durability.md` §11.1).
-    const kept = slot.keep({
+    const kept = (await slot.keep({
       ok: true,
       answer: result.answer,
       served: result.served,
       calls: filed(),
-    } satisfies JournaledCall) as Extract<JournaledCall, { ok: true }>;
+    } satisfies JournaledCall)) as Extract<JournaledCall, { ok: true }>;
     return { answer: kept.answer, served: result.served };
   } catch (error) {
     // Kept as a **value** rather than through the slot's error path, because a
     // spent ladder is more than its message: the records it filed are what a
     // reader of the failed node's entry reads, and they have to survive into
     // the resumed generation's trace with it.
-    slot.keep({
+    await slot.keep({
       ok: false,
       error: { name: nameOf(error), message: messageOf(error) },
       calls: filed(),
@@ -12640,7 +12645,11 @@ export async function runHuman(
   // answered. The journal is where it goes, because a replay that re-asked a
   // question somebody has already answered would be a durability story that
   // asks the human to do the work twice (`docs/durability.md` §3.4).
-  const slot = context.effects?.claim("human", { wait: id, node: descriptor.node, shown });
+  const slot = await context.effects?.claim("human", {
+    wait: id,
+    node: descriptor.node,
+    shown,
+  });
   if (slot?.held !== undefined) {
     if (slot.held.kind === "error") throw replayedFailure(slot.held);
     const held = slot.held.value as JournaledWait;
@@ -13310,14 +13319,14 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
   const journal = await openJournal();
   const resuming = opening.resuming === true;
   if (resuming) {
-    const row = journal.execution(opening.execution);
+    const row = await journal.execution(opening.execution);
     if (row !== undefined && row.journalVersion !== JOURNAL_VERSION) {
       throw new Error(
         `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §11)`,
       );
     }
   } else {
-    journal.begin({
+    await journal.begin({
       id: opening.execution,
       flow: opening.flow,
       trigger: opening.trigger,
@@ -13358,15 +13367,15 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
  *    decided this run; replaying it would re-derive the same failure from the
  *    same record.
  */
-export function settleExecution(execution: string, error?: unknown): void {
+export async function settleExecution(execution: string, error?: unknown): Promise<void> {
   const journal = settledJournals.get(execution);
   if (journal === undefined) return;
   if (staysOpen(execution, error)) return;
   if (error === undefined) {
-    journal.end(execution, "completed");
+    await journal.end(execution, "completed");
     return;
   }
-  journal.end(execution, "failed", describe(error));
+  await journal.end(execution, "failed", describe(error));
 }
 
 /**
@@ -13422,7 +13431,7 @@ export function divergenceOf(error: unknown): ReplayDivergence | undefined {
 /** One execution's lifecycle row, or `undefined` where the journal has none. */
 export async function journaledExecution(id: string): Promise<ExecutionRow | undefined> {
   if (!journalExists()) return undefined;
-  return (await openJournal()).execution(id);
+  return await (await openJournal()).execution(id);
 }
 
 /**
@@ -13433,7 +13442,7 @@ export async function journaledExecution(id: string): Promise<ExecutionRow | und
  */
 export async function openExecutions(): Promise<readonly ExecutionRow[]> {
   if (!journalExists()) return [];
-  return (await openJournal()).openExecutions();
+  return await (await openJournal()).openExecutions();
 }
 
 // ---------------------------------------------------------------------------
@@ -13453,7 +13462,7 @@ export async function openExecutions(): Promise<readonly ExecutionRow[]> {
  * id the receiver dedupes on (resolved q35).
  */
 export async function intendDelivery(intent: DeliveryIntent): Promise<DeliveryRecord> {
-  return (await openJournal()).intendDelivery(intent);
+  return await (await openJournal()).intendDelivery(intent);
 }
 
 /**
@@ -13464,7 +13473,7 @@ export async function refuseDelivery(
   intent: CallbackIntent,
   reason: string,
 ): Promise<DeliveryRecord> {
-  return (await openJournal()).refuseDelivery(intent, reason);
+  return await (await openJournal()).refuseDelivery(intent, reason);
 }
 
 /**
@@ -13477,7 +13486,7 @@ export async function refuseRecordedDelivery(
   ordinal: number,
   reason: string,
 ): Promise<void> {
-  (await openJournal()).refuseRecorded(execution, ordinal, reason);
+  await (await openJournal()).refuseRecorded(execution, ordinal, reason);
 }
 
 /**
@@ -13495,7 +13504,7 @@ export async function exhaustRecordedDelivery(
   ordinal: number,
   reason: string,
 ): Promise<void> {
-  (await openJournal()).exhaustRecorded(execution, ordinal, reason);
+  await (await openJournal()).exhaustRecorded(execution, ordinal, reason);
 }
 
 /** Record what one attempt did, and where the delivery stands after it. */
@@ -13505,7 +13514,7 @@ export async function recordDeliveryAttempt(
   attempt: DeliveryAttempt,
   status: DeliveryStatus,
 ): Promise<void> {
-  (await openJournal()).recordAttempt(execution, ordinal, attempt, status);
+  await (await openJournal()).recordAttempt(execution, ordinal, attempt, status);
 }
 
 /**
@@ -13517,13 +13526,13 @@ export async function recordDeliveryAttempt(
  */
 export async function deliveriesOf(execution: string): Promise<readonly DeliveryRecord[]> {
   if (!journalExists()) return [];
-  return (await openJournal()).deliveries(execution);
+  return await (await openJournal()).deliveries(execution);
 }
 
 /** Every delivery still owed an attempt — what a restarted `serve` picks up. */
 export async function undeliveredDeliveries(): Promise<readonly DeliveryRecord[]> {
   if (!journalExists()) return [];
-  return (await openJournal()).undelivered();
+  return await (await openJournal()).undelivered();
 }
 
 /** What a report is *of*, before the journal's own half is read into it. */

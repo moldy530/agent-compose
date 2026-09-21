@@ -895,6 +895,25 @@ impl References {
             }
         }
 
+        // The journal's own connection, and it is the **hub's alone**: PRD
+        // resolved q42 makes the hub the single writer — "workers stream effect
+        // records home" — so a worker never opens this connection and must not
+        // be asked for the credential that would. It is the sharpest case
+        // §9.1's fifth clause covers, because the alternative reads plausible:
+        // a placed node's effects are journaled, so a reader could expect the
+        // worker to need the address. It does not; the batch goes over the
+        // wire and the hub writes the row (grammar 14.7, PRD resolved q62).
+        //
+        // Unconditional past this gate, like the trace sink and unlike
+        // `hub.join_token:`: every invocation of every flow is journaled with no
+        // key to turn it off (Decision D121), so a target that binds a remote
+        // provider opens that connection on every `run`, `serve` and `resume`.
+        if let Some(journal) = &ir.deploy.journal
+            && let Some(url) = &journal.url
+        {
+            references.record(&url.value.name, "deploy.journal.url");
+        }
+
         if let Some(triggers) = &ir.triggers {
             for (name, trigger) in &triggers.entries {
                 let TriggerKind::Http(http) = &trigger.kind else {

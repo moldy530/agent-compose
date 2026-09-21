@@ -78,9 +78,9 @@ other, never both (Decision [D3](#d3-spec-files-and-deploy-files-are-disjoint-do
 | Kind | Selected by | May contain |
 |---|---|---|
 | **Spec file** | reachable from the entrypoint's `imports:`, or being the entrypoint | `version`, `imports` (entrypoint only), `defaults`, `state`, `triggers`, typed-address definition keys |
-| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `package_registry`, `trace_sink`, `event_sources` |
+| **Deploy file** | `--target <name>` → `deploy/<name>.yml` | `version`, `hub`, `placements`, `storage_backends`, `journal`, `package_registry`, `trace_sink`, `event_sources` |
 
-A spec file that declares `hub`, `placements`, `storage_backends`,
+A spec file that declares `hub`, `placements`, `storage_backends`, `journal`,
 `package_registry`, `trace_sink`,
 or `event_sources` is a compile error, and a deploy file that declares
 definitions, `imports`, `state`, `triggers`, or `defaults` is a compile error. This is the
@@ -157,6 +157,7 @@ imports:
 | `hub` | illegal | illegal | allowed | ≤ 1 per target |
 | `placements` | illegal | illegal | allowed | ≤ 1 per target |
 | `storage_backends` | illegal | illegal | allowed | ≤ 1 per target |
+| `journal` | illegal | illegal | allowed | ≤ 1 per target |
 | `package_registry` | illegal | illegal | allowed | ≤ 1 per target |
 | `trace_sink` | illegal | illegal | allowed | ≤ 1 per target |
 | `event_sources` | illegal | illegal | allowed | ≤ 1 per target |
@@ -5142,13 +5143,17 @@ well-defined rather than a file the grammar half-recognizes (Decision
   (§15), parsed,
   type-checked, and carried into the IR under every target, so it is not inert
   there either.
-- It MUST NOT declare `storage_backends:`. That section is *active* grammar which
-  `local` overrides unconditionally: no alias and no per-kind default is ever
-  consulted, so the block could only be an inert key whose author expected a
-  substitution — a compile error naming the file and the target, not a silent
-  no-op ([D61](#d61-else-takes-the-literal-true),
+- It MUST NOT declare `storage_backends:`, and it MUST NOT declare `journal:`.
+  Both are *active* grammar which `local` overrides unconditionally: no alias and
+  no per-kind default is ever consulted, and the SQLite journal file beside the
+  project is bound whatever a `provider:` written here would say — so either
+  block could only be an inert key whose author expected a substitution. Each is
+  a compile error naming the file and the target, not a silent no-op
+  ([D61](#d61-else-takes-the-literal-true),
   [D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
-  A store that wants a real backend locally is a `--target` of its own.
+  A store that wants a real backend locally, or a journal that lives on a server,
+  is a `--target` of its own
+  ([D148](#d148-the-journal-is-a-deploy-layer-slot-and-three-backends-sit-behind-one-interface)).
 - Under `local`, the two **target-dependent binding checks are satisfied
   vacuously**: a store's `backend:` alias needs no definition (§11.3) because
   `local` resolves none, and an `event` trigger's `source:` needs no
@@ -5182,6 +5187,10 @@ storage_backends:
     kv: { provider: redis, url: "${REDIS_URL}" }
   aliases:
     docs_db: { provider: chroma, url: "${CHROMA_URL}" }
+
+journal:
+  provider: postgres
+  url: ${JOURNAL_URL}
 
 package_registry:
   url: "https://npm.internal.example/repository/npm-group/"
@@ -5702,6 +5711,97 @@ the project it serves and a worker runs `bun install` over the artifact it just
 materialised (`docs/distributed.md` §4 step 4, §9.1). So `readEnvironment()`
 refuses at launch naming it, and a worker without it is refused at join naming it
 (§9.2), which is resolved q15's posture landing at the surfaces that install.
+
+### 14.7 `journal`
+
+**Which backend this target's execution journal binds.** Every invocation of
+every flow is journaled, with no key to turn it off and none to turn it on
+([D121](#d121-durability-adds-no-grammar-journaling-is-unconditional-and-the-target-binds-the-backend)):
+what this block chooses is *where the record lives*, not whether there is one.
+The composition says nothing — nothing in a spec file names a journal — so this
+is the target's, exactly as a store's physical backing is (PRD resolved q27,
+q62).
+
+| Key | Type | Required | Notes |
+|---|---|---|---|
+| `provider` | `sqlite` \| `postgres` \| `mysql` | yes | which backend binds |
+| `url` | `${ENV}` reference | for `postgres` and `mysql` | the connection it dials; a literal is a compile error (§4.3), and `sqlite` takes none |
+
+```yaml
+journal:
+  provider: postgres
+  url: ${JOURNAL_URL}
+```
+
+**The whole block is OPTIONAL, and its absence is `sqlite`.** A target that
+declares no `journal:` binds one SQLite file beside the project's stores —
+`<project>/.agent-compose/journal.sqlite`, moved as a whole by
+`AGENT_COMPOSE_DATA_DIR`, retained by leaving it and deleted by deleting it.
+That is "durable by default, zero configuration" (PRD resolved q27) and it is
+the default under **every** target, not a concession `local` gets: a named target
+that says nothing about its journal gets the same file its laptop does.
+
+**One journal, not a map of them**, which is where this block's shape parts
+company with §14.3's. `storage_backends:` carries aliases and per-kind defaults
+because a composition *names* store slots with `backend:` and the deploy layer
+has to answer per name. Nothing names a journal, so there is one of these and no
+key selects between two.
+
+The rules (Decision
+[D148](#d148-the-journal-is-a-deploy-layer-slot-and-three-backends-sit-behind-one-interface)):
+
+1. **`provider:` is required**, and is one of the three. A block written with no
+   provider says nothing that its own absence does not say better, so it is
+   `missing-key` rather than a silent `sqlite`; a fourth spelling is
+   `unknown-variant` naming the three.
+2. **`postgres` and `mysql` REQUIRE `url:`, and `sqlite` refuses it.** A journal
+   on a server is a connection rather than a file, so the address is the whole of
+   what the deploy file has to say; a `sqlite` journal has no address, so a `url:`
+   written beside it is a key nobody reads — the inert key D50 and D61 refuse.
+   The two directions have codes of their own: `missing-journal-url` and
+   `unsupported-journal-key`, because `url:` is legal one line up and "this
+   construct does not define it" would be false about the file in front of the
+   reader.
+3. **`url:` takes an `${ENV}` value-form reference and nothing else** (§4.3
+   class 1, PRD resolved q32). A literal URL or credential is a compile error:
+   the deploy file names the slot, the environment holds the credential, and
+   `validate` never sees a URL. **Presence is checked at launch**, not at build —
+   `build` reads no environment (PRD resolved q15) — and the variable joins the
+   **hub's** environment manifest and no placement's, because the hub is the
+   single writer (PRD resolved q42) and a worker that never opens the connection
+   must not be asked for what opens it (`docs/distributed.md` §9.1).
+4. **`deploy/local.yml` MUST NOT declare this block**, exactly as it may not
+   declare `storage_backends:` (§14, [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)).
+   `local` binds the SQLite file unconditionally, so a `provider:` written there
+   is never consulted; the refusal is `misplaced-section`, naming the file and
+   the target.
+5. **Unknown keys are errors**, as everywhere outside a plugin-config object
+   ([D50](#d50-unknown-keys-are-errors-everywhere-except-plugin-config-objects)).
+   A pool size, a schema name, a timeout: none of them is grammar here, because
+   the interface behind this block is a handful of per-record inserts and
+   frontier reads rather than a database configuration surface.
+
+**The interface does not move, and that is the point.**
+[`docs/durability.md`](durability.md) is normative for the record, its keys, the
+frontier, the recovery verbs and `JOURNAL_VERSION`, and none of them is
+per-provider: a runtime cannot tell which backend it got. What *is* stated per
+provider is the durability contract beneath it (`docs/durability.md` §2) — that
+one effect is one committed insert, what a crash can leave, and the writer guard
+the two remote backends hold under the hub's one-writer rule (PRD resolved q42).
+
+**What a driver costs, and only where it is bound.** A generated project carries
+`pg` exactly where its target's journal binds `postgres` and `mysql2` exactly
+where it binds `mysql`, pinned like every other dependency (PRD §9.18): the
+zero-infra local build keeps its dependency set unchanged, and the emitted
+`README.md` says which journal this target bound and where it lives.
+
+**What a remote journal buys** is the property a single host cannot give: the
+hub's record survives the hub's disk, so a `serve` restarted on a fresh machine
+recovers every open execution from the database. Cross-host resume stays a named
+exclusion for **SQLite** journals only (PRD resolved q28) — a file is a file.
+What it costs is the operator's: retention is a `DELETE` rather than removing
+one file, and the payloads a journal holds (`docs/durability.md` §8) are private
+recovery data that binding into a shared database is an explicit choice about.
 
 ---
 
@@ -8137,27 +8237,35 @@ with no header for this rule to be about. *PRD 5.9, G3.*
 
 ### D121. Durability adds no grammar: journaling is unconditional and the target binds the backend
 
-Every invocation of every flow is **journaled**, with no key to turn it off and
-none to turn it on, and `--target local` binds a SQLite journal file beside the
-project. There is no `journal:` block, no deploy-file section, and no addition to
-the published schema. [`docs/durability.md`](durability.md) is normative for the
-record, its keys, and the replay that reads it back. **Rationale**: PRD resolved
-q27 makes the journal a *deploy-target slot*, exactly as `storage_backends` are —
-"the composition says nothing, the target binds it" — and every target this
-compiler release can build is process-local, so every one of them binds the same
-backend. A configuration surface is a choice expressed in grammar; with one
-backend there is no choice, and a key whose only legal value is its default is a
-key an author has to read and cannot use. resolved q27 also fixes the property
-that key would otherwise carry: durability is "durable by default, zero
-configuration, one file to delete".
+**SUPERSEDED in part, 2026-09-21**, by
+[D148](#d148-the-journal-is-a-deploy-layer-slot-and-three-backends-sit-behind-one-interface),
+which is PRD resolved q62 — **exactly as this entry scheduled itself to be**.
+The paragraph below said the deploy-level surface "arrives with the first
+non-local backend […] and it will land in §14 beside `storage_backends:` where it
+belongs"; that release is D148, and §14.7 is the block. What is *not* superseded
+is the half this entry is named for and which D148 restates unchanged:
+journaling is **unconditional**, there is no key to turn it off and none to turn
+it on, and a target that declares nothing still binds SQLite beside the project.
+The amended text follows; the superseded paragraph is quoted at the end so a
+reader of an older citation can see what changed.
 
-The deploy-level surface arrives with the **first non-local backend** — the
-Postgres journal a distributed target binds — which is the release where a
-choice exists to express, and it will land in §14 beside `storage_backends:`
-where it belongs. Reserving the key now would be reserving a shape nobody has
-had to write against a backend nobody has implemented, which is the one kind of
-forward-compatibility this document does not practise (§15's reserved
-constructs are all *fully specified*).
+Every invocation of every flow is **journaled**, with no key to turn it off and
+none to turn it on, and a target that declares no `journal:` binds a SQLite
+journal file beside the project — `--target local` always, and every other target
+until it says otherwise (§14.7).
+[`docs/durability.md`](durability.md) is normative for the
+record, its keys, and the replay that reads it back, and it is
+**backend-invariant**: what §14.7 chooses is where the record lives, never what
+is in it. **Rationale**: PRD resolved
+q27 makes the journal a *deploy-target slot*, exactly as `storage_backends` are —
+"the composition says nothing, the target binds it" — and at the release this
+entry was written every target this compiler could build was process-local, so
+every one of them bound the same backend. A configuration surface is a choice
+expressed in grammar; with one backend there was no choice, and a key whose only
+legal value is its default is a key an author has to read and cannot use.
+resolved q27 also fixes the property that key must not cost: durability is
+"durable by default, zero configuration", which §14.7's optional block and its
+stated default are what keep true.
 
 Durability is **not** §14's checkpointing, and the two must not be read as one
 rule. "`local` is not durably checkpointed; every other target is" — the property
@@ -8165,7 +8273,23 @@ rule. "`local` is not durably checkpointed; every other target is" — the prope
 about a LangGraph **checkpointer**, which PRD resolved q26 rules out as this
 project's durability mechanism in favour of journal + replay. `--target local` is
 still the un-checkpointed target, `detach: true` is still legal only there, and
-it is now also a durable one. *PRD 5.11, resolved q26–q29.*
+it is now also a durable one.
+
+**What the amendment replaced**, verbatim: *"There is no `journal:` block, no
+deploy-file section, and no addition to the published schema. […] The
+deploy-level surface arrives with the **first non-local backend** — the Postgres
+journal a distributed target binds — which is the release where a choice exists
+to express, and it will land in §14 beside `storage_backends:` where it belongs.
+Reserving the key now would be reserving a shape nobody has had to write against
+a backend nobody has implemented, which is the one kind of forward-compatibility
+this document does not practise (§15's reserved constructs are all *fully
+specified*)."* The forecast was right down to the section: the block landed in
+§14 beside `storage_backends:`, fully specified, with two backends implemented
+behind it rather than reserved
+([D148](#d148-the-journal-is-a-deploy-layer-slot-and-three-backends-sit-behind-one-interface)).
+
+**Status**: ratified, amended by PRD resolved q62. *PRD 5.11, resolved q26–q29,
+q62.*
 
 ### D122. Server tools are provider-side config, checked in two tiers
 
@@ -9949,6 +10073,98 @@ a, b and c. *PRD 5.6, G3, resolved q15, q22, q23, q41, q45, q54, q57, q58, q61;
 [D138](#d138-a-coder-nodes-containment-is-a-workspace-an-access-preset-and-a-tool-list-one-harness-enforces),
 [D142](#d142-the-policy-chain-wraps-a-whole-harness-run-and-harness-native-resume-is-excluded).*
 
+### D148. The journal is a deploy-layer slot, and three backends sit behind one interface
+
+`journal:` is a deploy-file section (§14.7) holding one backend config:
+`provider: sqlite | postgres | mysql`, plus a `url:` that the two remote
+providers require and `sqlite` refuses. The block is optional and its absence is
+`sqlite`; `deploy/local.yml` may not declare it at all; the `url:` is an `${ENV}`
+value-form reference and never a literal; unknown keys are errors. A generated
+project carries `pg` where its target binds Postgres and `mysql2` where it binds
+MySQL, and neither anywhere else.
+
+**Rationale**: PRD resolved q62, which is
+[D121](#d121-durability-adds-no-grammar-journaling-is-unconditional-and-the-target-binds-the-backend)'s
+own scheduled arrival — that entry said the surface lands "with the first
+non-local backend […] in §14 beside `storage_backends:` where it belongs", and
+this is that release. What makes it worth a block now is that a choice exists to
+express: a remote journal buys the property resolved q27 could not give a single
+host, the hub's record surviving the hub's disk, so a `serve` restarted on a
+fresh machine recovers every open execution. MySQL joins Postgres because
+operators run managed MySQL as routinely as managed Postgres and the interface
+the two implement is the same handful of per-record inserts and frontier reads.
+
+**The shape is a single config rather than §14.3's aliases and defaults**, and
+that asymmetry is the difference between the two things rather than an
+inconsistency. A store is a slot a composition *names* — `backend: docs_db` — so
+the deploy layer has to answer per name, and §11.3's resolution order exists to
+say which answer wins. Nothing in a composition names a journal; resolved q27
+puts it in the target precisely so that the composition says nothing. One target,
+one journal, one config.
+
+**The block is optional and its default is stated rather than implied.** A key
+whose only legal value is its default is what D121 refused to reserve, and the
+same argument now says the *block* must be skippable: a named target that has no
+opinion about its journal must not be forced to write one, or "durable by
+default, zero configuration" would become "durable by default in one target".
+So absence is `sqlite`, everywhere, and the IR records the difference between a
+block that was written and one that was not — which is what a plan document
+reports on.
+
+**`url:` is required by the providers that dial and refused by the one that does
+not**, with a code on each side. `missing-journal-url` is the
+[D130](#d130-the-hub-block-and-the-conditional-join-token) shape: a sibling value
+— the `provider:` on the line above — decides whether a second key is required,
+and the repair is a choice of two. `unsupported-journal-key` is the other
+direction and is *not* an `unknown-key`, because `url:` is this construct's own
+key and is legal one line up: what is refused is the pair, which is
+[D122](#d122-server-tools-are-provider-side-config-checked-in-two-tiers)'s
+`unsupported-server-tools` shape. The harm the second one prevents is the one
+D50 and [D61](#d61-else-takes-the-literal-true) are written against: an author
+who wrote an address and got a file, silently, for as long as the target stays
+deployed.
+
+**Nothing else is grammar here, and that is a statement about the interface.**
+No pool size, no schema name, no timeout, no `ssl:` block. The runtime behind
+this block does per-record inserts, a frontier read, a recovery scan and a writer
+guard; a configuration surface wider than that would be this grammar describing
+somebody else's database rather than its own journal, and every key of it would
+be a key `validate` could not check. An operator who needs a pool tuned puts it
+in the connection string the `${ENV}` holds, which is where every driver already
+reads one.
+
+**`deploy/local.yml` refuses it, extending [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)
+verbatim.** D87's argument was that `storage_backends:` there has three readings
+— honored, silently ignored, or rejected — and that the PRD's zero-infra sentence
+rules out the first while this document's posture picks rejection over silence.
+Every word of that reads on `journal:`: `local` binds the file unconditionally,
+so a `provider: postgres` written there could only be honored by contradicting
+the guarantee or ignored by leaving an author with a block, an expectation and no
+diagnostic. The list of sections `local` refuses is now two, and the three
+documents that publish the complement of that list —
+§14's bullet, `docs/plan.md` §11 and `agent-compose docs targets` — are held
+equal to the mechanism by a test, because a section made live or dead in the
+compiler and written into only two of them tells an author the opposite of what
+`validate` does.
+
+**The credential is the hub's and no worker's**, which is §9.1's fifth clause
+read on one more reference site. PRD resolved q42 makes the hub the single writer
+— workers stream effect records home — so a worker never opens this connection,
+and asking it for the variable that would is the false requirement the
+per-placement manifest exists to avoid. The plausible misreading is worth naming:
+a placed node's effects *are* journaled, so a reader could expect the worker to
+need the address. It does not; the batch goes over the wire and the hub writes
+the row.
+
+**And the drivers are pinned per binding**, exactly as a harness SDK is
+([D133](#d133-a-module-binding-declares-its-environment-and-pins-its-dependencies-exactly),
+PRD resolved q57): `pg` and `@types/pg` where Postgres is bound, `mysql2` where
+MySQL is, and nothing new where neither is. The emitted journal module is
+assembled the same way `src/harness.ts` is — an invariant half plus the arm the
+target binds — so a zero-infra project neither installs a network driver nor
+carries the code that would import one. *PRD 5.10, 5.11, 5.12, resolved q15,
+q27–q29, q32, q42, q45, q62; §14, §14.7, §4.3.*
+
 ## Appendix B — Editor integration
 
 [`schemas/agent-compose.schema.json`](../schemas/agent-compose.schema.json) is a
@@ -10017,9 +10233,9 @@ authority. The schema cannot see across files, so it does not check:
   containing the same text, making the schema stricter than `validate` and
   inverting the invariant this appendix closes with;
 - rules that key off the file's *name* or the active target rather than its
-  content: no `storage_backends:` in `deploy/local.yml` and the existence of
-  `deploy/<name>.yml` (§14, D87), and `detach: true` under a checkpointed target
-  (§8.6 rule 7, D59);
+  content: no `storage_backends:` and no `journal:` in `deploy/local.yml` and the
+  existence of `deploy/<name>.yml` (§14, §14.7, D87, D148), and `detach: true`
+  under a checkpointed target (§8.6 rule 7, D59);
 - context-sensitive schema rules whose surface is not syntactically identifiable
   in one file. `max_items` is the example of the split: on **every** result
   surface (§3.5) — `agent.output`, `tool.output`, `flow.outputs`,
@@ -10245,6 +10461,10 @@ version: "0.1"
 hub:              { join_token?: ${VAR}, public_url?: "https://<host>" }
 placements:       { <name>: { members: [agent.*|tool.*, ...], description? } }
 storage_backends: { defaults: { kv|vector|blob: {...} }, aliases: { <alias>: {...} } }
+journal:          { provider: sqlite|postgres|mysql, url?: ${VAR} }
+                                   # 14.7: one journal per target; absent =
+                                   # sqlite beside the project. url is required
+                                   # by postgres/mysql and refused by sqlite
 package_registry: { url: "https://<host>/<path>", token?: ${VAR},
                     scopes?: { "@<scope>": { url, token?: ${VAR} } } }
                                    # 14.6: build writes bunfig.toml + .npmrc

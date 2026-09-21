@@ -1,6 +1,6 @@
 # agent-compose — Plan Format
 
-**Plan version:** `3`
+**Plan version:** `4`
 
 This document is **normative** for `agent-compose plan --format json`. It is the
 whole of what a consumer of that document may rely on, and §12 is the contract:
@@ -295,6 +295,7 @@ is accounted for.
 | `"hub"` | the active target's `hub:` block |
 | `"trace_sink"` | the active target's `trace_sink:` block |
 | `"package_registry"` | the active target's `package_registry:` block |
+| `"journal"` | the active target's `journal:` block |
 | `"event_source"` | an entry of the active target's `event_sources:` |
 
 **What this section owns.** Every component arriving or leaving, and every field
@@ -311,7 +312,8 @@ Concretely, two components have fields held elsewhere:
   and what it is for. Its whole delivery surface is §6's.
 
 Everything else — an agent, a tool, a store, a provider, a model, a placement, the
-`hub:` block, the `trace_sink:` block, the `package_registry:` block, an event
+`hub:` block, the `trace_sink:` block, the `package_registry:` block, the
+`journal:` block, an event
 source — reports every field of its resolved definition here.
 
 One field of every entry is never reported: the key the artifact repeats
@@ -328,8 +330,8 @@ Which field it is depends on what the entry is, and this is all of them:
 | a trigger | `name` |
 | a `state:` channel (§5) | `name` |
 
-The `hub:`, `trace_sink:` and `package_registry:` blocks are not in that table
-and need no row: each
+The `hub:`, `trace_sink:`, `package_registry:` and `journal:` blocks are not in
+that table and need no row: each
 is a singleton rather than an entry under a key, so nothing inside one repeats
 one. A `package_registry:` **scope** does repeat its key, as a `name` beside the
 registry it names, and it is reported inside its block rather than as a subject
@@ -522,6 +524,7 @@ Every record names its subject by an address, and the spelling is fixed:
 | the `hub:` block | `hub` |
 | the `trace_sink:` block | `trace_sink` |
 | the `package_registry:` block | `package_registry` |
+| the `journal:` block | `journal` |
 | an event source | `event_source.` and its logical name: `event_source.bug_reports` |
 | a node | the flow's address, a `.`, and the flow-local node id: `flow.review_loop.draft` |
 | an edge | the flow's address, a `.`, the source, `->`, and the target: `flow.review_loop.draft->review` |
@@ -670,10 +673,13 @@ a reason:
   resolvable specs can differ in it; the day a second ships, a bump on its own
   will read as "the same composition" until this rule is revisited, and revisiting
   it is a version bump under §12.3.
-* **`storage_backends:`** — the deploy layer's backend bindings. `plan` resolves
-  the built-in `local` target on both sides (§1), and grammar 14 makes
-  `storage_backends:` a compile error under `local` (Decision D87), so no
-  artifact this command can build carries one. The five sections `local` *does*
+* **`storage_backends:` and `journal:`** — the two deploy sections `local`
+  refuses. `plan` resolves the built-in `local` target on both sides (§1), and
+  grammar 14 makes each of them a compile error under `local` (Decisions D87,
+  D148), so no artifact this command can build carries either. Both have a
+  `component` member all the same (§4, §12.6): the vocabulary is the *format's*
+  rather than this command's, and a reader is entitled to exhaust it. The five
+  sections `local` *does*
   admit — `hub:`, `placements:`, `package_registry:`, `trace_sink:` and
   `event_sources:` — are
   compared, and appear in §4.
@@ -868,7 +874,26 @@ kind version `2` never listed is a bump rather than an addition a reader could
 have absorbed. Nothing else moved: every key, every address spelling, the
 ordering and the location rule are version `1`'s.
 
-### 12.6 How the two are held together
+### 12.6 What version `4` changed
+
+One member again, added to the same closed vocabulary: `component` gained
+`"journal"`, and §8 gained the address `journal` that goes with it. The deploy
+layer grew a section — `journal:`, which binds the backend this target's
+execution journal lives on (`docs/grammar.md` §14.7, PRD resolved q62) — and,
+like `package_registry:` before it, §12.3 makes a reader entitled to exhaust
+`component`, so a kind version `3` never listed is a bump rather than an addition
+a reader could have absorbed.
+
+The section is one the built-in `local` target **refuses**, which is what
+`storage_backends:` is and what the two sections before this one are not — so §11
+now names two sections a plan can never carry rather than one. A plan still
+reports the block, and has to: `plan` compares two specs under `local` on both
+sides, so a `journal:` in either is a refusal rather than a change, and the
+vocabulary member is what a plan built for a *named* target reports. Nothing else
+moved: every key, every address spelling, the ordering and the location rule are
+version `1`'s.
+
+### 12.7 How the two are held together
 
 `crates/compose-core/tests/plan_format_inventory.rs` reads the record types out
 of `crates/compose-core/src/plan/` and holds each of them to this file: every

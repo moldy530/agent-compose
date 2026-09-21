@@ -8,7 +8,8 @@ compositions.
 
 A deploy file is never imported. It is a document kind of its own, and the two
 kinds are disjoint — a spec file declaring `hub:`, `placements:`,
-`storage_backends:`, `package_registry:`, `trace_sink:` or `event_sources:` is an
+`storage_backends:`, `journal:`, `package_registry:`, `trace_sink:` or
+`event_sources:` is an
 error, and so is a
 deploy file declaring definitions, `imports:`, `state:`, `triggers:` or
 `defaults:`.
@@ -31,6 +32,10 @@ storage_backends:
     kv: { provider: redis, url: "${REDIS_URL}" }
   aliases:
     docs_db: { provider: chroma, url: "${CHROMA_URL}" }
+
+journal:
+  provider: postgres
+  url: ${JOURNAL_URL}
 
 package_registry:
   url: "https://npm.internal.example/repository/npm-group/"
@@ -121,10 +126,12 @@ unconditionally. Four consequences:
   it there too. `trace_sink:` is live here because a laptop's `run` settles
   executions like any other target, and `event_sources:` is reserved grammar
   carried into the IR.
-- It **must not** declare `storage_backends:`. That section is *active* grammar
-  which `local` overrides unconditionally, so the block could only be an inert
-  key whose author expected a substitution. A store that wants a real backend
-  locally is a `--target` of its own.
+- It **must not** declare `storage_backends:`, and it **must not** declare
+  `journal:`. Both are *active* grammar which `local` overrides unconditionally —
+  it substitutes local storage for every store, and it binds the SQLite journal
+  file beside the project — so either block could only be an inert key whose
+  author expected a substitution. A store that wants a real backend locally, or a
+  journal that lives on a server, is a `--target` of its own.
 - `--target <name>` for any other name **requires** `deploy/<name>.yml` to
   exist. A missing file is `io-error` naming the expected path, never a silent
   fall-back to built-ins.
@@ -196,10 +203,42 @@ results, a person's answer — it is **private recovery data with the same
 sensitivity as this project's stores**, never an observability artifact. Nothing
 uploads it and no command prints it.
 
-A distributed target will bind Postgres behind the same interface; every target
-this release can build is process-local, so every one of them binds SQLite and
-there is nothing for a deploy file to say. `docs/durability.md` is normative,
-and `docs/grammar.md` Decision D121 records why there is no grammar for it.
+### Where the journal lives is the target's to say
+
+A target binds its journal with one block, and the block is optional:
+
+```yaml
+journal:
+  provider: postgres      # sqlite | postgres | mysql
+  url: ${JOURNAL_URL}     # required by postgres and mysql; sqlite takes none
+```
+
+A target that writes nothing binds `sqlite` — the file above, beside the project
+— under **every** target, not just `local`. `postgres` and `mysql` dial a server
+instead, and their `url:` is an `${ENV}` reference and never a literal: the
+deploy file names the slot, the environment holds the credential, and `validate`
+never sees a URL. Presence is checked at launch, and the variable belongs to the
+**hub's** environment and to no worker's — the hub is the single writer, and
+workers stream their effect records home to it.
+
+What a remote journal buys is the one thing a file cannot give: the hub's record
+survives the hub's disk, so a `serve` restarted on a fresh machine recovers every
+open execution from the database. What it costs is retention — a `DELETE` rather
+than removing one file — and a decision about where those payloads live, since a
+journal holds what a trace deliberately does not.
+
+Nothing above this block changes. The record, its keys, the frontier, the
+recovery verbs and `JOURNAL_VERSION` are the same behind all three providers, and
+the runtime cannot tell which it got. A generated project carries `pg` only where
+its target binds Postgres and `mysql2` only where it binds MySQL, so the
+zero-infra local build keeps its dependency set unchanged; the emitted
+`README.md` says which journal this target bound and where it lives.
+`deploy/local.yml` may not declare the block at all: `local` binds the file
+unconditionally, so a `provider:` written there would never be consulted.
+
+`docs/durability.md` is normative — §2 for the per-backend durability contract
+and §10 for what binds what — and `docs/grammar.md` §14.7 and Decision D148 are
+the grammar.
 
 ## `storage_backends`
 
@@ -453,4 +492,4 @@ outside the list — see `agent-compose docs triggers`. What that adds to a
 the manifest a built project checks at process start, so a deployment receiving
 only the secrets its own surfaces name receives these too.
 
-Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/trace.md`, `docs/grammar.md` §14, §14.1–14.6, §15
+Normative source: `docs/durability.md`, `docs/distributed.md`, `docs/trace.md`, `docs/grammar.md` §14, §14.1–14.7, §15

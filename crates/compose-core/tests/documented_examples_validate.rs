@@ -208,8 +208,10 @@ const EXPLANATIONS_WITH_A_DEPLOY_EXAMPLE: &[&str] = &[
     "conflicting-placement",
     "conflicting-registry-credential",
     "missing-join-token",
+    "missing-journal-url",
     "missing-registry-token",
     "process-local-store",
+    "unsupported-journal-key",
     "unsupported-placement",
 ];
 

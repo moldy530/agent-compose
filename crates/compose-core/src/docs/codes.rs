@@ -162,6 +162,10 @@ pub fn explanation(code: DiagnosticCode) -> &'static str {
             include_str!("codes/conflicting-registry-credential.md")
         }
         DiagnosticCode::MissingRegistryToken => include_str!("codes/missing-registry-token.md"),
+        DiagnosticCode::MissingJournalUrl => include_str!("codes/missing-journal-url.md"),
+        DiagnosticCode::UnsupportedJournalKey => {
+            include_str!("codes/unsupported-journal-key.md")
+        }
     }
 }
 

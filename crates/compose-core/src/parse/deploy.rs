@@ -6,9 +6,9 @@ use crate::ast::common::Namespace;
 use crate::ast::definition::StoreKind;
 use crate::ast::deploy::{
     BackendAlias, BackendConfig, BackendDefault, BackendProvider, ConnectionField, EventSource,
-    EventSourceKind, EventSourcesSection, HubSection, PackageRegistryScope, PackageRegistrySection,
-    Placement, PlacementsSection, PluginEntry, PluginValue, SECRET_FIELDS, StorageBackendsSection,
-    TraceSinkFormat, TraceSinkSection,
+    EventSourceKind, EventSourcesSection, HubSection, JournalProvider, JournalSection,
+    PackageRegistryScope, PackageRegistrySection, Placement, PlacementsSection, PluginEntry,
+    PluginValue, SECRET_FIELDS, StorageBackendsSection, TraceSinkFormat, TraceSinkSection,
 };
 use crate::diag::{Diagnostic, DiagnosticCode, Span, Spanned};
 use crate::yaml::{Mapping, Node, Yaml};
@@ -1108,6 +1108,102 @@ fn one_credential_per_address(section: &PackageRegistrySection, cx: &mut Cx) {
             ),
         );
     }
+}
+
+/// The `provider:` keywords a `journal:` chooses between (grammar 14.7).
+const JOURNAL_PROVIDERS: &[(&str, JournalProvider)] = &[
+    ("sqlite", JournalProvider::Sqlite),
+    ("postgres", JournalProvider::Postgres),
+    ("mysql", JournalProvider::Mysql),
+];
+
+/// Read the `journal:` section (grammar 14.7, PRD resolved q62).
+///
+/// A closed construct like `hub:`, `trace_sink:` and `package_registry:`: both
+/// keys are this compiler's own, and an unknown one is a mistake rather than a
+/// plugin's business (Decision D50).
+///
+/// It is a **single backend config** rather than `storage_backends:`' aliases
+/// and per-kind defaults, and the asymmetry is the shape of the two things: a
+/// store is a slot a composition names with `backend:`, so the deploy layer has
+/// to answer per name, while nothing in a composition names the journal at all
+/// (PRD resolved q27 — "the composition says nothing, the target binds it").
+/// One target, one journal.
+///
+/// Two rules are decided here because each is decidable from this file alone: a
+/// provider that dials out needs the `url:` it dials, and the provider that does
+/// not takes no `url:` at all. Whether the block may be written *under this
+/// target* is the other half, and is
+/// [`resolve::target`](crate::resolve)'s — `deploy/local.yml` carries no
+/// `journal:` for the reason it carries no `storage_backends:` (Decision D87).
+pub(crate) fn journal(node: &Node, cx: &mut Cx) -> Option<JournalSection> {
+    let mapping = expect_mapping(node, "`journal`", cx)?;
+    let mut fields = Fields::new(mapping, node.span.clone(), "`journal`");
+    let provider = fields
+        .require("provider", cx)
+        .and_then(|node| lexical::keyword(node, "`journal.provider`", JOURNAL_PROVIDERS, cx));
+    let url_key = fields.span_of("url");
+    let declares_url = url_key.is_some();
+    let url = fields
+        .take("url")
+        .and_then(|node| lexical::env_ref(node, "`journal.url`", cx));
+    fields.finish(cx);
+
+    if let Some(provider) = provider.as_ref() {
+        if provider.value.opens_in_process() {
+            if let Some(key) = url_key {
+                cx.push(
+                    Diagnostic::error(
+                        DiagnosticCode::UnsupportedJournalKey,
+                        key,
+                        format!(
+                            "`journal.url` is not a key of `provider: {}`",
+                            provider.value.as_str()
+                        ),
+                    )
+                    .with_label(
+                        provider.span.clone(),
+                        format!("`{}` is bound here", provider.value.as_str()),
+                    )
+                    .with_help(SQLITE_TAKES_NO_URL),
+                );
+            }
+        } else if !declares_url {
+            // Anchored on the `provider:` that decided it rather than on the
+            // block, because that is the line the reader has to look at: the
+            // block is right and the value on that line is what made a second
+            // key required (the anchoring `missing-credential` takes).
+            cx.push(
+                Diagnostic::error(
+                    DiagnosticCode::MissingJournalUrl,
+                    provider.span.clone(),
+                    format!(
+                        "`journal` binds `provider: {}` and declares no `url:`",
+                        provider.value.as_str()
+                    ),
+                )
+                .with_help(remote_journal_needs_a_url(provider.value)),
+            );
+        }
+    }
+
+    Some(JournalSection {
+        provider,
+        url,
+        declares_url,
+        span: node.span.clone(),
+    })
+}
+
+/// What an author who wrote `url:` under `provider: sqlite` is told.
+const SQLITE_TAKES_NO_URL: &str = "a `sqlite` journal is one file beside the project's stores — `<project>/.agent-compose/journal.sqlite`, moved as a whole by `AGENT_COMPOSE_DATA_DIR` — so there is no address to dial and nothing for a `url:` to say: drop the key, or bind a provider that dials out (`postgres`, `mysql`) if this target's journal lives on a server (grammar 14.7, PRD resolved q62)";
+
+/// …and what an author who bound a remote provider and wrote no `url:` is told.
+fn remote_journal_needs_a_url(provider: JournalProvider) -> String {
+    format!(
+        "a `{}` journal is a connection rather than a file, so the deploy file names the slot and the environment holds the credential: write `url: ${{SOME_VAR}}` — an `${{ENV}}` value-form reference and never a literal, so `validate` never sees a URL — or bind `provider: sqlite`, which needs no address at all (grammar 14.7, 4.3, PRD resolved q15, q32, q62)",
+        provider.as_str()
+    )
 }
 
 /// What a `package_registry.scopes` key must look like, as a refusal's help.

@@ -229,6 +229,32 @@ pub(super) fn components(before: &Ir, after: &Ir) -> Vec<ComponentChange> {
         &[],
     );
 
+    // …and so is `journal:`, the fourth block of one address (grammar 14.7, PRD
+    // resolved q62). Compared under `local` like the other three `local` admits
+    // — unlike `storage_backends:`, which `local` refuses outright — so that a
+    // deployment which moved its journal onto a server, or off one, is a change
+    // a plan reports rather than a silent difference in where an execution's
+    // record survives. An **absent** block compares as absent rather than as
+    // `provider: sqlite`: the two are the same binding and a plan that said
+    // nothing changed would be right, but the artifact records which was
+    // written, and a reader diffing two deploy files sees the key appear.
+    entry(
+        &mut found,
+        ComponentKind::Journal,
+        "journal",
+        before
+            .deploy
+            .journal
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        after
+            .deploy
+            .journal
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        &[],
+    );
+
     let sources: BTreeSet<&str> = names(before.deploy.event_sources.as_ref())
         .chain(names(after.deploy.event_sources.as_ref()))
         .collect();

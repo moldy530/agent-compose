@@ -25,7 +25,7 @@ use crate::diag::{Diagnostic, DiagnosticCode, Severity, Span};
 /// changes for reasons of its own. It is the first key of the document, so a
 /// consumer can dispatch on it before reading anything else, and a consumer that
 /// does not know a version must refuse the document rather than guess.
-pub const PLAN_VERSION: u32 = 3;
+pub const PLAN_VERSION: u32 = 4;
 
 /// One plan: what changed between two resolved compositions.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -143,6 +143,8 @@ pub enum ComponentKind {
     TraceSink,
     /// The active target's `package_registry:` block.
     PackageRegistry,
+    /// The active target's `journal:` block.
+    Journal,
     /// An entry of the active target's `event_sources:`.
     EventSource,
 }

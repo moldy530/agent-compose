@@ -9,10 +9,18 @@
 //! so SQLite is what every project gets and the composition says nothing about
 //! it (`docs/durability.md` §10).
 //!
-//! It is a **constant**, like [`super::runtime`], [`super::cel`] and
-//! [`super::stores`]: byte-identical in every project this compiler release
-//! builds, edited as TypeScript in the compiler's own tree
-//! (`src/codegen/js/journal.ts`) rather than as a Rust string literal.
+//! It is **assembled** the way [`super::harness`] is, and for that module's
+//! reason: an invariant half that is byte-identical in every project this
+//! compiler release builds, plus the arm the target's `journal:` bound
+//! (grammar §14.7, PRD resolved q62). A project whose target says nothing, or
+//! says `provider: sqlite`, gets the invariant half alone — the same bytes every
+//! project has always had — and neither the network driver nor the code that
+//! would import one. That is "emit only the drivers a composition uses", read
+//! one construct along from the harness SDKs.
+//!
+//! Every half is edited as TypeScript in the compiler's own tree
+//! (`src/codegen/js/journal.ts`, `journal-postgres.ts`, `journal-mysql.ts`)
+//! rather than as a Rust string literal.
 //!
 //! # Why it is a module of its own
 //!
@@ -30,16 +38,81 @@
 //! keying discipline have different sensitivity is better served by two files
 //! than by one file with a rule in the middle of it.
 
+use crate::ast::deploy::JournalProvider;
 use crate::ir::Ir;
+use crate::ir::deploy::journal_of;
 
-/// The journal's source, carried in the compiler and emitted verbatim.
+/// The invariant half: the record, the keys, the statements, and the SQLite arm.
 const SOURCE: &str = include_str!("js/journal.ts");
+
+/// The Postgres arm, emitted where the target binds one.
+const POSTGRES: &str = include_str!("js/journal-postgres.ts");
+
+/// …and the MySQL arm.
+const MYSQL: &str = include_str!("js/journal-mysql.ts");
+
+/// The driver each remote provider is reached through, pinned exactly.
+///
+/// The discipline [`super::project::PINS`] and [`super::harness::HARNESS_PINS`]
+/// are under, for their reason: what a journal does is what a compiled graph
+/// survives, so a release that let a driver float would change that with no
+/// commit saying so (PRD §9.18, §5.12).
+///
+/// `@types/pg` is in the list because `pg` ships no types of its own and this
+/// project type-checks under `strict`; it is a **development** pin, which
+/// [`development_pins_of`] is what separates out. `mysql2` ships its own, so its
+/// row is one entry long.
+pub const JOURNAL_PINS: &[(JournalProvider, &[(&str, &str)])] = &[
+    (JournalProvider::Postgres, &[("pg", "8.23.0")]),
+    (JournalProvider::Mysql, &[("mysql2", "3.24.4")]),
+];
+
+/// The development dependencies one remote provider brings, pinned.
+///
+/// Only Postgres has any, and only because `pg` publishes no type declarations:
+/// a `tsc --noEmit` over a project that imports it would fail on the import
+/// rather than on anything this compiler emitted.
+pub const JOURNAL_DEV_PINS: &[(JournalProvider, &[(&str, &str)])] =
+    &[(JournalProvider::Postgres, &[("@types/pg", "8.23.1")])];
+
+/// The packages one provider's arm brings, pinned — empty for `sqlite`, whose
+/// driver `./stores.ts` already pins for every project.
+#[must_use]
+pub fn pins_of(provider: JournalProvider) -> &'static [(&'static str, &'static str)] {
+    JOURNAL_PINS
+        .iter()
+        .find(|(held, _)| *held == provider)
+        .map_or(&[], |(_, pins)| *pins)
+}
+
+/// …and the development ones.
+#[must_use]
+pub fn development_pins_of(provider: JournalProvider) -> &'static [(&'static str, &'static str)] {
+    JOURNAL_DEV_PINS
+        .iter()
+        .find(|(held, _)| *held == provider)
+        .map_or(&[], |(_, pins)| *pins)
+}
 
 /// `src/journal.ts`.
 #[must_use]
 pub fn module(ir: &Ir) -> super::GeneratedFile {
     let mut contents = super::header(ir, "// ");
     contents.push_str(SOURCE);
+    // The arm the target bound, appended. It assigns itself into `BACKENDS`,
+    // which is what makes the dispatch in the invariant half above a lookup
+    // rather than a `switch` naming providers this project has no driver for.
+    match journal_of(ir) {
+        JournalProvider::Sqlite => {}
+        JournalProvider::Postgres => {
+            contents.push('\n');
+            contents.push_str(POSTGRES);
+        }
+        JournalProvider::Mysql => {
+            contents.push('\n');
+            contents.push_str(MYSQL);
+        }
+    }
     super::GeneratedFile {
         path: "src/journal.ts".to_string(),
         contents,

@@ -5,7 +5,7 @@ use crate::diag::{SourceName, Span, Spanned};
 use super::common::Ident;
 use super::definition::Definition;
 use super::deploy::{
-    EventSourcesSection, HubSection, PackageRegistrySection, PlacementsSection,
+    EventSourcesSection, HubSection, JournalSection, PackageRegistrySection, PlacementsSection,
     StorageBackendsSection, TraceSinkSection,
 };
 use super::policy::PolicyBlock;
@@ -20,7 +20,7 @@ pub enum DocumentKind {
     /// `state`, `triggers`.
     Spec,
     /// A deploy file: `version` plus `hub`, `placements`, `storage_backends`,
-    /// `package_registry`, `trace_sink`, `event_sources`.
+    /// `journal`, `package_registry`, `trace_sink`, `event_sources`.
     Deploy,
 }
 
@@ -134,6 +134,9 @@ pub struct DeployFile {
     pub hub: Option<HubSection>,
     /// `storage_backends:`
     pub storage_backends: Option<StorageBackendsSection>,
+    /// `journal:` — which backend this target's execution journal binds
+    /// (grammar 14.7).
+    pub journal: Option<JournalSection>,
     /// `package_registry:` — where this target's installer resolves packages
     /// from (grammar 14.6).
     pub package_registry: Option<PackageRegistrySection>,
@@ -258,6 +261,7 @@ pub const DEPLOY_SECTIONS: &[&str] = &[
     "hub",
     "placements",
     "storage_backends",
+    "journal",
     "package_registry",
     "trace_sink",
     "event_sources",
