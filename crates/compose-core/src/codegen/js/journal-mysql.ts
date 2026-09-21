@@ -309,6 +309,24 @@ class MysqlDriver implements JournalDriver {
  * session says so rather than assuming it. Both modes are appended to whatever
  * the server has: nothing an operator configured is dropped.
  *
+ * **`NO_BACKSLASH_ESCAPES` is cleared, and that one is removed rather than
+ * added because every parameter this arm binds is escaped on the *client*.**
+ * [`MysqlDriver`] runs `connection.query(sql, params)`, and `mysql2`'s `query`
+ * — unlike `execute` — interpolates the parameters itself with `SqlString`,
+ * which spells a quote `\'` and a backslash `\\`. Those are escapes only while
+ * the server reads a backslash as one. On a server carrying the mode they are
+ * literal bytes, so a payload with an apostrophe in it — a model answer, a tool
+ * result, a `human` answer — ends its own string literal early and the `INSERT`
+ * is refused mid-run, while a payload with only double quotes (which is every
+ * JSON payload this journal writes) is *stored* with its backslashes and throws
+ * in the `JSON.parse` on replay. The mode is the same class of server-side
+ * surprise as the two above and gets the same answer: state it on the session
+ * rather than assume it. Clearing is why the statement is more than a
+ * `CONCAT_WS`: a mode dropped out of the middle of the list by a plain
+ * `REPLACE` leaves the doubled comma — the empty mode name MySQL refuses — so
+ * the list is wrapped in commas, the member is taken out comma and all, and the
+ * wrapping is trimmed back off.
+ *
  * `GET_LOCK(name, 0)` rather than a timeout: a second opener is told what is
  * happening ([`guardHeld`]) rather than left blocking on a connection that may
  * be a `serve` which will hold it for days. The name is [`MYSQL_GUARD_NAME`],
@@ -355,8 +373,17 @@ async function openMysql(): Promise<JournalDriver> {
     // into the `NULL` `CONCAT_WS` skips. A mode the server already has is named
     // twice and collapses: `sql_mode` is a `SET`, so a repeated member is one
     // bit set twice.
+    //
+    // The `REPLACE` is the other direction — `NO_BACKSLASH_ESCAPES` taken out
+    // rather than a mode put in — and it is comma-wrapped for the same reason
+    // `CONCAT_WS` is used at all: a member removed from the middle of the list
+    // by a bare `REPLACE` leaves `A,,B`, which is that same empty mode name.
+    // Wrapping the whole list in commas makes every member `,NAME,`, so one is
+    // taken out with its separator, and `TRIM` puts the list back.
     await connection.query(
-      "SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@sql_mode, ''), 'ANSI_QUOTES', 'STRICT_TRANS_TABLES')",
+      "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', " +
+        "CONCAT_WS(',', NULLIF(@@sql_mode, ''), 'ANSI_QUOTES', 'STRICT_TRANS_TABLES')" +
+        ", ','), ',NO_BACKSLASH_ESCAPES,', ','))",
     );
     // Best effort, and said out loud where it does not take: see
     // [`guardWindowUnshortened`].

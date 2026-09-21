@@ -340,6 +340,59 @@ mod tests {
         );
     }
 
+    /// **The mode that would break the escaping this arm's parameters are bound
+    /// with is cleared, not assumed absent** (`docs/durability.md` §10).
+    ///
+    /// [`MysqlDriver`] runs every statement as `connection.query(sql, params)`,
+    /// and `mysql2`'s `query` — unlike its `execute` — interpolates the
+    /// parameters on the **client**, with `SqlString`: a quote becomes `\'` and
+    /// a backslash `\\`. Those are escapes only while the server reads a
+    /// backslash as one, and `NO_BACKSLASH_ESCAPES` is the mode that says it
+    /// does not. On a server carrying it, an apostrophe in a payload ends its
+    /// own string literal and the `INSERT` is refused mid-run, while a payload
+    /// with only double quotes — every JSON payload this journal writes — is
+    /// stored with literal backslashes and throws in the `JSON.parse` on
+    /// replay.
+    ///
+    /// A drift test for `mysql_sets_the_strict_mode_its_column_bounds_rest_on`'s
+    /// reason exactly: CI's server ships the default `sql_mode`, so no case run
+    /// against a real database can see the mode set, and the servers that do set
+    /// it are the ones nobody runs this suite against. The comma-wrapping is
+    /// asserted with it, because a bare `REPLACE` of the member would leave the
+    /// doubled comma MySQL refuses and turn a correctness fix into an open that
+    /// fails on every server carrying the mode.
+    #[test]
+    fn mysql_clears_the_mode_that_would_break_its_client_side_escaping() {
+        let opening = function_code(MYSQL, "openMysql");
+        assert!(
+            opening.contains("SET SESSION sql_mode") && opening.contains("NO_BACKSLASH_ESCAPES"),
+            "`openMysql` no longer clears `NO_BACKSLASH_ESCAPES` on its session, so on a server \
+             carrying that mode the client-side escaping every bound parameter goes through \
+             either ends a payload's string literal early or stores the backslashes it wrote \
+             (`docs/durability.md` §10)"
+        );
+        assert!(
+            opening.contains("',NO_BACKSLASH_ESCAPES,'") && opening.contains("TRIM"),
+            "the mode is taken out of the list without its separator, so a server that carries \
+             it in the middle of its `sql_mode` is sent `A,,B` — the empty mode name the \
+             `CONCAT_WS` beside it exists to avoid, and an open refused on exactly the servers \
+             this clearing is for"
+        );
+        // …and the other half of the pairing: the escaping is the client's
+        // because the parameters are interpolated rather than bound server-side.
+        // A driver that moved to `execute` would bind them on the server and
+        // need none of this. Read off the module's code rather than off one
+        // function, because `all` and `run` are a class's methods and the reader
+        // above takes top-level declarations.
+        let driver = code(MYSQL);
+        assert!(
+            driver.contains("(sql, [...parameters])") && !driver.contains(".execute("),
+            "the MySQL driver no longer interpolates its parameters client-side, which is the \
+             reason the session clears `NO_BACKSLASH_ESCAPES` above — state the new pairing \
+             here rather than leaving this test asserting a setting nothing rests on"
+        );
+    }
+
     /// **Every column a statement compares carries a binary collation**, and the
     /// one a reader would not look for is `dispatches.session`.
     ///

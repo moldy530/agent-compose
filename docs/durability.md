@@ -1531,6 +1531,15 @@ it on, a managed or legacy server with `sql_mode=''` does not, and a truncated
 `effects.key` would be two effects collapsing onto one primary key and a replay
 handing the first one's answer back at the second one's site.
 
+**The same session clears `NO_BACKSLASH_ESCAPES`**, which is the mode in the
+other direction: the arm binds its parameters through `mysql2`'s `query`, which
+escapes them on the client with backslashes, so a server that reads a backslash
+as an ordinary character would refuse any payload carrying an apostrophe and
+store every JSON payload with its escapes left in — a write refused mid-run on
+one backend, or a `JSON.parse` that throws on replay. Both directions are the
+one rule: a session setting this journal's statements rest on is stated by the
+arm rather than assumed of the server.
+
 Key ordering and case sensitivity are stated per backend in the same place:
 SQLite's `BINARY`, Postgres' `COLLATE "C"`, MySQL's `ascii_bin`, all of which
 make §4's key order the order a reader derives. That binding covers every column

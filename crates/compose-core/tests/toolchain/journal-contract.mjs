@@ -265,12 +265,25 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
 
   // 8. **The dispatch board**, whose park order breaks ties by insertion rather
   //    than by the millisecond two rows share (`docs/distributed.md` §6.2).
+  //
+  //    The handles are minted under this run's execution, the way a hub mints
+  //    them — the schema calls a dispatch id "a random handle the issuing hub
+  //    owns" (§10.1) and every verb that takes one keys on `dispatches.id`
+  //    **journal-globally**: `dispatchOf` selects on it alone, `claimDispatch`
+  //    and `settleDispatch` update on it alone. A fixed `dsp_1` would therefore
+  //    be the *same row set* on every run against a server that keeps its
+  //    journal — and the second run's `settleDispatch` would read the first
+  //    run's already-settled row and answer `false`, reporting
+  //    `a_settle_answers_once` as a backend failure that is this runner's own
+  //    bookkeeping. The executions are unique per run for the same reason; the
+  //    dispatch ids have to be too.
+  const dispatch = (name) => `dsp_${name}_${execution.slice("exec_".length)}`;
   const parkedAt = new Date().toISOString();
   for (const index of [0, 1, 2, 10, 11]) {
     await handle.park({
       execution,
       wait: `map/0/${index}`,
-      id: `dsp_${index}`,
+      id: dispatch(index),
       placement: "gpu",
       node: "flow.review.embed",
       site: `map/0/${index}`,
@@ -288,7 +301,7 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
   const reparked = await handle.park({
     execution,
     wait: "map/0/0",
-    id: "dsp_other",
+    id: dispatch("other"),
     placement: "gpu",
     node: "flow.review.embed",
     site: "map/0/0",
@@ -296,29 +309,30 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
     status: "parked",
     parkedAt: new Date().toISOString(),
   });
-  results.park_is_idempotent = reparked.id === "dsp_0";
+  results.park_is_idempotent = reparked.id === dispatch(0);
   results.a_claim_hands_the_row_over =
-    (await handle.claimDispatch("dsp_1", "session-a"))?.session === "session-a";
+    (await handle.claimDispatch(dispatch(1), "session-a"))?.session === "session-a";
   results.a_second_claim_takes_nothing =
-    (await handle.claimDispatch("dsp_1", "session-b")) === undefined;
+    (await handle.claimDispatch(dispatch(1), "session-b")) === undefined;
   // …and a release is the **holder's** alone. This one is a collation case as
   // much as a predicate case: `releaseDispatch` compares the session **in SQL**,
   // so the column's collation is what decides it, and on a case-insensitive one
   // — MySQL's own table default — a worker whose id differed from the holder's
   // only in case would put another worker's in-flight work back on the board
   // (§3.8, §10).
-  await handle.claimDispatch("dsp_2", "session-a");
+  await handle.claimDispatch(dispatch(2), "session-a");
   results.a_release_by_another_session_takes_nothing =
-    (await handle.releaseDispatch("dsp_2", "SESSION-A")) === false &&
-    (await handle.dispatchOf("dsp_2"))?.status === "dispatched";
+    (await handle.releaseDispatch(dispatch(2), "SESSION-A")) === false &&
+    (await handle.dispatchOf(dispatch(2)))?.status === "dispatched";
   results.a_release_by_the_holder_parks_it_again =
-    (await handle.releaseDispatch("dsp_2", "session-a")) === true &&
-    (await handle.dispatchOf("dsp_2"))?.status === "parked";
+    (await handle.releaseDispatch(dispatch(2), "session-a")) === true &&
+    (await handle.dispatchOf(dispatch(2)))?.status === "parked";
   results.a_settle_answers_once =
-    (await handle.settleDispatch("dsp_1", { kind: "value", value: { ok: UNICODE } })) === true &&
-    (await handle.settleDispatch("dsp_1", { kind: "value", value: { ok: "again" } })) === false;
+    (await handle.settleDispatch(dispatch(1), { kind: "value", value: { ok: UNICODE } })) ===
+      true &&
+    (await handle.settleDispatch(dispatch(1), { kind: "value", value: { ok: "again" } })) === false;
   results.a_settled_dispatch_keeps_its_outcome =
-    (await handle.dispatchOf("dsp_1"))?.outcome?.value?.ok === UNICODE;
+    (await handle.dispatchOf(dispatch(1)))?.outcome?.value?.ok === UNICODE;
 } finally {
   // Always, and before the writer guard's own case below: a connection left open
   // is a lock the next opener meets.

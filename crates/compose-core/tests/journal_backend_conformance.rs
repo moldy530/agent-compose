@@ -120,10 +120,21 @@ const JOURNAL_URL: &str = "AGENT_COMPOSE_JOURNAL_URL";
 
 /// Build one project whose target binds `provider`, and answer where it landed.
 fn built(root: &Path, provider: &str) -> PathBuf {
+    built_in(root, provider, provider)
+}
+
+/// …in a scratch area of its own, which is what lets a second test build one.
+///
+/// The area is the directory name rather than the provider because libtest runs
+/// the tests of one binary in **parallel threads**: two tests both building the
+/// SQLite project under `projects/journal/sqlite` would be one
+/// `remove_dir_all` racing the other's `bun` — a flake that would read as the
+/// emitted project being broken.
+fn built_in(root: &Path, provider: &str, area: &str) -> PathBuf {
     // Under `projects/`, which `.gitignore` already covers: everything this
     // suite writes is scratch, and a fixture left in the working tree would be a
     // composition nobody authored turning up as an untracked file.
-    let source = root.join("projects").join("journal-sources").join(provider);
+    let source = root.join("projects").join("journal-sources").join(area);
     let _ = fs::remove_dir_all(&source);
     fs::create_dir_all(source.join("deploy")).expect("the scratch area is writable");
     fs::write(source.join("main.yml"), COMPOSITION).expect("the entrypoint is writable");
@@ -155,7 +166,7 @@ fn built(root: &Path, provider: &str) -> PathBuf {
 
     let authored = compose_core::Authored::read(&ir, &source)
         .expect("the fixture references no module binding");
-    let destination = root.join("projects").join("journal").join(provider);
+    let destination = root.join("projects").join("journal").join(area);
     let _ = fs::remove_dir_all(&destination);
     for file in compose_core::emit(&ir, &authored).files() {
         let target = destination.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -428,6 +439,61 @@ fn every_journal_backend_answers_the_same_contract() {
         "note: the journal contract ran against {driven:?}; every backend was built and \
          type-checked"
     ));
+}
+
+/// **The contract runs the same against a journal it has already written.**
+///
+/// The suite builds a fresh project for every run and CI's service containers
+/// are fresh too, so nothing else here ever meets a journal that already holds
+/// rows — while the developer the skip notice invites to "set it locally"
+/// points `AGENT_COMPOSE_TEST_POSTGRES_URL` at a server that keeps them, and
+/// the runner's own bookkeeping is what decides whether their second run reads
+/// as a backend failure.
+///
+/// It is bookkeeping rather than contract because a dispatch id is
+/// journal-**global**: `dispatchOf` selects on `dispatches.id` alone and
+/// `claimDispatch` and `settleDispatch` update on it alone (`docs/durability.md`
+/// §3.8), which is exactly right for what the schema calls "a random handle the
+/// issuing hub owns" and exactly wrong for a fixed `dsp_1` re-parked by every
+/// run. A settled row from last run under the id this run just parked makes
+/// `a_settle_answers_once` answer `false` — a named case failing, with the
+/// provider in the message, for a reason that is not the provider's.
+///
+/// Driven on SQLite because it is the arm that needs no server, and the
+/// statements under test are the shared ones: what this pins is the runner.
+#[test]
+fn the_contract_is_re_runnable_against_a_journal_it_already_wrote() {
+    let Some(root) = installed() else {
+        return;
+    };
+    // A scratch area of its own — see [`built_in`]: the sibling above is
+    // building the SQLite project on another thread while this runs.
+    let project = built_in(root, "sqlite", "sqlite-twice");
+    for pass in ["first", "second"] {
+        let output = runner("journal-contract.mjs")
+            .arg(&project)
+            .output()
+            .expect("bun runs");
+        assert!(
+            output.status.success(),
+            "the {pass} run of the contract against one SQLite journal did not answer:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let answered: BTreeMap<String, Value> =
+            serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+        for case in TRUE_EVERYWHERE {
+            assert_eq!(
+                answered.get(*case).and_then(Value::as_bool),
+                Some(true),
+                "the {pass} run of the contract against one journal fails `{case}`, so the \
+                 suite carries state between runs: a developer who pointed \
+                 `AGENT_COMPOSE_TEST_POSTGRES_URL` or `AGENT_COMPOSE_TEST_MYSQL_URL` at a \
+                 server of their own would see their second run report a backend failure that \
+                 is this runner's bookkeeping. Every row a case keys on journal-globally has \
+                 to be minted per run: {answered:#?}"
+            );
+        }
+    }
 }
 
 /// **The runner and the module name one writer guard.**
