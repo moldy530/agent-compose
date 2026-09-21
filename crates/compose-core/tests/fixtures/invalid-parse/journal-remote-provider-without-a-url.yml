@@ -1,0 +1,12 @@
+# rule: a `journal:` binding a provider that dials out declares `url:` (grammar 14.7)
+# code: missing-journal-url
+# message: `journal` binds `provider: postgres` and declares no `url:`
+# at: 12:13
+# help: a `postgres` journal is a connection rather than a file, so the deploy file names the slot and the environment holds the credential: write `url: ${SOME_VAR}` — an `${ENV}` value-form reference and never a literal, so `validate` never sees a URL — or bind `provider: sqlite`, which needs no address at all (grammar 14.7, 4.3, PRD resolved q15, q32, q62)
+version: "0.1"
+
+# A journal on a server is a connection rather than a file, so the address is the
+# whole of what the deploy file has to say — and a block that binds the provider
+# without it names a server nobody wrote down.
+journal:
+  provider: postgres

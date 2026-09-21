@@ -200,7 +200,13 @@ async function openMysql(): Promise<JournalDriver> {
     bigNumberStrings: true,
   });
   try {
-    await connection.query("SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')");
+    // `CONCAT_WS` rather than `CONCAT`, because a server whose `sql_mode` is
+    // empty would otherwise be handed a list with a leading comma — an empty
+    // mode name, which MySQL refuses. `NULLIF` is what turns the empty string
+    // into the `NULL` `CONCAT_WS` skips.
+    await connection.query(
+      "SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@sql_mode, ''), 'ANSI_QUOTES')",
+    );
     for (const statement of MYSQL_SCHEMA) await connection.query(statement);
     const [rows] = await connection.query<RowDataPacket[]>("SELECT GET_LOCK(?, 0) AS taken", [
       WRITER_GUARD,

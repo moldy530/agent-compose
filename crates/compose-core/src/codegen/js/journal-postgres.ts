@@ -175,8 +175,9 @@ async function openPostgres(): Promise<JournalDriver> {
   await client.connect();
   try {
     await client.query(POSTGRES_SCHEMA);
-    const guard = await client.query("SELECT pg_try_advisory_lock($1) AS taken", [
-      String(WRITER_GUARD_KEY),
+    const guard = await client.query("SELECT pg_try_advisory_lock($1, $2) AS taken", [
+      WRITER_GUARD_KEYS[0],
+      WRITER_GUARD_KEYS[1],
     ]);
     const taken = (guard.rows[0] as { taken?: unknown } | undefined)?.taken;
     if (taken !== true) throw guardHeld();

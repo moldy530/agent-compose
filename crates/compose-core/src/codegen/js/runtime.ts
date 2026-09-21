@@ -105,6 +105,7 @@ import type {
   DeliveryRecord,
   DeliveryStatus,
   EffectRecorder,
+  EffectSlot,
   ExecutionRow,
   Journal,
 } from "./journal.ts";
@@ -12764,69 +12765,73 @@ export async function runHuman(
       announce(wait.execution);
       if (outcome === "resumed") {
         const ended = stopped(outcome);
-        let kept: Extract<JournaledWait, { settled: "resumed" }> | undefined;
-        try {
-          kept = slot?.keep({
-            ...instants,
-            settled: "resumed",
-            output: value,
-            settledAt: ended.settledAt,
-          } satisfies JournaledWait) as Extract<JournaledWait, { settled: "resumed" }> | undefined;
-        } catch (error) {
-          // **The parked promise is what a write failure leaves through**, and
-          // that is the whole of why the record is written inside a `try` here
-          // rather than beside every other `keep` in this file. The wait is
-          // already marked settled above — it has to be, or the answer and the
-          // expiry could both land — so a throw that escaped `settle`
-          // would leave a wait nothing may settle again holding a promise
-          // nothing ever settles: [`closeHumanWaits`] and [`releaseHumanWaits`]
-          // both skip a settled entry, a later [`deliverHumanAnswer`] refuses
-          // it, and the `human` node's `await` never returns. The run does not
-          // fail, does not park and does not end — it hangs, which is the one
-          // outcome a durable execution has no way back from.
-          //
-          // So the failure travels as the node's: the journal could not record
-          // what the person said, and a run that went on from a wait its own
-          // record does not hold is a run whose resume would ask them again
-          // (`docs/durability.md` §3.4).
-          reject(error);
-          return true;
-        }
-        // What the journal now holds, where it holds anything, for [`callModel`]'s
-        // reason: the answer a person gave is a value the rest of the graph reads
-        // and a later effect's identity may be built out of, so both generations
-        // are handed the same one (`docs/durability.md` §11.1).
-        resolve({
-          output: kept === undefined ? value : kept.output,
-          human: { ...opened, ...ended },
-        });
+        // **The record goes down before the promise resolves**, which is what
+        // keeps a run from going on out of a wait its own journal does not hold
+        // — a run whose resume would ask the person again
+        // (`docs/durability.md` §3.4). `keep` answers a promise, so the resolve
+        // is *chained onto* it rather than written after it: `settle` itself
+        // stays synchronous, because its caller reads the `boolean` it answers
+        // to decide whether this call was the one that settled the wait.
+        //
+        // **The parked promise is what a write failure leaves through**, and
+        // that is the whole of why this arm has a rejection handler at all
+        // rather than letting one travel. The wait is already marked settled
+        // above — it has to be, or the answer and the expiry could both land —
+        // so a failure nothing caught would leave a wait nothing may settle
+        // again holding a promise nothing ever settles: [`closeHumanWaits`] and
+        // [`releaseHumanWaits`] both skip a settled entry, a later
+        // [`deliverHumanAnswer`] refuses it, and the `human` node's `await`
+        // never returns. The run does not fail, does not park and does not end —
+        // it hangs, which is the one outcome a durable execution has no way back
+        // from. So the failure travels as the node's instead.
+        void kept(slot, {
+          ...instants,
+          settled: "resumed",
+          output: value,
+          settledAt: ended.settledAt,
+        }).then(
+          // What the journal now holds, where it holds anything, for
+          // [`callModel`]'s reason: the answer a person gave is a value the rest
+          // of the graph reads and a later effect's identity may be built out
+          // of, so both generations are handed the same one
+          // (`docs/durability.md` §11.1).
+          (held) => {
+            resolve({
+              output:
+                held === undefined
+                  ? value
+                  : (held as Extract<JournaledWait, { settled: "resumed" }>).output,
+              human: { ...opened, ...ended },
+            });
+          },
+          (error: unknown) => reject(error),
+        );
       } else if (outcome === "expired") {
         const ended = stopped(outcome);
-        try {
-          slot?.keep({
-            ...instants,
-            settled: "expired",
-            settledAt: ended.settledAt,
-          } satisfies JournaledWait);
-        } catch (error) {
-          // The same rule on the other settlement, and the arm where escaping
-          // would cost more: this one is reached from a `setTimeout` callback,
-          // where a throw is an uncaught exception rather than something a
-          // caller could report. The expiry is not routed either — a run that
-          // took `on_timeout:` past a wait whose expiry the journal does not
-          // hold would re-park on the resume and spend the budget again.
-          reject(error);
-          return true;
-        }
-        reject(
-          new HumanExpiry(
-            descriptor.flow,
-            descriptor.node,
-            id,
-            descriptor.timeoutMs ?? 0,
-            descriptor.onTimeout ?? END_NODE,
-            { ...opened, ...ended },
-          ),
+        // The same rule on the other settlement, and the arm where a failure
+        // escaping would cost more: this one is reached from a `setTimeout`
+        // callback, where a throw is an uncaught exception rather than something
+        // a caller could report. The expiry is not routed either — a run that
+        // took `on_timeout:` past a wait whose expiry the journal does not hold
+        // would re-park on the resume and spend the budget again.
+        void kept(slot, {
+          ...instants,
+          settled: "expired",
+          settledAt: ended.settledAt,
+        }).then(
+          () => {
+            reject(
+              new HumanExpiry(
+                descriptor.flow,
+                descriptor.node,
+                id,
+                descriptor.timeoutMs ?? 0,
+                descriptor.onTimeout ?? END_NODE,
+                { ...opened, ...ended },
+              ),
+            );
+          },
+          (error: unknown) => reject(error),
         );
       } else if (outcome === "interrupted") {
         // The answer surface went away while this pause was open, which is the
@@ -12861,6 +12866,25 @@ export async function runHuman(
       }
     }
   });
+}
+
+/**
+ * Write one settled wait into the journal, where there is a slot to write it
+ * into.
+ *
+ * The one seam both settlements of [`runHuman`] go through, and it exists
+ * because `settle` is **synchronous** — its caller reads the `boolean` it
+ * answers to decide whether this call was the one that settled the wait — while
+ * the write beneath it is not. So the promise is handed back for the arm to
+ * chain its own ending onto, and a slot that is absent answers `undefined`
+ * rather than making every caller ask.
+ */
+function kept(
+  slot: EffectSlot | undefined,
+  settled: JournaledWait,
+): Promise<JournaledWait | undefined> {
+  if (slot === undefined) return Promise.resolve(undefined);
+  return slot.keep(settled) as Promise<JournaledWait>;
 }
 
 /**
@@ -12950,7 +12974,7 @@ export async function runHuman(
 export async function holdRemotePause(
   execution: string,
   remote: RemotePause,
-  keep: (settled: JournaledWait) => void,
+  keep: (settled: JournaledWait) => Promise<void>,
 ): Promise<JournaledWait> {
   const address = `${remote.flow}.${remote.node}`;
   const descriptor = humanNodes.get(address);
@@ -13052,20 +13076,18 @@ export async function holdRemotePause(
                 settledAt: stopped(outcome).settledAt,
               }
             : { ...instants, settled: "expired", settledAt: stopped(outcome).settledAt };
-        try {
-          keep(settled);
-        } catch (error) {
-          // [`runHuman`]'s rule at its own `slot.keep`, which this arm is the
-          // other half of: the wait is already marked settled, so a throw that
-          // escaped would leave a promise nothing can ever settle and a node
-          // that never returns. It travels as the node's failure instead — the
-          // journal could not record what the person said, and a run that went
-          // on from a wait its own record does not hold is one whose resume
-          // would ask them again.
-          reject(error);
-          return true;
-        }
-        resolve(settled);
+        // [`runHuman`]'s rule at its own `slot.keep`, which this arm is the
+        // other half of, and chained rather than awaited for that function's
+        // reason: `settle` answers a `boolean` its caller reads. The wait is
+        // already marked settled, so a failure nothing caught would leave a
+        // promise nothing can ever settle and a node that never returns. It
+        // travels as the node's failure instead — the journal could not record
+        // what the person said, and a run that went on from a wait its own
+        // record does not hold is one whose resume would ask them again.
+        void keep(settled).then(
+          () => resolve(settled),
+          (error: unknown) => reject(error),
+        );
       } else if (outcome === "interrupted") {
         reject(new HumanInterrupt(remote.flow, remote.node, remote.wait, opened));
       } else {

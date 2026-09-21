@@ -111,6 +111,7 @@ import type {
   DeliveryRecord,
   DeliveryStatus,
   EffectRecorder,
+  EffectSlot,
   ExecutionRow,
   Journal,
 } from "./journal.ts";
@@ -119,10 +120,13 @@ export {
   JOURNAL_VERSION,
   ReplayDivergence,
   canonical,
+  journalBinding,
   journalExists,
+  journalLocation,
   journalPath,
   latchedDivergence,
   openJournal,
+  releaseJournal,
 } from "./journal.ts";
 export type {
   CallbackIntent,
@@ -135,6 +139,8 @@ export type {
   EffectKind,
   ExecutionRow,
   Journal,
+  JournalBinding,
+  JournalProvider,
   JournalRecord,
 } from "./journal.ts";
 
@@ -2116,7 +2122,7 @@ export async function callModel(
   // — an older journal still replays, and `JOURNAL_VERSION` does not move
   // (`docs/durability.md` §11.2, §11.3).
   const suites = ladder(selection).map((member) => member.provider.serverTools ?? []);
-  const slot = recorder.claim("model", {
+  const slot = await recorder.claim("model", {
     model: selection.address,
     system: request.system,
     turns: request.turns,
@@ -2165,19 +2171,19 @@ export async function callModel(
     // carries it verbatim — so a generation that went on with a differently
     // ordered copy of it would be reported as divergent by its own successor
     // (`docs/durability.md` §11.1).
-    const kept = slot.keep({
+    const kept = (await slot.keep({
       ok: true,
       answer: result.answer,
       served: result.served,
       calls: filed(),
-    } satisfies JournaledCall) as Extract<JournaledCall, { ok: true }>;
+    } satisfies JournaledCall)) as Extract<JournaledCall, { ok: true }>;
     return { answer: kept.answer, served: result.served };
   } catch (error) {
     // Kept as a **value** rather than through the slot's error path, because a
     // spent ladder is more than its message: the records it filed are what a
     // reader of the failed node's entry reads, and they have to survive into
     // the resumed generation's trace with it.
-    slot.keep({
+    await slot.keep({
       ok: false,
       error: { name: nameOf(error), message: messageOf(error) },
       calls: filed(),
@@ -12646,7 +12652,11 @@ export async function runHuman(
   // answered. The journal is where it goes, because a replay that re-asked a
   // question somebody has already answered would be a durability story that
   // asks the human to do the work twice (`docs/durability.md` §3.4).
-  const slot = context.effects?.claim("human", { wait: id, node: descriptor.node, shown });
+  const slot = await context.effects?.claim("human", {
+    wait: id,
+    node: descriptor.node,
+    shown,
+  });
   if (slot?.held !== undefined) {
     if (slot.held.kind === "error") throw replayedFailure(slot.held);
     const held = slot.held.value as JournaledWait;
@@ -12761,69 +12771,73 @@ export async function runHuman(
       announce(wait.execution);
       if (outcome === "resumed") {
         const ended = stopped(outcome);
-        let kept: Extract<JournaledWait, { settled: "resumed" }> | undefined;
-        try {
-          kept = slot?.keep({
-            ...instants,
-            settled: "resumed",
-            output: value,
-            settledAt: ended.settledAt,
-          } satisfies JournaledWait) as Extract<JournaledWait, { settled: "resumed" }> | undefined;
-        } catch (error) {
-          // **The parked promise is what a write failure leaves through**, and
-          // that is the whole of why the record is written inside a `try` here
-          // rather than beside every other `keep` in this file. The wait is
-          // already marked settled above — it has to be, or the answer and the
-          // expiry could both land — so a throw that escaped `settle`
-          // would leave a wait nothing may settle again holding a promise
-          // nothing ever settles: [`closeHumanWaits`] and [`releaseHumanWaits`]
-          // both skip a settled entry, a later [`deliverHumanAnswer`] refuses
-          // it, and the `human` node's `await` never returns. The run does not
-          // fail, does not park and does not end — it hangs, which is the one
-          // outcome a durable execution has no way back from.
-          //
-          // So the failure travels as the node's: the journal could not record
-          // what the person said, and a run that went on from a wait its own
-          // record does not hold is a run whose resume would ask them again
-          // (`docs/durability.md` §3.4).
-          reject(error);
-          return true;
-        }
-        // What the journal now holds, where it holds anything, for [`callModel`]'s
-        // reason: the answer a person gave is a value the rest of the graph reads
-        // and a later effect's identity may be built out of, so both generations
-        // are handed the same one (`docs/durability.md` §11.1).
-        resolve({
-          output: kept === undefined ? value : kept.output,
-          human: { ...opened, ...ended },
-        });
+        // **The record goes down before the promise resolves**, which is what
+        // keeps a run from going on out of a wait its own journal does not hold
+        // — a run whose resume would ask the person again
+        // (`docs/durability.md` §3.4). `keep` answers a promise, so the resolve
+        // is *chained onto* it rather than written after it: `settle` itself
+        // stays synchronous, because its caller reads the `boolean` it answers
+        // to decide whether this call was the one that settled the wait.
+        //
+        // **The parked promise is what a write failure leaves through**, and
+        // that is the whole of why this arm has a rejection handler at all
+        // rather than letting one travel. The wait is already marked settled
+        // above — it has to be, or the answer and the expiry could both land —
+        // so a failure nothing caught would leave a wait nothing may settle
+        // again holding a promise nothing ever settles: [`closeHumanWaits`] and
+        // [`releaseHumanWaits`] both skip a settled entry, a later
+        // [`deliverHumanAnswer`] refuses it, and the `human` node's `await`
+        // never returns. The run does not fail, does not park and does not end —
+        // it hangs, which is the one outcome a durable execution has no way back
+        // from. So the failure travels as the node's instead.
+        void kept(slot, {
+          ...instants,
+          settled: "resumed",
+          output: value,
+          settledAt: ended.settledAt,
+        }).then(
+          // What the journal now holds, where it holds anything, for
+          // [`callModel`]'s reason: the answer a person gave is a value the rest
+          // of the graph reads and a later effect's identity may be built out
+          // of, so both generations are handed the same one
+          // (`docs/durability.md` §11.1).
+          (held) => {
+            resolve({
+              output:
+                held === undefined
+                  ? value
+                  : (held as Extract<JournaledWait, { settled: "resumed" }>).output,
+              human: { ...opened, ...ended },
+            });
+          },
+          (error: unknown) => reject(error),
+        );
       } else if (outcome === "expired") {
         const ended = stopped(outcome);
-        try {
-          slot?.keep({
-            ...instants,
-            settled: "expired",
-            settledAt: ended.settledAt,
-          } satisfies JournaledWait);
-        } catch (error) {
-          // The same rule on the other settlement, and the arm where escaping
-          // would cost more: this one is reached from a `setTimeout` callback,
-          // where a throw is an uncaught exception rather than something a
-          // caller could report. The expiry is not routed either — a run that
-          // took `on_timeout:` past a wait whose expiry the journal does not
-          // hold would re-park on the resume and spend the budget again.
-          reject(error);
-          return true;
-        }
-        reject(
-          new HumanExpiry(
-            descriptor.flow,
-            descriptor.node,
-            id,
-            descriptor.timeoutMs ?? 0,
-            descriptor.onTimeout ?? END_NODE,
-            { ...opened, ...ended },
-          ),
+        // The same rule on the other settlement, and the arm where a failure
+        // escaping would cost more: this one is reached from a `setTimeout`
+        // callback, where a throw is an uncaught exception rather than something
+        // a caller could report. The expiry is not routed either — a run that
+        // took `on_timeout:` past a wait whose expiry the journal does not hold
+        // would re-park on the resume and spend the budget again.
+        void kept(slot, {
+          ...instants,
+          settled: "expired",
+          settledAt: ended.settledAt,
+        }).then(
+          () => {
+            reject(
+              new HumanExpiry(
+                descriptor.flow,
+                descriptor.node,
+                id,
+                descriptor.timeoutMs ?? 0,
+                descriptor.onTimeout ?? END_NODE,
+                { ...opened, ...ended },
+              ),
+            );
+          },
+          (error: unknown) => reject(error),
         );
       } else if (outcome === "interrupted") {
         // The answer surface went away while this pause was open, which is the
@@ -12858,6 +12872,25 @@ export async function runHuman(
       }
     }
   });
+}
+
+/**
+ * Write one settled wait into the journal, where there is a slot to write it
+ * into.
+ *
+ * The one seam both settlements of [`runHuman`] go through, and it exists
+ * because `settle` is **synchronous** — its caller reads the `boolean` it
+ * answers to decide whether this call was the one that settled the wait — while
+ * the write beneath it is not. So the promise is handed back for the arm to
+ * chain its own ending onto, and a slot that is absent answers `undefined`
+ * rather than making every caller ask.
+ */
+function kept(
+  slot: EffectSlot | undefined,
+  settled: JournaledWait,
+): Promise<JournaledWait | undefined> {
+  if (slot === undefined) return Promise.resolve(undefined);
+  return slot.keep(settled) as Promise<JournaledWait>;
 }
 
 /**
@@ -12947,7 +12980,7 @@ export async function runHuman(
 export async function holdRemotePause(
   execution: string,
   remote: RemotePause,
-  keep: (settled: JournaledWait) => void,
+  keep: (settled: JournaledWait) => Promise<void>,
 ): Promise<JournaledWait> {
   const address = `${remote.flow}.${remote.node}`;
   const descriptor = humanNodes.get(address);
@@ -13049,20 +13082,18 @@ export async function holdRemotePause(
                 settledAt: stopped(outcome).settledAt,
               }
             : { ...instants, settled: "expired", settledAt: stopped(outcome).settledAt };
-        try {
-          keep(settled);
-        } catch (error) {
-          // [`runHuman`]'s rule at its own `slot.keep`, which this arm is the
-          // other half of: the wait is already marked settled, so a throw that
-          // escaped would leave a promise nothing can ever settle and a node
-          // that never returns. It travels as the node's failure instead — the
-          // journal could not record what the person said, and a run that went
-          // on from a wait its own record does not hold is one whose resume
-          // would ask them again.
-          reject(error);
-          return true;
-        }
-        resolve(settled);
+        // [`runHuman`]'s rule at its own `slot.keep`, which this arm is the
+        // other half of, and chained rather than awaited for that function's
+        // reason: `settle` answers a `boolean` its caller reads. The wait is
+        // already marked settled, so a failure nothing caught would leave a
+        // promise nothing can ever settle and a node that never returns. It
+        // travels as the node's failure instead — the journal could not record
+        // what the person said, and a run that went on from a wait its own
+        // record does not hold is one whose resume would ask them again.
+        void keep(settled).then(
+          () => resolve(settled),
+          (error: unknown) => reject(error),
+        );
       } else if (outcome === "interrupted") {
         reject(new HumanInterrupt(remote.flow, remote.node, remote.wait, opened));
       } else {
@@ -13316,14 +13347,14 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
   const journal = await openJournal();
   const resuming = opening.resuming === true;
   if (resuming) {
-    const row = journal.execution(opening.execution);
+    const row = await journal.execution(opening.execution);
     if (row !== undefined && row.journalVersion !== JOURNAL_VERSION) {
       throw new Error(
         `\`${opening.execution}\` was journaled at version ${row.journalVersion} and this build reads version ${JOURNAL_VERSION}: a journal is read by the compiler release that wrote it (\`docs/durability.md\` §11)`,
       );
     }
   } else {
-    journal.begin({
+    await journal.begin({
       id: opening.execution,
       flow: opening.flow,
       trigger: opening.trigger,
@@ -13364,15 +13395,15 @@ export async function openExecution(opening: ExecutionOpening): Promise<void> {
  *    decided this run; replaying it would re-derive the same failure from the
  *    same record.
  */
-export function settleExecution(execution: string, error?: unknown): void {
+export async function settleExecution(execution: string, error?: unknown): Promise<void> {
   const journal = settledJournals.get(execution);
   if (journal === undefined) return;
   if (staysOpen(execution, error)) return;
   if (error === undefined) {
-    journal.end(execution, "completed");
+    await journal.end(execution, "completed");
     return;
   }
-  journal.end(execution, "failed", describe(error));
+  await journal.end(execution, "failed", describe(error));
 }
 
 /**
@@ -13428,7 +13459,7 @@ export function divergenceOf(error: unknown): ReplayDivergence | undefined {
 /** One execution's lifecycle row, or `undefined` where the journal has none. */
 export async function journaledExecution(id: string): Promise<ExecutionRow | undefined> {
   if (!journalExists()) return undefined;
-  return (await openJournal()).execution(id);
+  return await (await openJournal()).execution(id);
 }
 
 /**
@@ -13439,7 +13470,7 @@ export async function journaledExecution(id: string): Promise<ExecutionRow | und
  */
 export async function openExecutions(): Promise<readonly ExecutionRow[]> {
   if (!journalExists()) return [];
-  return (await openJournal()).openExecutions();
+  return await (await openJournal()).openExecutions();
 }
 
 // ---------------------------------------------------------------------------
@@ -13459,7 +13490,7 @@ export async function openExecutions(): Promise<readonly ExecutionRow[]> {
  * id the receiver dedupes on (resolved q35).
  */
 export async function intendDelivery(intent: DeliveryIntent): Promise<DeliveryRecord> {
-  return (await openJournal()).intendDelivery(intent);
+  return await (await openJournal()).intendDelivery(intent);
 }
 
 /**
@@ -13470,7 +13501,7 @@ export async function refuseDelivery(
   intent: CallbackIntent,
   reason: string,
 ): Promise<DeliveryRecord> {
-  return (await openJournal()).refuseDelivery(intent, reason);
+  return await (await openJournal()).refuseDelivery(intent, reason);
 }
 
 /**
@@ -13483,7 +13514,7 @@ export async function refuseRecordedDelivery(
   ordinal: number,
   reason: string,
 ): Promise<void> {
-  (await openJournal()).refuseRecorded(execution, ordinal, reason);
+  await (await openJournal()).refuseRecorded(execution, ordinal, reason);
 }
 
 /**
@@ -13501,7 +13532,7 @@ export async function exhaustRecordedDelivery(
   ordinal: number,
   reason: string,
 ): Promise<void> {
-  (await openJournal()).exhaustRecorded(execution, ordinal, reason);
+  await (await openJournal()).exhaustRecorded(execution, ordinal, reason);
 }
 
 /** Record what one attempt did, and where the delivery stands after it. */
@@ -13511,7 +13542,7 @@ export async function recordDeliveryAttempt(
   attempt: DeliveryAttempt,
   status: DeliveryStatus,
 ): Promise<void> {
-  (await openJournal()).recordAttempt(execution, ordinal, attempt, status);
+  await (await openJournal()).recordAttempt(execution, ordinal, attempt, status);
 }
 
 /**
@@ -13523,13 +13554,13 @@ export async function recordDeliveryAttempt(
  */
 export async function deliveriesOf(execution: string): Promise<readonly DeliveryRecord[]> {
   if (!journalExists()) return [];
-  return (await openJournal()).deliveries(execution);
+  return await (await openJournal()).deliveries(execution);
 }
 
 /** Every delivery still owed an attempt — what a restarted `serve` picks up. */
 export async function undeliveredDeliveries(): Promise<readonly DeliveryRecord[]> {
   if (!journalExists()) return [];
-  return (await openJournal()).undelivered();
+  return await (await openJournal()).undelivered();
 }
 
 /** What a report is *of*, before the journal's own half is read into it. */

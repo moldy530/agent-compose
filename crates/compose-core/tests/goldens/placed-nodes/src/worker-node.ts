@@ -193,17 +193,18 @@ class DispatchJournal implements Journal {
     this.#emit = emit;
   }
 
-  lookup(execution: string, key: string): JournalRecord | undefined {
+  lookup(execution: string, key: string): Promise<JournalRecord | undefined> {
     const held = this.#history.get(key);
-    return held === undefined || held.execution !== execution ? undefined : held;
+    return Promise.resolve(held === undefined || held.execution !== execution ? undefined : held);
   }
 
-  append(record: JournalRecord): void {
+  append(record: JournalRecord): Promise<void> {
     // Held as well as emitted: an effect this dispatch performed is one a later
     // read in the same process must find, and the hub's copy is a round trip
     // away.
     this.#history.set(record.key, record);
     this.#emit(record);
+    return Promise.resolve();
   }
 
   /**
@@ -216,43 +217,48 @@ class DispatchJournal implements Journal {
    * holds. Without it the redispatch of §7.2 would read an unmarked record and
    * call this run's own refusal a replay divergence.
    */
-  refuse(_execution: string, key: string): void {
+  refuse(_execution: string, key: string): Promise<void> {
     const held = this.#history.get(key);
-    if (held === undefined) return;
+    if (held === undefined) return Promise.resolve();
     const marked: JournalRecord = { ...held, refused: true };
     this.#history.set(key, marked);
     this.#emit(marked);
+    return Promise.resolve();
   }
 
-  begin(_row: ExecutionRow): void {
+  begin(_row: ExecutionRow): Promise<void> {
     throw new WorkerJournalReach("open an execution");
   }
 
-  end(_id: string, _status: Exclude<ExecutionStatus, "open">, _error?: string): void {
+  end(
+    _id: string,
+    _status: Exclude<ExecutionStatus, "open">,
+    _error?: string,
+  ): Promise<void> {
     throw new WorkerJournalReach("close an execution");
   }
 
-  execution(_id: string): ExecutionRow | undefined {
+  execution(_id: string): Promise<ExecutionRow | undefined> {
     throw new WorkerJournalReach("read an execution's lifecycle row");
   }
 
-  openExecutions(): readonly ExecutionRow[] {
+  openExecutions(): Promise<readonly ExecutionRow[]> {
     throw new WorkerJournalReach("list the open executions");
   }
 
-  intendDelivery(_intent: DeliveryIntent): DeliveryRecord {
+  intendDelivery(_intent: DeliveryIntent): Promise<DeliveryRecord> {
     throw new WorkerJournalReach("intend a lifecycle delivery");
   }
 
-  refuseDelivery(_intent: DeliveryIntent, _reason: string): DeliveryRecord {
+  refuseDelivery(_intent: DeliveryIntent, _reason: string): Promise<DeliveryRecord> {
     throw new WorkerJournalReach("refuse a lifecycle delivery");
   }
 
-  refuseRecorded(_execution: string, _ordinal: number, _reason: string): void {
+  refuseRecorded(_execution: string, _ordinal: number, _reason: string): Promise<void> {
     throw new WorkerJournalReach("refuse a recorded delivery");
   }
 
-  exhaustRecorded(_execution: string, _ordinal: number, _reason: string): void {
+  exhaustRecorded(_execution: string, _ordinal: number, _reason: string): Promise<void> {
     throw new WorkerJournalReach("exhaust a recorded delivery");
   }
 
@@ -261,56 +267,69 @@ class DispatchJournal implements Journal {
     _ordinal: number,
     _attempt: DeliveryAttempt,
     _status: DeliveryStatus,
-  ): void {
+  ): Promise<void> {
     throw new WorkerJournalReach("record a delivery attempt");
   }
 
-  deliveries(_execution: string): readonly DeliveryRecord[] {
+  deliveries(_execution: string): Promise<readonly DeliveryRecord[]> {
     throw new WorkerJournalReach("list an execution's deliveries");
   }
 
-  undelivered(): readonly DeliveryRecord[] {
+  undelivered(): Promise<readonly DeliveryRecord[]> {
     throw new WorkerJournalReach("list the undelivered callbacks");
   }
 
-  park(_row: DispatchRow): DispatchRow {
+  park(_row: DispatchRow): Promise<DispatchRow> {
     throw new WorkerJournalReach("park a dispatch");
   }
 
-  dispatchAt(_execution: string, _wait: string): DispatchRow | undefined {
+  dispatchAt(_execution: string, _wait: string): Promise<DispatchRow | undefined> {
     throw new WorkerJournalReach("read the dispatch board");
   }
 
-  dispatchOf(_id: string): DispatchRow | undefined {
+  dispatchOf(_id: string): Promise<DispatchRow | undefined> {
     throw new WorkerJournalReach("read the dispatch board");
   }
 
-  dispatchesOf(_execution: string): readonly DispatchRow[] {
+  dispatchesOf(_execution: string): Promise<readonly DispatchRow[]> {
     throw new WorkerJournalReach("read the dispatch board");
   }
 
-  unsettledDispatches(): readonly DispatchRow[] {
+  unsettledDispatches(): Promise<readonly DispatchRow[]> {
     throw new WorkerJournalReach("read the dispatch board");
   }
 
-  claimDispatch(_id: string, _session: string): DispatchRow | undefined {
+  claimDispatch(_id: string, _session: string): Promise<DispatchRow | undefined> {
     throw new WorkerJournalReach("claim a dispatch");
   }
 
-  releaseDispatch(_id: string, _session: string): boolean {
+  releaseDispatch(_id: string, _session: string): Promise<boolean> {
     throw new WorkerJournalReach("put a dispatch back on the board");
   }
 
-  settleDispatch(_id: string, _outcome: JournalOutcome): boolean {
+  settleDispatch(_id: string, _outcome: JournalOutcome): Promise<boolean> {
     throw new WorkerJournalReach("settle a dispatch");
   }
 
-  supersedeDispatch(_id: string, _reason: string): void {
+  supersedeDispatch(_id: string, _reason: string): Promise<void> {
     throw new WorkerJournalReach("supersede a dispatch");
   }
 
-  effectsUnder(_execution: string, _site: string): readonly JournalRecord[] {
+  effectsUnder(_execution: string, _site: string): Promise<readonly JournalRecord[]> {
     throw new WorkerJournalReach("read an execution's effect history");
+  }
+
+  /**
+   * Let go — of nothing.
+   *
+   * The one member of [`Journal`] that is not a refusal here: what a remote arm
+   * gives back is a connection and a writer guard, and this journal holds
+   * neither. It is a `Map` the hub filled and a callback home
+   * (`docs/distributed.md` §3.3), so a caller that closed it has done nothing
+   * wrong and nothing at all.
+   */
+  close(): Promise<void> {
+    return Promise.resolve();
   }
 }
 

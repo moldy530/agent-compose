@@ -54,6 +54,8 @@ const PARSER_CODES: &[&str] = &[
     "missing-join-token",
     "conflicting-registry-credential",
     "missing-registry-token",
+    "missing-journal-url",
+    "unsupported-journal-key",
     "unsupported-placement",
     "conflicting-placement",
     "unsupported-server-tools",

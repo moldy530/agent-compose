@@ -2,7 +2,7 @@
 
 **Journal version:** 1
 **Status:** Normative for the journal a compiled project writes and the replay it reads back
-**Companion artifacts:** [`docs/trace.md`](trace.md) (the keying this shares), [`docs/grammar.md`](grammar.md) §9.4 (idempotency keys), [`docs/distributed.md`](distributed.md) (the wire the dispatch ledger of §3.8 serves), [`prd.md`](../prd.md) §5.8, §5.11, resolved questions 26–29
+**Companion artifacts:** [`docs/trace.md`](trace.md) (the keying this shares), [`docs/grammar.md`](grammar.md) §9.4 (idempotency keys), §14.7 (the slot that binds the backend), [`docs/distributed.md`](distributed.md) (the wire the dispatch ledger of §3.8 serves), [`prd.md`](../prd.md) §5.8, §5.11, resolved questions 26–29, 62
 
 An execution of a compiled graph survives the process that started it. This
 document defines how: what is written, where, under what key, what a resumed
@@ -18,22 +18,37 @@ PRD resolved q26 fixes the mechanism and rules out the obvious alternative:
 resolved q27 fixes where it lives — "a deploy-target slot, exactly as
 `storage_backends` are"; resolved q28 fixes the scope — `serve` auto-recovers,
 `run` journals but is resumed explicitly, triggers fire once; resolved q29 fixes
-what replay executes — "read-only up to the frontier".
+what replay executes — "read-only up to the frontier"; and resolved q62 fills the
+slot, with `sqlite`, `postgres` and `mysql` behind one interface (§10).
+
+**Everything in this document but §2 and §10 is backend-invariant.** The record,
+its keys, the frontier, the recovery verbs and `JOURNAL_VERSION` are the same
+whichever backend a target bound, and the runtime cannot tell which it got. §2 is
+where the durability contract is stated per backend, because "committed" and
+"one writer" are the two things a file and a server mean differently; §10 is
+where the binding is.
 
 **Conformance language.** MUST / MUST NOT / REQUIRED / SHOULD / MAY are used in
 the RFC 2119 sense.
 
 **Where the fields are implemented.** Every record type here is a TypeScript
-interface in the emitted `src/journal.ts`, which is byte-identical in every
-project a given compiler release builds — like `src/runtime.ts` and
-`src/stores.ts` beside it.
+interface in the emitted `src/journal.ts`, and so is every statement that reads
+or writes one: there is **one** implementation of this document, and a backend
+supplies a connection, a schema and a writer guard beneath it. The invariant half
+of that module is byte-identical in every project a given compiler release builds
+— like `src/runtime.ts` and `src/stores.ts` beside it — and a project whose
+target binds a remote provider carries that arm appended to it and no other
+(§10, `docs/grammar.md` §14.7).
 
 ---
 
 ## Table of contents
 
 1. [The journal is not the trace](#1-the-journal-is-not-the-trace)
-2. [Where it lives, and what a crash can leave](#2-where-it-lives-and-what-a-crash-can-leave)
+2. [Where it lives, and what a crash can leave](#2-where-it-lives-and-what-a-crash-can-leave) — the
+   [backend-invariant guarantees](#21-what-every-backend-guarantees) and the
+   per-backend contract: [SQLite](#22-sqlite),
+   [Postgres and MySQL](#23-postgres-and-mysql)
 3. [What is recorded](#3-what-is-recorded) — including
    [callback deliveries](#37-a-callback-delivery),
    [placement dispatches](#38-a-placement-dispatch) and
@@ -44,7 +59,7 @@ project a given compiler release builds — like `src/runtime.ts` and
 7. [Divergence](#7-divergence)
 8. [Privacy posture](#8-privacy-posture)
 9. [What the trace of a resumed execution looks like](#9-what-the-trace-of-a-resumed-execution-looks-like)
-10. [Backends, and what v1 binds](#10-backends-and-what-v1-binds)
+10. [Backends, and what binds what](#10-backends-and-what-binds-what)
 11. [Stability](#11-stability)
 12. [Out of v1 scope](#12-out-of-v1-scope)
 
@@ -76,7 +91,52 @@ scheme; §4 is the one thing it adds, and it is a suffix.
 
 ## 2. Where it lives, and what a crash can leave
 
-One SQLite file per project, beside the project's stores:
+**The target says where, and the composition says nothing** — resolved q27's
+slot, filled by resolved q62 and spelled in `docs/grammar.md` §14.7:
+
+```yaml
+# deploy/<target>.yml
+journal:
+  provider: postgres      # sqlite | postgres | mysql
+  url: ${JOURNAL_URL}     # required by postgres and mysql; sqlite takes none
+```
+
+A target that declares no `journal:` binds **`sqlite`**, under every target and
+not only `local`. `deploy/local.yml` may not declare the block at all: `local`
+binds the file unconditionally, so a `provider:` written there would never be
+consulted (`docs/grammar.md` §14, Decisions D87, D148).
+
+### 2.1 What every backend guarantees
+
+Three statements hold on all three, and the rest of this document rests on them:
+
+* **Atomicity is per record.** One effect is one `INSERT`, committed before it is
+  answered. A process that dies mid-write leaves the row absent and never half
+  present: nothing any backend holds can parse as a complete record that is not
+  one.
+* **The crash window is the network's, not the store's.** The row is written when
+  the effect *answers*, so an effect that happened with no row for it is possible
+  on every backend and is re-executed on replay. That is the at-least-once
+  compromise `docs/grammar.md` §9.4's idempotency keys exist for — a repeated
+  write carries the key the first attempt carried, so a receiver that dedupes
+  still does — and it is stated here rather than promised away.
+* **One process at a time writes a project's journal**, which on a mesh is the
+  hub and only the hub: a worker streams its effect records home and never opens
+  this connection (resolved q42). That stays a *rule* — neither lock below is a
+  plan for two writers — and each backend puts a real one under it.
+
+**Concurrency inside the process** is one serializing queue in `src/journal.ts`,
+on every backend. A `serve` runs many executions at once, and several of the
+statements here are a read and a write that have to be one step: a delivery's
+ordinal is allocated and then inserted under, a dispatch is read before it is
+parked, a settle reads the status its own update is about to change. The
+synchronous SQLite driver gave that for free by blocking the event loop; a
+backend reached over a socket cannot, so it is held explicitly and one reading of
+those statements is right for all three.
+
+### 2.2 SQLite
+
+One file per project, beside the project's stores:
 
 ```text
 <project>/.agent-compose/journal.sqlite
@@ -89,30 +149,19 @@ and `resume`** of one project and one target — which is what makes
 `agent-compose resume <execution>` find the execution a crashed `run` left
 behind. Retention is deleting the file (resolved q27: "one file to delete").
 
-**Atomicity is per record.** One effect is one `INSERT`, which SQLite runs in an
-implicit transaction of its own, so a process that dies mid-write leaves the row
-absent and never half present: nothing in the file can parse as a complete
-record that is not one. `PRAGMA synchronous = FULL` is what makes "committed"
-mean "on the disk". SQLite's **rollback journal** is what backs that; a
-write-ahead log is deliberately not asked for, because this driver's virtual
-file system does not implement one — the pragma is accepted and leaves the mode
-at `delete`, so asking would be a line that reads like a guarantee and is not
-one. Atomicity per statement is the same either way.
+`PRAGMA synchronous = FULL` is what makes "committed" mean "on the disk".
+SQLite's **rollback journal** is what backs that; a write-ahead log is
+deliberately not asked for, because this driver's virtual file system does not
+implement one — the pragma is accepted and leaves the mode at `delete`, so asking
+would be a line that reads like a guarantee and is not one. Atomicity per
+statement is the same either way.
 
-**Concurrency.** A `serve` process runs many executions at once, and every
-statement here is synchronous: the driver blocks the event loop for the duration
-of a call, so two executions can never interleave inside one statement and no
-intra-process locking is needed.
-
-Across *processes* this release keeps the boundary PRD 5.10 draws and
-`src/stores.ts` already keeps — `--target local` is one process. **One process
-at a time writes a project's journal**, and that stays a rule rather than a
-promise; what the driver adds beneath it is a real lock. `node-sqlite3-wasm`
-takes SQLite's exclusive lock by creating `<file>.lock` as a directory and gives
-it back by removing it, so a second process on one journal meets `SQLITE_BUSY`
-rather than interleaving into pages the first has not committed. `PRAGMA
-busy_timeout` is set before any statement that can contend, and the open is
-retried under a deadline for the statements the pragma does not cover.
+The writer guard is the **file lock**. `node-sqlite3-wasm` takes SQLite's
+exclusive lock by creating `<file>.lock` as a directory and gives it back by
+removing it, so a second process on one journal meets `SQLITE_BUSY` rather than
+interleaving into pages the first has not committed. `PRAGMA busy_timeout` is set
+before any statement that can contend, and the open is retried under a deadline
+for the statements the pragma does not cover.
 
 **A lock does not die with its owner**, and that matters here more than
 anywhere: a process killed *inside* a write never reaches the `rmdir`, and the
@@ -125,12 +174,54 @@ one for anything like that long. The **rollback journal** the same crash leaves
 is not touched: SQLite recovers it on the next open, which is what makes the
 interrupted write leave no half-written row.
 
+The consequence a reader should hold on to is §12's: a second process does not
+merely queue on a SQLite journal — it eventually goes in.
+
 The project's **stores** are opened the same way, and for the same reason
 (`src/stores.ts`). They sit in the same directory, under the same driver and the
 same one-process rule, and one crash leaves locks on both — so a store that did
 not break a stale one would be a second artifact a single interrupted write can
 render permanently unopenable, and the first thing it would refuse is the live
 op a resume makes past its frontier (§5).
+
+### 2.3 Postgres and MySQL
+
+A connection rather than a file, at the address the deploy file's `url:` names as
+an `${ENV}` reference — never a literal, so `validate` never sees a URL and the
+artifact carries the variable's *name* (`docs/grammar.md` §4.3, §14.7; presence
+is checked at launch, resolved q15). The driver is `pg` for Postgres and `mysql2`
+for MySQL, pinned exactly and only into a project whose target binds it.
+
+"Committed" is the **server's** commit: each statement is its own transaction and
+the server has written it before it answers. The crash window above is unchanged
+and is, if anything, plainer here — it is the round trip.
+
+The writer guard is a **session-scoped advisory lock**, taken on the one
+connection the process holds and held for that process's lifetime:
+`pg_try_advisory_lock` on Postgres, `GET_LOCK` on MySQL. It is defence in depth
+under §2.1's one-writer rule rather than a second design, and a second opener is
+**refused by name** — the message says that one process at a time writes a
+project's journal, and that a `serve` which is up has already recovered every
+execution it holds open, so one is finished through its
+`POST /executions/:id/resume` route rather than beside it.
+
+**They are the right primitive for the same reason SQLite's lock is the wrong
+one: the server drops them when the connection ends.** A hub killed mid-write
+leaves nothing holding its journal, so the machine that takes over is not locked
+out of the record it exists to resume — there is no corpse to break, which is why
+neither arm has SQLite's stale-lock rule and neither needs one. The `try` form is
+deliberate too: a blocking acquire would leave an `agent-compose resume` typed
+beside a live `serve` hanging on a lock that process may hold for days, rather
+than being told what is happening.
+
+Both are acquired **without a timeout**, and neither is ever released by
+statement. A release a crash can skip would be a lock outliving its owner, which
+is the whole failure this choice avoids.
+
+**Retention is the operator's `DELETE`.** "One file to delete" is SQLite's line
+and stays SQLite's; a journal in a shared database is rows in tables an operator
+prunes, and binding the payloads of §8 into one is the deploy file's explicit,
+operator-owned choice.
 
 The two live surfaces are therefore kept **apart** rather than serialized:
 
@@ -1277,32 +1368,69 @@ derivation of an idempotency key nor where instance paths appear moved (§10.3's
 list, item by item). The journal is a separate artifact with a version of its
 own, which is the whole reason it can carry what §11 forbids the trace.
 
-## 10. Backends, and what v1 binds
+## 10. Backends, and what binds what
 
 resolved q27 makes the journal a **deploy-target slot**, exactly as
 `storage_backends` are: "the composition says nothing, the target binds it".
-`--target local` binds a SQLite journal file beside the project; a distributed
-target will bind Postgres; both sit behind one interface so the runtime cannot
-tell which it got.
+resolved q62 fills it. The slot is `docs/grammar.md` §14.7's `journal:` block,
+and it takes three providers:
 
-In v1:
+| `provider:` | where the record lives | `url:` | driver |
+|---|---|---|---|
+| `sqlite` | `<project>/.agent-compose/journal.sqlite`, opened in this process | takes none | `node-sqlite3-wasm` |
+| `postgres` | a Postgres server this process dials | REQUIRED, `${ENV}` only | `pg` |
+| `mysql` | a MySQL server this process dials | REQUIRED, `${ENV}` only | `mysql2` |
+
+What does **not** vary:
 
 * **journaling is unconditional.** Every invocation of every flow is journaled,
-  with no key to turn it off and none to turn it on. Zero configuration is the
-  point (resolved q27).
-* **every target this compiler can currently build is process-local**, so every
-  one of them binds SQLite. There is nothing for a deploy file to choose
-  between.
-* **there is therefore no new grammar or schema surface.** A deploy-level
-  journal configuration block arrives with the first non-local backend, which is
-  the release where a choice exists to express. `docs/grammar.md` Decision D121
-  records this.
+  with no key to turn it off and none to turn it on. What §14.7 chooses is where
+  the record goes, never whether there is one (Decision D121).
+* **the interface is one interface.** Everything in this document but §2 is
+  backend-invariant: the record vocabulary, the keys of §4, the frontier of §5,
+  the recovery verbs of §6, divergence, the two ledgers, `JOURNAL_VERSION`. The
+  runtime cannot tell which backend it got, and there is one implementation of
+  these statements rather than three.
+* **the default is stated, everywhere.** A target that declares no `journal:`
+  binds SQLite — `local` always, and every named target until it says otherwise.
+  Zero configuration is the point, and it is not a local-only concession
+  (resolved q27, q62).
+* **`deploy/local.yml` may not declare the block**, exactly as it may not declare
+  `storage_backends:` (Decisions D87, D148).
 
-**The driver is `node-sqlite3-wasm`** — the one `src/stores.ts` already opens.
-PRD §9.18 makes Node a supported fallback beside Bun and gates it statically
-over the whole golden corpus, so a generated module may name neither
+**What a remote journal buys** is the property resolved q27 could not give a
+single host: the hub's record survives the hub's disk, so a `serve` restarted on
+a fresh machine recovers every open execution from the database. §12's
+cross-process exclusion is therefore narrowed rather than lifted — it is about a
+**SQLite** journal, which is a file on one machine, and it always was.
+
+**What it costs.** An operator's `DELETE` instead of one file to delete (§2.3);
+a decision about where the payloads of §8 live, since a journal holds what a
+trace deliberately does not; and a dependency, which the target that binds it
+carries and no other does — a project whose journal is SQLite pins neither `pg`
+nor `mysql2` and carries neither arm in `src/journal.ts`.
+
+**The SQLite driver is `node-sqlite3-wasm`** — the one `src/stores.ts` already
+opens. PRD §9.18 makes Node a supported fallback beside Bun and gates it
+statically over the whole golden corpus, so a generated module may name neither
 `bun:sqlite` nor `node:sqlite`; the shared driver is also one fewer pinned
 dependency.
+
+**Schema creation is idempotent, and only SQLite migrates.** Every backend
+creates its tables on first open with `IF NOT EXISTS`, so a second open of a
+journal this release wrote does nothing. SQLite additionally *probes* for the
+columns §11.2 records as later arrivals, because files written by earlier
+releases exist; the two remote arms carry no such probes and need none, since no
+journal older than they are exists. A column added to a remote schema in a later
+release is the case to read §11.2 twice for, exactly as it is on the file.
+
+**How each backend is proved.** The contract of this document is a conformance
+suite — `crates/compose-core/tests/journal_backend_conformance.rs` — which drives
+the **same** cases against SQLite always, and against each remote provider when
+its server is reachable. CI runs all three against real servers as service
+containers, so "CI green" keeps meaning "actually done" for a backend whose
+failure modes are a network's (PRD resolved q62, CLAUDE.md's Validation
+strategy).
 
 **Durability is not checkpointing.** `docs/grammar.md` §14's rule that "`local`
 is not durably checkpointed; every other target is" — the rule
@@ -1342,8 +1470,10 @@ At a given `JOURNAL_VERSION`:
 
 A reader MUST NOT rely on the text of the divergence diagnostic (§7), which is
 written for a person and is improved between releases, nor on the physical
-schema of the SQLite file, which is this implementation's rather than this
-format's.
+schema any backend holds the record in — the SQLite file's tables, or the ones a
+remote journal creates on first open — which is this implementation's rather than
+this format's. Nor on **which** backend a deployment bound: §10 makes that the
+target's, and every promise in this section is the same behind all three.
 
 ### 11.2 What is a compatible change
 
@@ -1434,9 +1564,12 @@ enforces it.
 
 Stated by resolved q28, and restated here so a reader is not left to infer it:
 
-* **cross-process migration** — a journal written by one host and resumed on
-  another is M3-distribution's problem. The journal is a local file, and nothing
-  here promises it is portable.
+* **cross-process migration on a SQLite journal** — a file written by one host
+  and resumed on another is M3-distribution's problem, and nothing here promises
+  a file is portable. A **remote** journal is the narrowing resolved q62 makes:
+  the record is on a server both hosts dial, so a `serve` restarted on a fresh
+  machine recovers every execution the one that died left open (§10). The
+  exclusion is about the backend rather than about the format.
 * **journal compaction** — nothing is pruned. The file grows with the effects a
   project has ever issued, exactly as the stores' idempotency ledger does, and
   retention is deleting it.
@@ -1444,12 +1577,18 @@ Stated by resolved q28, and restated here so a reader is not left to infer it:
 And one this document states rather than defers, because it is a property of the
 backend v1 binds rather than a feature left out:
 
-* **two processes on one project's journal at once.** The driver's lock keeps
-  them out of each other's pages (§2), but it is a lock rather than a plan:
-  neither process can see what the other's replay is doing past the frontier, so
-  one process at a time writes a project's journal — `agent-compose resume`
-  beside a live `serve` included. Because a held lock is broken after a deadline
-  (§2), a second process does not merely queue: it eventually goes in.
+* **two processes on one project's journal at once.** Every backend's guard
+  keeps them out of each other's writes (§2), but a guard is a lock rather than a
+  plan: neither process can see what the other's replay is doing past the
+  frontier, so one process at a time writes a project's journal —
+  `agent-compose resume` beside a live `serve` included.
+
+  What a second process *meets* differs, and is worth knowing. On **SQLite** a
+  held lock is broken after a deadline (§2.2), so a second process does not
+  merely queue: it eventually goes in. On **Postgres and MySQL** the session-scoped
+  guard is refused outright and the second process is told so by name (§2.3) —
+  which is the stronger behaviour, and is possible only because the server drops
+  that lock when a connection ends and a dead owner therefore holds nothing.
 
 Three more, all consequences of §5 rather than deferrals:
 

@@ -754,7 +754,7 @@ compile error (Decision [D41](#d41-env-ref-forms-and-the-secret-field-list)):
 | Field | Where |
 |---|---|
 | `api_key`, `api_secret`, `token`, `password`, `access_key_id`, `secret_access_key`, `session_token`, `credentials_json` | `provider.*`, `storage_backends.*`, `event_sources.*` |
-| `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*` |
+| `url`, `base_url`, `endpoint`, `dsn` | `provider.*`, `storage_backends.*`, `event_sources.*`, and the deploy layer's `journal:` block on a provider that dials out (§14.7) |
 | `token`, `secret` | an `http` trigger's `auth:` and `callback_auth:` blocks (§13.3), and the deploy layer's `trace_sink.auth:` block (§14.5) |
 | `token` | the deploy layer's `package_registry:` block and each of its `scopes:` entries (§14.6) |
 | `join_token` | the deploy layer's `hub:` block (§14.2) |

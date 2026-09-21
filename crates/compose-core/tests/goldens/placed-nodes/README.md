@@ -247,6 +247,26 @@ script — so bun, npm and pnpm all resolve it to the same versions. The lockfil
 your installer writes is yours: `agent-compose build` never writes or removes
 one.
 
+## Where this project's journal lives
+
+Every invocation of every flow is **journaled** — every model answer, every tool
+result, every store op, every answer a person gave a `human:` node — and a
+resumed execution consumes that record rather than re-issuing it, up to the
+frontier. Nothing turns it on and nothing turns it off. What the deploy layer
+chooses is only where the record goes.
+
+This target binds the default: one **SQLite** file beside this project's stores,
+at `.agent-compose/journal.sqlite`, moved as a whole by `AGENT_COMPOSE_DATA_DIR`
+and deleted by deleting it. It costs no configuration and no dependency this
+project did not already have. A target that needs the record to outlive this
+machine binds `journal: { provider: postgres | mysql, url: ${SOME_VAR} }` in its
+deploy file instead.
+
+Because the journal holds what a trace deliberately does not — completions, tool
+results, a person's answer — it is private recovery data with the same
+sensitivity as this project's stores. Nothing uploads it and no command prints
+it.
+
 ## Answering a `human` node
 
 A flow that reaches a `human` node stops there and its execution reports

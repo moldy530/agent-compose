@@ -1382,10 +1382,16 @@ class SqlJournal implements Journal {
     // spelled with different case and `ORDER BY "key"` is the order a reader of
     // `docs/durability.md` §4 derives.
     const inside = `${site}/`;
+    // The prefix **length** is written into the statement rather than bound,
+    // and it is a number this module computed rather than anything a caller
+    // supplied, so nothing is injectable through it. Bound, it would be a
+    // parameter each backend has to infer an integer type for inside a
+    // `substr(text, int, int)` call — one more thing three servers could read
+    // three ways, for a value that is not a value.
     return this.#serial(async () => {
       const rows = await this.#all(
-        'SELECT * FROM effects WHERE execution = ? AND (site = ? OR substr(site, 1, ?) = ?) ORDER BY "key" ASC',
-        [execution, site, inside.length, inside],
+        `SELECT * FROM effects WHERE execution = ? AND (site = ? OR substr(site, 1, ${inside.length}) = ?) ORDER BY "key" ASC`,
+        [execution, site, inside],
       );
       return rows.map((row) => recordOf(row));
     });
@@ -1834,8 +1840,21 @@ function executionOf(row: Row): ExecutionRow {
  */
 const WRITER_GUARD = "agent-compose:journal";
 
-/** Postgres has no string locks, so the same name as a 64-bit key. */
-const WRITER_GUARD_KEY = 6_233_409_714_501_209_601;
+/**
+ * Postgres has no string locks, so the same name as a pair of 32-bit keys.
+ *
+ * The two-argument `pg_try_advisory_lock(int4, int4)` rather than the
+ * one-argument `bigint` form, and that is arithmetic rather than taste: a 64-bit
+ * key does not fit in a JavaScript number, so a constant written as one would be
+ * rounded on its way to the server and the value this module locked on would not
+ * be the value it was written as. Two `int4`s are exact.
+ *
+ * The numbers are [`WRITER_GUARD`]'s first eight characters read as two
+ * big-endian ASCII words — `agen` and `t-co` — which is a constant a reader can
+ * check rather than a magic number, and each is under `int4`'s ceiling by
+ * construction because ASCII is seven bits.
+ */
+const WRITER_GUARD_KEYS: readonly [number, number] = [0x6167_656e, 0x742d_636f];
 
 /** The connection string this target's journal dials, or a refusal. */
 function journalUrl(): string {

@@ -221,7 +221,7 @@ mod tests {
     /// refusal §10.1 forbids it to rely on.
     #[test]
     fn a_paused_result_may_not_name_a_node_its_dispatch_does_not_hold() {
-        let read = function_body("function pauseOf(");
+        let read = function_body("async function pauseOf(");
         assert!(
             read.contains("under(wait, row.site)") && read.contains("under(site, row.site)"),
             "a paused settlement is read without holding its wait and its effect record to the \
@@ -234,7 +234,7 @@ mod tests {
              beside it, so a session could journal its answer under another node's key: {read}"
         );
         assert!(
-            read.contains("ordinal !== claimedHumanOrdinal(journal, row.execution, site)"),
+            read.contains("ordinal !== (await claimedHumanOrdinal(journal, row.execution, site))"),
             "a paused settlement is read without holding its `ordinal` to the one the \
              redispatched node will claim at that site — and the key check above derives from \
              whatever ordinal travelled, so it cannot see it: the answer would be journaled at a \

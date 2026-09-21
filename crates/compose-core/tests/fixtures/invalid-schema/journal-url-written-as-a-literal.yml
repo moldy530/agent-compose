@@ -1,0 +1,7 @@
+# rule: a journal address is an ${ENV} reference and never a literal (grammar 4.3, 14.7)
+# at: /journal/url
+# via: /$defs/envRef/pattern
+version: "0.1"
+journal:
+  provider: mysql
+  url: "mysql://compose:hunter2@db.internal.example/journal"

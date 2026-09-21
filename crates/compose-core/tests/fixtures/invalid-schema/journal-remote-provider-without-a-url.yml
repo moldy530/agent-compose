@@ -1,0 +1,6 @@
+# rule: a journal that dials out names the address it dials (grammar 14.7)
+# at: /journal
+# via: /$defs/journal/allOf/0/then/required
+version: "0.1"
+journal:
+  provider: postgres

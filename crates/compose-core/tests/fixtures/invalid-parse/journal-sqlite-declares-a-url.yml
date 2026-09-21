@@ -1,0 +1,13 @@
+# rule: `provider: sqlite` takes no `url:` (grammar 14.7)
+# code: unsupported-journal-key
+# message: `journal.url` is not a key of `provider: sqlite`
+# at: 13:3
+# help: a `sqlite` journal is one file beside the project's stores — `<project>/.agent-compose/journal.sqlite`, moved as a whole by `AGENT_COMPOSE_DATA_DIR` — so there is no address to dial and nothing for a `url:` to say: drop the key, or bind a provider that dials out (`postgres`, `mysql`) if this target's journal lives on a server (grammar 14.7, PRD resolved q62)
+version: "0.1"
+
+# A SQLite journal is a file beside the project's stores, so an address written
+# here is a key nobody reads — and the author who wrote one expected their
+# executions to be recorded on a server.
+journal:
+  provider: sqlite
+  url: ${JOURNAL_URL}

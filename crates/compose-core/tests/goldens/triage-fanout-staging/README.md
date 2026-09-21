@@ -273,6 +273,20 @@ environment check this project already makes: the variable is in
 `environmentReferences`, so loading `src/index.ts` names it, and a worker that
 does not have it is refused at join rather than after a failed install.
 
+## Where this project's journal lives
+
+Every invocation of every flow is **journaled** — every model answer, every tool
+result, every store op, every answer a person gave a `human:` node — and a
+resumed execution consumes that record rather than re-issuing it, up to the
+frontier. Nothing turns it on and nothing turns it off. What the deploy layer
+chooses is only where the record goes.
+
+This target binds a **`postgres`** journal, at the address `${JOURNAL_URL}` holds. The variable is named here and never its value: `JOURNAL_URL` is read at process start, and `run`, `serve` and `resume` all fail before the graph is invoked when it is unset. The record lives on that server rather than in this directory, which is what lets a `serve` restarted on another machine recover every execution this one left open — and what makes retention a `DELETE` rather than removing a file.
+
+This project therefore pins `pg` at `8.23.0` and `@types/pg` at `8.23.1` in `package.json`. A target that binds the default journal pins neither.
+
+**One process at a time writes this journal**, and the server holds a session-scoped lock saying which. A second process that opens it is refused by name rather than left to interleave; the lock goes with the connection, so a process that died is never what is holding it.
+
 ## Answering a `human` node
 
 A flow that reaches a `human` node stops there and its execution reports

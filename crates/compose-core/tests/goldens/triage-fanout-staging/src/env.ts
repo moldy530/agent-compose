@@ -47,6 +47,12 @@ export const environmentReferences: readonly EnvironmentReference[] = [
     ],
   },
   {
+    name: "JOURNAL_URL",
+    sites: [
+      "deploy.journal.url",
+    ],
+  },
+  {
     name: "LOCAL_LLM_KEY",
     sites: [
       "provider.local.api_key",

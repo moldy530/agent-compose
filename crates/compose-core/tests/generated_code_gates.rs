@@ -7870,9 +7870,10 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     // the `patch-pipeline` golden, which binds both, is type-checked against
     // exactly these versions by gate 1.
     let runtime_and_harness = runtime_and_harness_pins();
+    let development = development_pins();
     for (section, pins) in [
         ("dependencies", runtime_and_harness.as_slice()),
-        ("devDependencies", compose_core::codegen::project::DEV_PINS),
+        ("devDependencies", development.as_slice()),
     ] {
         let block = manifest[section]
             .as_object()
@@ -7899,7 +7900,7 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     let declared = &lock;
     for (section, pins) in [
         ("dependencies", runtime_and_harness.as_slice()),
-        ("devDependencies", compose_core::codegen::project::DEV_PINS),
+        ("devDependencies", development.as_slice()),
     ] {
         for (package, version) in pins {
             // `bun.lock` is JSONC — trailing commas and all — so it is read as
@@ -7927,7 +7928,7 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     let root = &lock["packages"][""];
     for (section, pins) in [
         ("dependencies", runtime_and_harness.as_slice()),
-        ("devDependencies", compose_core::codegen::project::DEV_PINS),
+        ("devDependencies", development.as_slice()),
     ] {
         for (package, version) in pins {
             assert_eq!(
@@ -7940,15 +7941,59 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     }
 }
 
-/// Every package a generated project can declare under `dependencies`: the
-/// runtime's own pins, plus every harness SDK a `coder:` node can bind.
+/// Every package a generated project can declare under `devDependencies`: the
+/// type gate and the runtime's types, plus the typings a journal driver needs.
 ///
-/// Two lists rather than one in the emitter, because a composition declares the
-/// second set only where it binds a harness — and one list here, because the
-/// toolchain fixture installs the union once and every golden resolves against
-/// it (PRD resolved q57, `codegen::harness`).
+/// One list here for [`runtime_and_harness_pins`]' reason: a generated project
+/// declares `@types/pg` only where its target's `journal:` binds Postgres (PRD
+/// resolved q62), and the fixture installs the union once so that every project
+/// the suites build type-checks against exactly these versions.
+fn development_pins() -> Vec<(&'static str, &'static str)> {
+    let mut held: Vec<(&'static str, &'static str)> =
+        compose_core::codegen::project::DEV_PINS.to_vec();
+    for (provider, pins) in compose_core::codegen::journal::JOURNAL_DEV_PINS {
+        for (package, version) in *pins {
+            if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {
+                assert_eq!(
+                    already,
+                    version,
+                    "`{}` pins `{package}` at a version another list already holds",
+                    provider.as_str()
+                );
+                continue;
+            }
+            held.push((package, version));
+        }
+    }
+    held
+}
+
+/// Every package a generated project can declare under `dependencies`: the
+/// runtime's own pins, plus every harness SDK a `coder:` node can bind and every
+/// journal driver a target's `journal:` can bind.
+///
+/// Three lists rather than one in the emitter, because a composition declares
+/// the second set only where it binds a harness and a *target* declares the
+/// third only where it binds a remote journal — and one list here, because the
+/// toolchain fixture installs the union once and every project the suites build
+/// resolves against it (PRD resolved q57, q62; `codegen::harness`,
+/// `codegen::journal`).
 fn runtime_and_harness_pins() -> Vec<(&'static str, &'static str)> {
     let mut held: Vec<(&'static str, &'static str)> = compose_core::codegen::project::PINS.to_vec();
+    for (provider, pins) in compose_core::codegen::journal::JOURNAL_PINS {
+        for (package, version) in *pins {
+            if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {
+                assert_eq!(
+                    already,
+                    version,
+                    "`{}` pins `{package}` at a version another list already holds",
+                    provider.as_str()
+                );
+                continue;
+            }
+            held.push((package, version));
+        }
+    }
     for (harness, pins) in compose_core::codegen::harness::HARNESS_PINS {
         for (package, version) in *pins {
             if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {

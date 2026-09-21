@@ -612,7 +612,7 @@ export async function runFlow(
         // Said by the hook, where a hook has something to say.
       }
     }
-    runtime.settleExecution(executionId);
+    await runtime.settleExecution(executionId);
     return produced;
   } catch (error) {
     // Which of the three closing rows this is — `failed`, or none at all
@@ -631,7 +631,7 @@ export async function runFlow(
         // …and here it would replace the error the run really produced.
       }
     }
-    runtime.settleExecution(executionId, error);
+    await runtime.settleExecution(executionId, error);
     throw error;
   } finally {
     runtime.closeExecution(executionId);
