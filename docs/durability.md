@@ -197,7 +197,9 @@ the server has written it before it answers. The crash window above is unchanged
 and is, if anything, plainer here — it is the round trip.
 
 The writer guard is a **session-scoped advisory lock**, taken on the one
-connection the process holds and held for that process's lifetime:
+connection the process holds and held for as long as that connection lasts —
+which for a `serve` is days, because the connection is heartbeaten and a
+connection lost under a live process is a refusal rather than a redial (below):
 `pg_try_advisory_lock` on Postgres, `GET_LOCK` on MySQL. It is defence in depth
 under §2.1's one-writer rule rather than a second design, and a second opener is
 **refused by name** — the message says that one process at a time writes a
@@ -206,17 +208,57 @@ execution it holds open, so one is finished through its
 `POST /executions/:id/resume` route rather than beside it.
 
 **They are the right primitive for the same reason SQLite's lock is the wrong
-one: the server drops them when the connection ends.** A hub killed mid-write
-leaves nothing holding its journal, so the machine that takes over is not locked
-out of the record it exists to resume — there is no corpse to break, which is why
-neither arm has SQLite's stale-lock rule and neither needs one. The `try` form is
-deliberate too: a blocking acquire would leave an `agent-compose resume` typed
-beside a live `serve` hanging on a lock that process may hold for days, rather
-than being told what is happening.
+one: the server drops them when the session ends.** A hub killed on a machine
+that is still running leaves nothing holding its journal — the kernel closes its
+socket, the server ends the session, and the machine that takes over walks
+straight in. There is no corpse to break, which is why neither arm has SQLite's
+stale-lock rule and neither needs one. The `try` form is deliberate too: a
+blocking acquire would leave an `agent-compose resume` typed beside a live
+`serve` hanging on a lock that process may hold for days, rather than being told
+what is happening.
+
+**A host that vanishes closes nothing, and that is the case cross-host recovery
+is for.** A crash, a power loss or a partition leaves the server holding a
+session whose peer will never speak again, and a server left at its own defaults
+finds that out very late: Linux's `tcp_keepalive_time` is two hours, and MySQL's
+`wait_timeout` is eight. For that whole window the dead hub's guard would refuse
+the live one — the `serve` restarted on a fresh machine that §10 says recovers
+every open execution. So each arm **shortens the window for its own session** and
+keeps a heartbeat on it, which bounds that lockout to **five minutes**:
+
+| | how the server is told the peer is gone | set on |
+|---|---|---|
+| Postgres | `tcp_keepalives_idle` = 60s, `tcp_keepalives_interval` = 20s, `tcp_keepalives_count` = 12 | the session, at open |
+| MySQL | `wait_timeout` = 300s | the session, at open |
+| both | a round trip every 30s, so a `serve` that journals nothing all afternoon is still a live session | the held connection |
+
+Postgres' keepalive probes are answered by the peer's **kernel**, so a hub wedged
+behind a long step keeps its session and only a machine that is really gone loses
+one. MySQL has no per-session equivalent, so its window is measured on the
+application's own silence — which is what the heartbeat, an order of magnitude
+below it, is there to fill. Five minutes rather than five seconds because the two
+errors are not symmetric: a guard nobody holds costs a takeover a few minutes,
+and a guard taken from a hub that is still writing costs the record. A server
+that will not take the setting is **warned about on stderr** and opened anyway;
+the guard then falls back to that server's own schedule.
 
 Both are acquired **without a timeout**, and neither is ever released by
 statement. A release a crash can skip would be a lock outliving its owner, which
 is the whole failure this choice avoids.
+
+**The guard is taken before the schema is created**, so two processes opening one
+fresh journal at the same time have one creator rather than two racing
+`CREATE TABLE IF NOT EXISTS` runs — which Postgres documents as not atomic
+against a concurrent creator, and which would surface as a catalog error instead
+of the refusal above.
+
+**A connection lost under a live process is not redialled.** Every statement
+after it is refused by name, because the guard went with the connection and
+another hub may already have taken the journal over; a silent redial would take
+the guard back and put two writers into one record. Each arm listens for its
+driver's `error` event from the moment there is a connection to listen to — an
+`EventEmitter` that emits `error` with nothing listening ends the process, and an
+idle connection a server closes is the ordinary way that happens.
 
 **Retention is the operator's `DELETE`.** "One file to delete" is SQLite's line
 and stays SQLite's; a journal in a shared database is rows in tables an operator
@@ -1424,13 +1466,31 @@ releases exist; the two remote arms carry no such probes and need none, since no
 journal older than they are exists. A column added to a remote schema in a later
 release is the case to read §11.2 twice for, exactly as it is on the file.
 
+**A column holds the same values on all three.** The types differ — that is what
+a per-backend schema is for — but what fits does not: every column that is
+unbounded `TEXT` on SQLite and Postgres is `LONGTEXT` on MySQL, whose `TEXT` is
+64 KiB and whose shipped `STRICT_TRANS_TABLES` makes an over-long value an error
+rather than a truncation. That is not only about payloads: an execution's
+`error` is a provider's whole failure body, and a `failed` outcome the server
+refused would leave the lifecycle row `open` for ever, so every later `serve`
+start would re-recover an execution that has already finished. The two
+exceptions are the columns MySQL will not index without a bound — `effects.key`
+and `dispatches.wait`, `VARCHAR(2048)` each — which is a limit of that backend
+rather than of this document. Key ordering and case sensitivity are stated per
+backend in the same place: SQLite's `BINARY`, Postgres' `COLLATE "C"`, MySQL's
+`ascii_bin`, all of which make §4's key order the order a reader derives.
+
 **How each backend is proved.** The contract of this document is a conformance
 suite — `crates/compose-core/tests/journal_backend_conformance.rs` — which drives
 the **same** cases against SQLite always, and against each remote provider when
 its server is reachable. CI runs all three against real servers as service
 containers, so "CI green" keeps meaning "actually done" for a backend whose
 failure modes are a network's (PRD resolved q62, CLAUDE.md's Validation
-strategy).
+strategy). Both halves of §2.3's guard are among the cases: a *live* second
+opener is refused by name, and a **dead** one is not — the suite ends the
+holder's session from another connection, which is the path the server's own
+reap takes without the five-minute wait, and then requires the takeover to be
+admitted and the process that lost the connection to still be running.
 
 **Durability is not checkpointing.** `docs/grammar.md` §14's rule that "`local`
 is not durably checkpointed; every other target is" — the rule

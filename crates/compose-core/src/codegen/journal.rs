@@ -347,17 +347,185 @@ mod tests {
                  beside a live `serve` hangs instead of being told what is happening"
             );
         }
-        // …and the refusal says the thing a reader has to know, which is that a
-        // dead process is not what is holding it.
+        // …and the refusal says the two things a reader has to know: who may
+        // hold it, and when it goes. "When it goes" is bounded rather than
+        // instant — a host that vanished holds it until its server notices —
+        // and the refusal states the bound rather than the comfortable half of
+        // it, or a reader whose takeover was refused goes hunting for a `serve`
+        // that does not exist.
         let refusal = function_body(include_str!("js/journal.ts"), "guardHeld");
         for named in [
-            "released the moment that connection ends",
+            "released when that session ends",
             "one process at a time",
+            "${GUARD_REAP_SECONDS}s",
         ] {
             assert!(
                 refusal.contains(named),
                 "the guard refusal does not say `{named}`, so a reader meets a lock with no \
                  account of who holds it or when it goes"
+            );
+        }
+    }
+
+    /// **A guard nobody is holding is given back in minutes, not in hours**
+    /// (`docs/durability.md` §2.3, PRD resolved q62).
+    ///
+    /// The sibling above binds the *primitive*; this binds the property the
+    /// primitive only has once each arm asks for it. A session-scoped lock is
+    /// dropped when the **session** ends, and a session ends when the server
+    /// notices its peer is gone — which is immediate when a process is killed on
+    /// a machine that is still running, and is the server's own default when the
+    /// machine itself is lost. Those defaults are two hours (Linux's
+    /// `tcp_keepalive_time`, which Postgres leaves alone) and eight
+    /// (`wait_timeout`). A crash, a power loss or a partition is exactly the case
+    /// "a `serve` restarted on a fresh machine recovers every open execution"
+    /// exists for, so an unshortened window makes the headline property of a
+    /// remote journal unavailable for most of a working day — with the refusal
+    /// text telling the operator to go and look for a live `serve` that is not
+    /// there.
+    ///
+    /// So each arm shortens the window for its own session and keeps a heartbeat
+    /// on it, and both halves are read here: a shortened window with no heartbeat
+    /// reaps a `serve` that is merely idle, which is worse than the bug.
+    #[test]
+    fn each_remote_arm_bounds_how_long_a_lost_host_holds_the_guard() {
+        assert!(
+            SOURCE.contains("const GUARD_REAP_SECONDS = 300;")
+                && SOURCE.contains("const GUARD_HEARTBEAT_MS = 30_000;"),
+            "the window and the heartbeat are one pair of numbers for both arms, stated in the \
+             invariant half beside the guard they are about (`docs/durability.md` §2.3)"
+        );
+        for (arm, name, shortens) in [
+            (POSTGRES, "journal-postgres.ts", "tcp_keepalives_idle"),
+            (MYSQL, "journal-mysql.ts", "SET SESSION wait_timeout"),
+        ] {
+            assert!(
+                arm.contains(shortens),
+                "`{name}` leaves its server's reap window at the default, so a host that \
+                 vanished holds this journal's writer guard for hours and the takeover \
+                 `serve` is refused for all of them (`docs/durability.md` §2.3)"
+            );
+            assert!(
+                arm.contains("GUARD_REAP_SECONDS"),
+                "`{name}` shortens the window to a number of its own, so the two backends \
+                 promise different bounds while §2.3 states one"
+            );
+            assert!(
+                arm.contains("GUARD_HEARTBEAT_MS") && arm.contains("clearInterval("),
+                "`{name}` shortens the window and never says it is alive, so a `serve` that \
+                 journals nothing for an afternoon is reaped mid-deployment — or it heartbeats \
+                 and never stops, and a finished `run` does not exit"
+            );
+        }
+    }
+
+    /// **Neither arm lets a disconnect take the process with it**
+    /// (`docs/durability.md` §2.3).
+    ///
+    /// Both drivers are `EventEmitter`s that emit `error` on a connection the far
+    /// end closed with no command in flight, and an `EventEmitter` that emits
+    /// `error` with nothing listening raises `ERR_UNHANDLED_ERROR` — which for a
+    /// `serve` is every in-flight execution's in-process state, lost because a
+    /// server closed an idle socket. Nothing in the emitted app installs an
+    /// `uncaughtException` handler, and nothing should: this is the listener that
+    /// belongs beside the connection.
+    ///
+    /// The listener **records** rather than redials, and that is the one-writer
+    /// rule at the moment it matters most: the guard went with the connection, so
+    /// another hub may already hold the journal, and a redial would put two
+    /// writers into one record.
+    #[test]
+    fn a_lost_connection_is_refused_rather_than_taking_the_process_or_redialling() {
+        assert!(
+            SOURCE.contains("function connectionLost("),
+            "the invariant half no longer says what a statement over a lost connection is \
+             refused with, so each arm would answer it its own way"
+        );
+        for (arm, name) in [
+            (POSTGRES, "journal-postgres.ts"),
+            (MYSQL, "journal-mysql.ts"),
+        ] {
+            assert!(
+                arm.contains(".on(\"error\", (reported: unknown) =>"),
+                "`{name}` opens a connection and never listens for its `error` event, so a \
+                 server-side disconnect — a MySQL `wait_timeout`, a restarted Postgres — ends \
+                 the whole process with `ERR_UNHANDLED_ERROR` (`docs/durability.md` §2.3)"
+            );
+            assert!(
+                arm.contains("fault.error ??= connectionLost(reported)"),
+                "`{name}` hears the fault and does not keep it, so the statements after it go \
+                 to a connection that is gone"
+            );
+            assert!(
+                arm.contains("if (this.#fault.error !== undefined) throw this.#fault.error;"),
+                "`{name}`'s driver runs statements without asking whether the connection it \
+                 holds is still there"
+            );
+        }
+        // …and each arm dials **once**, in the function that takes the guard.
+        // A second dial anywhere is a redial by another name.
+        for (arm, name, open, dial) in [
+            (POSTGRES, "journal-postgres.ts", "openPostgres", "connect()"),
+            (MYSQL, "journal-mysql.ts", "openMysql", "createConnection({"),
+        ] {
+            assert_eq!(
+                arm.matches(dial).count(),
+                1,
+                "`{name}` opens a connection in more than one place, so something other than \
+                 `{open}` can dial: the writer guard went with the connection it lost, and a \
+                 redial would take it back from a hub that may already hold this journal \
+                 (`docs/durability.md` §2)"
+            );
+            assert!(
+                function_body(arm, open).contains(dial),
+                "`{name}` dials somewhere other than `{open}`, which is the one place that \
+                 takes the writer guard"
+            );
+        }
+    }
+
+    /// **The guard is taken before the schema is created** (§2.3).
+    ///
+    /// Two processes opening one fresh remote journal at the same time — a
+    /// `serve` restart overlapping the one it replaces, an `agent-compose resume`
+    /// typed beside a live `serve` — would otherwise both run the DDL. Postgres
+    /// documents `CREATE TABLE IF NOT EXISTS` as *not* atomic against a
+    /// concurrent creator, so one of the two can fail on a duplicate key in
+    /// `pg_type`: a catalog error on open rather than the refusal by name this
+    /// design promises. Under the guard there is one creator by construction, and
+    /// the opener about to be refused runs no DDL against an operator's database
+    /// at all.
+    #[test]
+    fn a_remote_arm_takes_the_guard_before_it_creates_anything() {
+        for (arm, name, open, acquire, schema) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "openPostgres",
+                "pg_try_advisory_lock",
+                "POSTGRES_SCHEMA",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "openMysql",
+                "GET_LOCK(?, 0)",
+                "MYSQL_SCHEMA",
+            ),
+        ] {
+            let body = function_body(arm, open);
+            let taken = body
+                .find(acquire)
+                .unwrap_or_else(|| panic!("`{name}` takes a writer guard in `{open}`"));
+            let created = body
+                .find(schema)
+                .unwrap_or_else(|| panic!("`{name}` creates its schema in `{open}`"));
+            assert!(
+                taken < created,
+                "`{name}` runs its DDL before it takes the guard, so a second opener that is \
+                 about to be refused still creates tables in an operator's database — and two \
+                 concurrent creators is a race Postgres does not make atomic \
+                 (`docs/durability.md` §2.3)"
             );
         }
     }

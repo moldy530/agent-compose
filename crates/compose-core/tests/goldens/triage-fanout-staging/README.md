@@ -301,7 +301,12 @@ journal pins none of these:
 **One process at a time writes this journal**, and the server holds a
 session-scoped lock saying which. A second process that opens it is refused
 by name rather than left to interleave; the lock goes with the connection, so
-a process that died is never what is holding it.
+a process killed on a machine that is still running is never what is holding
+it. A host that vanished outright — a crash, a power loss, a partition — holds
+it until its server notices, which this project bounds to about five minutes
+by shortening the window that server reaps a silent session in. That bound is
+what keeps a `serve` started on a fresh machine from being locked out of the
+record it exists to resume.
 
 Because the journal holds what a trace deliberately does not — completions,
 tool results, a person's answer — it is private recovery data with the same

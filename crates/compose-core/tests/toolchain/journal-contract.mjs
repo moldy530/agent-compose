@@ -41,8 +41,41 @@ const LARGE = "x".repeat(300_000);
  */
 const CASED = ["cased/0", "CASED/0"];
 
+/**
+ * The name the MySQL guard is taken under.
+ *
+ * A literal here and a literal in `src/journal.ts`, held to each other by
+ * `the_runner_and_the_module_take_one_writer_guard` in
+ * `journal_backend_conformance.rs` — this runner has to name the lock to find
+ * the session holding it, and a copy nothing compares is a copy that drifts.
+ */
+const WRITER_GUARD = "agent-compose:journal";
+
 const results = {};
 let handle;
+
+/**
+ * Open the journal, waiting out a guard the last connection has not given back.
+ *
+ * `close()` answers when **this** side's socket is closed; the server drops the
+ * session lock when the backend that held it exits, which is a moment later. So
+ * an open that arrives inside that moment can meet its own previous session's
+ * guard — a race in the *test*, not in the journal, and waiting is the whole of
+ * the answer. Anything that is not the guard is re-thrown at once, so a schema
+ * that stopped being idempotent still fails on the first attempt.
+ */
+async function opened(module, deadline = 4_000) {
+  const until = Date.now() + deadline;
+  for (;;) {
+    try {
+      return await module.openJournal();
+    } catch (error) {
+      const said = error instanceof Error ? error.message : String(error);
+      if (!said.includes("another process is already writing") || Date.now() > until) throw error;
+      await new Promise((resume) => setTimeout(resume, 50));
+    }
+  }
+}
 
 function record(execution, key, site, value, ordinal = 0) {
   return {
@@ -59,12 +92,28 @@ function record(execution, key, site, value, ordinal = 0) {
 }
 
 try {
-  // 1. **Open and create, twice.** The schema is created on first open with
-  //    `IF NOT EXISTS`, so a second open of a journal this build already made
-  //    does nothing (`docs/durability.md` §10, §11.2).
+  // 1. **Open, create, and open again.** The schema is created on first open
+  //    with `IF NOT EXISTS`, so a second open of a journal this build already
+  //    made runs every statement of that DDL against tables that exist and does
+  //    nothing (`docs/durability.md` §10, §11.2).
+  //
+  //    `releaseJournal()` between the two is what makes this a case at all.
+  //    `openJournal` memoizes its promise, so two calls without it are **one**
+  //    open that never reaches the server a second time — an assertion that
+  //    would hold with `IF NOT EXISTS` deleted from every statement in the
+  //    schema. The memoization is worth its own case, and gets one: a second
+  //    handle to a remote journal would meet its own writer guard and refuse.
   handle = await journal.openJournal();
-  const again = await journal.openJournal();
-  results.open_is_idempotent = again === handle;
+  const memoized = await journal.openJournal();
+  results.open_memoizes_one_handle = memoized === handle;
+  await journal.releaseJournal();
+  handle = await opened(journal).catch((error) => {
+    throw new Error(
+      `open_is_idempotent: a second open of a journal this build already created failed, so \
+its schema creation is not idempotent: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+  results.open_is_idempotent = handle !== memoized;
   results.journal_version = journal.JOURNAL_VERSION;
   results.provider = journal.journalBinding.provider;
 
@@ -144,6 +193,19 @@ try {
   results.a_closed_row_keeps_its_outcome = (await handle.execution(execution))?.status ===
     "completed";
 
+  // …and the columns that are **not** payloads take what a real failure is.
+  //  `executions.error` holds a provider's whole failure body or a harness run's
+  //  quoted transcript; MySQL's `TEXT` is 64 KiB and its shipped
+  //  `STRICT_TRANS_TABLES` makes an over-long value an error rather than a
+  //  truncation, so a `failed` outcome this size is a write SQLite and Postgres
+  //  take and one backend could refuse — leaving the lifecycle row `open` for
+  //  ever, so every later `serve` start re-recovers an execution that has
+  //  already finished (§3.6, §10). The blob case above drives the one column
+  //  that was always `LONGTEXT`, which is not this one.
+  await handle.end(execution, "failed", LARGE);
+  const ended = await handle.execution(execution);
+  results.a_large_error_round_trips = ended?.error === LARGE && ended?.status === "failed";
+
   // 6. **A refusal is marked on the record**, which is resolved q29's second
   //    divergence told apart from an ordinary mismatch (§7).
   await handle.refuse(execution, "review/0#model/0");
@@ -177,6 +239,18 @@ try {
   results.a_pending_delivery_is_owed = (await handle.undelivered()).some(
     (held) => held.execution === execution && held.ordinal === second.ordinal,
   );
+  // …and the ledger's own unbounded column, for the reason the lifecycle row's
+  // `error` is checked above: a `detail` is why an attempt failed, which is
+  // whatever the far end said.
+  await handle.recordAttempt(
+    execution,
+    second.ordinal,
+    { at: new Date().toISOString(), outcome: "failed", detail: LARGE },
+    "pending",
+  );
+  results.a_large_delivery_detail_round_trips =
+    (await handle.deliveries(execution)).find((held) => held.ordinal === second.ordinal)
+      ?.detail === LARGE;
 
   // 8. **The dispatch board**, whose park order breaks ties by insertion rather
   //    than by the millisecond two rows share (`docs/distributed.md` §6.2).
@@ -227,6 +301,56 @@ try {
   await journal.releaseJournal().catch(() => undefined);
 }
 
+/**
+ * End the session holding the writer guard, from outside, without closing it.
+ *
+ * The case below needs the state `docs/durability.md` §2.3's headline property
+ * is about: a hub whose **host** is gone. A process killed on a machine that is
+ * still running closes its socket and the server ends the session at once; a
+ * host that vanished closes nothing, and the server ends the session only when
+ * it notices — which is what each arm's shortened reap window bounds to five
+ * minutes. Waiting five minutes is not a test, so the session is ended from
+ * another connection instead: the same path the reap takes, at the moment this
+ * runner chooses.
+ *
+ * Answers how many sessions it ended, or a string saying why it could not — a
+ * server this runner may not ask to end a session is a case reported as
+ * unavailable rather than one asserted away or failed.
+ */
+async function endTheGuardSession(provider, url) {
+  if (provider === "postgres") {
+    const { Client } = await import("pg");
+    const client = new Client({ connectionString: url });
+    await client.connect();
+    try {
+      // The journal's guard is the only advisory lock anything in this project
+      // ever takes, so a session holding one here is the journal's writer.
+      const holders = await client.query(
+        "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted AND pid <> pg_backend_pid()",
+      );
+      for (const row of holders.rows) {
+        await client.query("SELECT pg_terminate_backend($1)", [row.pid]);
+      }
+      return holders.rows.length;
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  }
+  const { createConnection } = await import("mysql2/promise");
+  const connection = await createConnection({ uri: url });
+  try {
+    // `IS_USED_LOCK` answers the connection id holding the named lock, or NULL.
+    const [rows] = await connection.query("SELECT IS_USED_LOCK(?) AS holder", [WRITER_GUARD]);
+    const holder = rows[0]?.holder;
+    if (holder === null || holder === undefined) return 0;
+    // `KILL` takes no placeholder, so the id goes in as the number it is.
+    await connection.query(`KILL CONNECTION ${Number(holder)}`);
+    return 1;
+  } finally {
+    await connection.end().catch(() => undefined);
+  }
+}
+
 // 9. **The writer guard.** A second opener of a journal a live process holds is
 //    refused by name rather than left to interleave (`docs/durability.md` §2).
 //    Only the two remote backends have one — SQLite's file lock is broken after
@@ -234,8 +358,10 @@ try {
 //    reported as skipped there rather than asserted away.
 if (journal.journalBinding.provider === "sqlite") {
   results.writer_guard_refuses_a_second_opener = "not-applicable";
+  results.a_takeover_is_not_locked_out_by_a_dead_session = "not-applicable";
+  results.a_lost_connection_is_refused_rather_than_fatal = "not-applicable";
 } else {
-  const held = await journal.openJournal();
+  const held = await opened(journal);
   // A second module instance, loaded under a query string so the runtime treats
   // it as a different module and it opens a connection of its own — which is
   // what a second *process* would do, at the only level this runner can do it.
@@ -247,9 +373,55 @@ if (journal.journalBinding.provider === "sqlite") {
     results.writer_guard_refuses_a_second_opener = error instanceof Error ? error.message : String(error);
   } finally {
     await rival.releaseJournal().catch(() => undefined);
-    await journal.releaseJournal().catch(() => undefined);
   }
-  void held;
+
+  // 10. **…and a guard nobody is holding is not a lock.** The case above is a
+  //     *live* second opener, which is the easy half. The half §2.3 leans on
+  //     hardest is the dead one: "a `serve` restarted on a fresh machine
+  //     recovers every open execution" is a promise about taking over from a
+  //     host that is gone, and a guard that outlived its holder would refuse
+  //     exactly that takeover — while the refusal text told the operator to go
+  //     and find a live `serve` that does not exist.
+  const url = process.env[journal.journalBinding.urlEnv ?? ""] ?? "";
+  const ended = await endTheGuardSession(journal.journalBinding.provider, url).catch((error) =>
+    error instanceof Error ? error.message : String(error),
+  );
+  if (typeof ended !== "number" || ended === 0) {
+    results.a_takeover_is_not_locked_out_by_a_dead_session = `not-available: ${
+      ended === 0 ? "nothing was holding the guard" : ended
+    }`;
+  } else {
+    const successor = await import(`${at("src/journal.ts")}?successor`);
+    try {
+      await opened(successor);
+      results.a_takeover_is_not_locked_out_by_a_dead_session = "admitted";
+    } catch (error) {
+      results.a_takeover_is_not_locked_out_by_a_dead_session =
+        error instanceof Error ? error.message : String(error);
+    } finally {
+      await successor.releaseJournal().catch(() => undefined);
+    }
+  }
+
+  // 11. **…and this process is still here to report it.** Both drivers emit
+  //     `error` on a connection the server ended, and an `EventEmitter` that
+  //     emits `error` with nothing listening raises `ERR_UNHANDLED_ERROR` and
+  //     takes the process with it — so a run that reaches this line at all is
+  //     the listener each arm attaches. What the statement after a lost
+  //     connection answers is a refusal, never a row: the guard went with the
+  //     connection and another hub may already hold this journal, so nothing is
+  //     redialled (§2.3).
+  if (typeof ended === "number" && ended > 0) {
+    results.a_lost_connection_is_refused_rather_than_fatal = await held
+      .openExecutions()
+      .then(
+        () => "answered",
+        (error) => (error instanceof Error ? error.message : String(error)),
+      );
+  } else {
+    results.a_lost_connection_is_refused_rather_than_fatal = "not-available: no session was ended";
+  }
+  await journal.releaseJournal().catch(() => undefined);
 }
 
 process.stdout.write(JSON.stringify(results));

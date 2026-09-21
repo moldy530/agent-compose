@@ -130,28 +130,76 @@ const POSTGRES_DIALECT: Dialect = {
   insertionOrder: "seq",
 };
 
+/**
+ * How the server is asked to notice that the far end of this session is gone.
+ *
+ * `tcp_keepalives_*` rather than `idle_session_timeout`, and that is the
+ * difference between "this host is unreachable" and "this host is quiet". The
+ * keepalive probes are answered by the peer's **kernel**, so a hub whose event
+ * loop is wedged behind a long step still keeps its session; only a machine that
+ * is really gone fails to answer. A timeout measured on the application's own
+ * silence would reap the first of those too, which is the failure that costs the
+ * record rather than a few minutes of a takeover.
+ *
+ * The three compose to [`GUARD_REAP_SECONDS`]: the server waits
+ * `tcp_keepalives_idle` seconds of silence, then sends `tcp_keepalives_count`
+ * probes `tcp_keepalives_interval` apart before it ends the session and drops
+ * every advisory lock on it.
+ */
+const KEEPALIVE_IDLE_SECONDS = 60;
+
+/** …how far apart the probes after that silence are. */
+const KEEPALIVE_INTERVAL_SECONDS = 20;
+
+/** …and how many of them go unanswered before the session is ended. */
+const KEEPALIVE_PROBES = (GUARD_REAP_SECONDS - KEEPALIVE_IDLE_SECONDS) / KEEPALIVE_INTERVAL_SECONDS;
+
+/**
+ * The settings, as one statement. All three are `USERSET`, so a session sets its
+ * own without any privilege beyond the one it connected with.
+ */
+const POSTGRES_KEEPALIVES = `SET tcp_keepalives_idle = ${KEEPALIVE_IDLE_SECONDS}; SET tcp_keepalives_interval = ${KEEPALIVE_INTERVAL_SECONDS}; SET tcp_keepalives_count = ${KEEPALIVE_PROBES}`;
+
 /** The journal as a Postgres database, on one connection this process holds. */
 class PostgresDriver implements JournalDriver {
   readonly dialect = POSTGRES_DIALECT;
   readonly #client: Client;
+  /** What the connection reported, if it has reported anything. */
+  readonly #fault: ConnectionFault;
+  /** What keeps a shortened reap window from reaping an idle hub. */
+  readonly #heartbeat: ReturnType<typeof setInterval>;
 
-  constructor(client: Client) {
+  constructor(client: Client, fault: ConnectionFault) {
     this.#client = client;
+    this.#fault = fault;
+    this.#heartbeat = setInterval(() => {
+      // Nothing reads the answer and nothing acts on the failure: a round trip
+      // is the whole point, and a connection that could not make one has
+      // already told the listener in [`openPostgres`]. The rejection is caught
+      // so that a lost connection is one refused statement rather than an
+      // unhandled rejection.
+      void this.#client.query("SELECT 1").catch(() => undefined);
+    }, GUARD_HEARTBEAT_MS);
+    this.#heartbeat.unref();
   }
 
   async all(sql: string, parameters: readonly Bound[]): Promise<Row[]> {
+    if (this.#fault.error !== undefined) throw this.#fault.error;
     const answered = await this.#client.query(sql, [...parameters]);
     return answered.rows as Row[];
   }
 
   async run(sql: string, parameters: readonly Bound[]): Promise<void> {
+    if (this.#fault.error !== undefined) throw this.#fault.error;
     await this.#client.query(sql, [...parameters]);
   }
 
   async close(): Promise<void> {
     // The advisory lock goes with the session, so ending it is releasing the
-    // guard — there is nothing to unlock and nothing left holding it if this
-    // never runs (see [`guardHeld`]).
+    // guard — there is nothing to unlock, and a session this process never got
+    // to end is reaped by the server inside [`GUARD_REAP_SECONDS`] (see
+    // [`guardHeld`]).
+    clearInterval(this.#heartbeat);
     await this.#client.end();
   }
 }
@@ -166,26 +214,54 @@ class PostgresDriver implements JournalDriver {
  * module can use while making the writer guard unholdable: `pg_advisory_lock` is
  * **session**-scoped, and a pool hands sessions out and takes them back.
  *
- * The guard is taken with `pg_try_advisory_lock` rather than `pg_advisory_lock`:
- * a second opener is told what is happening ([`guardHeld`]) rather than left
- * blocking on a connection that may be a `serve` which will hold it for days.
+ * The guard is taken with the `try` form rather than the blocking one: a second
+ * opener is told what is happening ([`guardHeld`]) rather than left blocking on
+ * a connection that may be a `serve` which will hold it for days.
+ *
+ * **The guard is taken before the schema is created**, and the order is load
+ * bearing rather than tidy. Two processes opening one fresh journal at the same
+ * time — a `serve` restart overlapping the one it replaces, an
+ * `agent-compose resume` typed beside a live `serve` — would otherwise both run
+ * the DDL, and `CREATE TABLE IF NOT EXISTS` is documented as *not* atomic
+ * against a concurrent creator: one of the two can fail on a duplicate key in
+ * `pg_type`, which is a catalog error rather than the refusal this design
+ * promises. Under the guard there is one creator by construction, and the opener
+ * that is about to be refused runs no DDL against an operator's database at all.
  */
 async function openPostgres(): Promise<JournalDriver> {
-  const client = new Client({ connectionString: journalUrl() });
+  const client = new Client({
+    connectionString: journalUrl(),
+    // This side's own probes, which are the other direction of the same
+    // question the server-side settings below ask: a hub whose database has
+    // gone finds out on the heartbeat rather than on the next execution.
+    keepAlive: true,
+    keepAliveInitialDelayMillis: GUARD_HEARTBEAT_MS,
+  });
+  const fault: ConnectionFault = {};
+  // **Before `connect`**, because `pg` emits `error` on the client whenever it
+  // loses the socket with no query in flight — `Client._handleErrorEvent` does
+  // it unconditionally — and an `EventEmitter` that emits `error` with nothing
+  // listening ends the process. See [`ConnectionFault`].
+  client.on("error", (reported: unknown) => {
+    fault.error ??= connectionLost(reported);
+  });
   await client.connect();
   try {
-    await client.query(POSTGRES_SCHEMA);
+    // Best effort, and said out loud where it does not take: see
+    // [`guardWindowUnshortened`].
+    await client.query(POSTGRES_KEEPALIVES).catch(guardWindowUnshortened);
     const guard = await client.query("SELECT pg_try_advisory_lock($1, $2) AS taken", [
       WRITER_GUARD_KEYS[0],
       WRITER_GUARD_KEYS[1],
     ]);
     const taken = (guard.rows[0] as { taken?: unknown } | undefined)?.taken;
     if (taken !== true) throw guardHeld();
+    await client.query(POSTGRES_SCHEMA);
   } catch (error) {
     await client.end().catch(() => undefined);
     throw error;
   }
-  return new PostgresDriver(client);
+  return new PostgresDriver(client, fault);
 }
 
 BACKENDS.postgres = openPostgres;

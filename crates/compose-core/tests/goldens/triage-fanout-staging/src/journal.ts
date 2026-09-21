@@ -121,10 +121,25 @@
 //    above rather than a second design: a second opener is refused by name
 //    instead of writing into a record another process is replaying. They are the
 //    right primitive for the same reason SQLite's lock is the wrong one — **the
-//    server drops them when the connection dies**, so a hub that was killed
-//    mid-write leaves no lock behind and the machine that takes over is not
-//    locked out of the journal it has to resume. Nothing has to break a corpse's
-//    lock here, because there is no corpse to break.
+//    server drops them when the session ends**, so a hub killed on a machine
+//    that is still running leaves no lock behind: the kernel closes its socket,
+//    the server ends the session, and the machine that takes over walks straight
+//    in. Nothing has to break a corpse's lock here.
+//
+//    A host that **vanishes** — a crash, a power loss, a partition — closes
+//    nothing, and that is the case cross-host recovery is *for*. The server ends
+//    such a session only when it notices, and left at its own defaults it
+//    notices after hours (Linux's `tcp_keepalive_time` is two hours; MySQL's
+//    `wait_timeout` is eight). For that whole time a dead hub's guard would
+//    refuse the live one. So both arms shorten that window for their own session
+//    and keep a heartbeat on it ([`GUARD_REAP_SECONDS`],
+//    [`GUARD_HEARTBEAT_MS`]): the lockout after a host is lost is bounded to
+//    minutes and stated, here and in `docs/durability.md` §2.3, rather than
+//    being described as instant.
+//
+//    A connection that is lost under a live process is **not** redialled, and
+//    every statement after it is refused ([`connectionLost`]). A redial would
+//    take a guard back that another hub may already hold.
 //
 // So the two live surfaces are kept apart rather than serialized. `serve`
 // recovers every open execution at start, which means an execution a live
@@ -1862,6 +1877,95 @@ const WRITER_GUARD = "agent-compose:journal";
  */
 const WRITER_GUARD_KEYS: readonly [number, number] = [0x6167_656e, 0x742d_636f];
 
+/**
+ * The longest a server is asked to go on holding a session that has gone silent
+ * — and therefore the longest a dead host's guard locks a live one out.
+ *
+ * The property a remote journal exists for is cross-host recovery: a `serve`
+ * restarted on a fresh machine recovers every open execution from the database
+ * (`docs/durability.md` §2.3, §10). The machine it is taking over from is,
+ * almost by definition, one that stopped without closing anything — a crash, a
+ * power loss, a partition — so the far end's session is still open as far as the
+ * server is concerned, and the guard on it is still held. Left at its own
+ * defaults the server finds out very late: Linux's `tcp_keepalive_time` is two
+ * hours, and MySQL's `wait_timeout` is eight. Each arm therefore shortens the
+ * window **for its own session**, to this.
+ *
+ * Five minutes rather than five seconds, and the asymmetry is the reason: a
+ * window short enough to trip over a slow network would reap a hub that is still
+ * writing, and a guard nobody holds costs a takeover a few minutes while a guard
+ * taken from somebody still writing costs the record itself. Bounded, stated,
+ * and the same number on both backends.
+ */
+const GUARD_REAP_SECONDS = 300;
+
+/**
+ * How often a held connection says something, so that a shortened window never
+ * reaps a hub that is alive.
+ *
+ * A `serve` can hold this connection for hours and journal nothing — an idle
+ * deployment is the ordinary case, not an edge one — and silence is exactly what
+ * [`GUARD_REAP_SECONDS`] is measuring. The heartbeat is what makes "silent"
+ * mean "gone" rather than "quiet", with an order of magnitude between the two so
+ * a slow round trip is never mistaken for a dead host.
+ *
+ * The timer is `unref`'d: it never holds a process open, so a `run` that has
+ * finished still exits on its own.
+ */
+const GUARD_HEARTBEAT_MS = 30_000;
+
+/**
+ * The fault a remote connection reported, shared between the arm that opened it
+ * and the driver that runs statements over it.
+ *
+ * Both halves need it, and at different moments. The listener has to be attached
+ * **before** the connection is opened: both drivers emit `error` on the
+ * connection whenever the far end goes away with no command in flight, and an
+ * `EventEmitter` that emits `error` with nothing listening raises
+ * `ERR_UNHANDLED_ERROR` and takes the process with it — which for a `serve` is
+ * every in-flight execution's in-process state, lost to a server closing an idle
+ * socket. What has to *answer* for the fault, though, is every later statement,
+ * which is the driver's half.
+ */
+interface ConnectionFault {
+  /** The first one, which is the one that says what happened. */
+  error?: Error;
+}
+
+/**
+ * What a statement is refused with once the journal's connection has been lost.
+ *
+ * **Refused rather than redialled**, and that is §2.1's one-writer rule read at
+ * the moment it matters most: a connection this process lost is a guard the
+ * server has already dropped or is about to, so another hub may be opening this
+ * journal right now. A silent redial would take the guard back and put two
+ * writers into one record — the state the guard exists to prevent — so the
+ * command fails by name instead and whatever holds the journal keeps it.
+ */
+function connectionLost(cause: unknown): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(
+    `this project's journal lost its connection to ${journalLocation()}: ${detail}. It is not redialled: the writer guard went with the connection, and one process at a time writes a project's journal (\`docs/durability.md\` §2), so another process may already hold it. Start this command again — a \`serve\` recovers every execution an interrupted one left open`,
+  );
+}
+
+/**
+ * Say so when a server will not take the setting that shortens its reap window.
+ *
+ * Tolerated rather than fatal, and warned about rather than swallowed. A journal
+ * that refused to open because a server spells one connection setting
+ * differently would be a deployment blocked on something that does not touch a
+ * single record; a journal that quietly fell back to an eight-hour lockout would
+ * be `docs/durability.md` §2.3's bound untrue with nothing saying so. The
+ * operator gets the one line that tells them which of the two they have.
+ */
+function guardWindowUnshortened(cause: unknown): void {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  process.stderr.write(
+    `warning: this server would not shorten the window it reaps a silent session in (${detail}), so this journal's writer guard is released on the server's own schedule rather than within ${GUARD_REAP_SECONDS}s of a host disappearing (\`docs/durability.md\` §2.3). A \`serve\` started on a fresh machine may be refused until then.\n`,
+  );
+}
+
 /** The connection string this target's journal dials, or a refusal. */
 function journalUrl(): string {
   const variable = journalBinding.urlEnv;
@@ -1882,7 +1986,7 @@ function journalUrl(): string {
 /** What a second opener of a remote journal is told. See the module header. */
 function guardHeld(): Error {
   return new Error(
-    `another process is already writing this project's journal: ${journalLocation()} is held by a live connection, and one process at a time writes a project's journal (\`docs/durability.md\` §2). A \`serve\` that is up has already recovered every execution it holds open, so finish one through its \`POST /executions/:id/resume\` route rather than beside it. The guard is the server's own session lock and is released the moment that connection ends, so a process that died is not what is holding this`,
+    `another process is already writing this project's journal: ${journalLocation()} is held by an open session, and one process at a time writes a project's journal (\`docs/durability.md\` §2). A \`serve\` that is up has already recovered every execution it holds open, so finish one through its \`POST /executions/:id/resume\` route rather than beside it. The guard is the server's own session lock and is released when that session ends — a process killed on a machine that is still running has released it already, and a host that vanished outright releases it within ${GUARD_REAP_SECONDS}s, which is the window this journal shortens its server's own reaping to. So: if no \`serve\` is up, this is a host that has just been lost, and the same command ${GUARD_REAP_SECONDS}s from now goes in`,
   );
 }
 
@@ -2761,28 +2865,76 @@ const POSTGRES_DIALECT: Dialect = {
   insertionOrder: "seq",
 };
 
+/**
+ * How the server is asked to notice that the far end of this session is gone.
+ *
+ * `tcp_keepalives_*` rather than `idle_session_timeout`, and that is the
+ * difference between "this host is unreachable" and "this host is quiet". The
+ * keepalive probes are answered by the peer's **kernel**, so a hub whose event
+ * loop is wedged behind a long step still keeps its session; only a machine that
+ * is really gone fails to answer. A timeout measured on the application's own
+ * silence would reap the first of those too, which is the failure that costs the
+ * record rather than a few minutes of a takeover.
+ *
+ * The three compose to [`GUARD_REAP_SECONDS`]: the server waits
+ * `tcp_keepalives_idle` seconds of silence, then sends `tcp_keepalives_count`
+ * probes `tcp_keepalives_interval` apart before it ends the session and drops
+ * every advisory lock on it.
+ */
+const KEEPALIVE_IDLE_SECONDS = 60;
+
+/** …how far apart the probes after that silence are. */
+const KEEPALIVE_INTERVAL_SECONDS = 20;
+
+/** …and how many of them go unanswered before the session is ended. */
+const KEEPALIVE_PROBES = (GUARD_REAP_SECONDS - KEEPALIVE_IDLE_SECONDS) / KEEPALIVE_INTERVAL_SECONDS;
+
+/**
+ * The settings, as one statement. All three are `USERSET`, so a session sets its
+ * own without any privilege beyond the one it connected with.
+ */
+const POSTGRES_KEEPALIVES = `SET tcp_keepalives_idle = ${KEEPALIVE_IDLE_SECONDS}; SET tcp_keepalives_interval = ${KEEPALIVE_INTERVAL_SECONDS}; SET tcp_keepalives_count = ${KEEPALIVE_PROBES}`;
+
 /** The journal as a Postgres database, on one connection this process holds. */
 class PostgresDriver implements JournalDriver {
   readonly dialect = POSTGRES_DIALECT;
   readonly #client: Client;
+  /** What the connection reported, if it has reported anything. */
+  readonly #fault: ConnectionFault;
+  /** What keeps a shortened reap window from reaping an idle hub. */
+  readonly #heartbeat: ReturnType<typeof setInterval>;
 
-  constructor(client: Client) {
+  constructor(client: Client, fault: ConnectionFault) {
     this.#client = client;
+    this.#fault = fault;
+    this.#heartbeat = setInterval(() => {
+      // Nothing reads the answer and nothing acts on the failure: a round trip
+      // is the whole point, and a connection that could not make one has
+      // already told the listener in [`openPostgres`]. The rejection is caught
+      // so that a lost connection is one refused statement rather than an
+      // unhandled rejection.
+      void this.#client.query("SELECT 1").catch(() => undefined);
+    }, GUARD_HEARTBEAT_MS);
+    this.#heartbeat.unref();
   }
 
   async all(sql: string, parameters: readonly Bound[]): Promise<Row[]> {
+    if (this.#fault.error !== undefined) throw this.#fault.error;
     const answered = await this.#client.query(sql, [...parameters]);
     return answered.rows as Row[];
   }
 
   async run(sql: string, parameters: readonly Bound[]): Promise<void> {
+    if (this.#fault.error !== undefined) throw this.#fault.error;
     await this.#client.query(sql, [...parameters]);
   }
 
   async close(): Promise<void> {
     // The advisory lock goes with the session, so ending it is releasing the
-    // guard — there is nothing to unlock and nothing left holding it if this
-    // never runs (see [`guardHeld`]).
+    // guard — there is nothing to unlock, and a session this process never got
+    // to end is reaped by the server inside [`GUARD_REAP_SECONDS`] (see
+    // [`guardHeld`]).
+    clearInterval(this.#heartbeat);
     await this.#client.end();
   }
 }
@@ -2797,26 +2949,54 @@ class PostgresDriver implements JournalDriver {
  * module can use while making the writer guard unholdable: `pg_advisory_lock` is
  * **session**-scoped, and a pool hands sessions out and takes them back.
  *
- * The guard is taken with `pg_try_advisory_lock` rather than `pg_advisory_lock`:
- * a second opener is told what is happening ([`guardHeld`]) rather than left
- * blocking on a connection that may be a `serve` which will hold it for days.
+ * The guard is taken with the `try` form rather than the blocking one: a second
+ * opener is told what is happening ([`guardHeld`]) rather than left blocking on
+ * a connection that may be a `serve` which will hold it for days.
+ *
+ * **The guard is taken before the schema is created**, and the order is load
+ * bearing rather than tidy. Two processes opening one fresh journal at the same
+ * time — a `serve` restart overlapping the one it replaces, an
+ * `agent-compose resume` typed beside a live `serve` — would otherwise both run
+ * the DDL, and `CREATE TABLE IF NOT EXISTS` is documented as *not* atomic
+ * against a concurrent creator: one of the two can fail on a duplicate key in
+ * `pg_type`, which is a catalog error rather than the refusal this design
+ * promises. Under the guard there is one creator by construction, and the opener
+ * that is about to be refused runs no DDL against an operator's database at all.
  */
 async function openPostgres(): Promise<JournalDriver> {
-  const client = new Client({ connectionString: journalUrl() });
+  const client = new Client({
+    connectionString: journalUrl(),
+    // This side's own probes, which are the other direction of the same
+    // question the server-side settings below ask: a hub whose database has
+    // gone finds out on the heartbeat rather than on the next execution.
+    keepAlive: true,
+    keepAliveInitialDelayMillis: GUARD_HEARTBEAT_MS,
+  });
+  const fault: ConnectionFault = {};
+  // **Before `connect`**, because `pg` emits `error` on the client whenever it
+  // loses the socket with no query in flight — `Client._handleErrorEvent` does
+  // it unconditionally — and an `EventEmitter` that emits `error` with nothing
+  // listening ends the process. See [`ConnectionFault`].
+  client.on("error", (reported: unknown) => {
+    fault.error ??= connectionLost(reported);
+  });
   await client.connect();
   try {
-    await client.query(POSTGRES_SCHEMA);
+    // Best effort, and said out loud where it does not take: see
+    // [`guardWindowUnshortened`].
+    await client.query(POSTGRES_KEEPALIVES).catch(guardWindowUnshortened);
     const guard = await client.query("SELECT pg_try_advisory_lock($1, $2) AS taken", [
       WRITER_GUARD_KEYS[0],
       WRITER_GUARD_KEYS[1],
     ]);
     const taken = (guard.rows[0] as { taken?: unknown } | undefined)?.taken;
     if (taken !== true) throw guardHeld();
+    await client.query(POSTGRES_SCHEMA);
   } catch (error) {
     await client.end().catch(() => undefined);
     throw error;
   }
-  return new PostgresDriver(client);
+  return new PostgresDriver(client, fault);
 }
 
 BACKENDS.postgres = openPostgres;

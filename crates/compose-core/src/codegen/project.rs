@@ -1111,14 +1111,6 @@ nothing else. A run that needs source control needs a step in the graph that
 puts it there.
 "#;
 
-/// The section a composition declaring a `store.*` gets.
-///
-/// A store is the one construct that leaves something behind on disk, and where
-/// it leaves it is a promise this project keeps rather than a detail of
-/// `src/stores.ts`: a reader who wants to inspect, back up or delete what a run
-/// stored has to be told the layout. A composition with no store gets no
-/// section, exactly as one using no `function:` binding gets no host-function
-/// section.
 /// Which journal this target bound, and where it lives (grammar §14.7, PRD
 /// resolved q62).
 ///
@@ -1168,7 +1160,12 @@ fn journal_home(ir: &Ir) -> String {
          **One process at a time writes this journal**, and the server holds a\n\
          session-scoped lock saying which. A second process that opens it is refused\n\
          by name rather than left to interleave; the lock goes with the connection, so\n\
-         a process that died is never what is holding it.\n\
+         a process killed on a machine that is still running is never what is holding\n\
+         it. A host that vanished outright — a crash, a power loss, a partition — holds\n\
+         it until its server notices, which this project bounds to about five minutes\n\
+         by shortening the window that server reaps a silent session in. That bound is\n\
+         what keeps a `serve` started on a fresh machine from being locked out of the\n\
+         record it exists to resume.\n\
          \n\
          Because the journal holds what a trace deliberately does not — completions,\n\
          tool results, a person's answer — it is private recovery data with the same\n\
@@ -1206,6 +1203,14 @@ sensitivity as this project's stores. Nothing uploads it and no command prints
 it.
 "#;
 
+/// The section a composition declaring a `store.*` gets.
+///
+/// A store is the one construct that leaves something behind on disk, and where
+/// it leaves it is a promise this project keeps rather than a detail of
+/// `src/stores.ts`: a reader who wants to inspect, back up or delete what a run
+/// stored has to be told the layout. A composition with no store gets no
+/// section, exactly as one using no `function:` binding gets no host-function
+/// section.
 fn store_data(ir: &Ir) -> String {
     let stores = ir.definitions.values().any(|definition| {
         matches!(

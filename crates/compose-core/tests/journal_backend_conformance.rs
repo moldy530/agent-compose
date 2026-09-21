@@ -27,13 +27,19 @@
 //!
 //! # How it runs, and what it does when a server is absent
 //!
-//! SQLite **always**: it needs nothing but the pinned driver, so a developer
-//! machine runs the same cases CI does. Each remote provider runs when its
-//! environment variable names a reachable server —
-//! [`POSTGRES_URL`] and [`MYSQL_URL`] — and is **skipped loudly** when it does
-//! not, printing the variable to look at on stderr. Never silently green: a skip
-//! that said nothing would make a laptop's `cargo test` and CI's mean different
-//! things while reading the same.
+//! Every backend is **built and type-checked** on every run, server or no
+//! server: neither needs one, and MySQL has no golden carrying its arm, so this
+//! is the only place `src/codegen/js/journal-mysql.ts` meets `tsc` on a machine
+//! with no database.
+//!
+//! The **cases** then run where there is something to run them against. SQLite
+//! always: it needs nothing but the pinned driver, so a developer machine runs
+//! the same cases CI does. Each remote provider runs when its environment
+//! variable names a reachable server — [`POSTGRES_URL`] and [`MYSQL_URL`] — and
+//! is **skipped loudly** when it does not, naming the variable to look at. Loudly
+//! means through [`notice`] rather than `eprintln!`, which libtest swallows for
+//! a test that passes. Never silently green: a skip that said nothing would make
+//! a laptop's `cargo test` and CI's mean different things while reading the same.
 //!
 //! CI sets both, against `postgres:17` and `mysql:8` service containers declared
 //! in `.github/workflows/ci.yml`. That is the ratified shape of PRD resolved
@@ -43,6 +49,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -159,9 +166,47 @@ fn built(root: &Path, provider: &str) -> PathBuf {
     destination
 }
 
+/// Say something a plain `cargo test` really prints.
+///
+/// libtest captures a **passing** test's output, so the skip notices below
+/// written with `eprintln!` reached nobody: `cargo test` printed
+/// `2 passed; 0 ignored` and nothing else, and a laptop run that drove one of
+/// three backends read exactly like CI's run that drove all three — the state
+/// this module's docs say a skip must never leave. The capture is installed on
+/// the `print!`/`eprint!` family (`std::io::_print` and `_eprint` consult it);
+/// a write to the process's own stderr handle is fd 2 and goes to the terminal.
+fn notice(message: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "{message}");
+    let _ = stderr.flush();
+}
+
 /// Drive the contract runner against one built project, or `None` where the
 /// backend's server is absent.
 fn contract(root: &Path, backend: &Backend) -> Option<BTreeMap<String, Value>> {
+    // **Built and type-checked before the server is asked for**, because
+    // neither needs one and the two things that would go unchecked are not
+    // small. A remote arm is emitted only into a project that pins its driver,
+    // and this is where that pairing is checked for the two arms no golden
+    // carries: the Postgres one rides along on `triage-fanout-staging`, and
+    // **MySQL has no golden at all**, so a wrong `RowDataPacket` generic or a
+    // renamed export from `mysql2/promise` would pass `cargo fmt`, `cargo
+    // clippy` and `cargo test --workspace` on a machine with no MySQL and fail
+    // only in CI. What an absent server skips is the **run**, below.
+    let project = built(root, backend.provider);
+    let checked = bun()
+        .args(["run", "typecheck"])
+        .current_dir(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        checked.status.success(),
+        "the `{}` journal project does not type-check:\n{}\n{}",
+        backend.provider,
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr),
+    );
+
     let address = match backend.variable {
         None => None,
         Some(variable) => match std::env::var(variable) {
@@ -176,33 +221,17 @@ fn contract(root: &Path, backend: &Backend) -> Option<BTreeMap<String, Value>> {
                     backend.provider,
                     backend.provider,
                 );
-                eprintln!(
+                notice(&format!(
                     "warning: skipping the `{}` journal conformance cases — `{variable}` is \
-                     unset, so there is no server to drive them against. It is set in CI \
-                     (see .github/workflows/ci.yml); set it locally to run them.",
+                     unset, so there is no server to drive them against. The project was still \
+                     built and type-checked. It is set in CI (see .github/workflows/ci.yml); \
+                     set it locally to run them.",
                     backend.provider
-                );
+                ));
                 return None;
             }
         },
     };
-
-    let project = built(root, backend.provider);
-    // Every project type-checks, including the two that carry a network driver:
-    // a remote arm is emitted only into a project that pins its driver, so this
-    // is where that pairing is checked for the two arms no golden carries.
-    let checked = bun()
-        .args(["run", "typecheck"])
-        .current_dir(&project)
-        .output()
-        .expect("bun runs");
-    assert!(
-        checked.status.success(),
-        "the `{}` journal project does not type-check:\n{}\n{}",
-        backend.provider,
-        String::from_utf8_lossy(&checked.stdout),
-        String::from_utf8_lossy(&checked.stderr),
-    );
 
     let mut command = runner("journal-contract.mjs");
     command.arg(&project);
@@ -316,7 +345,13 @@ fn every_journal_backend_answers_the_same_contract() {
             );
             for named in [
                 "one process at a time",
-                "released the moment that connection ends",
+                "released when that session ends",
+                // …and the bound, which is the half a takeover needs. A dead
+                // host's session holds the guard until its server notices, so a
+                // refusal that only said "a process that died is not holding
+                // this" would send an operator hunting for a live `serve` that
+                // does not exist (§2.3).
+                "300s",
             ] {
                 assert!(
                     guard.contains(named),
@@ -326,12 +361,104 @@ fn every_journal_backend_answers_the_same_contract() {
                 );
             }
         }
+
+        // **…and the guard of a hub that is gone.** The case above is a *live*
+        // second opener, which is the easy half. §2.3's headline property —
+        // "a `serve` restarted on a fresh machine recovers every open
+        // execution" — is a promise about taking over from a host that has
+        // stopped, and a guard that outlived its holder refuses exactly that
+        // takeover while the refusal text sends the operator hunting for a
+        // `serve` that does not exist. The runner ends the holder's session
+        // from another connection, which is the path the server's own reap
+        // takes without the wait for it.
+        let takeover = answered
+            .get("a_takeover_is_not_locked_out_by_a_dead_session")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let after = answered
+            .get("a_lost_connection_is_refused_rather_than_fatal")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if backend.variable.is_none() {
+            assert_eq!(
+                takeover, "not-applicable",
+                "SQLite has no session to end; its stale lock is broken after a deadline \
+                 instead (`docs/durability.md` §2.2)"
+            );
+        } else if let Some(reason) = takeover.strip_prefix("not-available: ") {
+            // Not a failure and not silence: a server this runner may not ask
+            // to end a session is a case that could not run, and saying which
+            // is the difference between an unchecked promise and an unnoticed
+            // one.
+            notice(&format!(
+                "warning: the `{provider}` journal's dead-owner case did not run ({reason}), so \
+                 `docs/durability.md` §2.3's cross-host takeover is unchecked on this server. \
+                 It needs a connection allowed to end another session of its own user — which \
+                 the service containers in .github/workflows/ci.yml are."
+            ));
+        } else {
+            assert_eq!(
+                takeover, "admitted",
+                "the `{provider}` journal refused a takeover after the session holding its \
+                 writer guard had ended, so a `serve` restarted on a fresh machine is locked \
+                 out of the record it exists to resume — which is the property a remote \
+                 journal is for (`docs/durability.md` §2.3)"
+            );
+            // …and the process that lost that connection is still running,
+            // which is only true because each arm listens for its driver's
+            // `error` event: an `EventEmitter` emitting `error` with nothing
+            // listening ends the process, and a `serve` ended that way loses
+            // every in-flight execution's in-process state.
+            assert_ne!(
+                after, "answered",
+                "the `{provider}` journal answered a statement over a connection whose session \
+                 the server had ended, so it is reading something other than that server"
+            );
+            assert!(
+                !after.starts_with("not-available"),
+                "the `{provider}` journal's lost-connection case did not run: {after}"
+            );
+        }
     }
     assert!(
         driven.contains(&"sqlite"),
         "SQLite needs no server and is always driven; a run that skipped it read nothing"
     );
-    eprintln!("note: the journal contract ran against {driven:?}");
+    notice(&format!(
+        "note: the journal contract ran against {driven:?}; every backend was built and \
+         type-checked"
+    ));
+}
+
+/// **The runner and the module name one writer guard.**
+///
+/// The runner has to name MySQL's lock to find the session holding it —
+/// `IS_USED_LOCK` takes the name — so that literal exists twice. A copy nothing
+/// compares is a copy that drifts, and the drift is silent in the worst
+/// direction: `IS_USED_LOCK` of a name nobody took answers `NULL`, the runner
+/// reports the dead-owner case as unavailable, and the suite goes green having
+/// checked the one thing it was added for in neither direction.
+#[test]
+fn the_runner_and_the_module_take_one_writer_guard() {
+    const MODULE: &str = include_str!("../src/codegen/js/journal.ts");
+    const RUNNER: &str = include_str!("toolchain/journal-contract.mjs");
+    let named = |source: &str, whose: &str| -> String {
+        source
+            .split_once("const WRITER_GUARD = \"")
+            .unwrap_or_else(|| panic!("{whose} declares the writer guard's name"))
+            .1
+            .split('"')
+            .next()
+            .unwrap_or_else(|| panic!("{whose} declares it as a string literal"))
+            .to_string()
+    };
+    assert_eq!(
+        named(MODULE, "`src/codegen/js/journal.ts`"),
+        named(RUNNER, "`tests/toolchain/journal-contract.mjs`"),
+        "the journal takes its MySQL guard under one name and the conformance runner looks for \
+         another, so the dead-owner case finds nothing holding a lock and reports itself \
+         unavailable on a server that is working perfectly (PRD resolved q62)"
+    );
 }
 
 /// The version `docs/durability.md` heads with, read off the document.
@@ -351,9 +478,15 @@ fn journal_version() -> u64 {
 /// so a failure reads as the sentence of `docs/durability.md` it broke rather
 /// than as an index into a runner.
 const TRUE_EVERYWHERE: &[&str] = &[
-    // §10, §11.2 — the schema is created on first open and a second open does
-    // nothing.
+    // §10, §11.2 — the schema is created on first open, and a second open —
+    // a released journal re-opened, so the DDL really runs again against tables
+    // that already exist — does nothing rather than failing.
     "open_is_idempotent",
+    // …and one process gets one handle. `openJournal` memoizes its promise,
+    // which is what keeps a `serve` recovering several executions at once from
+    // opening several connections — on a remote binding the second would meet
+    // its own writer guard and refuse (§2.3).
+    "open_memoizes_one_handle",
     // §3.5 — a lifecycle row is written once and the second `begin` of one id is
     // a no-op, which is what a recovered execution re-entering `openExecution`
     // relies on.
@@ -365,6 +498,13 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "payload_round_trips_a_large_blob",
     "a_record_reads_back_its_request",
     "append_is_idempotent",
+    // …and the columns that are not payloads, which is where the sizes really
+    // diverge: MySQL's `TEXT` is 64 KiB and its shipped `STRICT_TRANS_TABLES`
+    // makes an over-long value an error rather than a truncation, so a failure
+    // message or an attempt's detail this size is a write two backends take and
+    // one could refuse — leaving a lifecycle row `open` for ever (§3.6, §10).
+    "a_large_error_round_trips",
+    "a_large_delivery_detail_round_trips",
     // §4 — two keys differing only in case are two effects.
     "keys_are_case_sensitive",
     // §5 — the frontier is the first key the journal does not hold.
