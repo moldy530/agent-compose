@@ -2840,7 +2840,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
   history       TEXT,
   policy        TEXT,
   status        TEXT COLLATE "C" NOT NULL,
-  session       TEXT,
+  session       TEXT COLLATE "C",
   outcome       TEXT COLLATE "C",
   payload       TEXT,
   parked_at     TEXT COLLATE "C" NOT NULL,

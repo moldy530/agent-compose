@@ -206,9 +206,9 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
 
   // …and the columns that are **not** payloads take what a real failure is.
   //  `executions.error` holds a provider's whole failure body or a harness run's
-  //  quoted transcript; MySQL's `TEXT` is 64 KiB and its shipped
-  //  `STRICT_TRANS_TABLES` makes an over-long value an error rather than a
-  //  truncation, so a `failed` outcome this size is a write SQLite and Postgres
+  //  quoted transcript; MySQL's `TEXT` is 64 KiB and the `STRICT_TRANS_TABLES`
+  //  that arm sets on its session makes an over-long value an error rather than
+  //  a truncation, so a `failed` outcome this size is a write SQLite and Postgres
   //  take and one backend could refuse — leaving the lifecycle row `open` for
   //  ever, so every later `serve` start re-recovers an execution that has
   //  already finished (§3.6, §10). The blob case above drives the one column
@@ -301,6 +301,19 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
     (await handle.claimDispatch("dsp_1", "session-a"))?.session === "session-a";
   results.a_second_claim_takes_nothing =
     (await handle.claimDispatch("dsp_1", "session-b")) === undefined;
+  // …and a release is the **holder's** alone. This one is a collation case as
+  // much as a predicate case: `releaseDispatch` compares the session **in SQL**,
+  // so the column's collation is what decides it, and on a case-insensitive one
+  // — MySQL's own table default — a worker whose id differed from the holder's
+  // only in case would put another worker's in-flight work back on the board
+  // (§3.8, §10).
+  await handle.claimDispatch("dsp_2", "session-a");
+  results.a_release_by_another_session_takes_nothing =
+    (await handle.releaseDispatch("dsp_2", "SESSION-A")) === false &&
+    (await handle.dispatchOf("dsp_2"))?.status === "dispatched";
+  results.a_release_by_the_holder_parks_it_again =
+    (await handle.releaseDispatch("dsp_2", "session-a")) === true &&
+    (await handle.dispatchOf("dsp_2"))?.status === "parked";
   results.a_settle_answers_once =
     (await handle.settleDispatch("dsp_1", { kind: "value", value: { ok: UNICODE } })) === true &&
     (await handle.settleDispatch("dsp_1", { kind: "value", value: { ok: "again" } })) === false;

@@ -992,7 +992,10 @@ async function ask(
       output.write(asked(wait));
       continue;
     }
-    const outcome = deliverHumanAnswer(execution, wait.id, payload);
+    // Awaited for the resume route's reason: `taken.` is printed once the
+    // journal holds the answer, never while the append is still in flight
+    // (`runtime.deliverHumanAnswer`).
+    const outcome = await deliverHumanAnswer(execution, wait.id, payload);
     if (outcome.ok) {
       output.write(`taken.\n`);
       return "settled";

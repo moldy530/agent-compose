@@ -523,10 +523,11 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_record_reads_back_its_request",
     "append_is_idempotent",
     // …and the columns that are not payloads, which is where the sizes really
-    // diverge: MySQL's `TEXT` is 64 KiB and its shipped `STRICT_TRANS_TABLES`
-    // makes an over-long value an error rather than a truncation, so a failure
-    // message or an attempt's detail this size is a write two backends take and
-    // one could refuse — leaving a lifecycle row `open` for ever (§3.6, §10).
+    // diverge: MySQL's `TEXT` is 64 KiB and the `STRICT_TRANS_TABLES` that arm
+    // sets on its session makes an over-long value an error rather than a
+    // truncation, so a failure message or an attempt's detail this size is a
+    // write two backends take and one could refuse — leaving a lifecycle row
+    // `open` for ever (§3.6, §10).
     "a_large_error_round_trips",
     "a_large_delivery_detail_round_trips",
     // §4 — two keys differing only in case are two effects.
@@ -548,6 +549,12 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "park_is_idempotent",
     "a_claim_hands_the_row_over",
     "a_second_claim_takes_nothing",
+    // …and a release belongs to the holder, which is a **collation** case as
+    // much as a predicate one: the session is compared in SQL, so a column left
+    // at a case-insensitive default would let one worker put another's in-flight
+    // dispatch back on the board (§3.8, §10).
+    "a_release_by_another_session_takes_nothing",
+    "a_release_by_the_holder_parks_it_again",
     "a_settle_answers_once",
     "a_settled_dispatch_keeps_its_outcome",
 ];

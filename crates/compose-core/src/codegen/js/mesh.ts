@@ -723,10 +723,12 @@ function awaited(
  * its next resume (`docs/durability.md` §3.4), so the throw travels as this
  * node's failure rather than being swallowed. It is also **inside** the
  * settlement rather than after it, which is the other half of the same rule: the
- * resume route answers `202` when `settle` returns, so a record appended in a
- * later turn of the loop is one a process killed in between never wrote. The
- * writer below is what `runtime.holdRemotePause` calls where `runtime.runHuman`
- * calls `slot.keep`.
+ * resume route answers `202` only once the settlement's write has landed — it
+ * awaits the very promise this returns (`runtime.deliverHumanAnswer`, the
+ * `Held.kept` it waits on) — so a record appended in a later turn of the loop
+ * would be one a process killed in between never wrote and an operator had
+ * already been told was taken. The writer below is what
+ * `runtime.holdRemotePause` calls where `runtime.runHuman` calls `slot.keep`.
  *
  * The wait's budget is the node's own `timeout:`, spent from the moment
  * `holdRemotePause` puts it on the board — never the worker-stamped

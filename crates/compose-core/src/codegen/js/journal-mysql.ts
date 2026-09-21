@@ -38,25 +38,44 @@ import type { Connection, RowDataPacket } from "mysql2/promise";
  * character is what then makes a two-column primary key fit inside InnoDB's
  * index limit with room to spare.
  *
- * **A column that is unbounded on the other two backends is `LONGTEXT` here**,
- * and that is the rule rather than a list. `TEXT` holds 64 KiB, MySQL 8 ships
- * `STRICT_TRANS_TABLES`, and this arm preserves whatever `sql_mode` the server
- * has — so an over-long value is an *error* rather than a truncation, and an
- * error on a write the other two backends took is "one contract, three
- * backends" untrue on one of them. The columns that make that concrete are not
- * only the payloads: `executions.error` is a provider's whole failure body or a
- * harness run's quoted transcript, and a `journal.end(id, 'failed', …)` the
- * server refuses leaves the lifecycle row `open` for ever — so every later
- * `serve` start re-recovers and re-replays an execution that has already
- * finished.
+ * **A column is compared if any statement's `WHERE` names it**, not only if it
+ * is a key: `dispatches.session` is the one that reads as a payload and is not.
+ * `releaseDispatch` puts a claimed row back on the board `WHERE … session = ?`,
+ * so on the table's own case-insensitive default a worker whose session id
+ * differed from the holder's only in case would release work another worker has
+ * in flight — which SQLite's `BINARY` and Postgres' `COLLATE "C"` both refuse.
+ * That today's ids are lowercase `wrk_<uuid>` is a property of the generator,
+ * and the schema is where that guarantee belongs.
  *
- * The exceptions are the columns MySQL will not index without a bound, and they
- * are bounded here rather than anywhere else: `VARCHAR(2048)` on the two halves
- * of a compound primary key that are not fixed-shape ids — `effects."key"` and
- * `dispatches.wait` — which with `VARCHAR(255)` beside them and one ASCII byte
- * per character leaves a 2303-byte key inside InnoDB's 3072-byte index limit
- * with room to spare. `ROW_FORMAT=DYNAMIC` is declared rather than inherited
- * because that limit is 767 bytes under the older row formats a server's
+ * **A column whose value is the caller's is `LONGTEXT` here**, and that is the
+ * rule rather than a list. `TEXT` holds 64 KiB and [`openMysql`] sets
+ * `STRICT_TRANS_TABLES` on the session — so an over-long value is an *error*
+ * rather than a truncation, and an error on a write the other two backends took
+ * is "one contract, three backends" untrue on one of them. The columns that
+ * make that concrete are not only the payloads: `executions.error` is a
+ * provider's whole failure body or a harness run's quoted transcript, and a
+ * `journal.end(id, 'failed', …)` the server refuses leaves the lifecycle row
+ * `open` for ever — so every later `serve` start re-recovers and re-replays an
+ * execution that has already finished.
+ *
+ * **A column whose value this codebase decides the shape of is bounded**, which
+ * is the other half of the same rule and the half the two other backends have no
+ * reason to spell: MySQL will not index an unbounded column at all, and an
+ * ASCII `VARCHAR` is what makes a compound key's arithmetic checkable. The
+ * bounds are `VARCHAR(2048)` on the two halves of a compound primary key that
+ * are not fixed-shape ids — `effects."key"` and `dispatches.wait` — which with
+ * `VARCHAR(255)` beside them and one ASCII byte per character leaves a
+ * 2303-byte key inside InnoDB's 3072-byte index limit with room to spare;
+ * `VARCHAR(255)` on an id this runtime mints, which is a four-character prefix
+ * and a UUID — `exec_`, `dsp_`, `wrk_`, 41 characters; `VARCHAR(16)` on the
+ * status, kind, event and outcome words, every one of which is a closed set
+ * this compiler emits; and `VARCHAR(32)` on an instant, which is an ISO-8601
+ * string of 24. Widening any of those values is a change to this schema too,
+ * and `docs/durability.md` §10 is where that is written down for somebody who
+ * is not reading this file.
+ *
+ * `ROW_FORMAT=DYNAMIC` is declared rather than inherited because the index limit
+ * above is 767 bytes under the older row formats a server's
  * `innodb_default_row_format` can still name, and a schema that created itself
  * differently on two servers would be the divergence this file exists to avoid.
  *
@@ -127,7 +146,7 @@ const MYSQL_SCHEMA = [
   history       LONGTEXT,
   policy        LONGTEXT,
   status        VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  session       VARCHAR(255),
+  session       VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin,
   outcome       VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin,
   payload       LONGTEXT,
   parked_at     VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
@@ -276,6 +295,20 @@ class MysqlDriver implements JournalDriver {
  * every literal `SqlJournal` spells is single-quoted, and this connection runs
  * no statement but its own.
  *
+ * **`STRICT_TRANS_TABLES` is set beside it, and it is the schema's arithmetic
+ * rather than a preference.** Every bounded column above rests on an over-long
+ * value being an *error*; without the mode MySQL right-**truncates** instead,
+ * silently, and the column it costs most is `effects."key"`. A journal key is
+ * `<site>#<kind>/<ordinal>` over an instance path, so a deep enough nesting can
+ * pass `VARCHAR(2048)` — and two keys sharing a 2048-byte prefix would truncate
+ * to the *same* primary key, which turns the second `append` into
+ * [`duplicateKeyNoop`] and hands the first effect's recorded answer back at the
+ * second effect's site. That is the silent wrong answer this arm chose
+ * `ON DUPLICATE KEY UPDATE` over `INSERT IGNORE` to avoid. MySQL 8 ships the
+ * mode on, but a managed or legacy server with `sql_mode=''` does not, so the
+ * session says so rather than assuming it. Both modes are appended to whatever
+ * the server has: nothing an operator configured is dropped.
+ *
  * `GET_LOCK(name, 0)` rather than a timeout: a second opener is told what is
  * happening ([`guardHeld`]) rather than left blocking on a connection that may
  * be a `serve` which will hold it for days. The name is [`MYSQL_GUARD_NAME`],
@@ -319,9 +352,11 @@ async function openMysql(): Promise<JournalDriver> {
     // `CONCAT_WS` rather than `CONCAT`, because a server whose `sql_mode` is
     // empty would otherwise be handed a list with a leading comma — an empty
     // mode name, which MySQL refuses. `NULLIF` is what turns the empty string
-    // into the `NULL` `CONCAT_WS` skips.
+    // into the `NULL` `CONCAT_WS` skips. A mode the server already has is named
+    // twice and collapses: `sql_mode` is a `SET`, so a repeated member is one
+    // bit set twice.
     await connection.query(
-      "SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@sql_mode, ''), 'ANSI_QUOTES')",
+      "SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@sql_mode, ''), 'ANSI_QUOTES', 'STRICT_TRANS_TABLES')",
     );
     // Best effort, and said out loud where it does not take: see
     // [`guardWindowUnshortened`].

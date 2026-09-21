@@ -11849,6 +11849,27 @@ interface Held {
   readonly parse: (payload: unknown) => unknown;
   /** Set the moment this pause stops waiting, whichever side stopped it. */
   settled?: Settlement;
+  /**
+   * The journal write this settlement started, where it started one.
+   *
+   * **What makes a `202` mean the answer is down.** `settle` is synchronous —
+   * its caller reads the `boolean` it answers to decide whether this call was
+   * the one that settled the wait — while the append beneath it is not, and on a
+   * `postgres` or `mysql` journal it is a network round trip. Left at that, the
+   * surface that delivered the answer would tell the person it was taken a turn
+   * of the loop *before* the record existed, and a hub killed in that gap would
+   * come back holding a wait with no answer in the journal and ask them the same
+   * question again (`docs/durability.md` §3.4). So the settlement hands its
+   * write back here and [`deliverHumanAnswer`] awaits it before it answers.
+   *
+   * **It is settled either way and never rejected**: the arm that started it has
+   * already chained the node's own ending onto it, so a write that failed is
+   * reported as the *node's* failure (see [`runHuman`]) and a second reader here
+   * would only be a second report of it. An outcome that journals nothing —
+   * `abandoned`, `interrupted` — leaves it unset, and awaiting `undefined` is
+   * the same nothing.
+   */
+  kept?: Promise<void>;
 }
 
 /** Every pause one execution is holding, in the order they began. */
@@ -12475,12 +12496,23 @@ export function humanWaits(execution: string): readonly HumanWait[] {
  * and the *node* failing with the write's own error (see [`runHuman`]): the turn
  * was spent, so it is not offered again here, and the run stops rather than
  * going on from a wait its own record does not hold.
+ *
+ * **And it answers no sooner than that record does.** This is `async` for one
+ * reason: the settlement's journal append is a promise — a network round trip on
+ * a `postgres` or `mysql` journal — and both surfaces above report success the
+ * moment this returns. Answering while the `INSERT` was still in flight would
+ * make `202` and `taken.` claims about a row that may never land: a hub whose
+ * host dies in that gap is recovered on a fresh machine, finds no record at the
+ * wait's key, re-parks it and asks the person the question they were just told
+ * was answered (`docs/durability.md` §3.4). So the write is awaited here (see
+ * [`Held.kept`]), and the refusals — every one of which consumes nothing — are
+ * the only answers this gives without one.
  */
-export function deliverHumanAnswer(
+export async function deliverHumanAnswer(
   execution: string,
   wait: string | undefined,
   payload: unknown,
-): ResumeOutcome {
+): Promise<ResumeOutcome> {
   const board = humanBoards.get(execution);
   const held = board === undefined ? [] : [...board.held.values()];
   // Ordered by id, for [`humanWaits`]'s reason and so that the two surfaces a
@@ -12543,6 +12575,11 @@ export function deliverHumanAnswer(
       detail: settledDetail(chosen.wait.id, chosen.settled ?? "expired"),
     };
   }
+  // The record this settlement started, waited for before anybody is told the
+  // answer was taken. It is settled either way — the node is what reports a
+  // write that failed — so there is nothing to catch and nothing this refuses
+  // for: see [`Held.kept`].
+  await chosen.kept;
   return { ok: true, wait: chosen.wait };
 }
 
@@ -12790,7 +12827,11 @@ export async function runHuman(
         // never returns. The run does not fail, does not park and does not end —
         // it hangs, which is the one outcome a durable execution has no way back
         // from. So the failure travels as the node's instead.
-        void kept(slot, {
+        //
+        // **The chained promise stays on the entry** rather than being dropped,
+        // for [`Held.kept`]'s reason: the surface that delivered this answer
+        // waits for it before it tells the person their answer was taken.
+        mine.kept = kept(slot, {
           ...instants,
           settled: "resumed",
           output: value,
@@ -12820,7 +12861,7 @@ export async function runHuman(
         // a caller could report. The expiry is not routed either — a run that
         // took `on_timeout:` past a wait whose expiry the journal does not hold
         // would re-park on the resume and spend the budget again.
-        void kept(slot, {
+        mine.kept = kept(slot, {
           ...instants,
           settled: "expired",
           settledAt: ended.settledAt,
@@ -13061,12 +13102,11 @@ export async function holdRemotePause(
       announce(execution);
       if (outcome === "resumed" || outcome === "expired") {
         // **Written before the promise resolves**, which is where [`runHuman`]
-        // writes a local pause's record and for the same reason: the caller of
-        // this promise answers the person `202` and the route returns, so a
-        // record appended after it is one a process killed in between never
-        // wrote — leaving a wait this board has settled, with nothing in the
-        // journal, which the next start re-derives off the settled dispatch row
-        // and asks a second time (`docs/durability.md` §3.4).
+        // writes a local pause's record and for the same reason: an answer the
+        // person has been told was taken, with nothing in the journal, is one
+        // the next start re-derives off the settled dispatch row and asks a
+        // second time (`docs/durability.md` §3.4). The delivering surface waits
+        // for this very write before it says so — see [`Held.kept`].
         //
         // An expiry is journaled the same way and **routed by the node**, not
         // here: the redispatch replays this record, and `runHuman` raises the
@@ -13089,8 +13129,11 @@ export async function holdRemotePause(
         // promise nothing can ever settle and a node that never returns. It
         // travels as the node's failure instead — the journal could not record
         // what the person said, and a run that went on from a wait its own
-        // record does not hold is one whose resume would ask them again.
-        void keep(settled).then(
+        // record does not hold is one whose resume would ask them again. The
+        // chained promise stays on the entry for [`Held.kept`]'s reason, which
+        // is the same one on both boards: the resume route waits for it before
+        // it answers `202`.
+        mine.kept = keep(settled).then(
           () => resolve(settled),
           (error: unknown) => reject(error),
         );

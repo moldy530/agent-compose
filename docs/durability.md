@@ -575,6 +575,16 @@ was spent, and a pause may not settle twice — and the run stops there rather
 than going on from a wait its own record does not hold, which is a wait the
 resume would put to the person a second time.
 
+An answer is **acknowledged no sooner than it is recorded**. The surfaces that
+take one — `POST /executions/:id/resume`'s `202`, and the `taken.` the terminal
+of a `run` prints — answer once the record above is down, not when the wait was
+settled in this process's memory. Settling a wait is synchronous and appending
+its record is not; on a remote journal (§10) the difference is a network round
+trip, and a hub whose host dies inside it is recovered on another machine, finds
+no record at that wait's key, re-parks it by the paragraph below, and puts to the
+person a question they have already been told was answered. A *refusal* carries
+no such promise and needs none: every refusal on both surfaces consumes nothing.
+
 An **unsettled** wait records nothing, and that is the whole of re-parking: a
 resumed execution reaching a wait the journal does not hold parks under the same
 wait id — the id is the node's instance path (`docs/grammar.md` §9.4), so it is
@@ -1481,18 +1491,52 @@ journal older than they are exists. A column added to a remote schema in a later
 release is the case to read §11.2 twice for, exactly as it is on the file.
 
 **A column holds the same values on all three.** The types differ — that is what
-a per-backend schema is for — but what fits does not: every column that is
-unbounded `TEXT` on SQLite and Postgres is `LONGTEXT` on MySQL, whose `TEXT` is
-64 KiB and whose shipped `STRICT_TRANS_TABLES` makes an over-long value an error
-rather than a truncation. That is not only about payloads: an execution's
-`error` is a provider's whole failure body, and a `failed` outcome the server
-refused would leave the lifecycle row `open` for ever, so every later `serve`
-start would re-recover an execution that has already finished. The two
-exceptions are the columns MySQL will not index without a bound — `effects.key`
-and `dispatches.wait`, `VARCHAR(2048)` each — which is a limit of that backend
-rather than of this document. Key ordering and case sensitivity are stated per
-backend in the same place: SQLite's `BINARY`, Postgres' `COLLATE "C"`, MySQL's
-`ascii_bin`, all of which make §4's key order the order a reader derives.
+a per-backend schema is for — but what fits does not. SQLite and Postgres spell
+every string column `TEXT`, which is unbounded on both. MySQL cannot: its `TEXT`
+is 64 KiB, and it will not index a column with no bound at all. So its schema
+splits the columns in two, and the split is the rule to read before widening any
+value this project writes.
+
+* **A value the caller decides the size of is `LONGTEXT`** — every payload,
+  every request, an execution's `inputs`, a delivery's `body` and `attempts`, a
+  dispatch's `inputs`, `history` and `policy`, a node address, a placement, and
+  an instance `site`. So is `executions.error`, which is a provider's whole
+  failure body or a harness run's quoted transcript: a `failed` outcome the
+  server refused would leave the lifecycle row `open` for ever, so every later
+  `serve` start would re-recover an execution that has already finished.
+* **A value whose shape this project fixes is a bounded `VARCHAR`**, and there
+  are four bounds. `VARCHAR(2048)` on `effects.key` and `dispatches.wait` — the
+  halves of a compound primary key that are not fixed-shape ids, and the pair
+  whose arithmetic has to stay inside InnoDB's 3072-byte index limit.
+  `VARCHAR(255)` on every id the runtime mints, which is a four-character prefix
+  and a UUID: `executions.id`, `effects.execution`, `deliveries.execution`,
+  `dispatches.execution`, `dispatches.id` and `dispatches.session`.
+  `VARCHAR(16)` on the `status`, `kind`, `event` and `outcome` columns, each a
+  closed set of words this compiler emits. `VARCHAR(32)` on every instant, which
+  is an ISO-8601 string of 24.
+
+The two classes meet at one seam worth naming: a `site` is `LONGTEXT` while the
+`effects.key` and `dispatches.wait` derived from it are bounded at 2048 bytes, so
+an instance path long enough to matter is refused at the key rather than at the
+site. §4's keys are `<site>#<kind>/<ordinal>` over an instance path, and 2048
+ASCII bytes of path is the depth this schema supports.
+
+**Widening one of those values is a change to the MySQL schema too**: a longer
+session id, an instant in another format, a fifth status word past sixteen
+characters. MySQL is the backend that refuses the write; SQLite and Postgres
+take it, which is what makes the divergence worth stating here rather than only
+in the schema. The refusal is a refusal rather than a silent right-truncation
+because the MySQL arm sets `STRICT_TRANS_TABLES` on its session — MySQL 8 ships
+it on, a managed or legacy server with `sql_mode=''` does not, and a truncated
+`effects.key` would be two effects collapsing onto one primary key and a replay
+handing the first one's answer back at the second one's site.
+
+Key ordering and case sensitivity are stated per backend in the same place:
+SQLite's `BINARY`, Postgres' `COLLATE "C"`, MySQL's `ascii_bin`, all of which
+make §4's key order the order a reader derives. That binding covers every column
+a statement compares, not only the keys — `dispatches.session` is compared by
+`releaseDispatch`, so a case-insensitive collation there would let one worker put
+another worker's in-flight dispatch back on the board.
 
 **How each backend is proved.** The contract of this document is a conformance
 suite — `crates/compose-core/tests/journal_backend_conformance.rs` — which drives

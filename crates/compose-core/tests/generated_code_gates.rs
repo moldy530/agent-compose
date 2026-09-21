@@ -2172,6 +2172,34 @@ fn the_wait_board_behaved(observed: &Value) {
     );
     assert_eq!(observed["answering"]["still_published"], json!([]));
 
+    // …and the answer is **acknowledged after it is recorded**, not before.
+    // `settle` is synchronous while the append beneath it is a promise — a
+    // network round trip on a `postgres` or `mysql` journal (PRD resolved q62) —
+    // so a delivery that answered the moment the wait was settled would have the
+    // resume route reply `202`, and `agent-compose run` print `taken.`, while
+    // the `INSERT` was still in flight. A hub killed in that gap is recovered on
+    // a fresh machine, finds no `human` record at the wait's key and puts to the
+    // person the question they were just told was answered
+    // (`docs/durability.md` §3.4). The recorder's write is deferred a turn of
+    // the loop, so the two events are orderable: `written` before
+    // `acknowledged`, or the guarantee is gone.
+    assert_eq!(
+        observed["acknowledging"]["order"],
+        json!(["written", "acknowledged"]),
+        "an answer is acknowledged before its journal record is written, so a `202` claims a \
+         row the person's hub may never have had: {observed}"
+    );
+    assert_eq!(
+        observed["acknowledging"]["taken"],
+        json!({ "ok": true, "wait": "review/0/sign/0" })
+    );
+    assert_eq!(observed["acknowledging"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["acknowledging"]["output"],
+        json!({ "decision": "approve" }),
+        "the node went on with something other than the answer the journal took: {observed}"
+    );
+
     // …and a journal that refuses the settled wait's record fails the **node**
     // rather than leaving the pause parked for ever. The wait is marked settled
     // before the record is written, so a write that threw out of the settlement

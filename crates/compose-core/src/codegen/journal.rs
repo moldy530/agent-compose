@@ -305,6 +305,84 @@ mod tests {
         );
     }
 
+    /// **The strict mode the MySQL schema's bounds rest on is set, not assumed**
+    /// (`docs/durability.md` §10).
+    ///
+    /// Every bounded column in `MYSQL_SCHEMA` — and the whole argument that a
+    /// value too long for one is an *error* on all three backends rather than a
+    /// silent divergence on one — rests on `STRICT_TRANS_TABLES`. Without it
+    /// MySQL right-**truncates**, and the column it costs most is
+    /// `effects."key"`: two journal keys sharing a 2048-byte prefix would
+    /// truncate to the same primary key, so the second `append` becomes
+    /// `duplicateKeyNoop` and the replay hands the first effect's recorded
+    /// answer back at the second effect's site.
+    ///
+    /// MySQL 8 ships the mode on, which is exactly why this is a drift test
+    /// rather than a conformance case: CI's server has it, so no case run
+    /// against a real database can see it missing, and the servers that do not
+    /// have it — `sql_mode=''` on a managed or legacy deployment — are the ones
+    /// nobody is running the suite against. It is read off the statement rather
+    /// than off the file for the sibling above's reason.
+    #[test]
+    fn mysql_sets_the_strict_mode_its_column_bounds_rest_on() {
+        let opening = function_code(MYSQL, "openMysql");
+        assert!(
+            opening.contains("SET SESSION sql_mode") && opening.contains("'STRICT_TRANS_TABLES'"),
+            "`openMysql` no longer sets `STRICT_TRANS_TABLES` on its session, so a server \
+             configured with a relaxed `sql_mode` silently truncates an over-long value where \
+             SQLite and Postgres refuse it — and two effect keys sharing a 2048-byte prefix \
+             become one row (`docs/durability.md` §10)"
+        );
+        assert!(
+            MYSQL.contains("VARCHAR(2048)"),
+            "the MySQL schema no longer bounds the two halves of a compound key that are not \
+             fixed-shape ids, so the strict mode above is holding nothing"
+        );
+    }
+
+    /// **Every column a statement compares carries a binary collation**, and the
+    /// one a reader would not look for is `dispatches.session`.
+    ///
+    /// Each arm states the rule — `COLLATE "C"` on Postgres, `ascii_bin` on
+    /// MySQL, "on every column a statement compares or orders by" — and the
+    /// keys and status words are where a reader checks it. `session` reads as a
+    /// payload and is not: `releaseDispatch` puts a claimed row back on the
+    /// board `WHERE … AND session = ?`, so a column left at MySQL's
+    /// case-insensitive table default would let a worker release a dispatch
+    /// another worker is holding, where SQLite's `BINARY` and a deterministic
+    /// Postgres collation both refuse it (`docs/durability.md` §3.8).
+    ///
+    /// Held here rather than only in the conformance suite because the ids the
+    /// runtime mints are lowercase, so the guarantee is currently an accident of
+    /// the generator; this is the assertion that it is the schema's.
+    #[test]
+    fn the_session_a_release_compares_is_bound_to_a_binary_collation() {
+        assert!(
+            SOURCE.contains("AND session = ?"),
+            "`releaseDispatch` no longer compares the session in SQL, so the collations below \
+             are guarding something else"
+        );
+        for (arm, name, bound) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "session       TEXT COLLATE \"C\"",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "session       VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin",
+            ),
+        ] {
+            assert!(
+                arm.contains(bound),
+                "`{name}` declares `dispatches.session` without the binary collation its own \
+                 schema comment requires of every compared column, so `releaseDispatch` can put \
+                 a dispatch another session is holding back on the board"
+            );
+        }
+    }
+
     /// **Each arm takes a writer guard, and says what a second opener is told**
     /// (`docs/durability.md` §2, PRD resolved q42, q62).
     ///
