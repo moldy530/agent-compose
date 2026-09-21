@@ -193,9 +193,12 @@ class MysqlDriver implements JournalDriver {
 async function openMysql(): Promise<JournalDriver> {
   const connection = await createConnection({
     uri: journalUrl(),
-    // Every payload is canonical JSON this module parses itself, and a column
-    // MySQL decoded into an object would arrive as something `JSON.parse` is
-    // then handed. The rows go in as text and come back as text.
+    // A `BIGINT` comes back as a **string** rather than as a JavaScript number,
+    // which is exact where a number is not: `dispatches.seq` is one, and so is
+    // the `MAX(ordinal) + 1` a delivery's ordinal is allocated from, because
+    // MySQL widens an aggregate over an `INT`. Every reader here goes through
+    // `Number(…)`, so a string costs nothing and a silently rounded 64-bit value
+    // would cost a row its identity.
     supportBigNumbers: true,
     bigNumberStrings: true,
   });

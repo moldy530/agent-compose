@@ -1133,40 +1133,50 @@ puts it there.
 fn journal_home(ir: &Ir) -> String {
     let provider = crate::ir::deploy::journal_of(ir);
     let mut section = String::from(JOURNAL_HOME);
-    match provider {
-        crate::ast::deploy::JournalProvider::Sqlite => section.push_str(JOURNAL_HOME_SQLITE),
-        remote => {
-            let variable = ir
-                .deploy
-                .journal
-                .as_ref()
-                .and_then(|journal| journal.url.as_ref())
-                .map(|url| url.value.name.clone())
-                .unwrap_or_default();
-            let drivers: Vec<String> = super::journal::pins_of(remote)
-                .iter()
-                .chain(super::journal::development_pins_of(remote))
-                .map(|(package, version)| format!("`{package}` at `{version}`"))
-                .collect();
-            section.push_str(&format!(
-                "This target binds a **`{}`** journal, at the address `${{{variable}}}` holds. \
-                 The variable is named here and never its value: `{variable}` is read at process \
-                 start, and `run`, `serve` and `resume` all fail before the graph is invoked \
-                 when it is unset. The record lives on that server rather than in this \
-                 directory, which is what lets a `serve` restarted on another machine recover \
-                 every execution this one left open — and what makes retention a `DELETE` \
-                 rather than removing a file.\n\n\
-                 This project therefore pins {} in `package.json`. A target that binds the \
-                 default journal pins neither.\n\n\
-                 **One process at a time writes this journal**, and the server holds a \
-                 session-scoped lock saying which. A second process that opens it is refused by \
-                 name rather than left to interleave; the lock goes with the connection, so a \
-                 process that died is never what is holding it.\n",
-                provider.as_str(),
-                drivers.join(" and "),
-            ));
-        }
+    if provider.opens_in_process() {
+        section.push_str(JOURNAL_HOME_SQLITE);
+        return section;
     }
+    let variable = ir
+        .deploy
+        .journal
+        .as_ref()
+        .and_then(|journal| journal.url.as_ref())
+        .map(|url| url.value.name.clone())
+        .unwrap_or_default();
+    let mut drivers = String::from("\n| package | version |\n|---|---|\n");
+    for (package, version) in super::journal::pins_of(provider)
+        .iter()
+        .chain(super::journal::development_pins_of(provider))
+    {
+        let _ = writeln!(drivers, "| `{package}` | `{version}` |");
+    }
+    let _ = write!(
+        section,
+        "This target binds a **`{}`** journal, at the address `${{{variable}}}` holds.\n\
+         The variable is named here and never its value: `{variable}` is read at\n\
+         process start, and `run`, `serve` and `resume` all fail before the graph is\n\
+         invoked when it is unset.\n\
+         \n\
+         The record lives on that server rather than in this directory, which is what\n\
+         lets a `serve` restarted on another machine recover every execution this one\n\
+         left open — and what makes retention a `DELETE` rather than removing a file.\n\
+         This project therefore pins the driver its journal is reached through, in\n\
+         `package.json` beside every other pin; a target that binds the default\n\
+         journal pins none of these:\n\
+         {}\n\
+         **One process at a time writes this journal**, and the server holds a\n\
+         session-scoped lock saying which. A second process that opens it is refused\n\
+         by name rather than left to interleave; the lock goes with the connection, so\n\
+         a process that died is never what is holding it.\n\
+         \n\
+         Because the journal holds what a trace deliberately does not — completions,\n\
+         tool results, a person's answer — it is private recovery data with the same\n\
+         sensitivity as this project's stores. Binding it into a shared database is\n\
+         this deploy file's explicit choice about where those payloads live.\n",
+        provider.as_str(),
+        drivers,
+    );
     section
 }
 
@@ -2270,6 +2280,63 @@ package_registry:
                 "the README does not document `{package}`"
             );
         }
+    }
+
+    /// **Every project is told where its journal lives, and which one it is**
+    /// (grammar §14.7, PRD resolved q62).
+    ///
+    /// Emitted unconditionally, unlike the sections around it, because
+    /// durability is unconditional (Decision D121): "where does this project's
+    /// record survive a restart" always has an answer, and a reader should not
+    /// have to know what the default is to find it.
+    ///
+    /// The half that is easy to get wrong is the address. A remote journal's is
+    /// a credential, and `docs/trace.md` §11.1 keeps a resolved `${ENV}` out of
+    /// every artifact this project writes — a README included — so what a reader
+    /// meets is the variable's **name**. A README that printed the value would
+    /// put a database password in a file every worker unpacks.
+    #[test]
+    fn every_project_is_told_which_journal_its_target_bound() {
+        let local = readme_of(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            local.contains("## Where this project's journal lives"),
+            "a project is not told where its journal is: {local}"
+        );
+        assert!(
+            local.contains(".agent-compose/journal.sqlite"),
+            "a target that bound the default is not told it is a file beside the project"
+        );
+        for package in ["`pg`", "`mysql2`", "`@types/pg`"] {
+            assert!(
+                !local.contains(package),
+                "the zero-infra build's README names {package}, which its `package.json` does \
+                 not pin and its `src/journal.ts` does not import"
+            );
+        }
+
+        let remote = readme_of(&crate::codegen::test_support::ir_of_mesh(
+            "version: \"0.1\"\n",
+            "version: \"0.1\"\njournal:\n  provider: postgres\n  url: ${JOURNAL_URL}\n",
+        ))
+        .contents;
+        assert!(
+            remote.contains("binds a **`postgres`** journal"),
+            "a target that bound a remote journal is not told which: {remote}"
+        );
+        assert!(
+            remote.contains("`${JOURNAL_URL}`") && remote.contains("| `pg` | "),
+            "the README names neither the variable holding the address nor the driver the \
+             manifest pins for it: {remote}"
+        );
+        assert!(
+            !remote.contains(".agent-compose/journal.sqlite"),
+            "a target that dials a server is told its record is in a file beside the project"
+        );
+        assert!(
+            remote.contains("One process at a time writes this journal"),
+            "the README does not state the one-writer rule the guard is under \
+             (`docs/durability.md` §2)"
+        );
     }
 
     /// A composition with no grammar 6.1 binding gets no host-function section,
