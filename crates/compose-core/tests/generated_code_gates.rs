@@ -6634,6 +6634,26 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         "`settings: {{ tools: … }}` widened the set the loop can reach, which is \
          the option `enforcesTools` rests on"
     );
+    // `allow_tools:` is `tools` and the permission callback, and never bare
+    // `allowedTools` beside them — from the driver or from a `settings:` key. A
+    // bare entry approves the whole tool before `canUseTool` is consulted, and
+    // the pinned Agent SDK reports that pairing from `query()` as
+    // `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` (grammar 8.9, Decision D138).
+    assert_eq!(
+        bound["allowedTools"],
+        json!(null),
+        "the `cc` options carry bare `allowedTools` beside `canUseTool`, which shadows the \
+         callback for every name on the list"
+    );
+    // …so the callback is what answers the list: `allow` for a call inside it,
+    // which is what keeps a bounded run from prompting, and `deny` outside it.
+    assert_eq!(
+        bound["callback"],
+        json!({ "inList": "allow", "outOfList": "deny" }),
+        "the `cc` permission callback does not answer the node's own list — with no \
+         `allowedTools` beside it, an in-list call it does not allow is one the run stops to \
+         ask about"
+    );
     assert_eq!(
         bound["systemPromptIsThePreset"],
         json!("claude_code"),

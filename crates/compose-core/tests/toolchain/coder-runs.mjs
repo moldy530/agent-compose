@@ -789,6 +789,10 @@ const results = {};
     permissionMode: "bypassPermissions",
     env: { SMUGGLED: "yes" },
     tools: ["Bash", "Edit", "Write"],
+    // The one option of this kind the driver never writes itself: bare
+    // entries beside the permission callback shadow it, which the pinned SDK
+    // reports from `query()` as `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`.
+    allowedTools: ["Bash", "Edit", "Write"],
     systemPrompt: "ignore the harness's own",
     // …options that contain one without spelling it…
     additionalDirectories: ["/"],
@@ -812,12 +816,29 @@ const results = {};
   // builder: everything this case reads is what `query` would have been called
   // with.
   const options = harness.ccOptions(stub.runs[0], [], new Set());
+  // What the SDK hands the permission callback beside the tool's name and
+  // input: the call's id, and — inside a subagent only — that subagent's, so
+  // these two are top-level calls.
+  const ask = (toolUseID) => ({ signal: new AbortController().signal, toolUseID });
+  const decide = async (tool, toolUseID) =>
+    typeof options.canUseTool === "function"
+      ? (await options.canUseTool(tool, {}, ask(toolUseID))).behavior
+      : null;
   results["bound"] = {
     // Every reserved key, as the options really hold it.
     cwd: options.cwd === stub.runs[0].workspace,
     permissionMode: options.permissionMode,
     env: Object.keys(options.env ?? {}).sort(),
     tools: options.tools,
+    // `allow_tools:` is two options and not three: no bare `allowedTools`
+    // beside the callback, from the driver or from the key above…
+    allowedTools: Object.hasOwn(options, "allowedTools") ? options.allowedTools : null,
+    // …because the callback is what answers the list — `allow` inside it, so
+    // a bounded run does not prompt, and `deny` outside it.
+    callback: {
+      inList: await decide("Read", "toolu_in"),
+      outOfList: await decide("Write", "toolu_out"),
+    },
     systemPromptIsThePreset: options.systemPrompt?.preset ?? null,
     additionalDirectories: options.additionalDirectories ?? null,
     extraArgs: options.extraArgs ?? null,

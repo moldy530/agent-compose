@@ -964,10 +964,95 @@ mod tests {
             .expect("…and declares it as a literal boolean")
     }
 
+    /// **A `cc` run never pairs bare `allowedTools` with its permission
+    /// callback** (grammar 8.9, Decision D138, PRD resolved q57 ruling c).
+    ///
+    /// `allow_tools:` reaches the Agent SDK as two options: `tools`, the
+    /// availability bound no permission mode widens, and `canUseTool`, the
+    /// per-call gate that answers `allow` for a call inside the list — which is
+    /// what keeps a bounded run from prompting — and denies, and tapes as
+    /// `"refused"`, a call outside it. A third option reads like the obvious way
+    /// to stop the prompting, and this driver shipped it: `allowedTools`, the
+    /// same list again. A bare entry there approves the whole tool **before**
+    /// the callback is consulted, so the pinned SDK
+    /// (`@anthropic-ai/claude-agent-sdk` 0.3.272) reports the pairing from
+    /// `query()` as a shadowed callback — `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` —
+    /// on every run of every `cc` node that declares `allow_tools:`, and half
+    /// of the list's decision is made ahead of the callback, where the trace's
+    /// refusal taping cannot see it.
+    ///
+    /// Read off the **emitted** module rather than the driver constant, so the
+    /// prelude and the `passthrough` it holds are covered too, and read as code:
+    /// a comment naming the option to say why it is absent is the comment doing
+    /// its job. The one mention code may make is the reserved-list entry, which
+    /// is what drops a `settings:` key spelling it (the runtime half of that is
+    /// `generated_code_gates`' `a_harness_run_is_contained_journaled_and_recorded`,
+    /// which calls the real option builder). The positive half is held here
+    /// too: the two layers that replace it are still set from the list, and
+    /// the callback still answers `allow` inside it.
+    #[test]
+    fn bare_allowed_tools_are_never_paired_with_the_permission_callback() {
+        let emitted = module(&one_coder_node(Harness::Cc)).contents;
+        let mentions: Vec<&str> = emitted
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                !(line.starts_with("//") || line.starts_with("/*") || line.starts_with('*'))
+            })
+            .filter(|line| {
+                line.split(|held: char| !held.is_ascii_alphanumeric() && held != '_' && held != '$')
+                    .any(|word| word == "allowedTools")
+            })
+            .collect();
+        assert_eq!(
+            mentions,
+            ["\"allowedTools\","],
+            "the emitted `cc` driver names `allowedTools` in code outside its reserved list: a bare \
+             entry there approves the whole tool before `canUseTool` is consulted, which the pinned \
+             SDK reports from `query()` as `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` (grammar 8.9, \
+             Decision D138)"
+        );
+        assert!(
+            quoted_list(&emitted, "CC_RESERVED").contains("allowedTools"),
+            "`CC_RESERVED` does not hold `allowedTools`, so a `settings:` key spelling it would \
+             pair bare entries with the permission callback the driver sets"
+        );
+        assert!(
+            from_allow_tools(&emitted).contains("tools"),
+            "the `cc` driver no longer sets `tools` from `allow_tools:`, which is the bound \
+             `access: full_access` cannot lift (PRD resolved q57 ruling c)"
+        );
+        assert!(
+            emitted.contains("options.canUseTool = (name, _input, ask) => {"),
+            "the `cc` driver no longer sets the permission callback, so a call outside the list \
+             is neither denied per call nor taped as `refused`"
+        );
+        assert!(
+            emitted.contains(
+                "if (allowed.includes(name)) return Promise.resolve({ behavior: \"allow\" as const });"
+            ),
+            "the `cc` permission callback no longer answers `allow` for a call inside the list, \
+             and with no `allowedTools` beside it nothing else keeps a bounded run from prompting"
+        );
+    }
+
     /// …and what the graph document says about the same harness, which is the
     /// surface an author reads (`docs/graph.md` §5.8).
     fn documented_enforcement(harness: Harness) -> bool {
-        let ir = ir_of(&format!(
+        crate::graph(&one_coder_node(harness))
+            .flows
+            .iter()
+            .flat_map(|flow| &flow.nodes)
+            .find_map(|node| node.coder.as_ref())
+            .expect("the composition has a coder node")
+            .tools_enforced
+    }
+
+    /// A composition whose one flow runs one `coder:` node on `harness`, under
+    /// the preset that asks for the least containment and with an
+    /// `allow_tools:` list — the node every enforcement claim is about.
+    fn one_coder_node(harness: Harness) -> Ir {
+        ir_of(&format!(
             "version: \"0.1\"
 provider.p:
   kind: anthropic
@@ -994,14 +1079,7 @@ flow.f:
     - {{ from: build, to: end }}
 ",
             harness.as_str()
-        ));
-        crate::graph(&ir)
-            .flows
-            .iter()
-            .flat_map(|flow| &flow.nodes)
-            .find_map(|node| node.coder.as_ref())
-            .expect("the composition has a coder node")
-            .tools_enforced
+        ))
     }
 
     /// The option keys one driver sets from the node's `allow_tools:`.
