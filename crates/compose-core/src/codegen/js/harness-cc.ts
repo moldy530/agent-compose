@@ -21,8 +21,8 @@ const CC_SETTINGS: readonly string[] = [
  * A composition that spelled one of these would be reaching around the
  * construct that states it, through the surface this grammar deliberately
  * leaves open — so they are dropped rather than passed. Two kinds of name are
- * on the list, and the second kind is why it is a list rather than a reading of
- * what the driver below assigns:
+ * on the list, and the second kind — with one name of the first — is why it is
+ * a list rather than a reading of what the driver below assigns:
  *
  *  * an option that **spells** a bound another key states. `workspace:` is
  *    `cwd`; `permission_mode:` is `permissionMode`, the plan-mode body beside it
@@ -33,11 +33,15 @@ const CC_SETTINGS: readonly string[] = [
  *    and custom headers are variables of the process it spawns (Decision D143),
  *    so one reserved name holds both bounds — `output:` is
  *    `outputFormat`, `prompt:` is `systemPrompt`, `allow_tools:` is the
- *    available tool set, the allowlist and the callback over them, `timeout:`
- *    is the abort controller, and `model:` is the model and the one thinking
- *    budget Decision D141 maps into it (`thinking` is here for that last
- *    reason: the SDK documents it as taking precedence over the
- *    `maxThinkingTokens` D141 writes);
+ *    available tool set and the callback over it, `timeout:` is the abort
+ *    controller, and `model:` is the model and the one thinking budget
+ *    Decision D141 maps into it (`thinking` is here for that last reason: the
+ *    SDK documents it as taking precedence over the `maxThinkingTokens` D141
+ *    writes). `allowedTools` spells `allow_tools:` too, and it is the one name
+ *    of this kind the driver below **never** writes: a bare entry there
+ *    approves a whole tool before `canUseTool` is consulted, which the pinned
+ *    SDK flags as a shadowed callback (see [`CC_DRIVER`]) — so a key spelling
+ *    it would put back the very pairing the driver leaves out;
  *  * an option that **contains** one without spelling it, which a driver never
  *    assigns and a list keyed off the driver could therefore never hold.
  *    `extraArgs` is an arbitrary CLI flag — `dangerously-skip-permissions` and
@@ -406,11 +410,12 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  *
  * **Two options, because one of them has a hole.** `tools` is the SDK's own
  * "base set of available built-in tools", so a list written there is a tool set
- * the model is never offered — a bound that holds whatever the permission mode
- * is. `canUseTool` denies, per call, anything outside the list that reached the
- * loop anyway, and tapes the denial as a `"refused"` tool event so the trace
- * says the bound bit; `allowedTools` auto-allows the ones inside it so a bounded
- * run is not also a prompting one.
+ * the model is never offered — the availability bound, which holds whatever the
+ * permission mode is. `canUseTool` is the per-call gate over it, consulted
+ * where a call would otherwise stop to ask: it answers `allow` for a name
+ * inside the list, so a bounded run is not also a prompting one, and it denies
+ * anything outside the list that reached the loop anyway, taping the denial as
+ * a `"refused"` tool event so the trace says the bound bit.
  *
  * The hole is `access: full_access`, and it is why `tools` carries the bound
  * rather than the callback: that preset is `permissionMode: "bypassPermissions"`,
@@ -420,6 +425,24 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  * q57 ruling c). Narrowing the available set is the answer the SDK's own
  * documentation gives for `allowedTools`: "to restrict which tools are
  * available, use the `tools` option instead".
+ *
+ * **And not three: there is no `allowedTools`**, though it reads like the way
+ * to keep a bounded run from prompting. A bare name there approves the whole
+ * tool *before* the callback is consulted, so beside `canUseTool` it shadows
+ * the callback — and the pinned SDK does not leave that silent: `query()`
+ * reports the pairing as a shadowed callback under
+ * `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`, naming every bare entry the callback
+ * will never be asked about. The callback already answers `allow` for exactly
+ * those names, so the list's whole decision is made in one place — the place a
+ * refusal is taped — rather than half of it ahead of the callback, where the
+ * trace cannot see it. `allowedTools` stays on [`CC_RESERVED`] for the same
+ * reason: a `settings:` key spelling it would put the shadow back.
+ *
+ * One shadow is accepted, and it is the hole above: under `bypassPermissions`
+ * the SDK reports the callback as shadowed under the same code, because that
+ * mode approves every call before any callback runs. The callback is kept there
+ * all the same — it is one options object for every mode, and under that mode
+ * the bound was never the callback's to hold: `tools` holds it.
  *
  * # Whose system prompt a run has
  *
@@ -546,7 +569,11 @@ export function ccOptions(
     // can reach, which is true under every one of the three `access:`
     // presets — `bypassPermissions` included.
     options.tools = [...allowed];
-    options.allowedTools = [...allowed];
+    // …and the per-call gate over it, which is also what keeps a bounded run
+    // from prompting: an in-list call is answered `allow` here. Nothing
+    // approves the list ahead of this callback — a bare `allowedTools` would,
+    // and the pinned SDK flags that pairing as a shadowed callback (see
+    // [`CC_DRIVER`]).
     options.canUseTool = (name, _input, ask) => {
       if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
       const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;
