@@ -69,11 +69,14 @@
 //
 // # Scope
 //
-// * `execution` — dies with the run. Its rows live in an **in-memory** database
+// * `execution` — dies with the run on every backend, though not by the same
+//   mechanism. On a local backend its rows live in an **in-memory** database
 //   opened per execution and closed by [`releaseExecution`], which `runFlow`
 //   calls when the run ends; its blobs live under a directory removed at the same
-//   point. Nothing survives the process, which is what "dies with the run" has to
-//   mean for a store nothing else can address.
+//   point; and a dialled `kv` store's rows are a partition on the server that the
+//   same call **deletes**. So "dies with the run" is the lifetime on all three,
+//   and only the in-memory one also dies with the *process* — which is the
+//   difference the replay discipline below turns on.
 // * `session` — partitioned by the session key the trigger supplied
 //   (`execution.session_key`, grammar 11.3). Cross-session memory is exactly this:
 //   a session-scoped store plus a trigger-supplied session key.
@@ -115,13 +118,21 @@
 //   written down here rather than promised away.
 //
 // A store a **resumed** execution reads across the frontier therefore has to be
-// one that outlives the run. `scope: session` and `scope: global` are files on
-// disk and are exactly the world the recorded prefix left behind; a
-// `scope: execution` `kv`/`vector` store and anything a target bound to
-// `provider: memory` are not — their rows died with the process, and a replayed
-// write is not applied a second time, so a live read past the frontier would
-// answer out of an empty database. That is refused rather than answered, by
-// [`inProcessState`], and `docs/durability.md` §5 is normative for it.
+// one that outlives the **process**, and which stores those are is a property of
+// the backend as much as of the scope. A store whose data is on disk or on a
+// server is exactly the world the recorded prefix left behind: `scope: session`
+// and `scope: global` under the local backends are files, a `scope: execution`
+// `blob` store is a directory, and a `kv` store bound to `postgres` or `mysql`
+// is rows on a server at **every** scope — `scope: execution` fixes when
+// [`releaseExecution`] deletes that partition (at the generation that *ends* the
+// execution, never at one that only parked) rather than where it lives. What
+// does not outlive the process is what was opened inside it: a
+// `scope: execution` `kv`/`vector` store on a local backend, and any
+// `kv`/`vector` store a target bound to `provider: memory`. Their rows died with
+// the process, and a replayed write is not applied a second time, so a live read
+// past the frontier would answer out of an empty database. That is refused
+// rather than answered, by [`inProcessState`] over [`inProcessOnly`], and
+// `docs/durability.md` §5 is normative for it.
 //
 // A store write an **agent** made through a synthesized tool (grammar 11.5)
 // carries no key and is not deduped. Grammar 9.4 names exactly two carriers — "a

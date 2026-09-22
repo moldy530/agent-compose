@@ -323,6 +323,50 @@ mod tests {
         assert!(declared(MYSQL).contains(&"MysqlStoreDriver"));
     }
 
+    /// **The MySQL arm's version floor is its upsert's, and it is asserted
+    /// before the DDL** (PRD resolved q63).
+    ///
+    /// `duplicateKeyOverwrite` spells a `store set` with the `AS excluded` row
+    /// alias, which MySQL took in **8.0.19**, while the `utf8mb4_0900_bin` the
+    /// schema asks for has been there since 8.0. So the DDL is not what stops an
+    /// earlier 8.0 server: it creates both tables cleanly, and every keyed write
+    /// afterwards is an `ER_PARSE_ERROR` at the `AS` while every `get`, `list`
+    /// and `delete` keeps answering — for the life of the deployment, since
+    /// nothing about it is transient. The open therefore reads the server's
+    /// version and refuses it by name *before* running the schema, which is the
+    /// ordering this holds.
+    ///
+    /// A drift test rather than a conformance case for the reason the journal's
+    /// session tests are: every server CI dials is above the floor, so no case
+    /// run against a real database can see this fail.
+    #[test]
+    fn the_mysql_store_arm_refuses_a_server_below_the_version_its_upsert_needs() {
+        assert!(
+            MYSQL.contains("AS excluded ON DUPLICATE KEY UPDATE"),
+            "the MySQL `set` no longer upserts through the row alias, so the 8.0.19 floor the \
+             open asserts is a requirement this arm no longer has — state the floor the \
+             statements really need, in `MYSQL_STORE_SCHEMA` and in `docs/topics/stores.md` too"
+        );
+        let checked = MYSQL.find("mysqlIsBelowFloor(version)").expect(
+            "`openMysqlStore` no longer reads the server's version, so a server between \
+             `utf8mb4_0900_bin` and the row alias — MySQL 8.0.0 through 8.0.18 — creates this \
+             store's tables and then refuses every `store set` with a raw syntax error",
+        );
+        let ddl = MYSQL
+            .find("for (const statement of MYSQL_STORE_SCHEMA)")
+            .expect("`openMysqlStore` no longer runs `MYSQL_STORE_SCHEMA`");
+        assert!(
+            checked < ddl,
+            "`openMysqlStore` checks the server's version after creating its tables, so an \
+             operator below the floor is left with a store whose schema exists and whose writes \
+             never will, rather than with the sentence `storeServerTooOld` writes"
+        );
+        assert!(
+            MYSQL.contains("8.0.19 or newer"),
+            "the refusal no longer names the version to bind instead (PRD G3)"
+        );
+    }
+
     /// The driver is reached by the one specifier PRD §9.18 admits, and the two
     /// this project refuses are named nowhere in it.
     #[test]

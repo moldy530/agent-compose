@@ -265,8 +265,11 @@ This release **opens** `memory`, `sqlite`, `sqlite_vec`, `local_fs` and — for 
 runs the same ops, the same scopes and the same recorded reads and deduplicated
 writes as a local one, so nothing in the composition changes and every process
 reaching the store reaches the same rows; it takes no writer guard, and per key
-the last write wins. A store bound to any other provider compiles and then
-refuses at its first op, naming the backend and where the binding came from.
+the last write wins. A `mysql` store needs a server at **8.0.19** or newer — the
+release its statements are written for — and refuses an older one when it opens
+rather than later on a write (`agent-compose docs stores`). A store bound to any
+other provider compiles and then refuses at its first op, naming the backend and
+where the binding came from.
 
 ## `package_registry` — where the installer resolves packages
 

@@ -41,8 +41,16 @@ import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise"
  *    PAD SPACE. Under PAD SPACE `'a'` and `'a '` compare equal, so a store
  *    holding both would hold one row and a `get` of one would answer the other —
  *    silently, and only for keys with trailing whitespace. It arrived in MySQL
- *    8.0, which is therefore this arm's floor; a server older than that refuses
- *    the DDL by name at the first open rather than folding keys afterwards.
+ *    8.0, so a server older than that refuses this DDL by name at the first open
+ *    rather than folding keys afterwards.
+ *
+ * **The arm's floor is higher than this collation's**, and it is asserted rather
+ * than discovered: [`duplicateKeyOverwrite`] spells the upsert with the row
+ * alias MySQL took in **8.0.19**, so 8.0.19 is the version this arm needs whole.
+ * A server between the two would create both tables cleanly and then refuse
+ * every keyed write with a syntax error, which is why [`openMysqlStore`] reads
+ * the server's version and refuses it by name *before* this DDL runs
+ * ([`mysqlIsBelowFloor`]).
  *
  * `scope_key` and `store` are this compiler's own strings — a store name is an
  * identifier (grammar 2.1) and a partition is `global`, `session/<encoded key>`
@@ -159,8 +167,16 @@ const MYSQL_TABLE_EXISTS = 1050;
  * the row being inserted. The alias clause belongs to the `INSERT` rather than
  * to the conflict clause, which is why this hook returns both halves: the shared
  * statement appends whatever it is given after the `VALUES (…)` list, and that
- * is exactly where an alias goes. MySQL 8.0 is this arm's floor anyway — see
- * [`MYSQL_STORE_SCHEMA`] on `utf8mb4_0900_bin`.
+ * is exactly where an alias goes.
+ *
+ * **The alias is what sets this arm's floor at 8.0.19**, one release above the
+ * 8.0 its collation asks for ([`MYSQL_STORE_SCHEMA`]): the same release that
+ * deprecated `VALUES(value)` is the one that took `AS excluded`, and an older
+ * server answers `ER_PARSE_ERROR` at the `AS` — on every `set` and on nothing
+ * else, since no other statement here has a conflict clause with a row in it.
+ * That failure is a live deployment's rather than an open's, so the floor is
+ * asserted at the open instead ([`mysqlIsBelowFloor`]) and the hook keeps the
+ * spelling that is not deprecated.
  */
 function duplicateKeyOverwrite(_target: string, column: string): string {
   return `AS excluded ON DUPLICATE KEY UPDATE ${column} = excluded.${column}`;
@@ -235,8 +251,16 @@ const MYSQL_STORE_AUTOCOMMIT = "SET SESSION autocommit = 1";
  */
 const MYSQL_STORE_SORT_LENGTH = "SET SESSION max_sort_length = 8192";
 
-/** …and what the session really carries once it has been sent. */
-const MYSQL_STORE_SESSION_HELD = "SELECT @@session.autocommit AS autocommit";
+/**
+ * …and what the session really carries once it has been sent, beside the server
+ * it was sent to.
+ *
+ * One statement for the two because the open already makes this round trip and
+ * a floor check is not worth a second one: the version is read at exactly the
+ * moment the `autocommit` read-back is, which is before any DDL runs.
+ */
+const MYSQL_STORE_SESSION_HELD =
+  "SELECT @@session.autocommit AS autocommit, VERSION() AS version";
 
 /** What a session that would not commit is refused with. */
 function storeWritesWouldNotCommit(where: string): Error {
@@ -249,6 +273,43 @@ function storeWritesWouldNotCommit(where: string): Error {
 function storeNamesNoDatabase(where: string): Error {
   return new Error(
     `the \`mysql\` store backend at \`\${${where}}\` names no database: a \`mysql://\` URL carries the schema as its path (\`mysql://user:pass@host:3306/agent_compose\`), and this one stops at the host. A store's tables live in a schema, so there is nothing to open until the variable names one (grammar 4.3, 14.3)`,
+  );
+}
+
+/**
+ * Whether the server this connection reached is older than **MySQL 8.0.19**,
+ * which is the version this arm's statements are spelled for.
+ *
+ * The floor is [`duplicateKeyOverwrite`]'s rather than the schema's: the row
+ * alias arrived in 8.0.19 while `utf8mb4_0900_bin` has been there since 8.0, so
+ * the DDL is not what an earlier 8.0 server refuses — it takes both tables and then
+ * answers a syntax error on every `set`, for the life of the deployment, while
+ * every `get`, `list` and `delete` keeps working. That is the failure this
+ * predicate exists to turn into an open that refuses by name.
+ *
+ * **Only a version that parses and is definitely below the floor is refused**,
+ * which is [`openMysqlStore`]'s rule for the `autocommit` read-back read once
+ * more: a proxy or a fork that answers something this does not recognize costs
+ * nothing rather than costing a working deployment its open, and what it gets
+ * instead is the server's own error on the statement that needed the version.
+ * A `5.5.5-` prefix — MariaDB's protocol-compatibility hack — parses as 5.5.5
+ * and is refused, which is the right answer either way: a MariaDB has neither
+ * the row alias nor the collation [`MYSQL_STORE_SCHEMA`] names.
+ */
+function mysqlIsBelowFloor(version: string): boolean {
+  const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(version);
+  if (parts === null) return false;
+  const major = Number(parts[1]);
+  const minor = Number(parts[2]);
+  if (major !== 8) return major < 8;
+  if (minor !== 0) return false;
+  return Number(parts[3]) < 19;
+}
+
+/** What a server below that floor is refused with. */
+function storeServerTooOld(where: string, version: string): Error {
+  return new Error(
+    `the \`mysql\` store backend at \`\${${where}}\` is version \`${version}\`, and this arm needs MySQL 8.0.19 or newer: a \`store set\` upserts with the \`AS excluded\` row alias, which arrived in 8.0.19, so an older server would create this store's tables and then refuse every keyed write with a syntax error while every read kept answering (grammar 14.3, PRD resolved q63). Bind this store to a server at 8.0.19 or newer`,
   );
 }
 
@@ -397,6 +458,10 @@ class MysqlStoreDriver implements StoreDriver {
  * answers a `SET` on the client's behalf without applying it to the backend
  * session is the way this fails rather than an error.
  *
+ * **The server's version comes back in that same read**, and a server below
+ * this arm's 8.0.19 floor is refused there rather than at its first `set` — see
+ * [`mysqlIsBelowFloor`] for why the DDL is not what catches it.
+ *
  * The connection charset is **left at `mysql2`'s own default**, which is
  * `utf8mb4` — the charset the key and value columns are declared in. Naming one
  * here would mean naming a *collation*, since that is what the driver's option
@@ -474,6 +539,13 @@ async function openMysqlStore(
     // `1`, so a driver that one day hands it back in some other shape costs
     // nothing rather than costing every MySQL deployment its open.
     if (Number.isFinite(autocommit) && autocommit !== 1) throw storeWritesWouldNotCommit(where);
+    // …and the server itself, refused **before** the DDL rather than after it:
+    // a server under the floor takes these tables and refuses every keyed write
+    // afterwards, so an open that created them and then failed would leave an
+    // operator reading a syntax error rather than a sentence. See
+    // [`mysqlIsBelowFloor`].
+    const version = String(session[0]?.["version"] ?? "");
+    if (mysqlIsBelowFloor(version)) throw storeServerTooOld(where, version);
     // The schema has to be named before the DDL runs under it: a URL that names
     // none would fail with MySQL's own "No database selected" on the first
     // `CREATE TABLE`, which tells an operator nothing about the line they wrote.

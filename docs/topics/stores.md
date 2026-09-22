@@ -144,6 +144,12 @@ server shows through is how long a key may be: a `kv` key and a session key are
 whatever the composition and the trigger supplied, and a `mysql` store holds
 2048 characters of each while a `postgres` one holds about 2704 bytes across the
 store name, the partition and the key together. A `sqlite` store bounds neither.
+A `mysql` store also has a version floor — **MySQL 8.0.19 or newer**, the release
+whose upsert spelling and key collation it is written for — and a server below it
+is refused when the store is opened, naming the version that server reported
+rather than failing later on a write. The `postgres` arm asks for nothing newer
+than `ON CONFLICT`, which every Postgres still in support has, so it states no
+floor of its own.
 A store bound to any other provider (`redis`, `chroma`, `pgvector`, `qdrant`,
 `s3`, `gcs`) compiles and then refuses at its first op, naming the backend and
 where the binding came from.
