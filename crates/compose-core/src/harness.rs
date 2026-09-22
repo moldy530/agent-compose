@@ -1996,7 +1996,9 @@ mod tests {
                  the release's own `PermissionMode` declaration and the sentence it documents \
                  each member with, decide which `access:` level admits a new one, re-check which \
                  modes consult `canUseTool` (the driver hands `allow_tools:` to `allowedTools` \
-                 under the one that does not, `dontAsk`), and move this version up (grammar 8.9, \
+                 under the one that does not, `dontAsk`) and that a denial made without it is \
+                 still reported as a `permission_denied` frame (the driver tapes that frame \
+                 `\"refused\"`, `docs/trace.md` 7.6.3), and move this version up (grammar 8.9, \
                  Decision D146)",
                 row.harness.as_str(),
                 version_of(row.harness),

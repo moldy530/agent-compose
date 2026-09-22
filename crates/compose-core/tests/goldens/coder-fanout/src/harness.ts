@@ -606,12 +606,13 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  *  * `auto` asks its model classifier first and the host only where the
  *    classifier hands the question back, so the same callback is set — and an
  *    in-list call the classifier refuses is refused before the callback is
- *    consulted, reaching the trace as the error `tool_result` it comes back as
- *    rather than as `"refused"`. That order is the mode the node named ("use a
- *    model classifier to approve/deny permission prompts"): approving the list
- *    ahead of the classifier would leave it nothing to answer. It is read off
- *    the pinned CLI's permission flow, not observed — no offline run engages
- *    the classifier.
+ *    consulted. That denial is still the harness's permission surface declining
+ *    the call, and is taped `"refused"` off the frame the SDK reports it with
+ *    (see *How a refusal reaches the trace*). That order is the mode the node
+ *    named ("use a model classifier to approve/deny permission prompts"):
+ *    approving the list ahead of the classifier would leave it nothing to
+ *    answer. It is read off the pinned CLI's permission flow, not observed — no
+ *    offline run engages the classifier.
  *  * `dontAsk` consults nobody. The pinned SDK documents it as "deny if not
  *    pre-approved", and its CLI denies a call that would ask **without**
  *    consulting `canUseTool` (observed against the pinned release, not only
@@ -622,8 +623,8 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  *    pre-approve one (`allowedTools`, `settings` and `settingSources` are all
  *    on [`CC_RESERVED`]). So under `dontAsk` the list *is* the pre-approval —
  *    `allowedTools` — and no callback is set. A call outside the list is still
- *    denied per call, by the mode; what that mode gives up is the taping, for
- *    the classifier's reason above.
+ *    denied per call, by the mode, and still taped `"refused"`: the SDK
+ *    reports that denial with the same frame as the classifier's.
  *  * `bypassPermissions` consults nobody either, and approves: see the hole.
  *
  * The hole is `access: full_access`, and it is why `tools` carries the bound
@@ -651,6 +652,41 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  * mode approves every call before any callback runs. The callback is kept there
  * all the same — that mode reads no pre-approval the list could move into, and
  * under it the bound was never the gate's to hold: `tools` holds it.
+ *
+ * # How a refusal reaches the trace
+ *
+ * `"refused"` is the harness's own permission surface declining a call, and
+ * `"failed"` a call that executed and failed (`docs/trace.md` §7.6.3). Which
+ * part of the SDK's permission surface said no — this runtime's callback, the
+ * `dontAsk` mode, `auto`'s classifier — is not the trace's business, so every
+ * one of them is taped `"refused"`, from one of two places:
+ *
+ *  * a denial the **callback** makes is taped where it is made, because the
+ *    callback is this runtime's own code;
+ *  * a denial the SDK makes **without** asking the callback is reported by the
+ *    SDK as a `system` message of subtype `permission_denied`, carrying the
+ *    call's id, the tool's name and the rejection the model is handed back — and
+ *    [`ccEvents`] tapes that frame. The pinned SDK documents the frame as
+ *    covering exactly these short-circuits ("auto-mode classifier, dontAsk
+ *    mode, … or a deny rule", and, with no `canUseTool` set, every would-ask
+ *    call), and its CLI emits it from inside the permission check, before the
+ *    denial becomes the call's `tool_result` — so the frame arrives first.
+ *
+ * Either way the call's id goes into the driver's `refused` set, and the error
+ * `tool_result` that carries the denial back to the model is payload only:
+ * taping it too would claim a second tool event, and a `"failed"` one, for a
+ * call that never executed. A frame whose id is already in the set — the
+ * callback's own denial reported again, or one report arriving twice — is
+ * payload only for the same reason. A frame from inside a subagent carries
+ * `agent_id` rather than `parent_tool_use_id`, and is payload only by the depth
+ * rule above, read off that field instead.
+ *
+ * The SDK calls the frame best-effort, and names the denials it does not
+ * report: a `PreToolUse` hook's, and a path-scoped deny rule's on a file tool.
+ * Nothing the driver reads ahead of such a call's error result says it was a
+ * denial, so it reaches the trace as that result does. That is a limit of what
+ * the SDK reports, and not one `allow_tools:` reaches: the list is enforced by
+ * `tools` and the gate above, never by a hook or a rule.
  *
  * # Whose system prompt a run has
  *
@@ -684,11 +720,14 @@ const CC_DRIVER: runtime.HarnessDriver = {
       // The name each top-level `tool_use` went out under, so the `tool_result`
       // that answers it can be taped under the same name.
       const calls = new Map<string, string>();
-      // The `tool_use` ids the callback below denied. A denial is taped once,
-      // from the callback; the `tool_result` the SDK then hands the model is
-      // that same denial travelling back, and taping it again would claim two
-      // tool events where the run made one (`docs/trace.md` 7.6.3, whose
-      // `completed` and `failed` describe a call that executed).
+      // The top-level `tool_use` ids whose denial is already taped `refused` —
+      // by the callback below, or off the `permission_denied` frame the SDK
+      // reports a denial it made without asking the callback. A denial is taped
+      // once; the `tool_result` the SDK then hands the model is that same
+      // denial travelling back, and taping it again would claim two tool events
+      // where the run made one (`docs/trace.md` 7.6.3, whose `completed` and
+      // `failed` describe a call that executed). Kept for the whole run, so a
+      // denial reported twice is still one event.
       const refused = new Set<string>();
 
       const config = ccOptions(run, refusals, refused);
@@ -818,12 +857,42 @@ export function ccOptions(
   return options;
 }
 
-/** One SDK message, as the events the tap reads (see [`CC_DRIVER`]). */
-function* ccEvents(
+/**
+ * One SDK message, as the events the tap reads (see [`CC_DRIVER`]).
+ *
+ * **Exported for the reason [`ccOptions`] is**: which tool event a message
+ * becomes — and above all that a denial the SDK made without the callback is
+ * `"refused"` rather than `"failed"` — is decided here, off the vendor's own
+ * message shapes, and a scripted driver never produces one of those. So a test
+ * hands this the SDK's messages and reads what it taps. `calls` and `refused`
+ * are the driver's own state across one run's messages.
+ */
+export function* ccEvents(
   message: SDKMessage,
   calls: Map<string, string>,
   refused: Set<string>,
 ): Generator<runtime.HarnessEvent> {
+  // A denial the SDK made without asking the permission callback — a
+  // `dontAsk` mode denial, `auto`'s classifier, a deny rule — reported as its
+  // own frame (see *How a refusal reaches the trace*). It is the harness's
+  // permission surface declining the call, so it is taped `refused` with the
+  // rejection the model was handed back, and its id is remembered so the error
+  // `tool_result` that follows is not taped again as `failed`. The frame
+  // carries no `parent_tool_use_id`: a subagent's is marked by `agent_id`,
+  // the field the callback reads the same rule off, and is payload only. So is
+  // a frame for a denial already taped.
+  if (message.type === "system" && message.subtype === "permission_denied") {
+    if (message.agent_id !== undefined || refused.has(message.tool_use_id)) {
+      yield { source: message };
+      return;
+    }
+    refused.add(message.tool_use_id);
+    yield {
+      source: message,
+      tap: { kind: "tool", name: message.tool_name, outcome: "refused", error: message.message },
+    };
+    return;
+  }
   // A message from inside a subagent is payload and nothing else — the depth
   // rule PRD resolved q57 ruling a fixes, read off the one field that carries
   // it.
@@ -848,12 +917,13 @@ function* ccEvents(
       if (block.type !== "tool_result") continue;
       const name = calls.get(block.tool_use_id);
       if (name === undefined) continue;
-      // A call the permission callback denied was taped `refused` there, and
-      // this result is that denial on its way to the model rather than a second
-      // event: the call never executed, so neither `completed` nor `failed`
-      // describes it (`docs/trace.md` 7.6.3). The message still reaches the
-      // journal's payload above, untapped, like every other result.
-      if (refused.delete(block.tool_use_id)) {
+      // A denied call was taped `refused` already — by the callback, or off
+      // the SDK's `permission_denied` frame — and this result is that denial on
+      // its way to the model rather than a second event: the call never
+      // executed, so neither `completed` nor `failed` describes it
+      // (`docs/trace.md` 7.6.3). The message still reaches the journal's
+      // payload above, untapped, like every other result.
+      if (refused.has(block.tool_use_id)) {
         calls.delete(block.tool_use_id);
         continue;
       }

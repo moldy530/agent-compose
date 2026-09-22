@@ -5761,7 +5761,13 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 ///    spawns, `codex` carries two as its client's options, and a provider with
 ///    **no** credential injects none at all rather than an empty one, which is
 ///    resolved q25's keyless-gateway posture surviving the crossing (PRD
-///    resolved q58 ruling a).
+///    resolved q58 ruling a);
+///  * **a refusal is a refusal** — a denial the Agent SDK makes without asking
+///    the permission callback (every one under `dontAsk`, and `auto`'s
+///    classifier) is one `"refused"` tool event, taped off the SDK's own
+///    `permission_denied` frame, and not the `"failed"` its error `tool_result`
+///    would read as (`docs/trace.md` §7.6.3). The real `ccEvents` is fed those
+///    frames, because a scripted driver never produces one.
 #[test]
 fn a_harness_run_is_contained_journaled_and_recorded() {
     let Some(root) = installed() else {
@@ -6818,6 +6824,72 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
              list allows it, and no `settings:` key can pre-approve one instead (Decision D146)"
         );
     }
+
+    // --- A refusal is a refusal, whichever part of the SDK made it ----------
+    //
+    // `docs/trace.md` §7.6.3: `"refused"` is the harness's own permission
+    // surface declining a call, and `"failed"` is a call that executed and
+    // failed. A denial the Agent SDK makes without asking the callback — every
+    // one under `dontAsk`, and one `auto`'s classifier makes itself, on an
+    // in-list call — comes back to the loop as an error `tool_result`. The SDK
+    // also reports it as a top-level `system`/`permission_denied` frame. The
+    // driver tapes that frame, and the error result after it is payload only.
+    // These are the records `runCoder` filed from the real `ccEvents` fed those
+    // frames: the classifier's denial and the callback's are one event each,
+    // even when reported twice; a subagent's is not an event at all; and a
+    // call that ran keeps its own outcome.
+    let taping = &answer["refusalTaping"];
+    assert_eq!(
+        taping["auto"],
+        json!({
+            "mode": "auto",
+            "toolCalls": [
+                {
+                    "name": "Bash",
+                    "outcome": "refused",
+                    "error": "Permission to use Bash has been denied by the auto mode classifier."
+                },
+                {
+                    "name": "Write",
+                    "outcome": "refused",
+                    "error": "`flow.patch.implement` allows `Bash`, `Read`, and `Write` is not one of them"
+                },
+                { "name": "Read", "outcome": "completed" },
+                {
+                    "name": "Bash",
+                    "outcome": "failed",
+                    "error": "the tool result came back as an error"
+                }
+            ],
+            "turns": 2,
+            "payloadOnce": true
+        }),
+        "an `auto` run's record misreports its denials: a call `auto`'s classifier denied \
+         without asking the callback is a `\"refused\"` event taped off the SDK's \
+         `permission_denied` frame, not the `\"failed\"` its error `tool_result` reads as; one \
+         denial is one event, however many times the SDK reports it; a subagent's denial is \
+         payload only; and every SDK message reaches the payload once (`docs/trace.md` 7.6.3, \
+         PRD resolved q57 ruling a)"
+    );
+    assert_eq!(
+        taping["dontAsk"],
+        json!({
+            "mode": "dontAsk",
+            "callback": false,
+            "toolCalls": [
+                {
+                    "name": "Bash",
+                    "outcome": "refused",
+                    "error": "Permission to use Bash has been denied because Claude Code is running in don't ask mode."
+                }
+            ],
+            "payloadOnce": true
+        }),
+        "a `dontAsk` run's denial is not one `\"refused\"` event: that mode consults no \
+         callback, so the SDK's `permission_denied` frame is the only place the driver learns \
+         of it, and the error `tool_result` after it records a call that never executed as \
+         `\"failed\"` (`docs/trace.md` 7.6.3)"
+    );
 
     let codex = &answer["codexBound"];
     assert_eq!(

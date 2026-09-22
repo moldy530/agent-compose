@@ -8,7 +8,7 @@
 // hands in a script and everything above the seam — the config map, the journal,
 // the stream tap, the output gate — is the code a deployment really ships.
 //
-// Fourteen claims, and each is invisible from outside a run:
+// Fifteen claims, and each is invisible from outside a run:
 //
 //   * **the config map** — `workspace:` resolves its `${ENV}` at the call and an
 //     empty one is refused; the environment is **scrubbed** to the declared
@@ -59,7 +59,13 @@
 //     before the map goes over the top, which is the one door `validate` cannot
 //     reach. Invisible from the seam for section 11's reason: a scripted driver
 //     is handed `run.connection` whole, and it is the real driver that decides
-//     what the SDK is called with.
+//     what the SDK is called with;
+//   * **a refusal is a refusal** — a denial the Agent SDK makes without asking
+//     the permission callback (`dontAsk`, `auto`'s classifier) is one
+//     `"refused"` tool event, taped off the frame the SDK reports it with, and
+//     not the `"failed"` its error `tool_result` would read as. Invisible from
+//     the seam because a scripted driver never produces the vendor's frames:
+//     section 16 feeds them to the real `ccEvents`.
 //
 // Usage: node coder-runs.mjs <generated project directory> <scratch dir>
 // Output: one JSON object, read by `generated_code_gates.rs`.
@@ -1336,6 +1342,196 @@ const results = {};
   results["awkwardWorkspace"] = {
     handed,
     joined: joining.runs[0].workspace,
+  };
+}
+
+// --- 16. A refusal is a refusal, whichever part of the SDK made it ---------
+//
+// `docs/trace.md` §7.6.3: `"refused"` is the harness's own permission surface
+// declining a call, and `"failed"` is a call that executed and failed. On `cc`
+// that surface speaks in two places. The permission callback is this runtime's
+// own code and tapes its denial where it makes it. A denial the SDK makes
+// **without** asking the callback — every one under `dontAsk`, which consults
+// none, and one `auto`'s classifier makes itself — is reported by the SDK as a
+// top-level `system`/`permission_denied` frame (`SDKPermissionDeniedMessage` in
+// the pinned `sdk.d.ts`), and then handed to the model as an error
+// `tool_result`. Taping that result instead of the frame records a call that
+// never ran as a `failed` one.
+//
+// A scripted driver never produces the vendor's own message shapes, so this
+// case's driver is `CC_DRIVER.run` with `query` taken out: the real
+// `ccOptions` built for the run the adapter made, the real `ccEvents` fed the
+// SDK's messages in the order the SDK sends them, and the permission callback
+// called where the SDK would call it. The record `runCoder` files from that is
+// the trace's own `toolCalls`. The first run is `auto` with `allow_tools:
+// [Bash, Read]`, and its classifier blocks an in-list `Bash`. The second run
+// is `dontAsk`, whose mode denies a call. Five claims:
+//
+//   * a classifier's denial and a `dontAsk` mode denial are each **one**
+//     `"refused"` event carrying the rejection the model was handed back;
+//   * the error `tool_result` that follows each is payload only;
+//   * a denial the callback taped is one event even when the SDK reports it
+//     again as a frame, and so is a frame that arrives twice;
+//   * a frame from inside a subagent (`agent_id`) is payload only, which is PRD
+//     resolved q57 ruling a's depth rule;
+//   * a call that ran is still `completed` or `failed` by its own result, and
+//     every SDK message reaches the journal payload once.
+{
+  /** `CC_DRIVER.run`, with the SDK's stream scripted instead of queried. */
+  const sdkStream = (steps) => {
+    // How many events carried each SDK message as their `source`, which is
+    // what reaches the journal payload; and the options the run was built.
+    const held = { payload: new Map(), options: null };
+    const driver = {
+      sdk: "agent-compose:sdk-stream/cc",
+      version: "0",
+      enforcesTools: true,
+      run(run) {
+        const refusals = [];
+        const calls = new Map();
+        const refused = new Set();
+        const options = harness.ccOptions(run, refusals, refused);
+        held.options = options;
+        const payload = held.payload;
+        return (async function* driven() {
+          for (const step of steps) {
+            // A function step is the SDK asking the permission callback.
+            if (typeof step === "function") {
+              await step(options);
+              continue;
+            }
+            while (refusals.length > 0) yield refusals.shift();
+            for (const event of harness.ccEvents(step, calls, refused)) {
+              if (event.source === step) payload.set(step, (payload.get(step) ?? 0) + 1);
+              yield event;
+            }
+          }
+          while (refusals.length > 0) yield refusals.shift();
+        })();
+      },
+    };
+    return { driver, held };
+  };
+  const assistant = (uses) => ({
+    type: "assistant",
+    parent_tool_use_id: null,
+    message: {
+      role: "assistant",
+      content: uses.map(([id, name]) => ({ type: "tool_use", id, name, input: {} })),
+    },
+    uuid: "uuid_assistant",
+    session_id: "session_refusals",
+  });
+  const toolResults = (answers) => ({
+    type: "user",
+    parent_tool_use_id: null,
+    message: {
+      role: "user",
+      content: answers.map(([id, failed]) => ({
+        type: "tool_result",
+        tool_use_id: id,
+        is_error: failed,
+        content: failed ? "an error the loop hands back" : "ok",
+      })),
+    },
+    uuid: "uuid_user",
+    session_id: "session_refusals",
+  });
+  const denied = (id, name, reason, message, extra = {}) => ({
+    type: "system",
+    subtype: "permission_denied",
+    tool_name: name,
+    tool_use_id: id,
+    decision_reason_type: reason,
+    message,
+    uuid: `uuid_${id}`,
+    session_id: "session_refusals",
+    ...extra,
+  });
+  const settled = {
+    type: "result",
+    subtype: "success",
+    usage: { input_tokens: 10, output_tokens: 5 },
+    total_cost_usd: 0.001,
+    stop_reason: "end_turn",
+    structured_output: { summary: "x", touched: [] },
+    uuid: "uuid_result",
+    session_id: "session_refusals",
+  };
+  const CLASSIFIED = "Permission to use Bash has been denied by the auto mode classifier.";
+  const MODED =
+    "Permission to use Bash has been denied because Claude Code is running in don't ask mode.";
+
+  // `auto`, `allow_tools: [Bash, Read]`.
+  const classifierFrame = denied("toolu_classified", "Bash", "classifier", CLASSIFIED);
+  const auto = sdkStream([
+    assistant([
+      ["toolu_classified", "Bash"],
+      ["toolu_outside", "Write"],
+      ["toolu_read", "Read"],
+    ]),
+    // The classifier blocks an in-list call, without asking the callback…
+    classifierFrame,
+    // …and the SDK reports it twice.
+    { ...classifierFrame, uuid: "uuid_again" },
+    // The SDK asks the callback about an out-of-list call, and it denies…
+    async (options) => {
+      await options.canUseTool("Write", {}, {
+        signal: new AbortController().signal,
+        toolUseID: "toolu_outside",
+      });
+    },
+    // …and that denial is reported as a frame as well.
+    denied("toolu_outside", "Write", "other", "the callback's own sentence"),
+    // A subagent's denial is the subagent's.
+    denied("toolu_inside", "Bash", "classifier", CLASSIFIED, { agent_id: "agent_sub" }),
+    toolResults([
+      ["toolu_classified", true],
+      ["toolu_outside", true],
+      ["toolu_read", false],
+    ]),
+    assistant([["toolu_broken", "Bash"]]),
+    toolResults([["toolu_broken", true]]),
+    settled,
+  ]);
+  const autoAnswer = await runCoder(
+    binding({ permissionMode: "auto" }),
+    { goal: "fix it" },
+    context(),
+    { cc: auto.driver },
+  );
+
+  // `dontAsk`: no callback, and the mode denies.
+  const dontAsk = sdkStream([
+    assistant([["toolu_moded", "Bash"]]),
+    denied("toolu_moded", "Bash", "mode", MODED),
+    toolResults([["toolu_moded", true]]),
+    settled,
+  ]);
+  const dontAskAnswer = await runCoder(
+    binding({ permissionMode: "dontAsk" }),
+    { goal: "fix it" },
+    context(),
+    { cc: dontAsk.driver },
+  );
+
+  // Every SDK message the stream held, each carried into the payload by
+  // exactly one event: nine on the `auto` run, four on the `dontAsk` one.
+  const payloadOnce = ({ held }, count) =>
+    held.payload.size === count && [...held.payload.values()].every((seen) => seen === 1);
+  results["refusalTaping"] = {
+    auto: {
+      mode: auto.held.options.permissionMode,
+      toolCalls: autoAnswer.harness[0].toolCalls,
+      turns: autoAnswer.harness[0].turns.length,
+      payloadOnce: payloadOnce(auto, 9),
+    },
+    dontAsk: {
+      mode: dontAsk.held.options.permissionMode,
+      callback: typeof dontAsk.held.options.canUseTool === "function",
+      toolCalls: dontAskAnswer.harness[0].toolCalls,
+      payloadOnce: payloadOnce(dontAsk, 4),
+    },
   };
 }
 

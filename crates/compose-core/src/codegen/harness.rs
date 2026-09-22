@@ -581,16 +581,22 @@ mod tests {
         );
     }
 
-    /// A call the `cc` permission callback denied is **one** tool event
-    /// (`docs/trace.md` §7.6.3).
+    /// A call the `cc` permission surface denied is **one** tool event, and a
+    /// `"refused"` one (`docs/trace.md` §7.6.3).
     ///
-    /// The denial is taped `refused` where it happens, and the SDK then hands
-    /// the model that same denial as the `tool_result` answering the
-    /// `tool_use`. Taping that too would put a second event in the record for
-    /// one call, under an outcome that describes a call which ran — `completed`
-    /// is "handed its model the tool's result" and `failed` is an execution
-    /// that failed, and a refusal is neither. Correlating them needs the id, so
-    /// the id is what is pinned here.
+    /// The denial is taped `refused` where the driver learns of it — in the
+    /// permission callback, or off the `permission_denied` frame the SDK reports
+    /// a denial it made **without** asking the callback (a `dontAsk` mode
+    /// denial, `auto`'s classifier) — and the SDK then hands the model that same
+    /// denial as the `tool_result` answering the `tool_use`. Taping that too
+    /// would put a second event in the record for one call, under an outcome
+    /// that describes a call which ran — `completed` is "handed its model the
+    /// tool's result" and `failed` is an execution that failed, and a refusal
+    /// is neither. Correlating them needs the id, so the id is what is pinned
+    /// here, at both places a denial is learned of. What the taping produces
+    /// for each shape of message is `generated_code_gates`'
+    /// `a_harness_run_is_contained_journaled_and_recorded`, which feeds the
+    /// real `ccEvents` the SDK's own frames.
     #[test]
     fn a_cc_call_the_allowlist_denied_is_one_tool_event() {
         assert!(
@@ -599,7 +605,15 @@ mod tests {
              downstream can tell the denial's own `tool_result` from a tool's answer"
         );
         assert!(
-            CC.contains("if (refused.delete(block.tool_use_id)) {"),
+            CC.contains(
+                "if (message.type === \"system\" && message.subtype === \"permission_denied\") {"
+            ) && CC.contains("refused.add(message.tool_use_id);"),
+            "the `cc` driver does not tape the SDK's `permission_denied` frame, so a denial the SDK \
+             made without the callback — every one under `dontAsk`, and `auto`'s classifier — \
+             reaches the trace as its error `tool_result`, a `failed` call that never executed"
+        );
+        assert!(
+            CC.contains("if (refused.has(block.tool_use_id)) {"),
             "the `cc` driver tapes a `tool_result` for a call it already taped as `refused`"
         );
     }
