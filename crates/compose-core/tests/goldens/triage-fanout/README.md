@@ -448,8 +448,9 @@ resume route instead.
 unconditionally, so a composition with a `store.*` in it runs with nothing
 installed (PRD 5.8). A named target may bind a `kv` store to `postgres` or
 `mysql` instead, in which case that store's rows are on the server its
-`storage_backends:` entry names and nothing of it is under this directory. What
-the local backends write lives here:
+`storage_backends:` entry names and nothing of it is under this directory.
+
+What the local backends write lives here:
 
 ```text
 .agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store

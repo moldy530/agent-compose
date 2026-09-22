@@ -19,9 +19,10 @@
 // underneath it.
 //
 // Usage: node store-contract.mjs <project> <provider> <data directory>
-// Environment: AGENT_COMPOSE_STORE_URL and AGENT_COMPOSE_STORE_URL_B on a
-// dialled provider — two names for one server, which is how the interleaved
-// writers below become two connections.
+// Environment: AGENT_COMPOSE_STORE_URL and AGENT_COMPOSE_STORE_URL_B … _E on a
+// dialled provider — five names for one server, which is how the interleaved
+// writers below become two connections and the killed one becomes a sixth this
+// file can take away without touching the others.
 // Prints one JSON object of everything the suite asserts about.
 
 import { randomUUID } from "node:crypto";
@@ -43,11 +44,13 @@ const at = (relative) => pathToFileURL(path.resolve(project, relative)).href;
 const stores = await import(at("src/stores.ts"));
 const journal = await import(at("src/journal.ts"));
 
-/** The variable each of the four connections reads its address from. */
+/** The variable each of the five connections reads its address from. */
 const URL_ENV = "AGENT_COMPOSE_STORE_URL";
 const OTHER_URL_ENV = "AGENT_COMPOSE_STORE_URL_B";
 const THIRD_URL_ENV = "AGENT_COMPOSE_STORE_URL_C";
 const FOURTH_URL_ENV = "AGENT_COMPOSE_STORE_URL_D";
+/** …and the fifth, which is the one this file gets the server to take away. */
+const KILLED_URL_ENV = "AGENT_COMPOSE_STORE_URL_E";
 
 /**
  * A prefix nothing else on this server is using.
@@ -125,6 +128,125 @@ const set = (store, key, value, run, key_ = undefined) =>
 const get = (store, key, run) => stores.runStoreOp(store, "get", { key }, run, node());
 const list = (store, run, prefix = undefined, limit = 50) =>
   stores.runStoreOp(store, "list", { limit, ...(prefix === undefined ? {} : { prefix }) }, run, node());
+
+// --- The second connection, which is this file's and not a store's -----------
+//
+// The last case needs two things no `kv` op can do: hold a row lock on the key a
+// store is about to write, and end that store's session. Both are the server's
+// own vocabulary, so they are spoken over a connection this file opens with the
+// project's pinned driver directly — resolved out of the toolchain fixture's
+// `node_modules` beside this runner, which pins the same `pg` and `mysql2` the
+// emitted `package.json` does.
+
+/**
+ * A second connection to the server the killed store binding dials.
+ *
+ * Both drivers are CommonJS, so the export is taken off the namespace or off its
+ * `default` — whichever this runtime's interop put it on. Each connection gets
+ * an `error` listener for the reason the arms' own do: an `EventEmitter` that
+ * emits `error` with nothing listening ends the process, and this one is beside
+ * a connection deliberately being killed.
+ */
+async function openKiller() {
+  const address = process.env[KILLED_URL_ENV];
+  if (provider === "postgres") {
+    const pg = await import("pg");
+    const Client = pg.Client ?? pg.default.Client;
+    const client = new Client({ connectionString: address });
+    client.on("error", () => undefined);
+    await client.connect();
+    return client;
+  }
+  const mysql = await import("mysql2/promise");
+  const createConnection = mysql.createConnection ?? mysql.default.createConnection;
+  const connection = await createConnection({ uri: address });
+  connection.on("error", () => undefined);
+  return connection;
+}
+
+/** Rows, out of whichever driver answered. */
+async function rows(killer, sql, parameters = []) {
+  if (provider === "postgres") return (await killer.query(sql, parameters)).rows;
+  const [answered] = await killer.query(sql, parameters);
+  return answered;
+}
+
+async function begin(killer) {
+  await rows(killer, provider === "postgres" ? "BEGIN" : "START TRANSACTION");
+}
+
+async function rollback(killer) {
+  await rows(killer, "ROLLBACK");
+}
+
+/**
+ * Take — and keep — the row lock the store's next write has to wait for.
+ *
+ * An uncommitted insert of the very key the store is about to write is a lock on
+ * that key's index record on both servers, and the store's own
+ * `INSERT … ON CONFLICT`/`ON DUPLICATE KEY` waits on it rather than failing. The
+ * columns are the four the arms declare; a MySQL row's two hashes are generated
+ * and are the server's to fill.
+ */
+async function holdTheKey(killer, store, key) {
+  const value = JSON.stringify({ held: "by the killer" });
+  await rows(
+    killer,
+    provider === "postgres"
+      ? 'INSERT INTO store_entries (store, scope_key, "key", value) VALUES ($1, $2, $3, $4)'
+      : "INSERT INTO store_entries (store, scope_key, `key`, value) VALUES (?, ?, ?, ?)",
+    [store, "global", key, value],
+  );
+}
+
+/**
+ * The session id of the store's connection, once the server can see it waiting.
+ *
+ * Polled rather than assumed, because "the statement is in flight" is the whole
+ * premise of the case that calls this: a kill that landed on an idle connection
+ * would exercise the driver's `error` event instead, which is the half that was
+ * never in doubt. `undefined` when it never turns up, which the caller reports
+ * rather than hiding.
+ *
+ * MySQL is asked by the statement text — `mysql2` interpolates parameters on the
+ * client, so the blocked `INSERT` carries this run's unique store name — and
+ * Postgres by state, since `pg` binds parameters on the server and its
+ * `pg_stat_activity.query` holds `$1` where the name would be.
+ */
+async function waitingOn(killer, store) {
+  const found = async () => {
+    if (provider === "postgres") {
+      return await rows(
+        killer,
+        "SELECT pid AS id FROM pg_stat_activity WHERE datname = current_database() " +
+          "AND pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%store_entries%'",
+      );
+    }
+    return await rows(
+      killer,
+      "SELECT ID AS id FROM information_schema.processlist WHERE DB = DATABASE() " +
+        "AND ID <> CONNECTION_ID() AND INFO LIKE ?",
+      [`%${store}%`],
+    );
+  };
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const held = await found();
+    if (held.length === 1) return Number(held[0].id);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return undefined;
+}
+
+/** End that session, from outside the process that owns it. */
+async function kill(killer, id) {
+  if (provider === "postgres") {
+    await rows(killer, "SELECT pg_terminate_backend($1)", [id]);
+    return;
+  }
+  // `KILL` takes no placeholder, and `id` is a number this file read off the
+  // server's own session list.
+  await rows(killer, `KILL ${id}`);
+}
 
 const answer = {};
 
@@ -451,6 +573,97 @@ const answer = {};
   answer.a_replayed_write_is_not_applied_again =
     (await get(store, "k", live)).value?.generation === "moved";
   await journal.releaseJournal();
+}
+
+// --- A connection the server took away, and the redial that follows ----------
+
+if (provider !== "sqlite") {
+  // **The failure a `serve` has and a `run` does not.** A dialled store's
+  // connection outlives every execution that uses it, so a managed failover, a
+  // proxy's idle reaper or an operator's `KILL` ends it *under* whichever op was
+  // holding it — and a store that treated that as permanent would refuse every
+  // later op of every later execution until the process restarted, which on a
+  // `serve` is for ever. What the arms promise instead is in the sentence
+  // `storeConnectionLost` raises: this op fails, the node's own `retry:` decides
+  // what happens next, and the retry "runs over a connection dialled again
+  // rather than over this one".
+  //
+  // **The kill lands while a statement is in flight**, and that is the whole
+  // design of this case rather than an incidental detail. Killing an *idle*
+  // connection is the easy half: both drivers emit `error` on the connection,
+  // the arms' listeners hear it, and the entry is dropped. With a statement in
+  // flight `mysql2` does the opposite — `_notifyError` hands the error to that
+  // statement and emits nothing — so a case that killed an idle socket would
+  // pass over a store that is permanently unreachable the moment a real server
+  // fails over. The statement is put in flight deterministically: a second
+  // connection this file opens with the pinned driver holds an uncommitted row
+  // lock on the key the store is about to write, so the store's `set` is
+  // provably waiting on the server when the kill arrives.
+  const store = kv("redial", "global", KILLED_URL_ENV);
+  const run = ctx(execution("redial"));
+  const HELD = "held-by-the-killer";
+  const killer = await openKiller();
+  let blocked;
+  try {
+    // First, so that the connection — and the DDL its open runs — is there
+    // before the killer takes a lock on the table that DDL would need.
+    await set(store, "before", { held: "first" }, run, "rd/1");
+
+    await begin(killer);
+    await holdTheKey(killer, store.name, HELD);
+    // Not awaited, and carrying no idempotency key so that the statement in
+    // flight is the write itself: it is now waiting on the killer's uncommitted
+    // row, which is what makes the connection's death arrive mid-statement.
+    //
+    // Its outcome is captured **the moment the promise exists** rather than
+    // awaited where it is wanted: a rejection nothing is listening to yet ends
+    // the process on this runtime's floor, and what this one rejects with is the
+    // whole point of the case.
+    const writing = set(store, HELD, { held: "never" }, run);
+    blocked = writing.then(
+      () => undefined,
+      (error) => String(error?.message ?? error),
+    );
+    const victim = await waitingOn(killer, store.name);
+    answer.the_store_was_caught_mid_statement = victim !== undefined;
+    answer.redial_victim = victim ?? null;
+    // Read only once the kill is in: a write still waiting on a lock nothing has
+    // released yet would hang this runner rather than fail it. Where the victim
+    // never turned up, the `finally` releases the lock instead and the case
+    // above is what says so.
+    if (victim !== undefined) {
+      await kill(killer, victim);
+      const refusal = (await blocked) ?? "";
+      answer.redial_refusal = refusal;
+      // The op that met the kill is refused by name rather than with whatever
+      // the driver said, which is what names the variable an operator can
+      // change — and on MySQL it is the only sign the loss was noticed at all.
+      answer.a_lost_connection_is_refused_by_name = refusal.includes(
+        `lost its connection to the \`${provider}\` store backend`,
+      );
+    }
+  } catch (error) {
+    // A store that never came back throws here rather than answering, the two
+    // cases below stay absent, and the Rust side prints this beside them.
+    answer.redial_error = String(error?.message ?? error);
+  } finally {
+    // Before anything dials again: the lock is what the next write would queue
+    // behind, and an open transaction holds a metadata lock a reopen's DDL wants.
+    await rollback(killer).catch(() => undefined);
+    if (blocked !== undefined) await blocked;
+    await killer.end().catch(() => undefined);
+  }
+  try {
+    await set(store, "after", { held: "second" }, run, "rd/3");
+    answer.a_lost_connection_is_redialled =
+      (await get(store, "after", run)).value?.held === "second";
+    // …and what the lost connection had already committed is still there, which
+    // is what makes the redial a reconnection rather than a new store.
+    answer.a_redialled_store_still_holds_what_it_wrote =
+      (await get(store, "before", run)).value?.held === "first";
+  } catch (error) {
+    answer.redial_error = String(error?.message ?? error);
+  }
 }
 
 await stores.releaseStores();

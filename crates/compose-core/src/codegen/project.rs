@@ -1155,6 +1155,16 @@ fn journal_home(ir: &Ir) -> String {
     let mut section = String::from(JOURNAL_HOME);
     if provider.opens_in_process() {
         section.push_str(JOURNAL_HOME_SQLITE);
+        // "No dependency this project did not already have" is a sentence about
+        // the **journal**, and a reader auditing `package.json` has no way to
+        // know that unless the driver a *store* pinned is attributed to the
+        // store. A target whose journal is the default and whose `kv` store
+        // dials Postgres carries `pg` and `@types/pg`, and the only other place
+        // this document names a driver is the dialled-journal arm below.
+        if !super::stores::pins(ir).is_empty() {
+            section.push_str(JOURNAL_HOME_SQLITE_BESIDE_A_DIALLED_STORE);
+        }
+        section.push_str(JOURNAL_HOME_SQLITE_PRIVATE);
         return section;
     }
     let variable = ir
@@ -1224,7 +1234,24 @@ and deleted by deleting it. It costs no configuration and no dependency this
 project did not already have. A target that needs the record to outlive this
 machine binds `journal: { provider: postgres | mysql, url: ${SOME_VAR} }` in its
 deploy file instead.
+"#;
 
+/// …and the sentence that adds, where a **store** dialled a server, whose the
+/// database driver in `package.json` then is (grammar §14.3, PRD resolved q63).
+///
+/// Without it the paragraph above is read as covering the whole manifest: it
+/// says the journal costs no dependency, this document's only driver table is in
+/// the dialled-*journal* arm, and an operator auditing the dependency set finds
+/// `pg` in it with nothing anywhere attributing it to anything.
+const JOURNAL_HOME_SQLITE_BESIDE_A_DIALLED_STORE: &str = r#"
+A database driver **is** pinned in `package.json` all the same, and it is a
+store's rather than this journal's: see *Where a store keeps its data* below,
+which names the backend each of this target's stores dials and the driver that
+goes with it.
+"#;
+
+/// …and the privacy paragraph that closes the default arm either way.
+const JOURNAL_HOME_SQLITE_PRIVATE: &str = r#"
 Because the journal holds what a trace deliberately does not — completions, tool
 results, a person's answer — it is private recovery data with the same
 sensitivity as this project's stores. Nothing uploads it and no command prints
@@ -1249,7 +1276,64 @@ fn store_data(ir: &Ir) -> String {
     if !stores {
         return String::new();
     }
-    String::from(STORE_DATA)
+    let mut section = String::from(STORE_DATA);
+    section.push_str(&dialled_stores(ir));
+    section.push_str(STORE_DATA_LOCAL);
+    section
+}
+
+/// Which of this target's stores are on a server, and what carrying them costs
+/// (grammar §14.3, PRD resolved q63).
+///
+/// The generic sentence beside this one says a named target *may* bind a `kv`
+/// store to a server. This says which ones **this** target bound, in which
+/// variable each address is, and which driver `package.json` therefore pins —
+/// the same three facts [`journal_home`] states for the slot beside it, and for
+/// the same reason: a reader auditing the emitted project's dependency set has
+/// to be able to find out what a package is there for, and a store's driver is
+/// otherwise the one pin this document never mentions.
+///
+/// The address is the **variable's name**, never what it holds: `docs/trace.md`
+/// §11.1 keeps a resolved `${ENV}` out of every artifact this project writes,
+/// and a store URL is a credential.
+fn dialled_stores(ir: &Ir) -> String {
+    let mut bound: Vec<(String, &'static str, String)> = Vec::new();
+    for (address, definition) in &ir.definitions {
+        let crate::ir::definition::DefinitionBody::Store(store) = &definition.body else {
+            continue;
+        };
+        let backend = crate::ir::deploy::backend_of(ir, store);
+        // Keyed on "this project carries a driver for it" rather than on "it
+        // dials out", which is the same question this section is answering. A
+        // store bound to a provider this release has not implemented is refused
+        // by name at its first op and pins nothing, so a row for it here would
+        // be a README describing a connection that is never opened.
+        if super::stores::driver_of(backend.provider).is_none() {
+            continue;
+        }
+        bound.push((
+            address.clone(),
+            backend.provider.as_str(),
+            backend
+                .url_env
+                .map_or_else(|| "—".to_string(), |variable| format!("${{{variable}}}")),
+        ));
+    }
+    if bound.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(DIALLED_STORES);
+    for (address, provider, address_env) in &bound {
+        let _ = writeln!(section, "| `{address}` | `{provider}` | `{address_env}` |");
+    }
+    section.push_str(DIALLED_STORE_DRIVERS);
+    let pins = super::stores::pins(ir);
+    let development = super::stores::development_pins(ir);
+    for (package, version) in pins.iter().chain(development.iter()) {
+        let _ = writeln!(section, "| `{package}` | `{version}` |");
+    }
+    section.push_str(DIALLED_STORE_POSTURE);
+    section
 }
 
 const STORE_DATA: &str = r#"
@@ -1259,8 +1343,41 @@ const STORE_DATA: &str = r#"
 unconditionally, so a composition with a `store.*` in it runs with nothing
 installed (PRD 5.8). A named target may bind a `kv` store to `postgres` or
 `mysql` instead, in which case that store's rows are on the server its
-`storage_backends:` entry names and nothing of it is under this directory. What
-the local backends write lives here:
+`storage_backends:` entry names and nothing of it is under this directory.
+"#;
+
+/// The table's heading, for a target that bound at least one store to a server.
+const DIALLED_STORES: &str = r#"
+This target bound these:
+
+| store | backend | address |
+|---|---|---|
+"#;
+
+/// …and what carrying them costs the manifest.
+const DIALLED_STORE_DRIVERS: &str = r#"
+Each address is the **name** of a variable and never its value: it is read at
+that store's first op, and a launch that is short one is refused with the site
+that asked for it before the graph is invoked. This project therefore pins the
+driver each of those stores is reached through, in `package.json` beside every
+other pin; a target whose stores are all local pins none of these:
+
+| package | version |
+|---|---|
+"#;
+
+/// …and the posture a dialled store is under, which is not the local ones'.
+const DIALLED_STORE_POSTURE: &str = r#"
+A store on a server is a connection rather than a file, so every process that
+reaches it reaches the same rows — which is what makes one usable from a
+placement where a local store is refused. It takes no lock and no writer guard,
+and per key the last write wins. The ops, the scopes, the recorded reads and the
+deduplicated writes are the same on every backend.
+"#;
+
+/// The rest of the section: the local layout, and what is not a store's.
+const STORE_DATA_LOCAL: &str = r#"
+What the local backends write lives here:
 
 ```text
 .agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
@@ -2007,6 +2124,127 @@ store.prefs:
             section > contents.find("### On Node instead").expect("the fallback"),
             "…and after the launch instructions it is about"
         );
+    }
+
+    /// **A target that binds a store to a server says which store, at which
+    /// variable, and what the driver in `package.json` is for** (grammar §14.3,
+    /// PRD resolved q63).
+    ///
+    /// The journal's slot states those three facts about itself (resolved q62),
+    /// and the store's has to state them about its own or the emitted project is
+    /// not auditable: a target whose `journal:` is absent — so SQLite, the
+    /// default — and whose `kv` store dials Postgres ships a `package.json`
+    /// carrying `pg` and `@types/pg`, a journal section saying the journal cost
+    /// no dependency this project did not already have, and, before this, no
+    /// other mention of either package anywhere in the document. The pin table
+    /// at the foot is [`PINS`] and [`DEV_PINS`] only, by construction: a
+    /// driver is carried by the *deployment* rather than by the compiler
+    /// release, so it cannot be a row there.
+    ///
+    /// The address is the variable's **name**. A README that printed the value
+    /// would put a database password in a file every worker unpacks
+    /// (`docs/trace.md` §11.1).
+    #[test]
+    fn a_target_that_dials_a_store_is_told_which_driver_that_costs() {
+        const COMPOSITION: &str = r#"version: "0.1"
+
+store.notes:
+  kind: kv
+  scope: global
+  description: What a run wrote down.
+  backend: notes_db
+  value_schema:
+    text: { type: string }
+"#;
+
+        let local = readme_of(&ir_of(COMPOSITION)).contents;
+        assert!(
+            local.contains("## Where a store keeps its data"),
+            "a composition with a store is told where its data goes: {local}"
+        );
+        for absent in [
+            "| `pg` |",
+            "This target bound these:",
+            "A database driver **is** pinned",
+        ] {
+            assert!(
+                !local.contains(absent),
+                "the zero-infra build's README carries `{absent}`, and its `package.json` pins \
+                 no driver at all: {local}"
+            );
+        }
+
+        let dialled = readme_of(&crate::codegen::test_support::ir_of_mesh(
+            COMPOSITION,
+            "version: \"0.1\"\nstorage_backends:\n  aliases:\n    \
+             notes_db: { provider: postgres, url: \"${NOTES_URL}\" }\n",
+        ))
+        .contents;
+        assert!(
+            dialled.contains("| `store.notes` | `postgres` | `${NOTES_URL}` |"),
+            "the README names neither the store this target dialled nor the variable holding \
+             its address: {dialled}"
+        );
+        for (package, version) in [("pg", "8.23.0"), ("@types/pg", "8.23.1")] {
+            assert!(
+                dialled.contains(&format!("| `{package}` | `{version}` |")),
+                "`{package}` is in this project's `package.json` and in no table of its \
+                 README: {dialled}"
+            );
+        }
+        assert!(
+            dialled.contains("A database driver **is** pinned"),
+            "the journal section still reads as though nothing in `package.json` were a \
+             driver, which is what it says when the journal is the default one: {dialled}"
+        );
+        // The driver table and the journal's default-arm paragraph are the two
+        // halves of one answer, and the sentence above points forward at it.
+        assert!(
+            dialled.find("A database driver **is** pinned")
+                < dialled.find("| `store.notes` | `postgres` |"),
+            "the journal section points *below* at the store section: {dialled}"
+        );
+        assert!(
+            dialled.find("| `store.notes` | `postgres` |")
+                < dialled.find("What the local backends write lives here"),
+            "which store is on a server is told before the local layout it is not part of: \
+             {dialled}"
+        );
+    }
+
+    /// A store bound to a backend this release has **not** implemented gets no
+    /// row, because it carries no driver and opens no connection.
+    ///
+    /// `redis` is grammar §14.3 `kv` vocabulary the runtime refuses by name at
+    /// the first op (PRD resolved q63), so a row for it would tell the reader of
+    /// an emitted project that a store is on a server it will never reach — and
+    /// would head a driver table with nothing in it.
+    #[test]
+    fn a_store_on_an_unimplemented_backend_is_not_listed_as_dialled() {
+        let contents = readme_of(&crate::codegen::test_support::ir_of_mesh(
+            r#"version: "0.1"
+
+store.notes:
+  kind: kv
+  scope: global
+  description: What a run wrote down.
+  backend: notes_db
+  value_schema:
+    text: { type: string }
+"#,
+            "version: \"0.1\"\nstorage_backends:\n  aliases:\n    \
+             notes_db: { provider: redis, url: \"${REDIS_URL}\" }\n",
+        ))
+        .contents;
+        assert!(
+            contents.contains("## Where a store keeps its data"),
+            "{contents}"
+        );
+        assert!(
+            !contents.contains("This target bound these:"),
+            "a store on a refused backend is listed as one this project dials: {contents}"
+        );
+        assert!(!contents.contains("${REDIS_URL}"), "{contents}");
     }
 
     /// A composition holding a built-in is told where it works and what it may

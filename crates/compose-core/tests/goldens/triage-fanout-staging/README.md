@@ -494,8 +494,32 @@ resume route instead.
 unconditionally, so a composition with a `store.*` in it runs with nothing
 installed (PRD 5.8). A named target may bind a `kv` store to `postgres` or
 `mysql` instead, in which case that store's rows are on the server its
-`storage_backends:` entry names and nothing of it is under this directory. What
-the local backends write lives here:
+`storage_backends:` entry names and nothing of it is under this directory.
+
+This target bound these:
+
+| store | backend | address |
+|---|---|---|
+| `store.triage_memory` | `postgres` | `${TRIAGE_MEMORY_URL}` |
+
+Each address is the **name** of a variable and never its value: it is read at
+that store's first op, and a launch that is short one is refused with the site
+that asked for it before the graph is invoked. This project therefore pins the
+driver each of those stores is reached through, in `package.json` beside every
+other pin; a target whose stores are all local pins none of these:
+
+| package | version |
+|---|---|
+| `pg` | `8.23.0` |
+| `@types/pg` | `8.23.1` |
+
+A store on a server is a connection rather than a file, so every process that
+reaches it reaches the same rows — which is what makes one usable from a
+placement where a local store is refused. It takes no lock and no writer guard,
+and per key the last write wins. The ops, the scopes, the recorded reads and the
+deduplicated writes are the same on every backend.
+
+What the local backends write lives here:
 
 ```text
 .agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store

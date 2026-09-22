@@ -1320,6 +1320,7 @@ function connectionFor(store: StoreBinding): Promise<RemoteKv> {
   // the module header on what is deliberately not copied from the journal.
   let dialling: Promise<RemoteKv> | undefined;
   let faulted = false;
+  let dropped = false;
   const lost = (): void => {
     faulted = true;
     const held = dialling;
@@ -1328,6 +1329,13 @@ function connectionFor(store: StoreBinding): Promise<RemoteKv> {
     // one before its first `await`, so this is belt and braces rather than a
     // path anybody has taken.
     if (held === undefined) return;
+    // **Dropped once.** An arm reports a lost socket from two places — the
+    // statement it died under, and the driver's own `error` event — and one loss
+    // is both of them: the statement settles first and the event follows when
+    // the socket ends. Without this the second call would queue a second close
+    // on a connection already closing.
+    if (dropped) return;
+    dropped = true;
     if (DIALLED.get(cacheKey) === held) DIALLED.delete(cacheKey);
     // Queued behind whatever is still in flight on it, which is `RemoteKv`'s
     // own serialization; a close that fails is a socket the server reaps.

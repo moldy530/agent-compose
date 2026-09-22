@@ -33,7 +33,11 @@
 //!  * a unique index and a conflict-ignore that really make a double-delivered
 //!    write land **once** (grammar 9.4, PRD 5.8) — which is the clause resolved
 //!    q63 moved from the caller's promise to the backend's;
-//!  * a placeholder dialect — `?` against `$1` — and an upsert spelled two ways.
+//!  * a placeholder dialect — `?` against `$1` — and an upsert spelled two ways;
+//!  * a connection the **server** takes away under the op that was using it,
+//!    which is the one failure a `serve` cannot be restarted out of. See
+//!    [`TRUE_WHEN_DIALLED`], which is the half of the contract only a backend
+//!    with a socket has.
 //!
 //! # How it runs, and what it does when a server is absent
 //!
@@ -187,18 +191,21 @@ flow.probe:\n  \
 /// address.
 const STORE_URL: &str = "AGENT_COMPOSE_STORE_URL";
 
-/// …and three more names for the same server, which is how the runner's
-/// interleaved-writer and concurrent-open cases become several connections
-/// rather than one.
+/// …and four more names for the same server, which is how the runner's
+/// interleaved-writer, concurrent-open and killed-connection cases become
+/// several connections rather than one.
 ///
 /// `src/stores.ts` caches a dialled connection per provider and variable name,
 /// so two bindings naming one variable share a socket by design — which is right
-/// for a graph and useless for a case about two writers, or about four processes
-/// of a placement reaching one fresh database at the same moment.
+/// for a graph and useless for a case about two writers, about four processes of
+/// a placement reaching one fresh database at the same moment, or about a
+/// connection the server takes away: the last of those has to be a socket no
+/// other case is holding.
 const OTHER_STORE_URLS: &[&str] = &[
     "AGENT_COMPOSE_STORE_URL_B",
     "AGENT_COMPOSE_STORE_URL_C",
     "AGENT_COMPOSE_STORE_URL_D",
+    "AGENT_COMPOSE_STORE_URL_E",
 ];
 
 /// Build the project `composition` and `deploy` describe, and answer where the
@@ -380,6 +387,21 @@ fn every_store_backend_answers_the_same_contract() {
             );
         }
 
+        // …and the cases only a backend with a socket has. A local store has no
+        // connection to lose, so these are the dialled arms' own half of the
+        // contract rather than a row of grammar 11.4's catalogue.
+        if backend.variable.is_some() {
+            for case in TRUE_WHEN_DIALLED {
+                assert_eq!(
+                    answered.get(*case).and_then(Value::as_bool),
+                    Some(true),
+                    "the `{provider}` store fails `{case}`, which is what a dialled backend \
+                     promises an operator about a connection its server takes away (PRD \
+                     resolved q63, `storeConnectionLost` in `src/stores.ts`): {answered:#?}"
+                );
+            }
+        }
+
         // `list` answers in UTF-8 byte order on every backend, which on a server
         // is the column's collation answering: U+FF00 is `EF BC 80` and U+1F600
         // is `F0 9F 98 80`, so bytes put U+FF00 first while a UTF-16 comparison
@@ -481,6 +503,34 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // PRD 5.8's replay discipline, unchanged by the arms underneath it.
     "a_replayed_read_answers_out_of_the_record",
     "a_replayed_write_is_not_applied_again",
+];
+
+/// The cases a backend with a **socket** must answer `true`, on top of those.
+///
+/// A local store has no connection to lose, so this is the dialled arms' own
+/// half of the contract rather than a row of grammar 11.4's catalogue — and it
+/// is the half a `serve` depends on most, because a `serve` is the deployment
+/// with no next run to fix anything: a store whose connection is taken away by a
+/// managed failover, a proxy's idle reaper or an operator's `KILL` has to come
+/// back on the next op, or it is gone for the life of the process.
+///
+/// The runner kills the connection with a statement **in flight**, which is what
+/// makes these cases about more than a driver's `error` event: `mysql2` reports
+/// a socket that died under a command to that command alone and emits nothing,
+/// so an arm that listened only to the event would leave a dead connection in
+/// the dialled cache and refuse every later op with a raw
+/// `Can't add new command when connection is in closed state`.
+const TRUE_WHEN_DIALLED: &[&str] = &[
+    // The premise of the two below: the kill really landed on a statement the
+    // server could see waiting, rather than on an idle socket.
+    "the_store_was_caught_mid_statement",
+    // The op that met the loss is refused with the sentence that names the
+    // variable an operator can change, rather than with the driver's own.
+    "a_lost_connection_is_refused_by_name",
+    // …and the next op runs over a connection dialled again, against the rows
+    // the lost one had already committed.
+    "a_lost_connection_is_redialled",
+    "a_redialled_store_still_holds_what_it_wrote",
 ];
 
 /// **A target that binds both dialled arms gets one module, and it compiles.**

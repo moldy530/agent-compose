@@ -170,35 +170,101 @@ const POSTGRES_STORE_DIALECT: StoreDialect = {
   ignore: standardIgnore,
 };
 
+/**
+ * Whether an error a statement was rejected with means the **connection** is
+ * gone rather than that the statement was refused.
+ *
+ * `FATAL` is Postgres's own severity for exactly that: a FATAL message aborts
+ * the session that received it, so this socket is on its way out whatever the
+ * code beside it says — `57P01` for an administrator's `pg_terminate_backend`,
+ * `57P02` for a crash shutdown, `08006` for a connection failure. An ordinary
+ * refusal is `ERROR` and leaves the session alone, so a unique violation or a
+ * value too long stays what it is: this statement's failure, and this store's to
+ * report as one.
+ *
+ * Read on the statement and not only on the client's `error` event because the
+ * two arrive in that order rather than the other. `Client._handleErrorMessage`
+ * hands a FATAL to the query in flight and returns; the `error` event follows
+ * only when the socket itself ends, a turn of the event loop later, by which
+ * time this statement has already settled. The eviction happens either way here,
+ * because `Client._handleErrorEvent` emits unconditionally once the socket goes;
+ * what this adds is that the op which *met* the loss is refused with the
+ * sentence naming the variable an operator can change rather than with the
+ * driver's own.
+ */
+function postgresConnectionIsGone(error: unknown): boolean {
+  return (error as { severity?: unknown } | null)?.severity === "FATAL";
+}
+
 /** One Postgres server, as the connection a dialled `kv` store runs over. */
 class PostgresStoreDriver implements StoreDriver {
   readonly dialect = POSTGRES_STORE_DIALECT;
   readonly #client: Client;
   /** What the connection reported, if it has reported anything. */
   readonly #fault: { error?: Error };
+  /**
+   * The **name** of the variable this connection's address was read from, which
+   * is what every message about it names — see [`storeConnectionLost`].
+   */
+  readonly #where: string;
+  /** What drops this connection from the dialled cache. See [`#reported`]. */
+  readonly #lost: () => void;
 
-  constructor(client: Client, fault: { error?: Error }) {
+  constructor(client: Client, fault: { error?: Error }, where: string, lost: () => void) {
     this.#client = client;
     this.#fault = fault;
+    this.#where = where;
+    this.#lost = lost;
   }
 
   async all(sql: string, parameters: readonly Bound[]): Promise<Record<string, unknown>[]> {
     if (this.#fault.error !== undefined) throw this.#fault.error;
-    const answered = await this.#client.query(sql, [...parameters]);
-    return answered.rows as Record<string, unknown>[];
+    try {
+      const answered = await this.#client.query(sql, [...parameters]);
+      return answered.rows as Record<string, unknown>[];
+    } catch (error) {
+      throw this.#reported(error);
+    }
   }
 
   async run(sql: string, parameters: readonly Bound[]): Promise<number> {
     if (this.#fault.error !== undefined) throw this.#fault.error;
-    const answered = await this.#client.query(sql, [...parameters]);
-    // `rowCount` is `null` on a statement that has no rows to count — `BEGIN`,
-    // `COMMIT`, `ROLLBACK` — and the only callers that read it are the ones
-    // whose statements do have them.
-    return answered.rowCount ?? 0;
+    try {
+      const answered = await this.#client.query(sql, [...parameters]);
+      // `rowCount` is `null` on a statement that has no rows to count — `BEGIN`,
+      // `COMMIT`, `ROLLBACK` — and the only callers that read it are the ones
+      // whose statements do have them.
+      return answered.rowCount ?? 0;
+    } catch (error) {
+      throw this.#reported(error);
+    }
   }
 
   async close(): Promise<void> {
     await this.#client.end();
+  }
+
+  /**
+   * What a rejected statement is really reported as.
+   *
+   * A server's refusal is itself. A connection that ended under the statement
+   * ([`postgresConnectionIsGone`]) is the fault recorded, so every later
+   * statement over this connection is refused with the same sentence, and
+   * `lost()` called, so the retry the node's `retry:` makes runs over a
+   * connection dialled again — which is what [`storeConnectionLost`] promises
+   * the operator in so many words.
+   *
+   * Done **once**: a fault is permanent, `lost()` is the caller's whole response
+   * to it, and the client's own `error` event will arrive afterwards saying the
+   * same thing.
+   */
+  #reported(error: unknown): unknown {
+    if (!postgresConnectionIsGone(error)) return error;
+    if (this.#fault.error === undefined) {
+      this.#fault.error = storeConnectionLost("postgres", this.#where, error);
+      this.#lost();
+    }
+    return this.#fault.error;
   }
 }
 
@@ -246,7 +312,7 @@ async function openPostgresStore(
     await client.end().catch(() => undefined);
     throw error;
   }
-  return new PostgresStoreDriver(client, fault);
+  return new PostgresStoreDriver(client, fault, where, lost);
 }
 
 STORE_BACKENDS.postgres = openPostgresStore;

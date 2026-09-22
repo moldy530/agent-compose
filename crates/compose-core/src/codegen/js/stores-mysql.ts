@@ -252,36 +252,113 @@ function storeNamesNoDatabase(where: string): Error {
   );
 }
 
+/**
+ * Whether an error a statement was rejected with means the **connection** is
+ * gone rather than that the statement was refused.
+ *
+ * `fatal` is `mysql2`'s own word for it, and it sets the flag at exactly the
+ * places a connection stops being usable: `_handleFatalError` (a network error,
+ * a protocol error, a handshake that failed), the `PROTOCOL_CONNECTION_LOST` the
+ * stream's `close` raises, and `_addCommandClosedState` — which is what every
+ * statement written to an already-dead connection takes. A server's error packet
+ * carries none of it, so `ER_DUP_ENTRY` and a value too long stay what they are:
+ * this statement's failure, and this store's to report as one.
+ *
+ * **It is read on the statement rather than only on the connection's `error`
+ * event, and that is the whole of why this exists.** `_notifyError` computes
+ * `bubbleErrorToConnection` from `!this._command`: a connection that dies with a
+ * statement **in flight** hands the error to that statement's `onResult` and
+ * emits nothing at all, so the listener [`openMysqlStore`] attaches never runs.
+ * That is not the rare half of the failure, it is the ordinary one — a managed
+ * failover, a proxy's idle reaper or an operator's `KILL` takes the socket away
+ * under whichever op was holding it. Left to the listener alone, such a
+ * connection would sit in the dialled cache with no fault recorded, every later
+ * op would be a `query()` on a closed connection answering `mysql2`'s raw
+ * `Can't add new command when connection is in closed state`, and it would do so
+ * for the life of the process — which on a `serve`, the deployment a dialled
+ * store exists for, is for ever. The Postgres arm has no such hole:
+ * `Client._handleErrorEvent` errors the queries **and** emits, unconditionally.
+ */
+function mysqlConnectionIsGone(error: unknown): boolean {
+  return (error as { fatal?: unknown } | null)?.fatal === true;
+}
+
 /** One MySQL server, as the connection a dialled `kv` store runs over. */
 class MysqlStoreDriver implements StoreDriver {
   readonly dialect = MYSQL_STORE_DIALECT;
   readonly #connection: Connection;
   /** What the connection reported, if it has reported anything. */
   readonly #fault: { error?: Error };
+  /**
+   * The **name** of the variable this connection's address was read from, which
+   * is what every message about it names — see [`storeConnectionLost`].
+   */
+  readonly #where: string;
+  /** What drops this connection from the dialled cache. See [`#reported`]. */
+  readonly #lost: () => void;
 
-  constructor(connection: Connection, fault: { error?: Error }) {
+  constructor(
+    connection: Connection,
+    fault: { error?: Error },
+    where: string,
+    lost: () => void,
+  ) {
     this.#connection = connection;
     this.#fault = fault;
+    this.#where = where;
+    this.#lost = lost;
   }
 
   async all(sql: string, parameters: readonly Bound[]): Promise<Record<string, unknown>[]> {
     if (this.#fault.error !== undefined) throw this.#fault.error;
-    const [rows] = await this.#connection.query<RowDataPacket[]>(sql, [...parameters]);
-    return rows as Record<string, unknown>[];
+    try {
+      const [rows] = await this.#connection.query<RowDataPacket[]>(sql, [...parameters]);
+      return rows as Record<string, unknown>[];
+    } catch (error) {
+      throw this.#reported(error);
+    }
   }
 
   async run(sql: string, parameters: readonly Bound[]): Promise<number> {
     if (this.#fault.error !== undefined) throw this.#fault.error;
-    const [result] = await this.#connection.query(sql, [...parameters]);
-    // `BEGIN`, `COMMIT` and `ROLLBACK` answer a header too, and its
-    // `affectedRows` is 0 — which is what the callers that do not read it
-    // expect and what the callers that do would never ask of one.
-    const header = result as Partial<ResultSetHeader>;
-    return typeof header.affectedRows === "number" ? header.affectedRows : 0;
+    try {
+      const [result] = await this.#connection.query(sql, [...parameters]);
+      // `BEGIN`, `COMMIT` and `ROLLBACK` answer a header too, and its
+      // `affectedRows` is 0 — which is what the callers that do not read it
+      // expect and what the callers that do would never ask of one.
+      const header = result as Partial<ResultSetHeader>;
+      return typeof header.affectedRows === "number" ? header.affectedRows : 0;
+    } catch (error) {
+      throw this.#reported(error);
+    }
   }
 
   async close(): Promise<void> {
     await this.#connection.end();
+  }
+
+  /**
+   * What a rejected statement is really reported as.
+   *
+   * A server's refusal is itself. A **fatal** one is this connection ending
+   * under the op that was using it ([`mysqlConnectionIsGone`]), and it is
+   * recorded here exactly where the connection's own `error` listener would have
+   * recorded it: the fault is set, so every later statement over this connection
+   * is refused with the same sentence rather than with a raw closed-state
+   * message, and `lost()` drops it from the dialled cache so that the retry the
+   * node's `retry:` makes runs over a connection dialled again — which is what
+   * [`storeConnectionLost`] promises the operator in so many words.
+   *
+   * Done **once**: a fault is permanent, `lost()` is the caller's whole response
+   * to it, and a second call would queue a second close behind the first.
+   */
+  #reported(error: unknown): unknown {
+    if (!mysqlConnectionIsGone(error)) return error;
+    if (this.#fault.error === undefined) {
+      this.#fault.error = storeConnectionLost("mysql", this.#where, error);
+      this.#lost();
+    }
+    return this.#fault.error;
   }
 }
 
@@ -362,6 +439,11 @@ async function openMysqlStore(
   // nothing listening ends the process. This is the first moment there is a
   // connection to attach to: the promise `createConnection` answers rejects
   // rather than emits when it is the *connect* that failed.
+  //
+  // It is **half** of how this arm hears about a lost socket, and deliberately
+  // so: the other half is [`MysqlStoreDriver.#reported`], which covers the case
+  // this listener is never called for — the far end going away with a statement
+  // in flight, which `mysql2` reports to that statement and to nobody else.
   connection.on("error", (reported: unknown) => {
     fault.error ??= storeConnectionLost("mysql", where, reported);
     // …and the connection goes with it, so the next op dials a fresh one rather
@@ -412,7 +494,7 @@ async function openMysqlStore(
     await connection.end().catch(() => undefined);
     throw error;
   }
-  return new MysqlStoreDriver(connection, fault);
+  return new MysqlStoreDriver(connection, fault, where, lost);
 }
 
 STORE_BACKENDS.mysql = openMysqlStore;
