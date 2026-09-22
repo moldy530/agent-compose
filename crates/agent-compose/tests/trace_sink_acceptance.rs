@@ -26,6 +26,18 @@
 //! `compose-core`'s `tests/otlp_conformance.rs`, over a corpus that pins exact
 //! output; this suite asks only that what arrives is that mapping's shape, so
 //! the two do not restate each other.
+//!
+//! # The second event class
+//!
+//! PRD resolved q64 gives the sink a second kind of POST: every settled
+//! **detached `flow.*` delivery** ships an envelope of its own, headed
+//! `detached: true`, `parent_execution` and the grammar §9.4 `idempotency_key`,
+//! while its parent's entry keeps exactly the stub `"detached"` record it always
+//! had. Detach is legal only under `--target local` (Decision D59), so those
+//! tests serve the `detached-trace-sink` fixture under a `deploy/local.yml` —
+//! the only place the second class can exist — and the verification the ruling
+//! ratified is theirs: two envelopes, the linkage between them, the failed
+//! delivery shipping with its outcome, and the re-shipping a recovery does.
 
 #[path = "compiled_graph_acceptance/harness.rs"]
 mod harness;
@@ -34,7 +46,7 @@ use std::collections::HashSet;
 use std::net::TcpListener;
 use std::time::Duration;
 
-use mock_provider::{Client, MockProvider, Request};
+use mock_provider::{Client, MockProvider, Outcome, Request, Script};
 use serde_json::{Value, json};
 
 /// The fixture every test here drives.
@@ -1214,5 +1226,530 @@ fn a_run_whose_sink_credential_is_blank_journals_the_export_and_sends_nothing() 
         collector.of_event("settled").is_empty(),
         "a delivery signed with nothing was sent anyway: {:?}",
         collector.of_event("settled")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The second event class: a detached `flow.*` delivery's own envelope
+// ---------------------------------------------------------------------------
+
+/// The fixture the second event class is served from.
+const DETACHED_FIXTURE: &str = "detached-trace-sink";
+
+/// The one target `detach: true` is legal under (grammar 8.6 rule 7, Decision
+/// D59), and so the one target the second event class exists under.
+const LOCAL: &str = "local";
+
+/// The provider-native id `model.local` resolves to in that fixture.
+const REVIEWER_MODEL: &str = "qwen3-coder-30b";
+
+/// What [`served_detached`] hands back: the staged composition (whose
+/// entrypoint is only valid while it lives), that entrypoint, the project
+/// directory a restart serves again, and the running app.
+type DetachedServe = (
+    harness::Scratch,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    harness::Served,
+);
+
+/// Stage and serve the detached fixture under `deploy/local.yml`, naming a sink.
+fn served_detached(
+    purpose: &str,
+    provider: &MockProvider,
+    collector: &harness::Receiver,
+    format: Option<&str>,
+) -> Option<DetachedServe> {
+    let (composition, entrypoint) = harness::staged_with_deploy(
+        purpose,
+        DETACHED_FIXTURE,
+        LOCAL,
+        &sink_target(&format!("{}/v1/traces", collector.base_url), format, false),
+    );
+    let project = harness::scratch_project(purpose)?;
+    let served = harness::serve_target_into(&project, &entrypoint, LOCAL, &environment(provider))?;
+    Some((composition, entrypoint, project, served))
+}
+
+/// Start one execution through `route` and answer its id.
+fn started(app: &Client, route: &str) -> String {
+    let answered = app
+        .send(Request::post(route).json(&json!({ "subjects": ["the collector"] })))
+        .expect("the trigger's route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+    answered.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string()
+}
+
+/// Split envelope-format exports into the executions' own and the detached
+/// deliveries', by the head that tells them apart (`docs/trace.md` §2).
+fn by_class(
+    exported: &[harness::Delivered],
+) -> (Vec<&harness::Delivered>, Vec<&harness::Delivered>) {
+    exported
+        .iter()
+        .partition(|delivered| delivered.body.get("detached").is_none())
+}
+
+/// The stub record a detached dispatch leaves on its map node's entry.
+fn stub_record<'a>(parent: &'a Value, node: &str) -> &'a Value {
+    let entry = parent["entries"]
+        .as_array()
+        .expect("an envelope carries entries")
+        .iter()
+        .find(|entry| entry["node"] == node)
+        .unwrap_or_else(|| panic!("the parent's trace has a `{node}` entry: {parent:#}"));
+    let dispatches = entry["dispatches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a map node's entry carries its dispatches: {entry:#}"));
+    assert_eq!(dispatches.len(), 1, "one subject, one dispatch: {entry:#}");
+    &dispatches[0]
+}
+
+/// One span attribute's value, by key.
+fn attribute(span: &Value, key: &str) -> Option<Value> {
+    span["attributes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|held| held["key"] == key)
+        .map(|held| held["value"].clone())
+}
+
+/// **A settled detached delivery ships its own envelope, and its parent's entry
+/// does not move an inch** (PRD resolved q64, `docs/trace.md` §1.4, §2, §5.1).
+///
+/// The ruling's verification, both halves in one run. The parent's export is the
+/// one it always was: its map node's entry carries exactly the stub `"detached"`
+/// record — `attempts: 0`, no `inner` — and no model call, because the parent
+/// makes none and the delivery's is not the parent's (D94). The delivery's own
+/// envelope is the second POST: headed `detached: true`, `parent_execution` and
+/// the grammar §9.4 `idempotency_key`, which is **byte for byte** the stub
+/// record's key — the join between the two is string equality — and carrying the
+/// delivery's own trace with its model call on it.
+///
+/// Both ride the parent's ledger as two deliveries of one execution: two ids,
+/// both `settled` events, so a receiver's dedupe on the delivery id cannot fold
+/// the one into the other.
+#[test]
+fn a_settled_detached_delivery_ships_its_own_envelope_beside_its_parents() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let Some((_composition, _entrypoint, _project, served)) =
+        served_detached("sink-detached", &provider, &collector, None)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let execution = started(&app, "/reviews");
+
+    let exported = collector.wait_for_event("settled", 2, PATIENCE);
+    let (parents, deliveries) = by_class(&exported);
+    assert_eq!(
+        (parents.len(), deliveries.len()),
+        (1, 1),
+        "the sink received the execution's export and the delivery's envelope, one each: \
+         {exported:#?}"
+    );
+    let parent = &parents[0].body;
+    let delivery = &deliveries[0].body;
+
+    // The parent's export: the first event class, unchanged.
+    assert_eq!(parent["execution_id"], execution, "{parent:#}");
+    assert_eq!(parent["flow"], "flow.dispatch", "{parent:#}");
+    assert_eq!(parent["status"], "completed", "{parent:#}");
+    for head in ["detached", "parent_execution", "idempotency_key"] {
+        assert!(
+            parent.get(head).is_none(),
+            "`{head}` heads a detached delivery's envelope and no other: {parent:#}"
+        );
+    }
+    let stub = stub_record(parent, "review");
+    assert_eq!(stub["outcome"], "detached", "{stub:#}");
+    assert_eq!(stub["attempts"], 0, "{stub:#}");
+    assert_eq!(stub["target"], "flow.review", "{stub:#}");
+    assert!(
+        stub.get("inner").is_none(),
+        "the stub record is the parent's whole account of the dispatch (`docs/trace.md` \
+         §5.1): {stub:#}"
+    );
+    for entry in parent["entries"].as_array().expect("entries") {
+        for collected in ["models", "stores", "toolDispatches", "harness", "inner"] {
+            assert!(
+                entry.get(collected).is_none(),
+                "the parent made no `{collected}` of its own, so one on its `{}` entry is the \
+                 delivery's leaking into its parent's collector: {parent:#}",
+                entry["node"]
+            );
+        }
+    }
+
+    // The delivery's own envelope: the second event class.
+    let key = stub["idempotencyKey"]
+        .as_str()
+        .expect("a dispatch record carries its key");
+    assert_eq!(
+        key,
+        format!("{execution}/review/0/0"),
+        "grammar §9.4's key for item 0 of map node `review` on its first traversal"
+    );
+    assert_eq!(delivery["trace_version"], 4, "{delivery:#}");
+    assert_eq!(delivery["detached"], true, "{delivery:#}");
+    assert_eq!(delivery["parent_execution"], execution, "{delivery:#}");
+    assert_eq!(
+        delivery["idempotency_key"], key,
+        "the join between the parent's stub record and this envelope is string equality on \
+         the key: {delivery:#}"
+    );
+    assert_eq!(
+        delivery["execution_id"], execution,
+        "a detached delivery is not an execution of its own, so its entries belong to the one \
+         it ran under: {delivery:#}"
+    );
+    assert_eq!(delivery["flow"], "flow.review", "{delivery:#}");
+    assert_eq!(delivery["status"], "completed", "{delivery:#}");
+    assert!(delivery.get("error").is_none(), "{delivery:#}");
+    let head = String::from_utf8_lossy(&deliveries[0].bytes);
+    assert!(
+        head.starts_with(&format!(
+            "{{\"trace_version\":4,\"detached\":true,\"parent_execution\":\"{execution}\",\
+             \"idempotency_key\":\"{key}\","
+        )),
+        "the envelope is **headed** by the version and the linkage, in that order: {head}"
+    );
+    let entries = delivery["entries"]
+        .as_array()
+        .expect("a detached envelope carries entries");
+    assert_eq!(entries.len(), 1, "{delivery:#}");
+    let judged = &entries[0];
+    assert_eq!(judged["node"], "judge", "{judged:#}");
+    assert_eq!(judged["flow"], "flow.review", "{judged:#}");
+    assert_eq!(
+        judged["step"], 1,
+        "an instance numbers its own steps: {judged:#}"
+    );
+    assert_eq!(judged["outcome"], "completed", "{judged:#}");
+    let models = judged["models"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the delivery's model call is on its own entry: {judged:#}"));
+    assert_eq!(models.len(), 1, "{judged:#}");
+    assert_eq!(models[0]["model"], "model.local", "{judged:#}");
+    assert_eq!(models[0]["servedBy"], "model.local", "{judged:#}");
+
+    // Two deliveries on the parent's ledger, told apart by id.
+    let ids: Vec<&str> = exported
+        .iter()
+        .map(|delivered| {
+            delivered
+                .header("x-agentcompose-delivery")
+                .expect("a delivery names its id")
+        })
+        .collect();
+    assert_ne!(ids[0], ids[1], "two envelopes are two deliveries: {ids:?}");
+    for id in &ids {
+        assert!(
+            id.starts_with(&format!("{execution}:")),
+            "both ride the ledger of the execution the delivery ran under: {ids:?}"
+        );
+    }
+    assert_eq!(
+        collector.distinct("settled").len(),
+        2,
+        "no third export: {:?}",
+        collector.distinct("settled")
+    );
+}
+
+/// **A delivery that failed ships too, its outcome on the envelope** (PRD
+/// resolved q64).
+///
+/// The debugging story the ruling says is strongest exactly here: the review ran
+/// and made its model call, the filing step failed, and none of it touched the
+/// parent — which settled `completed`, because nothing a detached dispatch does
+/// can fail the enclosing flow instance (grammar §8.6 rule 7). The envelope says
+/// `status: "failed"`, names what stopped the delivery, and carries both of the
+/// delivery's entries, the aborting one last (`docs/trace.md` §9).
+#[test]
+fn a_detached_delivery_that_failed_ships_its_envelope_with_its_outcome() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "revise" })),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let Some((_composition, _entrypoint, _project, served)) =
+        served_detached("sink-detached-failed", &provider, &collector, None)
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let execution = started(&app, "/filings");
+
+    let exported = collector.wait_for_event("settled", 2, PATIENCE);
+    let (parents, deliveries) = by_class(&exported);
+    assert_eq!((parents.len(), deliveries.len()), (1, 1), "{exported:#?}");
+    let parent = &parents[0].body;
+    let delivery = &deliveries[0].body;
+
+    assert_eq!(
+        parent["status"], "completed",
+        "a delivery's failure is not its parent's: {parent:#}"
+    );
+    let stub = stub_record(parent, "review");
+    assert_eq!(
+        stub["outcome"], "detached",
+        "the join never observes a detached delivery's outcome (D94): {stub:#}"
+    );
+    assert!(stub.get("error").is_none(), "{stub:#}");
+
+    assert_eq!(delivery["detached"], true, "{delivery:#}");
+    assert_eq!(delivery["parent_execution"], execution, "{delivery:#}");
+    assert_eq!(
+        delivery["idempotency_key"], stub["idempotencyKey"],
+        "{delivery:#}"
+    );
+    assert_eq!(delivery["flow"], "flow.review_and_file", "{delivery:#}");
+    assert_eq!(delivery["status"], "failed", "{delivery:#}");
+    assert!(
+        delivery["error"]
+            .as_str()
+            .is_some_and(|held| !held.is_empty()),
+        "a failed delivery's envelope names what stopped it: {delivery:#}"
+    );
+    let entries = delivery["entries"].as_array().expect("entries");
+    let nodes: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| entry["node"].as_str())
+        .collect();
+    assert_eq!(
+        nodes,
+        ["judge", "file"],
+        "the review that ran, then the filing it failed at: {delivery:#}"
+    );
+    assert_eq!(entries[0]["outcome"], "completed", "{delivery:#}");
+    assert!(
+        entries[0]["models"]
+            .as_array()
+            .is_some_and(|models| models.len() == 1),
+        "the model call the delivery made before it failed is on its envelope: {delivery:#}"
+    );
+    assert_eq!(entries[1]["outcome"], "failed", "{delivery:#}");
+}
+
+/// **Under `format: otlp` the head rides the delivery's root span, in its
+/// parent's trace** (PRD resolved q64, `docs/trace.md` §12.2, §12.5).
+///
+/// The same two POSTs mapped to spans. The delivery's export carries
+/// `agentcompose.detached`, `agentcompose.parent_execution` and
+/// `agentcompose.idempotency_key` on its root, the key equal to the instance
+/// path the parent's dispatch span reports — the OTLP spelling of the same
+/// string-equality join — and its root is hung off the parent execution's root
+/// span in the parent's trace, so a collector files the delivery under the run it
+/// was dispatched from rather than beside it.
+#[test]
+fn an_otlp_sink_receives_the_detached_head_on_the_deliverys_root_span() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let Some((_composition, _entrypoint, _project, served)) =
+        served_detached("sink-detached-otlp", &provider, &collector, Some("otlp"))
+    else {
+        return;
+    };
+    let app = Client::new(&served.base_url).expect("a client for the generated app");
+    let execution = started(&app, "/reviews");
+
+    let exported = collector.wait_for_event("settled", 2, PATIENCE);
+    let (deliveries, parents): (Vec<&harness::Delivered>, Vec<&harness::Delivered>) =
+        exported.iter().partition(|delivered| {
+            attribute(root_span(&delivered.body), "agentcompose.detached").is_some()
+        });
+    assert_eq!((parents.len(), deliveries.len()), (1, 1), "{exported:#?}");
+    let parent_root = root_span(&parents[0].body);
+    let delivery_root = root_span(&deliveries[0].body);
+
+    assert_eq!(
+        attribute(parent_root, "agentcompose.execution.id"),
+        Some(json!({ "stringValue": execution })),
+        "{parent_root:#}"
+    );
+    for head in [
+        "agentcompose.detached",
+        "agentcompose.parent_execution",
+        "agentcompose.idempotency_key",
+    ] {
+        assert!(
+            attribute(parent_root, head).is_none(),
+            "`{head}` is on a detached delivery's root and no other: {parent_root:#}"
+        );
+    }
+
+    // The parent's dispatch span, whose instance path is the stub's key.
+    let dispatched = parents[0].body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("spans")
+        .iter()
+        .find(|span| attribute(span, "agentcompose.dispatch.outcome").is_some())
+        .unwrap_or_else(|| {
+            panic!(
+                "the parent's export has a dispatch span: {:#}",
+                parents[0].body
+            )
+        });
+    let key = attribute(dispatched, "agentcompose.instance_path")
+        .and_then(|held| held["stringValue"].as_str().map(str::to_string))
+        .expect("a dispatch span reports its instance path");
+
+    assert_eq!(
+        attribute(delivery_root, "agentcompose.detached"),
+        Some(json!({ "boolValue": true })),
+        "{delivery_root:#}"
+    );
+    assert_eq!(
+        attribute(delivery_root, "agentcompose.parent_execution"),
+        Some(json!({ "stringValue": execution })),
+        "{delivery_root:#}"
+    );
+    assert_eq!(
+        attribute(delivery_root, "agentcompose.idempotency_key"),
+        Some(json!({ "stringValue": key })),
+        "the delivery's key is the parent's dispatch span's instance path: {delivery_root:#}"
+    );
+    assert_eq!(delivery_root["name"], "flow.review", "{delivery_root:#}");
+    assert_eq!(
+        delivery_root["traceId"], parent_root["traceId"],
+        "the delivery is exported into its parent's trace"
+    );
+    assert_eq!(
+        delivery_root["parentSpanId"], parent_root["spanId"],
+        "…hung off the parent execution's root span"
+    );
+    assert_ne!(
+        delivery_root["spanId"], parent_root["spanId"],
+        "two roots of one id would be one span to a collector"
+    );
+    let spans = deliveries[0].body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .expect("spans");
+    assert!(
+        spans.iter().any(|span| span["name"] == "model.local"),
+        "the delivery's model call is a span of its own export: {:#}",
+        deliveries[0].body
+    );
+}
+
+/// **A recovered execution re-ships its detached delivery on that delivery's own
+/// settlement, and still ships its own export when it settles** (PRD resolved
+/// q64, `docs/trace.md` §1.4, §8, `docs/durability.md` §3.2).
+///
+/// The at-least-once half. The parent detaches a review and parks at a `human`
+/// node, so its lifecycle row stays open with the delivery already settled and
+/// its envelope already shipped. The app is killed and started again over the
+/// same journal; recovery re-runs the execution, the delivery with it — its model
+/// call replayed from the journal rather than asked again — and on that
+/// settlement the envelope ships a **second** time, under a second delivery id
+/// and the same `(parent_execution, idempotency_key)`, which is the pair a
+/// receiver dedupes on.
+///
+/// Then the pause is answered and the parent settles, and its own export arrives
+/// — with two `trace_sink` rows of the delivery's already on its ledger. A guard
+/// that read any such row as "this execution is exported" would have silenced it.
+#[test]
+fn a_recovered_execution_reships_its_detached_delivery_and_still_exports_itself() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let Some((_composition, entrypoint, project, mut first)) =
+        served_detached("sink-detached-recovered", &provider, &collector, None)
+    else {
+        return;
+    };
+    let app = Client::new(&first.base_url).expect("a client for the generated app");
+    let execution = started(&app, "/awaited-reviews");
+
+    let shipped = collector.wait_for_event("settled", 1, PATIENCE);
+    assert_eq!(
+        shipped[0].body["detached"], true,
+        "a parked parent has not settled, so the first POST is the delivery's: {:#}",
+        shipped[0].body
+    );
+    let parked = harness::settled(&app, &execution);
+    assert_eq!(parked["status"], "interrupted", "{parked}");
+    let asked = provider.requests().len();
+
+    first.stop();
+    let Some(second) =
+        harness::serve_target_into(&project, &entrypoint, LOCAL, &environment(&provider))
+    else {
+        return;
+    };
+
+    let reshipped = collector.wait_for_event("settled", 2, PATIENCE);
+    let (original, again) = (&reshipped[0], &reshipped[1]);
+    assert_eq!(again.body["detached"], true, "{:#}", again.body);
+    assert_eq!(
+        (
+            &again.body["parent_execution"],
+            &again.body["idempotency_key"]
+        ),
+        (
+            &original.body["parent_execution"],
+            &original.body["idempotency_key"]
+        ),
+        "a re-shipped envelope carries the pair a receiver dedupes on, unchanged"
+    );
+    assert_eq!(
+        again.body["entries"], original.body["entries"],
+        "the recovered delivery replayed what the first one did, so it reports the same trace"
+    );
+    assert_ne!(
+        again.header("x-agentcompose-delivery"),
+        original.header("x-agentcompose-delivery"),
+        "the re-ship is a second delivery, which is why receivers dedupe on the pair rather \
+         than on the delivery id"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        asked,
+        "the recovered delivery's model call was replayed from the journal, not asked again"
+    );
+
+    // The parent settles, and its own export ships beside the delivery's two.
+    let app = Client::new(&second.base_url).expect("a client for the restarted app");
+    harness::until(PATIENCE, || {
+        let answered = app
+            .post_json(
+                &format!("/executions/{execution}/resume"),
+                &json!({ "decision": "approve" }),
+            )
+            .expect("the resume route answers");
+        (answered.status == 202).then_some(())
+    });
+    let all = collector.wait_for_event("settled", 3, PATIENCE);
+    let (parents, deliveries) = by_class(&all);
+    assert_eq!(
+        (parents.len(), deliveries.len()),
+        (1, 2),
+        "the parent's export is not mistaken for — or silenced by — its delivery's: {all:#?}"
+    );
+    let parent = &parents[0].body;
+    assert_eq!(parent["execution_id"], execution, "{parent:#}");
+    assert_eq!(parent["status"], "completed", "{parent:#}");
+    assert_eq!(
+        stub_record(parent, "review")["idempotencyKey"],
+        deliveries[0].body["idempotency_key"],
+        "{parent:#}"
     );
 }

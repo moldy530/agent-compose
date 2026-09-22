@@ -1,0 +1,239 @@
+# Acceptance fixture: a detached `flow.*` delivery's own trace envelope — the
+# trace sink's second event class (PRD resolved q64, `docs/trace.md` §1.4, §2).
+#
+# `trace-sink` is the fixture for the sink's first event class, one POST per
+# settled execution, and it is served under a target of its own. This one cannot
+# be: `detach: true` is legal under `--target local` and under no other target
+# (grammar 8.6 rule 7, Decision D59), so the deploy file the suite writes beside
+# a copy of this directory is `deploy/local.yml` — which admits `trace_sink:`
+# (grammar 14) — and the second event class exists exactly where detach does.
+#
+# What it is *for* is the split the ruling draws, so each flow is one half of it:
+#
+#   * `flow.dispatch` detaches a `flow.review` per subject and carries on. The
+#     parent never makes a model call of its own, so the one model call in the
+#     whole execution is the delivery's — and "it is on the delivery's envelope
+#     and not on the parent's entry" is an assertion with nothing else in the
+#     way. The parent's account of the dispatch stays the stub `"detached"`
+#     record (Decision D94, `docs/trace.md` §5.1);
+#   * `flow.dispatch_filing` detaches a `flow.review_and_file`, whose second
+#     node always fails — the delivery that *failed*, which ships too, with its
+#     outcome on the envelope and the model call it made before failing still
+#     on it;
+#   * `flow.dispatch_and_wait` detaches the same review and then **parks** at a
+#     `human` node, so its lifecycle row stays open with the delivery already
+#     settled and shipped. A restarted `serve` recovers the execution, re-runs
+#     the delivery from the journal and re-ships on that settlement — the
+#     at-least-once half, deduped by a receiver on `(parent_execution,
+#     idempotency_key)` — and the answer that finally settles the parent is what
+#     shows its own export was not mistaken for one of the envelopes already on
+#     its ledger.
+#
+# The provider is the mock, reached through `${MOCK_BASE_URL}` exactly as every
+# other fixture reaches it (PRD 5.9), and the two `exec:` nodes use `${OPS_BIN}`
+# as `trace-sink`'s do.
+version: "0.1"
+
+defaults:
+  timeout: 60s
+  on_error: fail
+
+state:
+  noted:
+    description: What the parent wrote after it had detached its deliveries.
+    type: string
+    default: ""
+  decision:
+    description: What the person answered, on the parent that parks.
+    enum: [approve, reject]
+    default: reject
+
+triggers:
+  on_review_request:
+    type: http
+    flow: flow.dispatch
+    path: /reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+  on_filing_request:
+    type: http
+    flow: flow.dispatch_filing
+    path: /filings
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+  on_awaited_request:
+    type: http
+    flow: flow.dispatch_and_wait
+    path: /awaited-reviews
+    method: POST
+    input:
+      subjects: "payload.body.subjects"
+    respond: async
+
+provider.mock:
+  kind: openai_compatible
+  base_url: ${MOCK_BASE_URL}
+  api_key: ${MOCK_API_KEY}
+
+model.local:
+  provider: provider.mock
+  id: qwen3-coder-30b
+
+# The delivery's one model call. Its `output:` names no channel, so nothing the
+# delivery answers is written anywhere — a detached dispatch may write no state
+# (grammar 8.6 rule 7) — and the call is on the trace and nowhere else.
+agent.reviewer:
+  description: Reviews one subject, off its parent's clock.
+  model: model.local
+  prompt: |
+    Review the subject you are given and say whether it passes.
+  input:
+    subject:
+      type: string
+  output:
+    verdict:
+      enum: [approve, revise]
+
+# The delivery. `outputs: {}`, because what a detached `flow.*` returns is
+# written after everything that reads it and so is refused (Decision D94).
+flow.review:
+  description: Review one subject — the work a detached delivery does.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    judge:
+      agent: agent.reviewer
+      input:
+        subject: "input.subject"
+  edges:
+    - { from: start, to: judge }
+    - { from: judge, to: end }
+
+# The delivery that fails: the same review, then a filing step that cannot
+# succeed. The review's model call really happened, and a delivery's envelope
+# is the only account of it — which is the debugging story the ruling says is
+# strongest exactly here.
+flow.review_and_file:
+  description: Review one subject and file it — a delivery whose filing always fails.
+  inputs:
+    subject:
+      type: string
+      min_length: 1
+  outputs: {}
+  nodes:
+    judge:
+      agent: agent.reviewer
+      input:
+        subject: "input.subject"
+    file:
+      exec:
+        command: "${OPS_BIN}/false"
+  edges:
+    - { from: start, to: judge }
+    - { from: judge, to: file }
+    - { from: file, to: end }
+
+flow.dispatch:
+  description: Detach a review per subject, then note that they were sent.
+  inputs:
+    subjects:
+      description: One detached delivery per element.
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    noted:
+      type: string
+  nodes:
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"dispatched"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: note }
+    - { from: note, to: end }
+
+flow.dispatch_filing:
+  description: Detach a review that fails, and settle anyway.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    noted:
+      type: string
+  nodes:
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review_and_file
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    note:
+      exec:
+        command: "${OPS_BIN}/echo"
+        args: ['{"noted":"dispatched"}']
+        output:
+          noted: { type: string }
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: note }
+    - { from: note, to: end }
+
+flow.dispatch_and_wait:
+  description: Detach a review, then park until a person signs it off.
+  inputs:
+    subjects:
+      type: array
+      max_items: 4
+      items: { type: string }
+  outputs:
+    decision:
+      enum: [approve, reject]
+  nodes:
+    review:
+      map:
+        over: input.subjects
+        as: one
+        node: flow.review
+        max_concurrency: 1
+        detach: true
+        input:
+          subject: "one"
+    sign_off:
+      human:
+        input:
+          note: { type: string }
+        output:
+          decision: { enum: [approve, reject] }
+      input:
+        note: "'is the review in?'"
+  edges:
+    - { from: start, to: review }
+    - { from: review, to: sign_off }
+    - { from: sign_off, to: end }

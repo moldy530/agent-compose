@@ -129,6 +129,13 @@ pub const FIXTURES: &[&str] = &[
     "agent-openai",
     "bounded-cycle",
     "builtin-tools",
+    // The trace sink's second event class (PRD resolved q64): detached `flow.*`
+    // deliveries whose own envelopes ship beside their parents'. Under `local`
+    // with no deploy file — which is what `the_acceptance_fixtures_validate_clean`
+    // resolves it as — it declares no sink; `tests/trace_sink_acceptance.rs`
+    // writes the `deploy/local.yml` it needs into a copy, as it does for
+    // `trace-sink`, and `local` is the one target `detach: true` is legal under.
+    "detached-trace-sink",
     "durability",
     "fanout",
     "flow-as-tool",
