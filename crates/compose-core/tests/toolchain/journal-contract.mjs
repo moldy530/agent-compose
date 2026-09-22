@@ -18,6 +18,8 @@
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import process from "node:process";
+import { spawnSync } from "node:child_process";
+import { writeFileSync, rmSync } from "node:fs";
 
 const [, , project] = process.argv;
 if (project === undefined) {
@@ -529,6 +531,51 @@ async function endTheGuardSession(provider, url) {
   }
 }
 
+/**
+ * Open this project's journal from a child process, and say how that went.
+ *
+ * The one honest way to meet the writer guard: `openJournal()` caches its
+ * promise per module instance and this runtime deduplicates module instances
+ * more aggressively than a query-stringed re-import assumes, so any in-process
+ * "second opener" risks holding the first opener's handle and vouching for a
+ * guard it never touched. A child process shares nothing, which is exactly the
+ * claim §2.3 makes.
+ *
+ * Answers `{ outcome: "opened" }` — the child released what it opened before
+ * reporting — or `{ outcome: "refused", message }` with the arm's own text.
+ */
+function secondOpener() {
+  const script = path.resolve(project, ".journal-second-opener.mjs");
+  writeFileSync(
+    script,
+    `const journal = await import(${JSON.stringify(at("src/journal.ts"))});\n` +
+      `try {\n` +
+      `  await journal.openJournal();\n` +
+      `  await journal.releaseJournal().catch(() => undefined);\n` +
+      `  process.stdout.write(JSON.stringify({ outcome: "opened" }));\n` +
+      `} catch (error) {\n` +
+      `  process.stdout.write(JSON.stringify({ outcome: "refused", message: error instanceof Error ? error.message : String(error) }));\n` +
+      `}\n`,
+  );
+  try {
+    const ran = spawnSync(process.execPath, [script], {
+      cwd: project,
+      env: process.env,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    if (ran.status !== 0 || ran.stdout === "") {
+      return {
+        outcome: "refused",
+        message: `the second opener did not report: exit ${ran.status}, stderr: ${ran.stderr}`,
+      };
+    }
+    return JSON.parse(ran.stdout);
+  } finally {
+    rmSync(script, { force: true });
+  }
+}
+
 // 9. **The writer guard.** A second opener of a journal a live process holds is
 //    refused by name rather than left to interleave (`docs/durability.md` §2).
 //    Only the two remote backends have one — SQLite's file lock is broken after
@@ -540,18 +587,18 @@ if (journal.journalBinding.provider === "sqlite") {
   results.a_lost_connection_is_refused_rather_than_fatal = "not-applicable";
 } else {
   const held = await opened(journal);
-  // A second module instance, loaded under a query string so the runtime treats
-  // it as a different module and it opens a connection of its own — which is
-  // what a second *process* would do, at the only level this runner can do it.
-  const rival = await import(`${at("src/journal.ts")}?rival`);
-  try {
-    await rival.openJournal();
-    results.writer_guard_refuses_a_second_opener = "not-refused";
-  } catch (error) {
-    results.writer_guard_refuses_a_second_opener = error instanceof Error ? error.message : String(error);
-  } finally {
-    await rival.releaseJournal().catch(() => undefined);
-  }
+  // A second **process**, literally: an earlier draft loaded a second module
+  // instance under a query string (`src/journal.ts?rival`) and Bun answered
+  // that absolute-URL import with the *same* module namespace, so the "rival"
+  // resolved the first opener's cached promise, no second connection ever
+  // existed, and the case could not fail against any server. A contract case
+  // that cannot fail is not a case, and the guard it vouched for is the one
+  // §2.3 leans on — so the second opener is now a child process running this
+  // project's own `openJournal()`, which is also the situation the guard
+  // exists for.
+  const verdict = secondOpener();
+  results.writer_guard_refuses_a_second_opener =
+    verdict.outcome === "opened" ? "not-refused" : verdict.message;
 
   // 10. **…and a guard nobody is holding is not a lock.** The case above is a
   //     *live* second opener, which is the easy half. The half §2.3 leans on
@@ -569,16 +616,22 @@ if (journal.journalBinding.provider === "sqlite") {
       ended === 0 ? "nothing was holding the guard" : ended
     }`;
   } else {
-    const successor = await import(`${at("src/journal.ts")}?successor`);
-    try {
-      await opened(successor);
-      results.a_takeover_is_not_locked_out_by_a_dead_session = "admitted";
-    } catch (error) {
-      results.a_takeover_is_not_locked_out_by_a_dead_session =
-        error instanceof Error ? error.message : String(error);
-    } finally {
-      await successor.releaseJournal().catch(() => undefined);
+    // A real process again (see the rival above), because what a takeover is.
+    // The kill and the successor race by nature — the server releases the dead
+    // session's guard when it finishes terminating it — so a refusal that reads
+    // as the guard still held is retried under the same deadline `opened()`
+    // gives a live one.
+    const until = Date.now() + 4_000;
+    let verdict = secondOpener();
+    while (
+      verdict.outcome === "refused" &&
+      verdict.message.includes("another process is already writing") &&
+      Date.now() <= until
+    ) {
+      verdict = secondOpener();
     }
+    results.a_takeover_is_not_locked_out_by_a_dead_session =
+      verdict.outcome === "opened" ? "admitted" : verdict.message;
   }
 
   // 11. **…and this process is still here to report it.** Both drivers emit
