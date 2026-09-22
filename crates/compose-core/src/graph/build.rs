@@ -741,7 +741,8 @@ fn connection_views(ir: &Ir, coder: &Coder) -> Vec<ConnectionView> {
 /// (grammar 8.9, PRD resolved q57 ruling c).
 ///
 /// `cc` does, by making the list the tool set the SDK offers its loop at all and
-/// denying anything outside it at the per-call permission callback; `codex`
+/// denying anything outside it per call — at the permission callback, or under
+/// `dontAsk` by the mode itself, which reads the list as its pre-approval; `codex`
 /// bounds at the sandbox boundary only, per-call approval being the tier of
 /// their app server this release does not adopt. The two reserved harnesses
 /// never reach here — `validate` refuses them — and answer `false`, which is

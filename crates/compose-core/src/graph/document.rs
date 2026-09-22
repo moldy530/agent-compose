@@ -769,8 +769,9 @@ pub struct CoderView {
     pub allow_tools: Vec<String>,
     /// Whether this harness enforces `allow_tools` inside its own loop.
     /// `cc` does, by narrowing the tool set its loop is offered and denying the
-    /// rest at its per-call permission callback; `codex` bounds at the sandbox
-    /// only (grammar 8.9, PRD resolved q57 ruling c).
+    /// rest per call — at its permission callback, or under `dontAsk` by the
+    /// mode itself, which reads the list as its pre-approval; `codex` bounds at
+    /// the sandbox only (grammar 8.9, PRD resolved q57 ruling c).
     pub tools_enforced: bool,
     /// `env:` — the declared environment, in declaration order. Absent where
     /// the node declares none, which is a wholly scrubbed child environment.

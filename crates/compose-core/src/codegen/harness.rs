@@ -581,16 +581,22 @@ mod tests {
         );
     }
 
-    /// A call the `cc` permission callback denied is **one** tool event
-    /// (`docs/trace.md` §7.6.3).
+    /// A call the `cc` permission surface denied is **one** tool event, and a
+    /// `"refused"` one (`docs/trace.md` §7.6.3).
     ///
-    /// The denial is taped `refused` where it happens, and the SDK then hands
-    /// the model that same denial as the `tool_result` answering the
-    /// `tool_use`. Taping that too would put a second event in the record for
-    /// one call, under an outcome that describes a call which ran — `completed`
-    /// is "handed its model the tool's result" and `failed` is an execution
-    /// that failed, and a refusal is neither. Correlating them needs the id, so
-    /// the id is what is pinned here.
+    /// The denial is taped `refused` where the driver learns of it — in the
+    /// permission callback, or off the `permission_denied` frame the SDK reports
+    /// a denial it made **without** asking the callback (a `dontAsk` mode
+    /// denial, `auto`'s classifier) — and the SDK then hands the model that same
+    /// denial as the `tool_result` answering the `tool_use`. Taping that too
+    /// would put a second event in the record for one call, under an outcome
+    /// that describes a call which ran — `completed` is "handed its model the
+    /// tool's result" and `failed` is an execution that failed, and a refusal
+    /// is neither. Correlating them needs the id, so the id is what is pinned
+    /// here, at both places a denial is learned of. What the taping produces
+    /// for each shape of message is `generated_code_gates`'
+    /// `a_harness_run_is_contained_journaled_and_recorded`, which feeds the
+    /// real `ccEvents` the SDK's own frames.
     #[test]
     fn a_cc_call_the_allowlist_denied_is_one_tool_event() {
         assert!(
@@ -599,7 +605,15 @@ mod tests {
              downstream can tell the denial's own `tool_result` from a tool's answer"
         );
         assert!(
-            CC.contains("if (refused.delete(block.tool_use_id)) {"),
+            CC.contains(
+                "if (message.type === \"system\" && message.subtype === \"permission_denied\") {"
+            ) && CC.contains("refused.add(message.tool_use_id);"),
+            "the `cc` driver does not tape the SDK's `permission_denied` frame, so a denial the SDK \
+             made without the callback — every one under `dontAsk`, and `auto`'s classifier — \
+             reaches the trace as its error `tool_result`, a `failed` call that never executed"
+        );
+        assert!(
+            CC.contains("if (refused.has(block.tool_use_id)) {"),
             "the `cc` driver tapes a `tool_result` for a call it already taped as `refused`"
         );
     }
@@ -964,10 +978,118 @@ mod tests {
             .expect("…and declares it as a literal boolean")
     }
 
+    /// **A `cc` run never pairs bare `allowedTools` with its permission
+    /// callback, and carries the list's per-call answer through the option its
+    /// mode reads** (grammar 8.9, Decisions D138 and D146, PRD resolved q57
+    /// ruling c and q60 ruling a).
+    ///
+    /// `allow_tools:` reaches the Agent SDK as two layers: `tools`, the
+    /// availability bound no permission mode widens, and a per-call gate whose
+    /// answer is the list's own — `allow` inside it, so a bounded run neither
+    /// prompts about nor denies what it allows, and `deny` outside it. Which
+    /// option carries the gate is the mode's to say:
+    ///
+    ///  * every mode that consults a callback (`default`, `acceptEdits`,
+    ///    `plan`, and `auto` once its classifier hands a question back) gets
+    ///    `canUseTool`, which also tapes a denial as `"refused"` — and **no**
+    ///    `allowedTools` beside it: a bare entry there approves the whole tool
+    ///    before the callback is consulted, so the pinned SDK
+    ///    (`@anthropic-ai/claude-agent-sdk` 0.3.272) reports the pairing from
+    ///    `query()` as a shadowed callback, `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`;
+    ///  * `dontAsk`, which the SDK documents as "deny if not pre-approved" and
+    ///    whose CLI denies a would-ask call **without** consulting
+    ///    `canUseTool`, gets the list as `allowedTools` and no callback. A
+    ///    callback there is dead, and with nothing pre-approved every in-list
+    ///    tool that needs a permission is denied — the regression this test
+    ///    keeps out, and one a check that only asked the callback what it
+    ///    answers could never see.
+    ///
+    /// Read off the **emitted** module rather than the driver constant, so the
+    /// prelude and the `passthrough` it holds are covered too, and read as code:
+    /// a comment naming the option to say why it is absent is the comment doing
+    /// its job. Code may name `allowedTools` in two places — the reserved-list
+    /// entry, which drops a `settings:` key spelling it, and the `dontAsk`
+    /// branch — and the two gate options must be the two arms of one
+    /// `mode === "dontAsk"` test, so no mode is handed both. The runtime half,
+    /// mode by mode, is `generated_code_gates`'
+    /// `a_harness_run_is_contained_journaled_and_recorded`, which calls the real
+    /// option builder.
+    #[test]
+    fn bare_allowed_tools_are_never_paired_with_the_permission_callback() {
+        let emitted = module(&one_coder_node(Harness::Cc)).contents;
+        let code: Vec<&str> = emitted
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                !(line.starts_with("//") || line.starts_with("/*") || line.starts_with('*'))
+            })
+            .collect();
+        let mentions: Vec<&str> = code
+            .iter()
+            .copied()
+            .filter(|line| {
+                line.split(|held: char| !held.is_ascii_alphanumeric() && held != '_' && held != '$')
+                    .any(|word| word == "allowedTools")
+            })
+            .collect();
+        assert_eq!(
+            mentions,
+            ["\"allowedTools\",", "options.allowedTools = [...allowed];"],
+            "the emitted `cc` driver names `allowedTools` in code outside its reserved list and its \
+             `dontAsk` branch: a bare entry beside `canUseTool` approves the whole tool before the \
+             callback is consulted, which the pinned SDK reports from `query()` as \
+             `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` (grammar 8.9, Decision D138)"
+        );
+        let gate = [
+            "if (mode === \"dontAsk\") {",
+            "options.allowedTools = [...allowed];",
+            "} else {",
+            "options.canUseTool = (name, _input, ask) => {",
+        ];
+        assert!(
+            code.windows(gate.len()).any(|window| window == gate),
+            "the `cc` driver's two gate options are no longer the two arms of one \
+             `mode === \"dontAsk\"` test: either some mode is handed `allowedTools` beside the \
+             callback it shadows, or `dontAsk` — which denies a would-ask call without consulting \
+             `canUseTool` — is handed the callback instead of the pre-approval, and every in-list \
+             tool that needs a permission is denied (Decision D146)"
+        );
+        assert!(
+            quoted_list(&emitted, "CC_RESERVED").contains("allowedTools"),
+            "`CC_RESERVED` does not hold `allowedTools`, so a `settings:` key spelling it would \
+             pair bare entries with the permission callback the driver sets"
+        );
+        assert!(
+            from_allow_tools(&emitted).contains("tools"),
+            "the `cc` driver no longer sets `tools` from `allow_tools:`, which is the bound \
+             `access: full_access` cannot lift (PRD resolved q57 ruling c)"
+        );
+        assert!(
+            emitted.contains(
+                "if (allowed.includes(name)) return Promise.resolve({ behavior: \"allow\" as const });"
+            ),
+            "the `cc` permission callback no longer answers `allow` for a call inside the list, \
+             so under a mode that consults it an in-list call stops to ask"
+        );
+    }
+
     /// …and what the graph document says about the same harness, which is the
     /// surface an author reads (`docs/graph.md` §5.8).
     fn documented_enforcement(harness: Harness) -> bool {
-        let ir = ir_of(&format!(
+        crate::graph(&one_coder_node(harness))
+            .flows
+            .iter()
+            .flat_map(|flow| &flow.nodes)
+            .find_map(|node| node.coder.as_ref())
+            .expect("the composition has a coder node")
+            .tools_enforced
+    }
+
+    /// A composition whose one flow runs one `coder:` node on `harness`, under
+    /// the preset that asks for the least containment and with an
+    /// `allow_tools:` list — the node every enforcement claim is about.
+    fn one_coder_node(harness: Harness) -> Ir {
+        ir_of(&format!(
             "version: \"0.1\"
 provider.p:
   kind: anthropic
@@ -994,14 +1116,7 @@ flow.f:
     - {{ from: build, to: end }}
 ",
             harness.as_str()
-        ));
-        crate::graph(&ir)
-            .flows
-            .iter()
-            .flat_map(|flow| &flow.nodes)
-            .find_map(|node| node.coder.as_ref())
-            .expect("the composition has a coder node")
-            .tools_enforced
+        ))
     }
 
     /// The option keys one driver sets from the node's `allow_tools:`.

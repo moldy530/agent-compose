@@ -5761,7 +5761,13 @@ fn a_node_that_asks_for(keyword: &str) -> Option<Value> {
 ///    spawns, `codex` carries two as its client's options, and a provider with
 ///    **no** credential injects none at all rather than an empty one, which is
 ///    resolved q25's keyless-gateway posture surviving the crossing (PRD
-///    resolved q58 ruling a).
+///    resolved q58 ruling a);
+///  * **a refusal is a refusal** — a denial the Agent SDK makes without asking
+///    the permission callback (every one under `dontAsk`, and `auto`'s
+///    classifier) is one `"refused"` tool event, taped off the SDK's own
+///    `permission_denied` frame, and not the `"failed"` its error `tool_result`
+///    would read as (`docs/trace.md` §7.6.3). The real `ccEvents` is fed those
+///    frames, because a scripted driver never produces one.
 #[test]
 fn a_harness_run_is_contained_journaled_and_recorded() {
     let Some(root) = installed() else {
@@ -6634,6 +6640,29 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         "`settings: {{ tools: … }}` widened the set the loop can reach, which is \
          the option `enforcesTools` rests on"
     );
+    // `allow_tools:` is `tools` and the permission callback, and never bare
+    // `allowedTools` beside them — from the driver or from a `settings:` key. A
+    // bare entry approves the whole tool before `canUseTool` is consulted, and
+    // the pinned Agent SDK reports that pairing from `query()` as
+    // `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` (grammar 8.9, Decision D138).
+    assert_eq!(
+        bound["allowedTools"],
+        json!(null),
+        "the `cc` options carry bare `allowedTools` beside `canUseTool`, which shadows the \
+         callback for every name on the list"
+    );
+    // …so under this node's mode — `acceptEdits`, derived, which asks the host
+    // about a call it does not settle itself — the callback is what answers the
+    // list: `allow` for a call inside it, which is what keeps a bounded run from
+    // prompting, and `deny` outside it. Whether a given mode asks the callback
+    // at all is the `allowlistByMode` table below.
+    assert_eq!(
+        bound["callback"],
+        json!({ "inList": "allow", "outOfList": "deny" }),
+        "the `cc` permission callback does not answer the node's own list — under \
+         `acceptEdits`, which asks the host about a call it does not settle itself, an in-list \
+         call the callback does not allow is one the run stops to ask about"
+    );
     assert_eq!(
         bound["systemPromptIsThePreset"],
         json!("claude_code"),
@@ -6686,7 +6715,8 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
     // all three are read, because keying two of them off `run.access` is the
     // shape that looks right and is not — it would arm the skip flag on a
     // `full_access` node that asked for `plan`, and leave that same node running
-    // the vendor's default plan body instead of its own `prompt:`.
+    // the vendor's default plan body instead of its own `prompt:`. The fourth
+    // thing that answers to it, the allowlist's per-call gate, follows them.
     let modes = &answer["permissionMode"];
     for (level, derived) in [
         ("derivedReadOnly", "plan"),
@@ -6740,6 +6770,127 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         modes["statedBypassUnderFullAccess"],
         json!({ "mode": "bypassPermissions", "skip": true, "planBody": null }),
         "writing out the mode a level already derives changed what the run is handed"
+    );
+
+    // …and the fourth thing that answers to the mode: which option carries
+    // `allow_tools:`'s per-call answer (grammar 8.9, Decisions D138 and D146).
+    // The answer is the list's in every mode; what differs is who the SDK asks.
+    // Every mode but `dontAsk` gets the callback and no `allowedTools` beside it
+    // — a bare entry there approves the whole tool before the callback is
+    // consulted, which the pinned SDK reports from `query()` as
+    // `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`. `auto` asks its classifier first and
+    // the callback where the classifier hands a question back;
+    // `bypassPermissions` approves an ordinary call itself and asks the
+    // callback about the checks the CLI holds immune to that mode, and `tools`
+    // holds the bound.
+    let gates = &answer["allowlistByMode"];
+    for mode in [
+        "default",
+        "acceptEdits",
+        "plan",
+        "auto",
+        "bypassPermissions",
+    ] {
+        assert_eq!(
+            gates[mode],
+            json!({
+                "mode": mode,
+                "tools": ["Bash", "Read"],
+                "allowedTools": null,
+                "callback": { "inList": "allow", "outOfList": "deny" },
+            }),
+            "a `cc` run under `{mode}` is not bounded by `tools` and gated by the permission \
+             callback alone: with `allowedTools` beside the callback the SDK reports it shadowed, \
+             and without a callback that answers the list an in-list call stops to ask or is \
+             denied"
+        );
+    }
+    // `dontAsk` is the mode that consults no callback: the pinned SDK documents
+    // it as "deny if not pre-approved", and its CLI denies a would-ask call
+    // without asking `canUseTool`. So the list is the pre-approval and no
+    // callback is set — a callback there is dead, and beside bare `allowedTools`
+    // it is the shadowed pairing again. Read at two levels, so the choice is
+    // seen to key off the mode rather than off `access:`.
+    for case in ["dontAsk", "dontAskUnderFullAccess"] {
+        assert_eq!(
+            gates[case],
+            json!({
+                "mode": "dontAsk",
+                "tools": ["Bash", "Read"],
+                "allowedTools": ["Bash", "Read"],
+                "callback": null,
+            }),
+            "a `dontAsk` run does not pre-approve its own `allow_tools:` — that mode denies a \
+             call it finds no pre-approval for without consulting `canUseTool`, so every in-list \
+             tool that needs a permission (`Bash`, `Edit`, `Write`) is denied on a node whose \
+             list allows it, and no `settings:` key can pre-approve one instead (Decision D146)"
+        );
+    }
+
+    // --- A refusal is a refusal, whichever part of the SDK made it ----------
+    //
+    // `docs/trace.md` §7.6.3: `"refused"` is the harness's own permission
+    // surface declining a call, and `"failed"` is a call that executed and
+    // failed. A denial the Agent SDK makes without asking the callback — every
+    // one under `dontAsk`, and one `auto`'s classifier makes itself, on an
+    // in-list call — comes back to the loop as an error `tool_result`. The SDK
+    // also reports it as a top-level `system`/`permission_denied` frame. The
+    // driver tapes that frame, and the error result after it is payload only.
+    // These are the records `runCoder` filed from the real `ccEvents` fed those
+    // frames: the classifier's denial and the callback's are one event each,
+    // even when reported twice; a subagent's is not an event at all; and a
+    // call that ran keeps its own outcome.
+    let taping = &answer["refusalTaping"];
+    assert_eq!(
+        taping["auto"],
+        json!({
+            "mode": "auto",
+            "toolCalls": [
+                {
+                    "name": "Bash",
+                    "outcome": "refused",
+                    "error": "Permission to use Bash has been denied by the auto mode classifier."
+                },
+                {
+                    "name": "Write",
+                    "outcome": "refused",
+                    "error": "`flow.patch.implement` allows `Bash`, `Read`, and `Write` is not one of them"
+                },
+                { "name": "Read", "outcome": "completed" },
+                {
+                    "name": "Bash",
+                    "outcome": "failed",
+                    "error": "the tool result came back as an error"
+                }
+            ],
+            "turns": 2,
+            "payloadOnce": true
+        }),
+        "an `auto` run's record misreports its denials: a call `auto`'s classifier denied \
+         without asking the callback is a `\"refused\"` event taped off the SDK's \
+         `permission_denied` frame, not the `\"failed\"` its error `tool_result` reads as; one \
+         denial is one event, however many times the SDK reports it; a subagent's denial is \
+         payload only; and every SDK message reaches the payload once (`docs/trace.md` 7.6.3, \
+         PRD resolved q57 ruling a)"
+    );
+    assert_eq!(
+        taping["dontAsk"],
+        json!({
+            "mode": "dontAsk",
+            "callback": false,
+            "toolCalls": [
+                {
+                    "name": "Bash",
+                    "outcome": "refused",
+                    "error": "Permission to use Bash has been denied because Claude Code is running in don't ask mode."
+                }
+            ],
+            "payloadOnce": true
+        }),
+        "a `dontAsk` run's denial is not one `\"refused\"` event: that mode consults no \
+         callback, so the SDK's `permission_denied` frame is the only place the driver learns \
+         of it, and the error `tool_result` after it records a call that never executed as \
+         `\"failed\"` (`docs/trace.md` 7.6.3)"
     );
 
     let codex = &answer["codexBound"];

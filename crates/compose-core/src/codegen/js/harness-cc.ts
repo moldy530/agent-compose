@@ -21,8 +21,8 @@ const CC_SETTINGS: readonly string[] = [
  * A composition that spelled one of these would be reaching around the
  * construct that states it, through the surface this grammar deliberately
  * leaves open — so they are dropped rather than passed. Two kinds of name are
- * on the list, and the second kind is why it is a list rather than a reading of
- * what the driver below assigns:
+ * on the list, and the second kind — with one name of the first — is why it is
+ * a list rather than a reading of what the driver below assigns:
  *
  *  * an option that **spells** a bound another key states. `workspace:` is
  *    `cwd`; `permission_mode:` is `permissionMode`, the plan-mode body beside it
@@ -33,11 +33,17 @@ const CC_SETTINGS: readonly string[] = [
  *    and custom headers are variables of the process it spawns (Decision D143),
  *    so one reserved name holds both bounds — `output:` is
  *    `outputFormat`, `prompt:` is `systemPrompt`, `allow_tools:` is the
- *    available tool set, the allowlist and the callback over them, `timeout:`
- *    is the abort controller, and `model:` is the model and the one thinking
- *    budget Decision D141 maps into it (`thinking` is here for that last
- *    reason: the SDK documents it as taking precedence over the
- *    `maxThinkingTokens` D141 writes);
+ *    available tool set and the per-call gate over it (`canUseTool`, or
+ *    `allowedTools` under the one mode that never consults a callback),
+ *    `timeout:` is the abort controller, and `model:` is the model and the one
+ *    thinking budget Decision D141 maps into it (`thinking` is here for that
+ *    last reason: the SDK documents it as taking precedence over the
+ *    `maxThinkingTokens` D141 writes). `allowedTools` is the name of this kind
+ *    the driver below writes under **one** mode only, and never beside
+ *    `canUseTool`: a bare entry there approves a whole tool before the callback
+ *    is consulted, which the pinned SDK flags as a shadowed callback (see
+ *    [`CC_DRIVER`]) — so a key spelling it would put back the very pairing the
+ *    driver leaves out;
  *  * an option that **contains** one without spelling it, which a driver never
  *    assigns and a list keyed off the driver could therefore never hold.
  *    `extraArgs` is an arbitrary CLI flag — `dangerously-skip-permissions` and
@@ -156,12 +162,14 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
  * `access:` level derives (grammar 8.9, Decision D146, PRD resolved q60 ruling
  * a).
  *
- * **One function, because three options answer to this value** and a second
+ * **One function, because four options answer to this value** and a second
  * reading of it would be a second answer. `permissionMode` is the mode itself;
  * `allowDangerouslySkipPermissions` is the flag the SDK *requires* beside
- * `bypassPermissions` and beside nothing else; and `planModeInstructions` is
- * plan mode's body, which exists only when the mode is `plan`. Keying those two
- * off `run.access` instead — which is what this driver did while `access:` was
+ * `bypassPermissions` and beside nothing else; `planModeInstructions` is plan
+ * mode's body, which exists only when the mode is `plan`; and `allow_tools:`'s
+ * per-call gate is `canUseTool` or `allowedTools` according to whether the mode
+ * ever consults a callback (see [`CC_DRIVER`]). Keying the two flags off
+ * `run.access` instead — which is what this driver did while `access:` was
  * the only axis — would arm the skip flag on a `full_access` node that asked for
  * `plan`, and leave a `full_access` node that asked for `plan` running the
  * vendor's default code-implementation body instead of the node's own prompt.
@@ -404,22 +412,117 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  *
  * # What enforces the allowlist
  *
- * **Two options, because one of them has a hole.** `tools` is the SDK's own
+ * **Two layers, because one of them has a hole.** `tools` is the SDK's own
  * "base set of available built-in tools", so a list written there is a tool set
- * the model is never offered — a bound that holds whatever the permission mode
- * is. `canUseTool` denies, per call, anything outside the list that reached the
- * loop anyway, and tapes the denial as a `"refused"` tool event so the trace
- * says the bound bit; `allowedTools` auto-allows the ones inside it so a bounded
- * run is not also a prompting one.
+ * the model is never offered — the availability bound, which holds whatever the
+ * permission mode is. Over it sits a per-call gate whose answer is always the
+ * list's own — `allow` inside it, so a bounded run is not also a prompting or
+ * a denying one, and `deny` outside it — and **which option carries that answer
+ * is the mode's to say**, because the SDK's six modes do not all consult the
+ * same party about a call they do not settle themselves:
+ *
+ *  * `default`, `acceptEdits` and `plan` stop to ask the host, and the host's
+ *    answer is `canUseTool`. It answers `allow` for a name inside the list and
+ *    denies anything outside it that reached the loop anyway, taping the
+ *    denial as a `"refused"` tool event so the trace says the bound bit.
+ *  * `auto` asks its model classifier first and the host only where the
+ *    classifier hands the question back, so the same callback is set — and an
+ *    in-list call the classifier refuses is refused before the callback is
+ *    consulted. That denial is still the harness's permission surface declining
+ *    the call, and is taped `"refused"` off the frame the SDK reports it with
+ *    (see *How a refusal reaches the trace*). That order is the mode the node
+ *    named ("use a model classifier to approve/deny permission prompts"):
+ *    approving the list ahead of the classifier would leave it nothing to
+ *    answer. It is read off the pinned CLI's permission flow, not observed — no
+ *    offline run engages the classifier.
+ *  * `dontAsk` consults nobody. The pinned SDK documents it as "deny if not
+ *    pre-approved", and its CLI denies a call that would ask **without**
+ *    consulting `canUseTool` (observed against the pinned release, not only
+ *    read: the call denied, the callback never asked) — so a callback there
+ *    would be dead, and the list's `allow` would be answered by nothing: every
+ *    in-list tool that needs a permission (`Bash`, `Edit`, `Write`) denied, on
+ *    a node whose own list allows it, with no other way for the author to
+ *    pre-approve one (`allowedTools`, `settings` and `settingSources` are all
+ *    on [`CC_RESERVED`]). So under `dontAsk` the list *is* the pre-approval —
+ *    `allowedTools` — and no callback is set. A call outside the list is still
+ *    denied per call, by the mode, and still taped `"refused"`: the SDK
+ *    reports that denial with the same frame as the classifier's.
+ *  * `bypassPermissions` approves an ordinary call itself, asking nobody: see
+ *    the hole. It is not a mode that never asks, though. The pinned CLI's
+ *    permission flow still returns `ask` under it for a check it marks
+ *    **bypass-immune** — a dangerous removal among them — and hands that ask
+ *    to the host as any other mode would, so the same callback is set and
+ *    answers those asks with the list. That is read off the pinned CLI's
+ *    permission flow, not observed in a run.
  *
  * The hole is `access: full_access`, and it is why `tools` carries the bound
- * rather than the callback: that preset is `permissionMode: "bypassPermissions"`,
- * which the SDK documents as bypassing **all** permission checks — so
- * `canUseTool` does not run, and a node whose `enforcesTools` says its list is
- * enforced would be asserting a bound nothing held (grammar 8.9, PRD resolved
- * q57 ruling c). Narrowing the available set is the answer the SDK's own
- * documentation gives for `allowedTools`: "to restrict which tools are
- * available, use the `tools` option instead".
+ * rather than the gate: that preset is `permissionMode: "bypassPermissions"`,
+ * which the SDK documents as bypassing **all** permission checks — and which
+ * does approve an ordinary call without asking the gate, so a node whose
+ * `enforcesTools` says its list is enforced would, on the gate alone, be
+ * asserting a bound nothing held (grammar 8.9, PRD resolved q57 ruling c).
+ * Narrowing the available set is the answer the SDK's own documentation gives
+ * for `allowedTools`: "to restrict which tools are available, use the `tools`
+ * option instead".
+ *
+ * **Never both.** A bare `allowedTools` name approves the whole tool *before*
+ * the callback is consulted, so beside `canUseTool` it shadows the callback —
+ * and the pinned SDK does not leave that silent: `query()` reports the pairing
+ * as a shadowed callback under `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`, naming every
+ * bare entry the callback will never be asked about. So under a mode that
+ * consults the callback the list is answered there alone — where a refusal is
+ * taped — and under `dontAsk`, which reads the pre-approval and never the
+ * callback, it is answered there alone, with no callback beside it to shadow.
+ * `allowedTools` stays on [`CC_RESERVED`] for the same reason: a `settings:`
+ * key spelling it would put the shadow back under every other mode.
+ *
+ * One shadow report is accepted, and it is the hole above: under
+ * `bypassPermissions` the SDK reports the callback as shadowed under the same
+ * code, with a warning that the mode "auto-approves every tool call (except
+ * explicit deny rules) before the callback is consulted". That is true of an
+ * ordinary call and not of every one: the bypass-immune checks above still
+ * come back as asks, and the SDK hands an ask to `canUseTool` where one is set
+ * and treats it as a denial where none is. So the callback is not dead under
+ * that mode, and that is why it is kept: it answers those asks with the list —
+ * `allow` for a tool inside it, as under every mode that asks it, so on a
+ * `full_access` node whose list holds `Bash` a removal the CLI stopped to ask
+ * about is approved. What the gate never holds under that mode is the bound
+ * itself: `tools` holds it.
+ *
+ * # How a refusal reaches the trace
+ *
+ * `"refused"` is the harness's own permission surface declining a call, and
+ * `"failed"` a call that executed and failed (`docs/trace.md` §7.6.3). Which
+ * part of the SDK's permission surface said no — this runtime's callback, the
+ * `dontAsk` mode, `auto`'s classifier — is not the trace's business, so every
+ * one of them is taped `"refused"`, from one of two places:
+ *
+ *  * a denial the **callback** makes is taped where it is made, because the
+ *    callback is this runtime's own code;
+ *  * a denial the SDK makes **without** asking the callback is reported by the
+ *    SDK as a `system` message of subtype `permission_denied`, carrying the
+ *    call's id, the tool's name and the rejection the model is handed back — and
+ *    [`ccEvents`] tapes that frame. The pinned SDK documents the frame as
+ *    covering exactly these short-circuits ("auto-mode classifier, dontAsk
+ *    mode, … or a deny rule", and, with no `canUseTool` set, every would-ask
+ *    call), and its CLI emits it from inside the permission check, before the
+ *    denial becomes the call's `tool_result` — so the frame arrives first.
+ *
+ * Either way the call's id goes into the driver's `refused` set, and the error
+ * `tool_result` that carries the denial back to the model is payload only:
+ * taping it too would claim a second tool event, and a `"failed"` one, for a
+ * call that never executed. A frame whose id is already in the set — the
+ * callback's own denial reported again, or one report arriving twice — is
+ * payload only for the same reason. A frame from inside a subagent carries
+ * `agent_id` rather than `parent_tool_use_id`, and is payload only by the depth
+ * rule above, read off that field instead.
+ *
+ * The SDK calls the frame best-effort, and names the denials it does not
+ * report: a `PreToolUse` hook's, and a path-scoped deny rule's on a file tool.
+ * Nothing the driver reads ahead of such a call's error result says it was a
+ * denial, so it reaches the trace as that result does. That is a limit of what
+ * the SDK reports, and not one `allow_tools:` reaches: the list is enforced by
+ * `tools` and the gate above, never by a hook or a rule.
  *
  * # Whose system prompt a run has
  *
@@ -453,11 +556,14 @@ const CC_DRIVER: runtime.HarnessDriver = {
       // The name each top-level `tool_use` went out under, so the `tool_result`
       // that answers it can be taped under the same name.
       const calls = new Map<string, string>();
-      // The `tool_use` ids the callback below denied. A denial is taped once,
-      // from the callback; the `tool_result` the SDK then hands the model is
-      // that same denial travelling back, and taping it again would claim two
-      // tool events where the run made one (`docs/trace.md` 7.6.3, whose
-      // `completed` and `failed` describe a call that executed).
+      // The top-level `tool_use` ids whose denial is already taped `refused` —
+      // by the callback below, or off the `permission_denied` frame the SDK
+      // reports a denial it made without asking the callback. A denial is taped
+      // once; the `tool_result` the SDK then hands the model is that same
+      // denial travelling back, and taping it again would claim two tool events
+      // where the run made one (`docs/trace.md` 7.6.3, whose `completed` and
+      // `failed` describe a call that executed). Kept for the whole run, so a
+      // denial reported twice is still one event.
       const refused = new Set<string>();
 
       const config = ccOptions(run, refusals, refused);
@@ -495,7 +601,7 @@ export function ccOptions(
   refusals: runtime.HarnessEvent[],
   refused: Set<string>,
 ): Options {
-  // The node's approval mode, resolved once: the three options below that
+  // The node's approval mode, resolved once: the four options below that
   // answer to it read this value rather than `run.access`, so a stated mode and
   // the flags its SDK requires can never disagree (see [`ccPermissionMode`]).
   const mode = ccPermissionMode(run);
@@ -546,37 +652,84 @@ export function ccOptions(
     // can reach, which is true under every one of the three `access:`
     // presets — `bypassPermissions` included.
     options.tools = [...allowed];
-    options.allowedTools = [...allowed];
-    options.canUseTool = (name, _input, ask) => {
-      if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
-      const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;
-      // The call this denial answers, remembered by its id: the SDK hands
-      // the model the denial as the `tool_result` for that `tool_use`, and
-      // one call is one tool event.
-      refused.add(ask.toolUseID);
-      refusals.push({
-        source: { type: "agent-compose.permission_denied", tool: name, message },
-        // A denial inside a **subagent** is that subagent's, and the
-        // envelope carries the top level only — the same depth rule
-        // [`ccEvents`] reads off `parent_tool_use_id`, read here off the
-        // sub-agent id the SDK passes the callback (PRD resolved q57
-        // ruling a).
-        ...(ask.agentID === undefined
-          ? { tap: { kind: "tool" as const, name, outcome: "refused" as const, error: message } }
-          : {}),
-      });
-      return Promise.resolve({ behavior: "deny" as const, message });
-    };
+    // …and the per-call gate over it, whose answer is the list's and whose
+    // option is the mode's (see [`CC_DRIVER`]). Never both options at once: a
+    // bare `allowedTools` beside `canUseTool` approves the list ahead of the
+    // callback, and the pinned SDK flags that pairing as a shadowed callback.
+    if (mode === "dontAsk") {
+      // The mode that consults no callback: a call it finds no pre-approval
+      // for is denied without `canUseTool` being asked, so the list is that
+      // pre-approval — or every in-list tool that needs a permission is
+      // denied on a node whose own list allows it.
+      options.allowedTools = [...allowed];
+    } else {
+      // Every other mode asks the host about a call it does not settle itself
+      // (`auto` once its classifier hands the question back, and
+      // `bypassPermissions` for the checks the CLI holds immune to that mode),
+      // and this is the host's answer: `allow` inside the list, which is what
+      // keeps a bounded run from prompting, and a taped `deny` outside it.
+      // Under `bypassPermissions` `tools` holds the bound.
+      options.canUseTool = (name, _input, ask) => {
+        if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
+        const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;
+        // The call this denial answers, remembered by its id: the SDK hands
+        // the model the denial as the `tool_result` for that `tool_use`, and
+        // one call is one tool event.
+        refused.add(ask.toolUseID);
+        refusals.push({
+          source: { type: "agent-compose.permission_denied", tool: name, message },
+          // A denial inside a **subagent** is that subagent's, and the
+          // envelope carries the top level only — the same depth rule
+          // [`ccEvents`] reads off `parent_tool_use_id`, read here off the
+          // sub-agent id the SDK passes the callback (PRD resolved q57
+          // ruling a).
+          ...(ask.agentID === undefined
+            ? { tap: { kind: "tool" as const, name, outcome: "refused" as const, error: message } }
+            : {}),
+        });
+        return Promise.resolve({ behavior: "deny" as const, message });
+      };
+    }
   }
   return options;
 }
 
-/** One SDK message, as the events the tap reads (see [`CC_DRIVER`]). */
-function* ccEvents(
+/**
+ * One SDK message, as the events the tap reads (see [`CC_DRIVER`]).
+ *
+ * **Exported for the reason [`ccOptions`] is**: which tool event a message
+ * becomes — and above all that a denial the SDK made without the callback is
+ * `"refused"` rather than `"failed"` — is decided here, off the vendor's own
+ * message shapes, and a scripted driver never produces one of those. So a test
+ * hands this the SDK's messages and reads what it taps. `calls` and `refused`
+ * are the driver's own state across one run's messages.
+ */
+export function* ccEvents(
   message: SDKMessage,
   calls: Map<string, string>,
   refused: Set<string>,
 ): Generator<runtime.HarnessEvent> {
+  // A denial the SDK made without asking the permission callback — a
+  // `dontAsk` mode denial, `auto`'s classifier, a deny rule — reported as its
+  // own frame (see *How a refusal reaches the trace*). It is the harness's
+  // permission surface declining the call, so it is taped `refused` with the
+  // rejection the model was handed back, and its id is remembered so the error
+  // `tool_result` that follows is not taped again as `failed`. The frame
+  // carries no `parent_tool_use_id`: a subagent's is marked by `agent_id`,
+  // the field the callback reads the same rule off, and is payload only. So is
+  // a frame for a denial already taped.
+  if (message.type === "system" && message.subtype === "permission_denied") {
+    if (message.agent_id !== undefined || refused.has(message.tool_use_id)) {
+      yield { source: message };
+      return;
+    }
+    refused.add(message.tool_use_id);
+    yield {
+      source: message,
+      tap: { kind: "tool", name: message.tool_name, outcome: "refused", error: message.message },
+    };
+    return;
+  }
   // A message from inside a subagent is payload and nothing else — the depth
   // rule PRD resolved q57 ruling a fixes, read off the one field that carries
   // it.
@@ -601,12 +754,13 @@ function* ccEvents(
       if (block.type !== "tool_result") continue;
       const name = calls.get(block.tool_use_id);
       if (name === undefined) continue;
-      // A call the permission callback denied was taped `refused` there, and
-      // this result is that denial on its way to the model rather than a second
-      // event: the call never executed, so neither `completed` nor `failed`
-      // describes it (`docs/trace.md` 7.6.3). The message still reaches the
-      // journal's payload above, untapped, like every other result.
-      if (refused.delete(block.tool_use_id)) {
+      // A denied call was taped `refused` already — by the callback, or off
+      // the SDK's `permission_denied` frame — and this result is that denial on
+      // its way to the model rather than a second event: the call never
+      // executed, so neither `completed` nor `failed` describes it
+      // (`docs/trace.md` 7.6.3). The message still reaches the journal's
+      // payload above, untapped, like every other result.
+      if (refused.has(block.tool_use_id)) {
         calls.delete(block.tool_use_id);
         continue;
       }
