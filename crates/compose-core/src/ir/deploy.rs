@@ -311,6 +311,17 @@ pub struct ResolvedBackend {
     /// `deploy.storage_backends.defaults.<kind>`. Absent where the target
     /// built-in decided it, because no entry wrote that one.
     pub site: Option<String>,
+    /// The **name** of the variable holding this backend's address, where the
+    /// entry declared a `url:` (grammar 4.3, 14.3).
+    ///
+    /// A name and never a value: the deploy file writes an `${ENV}` reference,
+    /// `validate` never sees an address, and the emitted binding carries the
+    /// same name the environment partition already routes to the processes that
+    /// reach this store (`docs/distributed.md` §9.1). It is what a dialled
+    /// backend's arm opens with (PRD resolved q63), and `None` on a store the
+    /// target's built-in decided or an entry that declared no address — which
+    /// is every process-local binding.
+    pub url_env: Option<String>,
 }
 
 /// Grammar 11.3's resolution order, run at compile time.
@@ -343,6 +354,7 @@ pub fn backend_of(ir: &crate::ir::Ir, store: &crate::ir::definition::Store) -> R
             from: "the `local` target substitutes local storage for every store unconditionally"
                 .to_string(),
             site: None,
+            url_env: None,
         };
     }
     let backends = ir.deploy.storage_backends.as_ref();
@@ -357,6 +369,7 @@ pub fn backend_of(ir: &crate::ir::Ir, store: &crate::ir::definition::Store) -> R
                 alias.value, ir.target
             ),
             site: Some(format!("deploy.storage_backends.aliases.{}", alias.value)),
+            url_env: address_of(config),
         };
     }
     if let Some(config) = backends.and_then(|backends| backends.defaults.get(store.kind.as_str())) {
@@ -371,6 +384,7 @@ pub fn backend_of(ir: &crate::ir::Ir, store: &crate::ir::definition::Store) -> R
                 "deploy.storage_backends.defaults.{}",
                 store.kind.as_str()
             )),
+            url_env: address_of(config),
         };
     }
     ResolvedBackend {
@@ -381,5 +395,20 @@ pub fn backend_of(ir: &crate::ir::Ir, store: &crate::ir::definition::Store) -> R
             ir.target
         ),
         site: None,
+        url_env: None,
     }
+}
+
+/// The variable a backend entry names its address in, or `None`.
+///
+/// `url:` alone, which is the key grammar 4.3 puts a connection string under and
+/// the one the two dialled `kv` arms open with (PRD resolved q63). The other
+/// class-1 fields a plugin config may carry belong to that plugin's own
+/// published schema, and reading one here would be this compiler guessing at a
+/// shape it does not publish.
+fn address_of(config: &BackendConfig) -> Option<String> {
+    config
+        .connection
+        .get("url")
+        .map(|reference| reference.value.name.clone())
 }

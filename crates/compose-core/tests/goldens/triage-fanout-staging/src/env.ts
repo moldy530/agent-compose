@@ -109,7 +109,6 @@ export const environmentReferences: readonly EnvironmentReference[] = [
   {
     name: "REDIS_URL",
     sites: [
-      "deploy.storage_backends.defaults.kv.url",
       "deploy.event_sources.bug_reports.url",
     ],
   },
@@ -129,6 +128,12 @@ export const environmentReferences: readonly EnvironmentReference[] = [
     name: "TRIAGE_HOST",
     sites: [
       "flow.enrich.node.fetch.http.url",
+    ],
+  },
+  {
+    name: "TRIAGE_MEMORY_URL",
+    sites: [
+      "deploy.storage_backends.defaults.kv.url",
     ],
   },
   {

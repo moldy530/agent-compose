@@ -206,8 +206,21 @@ pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
     // per target, so there is nothing to reconcile: the zero-infra build binds
     // `sqlite`, whose driver `super::stores` already pins for every project, and
     // adds nothing here at all.
-    for (package, version) in super::journal::pins_of(crate::ir::deploy::journal_of(ir)) {
-        harness.insert((*package).to_string(), (*version).to_string());
+    // …and the store drivers, pinned where a `store.*` resolves to a backend
+    // that dials out (grammar §14.3, PRD resolved q63). Same table as the
+    // journal's ([`super::drivers`]) and the same map, which is what makes a
+    // target whose journal and whose store both bind Postgres declare `pg`
+    // **once**: the second insert finds the version the first wrote.
+    for (package, version) in super::journal::pins_of(crate::ir::deploy::journal_of(ir))
+        .iter()
+        .copied()
+        .chain(super::stores::pins(ir))
+    {
+        let held = harness.insert(package.to_string(), version.to_string());
+        assert!(
+            held.is_none_or(|held| held == *version),
+            "two slots pin `{package}` at two versions"
+        );
     }
     let mut declared: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -288,26 +301,41 @@ fn dependency_block(key: &str, pins: &[(String, String)], trailing_comma: bool) 
 }
 
 /// Every package the generated `package.json` declares under
-/// `devDependencies`: [`DEV_PINS`], plus what this target's journal driver needs
-/// to type-check.
+/// `devDependencies`: [`DEV_PINS`], plus what this project's database drivers
+/// need to type-check.
 ///
 /// One entry has ever arrived from the second half and it is `@types/pg`: `pg`
 /// publishes no type declarations of its own, and an emitted module importing it
 /// under `strict` fails `tsc` on the import rather than on anything this
-/// compiler wrote. `mysql2` ships its own, so a MySQL journal adds nothing here.
+/// compiler wrote. `mysql2` ships its own, so a MySQL journal or store adds
+/// nothing here — and a project whose journal *and* whose store both bind
+/// Postgres declares `@types/pg` once, which is what the deduplication below is
+/// for.
 ///
 /// It is a **development** dependency for the reason `typescript` is: nothing at
 /// run time reads a `.d.ts`, and a reader who installs with `--production` is
 /// installing a project that runs.
 #[must_use]
 pub fn development_dependencies(ir: &Ir) -> Vec<(String, String)> {
-    DEV_PINS
+    let mut held: Vec<(String, String)> = DEV_PINS
         .iter()
-        .chain(super::journal::development_pins_of(
-            crate::ir::deploy::journal_of(ir),
-        ))
         .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
-        .collect()
+        .collect();
+    for (package, version) in super::journal::development_pins_of(crate::ir::deploy::journal_of(ir))
+        .iter()
+        .copied()
+        .chain(super::stores::development_pins(ir))
+    {
+        if let Some((_, already)) = held.iter().find(|(name, _)| name == package) {
+            assert!(
+                already == version,
+                "two slots pin `{package}` at two versions"
+            );
+            continue;
+        }
+        held.push((package.to_string(), version.to_string()));
+    }
+    held
 }
 
 /// `tsconfig.json`.
@@ -441,7 +469,7 @@ const README_BODY: &str = r#"| `tsconfig.json` | the type checker's settings: st
 | `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, the type of the `env:` that binding declared, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/otlp.ts` | the OTLP/JSON span exporter: one settled trace envelope mapped to an `ExportTraceServiceRequest`, hand-written and with no OpenTelemetry dependency behind it (`docs/trace.md` §12) |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
-| `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
+| `src/stores.ts` | the store backends: SQLite for a local `kv` or `vector`, a directory of files for a `blob`, and the arm for each dialled `kv` backend this target binds (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
@@ -1229,7 +1257,10 @@ const STORE_DATA: &str = r#"
 
 `--target local` substitutes SQLite and local disk for every store
 unconditionally, so a composition with a `store.*` in it runs with nothing
-installed (PRD 5.8). What it writes lives under this directory:
+installed (PRD 5.8). A named target may bind a `kv` store to `postgres` or
+`mysql` instead, in which case that store's rows are on the server its
+`storage_backends:` entry names and nothing of it is under this directory. What
+the local backends write lives here:
 
 ```text
 .agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
@@ -1276,9 +1307,13 @@ rather than the operating system's — so two `agent-compose run`s sharing a
 `session` or `global` store contend for it, and the loser waits and then fails
 the node with `SQLite3Error: database is locked`. It fails loudly rather than
 corrupting anything, and a `serve` process — which runs its executions in **one**
-process — is not affected. Concurrency across processes arrives with the
-production `storage_backends:` of a later milestone; until then `--target local`
-means one process, which is the same boundary the target draws everywhere else.
+process — is not affected. `--target local` means one process, which is the same
+boundary the target draws everywhere else. A deployment that really has two is a
+named target binding a **dialled** backend: a `kv` store on `postgres` or
+`mysql` is a connection rather than a file, every process reaching it reaches the
+same rows, and nothing else about the store changes — same ops, same scopes, same
+recorded reads and deduplicated writes. It takes no lock and no writer guard, and
+per key the last write wins.
 
 **Opening** is the concession to that, and both artifacts make it: the journal
 and the stores wait for a lock rather than failing on one, so an

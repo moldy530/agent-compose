@@ -3867,6 +3867,34 @@ fn the_local_backends_behaved(answer: &Value) {
         production.contains("redis") && production.contains("M3"),
         "the refusal names the backend and the milestone that lands it: {production}"
     );
+    // …and it names the two that **are** implemented as the shape the rest will
+    // arrive in, which is the clause PRD resolved q63 narrowed this message with:
+    // an author reading it is being told what exists as much as what does not.
+    assert!(
+        production.contains("`postgres` and `mysql` `kv` backends are implemented"),
+        "the refusal does not name the implemented arms, so it reads as though no networked \
+         backend worked at all (PRD resolved q63): {production}"
+    );
+
+    // The two ways a **dialled** binding can arrive in a build that carries no
+    // arm for it. Neither is an `undefined` dereference, and each names the half
+    // an author can act on: a deploy entry short a `url:`, and a project built
+    // from another target's deploy layer.
+    let addressless = answer["dialledWithoutAnAddress"]
+        .as_str()
+        .expect("a dialled binding with no address is refused");
+    assert!(
+        addressless.contains("names no `url:`") && addressless.contains("postgres"),
+        "the refusal does not name the key the entry is missing: {addressless}"
+    );
+    let armless = answer["dialledWithoutADriver"]
+        .as_str()
+        .expect("a dialled binding this build emitted no arm for is refused");
+    assert!(
+        armless.contains("carries no driver for one") && armless.contains("mysql"),
+        "a project built for one deploy layer and handed another's binding must say so rather \
+         than failing on a missing backend entry: {armless}"
+    );
 }
 
 /// Gate 22: what the two built-in tools do inside one call — `src/runtime.ts`,
@@ -7988,23 +8016,24 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
 }
 
 /// Every package a generated project can declare under `devDependencies`: the
-/// type gate and the runtime's types, plus the typings a journal driver needs.
+/// type gate and the runtime's types, plus the typings a database driver needs.
 ///
 /// One list here for [`runtime_and_harness_pins`]' reason: a generated project
-/// declares `@types/pg` only where its target's `journal:` binds Postgres (PRD
-/// resolved q62), and the fixture installs the union once so that every project
-/// the suites build type-checks against exactly these versions.
+/// declares `@types/pg` only where its target's `journal:` or one of its stores
+/// binds Postgres (PRD resolved q62, q63), and the fixture installs the union
+/// once so that every project the suites build type-checks against exactly these
+/// versions.
 fn development_pins() -> Vec<(&'static str, &'static str)> {
     let mut held: Vec<(&'static str, &'static str)> =
         compose_core::codegen::project::DEV_PINS.to_vec();
-    for (provider, pins) in compose_core::codegen::journal::JOURNAL_DEV_PINS {
+    for (driver, pins) in compose_core::codegen::drivers::DRIVER_DEV_PINS {
         for (package, version) in *pins {
             if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {
                 assert_eq!(
                     already,
                     version,
                     "`{}` pins `{package}` at a version another list already holds",
-                    provider.as_str()
+                    driver.package()
                 );
                 continue;
             }
@@ -8016,24 +8045,24 @@ fn development_pins() -> Vec<(&'static str, &'static str)> {
 
 /// Every package a generated project can declare under `dependencies`: the
 /// runtime's own pins, plus every harness SDK a `coder:` node can bind and every
-/// journal driver a target's `journal:` can bind.
+/// database driver a target's `journal:` or a store's backend can bind.
 ///
 /// Three lists rather than one in the emitter, because a composition declares
 /// the second set only where it binds a harness and a *target* declares the
-/// third only where it binds a remote journal — and one list here, because the
-/// toolchain fixture installs the union once and every project the suites build
-/// resolves against it (PRD resolved q57, q62; `codegen::harness`,
-/// `codegen::journal`).
+/// third only where it binds a remote journal or a dialled store — and one list
+/// here, because the toolchain fixture installs the union once and every project
+/// the suites build resolves against it (PRD resolved q57, q62, q63;
+/// `codegen::harness`, `codegen::drivers`).
 fn runtime_and_harness_pins() -> Vec<(&'static str, &'static str)> {
     let mut held: Vec<(&'static str, &'static str)> = compose_core::codegen::project::PINS.to_vec();
-    for (provider, pins) in compose_core::codegen::journal::JOURNAL_PINS {
+    for (driver, pins) in compose_core::codegen::drivers::DRIVER_PINS {
         for (package, version) in *pins {
             if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {
                 assert_eq!(
                     already,
                     version,
                     "`{}` pins `{package}` at a version another list already holds",
-                    provider.as_str()
+                    driver.package()
                 );
                 continue;
             }

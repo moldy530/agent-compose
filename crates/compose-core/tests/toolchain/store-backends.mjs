@@ -325,4 +325,37 @@ const answer = {};
   );
 }
 
+// --- …and the two the release does, reached out of a build that has neither ---
+
+// This golden's target is `local`, so `src/stores.ts` here is the invariant half
+// alone: no arm, no driver, and no `package.json` entry for one (PRD resolved
+// q63). Both of the ways a binding can arrive at that half are refused by name
+// rather than by an `undefined`, because both are a deploy file's mistake or a
+// build's and an author has to be able to tell which.
+
+{
+  // A dialled backend whose entry declared no `url:`: there is nowhere to go.
+  const store = binding("addressless", "kv", "global", {
+    backend: { provider: "postgres", from: "the alias `prefs_db`, defined by the `staging` target" },
+  });
+  answer.dialledWithoutAnAddress = await refusal(() =>
+    stores.runStoreOp(store, "get", { key: "a" }, context("exec_a"), node()),
+  );
+}
+
+{
+  // …and one with an address, in a project `build` emitted no arm into.
+  process.env["STORE_BACKENDS_PROBE_URL"] = "postgres://user:pass@127.0.0.1:5432/nothing";
+  const store = binding("armless", "kv", "global", {
+    backend: {
+      provider: "mysql",
+      from: "the alias `notes_db`, defined by the `staging` target",
+      urlEnv: "STORE_BACKENDS_PROBE_URL",
+    },
+  });
+  answer.dialledWithoutADriver = await refusal(() =>
+    stores.runStoreOp(store, "get", { key: "a" }, context("exec_d"), node()),
+  );
+}
+
 process.stdout.write(JSON.stringify(answer));

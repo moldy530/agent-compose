@@ -42,89 +42,89 @@ Deploy(
             StorageBackendsSection {
                 defaults: [
                     BackendDefault {
-                        kind: Kv @ 31:5..31:7,
+                        kind: Kv @ 39:5..39:7,
                         config: BackendConfig {
                             provider: Some(
-                                Redis @ 32:17..32:22,
+                                Postgres @ 40:17..40:25,
                             ),
                             connection: [
                                 ConnectionField {
-                                    name: "url" @ 33:7..33:10,
-                                    value: env("${REDIS_URL}") @ 33:12..33:24,
+                                    name: "url" @ 41:7..41:10,
+                                    value: env("${TRIAGE_MEMORY_URL}") @ 41:12..41:32,
                                 },
                             ],
                             extra: [],
-                            span: 32:7..33:24,
+                            span: 40:7..41:32,
                         },
                     },
                 ],
                 aliases: [
                     BackendAlias {
-                        name: "docs_db" @ 37:5..37:12,
+                        name: "docs_db" @ 45:5..45:12,
                         config: BackendConfig {
                             provider: Some(
-                                Chroma @ 38:17..38:23,
+                                Chroma @ 46:17..46:23,
                             ),
                             connection: [
                                 ConnectionField {
-                                    name: "url" @ 39:7..39:10,
-                                    value: env("${CHROMA_URL}") @ 39:12..39:25,
+                                    name: "url" @ 47:7..47:10,
+                                    value: env("${CHROMA_URL}") @ 47:12..47:25,
                                 },
                             ],
                             extra: [
                                 PluginEntry {
-                                    key: "index" @ 40:7..40:12,
+                                    key: "index" @ 48:7..48:12,
                                     value: Text(
                                         "project-docs",
-                                    ) @ 40:14..40:26,
+                                    ) @ 48:14..48:26,
                                 },
                             ],
-                            span: 38:7..40:26,
+                            span: 46:7..48:26,
                         },
                     },
                 ],
-                span: 30:3..40:26,
+                span: 30:3..48:26,
             },
         ),
         journal: Some(
             JournalSection {
                 provider: Some(
-                    Postgres @ 52:13..52:21,
+                    Postgres @ 60:13..60:21,
                 ),
                 url: Some(
-                    env("${JOURNAL_URL}") @ 53:8..53:22,
+                    env("${JOURNAL_URL}") @ 61:8..61:22,
                 ),
                 declares_url: true,
-                span: 52:3..53:22,
+                span: 60:3..61:22,
             },
         ),
         package_registry: Some(
             PackageRegistrySection {
                 url: Some(
-                    "https://npm.internal.example/repository/npm-group/" @ 63:8..63:60,
+                    "https://npm.internal.example/repository/npm-group/" @ 71:8..71:60,
                 ),
                 token: Some(
-                    env("${NPM_MIRROR_TOKEN}") @ 64:10..64:29,
+                    env("${NPM_MIRROR_TOKEN}") @ 72:10..72:29,
                 ),
                 scopes: [
                     PackageRegistryScope {
-                        name: "@corp" @ 67:5..67:12,
+                        name: "@corp" @ 75:5..75:12,
                         url: Some(
-                            "https://npm.internal.example/repository/corp/" @ 68:12..68:59,
+                            "https://npm.internal.example/repository/corp/" @ 76:12..76:59,
                         ),
                         token: Some(
-                            env("${NPM_CORP_TOKEN}") @ 69:14..69:31,
+                            env("${NPM_CORP_TOKEN}") @ 77:14..77:31,
                         ),
-                        span: 67:5..69:31,
+                        span: 75:5..77:31,
                     },
                 ],
-                span: 63:3..69:31,
+                span: 71:3..77:31,
             },
         ),
         trace_sink: Some(
             TraceSinkSection {
                 url: Some(
-                    "https://collector.internal.example/v1/traces" @ 80:8..80:54,
+                    "https://collector.internal.example/v1/traces" @ 88:8..88:54,
                 ),
                 format: None,
                 auth: Some(
@@ -132,52 +132,52 @@ Deploy(
                         bearer: Some(
                             BearerAuth {
                                 token: Some(
-                                    env("${TRACE_SINK_TOKEN}") @ 83:14..83:33,
+                                    env("${TRACE_SINK_TOKEN}") @ 91:14..91:33,
                                 ),
                                 header: None,
                                 prefix: None,
                             },
                         ),
                         hmac: None,
-                    } @ 82:5..83:33,
+                    } @ 90:5..91:33,
                 ),
-                span: 80:3..83:33,
+                span: 88:3..91:33,
             },
         ),
         event_sources: Some(
             EventSourcesSection {
                 sources: [
                     EventSource {
-                        name: "bug_reports" @ 88:3..88:14,
+                        name: "bug_reports" @ 96:3..96:14,
                         kind: Some(
-                            RedisStreams @ 89:11..89:24,
+                            RedisStreams @ 97:11..97:24,
                         ),
                         connection: [
                             ConnectionField {
-                                name: "url" @ 90:5..90:8,
-                                value: env("${REDIS_URL}") @ 90:10..90:22,
+                                name: "url" @ 98:5..98:8,
+                                value: env("${REDIS_URL}") @ 98:10..98:22,
                             },
                         ],
                         extra: [
                             PluginEntry {
-                                key: "stream" @ 91:5..91:11,
+                                key: "stream" @ 99:5..99:11,
                                 value: Text(
                                     "bug-reports",
-                                ) @ 91:13..91:24,
+                                ) @ 99:13..99:24,
                             },
                             PluginEntry {
-                                key: "consumer_group" @ 92:5..92:19,
+                                key: "consumer_group" @ 100:5..100:19,
                                 value: Text(
                                     "agent-compose",
-                                ) @ 92:21..92:34,
+                                ) @ 100:21..100:34,
                             },
                         ],
-                        span: 88:3..92:34,
+                        span: 96:3..100:34,
                     },
                 ],
-                span: 88:3..92:34,
+                span: 96:3..100:34,
             },
         ),
-        span: 4:1..92:34,
+        span: 4:1..100:34,
     },
 )
