@@ -138,10 +138,15 @@ repair a build of this release runs is the other one.
 store with one process, whatever its backend. Dropping `agent.archivist` from
 `members:` says the filing happens on the hub, which is where the store is.
 
-The **diagnostic** names the two in the other order — the networked backend
-first, because that is the shape the deployment is heading for, then which of the
-names it offered this release opens — so both texts leave a reader at an edit
-that works, whichever they met first.
+This page and the **diagnostic** both lead with the dialled backend, because that
+is the shape the deployment is heading for, and both offer taking the component
+out of the mesh as the other repair. What differs is where the release caveat
+sits. This page puts it *between* the two, so a `vector` or `blob` reader meets
+it exactly where the first repair stops applying to them and is handed the second
+in the same breath. The diagnostic is one line with no room to interleave, so it
+names both repairs and then ends on which of the names it offered this release
+opens — last, because that is what a reader has to leave with. Either way a
+reader ends at an edit that works, whichever of the two texts they met first.
 
 **Under `--target local` the backend repair is not available at all**, and the
 diagnostic says so: `local` substitutes local storage for every store

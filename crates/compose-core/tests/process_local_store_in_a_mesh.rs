@@ -616,11 +616,12 @@ fn the_local_target_refuses_and_names_the_repair_it_admits() {
 /// it.
 ///
 /// **The order the repairs are named in is pinned as well**, because
-/// `src/docs/codes/process-local-store.md` tells a reader what it is — the
-/// document leads with the repair a build runs and says so, and says the
-/// diagnostic leads with the other. Nothing else holds those two texts together,
-/// and a reader who checks one against the other is exactly the reader the
-/// `explain` document is for.
+/// `src/docs/codes/process-local-store.md` tells a reader what it is — both
+/// texts lead with the dialled backend, both offer the composition repair as the
+/// other one, and the document states where each puts the release caveat: itself
+/// between the two repairs, the diagnostic last. Nothing else holds those two
+/// texts together, and a reader who checks one against the other is exactly the
+/// reader the `explain` document is for.
 #[test]
 fn the_repair_names_the_half_a_build_of_this_release_can_run() {
     // The one phrase both spellings of the caveat share — "the others compile
@@ -661,9 +662,11 @@ fn the_repair_names_the_half_a_build_of_this_release_can_run() {
     // **The order of the two, which the `explain` document describes.** The
     // networked backend is named first because it is the shape the deployment is
     // heading for, and the caveat is last because it is what a reader has to
-    // leave with. `src/docs/codes/process-local-store.md` states that ordering
-    // and contrasts it with its own, so a message reordered here without the
-    // document is a document that describes another compiler's output.
+    // leave with. `src/docs/codes/process-local-store.md` states that ordering —
+    // it leads with the same backend repair, and says this message names both
+    // repairs and then ends on the caveat, where the page instead keeps the
+    // caveat between the two — so a message reordered here without the document
+    // is a document that describes another compiler's output.
     let backend = named
         .find("bind `redis`, `postgres` or `mysql` instead")
         .expect("the design's repair is offered");
