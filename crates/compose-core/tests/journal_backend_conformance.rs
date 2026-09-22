@@ -551,6 +551,78 @@ fn the_runner_and_the_module_take_one_writer_guard() {
     );
 }
 
+/// **Every verb of the journal interface is driven against every backend.**
+///
+/// [`TRUE_EVERYWHERE`] is only the whole contract if the runner beside it
+/// really runs the whole interface, and that is not a property a list of case
+/// names can show. Four settle predicates shipped undriven — `refuseRecorded`,
+/// `exhaustRecorded`, `refuseDelivery` and `supersedeDispatch` — while this file
+/// said there is "one set of cases and one set of expectations, because there is
+/// one contract". Each is an `UPDATE` with a `WHERE` whose whole job is to be
+/// exact, and `refuseRecorded`'s was the only comparison of `deliveries.kind`
+/// anywhere in `SqlJournal` — the column `docs/durability.md` §10 claims the
+/// per-backend collation binding covers.
+///
+/// What an undriven verb costs is specific rather than theoretical: dropping a
+/// collation from a column only it compares, or mis-numbering a `?` in its
+/// statement — Postgres' `numberedBind` counts them positionally, so one added
+/// literal shifts every later parameter — is a change `cargo test --workspace`
+/// answers green for against real servers in CI.
+///
+/// So the interface is read off the module rather than off a list, which is what
+/// makes a verb added in a later release arrive with a case rather than without
+/// one.
+#[test]
+fn the_contract_runner_drives_every_verb_of_the_journal_interface() {
+    const MODULE: &str = include_str!("../src/codegen/js/journal.ts");
+    const RUNNER: &str = include_str!("toolchain/journal-contract.mjs");
+    // `close()` is the one exemption, and it is driven: the runner ends every
+    // handle through `releaseJournal()`, which is what a command really calls
+    // and what the writer-guard cases rest on.
+    const RELEASED_INSTEAD: &[&str] = &["close"];
+
+    let declared = MODULE
+        .split_once("export interface Journal {")
+        .expect("`src/codegen/js/journal.ts` declares the journal interface")
+        .1
+        .split_once("\n}")
+        .expect("the journal interface is closed at column zero")
+        .0;
+    let verbs: Vec<&str> = declared
+        .lines()
+        // One level of indent is a member of this interface; a doc line, a
+        // continued parameter list and a nested type are all deeper or start
+        // with something that is not an identifier.
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter_map(|member| {
+            let name = member.split('(').next()?;
+            (!name.is_empty()
+                && name.chars().all(|held| held.is_ascii_alphanumeric())
+                && member[name.len()..].starts_with('('))
+            .then_some(name)
+        })
+        .collect();
+    assert!(
+        verbs.len() >= 20 && verbs.contains(&"append") && verbs.contains(&"supersedeDispatch"),
+        "the journal interface was read as {verbs:?}, which is not the interface \
+         `docs/durability.md` describes — so this test is quantifying over almost nothing"
+    );
+
+    let undriven: Vec<&str> = verbs
+        .iter()
+        .copied()
+        .filter(|verb| !RELEASED_INSTEAD.contains(verb))
+        .filter(|verb| !RUNNER.contains(&format!("handle.{verb}(")))
+        .collect();
+    assert!(
+        undriven.is_empty(),
+        "`tests/toolchain/journal-contract.mjs` drives no case through {undriven:?}, so \
+         `docs/durability.md`'s contract is unchecked there on every backend — including the \
+         two whose failure modes are a server's answer rather than this code's logic. Add a \
+         case per verb to the runner and its name to `TRUE_EVERYWHERE` (PRD resolved q62)"
+    );
+}
+
 /// The version `docs/durability.md` heads with, read off the document.
 fn journal_version() -> u64 {
     let document = fs::read_to_string(repository().join("docs/durability.md"))
@@ -611,8 +683,27 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "delivery_ordinals_increase",
     "a_settled_delivery_is_not_reopened",
     "a_pending_delivery_is_owed",
+    // …and the two endings beside `delivered`, through the three verbs that
+    // reach them, each a settle predicate whose whole job is to be exact.
+    // `refuseRecorded` is also the one
+    // statement in `SqlJournal` that compares `deliveries.kind` — `AND (kind IS
+    // NULL OR kind = 'callback')` — so it is the only case that drives the
+    // column §10's per-backend collation binding covers ("every column a
+    // statement compares, not only the keys"). Without it, dropping `CHARACTER
+    // SET ascii COLLATE ascii_bin` from that column, or mis-numbering a `?` in
+    // any of the three statements — Postgres' `numberedBind` counts them
+    // positionally, so one added literal shifts every later parameter — is a
+    // change no server in CI would answer differently for.
+    "a_delivery_refused_at_intent_is_opened_settled",
+    "a_recorded_callback_is_refused_by_ordinal",
+    "a_trace_sink_row_is_not_refused",
+    "a_spent_schedule_exhausts_its_delivery",
+    "a_settled_delivery_is_not_exhausted",
     // §3.8 — the dispatch board.
     "park_is_idempotent",
+    // …and the two readers a recovering hub re-attaches through (§6.1).
+    "a_dispatch_is_found_at_its_wait",
+    "the_dispatches_of_an_execution_are_its_own_in_park_order",
     "a_claim_hands_the_row_over",
     "a_second_claim_takes_nothing",
     // …and a release belongs to the holder, which is a **collation** case as
@@ -623,6 +714,11 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_release_by_the_holder_parks_it_again",
     "a_settle_answers_once",
     "a_settled_dispatch_keeps_its_outcome",
+    // …and the board verb a replaced hub runs over every row it inherited: an
+    // ending the hub makes *without* a result, which is what makes a late result
+    // meet `409` rather than `204` (§3.8, `docs/distributed.md` §5, §6.3).
+    "a_dispatch_is_superseded_without_an_outcome",
+    "a_settled_dispatch_is_not_superseded",
 ];
 
 /// **Every backend the grammar spells is driven, or says why it is not.**

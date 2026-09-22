@@ -2906,6 +2906,103 @@ const KEEPALIVE_PROBES = (GUARD_REAP_SECONDS - KEEPALIVE_IDLE_SECONDS) / KEEPALI
  */
 const POSTGRES_KEEPALIVES = `SET tcp_keepalives_idle = ${KEEPALIVE_IDLE_SECONDS}; SET tcp_keepalives_interval = ${KEEPALIVE_INTERVAL_SECONDS}; SET tcp_keepalives_count = ${KEEPALIVE_PROBES}`;
 
+/**
+ * What makes "committed" mean "in the write-ahead log" rather than "in a buffer
+ * the next power cut takes with it".
+ *
+ * The SQLite arm sets `PRAGMA synchronous = FULL` for exactly this, and says so
+ * in one line; this is the same sentence spoken to the other server.
+ * `docs/durability.md` §2.1 promises that one effect is one `INSERT`
+ * **committed before it is answered**, and §2.3 spells that out as "each
+ * statement is its own transaction and the server has written it before it
+ * answers". On a server whose `synchronous_commit` is `off` — settable
+ * cluster-wide in `postgresql.conf`, per database with `ALTER DATABASE … SET`
+ * and per role with `ALTER ROLE … SET`, and the default on more than one managed
+ * provider's "fast" tier — an `INSERT` into `effects` answers the hub before its
+ * WAL record is flushed, and a crash or a power loss discards up to roughly
+ * three times `wal_writer_delay` of effects this journal has already claimed to
+ * hold. A replay then re-issues model calls and tool invocations whose answers
+ * the record said were down, which is the one thing §2.1's per-record atomicity
+ * rules out — and the crash window §2.3 calls "the round trip" would be silently
+ * wider than one.
+ *
+ * `USERSET` like the three above, so this costs no privilege either. It is the
+ * arm's standing rule, the same one the MySQL side applies to `sql_mode` and
+ * `autocommit`: **a session setting this journal's statements rest on is stated
+ * by the arm rather than assumed of the server**. Unlike the reap window it is
+ * not best-effort — a server that refuses it fails the open, because a journal
+ * that cannot promise §2.1 is not this journal.
+ */
+const POSTGRES_SYNCHRONOUS_COMMIT = "SET synchronous_commit = on";
+
+/**
+ * …and what the session really carries once both statements have been sent.
+ *
+ * Read back rather than assumed, because on this backend a `SET` that *succeeds*
+ * is not a setting that took. The assign hooks for the three keepalive GUCs call
+ * `pq_setkeepalives*` and **discard the return value**: a platform without
+ * `TCP_KEEPIDLE` logs "setting the keepalive idle time is not supported" on the
+ * server and the `SET` still answers, and a Unix-domain-socket connection is a
+ * documented no-op that also answers. In both cases `SHOW tcp_keepalives_idle`
+ * reads back `0` — which is the only place the difference is visible from here.
+ *
+ * Without this read the `.catch` in [`openPostgres`] is unreachable, so
+ * [`guardWindowUnshortened`] never prints, and a hub whose host vanished holds
+ * its `pg_try_advisory_lock` until Linux's own two-hour `tcp_keepalive_time`
+ * reaps the backend — while the takeover `serve` is refused by [`guardHeld`]'s
+ * text promising that "a host that vanished outright releases it within 300s".
+ * The operator waits five minutes, is refused again, and the only explanation
+ * the message offers is a live `serve` that does not exist.
+ */
+const POSTGRES_SESSION_HELD =
+  "SELECT current_setting('synchronous_commit') AS synchronous_commit, " +
+  "current_setting('tcp_keepalives_idle') AS idle, " +
+  "current_setting('tcp_keepalives_interval') AS probe_interval, " +
+  "current_setting('tcp_keepalives_count') AS probes";
+
+/** What an unflushed server is refused with. See [`POSTGRES_SYNCHRONOUS_COMMIT`]. */
+function writesAreNotFlushed(): Error {
+  return new Error(
+    `this project's journal is ${journalLocation()}, and that server answers before it has written: \`synchronous_commit\` is \`off\` on this session even though it was asked for \`on\`. Every effect this journal records would be acknowledged out of a buffer, so a crash or a power loss would drop records the run has already treated as down and a replay would re-issue the model calls and tool invocations behind them — which is the one thing \`docs/durability.md\` §2.1 promises it will not do. Take the \`synchronous_commit = off\` off this database or role (\`ALTER DATABASE … SET\`, \`ALTER ROLE … SET\`, \`postgresql.conf\`), or point \`journal:\` at a server that flushes`,
+  );
+}
+
+/**
+ * Read the session back, and say what did not take.
+ *
+ * Two severities, because two different promises are at stake. The flush is
+ * §2.1's and is not negotiable, so a server that will not make it is refused by
+ * name. The reap window is §2.3's five-minute bound on a *lockout*, which costs
+ * a takeover minutes rather than costing the record — §2.3 says in as many words
+ * that a server which will not take it is "warned about on stderr and opened
+ * anyway".
+ */
+async function confirmPostgresSession(client: Client): Promise<void> {
+  let held: Record<string, unknown> | undefined;
+  try {
+    const answered = await client.query(POSTGRES_SESSION_HELD);
+    held = answered.rows[0] as Record<string, unknown> | undefined;
+  } catch (error) {
+    // The read is the check, so a read that failed is a window nothing
+    // confirmed — which is what the warning says.
+    guardWindowUnshortened(error);
+    return;
+  }
+  if (held?.["synchronous_commit"] === "off") throw writesAreNotFlushed();
+  const asked: readonly (readonly [string, string, number])[] = [
+    ["tcp_keepalives_idle", "idle", KEEPALIVE_IDLE_SECONDS],
+    ["tcp_keepalives_interval", "probe_interval", KEEPALIVE_INTERVAL_SECONDS],
+    ["tcp_keepalives_count", "probes", KEEPALIVE_PROBES],
+  ];
+  const missed = asked.filter(([, column, seconds]) => Number(held?.[column]) !== seconds);
+  if (missed.length === 0) return;
+  guardWindowUnshortened(
+    `the server took the settings and this session carries ${missed
+      .map(([name, column]) => `\`${name}\` = ${String(held?.[column] ?? "")}`)
+      .join(", ")}`,
+  );
+}
+
 /** The journal as a Postgres database, on one connection this process holds. */
 class PostgresDriver implements JournalDriver {
   readonly dialect = POSTGRES_DIALECT;
@@ -2960,6 +3057,13 @@ class PostgresDriver implements JournalDriver {
  * module can use while making the writer guard unholdable: `pg_advisory_lock` is
  * **session**-scoped, and a pool hands sessions out and takes them back.
  *
+ * **The session states what it rests on rather than inheriting it**, which is
+ * the MySQL arm's rule read on this backend: `synchronous_commit` decides
+ * whether "committed" means "in the write-ahead log" or "in a buffer", and it is
+ * settable per cluster, per database and per role — so it is asked for by name
+ * ([`POSTGRES_SYNCHRONOUS_COMMIT`]) and read back with the reap window
+ * ([`confirmPostgresSession`]) rather than assumed of the server.
+ *
  * The guard is taken with the `try` form rather than the blocking one: a second
  * opener is told what is happening ([`guardHeld`]) rather than left blocking on
  * a connection that may be a `serve` which will hold it for days.
@@ -2993,9 +3097,17 @@ async function openPostgres(): Promise<JournalDriver> {
   });
   await client.connect();
   try {
-    // Best effort, and said out loud where it does not take: see
-    // [`guardWindowUnshortened`].
+    // Best effort, and said out loud where it does not take: a `SET` the server
+    // refuses lands in this `catch`, and a `SET` it accepts without applying
+    // lands in [`confirmPostgresSession`]'s read-back. Both reach
+    // [`guardWindowUnshortened`], and on this backend the second is the path
+    // that really happens.
     await client.query(POSTGRES_KEEPALIVES).catch(guardWindowUnshortened);
+    // Not best-effort: §2.1's "committed before it is answered" rests on it, so
+    // a server that refuses it refuses the open. See
+    // [`POSTGRES_SYNCHRONOUS_COMMIT`].
+    await client.query(POSTGRES_SYNCHRONOUS_COMMIT);
+    await confirmPostgresSession(client);
     const guard = await client.query("SELECT pg_try_advisory_lock($1, $2) AS taken", [
       WRITER_GUARD_KEYS[0],
       WRITER_GUARD_KEYS[1],

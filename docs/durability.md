@@ -196,6 +196,29 @@ for MySQL, pinned exactly and only into a project whose target binds it.
 the server has written it before it answers. The crash window above is unchanged
 and is, if anything, plainer here — it is the round trip.
 
+**Neither half of that sentence is a default, so each arm states it on its own
+session.** MySQL's `autocommit` is what makes a statement a transaction, and
+`mysql2` never sends it: on a server configured with `autocommit = 0` — a dynamic
+system variable, settable globally or through `init_connect` — the schema's DDL
+would still land, because DDL commits implicitly, and every record after it would
+join one transaction with no `COMMIT` anywhere in the journal. Nothing would read
+wrong while the process lived, since its own reads come back over the same
+connection and see their own uncommitted rows; the loss would arrive at the one
+moment the journal exists for, when the hub died and the server rolled the whole
+transaction back. Postgres' `synchronous_commit` is the other half: set `off` —
+per cluster in `postgresql.conf`, per database with `ALTER DATABASE … SET`, per
+role with `ALTER ROLE … SET` — an insert answers before its write-ahead-log
+record is flushed, so a crash or a power loss discards effects the run has
+already treated as recorded and a replay re-issues the model calls and tool
+invocations behind them. So the MySQL arm sends `SET SESSION autocommit = 1` and
+the Postgres arm `SET synchronous_commit = on`, both before any record, and both
+read back beside the reap window below. Unlike that window these are **not**
+best-effort: a server that will not make the promise is refused the journal
+rather than warned about, because the window costs a takeover minutes and this
+costs the record. It is the same rule §10 states for `sql_mode` — a session
+setting this journal's statements rest on is stated by the arm rather than
+assumed of the server.
+
 The writer guard is a **session-scoped advisory lock**, taken on the one
 connection the process holds and held for as long as that connection lasts —
 which for a `serve` is days, because the connection is heartbeaten and a
@@ -255,6 +278,19 @@ errors are not symmetric: a guard nobody holds costs a takeover a few minutes,
 and a guard taken from a hub that is still writing costs the record. A server
 that will not take the setting is **warned about on stderr** and opened anyway;
 the guard then falls back to that server's own schedule.
+
+**The window is read back rather than assumed to have taken**, because on this
+one a `SET` that succeeds is not a setting that applied. Postgres' assign hooks
+for the three keepalive GUCs call `pq_setkeepalives*` and discard the result, so
+a platform without `TCP_KEEPIDLE` logs a server-side notice and still answers the
+client, and a Unix-domain-socket connection is a documented no-op that also
+answers — in both cases `SHOW tcp_keepalives_idle` reads back `0`, which is the
+only place the difference is visible. `SET SESSION wait_timeout` on MySQL cannot
+fail at all. So each arm asks the session what it is really carrying and warns on
+a mismatch; without that read, the warning above is a line nothing could ever
+print, and the bound in this table would be a claim rather than a check. It is
+also the difference between an operator who is told to wait five minutes and
+waits two hours, and one who is told which of the two they have.
 
 Both are acquired **without a timeout**, and neither is ever released by
 statement. A release a crash can skip would be a lock outliving its owner, which
@@ -1540,6 +1576,18 @@ one backend, or a `JSON.parse` that throws on replay. Both directions are the
 one rule: a session setting this journal's statements rest on is stated by the
 arm rather than assumed of the server.
 
+**That rule reaches past `sql_mode` to what "committed" means**, which is §2.1's
+promise rather than a schema detail. MySQL's `autocommit` and Postgres'
+`synchronous_commit` decide whether a statement is its own transaction and
+whether a commit is a write; neither driver sends either, and both are
+configurable per server, per database and per role. So each arm sends its own —
+`SET SESSION autocommit = 1`, `SET synchronous_commit = on` — before any record,
+and a server that refuses is refused the journal. §2.3 says what each costs when
+it is missing. What makes them belong beside the modes above is that they are
+invisible to every case the conformance suite can run: CI's containers ship both
+the right way round, and a MySQL journal with `autocommit` off would report every
+case in the suite green and hold nothing.
+
 Key ordering and case sensitivity are stated per backend in the same place:
 SQLite's `BINARY`, Postgres' `COLLATE "C"`, MySQL's `ascii_bin`, all of which
 make §4's key order the order a reader derives. That binding covers every column
@@ -1558,6 +1606,16 @@ opener is refused by name, and a **dead** one is not — the suite ends the
 holder's session from another connection, which is the path the server's own
 reap takes without the five-minute wait, and then requires the takeover to be
 admitted and the process that lost the connection to still be running.
+
+**Every verb of the interface is driven**, and that is held by a test which reads
+the interface off the module rather than off a list beside it. An undriven verb
+is a `WHERE` no server ever answers: each of `refuseRecorded`, `exhaustRecorded`,
+`refuseDelivery` and `supersedeDispatch` is a settle predicate whose whole job is
+to be exact, `refuseRecorded`'s is the only comparison of `deliveries.kind`
+anywhere in the journal, and a placeholder mis-numbered in any of them shifts
+every later parameter on Postgres, where `?` is counted positionally into `$n`.
+The settings §2.3 states on each session are the complement of this: they are
+what no case can see, because a server that has them is the only kind CI runs.
 
 **Durability is not checkpointing.** `docs/grammar.md` §14's rule that "`local`
 is not durably checkpointed; every other target is" — the rule

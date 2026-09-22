@@ -32,6 +32,22 @@ const UNICODE = "héllo → 世界 \u0000-free 🙂 \\\" ' ; = -- /* not sql */"
 const LARGE = "x".repeat(300_000);
 
 /**
+ * …and the same shapes for the columns a caller's string reaches **raw**.
+ *
+ * Every use of `UNICODE` above is serialized on the way in — `canonical` and
+ * `JSON.stringify` write a NUL as the six characters of a `\u0000` escape — while
+ * a `detail` is the caller's own string put straight into a column. SQLite's
+ * driver hands that to the C API as a NUL-terminated string, so a NUL truncates
+ * there and on neither server; a case carrying one would be asserting that
+ * divergence rather than this document's contract, and what a `detail` actually
+ * holds — an HTTP status, a transport error, a reason this codebase wrote — has
+ * no NUL in it. Everything else stays, because every other shape here is one a
+ * `detail` really does carry: the non-ASCII, the quote, the backslash, the
+ * comment openers and the bare `--`.
+ */
+const UNSERIALIZED = UNICODE.replaceAll("\u0000", "");
+
+/**
  * Two sites distinct only by case, which a case-insensitive key column merges.
  *
  * A site of their own rather than a second reading of `review/0`: the append
@@ -263,6 +279,82 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
     (await handle.deliveries(execution)).find((held) => held.ordinal === second.ordinal)
       ?.detail === LARGE;
 
+  // …and the two endings §3.7 gives a delivery beside `delivered`, through the
+  // three verbs that reach them — none of which the cases above drive at all.
+  //
+  //  * `refuseDelivery` opens a row that is already over — a callback URL no
+  //    `callback_allow:` entry admitted, recorded rather than raised (resolved
+  //    q33, grammar §13.3);
+  //  * `refuseRecorded` is the same ending for a row already on the ledger, and
+  //    it is the **only** statement anywhere in `SqlJournal` that compares
+  //    `deliveries.kind` — `AND (kind IS NULL OR kind = 'callback')`. Nothing
+  //    else drives that column, and `docs/durability.md` §10 says the
+  //    per-backend collation binding "covers every column a statement compares,
+  //    not only the keys". A `trace_sink` address is admitted by no list, so
+  //    there is nothing for it to fail to match and its row must stay owed
+  //    (grammar §14.5, PRD resolved q50);
+  //  * `exhaustRecorded` is the end where the bounded schedule ran out.
+  //
+  // Both `UPDATE`s also carry `status = 'pending'`, which is what stops a late
+  // refusal or a spent schedule reopening a row that already has an outcome —
+  // so each is driven twice, once where it must take and once where it must not.
+  const BLOCKED = `no \`callback_allow:\` entry admits it: ${UNSERIALIZED}`;
+  const refused = await handle.refuseDelivery(
+    {
+      execution,
+      kind: "callback",
+      event: "settled",
+      url: "https://blocked.example/hook",
+      body: JSON.stringify({ blocked: UNICODE }),
+      pauses: [],
+    },
+    BLOCKED,
+  );
+  const opener = (await handle.deliveries(execution)).find(
+    (held) => held.ordinal === refused.ordinal,
+  );
+  results.a_delivery_refused_at_intent_is_opened_settled =
+    refused.status === "refused" &&
+    refused.ordinal === second.ordinal + 1 &&
+    opener?.status === "refused" &&
+    opener?.kind === "callback" &&
+    opener?.detail === BLOCKED &&
+    opener?.settledAt !== undefined;
+
+  const owed = await handle.intendDelivery({
+    execution,
+    kind: "callback",
+    event: "settled",
+    url: "https://receiver.example/late",
+    body: "{}",
+    pauses: [],
+  });
+  const REFUSAL = `the allowlist stopped admitting it: ${UNSERIALIZED}`;
+  // …the callback row, which the predicate must take…
+  await handle.refuseRecorded(execution, owed.ordinal, REFUSAL);
+  // …the `trace_sink` row, which it must not, because `kind` is compared…
+  await handle.refuseRecorded(execution, second.ordinal, REFUSAL);
+  const ledgerAfterRefusal = await handle.deliveries(execution);
+  const refusedLate = ledgerAfterRefusal.find((held) => held.ordinal === owed.ordinal);
+  results.a_recorded_callback_is_refused_by_ordinal =
+    refusedLate?.status === "refused" &&
+    refusedLate?.detail === REFUSAL &&
+    refusedLate?.settledAt !== undefined;
+  results.a_trace_sink_row_is_not_refused =
+    ledgerAfterRefusal.find((held) => held.ordinal === second.ordinal)?.status === "pending";
+
+  const SPENT = `every attempt in the schedule failed: ${UNSERIALIZED}`;
+  // …the row still owed, which the predicate must take…
+  await handle.exhaustRecorded(execution, second.ordinal, SPENT);
+  // …and the one that was refused a moment ago, which it must not.
+  await handle.exhaustRecorded(execution, owed.ordinal, SPENT);
+  const ledgerAfterExhaustion = await handle.deliveries(execution);
+  const spent = ledgerAfterExhaustion.find((held) => held.ordinal === second.ordinal);
+  results.a_spent_schedule_exhausts_its_delivery =
+    spent?.status === "exhausted" && spent?.detail === SPENT && spent?.settledAt !== undefined;
+  results.a_settled_delivery_is_not_exhausted =
+    ledgerAfterExhaustion.find((held) => held.ordinal === owed.ordinal)?.status === "refused";
+
   // 8. **The dispatch board**, whose park order breaks ties by insertion rather
   //    than by the millisecond two rows share (`docs/distributed.md` §6.2).
   //
@@ -310,6 +402,21 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
     parkedAt: new Date().toISOString(),
   });
   results.park_is_idempotent = reparked.id === dispatch(0);
+  // …and the two readers a recovering hub re-attaches through: the row at one
+  // wait, which is how a resumed execution finds the dispatch its predecessor
+  // left rather than opening a second one for work a worker may already be
+  // doing, and every row of one execution, which is what a takeover enumerates
+  // (§3.8, §6.1). `dispatchesOf` is ordered like the board — `parked_at` first,
+  // insertion order to break the tie a fan-out's five rows share — and scoped to
+  // the execution asked for, which on a journal that has held other runs is not
+  // the same as "every row".
+  results.a_dispatch_is_found_at_its_wait =
+    (await handle.dispatchAt(execution, "map/0/0"))?.id === dispatch(0) &&
+    (await handle.dispatchAt(execution, "map/0/99")) === undefined;
+  const mine = await handle.dispatchesOf(execution);
+  results.the_dispatches_of_an_execution_are_its_own_in_park_order =
+    mine.every((row) => row.execution === execution) &&
+    mine.map((row) => row.wait).join(",") === "map/0/0,map/0/1,map/0/2,map/0/10,map/0/11";
   results.a_claim_hands_the_row_over =
     (await handle.claimDispatch(dispatch(1), "session-a"))?.session === "session-a";
   results.a_second_claim_takes_nothing =
@@ -333,6 +440,29 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
     (await handle.settleDispatch(dispatch(1), { kind: "value", value: { ok: "again" } })) === false;
   results.a_settled_dispatch_keeps_its_outcome =
     (await handle.dispatchOf(dispatch(1)))?.outcome?.value?.ok === UNICODE;
+  // …and the *other* ending, which is the hub's rather than a result's: a
+  // session that fell outside the liveness window, or a dispatch issued under an
+  // artifact that has been replaced (§3.8, `docs/distributed.md` §5, §6.3). The
+  // statement is `supersedeDispatch`'s, and nothing above reaches it — while a
+  // replaced hub runs it over every row it inherited. Three things have to be
+  // true of it: the row ends without an outcome, so a late result meets `409`
+  // rather than `204`; the session it was claimed under is let go; and a row
+  // that already ended keeps the ending it has, which is the
+  // `status IN ('parked', 'dispatched')` predicate.
+  const ORPHANED = `the hub stopped waiting for this dispatch: ${UNSERIALIZED}`;
+  await handle.claimDispatch(dispatch(10), "session-c");
+  await handle.supersedeDispatch(dispatch(10), ORPHANED);
+  const orphaned = await handle.dispatchOf(dispatch(10));
+  results.a_dispatch_is_superseded_without_an_outcome =
+    orphaned?.status === "superseded" &&
+    orphaned?.detail === ORPHANED &&
+    orphaned?.settledAt !== undefined &&
+    orphaned?.outcome === undefined &&
+    orphaned?.session === undefined;
+  await handle.supersedeDispatch(dispatch(1), ORPHANED);
+  const kept = await handle.dispatchOf(dispatch(1));
+  results.a_settled_dispatch_is_not_superseded =
+    kept?.status === "settled" && kept?.outcome?.value?.ok === UNICODE;
 } finally {
   // Always, and before the writer guard's own case below: a connection left open
   // is a lock the next opener meets.

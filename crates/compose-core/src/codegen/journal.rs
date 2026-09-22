@@ -393,6 +393,151 @@ mod tests {
         );
     }
 
+    /// **Each remote arm states the durability its records rest on rather than
+    /// inheriting it** (`docs/durability.md` §2.1, §2.3, §10).
+    ///
+    /// §2.1 promises of every backend that one effect is one `INSERT`,
+    /// **committed before it is answered**, and §2.3 spells that out for the two
+    /// servers: "each statement is its own transaction and the server has
+    /// written it before it answers". Neither sentence is true by default on
+    /// either backend, and on both the setting that makes it true is a session
+    /// one the arm has to ask for.
+    ///
+    /// On **MySQL** it is `autocommit`. `mysql2` never sends the statement, so
+    /// what a connection gets is the server's own — a dynamic system variable an
+    /// operator sets globally or through `init_connect`. With it off, the DDL
+    /// still lands (it commits implicitly) and every record after it joins one
+    /// transaction nothing here commits; the reads come back over the same
+    /// connection and see their own uncommitted rows, so a hub, a status route
+    /// and the whole conformance suite all read correct until the process ends
+    /// and the server rolls the lot back.
+    ///
+    /// On **Postgres** it is `synchronous_commit`, which the SQLite arm's
+    /// `PRAGMA synchronous = FULL` is the other spelling of. Set `off` — per
+    /// cluster, per database or per role — an insert answers before its WAL
+    /// record is flushed, so a power loss drops effects the run already treated
+    /// as recorded and a replay re-issues the model calls behind them.
+    ///
+    /// A drift test rather than a conformance case, for
+    /// `mysql_sets_the_strict_mode_its_column_bounds_rest_on`'s reason exactly:
+    /// CI's `mysql:8` ships `autocommit = 1` and its `postgres:17` ships
+    /// `synchronous_commit = on`, so no case run against a real server can see
+    /// either missing — and a MySQL journal with `autocommit` off would report
+    /// every case in the suite green.
+    #[test]
+    fn each_remote_arm_states_the_durability_its_records_rest_on() {
+        for (arm, name, open, statement) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "openPostgres",
+                "POSTGRES_SYNCHRONOUS_COMMIT",
+            ),
+            (MYSQL, "journal-mysql.ts", "openMysql", "MYSQL_AUTOCOMMIT"),
+        ] {
+            assert!(
+                function_code(arm, open).contains(&format!("query({statement})")),
+                "`{name}` does not send `{statement}` from `{open}`, so whether a record this \
+                 journal answers for has been committed is the server's configuration rather \
+                 than this arm's promise (`docs/durability.md` §2.1, §2.3)"
+            );
+        }
+        assert!(
+            declaration(POSTGRES, "POSTGRES_SYNCHRONOUS_COMMIT")
+                .contains("synchronous_commit = on"),
+            "the Postgres arm asks for something other than `synchronous_commit = on`, so an \
+             `INSERT` can answer before its WAL record is flushed and a power loss drops effects \
+             the run already treated as recorded (`docs/durability.md` §2.1)"
+        );
+        assert!(
+            declaration(MYSQL, "MYSQL_AUTOCOMMIT").contains("SET SESSION autocommit = 1"),
+            "the MySQL arm asks for something other than `autocommit = 1`, so on a server with \
+             `autocommit` off every record joins one transaction with no `COMMIT` in this \
+             module — and a `serve` restarted on a fresh machine finds nothing to recover \
+             (`docs/durability.md` §2.1, §2.3)"
+        );
+        // …and neither is best-effort. The reap window is warned about and
+        // opened anyway (§2.3 says so in as many words) because it costs a
+        // takeover minutes; this costs the record, so a server that will not
+        // make the promise does not get to open the journal.
+        for (arm, name, statement) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "POSTGRES_SYNCHRONOUS_COMMIT",
+            ),
+            (MYSQL, "journal-mysql.ts", "MYSQL_AUTOCOMMIT"),
+        ] {
+            assert!(
+                !code(arm).contains(&format!("query({statement}).catch")),
+                "`{name}` swallows a refusal of `{statement}`, so a server that will not commit \
+                 what it answers for opens this journal anyway with a line on stderr"
+            );
+        }
+    }
+
+    /// **…and each reads back what the session really carries**
+    /// (`docs/durability.md` §2.3).
+    ///
+    /// The window is the setting a `SET` can take without taking effect, and
+    /// that is why it is the one that is read back. In PostgreSQL the assign
+    /// hooks for `tcp_keepalives_idle`/`interval`/`count` call `pq_setkeepalives*`
+    /// and **discard** the return value, so a platform without `TCP_KEEPIDLE`
+    /// logs a `LOG` line server-side and answers the client `SET`, and a
+    /// Unix-domain-socket connection is a documented no-op that also answers;
+    /// `SET SESSION wait_timeout` on MySQL cannot fail at all. So a
+    /// `.catch(guardWindowUnshortened)` on either statement is a path nothing
+    /// takes, and without a read-back beside it [`guardWindowUnshortened`] never
+    /// prints: a hub whose host vanished would hold the guard until the OS
+    /// reaped the backend two hours later, while the takeover `serve` was
+    /// refused by [`guardHeld`]'s promise that "the same command 300s from now
+    /// goes in" — the operator retries at five minutes, is refused again, and
+    /// the only explanation the message offers is a live `serve` that does not
+    /// exist.
+    ///
+    /// The read is held here rather than in the conformance suite because CI's
+    /// servers take the settings: a case can only ever see the window shortened.
+    #[test]
+    fn each_remote_arm_reads_its_reap_window_back_rather_than_assuming_it_took() {
+        for (arm, name, open, confirm, held, reads) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "openPostgres",
+                "confirmPostgresSession",
+                "POSTGRES_SESSION_HELD",
+                "current_setting('tcp_keepalives_idle')",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "openMysql",
+                "confirmMysqlSession",
+                "MYSQL_SESSION_HELD",
+                "@@session.wait_timeout",
+            ),
+        ] {
+            assert!(
+                declaration(arm, held).contains(reads),
+                "`{name}`'s `{held}` no longer reads `{reads}` back, so the shortened reap \
+                 window is a setting this arm sent and nothing observed — and the `SET` that \
+                 carries it cannot fail, so nothing else would notice \
+                 (`docs/durability.md` §2.3)"
+            );
+            assert!(
+                function_code(arm, open).contains(&format!("{confirm}(")),
+                "`{name}` reads its session settings back from nowhere `{open}` calls, so the \
+                 check is dead code beside a promise (`docs/durability.md` §2.3)"
+            );
+            assert!(
+                function_code(arm, confirm).contains("guardWindowUnshortened("),
+                "`{name}`'s `{confirm}` reads the window back and says nothing when it is not \
+                 the one asked for, so §2.3's five-minute bound stays a written claim rather \
+                 than a checked one"
+            );
+        }
+    }
+
     /// **Every column a statement compares carries a binary collation**, and the
     /// one a reader would not look for is `dispatches.session`.
     ///

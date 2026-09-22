@@ -199,6 +199,100 @@ const MYSQL_DIALECT: Dialect = {
 const MYSQL_WAIT_TIMEOUT = `SET SESSION wait_timeout = ${GUARD_REAP_SECONDS}`;
 
 /**
+ * What makes each statement below its own transaction, which is what
+ * `docs/durability.md` §2.1 and §2.3 promise of every backend.
+ *
+ * The other two arms get it from the driver: SQLite's is autocommitting unless a
+ * `BEGIN` is spelled, and `pg` sends every query outside an explicit transaction
+ * block. `mysql2` sends **nothing** — `grep -rn autocommit node_modules/mysql2/lib/`
+ * matches only its constant tables — so what this connection gets is whatever
+ * the server's `autocommit` is, and that is a dynamic system variable an
+ * operator can set globally or through `init_connect`.
+ *
+ * With it off, the `CREATE TABLE`s below still land (DDL commits implicitly) and
+ * then **every journal write from the first `INSERT` into `executions` onward
+ * joins one transaction with no `COMMIT` anywhere in this module**. Nothing
+ * reads wrong while the hub is up, because the reads come back over the same
+ * connection and see their own uncommitted rows — including the conformance
+ * suite's, which would report all of `docs/durability.md`'s cases green. Then
+ * the hub dies, which is the exact event a journal exists for, the server rolls
+ * the transaction back, and the `serve` restarted on a fresh machine finds an
+ * empty `executions` table. A live `serve` would also pin one InnoDB read view
+ * and its row locks for days.
+ *
+ * CI cannot see this — the `mysql:8` service container ships `autocommit = 1` —
+ * which is why it is stated here and held by a drift test rather than by a case.
+ * It is the same rule [`openMysql`] already applies to `STRICT_TRANS_TABLES` and
+ * `NO_BACKSLASH_ESCAPES`: a session setting this journal's statements rest on is
+ * stated by the arm rather than assumed of the server.
+ */
+const MYSQL_AUTOCOMMIT = "SET SESSION autocommit = 1";
+
+/**
+ * …and what the session really carries once those two have been sent.
+ *
+ * Read back rather than assumed, because neither statement failing is the way
+ * either of them goes wrong. `SET SESSION wait_timeout` cannot fail, so the
+ * `.catch` beside it is a path nothing takes — and without this read
+ * [`guardWindowUnshortened`] would never print at all, leaving §2.3's
+ * five-minute bound a written claim rather than a checked one. What can happen
+ * instead is a connection proxy that answers a `SET` on the client's behalf and
+ * never applies it to the backend session; then the window is MySQL's own eight
+ * hours, [`guardHeld`] tells the operator that "the same command 300s from now
+ * goes in", and the retry at five minutes is refused again with no explanation
+ * that is true.
+ *
+ * `autocommit` rides along because it is the same round trip and because what it
+ * costs is worse than a lockout: see [`MYSQL_AUTOCOMMIT`].
+ */
+const MYSQL_SESSION_HELD =
+  "SELECT @@session.autocommit AS autocommit, @@session.wait_timeout AS wait_timeout";
+
+/** What a session that would not commit is refused with. See [`MYSQL_AUTOCOMMIT`]. */
+function writesWouldNotCommit(): Error {
+  return new Error(
+    `this project's journal is ${journalLocation()}, and that session does not commit: \`autocommit\` is off even though it was asked to be on. Every record this journal writes would join one open transaction and be rolled back when the process ends, so a \`serve\` restarted on a fresh machine would find nothing to recover — which is the property a remote journal exists for (\`docs/durability.md\` §2.1, §2.3). Take the \`autocommit = 0\` off this server or its \`init_connect\`, or point \`journal:\` at one that commits`,
+  );
+}
+
+/**
+ * Read the session back, and say what did not take.
+ *
+ * Two severities, because two different promises are at stake. Committing is
+ * §2.1's and is not negotiable, so a session that will not do it is refused by
+ * name. The reap window is §2.3's five-minute bound on a *lockout*, which costs
+ * a takeover minutes rather than costing the record — §2.3 says in as many words
+ * that a server which will not take it is "warned about on stderr and opened
+ * anyway".
+ *
+ * A value that does not parse is reported rather than refused: `autocommit` is
+ * only acted on when the server answered a number that is definitely not `1`, so
+ * a driver that one day hands these back in some other shape costs a warning
+ * rather than every MySQL deployment its open.
+ */
+async function confirmMysqlSession(connection: Connection): Promise<void> {
+  let held: RowDataPacket | undefined;
+  try {
+    const [rows] = await connection.query<RowDataPacket[]>(MYSQL_SESSION_HELD);
+    held = rows[0];
+  } catch (error) {
+    // The read is the check, so a read that failed is a window nothing
+    // confirmed — which is what the warning says.
+    guardWindowUnshortened(error);
+    return;
+  }
+  const autocommit = Number(held?.["autocommit"]);
+  if (Number.isFinite(autocommit) && autocommit !== 1) throw writesWouldNotCommit();
+  if (Number(held?.["wait_timeout"]) !== GUARD_REAP_SECONDS) {
+    guardWindowUnshortened(
+      `the server took the setting and this session carries \`wait_timeout\` = ${String(
+        held?.["wait_timeout"] ?? "",
+      )}`,
+    );
+  }
+}
+
+/**
  * [`WRITER_GUARD`], qualified with the schema this connection is addressing.
  *
  * **MySQL's user-level locks are server-wide**, and that is the one place this
@@ -327,6 +421,13 @@ class MysqlDriver implements JournalDriver {
  * the list is wrapped in commas, the member is taken out comma and all, and the
  * wrapping is trimmed back off.
  *
+ * **`autocommit` is asserted rather than inherited**, and it is the third
+ * reading of the same rule: `mysql2` never sends the statement, so a server
+ * whose `autocommit` is off would put every record this journal writes into one
+ * transaction nothing here commits — green everywhere, including in the
+ * conformance suite, until the hub dies and the server rolls it back. See
+ * [`MYSQL_AUTOCOMMIT`], and [`confirmMysqlSession`] for what is then read back.
+ *
  * `GET_LOCK(name, 0)` rather than a timeout: a second opener is told what is
  * happening ([`guardHeld`]) rather than left blocking on a connection that may
  * be a `serve` which will hold it for days. The name is [`MYSQL_GUARD_NAME`],
@@ -367,6 +468,9 @@ async function openMysql(): Promise<JournalDriver> {
     fault.error ??= connectionLost(reported);
   });
   try {
+    // **First of everything**, so that nothing this open runs can already be
+    // inside a transaction nobody will commit. See [`MYSQL_AUTOCOMMIT`].
+    await connection.query(MYSQL_AUTOCOMMIT);
     // `CONCAT_WS` rather than `CONCAT`, because a server whose `sql_mode` is
     // empty would otherwise be handed a list with a leading comma — an empty
     // mode name, which MySQL refuses. `NULLIF` is what turns the empty string
@@ -385,9 +489,12 @@ async function openMysql(): Promise<JournalDriver> {
         "CONCAT_WS(',', NULLIF(@@sql_mode, ''), 'ANSI_QUOTES', 'STRICT_TRANS_TABLES')" +
         ", ','), ',NO_BACKSLASH_ESCAPES,', ','))",
     );
-    // Best effort, and said out loud where it does not take: see
-    // [`guardWindowUnshortened`].
+    // Best effort, and said out loud where it does not take: a `SET` the server
+    // refuses lands in this `catch` — which on this backend is a path nothing
+    // takes — and a `SET` something answered without applying lands in
+    // [`confirmMysqlSession`]'s read-back below.
     await connection.query(MYSQL_WAIT_TIMEOUT).catch(guardWindowUnshortened);
+    await confirmMysqlSession(connection);
     // The schema has to be there before the guard is taken under it: a URL that
     // names none leaves `DATABASE()` `NULL`, which makes [`MYSQL_GUARD_NAME`]
     // `NULL` and `GET_LOCK` of it an error or a nothing — and a nothing reads
