@@ -160,6 +160,7 @@ import {
   beingWorked,
   blankSinkCredentials,
   insisting,
+  journalDetachedTrace,
   message,
   pause,
   retrySchedule,
@@ -185,6 +186,7 @@ import {
   refuseDelivery,
   refuseRecordedDelivery,
   undeliveredDeliveries,
+  watchDetachedSettlements,
   watchHumanPauses,
   watchQuiescence,
 } from "./runtime.ts";
@@ -380,6 +382,21 @@ export function createApp(): FastifyInstance {
       method: trigger.method,
       url: trigger.path,
       handler: (request, reply) => start(executions, trigger, request, reply),
+    });
+  }
+
+  // The sink's second event class (PRD resolved q64): every detached `flow.*`
+  // delivery that settles in this process ships its own envelope. Subscribed
+  // **before** the recovery hook below, because a recovered execution re-runs
+  // the detached deliveries its dead generation left in flight and each of them
+  // re-ships on its own settlement — at-least-once, deduped by a receiver on
+  // `(parent_execution, idempotency_key)`. And let go of when the app closes,
+  // so an ejected caller that builds a second app in one process does not ship
+  // every envelope twice.
+  if (sinkConfigured()) {
+    const unwatch = watchDetachedSettlements(exportingDetached);
+    app.addHook("onClose", async () => {
+      unwatch();
     });
   }
 
@@ -1392,6 +1409,23 @@ function shipping(
     });
   execution.deliveries = journaled.then(() => undefined);
   return journaled;
+}
+
+/**
+ * Journal a settled detached `flow.*` delivery's own envelope and set its
+ * schedule going (PRD resolved q64, `docs/trace.md` §1.4).
+ *
+ * The listener [`createApp`] subscribes with, and it is [`shipping`]'s sibling
+ * on the same ledger: the intent is journaled under the execution the delivery
+ * ran under, and the attempts are set going after it lands and are not awaited.
+ * Nothing waits for any of it — the delivery has already settled, the flow
+ * instance that issued it never waited for it (grammar 8.6 rule 7), and a sink
+ * that is down costs this envelope a retry exactly as it costs the parent's.
+ */
+function exportingDetached(settled: runtime.DetachedSettlement): void {
+  void journalDetachedTrace(settled).then((record) => {
+    if (record !== undefined) void workDelivery(record, sinkAuth(), true);
+  });
 }
 
 /**

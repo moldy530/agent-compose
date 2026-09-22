@@ -923,7 +923,9 @@ export interface RunContext {
    * read the moment the join returns, and the join never waits for such a
    * delivery (D94), so a record it pushed would be on the node's entry or not
    * depending on when the sink answered. See [`runMap`], and `docs/trace.md`
-   * §5.1.
+   * §5.1. A detached `flow.*` delivery's own nodes keep collectors of their
+   * own, and what they collect ships on the delivery's envelope instead
+   * ([`collectDetached`], PRD resolved q64).
    *
    * Mutable behind a `readonly` field on purpose: the field is the channel, and
    * what flows through it is appended by whoever runs an op.
@@ -2156,10 +2158,13 @@ export async function callModel(
     // `calls` where there is one, because those are the objects just pushed into
     // the node's channel and the trace reconciles the two lists by **identity**
     // ([`merged`]). The field is what makes the empty case answerable: `calls`
-    // is the *node execution's* collector, and a detached `map` delivery has
-    // none by construction (D94, and see [`runMap`]) — so its record holds an
-    // empty list, and a `served` inferred from that tail would fail a resume of
-    // a composition nobody had touched.
+    // is the *node execution's* collector, and a detached `map` delivery to an
+    // `agent.*` has none by construction (D94, and see [`runMap`]) — so its
+    // record holds an empty list, and a `served` inferred from that tail would
+    // fail a resume of a composition nobody had touched. (A detached `flow.*`
+    // delivery's calls are made by its own nodes, into their own collectors,
+    // and reach the envelope it ships when it settles — PRD resolved q64, and
+    // see [`collectDetached`].)
     const served = held.calls[held.calls.length - 1] ?? held.served;
     if (served === undefined) {
       throw new ReplayDivergence(
@@ -9468,6 +9473,40 @@ export const TRACE_VERSION = 4;
 export interface TraceDocument {
   /** [`TRACE_VERSION`]: the format the `entries` below are written in. */
   readonly trace_version: number;
+  /**
+   * `true` on the envelope a **detached `flow.*` delivery** ships of its own when
+   * it settles, and absent on every other — never `false` (PRD resolved q64,
+   * `docs/trace.md` §1.4, §2).
+   *
+   * The second event class of the trace sink. A detached delivery runs real
+   * nodes under its parent's execution id, past the join and under its own
+   * signal, and the parent's entry carries only the stub `"detached"` record
+   * (Decision D94, `docs/trace.md` §5.1); this envelope is where everything the
+   * delivery did is written instead. See [`detachedTraceDocument`].
+   */
+  readonly detached?: true;
+  /**
+   * The execution a detached delivery ran under, on the envelope that carries
+   * [`detached`][`TraceDocument.detached`] and on no other.
+   *
+   * The same id as `execution_id` below, and deliberately so: a detached
+   * delivery is not an execution of its own (PRD resolved q64 — no execution
+   * row, no journal of its own), so the execution its entries belong to *is*
+   * its parent's. It is written out anyway because it is half of the pair a
+   * receiver dedupes on, and a reader joining the two envelopes should not have
+   * to know that one field doubles as the other.
+   */
+  readonly parent_execution?: string;
+  /**
+   * The grammar 9.4 key of the dispatch that issued a detached delivery, on the
+   * envelope that carries [`detached`][`TraceDocument.detached`] and on no other.
+   *
+   * Byte for byte the `idempotencyKey` of the parent's stub `"detached"`
+   * [`DispatchRecord`], so the join between the parent's entry and this
+   * envelope is string equality — the key gains a *reader*, not a carrier
+   * (grammar 9.4's carriers are unchanged).
+   */
+  readonly idempotency_key?: string;
   /** The flow that was run, as its typed address (grammar 2.2). */
   readonly flow: string;
   /** The execution the entries belong to (grammar 4.1's `execution.id`). */
@@ -11088,8 +11127,10 @@ export async function runMap(
       // observed, and a detached delivery's outcome is the one thing it never
       // observes — `outcome: "detached"` and `attempts: 0` are already that
       // statement, and an entry that carried the delivery's model call beside
-      // them would contradict both. Dropped rather than collected somewhere
-      // else, because there is no entry for a second collector to reach.
+      // them would contradict both. So nothing the delivery does is handed to
+      // the node's collectors — and where the delivery is a `flow.*`, what it
+      // does is collected by one of its own instead, which is `collector`
+      // below and PRD resolved q64.
       const delivery: RunContext = {
         ...scoped,
         signal: new AbortController().signal,
@@ -11108,6 +11149,16 @@ export async function runMap(
       // node in this tick is already inside it, and comes off however the
       // delivery ends — including before `route.run` is reached.
       const undetach = detaching(scoped.execution.id, site.path.join("/"));
+      // **The delivery's own collector, from dispatch to settlement** (PRD
+      // resolved q64). Opened in the same tick the stub record above is written
+      // and settled where the quiescence mark comes off, so it spans exactly
+      // the delivery's life — and it is the delivery's alone: it reads what the
+      // instance answered or failed with, and writes nothing the map node's
+      // entry reads. Only a `flow.*` has one, because only a `flow.*` runs
+      // nodes that make entries; see [`collectDetached`].
+      const collector = collectDetached(scoped.execution.id, route.target, site);
+      let answered: NodeAnswer | undefined;
+      let raised: { readonly error: unknown } | undefined;
       const delivering = (async () => {
         try {
           // `max_concurrency` is an **admission** bound over every in-flight
@@ -11123,14 +11174,24 @@ export async function runMap(
           await gate.acquire("detached");
           await node.acquire("detached");
           try {
-            await route.run(instance.input, delivery, site);
+            answered = await route.run(instance.input, delivery, site);
           } finally {
             node.release();
             gate.release();
             retire(plan.admission, admission);
           }
+        } catch (error) {
+          raised = { error };
+          throw error;
         } finally {
           undetach();
+          // **Settled**: the mark just came off, however the delivery ended.
+          // What the collector does with that is downstream of it and cannot
+          // reach back — it neither throws nor is awaited — so nothing about a
+          // delivery's own trace can delay or fail the enclosing flow instance
+          // (grammar 8.6 rule 7), and the swallow below still sees the
+          // delivery's own error rather than one of the collector's.
+          collector?.settle(answered, raised);
         }
       })().catch((error: unknown) => {
         // Nothing it does can fail the enclosing flow instance, which is what an
@@ -11357,6 +11418,188 @@ export async function settleDetached(execution: string): Promise<void> {
     if (held === undefined || held.size === 0) return;
     await Promise.all([...held]);
   }
+}
+
+// ---------------------------------------------------------------------------
+// A detached delivery's own trace (PRD resolved q64, `docs/trace.md` §1.4, §2)
+// ---------------------------------------------------------------------------
+
+/**
+ * One detached `flow.*` delivery, **settled**: everything it did, and how it
+ * ended (PRD resolved q64).
+ *
+ * The two halves of the ruling meet here and are easy to mistake for each other,
+ * so both are stated. **What D94 settled stays settled**: the map node's entry
+ * carries the stub `"detached"` record and nothing else of this, because that
+ * entry is written when the join finishes and a fuller one would be
+ * nondeterministic (`docs/trace.md` §5.1). **What was never asked is answered
+ * here**: the delivery itself ran real nodes under its parent's execution id,
+ * and the moment it settles is a moment the runtime knows — the quiescence mark
+ * coming off ([`detaching`]) — so its trace is a finished record at that moment
+ * and nothing about it depends on scheduling.
+ *
+ * It is not an execution and does not become one: no lifecycle row, no journal
+ * of its own, no recovery identity beyond what grammar 9.4 delivery recovery
+ * already gives it. Its effects stay journaled under the parent's id, which is
+ * why `parentExecution` is the only execution this names.
+ */
+export interface DetachedSettlement {
+  /** The execution the delivery ran under — its parent's id. */
+  readonly parentExecution: string;
+  /**
+   * The grammar 9.4 key of the dispatch that issued it: the parent's stub
+   * record's `idempotencyKey`, byte for byte.
+   */
+  readonly idempotencyKey: string;
+  /** The `flow.*` the delivery instantiated, as its typed address. */
+  readonly flow: string;
+  /**
+   * How it ended. Two of the envelope's three: a detached dispatch reaching a
+   * `human` node is refused at build time (Decision D118), so no delivery can
+   * end holding a pause.
+   */
+  readonly status: "completed" | "failed";
+  /** What stopped a delivery that failed, in the `<error name>: <message>` shape. */
+  readonly error?: string;
+  /**
+   * The instance's own entries, ordered as any instance's are — the trace a
+   * joined dispatch would have carried under `DispatchRecord.inner`, with its
+   * model calls, store records, harness runs and its own dispatches on them.
+   */
+  readonly entries: readonly TraceEntry[];
+  /** When the delivery was issued, as an ISO 8601 instant. */
+  readonly dispatchedAt: string;
+  /** When it settled — the quiescence mark came off — as an ISO 8601 instant. */
+  readonly settledAt: string;
+}
+
+/**
+ * Who is told when a detached `flow.*` delivery settles.
+ *
+ * Process-wide rather than per execution, because a delivery outlives the
+ * `runFlow` that issued it (D94: the join never waits for it) and the one thing
+ * that has to hear about it — the trace sink — is the deployment's standing
+ * subscription rather than a request's. `src/serve.ts` subscribes for as long as
+ * its app lives, and `src/cli.ts` for as long as one command's run does.
+ */
+const detachedListeners = new Set<(settled: DetachedSettlement) => void>();
+
+/**
+ * Be told of every detached `flow.*` delivery that settles in this process, and
+ * answer the unsubscribe (PRD resolved q64).
+ *
+ * A listener is called **after** the delivery settled and is never awaited: what
+ * it does with the settlement — journal an export, send it — is downstream of
+ * the delivery and of the flow instance that issued it, which is grammar 8.6
+ * rule 7's "nothing it does can delay the enclosing flow instance" kept true of
+ * one more thing. A listener that throws is its own problem and nobody else's.
+ */
+export function watchDetachedSettlements(
+  listener: (settled: DetachedSettlement) => void,
+): () => void {
+  detachedListeners.add(listener);
+  return () => {
+    detachedListeners.delete(listener);
+  };
+}
+
+/**
+ * A detached delivery's own trace collector, from dispatch to settlement — or
+ * `undefined` for a target that makes no entries (PRD resolved q64).
+ *
+ * **Only a `flow.*` has one.** The ruling's second event class is one POST per
+ * settled detached `flow.*` delivery, because a `flow.*` is the one target that
+ * runs *nodes*: its instance is a run of its own graph, every node in it files
+ * an entry through its own [`runNode`] collectors, and those entries are what
+ * [`runSubflow`] answers with (or a [`SubflowFailure`] carries). An `agent.*` or
+ * a `tool.*` sink runs no node and has no entry to put anything on, so its
+ * account stays the stub record D94 gives it.
+ *
+ * **Nothing it collects reaches the map node's entry.** The delivery runs under
+ * a context whose node collectors are cut ([`runMap`]), and this reads only what
+ * the instance itself answered — so the stub record `docs/trace.md` §5.1
+ * describes stays the parent's whole account, and this is a second account
+ * written somewhere else.
+ *
+ * **A divergence settles nothing.** A delivery that met a
+ * [`ReplayDivergence`] did not end: the record and this build disagree about
+ * it, the execution is held open for a build that agrees (PRD resolved q29,
+ * [`latchDivergence`]), and a replay will run it again. Shipping an envelope for
+ * it would be announcing an outcome the execution does not have, which is the
+ * sentence "a divergence fires nothing" refuses.
+ */
+function collectDetached(
+  execution: string,
+  target: string,
+  site: DispatchSite,
+):
+  | { settle(answer: NodeAnswer | undefined, raised: { readonly error: unknown } | undefined): void }
+  | undefined {
+  if (!target.startsWith("flow.")) return undefined;
+  const dispatchedAt = new Date().toISOString();
+  return {
+    settle(answer, raised) {
+      try {
+        if (raised !== undefined && divergenceOf(raised.error) !== undefined) return;
+        const settled: DetachedSettlement = {
+          parentExecution: execution,
+          idempotencyKey: site.idempotencyKey,
+          flow: target,
+          status: raised === undefined ? "completed" : "failed",
+          ...(raised === undefined ? {} : { error: describe(raised.error) }),
+          // The instance's trace: on the answer where it reached quiescence, on
+          // the failure where it did not — the same two places a joined
+          // dispatch's record reads it from, so the two accounts of one
+          // instance cannot be assembled differently.
+          entries:
+            raised === undefined ? (answer?.inner ?? []) : (traceOf(raised.error) ?? []),
+          dispatchedAt,
+          settledAt: new Date().toISOString(),
+        };
+        for (const listener of [...detachedListeners]) {
+          try {
+            listener(settled);
+          } catch {
+            // A listener's failure is its own (see [`watchDetachedSettlements`]).
+          }
+        }
+      } catch {
+        // Nothing here may reach the delivery's own promise: the swallow in
+        // [`runMap`] is reading *its* error, and one raised by the account of it
+        // would be misread there as the delivery's.
+      }
+    },
+  };
+}
+
+/**
+ * The envelope a settled detached delivery ships (PRD resolved q64,
+ * `docs/trace.md` §2).
+ *
+ * The same [`TraceDocument`] every other surface carries, headed by the three
+ * fields only this one has: `detached: true`, `parent_execution`, and the
+ * grammar 9.4 `idempotency_key` — which is the parent's stub record's key, so a
+ * receiver joins the two by string equality and dedupes on
+ * `(parent_execution, idempotency_key)` across the re-shipping a recovery does.
+ * `execution_id` is the parent's id too, because the entries belong to the
+ * execution they ran under and a detached delivery is not one of its own.
+ *
+ * Written in one place because two writers would drift: the head's key order is
+ * what a reader reading the bytes sees first, and the version leads it as it
+ * leads every envelope.
+ */
+export function detachedTraceDocument(settled: DetachedSettlement): TraceDocument {
+  return {
+    trace_version: TRACE_VERSION,
+    detached: true,
+    parent_execution: settled.parentExecution,
+    idempotency_key: settled.idempotencyKey,
+    flow: settled.flow,
+    execution_id: settled.parentExecution,
+    status: settled.status,
+    ...(settled.error === undefined ? {} : { error: settled.error }),
+    entries: settled.entries,
+  };
 }
 
 /** A failed item, carrying how many attempts its policy made. */

@@ -1275,6 +1275,178 @@ const observed = {};
   ]);
 }
 
+// --- A detached `flow.*` delivery's own collector (PRD resolved q64) -------
+//
+// The ruling's two halves, from inside. The map node's entry keeps exactly the
+// stub `"detached"` record and nothing the delivery did — its model call, its
+// store op — because the delivery's context carries none of the node's
+// collectors (D94, `docs/trace.md` §5.1). What the delivery did is collected by
+// a collector of its own, from dispatch to settlement, and handed to whoever
+// `watchDetachedSettlements` subscribed once the quiescence mark comes off —
+// which is after the map node has returned, because the join never waits.
+//
+// Driven through `runNode`, because the parent's *entry* is half of what is
+// asserted and only a node execution makes one. Every shape of settlement is
+// here: a `flow.*` that completed (its instance's trace on the answer), one that
+// failed (its trace on the `SubflowFailure`), one that met a divergence (which
+// settles nothing: q29's "a divergence fires nothing"), and a `tool.*` sink,
+// which runs no nodes and so has no envelope of its own to ship.
+{
+  const settlements = [];
+  const unwatch = runtime.watchDetachedSettlements((settled) => settlements.push(settled));
+  // A listener that throws is its own problem: the one after it still hears,
+  // and nothing reaches the delivery or the flow instance.
+  const unwatchLoud = runtime.watchDetachedSettlements(() => {
+    throw new Error("a listener that throws");
+  });
+  const called = (model) => ({ model, servedBy: model, fallback: 0, failovers: [] });
+  const innerEntry = (flow, node, outcome, extra = {}) => ({
+    step: 1,
+    flow,
+    node,
+    traversal: 0,
+    outcome,
+    attempts: 1,
+    ...extra,
+  });
+  // Every delivery tries to reach the node's collectors, the way an activity
+  // run under the node's own context would. The context it is handed must
+  // hold none of them, so each push below is one that has nowhere to land.
+  const leaky = (context) => {
+    context.modelCalls?.push(called("model.leaked"));
+    context.storeRecords?.push({ store: "store.leaked", op: "get" });
+    context.toolDispatches?.push({ index: 99, target: "flow.leaked" });
+  };
+  const map = descriptor({
+    node: "hand_off",
+    maxConcurrency: 8,
+    routeBy: "kind",
+    routes: [
+      route({
+        tag: "joined",
+        writes: [],
+        run: async (_input, context) => {
+          const call = called("model.joined");
+          context.modelCalls?.push(call);
+          return { output: {}, models: [call] };
+        },
+      }),
+      route({
+        tag: "review",
+        detach: true,
+        target: "flow.review",
+        writes: [],
+        run: async (_input, context) => {
+          leaky(context);
+          await sleep(120);
+          return {
+            output: {},
+            inner: [
+              innerEntry("flow.review", "judge", "completed", {
+                writes: [],
+                models: [called("model.local")],
+              }),
+            ],
+          };
+        },
+      }),
+      route({
+        tag: "broken",
+        detach: true,
+        target: "flow.broken",
+        writes: [],
+        run: async (_input, context) => {
+          leaky(context);
+          await sleep(80);
+          throw new runtime.SubflowFailure(
+            "flow.broken",
+            "did not run to quiescence",
+            [
+              innerEntry("flow.broken", "judge", "completed", {
+                writes: [],
+                models: [called("model.local")],
+              }),
+              innerEntry("flow.broken", "file", "failed", { error: "Error: cannot file" }),
+            ],
+            new Error("cannot file"),
+          );
+        },
+      }),
+      route({
+        tag: "diverged",
+        detach: true,
+        target: "flow.diverged",
+        writes: [],
+        run: async () => {
+          await sleep(40);
+          throw new runtime.ReplayDivergence(
+            { key: "k", site: "exec_trace_q64/hand_off/0/3", kind: "model", ordinal: 0 },
+            "a probe",
+          );
+        },
+      }),
+      route({
+        tag: "sink",
+        detach: true,
+        target: "tool.sink",
+        writes: [],
+        run: async (_input, context) => {
+          leaky(context);
+          return { output: { receipt: "sent" } };
+        },
+      }),
+    ],
+  });
+  const node = mapNode(
+    map,
+    [{ kind: "joined" }, { kind: "review" }, { kind: "broken" }, { kind: "diverged" }, { kind: "sink" }],
+    { id: "exec_trace_q64" },
+  );
+  const entry = entryOf(await runtime.runNode(node.descriptor, node.state));
+  const heardAtReturn = settlements.length;
+  await runtime.settleDetached("exec_trace_q64");
+  // `settleDetached` returns as the last delivery's promise does, and a
+  // settlement is announced in that promise's own `finally` — so by here every
+  // one that is going to be heard has been.
+  unwatch();
+  unwatchLoud();
+  const byKey = Object.fromEntries(settlements.map((held) => [held.idempotencyKey, held]));
+  const review = byKey["exec_trace_q64/hand_off/0/1"];
+  const broken = byKey["exec_trace_q64/hand_off/0/2"];
+  observed.detachedCollector = {
+    parent: {
+      models: (entry.models ?? []).map((call) => call.model),
+      stores: entry.stores ?? null,
+      toolDispatches: entry.toolDispatches ?? null,
+      dispatches: entry.dispatches.map((record) => ({
+        index: record.index,
+        target: record.target,
+        outcome: record.outcome,
+        attempts: record.attempts,
+        key: record.idempotencyKey,
+        inner: record.inner ?? null,
+      })),
+    },
+    heardAtReturn,
+    heard: settlements.map((held) => held.idempotencyKey).sort(),
+    review: {
+      parentExecution: review.parentExecution,
+      flow: review.flow,
+      status: review.status,
+      error: review.error ?? null,
+      entries: review.entries.map((held) => [held.node, held.outcome, (held.models ?? []).length]),
+      ordered: Date.parse(review.dispatchedAt) <= Date.parse(review.settledAt),
+    },
+    broken: {
+      status: broken.status,
+      error: broken.error,
+      entries: broken.entries.map((held) => [held.node, held.outcome]),
+    },
+    document: runtime.detachedTraceDocument(review),
+    failedDocument: runtime.detachedTraceDocument(broken),
+  };
+}
+
 // --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------
 {
   observed.policy = {

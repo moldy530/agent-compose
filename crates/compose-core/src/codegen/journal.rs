@@ -1304,19 +1304,34 @@ mod tests {
              attempt is made and recorded nowhere (`docs/durability.md` §3.7)"
         );
 
-        // The **trace sink's** intent, on the same ledger and in the same order:
-        // recorded where the lifecycle row closes, and never attempted from
-        // there (grammar 14.5, PRD resolved q50).
-        let ship = function_body(delivery, "shipTrace");
+        // The **trace sink's** intents, on the same ledger and in the same order:
+        // an execution's export recorded where the lifecycle row closes, a
+        // detached delivery's envelope where the delivery settles, and neither
+        // attempted from there (grammar 14.5, PRD resolved q50, q64). Both go
+        // through the one writer that serializes an export and opens its row.
+        let intend = function_body(delivery, "intendExport");
         assert!(
-            ship.contains("intendDelivery("),
+            intend.contains("intendDelivery("),
             "a trace export is journaled like every other delivery, or a sink outage is a trace \
              nothing will ever ship"
         );
+        for shipper in ["shipTrace", "shipDetachedTrace"] {
+            let ship = function_body(delivery, shipper);
+            assert!(
+                ship.contains("intendExport("),
+                "`{shipper}` no longer journals through the one export writer, so the sink's \
+                 two event classes can ship different things under one `format:`"
+            );
+            assert!(
+                !ship.contains("fetch(") && !ship.contains("workDelivery("),
+                "`{shipper}` sends the trace itself, so the moment it is called from — a \
+                 lifecycle row closing, a detached delivery settling — waits on a collector"
+            );
+        }
         assert!(
-            !ship.contains("fetch("),
-            "`shipTrace` sends the trace itself, so the hook that closes a lifecycle row waits \
-             on a collector"
+            !intend.contains("fetch(") && !intend.contains("workDelivery("),
+            "the export writer sends what it journals, so nothing about a sink is off the path \
+             of the run it describes"
         );
 
         // …and the one place a delivery leaves the process is the declaration

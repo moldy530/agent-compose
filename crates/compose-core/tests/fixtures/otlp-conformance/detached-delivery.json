@@ -1,0 +1,303 @@
+{
+  "name": "detached-delivery",
+  "about": "The envelope a settled detached `flow.*` delivery ships of its own (PRD resolved q64): headed `detached: true`, `parent_execution` and the grammar §9.4 `idempotency_key`, with the parent's id as `execution_id`. Its trace id is the parent's — derived from the same execution id — so the delivery lands in the trace its parent's export lands in; its root is keyed by the idempotency key, so its span id is not the parent's root's, and it hangs off the parent execution's root span, whose id is a function of the execution id alone (§12.2). The head rides the root as `agentcompose.detached`, `agentcompose.parent_execution` and `agentcompose.idempotency_key` (§12.5), and the entries' instance paths hang off the dispatch's own path, as a joined dispatch's `inner` does. The window is the delivery's own: issued to settled.",
+  "context": {
+    "target": "local",
+    "artifact": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+    "compiler": "0.0.0-dev",
+    "startedAt": "2026-09-01T10:00:01.000Z",
+    "endedAt": "2026-09-01T10:00:04.000Z"
+  },
+  "document": {
+    "trace_version": 4,
+    "detached": true,
+    "parent_execution": "exec_parent",
+    "idempotency_key": "exec_parent/review/0/0",
+    "flow": "flow.review",
+    "execution_id": "exec_parent",
+    "status": "completed",
+    "entries": [
+      {
+        "step": 1,
+        "flow": "flow.review",
+        "node": "judge",
+        "traversal": 0,
+        "outcome": "completed",
+        "attempts": 1,
+        "writes": [],
+        "routing": {
+          "edges": [
+            {
+              "to": "__end__",
+              "taken": true,
+              "reason": "unconditional"
+            }
+          ],
+          "targets": [
+            "__end__"
+          ],
+          "counters": {}
+        },
+        "models": [
+          {
+            "model": "model.local",
+            "servedBy": "model.local",
+            "fallback": 0,
+            "failovers": [],
+            "outputMechanism": "native"
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {
+                "stringValue": "flow.review"
+              }
+            },
+            {
+              "key": "service.namespace",
+              "value": {
+                "stringValue": "local"
+              }
+            },
+            {
+              "key": "service.version",
+              "value": {
+                "stringValue": "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+              }
+            },
+            {
+              "key": "deployment.environment.name",
+              "value": {
+                "stringValue": "local"
+              }
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "value": {
+                "stringValue": "agent-compose"
+              }
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "value": {
+                "stringValue": "nodejs"
+              }
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "value": {
+                "stringValue": "0.0.0-dev"
+              }
+            }
+          ]
+        },
+        "scopeSpans": [
+          {
+            "scope": {
+              "name": "agent-compose",
+              "version": "0.0.0-dev"
+            },
+            "spans": [
+              {
+                "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
+                "spanId": "5ceed65e6e9ec1c6",
+                "parentSpanId": "f9f5328d4c329dfb",
+                "name": "flow.review",
+                "kind": 1,
+                "startTimeUnixNano": "1788256801000000000",
+                "endTimeUnixNano": "1788256804000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.execution.id",
+                    "value": {
+                      "stringValue": "exec_parent"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.review"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.status",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.trace_version",
+                    "value": {
+                      "intValue": "4"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.detached",
+                    "value": {
+                      "boolValue": true
+                    }
+                  },
+                  {
+                    "key": "agentcompose.parent_execution",
+                    "value": {
+                      "stringValue": "exec_parent"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.idempotency_key",
+                    "value": {
+                      "stringValue": "exec_parent/review/0/0"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
+                "spanId": "3ebfe08faed5736c",
+                "parentSpanId": "5ceed65e6e9ec1c6",
+                "name": "judge",
+                "kind": 1,
+                "startTimeUnixNano": "1788256801000000000",
+                "endTimeUnixNano": "1788256804000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.instance_path",
+                    "value": {
+                      "stringValue": "exec_parent/review/0/0/judge/0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.flow",
+                    "value": {
+                      "stringValue": "flow.review"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.node",
+                    "value": {
+                      "stringValue": "judge"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.step",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.traversal",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.outcome",
+                    "value": {
+                      "stringValue": "completed"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.attempts",
+                    "value": {
+                      "intValue": "1"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.writes",
+                    "value": {
+                      "arrayValue": {
+                        "values": []
+                      }
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing",
+                    "value": {
+                      "stringValue": "{\"edges\":[{\"to\":\"__end__\",\"taken\":true,\"reason\":\"unconditional\"}],\"targets\":[\"__end__\"],\"counters\":{}}"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.routing.targets",
+                    "value": {
+                      "arrayValue": {
+                        "values": [
+                          {
+                            "stringValue": "__end__"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              },
+              {
+                "traceId": "39c13e2e5e0c6acee32c763e8e34308c",
+                "spanId": "8fe5757faa659a36",
+                "parentSpanId": "3ebfe08faed5736c",
+                "name": "model.local",
+                "kind": 3,
+                "startTimeUnixNano": "1788256801000000000",
+                "endTimeUnixNano": "1788256804000000000",
+                "attributes": [
+                  {
+                    "key": "agentcompose.model",
+                    "value": {
+                      "stringValue": "model.local"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.served_by",
+                    "value": {
+                      "stringValue": "model.local"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.fallback",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.failovers",
+                    "value": {
+                      "intValue": "0"
+                    }
+                  },
+                  {
+                    "key": "agentcompose.model.output_mechanism",
+                    "value": {
+                      "stringValue": "native"
+                    }
+                  }
+                ],
+                "events": [],
+                "links": [],
+                "status": {
+                  "code": 1
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
