@@ -127,8 +127,19 @@ that declares `placements:` runs a placed component in more than one process by
 design. Binding one from anything a placement's process can execute is
 `process-local-store`, at every `scope:` and under `local` too. The repair is a
 networked backend, whose variables the deployment already routes to every
-placement that reaches the store — or, until this release opens one, keeping the
-component that binds the store off `placements:` so only the hub opens it.
+placement that reaches the store — or keeping the component that binds the store
+off `placements:` so only the hub opens it.
+
+**Which backends this release opens.** The four above, and — for the `kv` kind —
+`postgres` and `mysql`. A store bound to one of those two is a connection rather
+than a file, and nothing else about it changes: the same ops below, the same
+scope partitions, the same recorded reads and deduplicated writes, so a graph
+moved between backends addresses the same rows and cannot tell which answered. It
+is deliberately **multi-writer** — no writer guard, because the placement rule
+above is what governs who may reach a store — and per key the last write wins. A
+store bound to any other provider (`redis`, `chroma`, `pgvector`, `qdrant`, `s3`,
+`gcs`) compiles and then refuses at its first op, naming the backend and where
+the binding came from.
 
 `scope: session` requires the execution to have a session identity, and that
 identity comes from the trigger. A declared `http`, `schedule`, or `event`

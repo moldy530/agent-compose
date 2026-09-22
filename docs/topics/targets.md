@@ -253,12 +253,20 @@ env-ref values only.
 
 | Kind | v0 `provider` values |
 |---|---|
-| `kv` | `memory`, `sqlite`, `redis`, `postgres` |
+| `kv` | `memory`, `sqlite`, `redis`, `postgres`, `mysql` |
 | `vector` | `sqlite_vec`, `chroma`, `pgvector`, `qdrant` |
 | `blob` | `local_fs`, `s3`, `gcs` |
 
 Capability checks apply at the alias definition: a `vector` store bound to a
 non-vector-capable provider is a compile error.
+
+This release **opens** `memory`, `sqlite`, `sqlite_vec`, `local_fs` and — for the
+`kv` kind — `postgres` and `mysql`. A store bound to one of the two dialled ones
+runs the same ops, the same scopes and the same recorded reads and deduplicated
+writes as a local one, so nothing in the composition changes and every process
+reaching the store reaches the same rows; it takes no writer guard, and per key
+the last write wins. A store bound to any other provider compiles and then
+refuses at its first op, naming the backend and where the binding came from.
 
 ## `package_registry` — where the installer resolves packages
 

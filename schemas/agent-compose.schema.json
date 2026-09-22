@@ -2982,7 +2982,7 @@
       "type": "object",
       "required": ["provider"],
       "properties": {
-        "provider": { "description": "Key-value storage provider plugin.", "enum": ["memory", "sqlite", "redis", "postgres"] }
+        "provider": { "description": "Key-value storage provider plugin.", "enum": ["memory", "sqlite", "redis", "postgres", "mysql"] }
       }
     },
     "vectorBackend": {
@@ -3016,6 +3016,7 @@
             "sqlite",
             "redis",
             "postgres",
+            "mysql",
             "sqlite_vec",
             "chroma",
             "pgvector",

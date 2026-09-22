@@ -4136,7 +4136,12 @@ position, so it accepts `provider.*` and nothing else (§2.3).
   `sqlite_vec`, `local_fs` — is one store per process, so §14.1 rule 5 refuses it
   wherever a component that can execute in a placement's process binds it. The
   rule is stated there because it is about placements; it is named here because
-  this is the line that decides which backend a store has.
+  this is the line that decides which backend a store has. A **dialled** `kv`
+  backend — `postgres` or `mysql` — is the repair, and it runs: the ops, the
+  scopes and the replay discipline below are identical on it, and the only thing
+  that changes is that every process reaching the store reaches the same one
+  (PRD resolved q63,
+  [D149](#d149-a-dialled-kv-store-is-multi-writer-and-per-key-last-write-wins)).
 - `scope: session` requires the execution to have a session identity, and that
   identity comes from the trigger. The check quantifies over **declared**
   triggers (§13): a declared `http`, `schedule`, or `event` trigger whose target
@@ -5311,16 +5316,23 @@ documents cite them by number** (Decisions
    process and is untouched, and so is a store only the hub ever opens.
 
    *The repair the design carries* is a **networked** backend (§14.3) — `redis`,
-   `postgres`, `chroma`, `pgvector`, `qdrant`, `s3`, `gcs` — whose variables
-   §9.1's partition already routes to every placement that reaches a store bound
-   to it. Under `local` there is no such edit, since that target admits no
-   `storage_backends:` at all, so a `local` mesh that has to share a store is a
-   target of its own (PRD resolved q45). *The repair this release runs* is the
-   other one: take the component that binds the store out of `placements:`, so
-   only the hub opens it. Both are named in the diagnostic, in that order,
-   because a compiler release opens only the process-local backends — a
-   networked one compiles and refuses at the first store op, since production
-   `storage_backends` land behind the store plugin interface in M3 (PRD §7).
+   `postgres`, `mysql`, `chroma`, `pgvector`, `qdrant`, `s3`, `gcs` — whose
+   variables §9.1's partition already routes to every placement that reaches a
+   store bound to it. Under `local` there is no such edit, since that target
+   admits no `storage_backends:` at all, so a `local` mesh that has to share a
+   store is a target of its own (PRD resolved q45). *The repair this release
+   runs* is the other one: take the component that binds the store out of
+   `placements:`, so only the hub opens it. Both are named in the diagnostic, in
+   that order — and which of them a build of this release can actually run
+   depends on the store's kind. For a **`kv`** store the first one works:
+   `postgres` and `mysql` are implemented behind the store interface (PRD
+   resolved q63,
+   [D149](#d149-a-dialled-kv-store-is-multi-writer-and-per-key-last-write-wins)),
+   which is what gives this rule its first live members on the dialled side. For
+   a `vector` or a `blob` store nothing networked is open yet — such a binding
+   compiles and refuses at the first store op, since the rest of production
+   `storage_backends` land behind the store plugin interface in M3 (PRD §7) — so
+   the diagnostic says so and the second repair is the one to take.
 
 And one thing that is **not** a rule, because it is what happens when no rule
 applies: **a component in no placement executes on the hub.** That is the
@@ -5407,12 +5419,25 @@ strings and credentials are env-ref values only (§4.3).
 
 | Kind | v0 `provider` values |
 |---|---|
-| `kv` | `memory`, `sqlite`, `redis`, `postgres` |
+| `kv` | `memory`, `sqlite`, `redis`, `postgres`, `mysql` |
 | `vector` | `sqlite_vec`, `chroma`, `pgvector`, `qdrant` |
 | `blob` | `local_fs`, `s3`, `gcs` |
 
 Capability checks apply at the alias definition: a `vector` store bound to a
 non-vector-capable provider is a compile error (PRD 5.8).
+
+**Which of those this release opens.** The vocabulary is the v0 one and the
+implementations arrive under it: `memory`, `sqlite`, `sqlite_vec` and `local_fs`
+have always run, and `postgres` and `mysql` run for the `kv` kind from PRD
+resolved q63 — behind the same store interface, with the same op catalogue
+(§11.4), the same scope partitions (§11.3) and the same recorded reads and
+deduplicated writes (PRD 5.8), so nothing at run time can tell which answered.
+A store bound to any other provider compiles and then refuses at its first op,
+naming the backend and where the binding came from; those land behind the store
+plugin interface in M3 (PRD §7). A dialled backend is **multi-writer by design**
+— it takes no writer guard, two processes reaching it are two readers of one
+store, and the concurrency posture per key is last write wins
+(Decision [D149](#d149-a-dialled-kv-store-is-multi-writer-and-per-key-last-write-wins)).
 
 ### 14.4 `event_sources` (RESERVED — parsed and validated, no-op in v0)
 
@@ -8832,9 +8857,19 @@ unwritable.
 whether the store is **opened in-process**, which is a property of the storage
 provider (§14.3) rather than of a store's declaration or a target's name. The
 four above are that set today; a provider added later is classified by the same
-question, and a networked one — `redis`, `postgres`, `chroma`, `pgvector`,
-`qdrant`, `s3`, `gcs` — is a connection to something outside every process that
-dials it, which is what makes two processes two readers of one store.
+question, and a networked one — `redis`, `postgres`, `mysql`, `chroma`,
+`pgvector`, `qdrant`, `s3`, `gcs` — is a connection to something outside every
+process that dials it, which is what makes two processes two readers of one
+store.
+
+*And the dialled side is no longer hypothetical.* `postgres` and `mysql` are
+implemented for the `kv` kind from PRD resolved q63
+([D149](#d149-a-dialled-kv-store-is-multi-writer-and-per-key-last-write-wins)),
+so the repair this rule recommends is one a build of this release runs rather
+than a direction of travel. That those backends take **no writer guard** is the
+same fact read from the other end: this rule is what governs who may reach a
+store, so two processes reaching a dialled one are two readers of one store by
+construction, and per key the last write wins.
 
 *Why execution rather than membership.* The rule reads exactly the closure rule 4
 reads, and for the same reason: the whole artifact reaches every worker (PRD
@@ -10164,6 +10199,67 @@ assembled the same way `src/harness.ts` is — an invariant half plus the arm th
 target binds — so a zero-infra project neither installs a network driver nor
 carries the code that would import one. *PRD 5.10, 5.11, 5.12, resolved q15,
 q27–q29, q32, q42, q45, q62; §14, §14.7, §4.3.*
+
+### D149. A dialled `kv` store is multi-writer, and per key last write wins
+
+`mysql` joins §14.3's `kv` row beside `postgres`, and both are **implemented**
+for that kind: a store bound to either is opened over a connection, answers
+§11.4's catalogue, partitions by §11.3's scopes and records and deduplicates
+exactly as a local one does. Nothing above the backend moves — the same
+`storage_backends:` alias binding (PRD resolved q9), the same `${ENV}`-only
+connection config (§4.3), the same `agent_access:` narrowing of the synthesized
+tools (§11.5, [D37](#d37-agent_access-narrows-the-synthesized-store-tool-surface)),
+the same `local` substitution
+(§14, [D87](#d87-local-is-a-reserved-target-and-deploylocalyml-carries-no-storage_backends)) —
+so this adds one vocabulary word and no grammar. The code is
+`process-local-store` on the rule this makes reachable, and nothing new here.
+
+**Why this is a runtime ruling and not a grammar one.** Resolved q27 fixed the
+phrasing for journals — "both sit behind one journal interface so the runtime
+cannot tell which it got" — and this is that sentence applied to stores. A
+store-op node (§11.4) and a synthesized tool (§11.5) call one function on every
+backend; the trace record they file, the idempotency key they carry and the
+replay that consumes their reads are the same. A composition therefore says
+nothing about where its data lives, which is the whole of PRD 5.8's alias-only
+binding.
+
+**Why there is no writer guard, and what that costs.** The journal's remote arms
+take a session-scoped lock because a journal has exactly one writer (PRD resolved
+q42). A store is the opposite **by design**: §14.1 rule 5 refuses a placement
+over a store the reaching process opens for itself, and admits a dialled one
+precisely because two processes reaching it are two readers of one store. Locking
+it would take that away. So the posture is stated rather than prevented: **per
+key, last write wins** — two writers setting one key leave whichever statement
+the server ran second, and two writers at different keys never meet. A
+composition that needs more than that is asking for a transaction across nodes,
+which a `kv` store is not.
+
+**What the backend does enforce is the idempotency key.** PRD 5.8 makes a store
+write at-least-once with a key derived from `execution_id + node + item_index`,
+and until now that key was a promise the *caller* kept. On a dialled backend it
+is the server's: the ledger's primary key is a unique index, the claim is an
+insert whose conflict clause does nothing, and a repeated write carrying the key
+its first attempt carried is rolled back and answered with what that attempt
+answered. A read-then-write would not do — two processes would both read nothing
+and both apply — and "two processes" is the case this backend exists for.
+
+**Why `postgres` and `mysql` and not the rest.** Operators run managed MySQL as
+routinely as managed Postgres, the two are the same handful of statements behind
+one dialect seam, and both drivers are already pinned by the journal slot — a
+target binding a journal and a store on one server declares `pg` once. The
+remaining providers (`redis`, `chroma`, `pgvector`, `qdrant`, `s3`, `gcs`) keep
+today's refusal, which now names these two as the shape the rest will arrive in.
+
+**And the schema is the correctness surface.** A `kv` key is the composition's
+own string, so every column a statement compares or orders by is byte-wise —
+`COLLATE "C"` on Postgres, `utf8mb4_0900_bin` on MySQL, which is binary *and* NO
+PAD, so neither case nor a trailing space folds two keys into one row. The value
+column is text rather than a JSON type, because it holds the JSON this runtime
+produced and a JSON type would normalize what comes back. MySQL's is `LONGTEXT`,
+because `TEXT` stops at 64 KiB and a `value:` does not. The contract is a
+conformance suite run against SQLite always and against real servers in CI, the
+way the journal's is (PRD resolved q62). *PRD 5.8, 5.10, 5.12, resolved q9, q13,
+q45, q62, q63; §11.3, §11.4, §11.5, §14.1, §14.3, §4.3.*
 
 ## Appendix B — Editor integration
 

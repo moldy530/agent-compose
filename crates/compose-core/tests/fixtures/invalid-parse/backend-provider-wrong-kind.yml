@@ -2,7 +2,7 @@
 # code: invalid-value
 # message: `chroma` is not a `kv` storage provider
 # at: 11:17
-# help: the `kv` providers are `memory`, `sqlite`, `redis`, `postgres`
+# help: the `kv` providers are `memory`, `sqlite`, `redis`, `postgres`, `mysql`
 version: "0.1"
 
 storage_backends:

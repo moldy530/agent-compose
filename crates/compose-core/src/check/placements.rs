@@ -402,16 +402,19 @@ pub(crate) fn check_stores(ctx: &mut Ctx<'_>) {
 /// block outright (grammar 14, Decision D87) — so offering one would send an
 /// author to a key the next compile refuses.
 ///
-/// **Both sentences end in the same caveat, and it is the honest half.** This
-/// compiler release opens only the process-local backends: `src/stores.ts`
-/// refuses every other provider at the first store op, because production
-/// `storage_backends` land behind the store plugin interface in M3 (PRD §7). So
-/// a diagnostic that offered `redis` and stopped would send an author to a
-/// build that compiles and then throws — a repair the release does not have.
-/// The one it does have is the second: take the component that binds the store
-/// out of `placements:`, which is a composition every release runs. Naming both,
-/// in that order, is what keeps this an error message an author can act on
-/// today without hiding the shape the deployment is heading for (PRD G3).
+/// **Both sentences end in the same caveat, and what it says depends on the
+/// store's kind.** For a `kv` store the first repair is one a build of this
+/// release really runs: `postgres` and `mysql` are implemented behind the store
+/// interface (PRD resolved q63), so an author told to bind one is told something
+/// that works, and the caveat's job is to say which of the offered names those
+/// are. For a `vector` or `blob` store none of them is yet: `src/stores.ts`
+/// refuses every other provider at the first store op, because the rest of
+/// production `storage_backends` land behind the store plugin interface in M3
+/// (PRD §7) — so a diagnostic that offered `chroma` and stopped would send an
+/// author to a build that compiles and then throws, and the repair the release
+/// does have is the second one, taking the component out of `placements:`.
+/// Naming both, in that order, is what keeps this an error message an author can
+/// act on today without hiding the shape the deployment is heading for (PRD G3).
 fn repair(ctx: &Ctx<'_>, provider: crate::ast::deploy::BackendProvider) -> String {
     // Only the ones that serve this store's kind: a `kv` store cannot be bound
     // to `s3`, so offering it would be a repair the next compile refuses
@@ -425,12 +428,32 @@ fn repair(ctx: &Ctx<'_>, provider: crate::ast::deploy::BackendProvider) -> Strin
         Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
         None => "a networked backend".to_string(),
     };
-    // The caveat both sentences end in: the second repair is the one a build of
-    // this release runs. See this function's own note.
-    let today = "This release opens only the process-local backends — a networked one compiles \
-                 and then refuses at the first store op, since production `storage_backends` land \
-                 behind the store plugin interface in M3 (PRD §7) — so taking the component out \
-                 of `placements:` is the repair a build of this release runs";
+    // …and which of those this release opens, which is what decides whether the
+    // sentence above is a repair or a direction of travel.
+    let live: Vec<String> = crate::ast::deploy::BackendProvider::networked()
+        .filter(|other| other.kind() == provider.kind() && other.implemented())
+        .map(|other| format!("`{}`", other.as_str()))
+        .collect();
+    // The caveat both sentences end in. See this function's own note.
+    let today = match live.split_last() {
+        None => "This release opens only the process-local backends for this kind — a networked \
+                 one compiles and then refuses at the first store op, since production \
+                 `storage_backends` land behind the store plugin interface in M3 (PRD §7) — so \
+                 taking the component out of `placements:` is the repair a build of this release \
+                 runs"
+            .to_string(),
+        Some((last, rest)) => {
+            let live = if rest.is_empty() {
+                last.clone()
+            } else {
+                format!("{} and {last}", rest.join(", "))
+            };
+            format!(
+                "Of those, this release opens {live}; the others compile and then refuse at the \
+                 first store op, since they land behind the store plugin interface in M3 (PRD §7)"
+            )
+        }
+    };
     if ctx.ir.target == crate::DEFAULT_TARGET {
         format!(
             "a mesh runs this store's component in more than one process — several workers may \
