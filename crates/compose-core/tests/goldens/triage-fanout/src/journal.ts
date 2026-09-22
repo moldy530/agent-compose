@@ -2260,10 +2260,20 @@ export function openSession(
   return session;
 }
 
-/** Close one execution's session. The journal handle is the project's. */
+/**
+ * Close one execution's session. The journal handle is the project's.
+ *
+ * A refusal mark this execution owed and nothing waited for ([`marks`]) is let
+ * go of here rather than awaited: this is a synchronous release called from a
+ * `finally`, the write is already on its way to the journal, and a mark that
+ * fails after the run has ended still says so on stderr. What a `run` or a
+ * `resume` gives it beyond that is `releaseJournal`, which closes the handle
+ * through the same queue the write is in.
+ */
 export function closeSession(execution: string): void {
   sessions.delete(execution);
   latched.delete(execution);
+  marks.delete(execution);
 }
 
 /**
@@ -2462,8 +2472,16 @@ export class EffectRecorder {
       refused: false,
     };
 
-    const write = (outcome: JournalOutcome): Promise<void> =>
-      session.journal.append({ ...from, outcome, recordedAt: new Date().toISOString() });
+    const write = async (outcome: JournalOutcome): Promise<void> => {
+      // Whatever this execution has said about an *earlier* answer goes down
+      // first. A refusal is marked from a synchronous parse, so the mark is
+      // issued and owed rather than finished there ([`refuseRecorded`]); this is
+      // the one place it has to have landed by, because the record about to be
+      // appended is the retried attempt's and a resume reading it past an
+      // unmarked refusal calls this build the first to refuse that answer (§7).
+      await refusalsMarked(session.execution);
+      await session.journal.append({ ...from, outcome, recordedAt: new Date().toISOString() });
+    };
 
     return {
       key,
@@ -2597,6 +2615,96 @@ export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergen
 }
 
 /**
+ * The refusal marks one execution has **issued and nothing has awaited yet**,
+ * and the first of them that failed.
+ *
+ * [`refuseRecorded`] is called from a synchronous parse and a journal answers
+ * promises, so the write cannot be finished where it is started. Dropping the
+ * promise there would leave two things nobody owns — the moment the mark lands,
+ * and a mark that could not be written at all — so it is owed here instead, and
+ * [`refusalsMarked`] is where both are collected.
+ *
+ * The promise held **never rejects**: a mark that failed resolves to its error.
+ * A rejection with nothing yet awaiting it is an unhandled rejection, which
+ * this runtime's Node floor ends the process on — a journal hiccup would take
+ * the hub down with it.
+ */
+const marks = new Map<string, Promise<Error | undefined>>();
+
+/**
+ * The failures [`refusalsMarked`] has already raised about.
+ *
+ * "Raised once" has to be true of the **failure** rather than of the map entry
+ * holding it: a mark owed by a second branch while the first is being waited for
+ * is collected with the failed one, so an entry dropped on the way out is not by
+ * itself enough to keep a single refused `UPDATE` from ending every attempt the
+ * node's ladder has left.
+ */
+const raised = new WeakSet<Error>();
+
+/**
+ * Owe one execution a refusal mark that has been issued.
+ *
+ * Marks of one execution are collected rather than chained: they are
+ * independent one-statement `UPDATE`s at distinct keys, so what the seam below
+ * has to wait for is *all* of them, in whatever order the backend runs them.
+ */
+function owe(execution: string, writing: Promise<void>): void {
+  const settled: Promise<Error | undefined> = writing.then(
+    () => undefined,
+    (error: unknown) => {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      // Said here as well as raised at the seam, because the two readers are
+      // different: the seam's raise reaches whoever is running this execution,
+      // and this reaches the operator of a process where nothing of this
+      // execution writes again (the run ended, or the node it failed was the
+      // last of it).
+      process.stderr.write(`could not mark a refused answer on its record: ${failure.message}\n`);
+      return failure;
+    },
+  );
+  const owed = marks.get(execution);
+  marks.set(
+    execution,
+    owed === undefined
+      ? settled
+      : Promise.all([owed, settled]).then(([earlier, later]) => earlier ?? later),
+  );
+}
+
+/**
+ * Wait for the refusal marks this execution has issued, and raise the first one
+ * that failed.
+ *
+ * Awaited **before this execution appends its next record** ([`EffectRecorder`],
+ * and the paragraph on [`refuseRecorded`] for why that is the ordering that
+ * matters). It raises rather than reports, because a generation that went on
+ * would be writing the retried attempt's record past a refusal the record does
+ * not carry — and the way *that* shows up is a resume months later refusing an
+ * execution whose composition nobody touched, with the journal hiccup that
+ * caused it long gone. Raising fails the node while the cause is still on the
+ * screen.
+ *
+ * The failure is raised **once** ([`raised`]), so the retry that follows writes
+ * its record and this execution goes on under the conservative half of
+ * [`refuseRecorded`]'s paragraph — an unmarked refusal a later resume reports as
+ * a divergence naming the step.
+ */
+export async function refusalsMarked(execution: string): Promise<void> {
+  const owed = marks.get(execution);
+  if (owed === undefined) return;
+  const failure = await owed;
+  // Only if nothing was owed on top while this was awaited, so a mark issued by
+  // another branch in the meantime is still owed by the execution.
+  if (marks.get(execution) === owed) marks.delete(execution);
+  if (failure === undefined || raised.has(failure)) return;
+  raised.add(failure);
+  throw new Error(
+    `the journal could not mark an answer this run's contract refused: ${failure.message}`,
+  );
+}
+
+/**
  * Say on the record that this generation's own contract refused what a live
  * effect answered. See [`JournalRecord.refused`].
  *
@@ -2606,18 +2714,30 @@ export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergen
  * generation *replayed* rather than performed — is not on any record and this
  * does nothing about it.
  *
- * Written **before** the mismatch is thrown, so the retry the mismatch sets off
- * appends its own record after the mark rather than before it. A process killed
- * between the effect's row and this one leaves the record unmarked, which is the
- * conservative half: a later resume reports a divergence naming the step instead
- * of replaying silently past it (§2's window, decided the safe way).
+ * **Issued before the mismatch is thrown and owed to the execution, which is
+ * what orders it against the retry that mismatch sets off.** The parse is
+ * synchronous and a journal answers promises — a remote one over a socket — so
+ * the write cannot be *finished* here. What the next generation has to be able
+ * to read is not "the mark was down before the throw" but "the mark was down
+ * before the record of the attempt that followed it": a record appended past an
+ * unmarked refusal is what a resume reads as this build being the first to
+ * refuse that answer (§7). So the mark is owed ([`owe`]) and the seam waits for
+ * what is owed before it appends ([`refusalsMarked`]), on every backend rather
+ * than on the one whose driver happens to queue its statements.
+ *
+ * A process killed between the effect's row and the mark still leaves the record
+ * unmarked, and that window is wider than a synchronous journal's — a microtask
+ * on SQLite, a round trip on `postgres` and `mysql`. It is the conservative
+ * half: a later resume reports a divergence naming the step instead of replaying
+ * silently past it (§2's window, decided the safe way).
  */
-export function refuseRecorded(value: unknown): Promise<void> {
-  if (value === null || typeof value !== "object") return Promise.resolve();
+export function refuseRecorded(value: unknown): void {
+  if (value === null || typeof value !== "object") return;
   const record = produced.get(value);
-  if (record === undefined) return Promise.resolve();
+  if (record === undefined) return;
   const session = sessions.get(record.execution);
-  return session?.journal.refuse(record.execution, record.key) ?? Promise.resolve();
+  if (session === undefined) return;
+  owe(record.execution, session.journal.refuse(record.execution, record.key));
 }
 
 // ---------------------------------------------------------------------------

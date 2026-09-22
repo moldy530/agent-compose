@@ -1072,6 +1072,84 @@ mod tests {
         );
     }
 
+    /// **A refused answer's mark is owed to its execution and waited for before
+    /// that execution's next record** (`docs/durability.md` §3, §7; PRD
+    /// resolved q29).
+    ///
+    /// The one seam in this runtime where a **synchronous** function starts a
+    /// journal **write**: `parseResult` refuses a live answer and the mark that
+    /// tells the next generation so is an `UPDATE` — a socket away on the two
+    /// remote arms. Three spellings are wrong and every one of them is silent:
+    ///
+    ///  * `refuseRecorded` **answering** the write, which a synchronous parse
+    ///    can only drop. The mark then lands whenever the backend gets to it,
+    ///    the record of the attempt the mismatch set off can be down first, and
+    ///    a `refuse` the server refuses rejects into nothing;
+    ///  * waiting for nothing at the seam and leaving the order to the driver.
+    ///    [`SqlJournal`] runs every method of one journal on one queue, so on
+    ///    all three backends this compiler ships the ordering would hold by
+    ///    accident — until a verb stops going through `#serial`, or a journal
+    ///    that is not this class answers the session ([`DispatchJournal`] in
+    ///    `./worker-node.ts` already is one);
+    ///  * `void`ing the promise under a `.catch`, which is the right shape for
+    ///    the superseded dispatch in `./mesh.ts` and the wrong one here: that
+    ///    write has nothing after it that must not be written first, and this
+    ///    one does.
+    ///
+    /// So the rule is read off both ends. The parse calls it as a statement —
+    /// nothing awaited, nothing dropped — the function hands its write to
+    /// [`owe`], and the recorder waits for what the execution owes before it
+    /// appends.
+    #[test]
+    fn a_refused_answers_mark_is_owed_by_its_execution_and_waited_for_before_its_next_record() {
+        let runtime = include_str!("js/runtime.ts");
+        let parse = function_code(runtime, "parseResult");
+        assert!(
+            parse.contains("refuseRecorded(value);"),
+            "`parseResult` no longer marks the record of an answer it refused, so a later resume \
+             reads this generation's own mismatch as a disagreement nobody has had before and \
+             raises the divergence resolved q29 makes un-absorbable"
+        );
+        assert!(
+            !parse.contains("await refuseRecorded") && !parse.contains("refuseRecorded(value)."),
+            "`parseResult` treats the mark as a promise of its own. It is synchronous — every \
+             caller of it is, down to a `CompiledFlow.parse` — so what it can do with a promise \
+             is drop it: the mark is owed to the execution instead (`refuseRecorded`)"
+        );
+
+        let marking = function_code(SOURCE, "refuseRecorded");
+        assert!(
+            marking.contains("export function refuseRecorded(value: unknown): void"),
+            "`refuseRecorded` answers its caller with the write rather than owing it, and its \
+             caller is a synchronous parse that can only drop it: nothing then orders the mark \
+             against the retried attempt's record, and a mark the journal refuses is swallowed \
+             (`docs/durability.md` §3)"
+        );
+        assert!(
+            marking.contains("owe(record.execution, session.journal.refuse("),
+            "the mark is issued without being owed by its execution, so nothing waits for it and \
+             nothing reports a `refuse` that failed"
+        );
+
+        let recorder = declaration(SOURCE, "EffectRecorder");
+        assert!(
+            recorder.contains("await refusalsMarked(session.execution);"),
+            "the effect seam appends this execution's next record without waiting for the \
+             refusal marks the execution owes. The ordering `docs/durability.md` §3 states — the \
+             mark down before the record of the attempt the mismatch set off — would then rest \
+             on `SqlJournal` running one queue rather than on anything this seam does"
+        );
+        let appending = recorder
+            .split_once("await refusalsMarked(session.execution);")
+            .expect("the seam waits for what the execution owes")
+            .1;
+        assert!(
+            appending.contains("session.journal.append("),
+            "the seam waits for the marks this execution owes somewhere other than before the \
+             record it is about to append, which is the one place the order matters"
+        );
+    }
+
     /// **Every effect site is journaled, and there are no others.**
     ///
     /// `docs/durability.md` §3 makes completeness the invariant — "an effect

@@ -440,6 +440,15 @@ function describeIssues(value: unknown, issues: readonly ResultIssue[]): string 
  * (`refuseRecorded` in `./journal.ts`) instead of leaving the next one to infer
  * it from the records around it — which cannot be done, because a retried call
  * and a repeated call leave the same sequence behind.
+ *
+ * **This function is synchronous and the mark is a write**, which is the one
+ * seam between the two worth reading twice. `refuseRecorded` issues the write
+ * and leaves it *owed by the execution* rather than answering a promise this
+ * parse would have to drop: the journal's own seam waits for what is owed before
+ * it appends the next record of this execution, so the mark is down before the
+ * retried attempt's record however far away the journal is, and a mark that
+ * could not be written at all fails that write instead of vanishing. Nothing is
+ * awaited here, and nothing is dropped here either.
  */
 export function parseResult<T>(schema: ResultSchema<T>, value: unknown, subject: string): T {
   const parsed = schema.safeParse(value);

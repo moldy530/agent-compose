@@ -398,9 +398,21 @@ The flag is `refused`, and it is the one thing a record cannot say at the moment
 it is written: whether the generation that recorded this effect went on to
 **refuse its own answer** against the contract the node declared. The seam has
 not seen the schema and the schema has not seen the answer, so the parse that
-refuses a live answer marks its record before raising, and a resume that meets
+refuses a live answer marks its record as it raises, and a resume that meets
 that answer again reads the mark. §7 is what it decides. It is `false` on every
 record of a run that went as its composition expected.
+
+**When the mark is down**, since a parse is synchronous and a mark is a write to
+a journal that may be a network away: it is *issued* before the mismatch is
+raised and **owed by the execution**, and the seam waits for what an execution
+owes before it appends that execution's next record. So the ordering a later
+generation reads is the one that decides anything — the mark is on the record
+before the record of the attempt the mismatch set off, on every backend. A
+process killed inside the gap between the two writes leaves the record unmarked,
+which §2's window covers and §7 decides the safe way: a resume reports a
+divergence naming the step rather than replaying silently past it. A mark the
+journal refuses outright is not silent — it fails the node that would otherwise
+have written past it, and says so on stderr.
 
 ### 3.1 A model call
 
@@ -1332,10 +1344,13 @@ disagreement new.
 
 **The record says which happened, because the generation that refused the answer
 wrote it down.** A parse that refuses a live answer marks that answer's record
-`refused` (§3) before it raises its mismatch, and a resume that meets a refused
-record raises the ordinary mismatch too: the ladder does now what it did then,
-and the attempt it spends is a replay rather than a call. A record with no mark
-is one this build is the first to refuse, which is the divergence.
+`refused` (§3) as it raises its mismatch — and, since the parse is synchronous
+and the mark is a write, the ordering §3 states is the load-bearing one: the
+mark is down before the record of the attempt that mismatch set off. A resume
+that meets a refused record raises the ordinary mismatch too: the ladder does
+now what it did then, and the attempt it spends is a replay rather than a call.
+A record with no mark is one this build is the first to refuse, which is the
+divergence.
 
 Nothing is inferred from the records *around* it, and two readings that tried to
 be are both wrong for one reason — what the ordinals hold is the **sequence** of
