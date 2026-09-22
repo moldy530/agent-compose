@@ -136,10 +136,17 @@ than a file, and nothing else about it changes: the same ops below, the same
 scope partitions, the same recorded reads and deduplicated writes, so a graph
 moved between backends addresses the same rows and cannot tell which answered. It
 is deliberately **multi-writer** — no writer guard, because the placement rule
-above is what governs who may reach a store — and per key the last write wins. A
-store bound to any other provider (`redis`, `chroma`, `pgvector`, `qdrant`, `s3`,
-`gcs`) compiles and then refuses at its first op, naming the backend and where
-the binding came from.
+above is what governs who may reach a store — and per key the last write wins.
+Each dialled store creates its tables at the first op of whichever process
+reaches it first, and several processes of one placement doing that at the same
+moment is the ordinary start-up rather than a race to lose. The one place a
+server shows through is how long a key may be: a `kv` key and a session key are
+whatever the composition and the trigger supplied, and a `mysql` store holds
+2048 characters of each while a `postgres` one holds about 2704 bytes across the
+store name, the partition and the key together. A `sqlite` store bounds neither.
+A store bound to any other provider (`redis`, `chroma`, `pgvector`, `qdrant`,
+`s3`, `gcs`) compiles and then refuses at its first op, naming the backend and
+where the binding came from.
 
 `scope: session` requires the execution to have a session identity, and that
 identity comes from the trigger. A declared `http`, `schedule`, or `event`

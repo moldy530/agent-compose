@@ -22,8 +22,14 @@
 //!    64 KiB — or one that *normalizes* the JSON it was handed;
 //!  * the key order a `list` answers in, which is the column's collation
 //!    answering and has to be the UTF-8 byte order every other arm gives;
+//!  * a key column bounded where another backend's is not, so a key or a
+//!    session key past that bound is a green `store set` on two arms and a
+//!    refusal on the third;
 //!  * a DDL that is not idempotent, so a second open of a store this build
-//!    already created fails rather than doing nothing;
+//!    already created fails rather than doing nothing — or one that is not
+//!    idempotent *concurrently*, which is the case a store has and the journal
+//!    does not: grammar 14.1 rule 5 admits a dialled store from a placement, so
+//!    several first opens against one fresh database is the ordinary start-up;
 //!  * a unique index and a conflict-ignore that really make a double-delivered
 //!    write land **once** (grammar 9.4, PRD 5.8) — which is the clause resolved
 //!    q63 moved from the caller's promise to the backend's;
@@ -141,13 +147,19 @@ flow.probe:\n  \
 /// address.
 const STORE_URL: &str = "AGENT_COMPOSE_STORE_URL";
 
-/// …and the second name for the same server, which is how the runner's
-/// interleaved-writer case becomes two connections rather than one.
+/// …and three more names for the same server, which is how the runner's
+/// interleaved-writer and concurrent-open cases become several connections
+/// rather than one.
 ///
 /// `src/stores.ts` caches a dialled connection per provider and variable name,
 /// so two bindings naming one variable share a socket by design — which is right
-/// for a graph and useless for a case about two writers.
-const OTHER_STORE_URL: &str = "AGENT_COMPOSE_STORE_URL_B";
+/// for a graph and useless for a case about two writers, or about four processes
+/// of a placement reaching one fresh database at the same moment.
+const OTHER_STORE_URLS: &[&str] = &[
+    "AGENT_COMPOSE_STORE_URL_B",
+    "AGENT_COMPOSE_STORE_URL_C",
+    "AGENT_COMPOSE_STORE_URL_D",
+];
 
 /// Build one project whose store binds `provider`, and answer where it landed.
 ///
@@ -274,9 +286,11 @@ fn contract(root: &Path, backend: &Backend) -> Option<BTreeMap<String, Value>> {
     let mut command = runner("store-contract.mjs");
     command.arg(&project).arg(backend.provider).arg(&data);
     if let Some(address) = address {
-        // Two names, one server. See [`OTHER_STORE_URL`].
+        // Four names, one server. See [`OTHER_STORE_URLS`].
         command.env(STORE_URL, &address);
-        command.env(OTHER_STORE_URL, &address);
+        for variable in OTHER_STORE_URLS {
+            command.env(variable, &address);
+        }
     }
     let output = command.output().expect("bun runs");
     assert!(
@@ -383,6 +397,18 @@ const TRUE_EVERYWHERE: &[&str] = &[
     // The key column's collation, in both of the ways it goes wrong.
     "keys_are_case_sensitive",
     "keys_keep_a_trailing_space",
+    // …and its *bound*, which is the same "a write two arms take and one
+    // refuses is not one contract" read on the column the key lives in. Grammar
+    // 11.4 restricts a `kv` key not at all, and a partition name is the encoded
+    // session key a trigger supplied rather than anything an author wrote.
+    "round_trips_a_key_longer_than_512_characters",
+    "two_long_keys_sharing_a_prefix_are_two_rows",
+    "a_long_session_key_is_its_own_partition",
+    // A fresh schema, created by several first opens at once — which grammar
+    // 14.1 rule 5 makes the ordinary start-up of a placement rather than an edge
+    // case, and which `CREATE TABLE IF NOT EXISTS` is not atomic against.
+    "a_fresh_schema_takes_every_opener_at_once",
+    "every_opener_wrote_through_its_own_connection",
     // Grammar 11.3's three scopes, keyed exactly as the local backend keys them
     // — which is what makes a graph moved between backends address the same
     // rows.

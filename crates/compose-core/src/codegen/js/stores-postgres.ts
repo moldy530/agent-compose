@@ -16,12 +16,63 @@
 import { Client } from "pg";
 
 /**
+ * The advisory lock one opener holds while it creates the schema.
+ *
+ * **Not the journal's writer guard, and the difference is the scope.** The
+ * journal takes a *session*-scoped `pg_try_advisory_lock` and keeps it for as
+ * long as the process lives, which is what makes it one writer
+ * (`journal-postgres.ts`). A store must be multi-writer (PRD resolved q63), so
+ * this is `pg_advisory_xact_lock`: the server drops it when the transaction that
+ * took it commits, which is the same round trip the DDL is in. Nothing holds
+ * anything afterwards, and two processes that have opened are two writers.
+ *
+ * It is there because the *creation* really does need one creator. Grammar 14.1
+ * rule 5 admits a dialled store from a **placement** — a hub and N workers, each
+ * of which opens at its own first op — so several processes reaching one fresh
+ * database at once is the ordinary start-up rather than an edge case, and
+ * Postgres documents `CREATE TABLE IF NOT EXISTS` as *not* atomic against a
+ * concurrent creator: one of the two can fail on a duplicate key in `pg_type` or
+ * `pg_class`, which is a catalog error naming nothing an operator wrote. Under
+ * the lock there is one creator by construction, exactly as under the journal's
+ * guard, and none of the store's ops are under anything.
+ *
+ * The blocking form rather than the `try` one, which is the other half of the
+ * same scope argument: what is being waited for is another opener's DDL, so the
+ * wait is one round trip. The journal cannot use it because what it would wait
+ * for is a `serve` that may hold its guard for days.
+ *
+ * Two keys, and the second differs from the journal's (`WRITER_GUARD_KEYS`) so
+ * that a project whose journal and stores share one database does not have its
+ * store openers queue behind the journal's writer.
+ */
+const POSTGRES_STORE_SCHEMA_LOCK: readonly [number, number] = [0x6167_656e, 0x742d_7374];
+
+/**
+ * The SQLSTATEs a concurrent creator raises out of a DDL that says
+ * `IF NOT EXISTS`.
+ *
+ * Belt and braces beside [`POSTGRES_STORE_SCHEMA_LOCK`], which already makes
+ * this unreachable for two openers of *this* runtime. What it covers is a
+ * creator outside the lock — a migration this database is being prepared with,
+ * an older build — and the cost of not covering it is an operator reading
+ * `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`
+ * on a line they never wrote.
+ *
+ * `23505` is the catalog's own unique index answering, `42P07` is
+ * `duplicate_table` and `42710` is `duplicate_object`, which is the index.
+ */
+const POSTGRES_CONCURRENT_CREATOR: readonly string[] = ["23505", "42P07", "42710"];
+
+/**
  * The schema, created on first open and never migrated.
  *
  * `IF NOT EXISTS` throughout, so a second open of a store this build already
  * created does nothing — which is all a physical schema can be asked for here: a
  * dialled store is created by this release or a later one, so there is no older
- * database whose columns have to be probed for.
+ * database whose columns have to be probed for. The whole of it is **one
+ * transaction holding [`POSTGRES_STORE_SCHEMA_LOCK`]**, because `IF NOT EXISTS`
+ * is not atomic against a concurrent creator and a store is opened concurrently
+ * by design.
  *
  * **`COLLATE "C"` on every column a statement compares or orders by**, and it is
  * a correctness choice rather than a preference. A `kv` key is the
@@ -50,6 +101,8 @@ import { Client } from "pg";
  * deleted whole when its run ends.
  */
 const POSTGRES_STORE_SCHEMA = `
+BEGIN;
+SELECT pg_advisory_xact_lock(${POSTGRES_STORE_SCHEMA_LOCK[0]}, ${POSTGRES_STORE_SCHEMA_LOCK[1]});
 CREATE TABLE IF NOT EXISTS store_entries (
   store     TEXT COLLATE "C" NOT NULL,
   scope_key TEXT COLLATE "C" NOT NULL,
@@ -66,7 +119,37 @@ CREATE TABLE IF NOT EXISTS store_applied (
   PRIMARY KEY (store, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS store_applied_partition ON store_applied (store, scope_key);
+COMMIT;
 `;
+
+/**
+ * Create it, and treat a creator that got there first as having created it.
+ *
+ * The second attempt runs against the tables the other opener has now committed,
+ * so every `IF NOT EXISTS` is the no-op it says it is. One retry rather than a
+ * loop: what is being waited out is a single concurrent `CREATE`, and a server
+ * that answers a duplicate a second time is telling us something other than
+ * "somebody else is creating this".
+ *
+ * The `ROLLBACK` is not optional tidying. The DDL is one simple query carrying
+ * its own `BEGIN`, so a statement that fails leaves the session in an aborted
+ * transaction in which every later statement — the retry, and every store op
+ * after it — is refused with `25P02`.
+ */
+async function createPostgresStoreSchema(client: Client): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await client.query(POSTGRES_STORE_SCHEMA);
+      return;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      const code = (error as { code?: unknown } | null)?.code;
+      if (attempt > 0 || typeof code !== "string" || !POSTGRES_CONCURRENT_CREATOR.includes(code)) {
+        throw error;
+      }
+    }
+  }
+}
 
 /**
  * Postgres numbers its parameters, so the statements' `?`s are counted off.
@@ -122,18 +205,28 @@ class PostgresStoreDriver implements StoreDriver {
 /**
  * What a statement is refused with once a store's connection has been lost.
  *
- * **Refused rather than redialled**, which on a store is a narrower claim than
- * on the journal: there is no guard to hand to another process, so the reason is
- * the simpler one — a command whose connection died mid-transaction does not
- * know whether its write landed, and a silent redial would answer as though it
- * had. The node fails under its own `retry:`/`on_error:` (grammar 9.2), and a
- * retry carrying the idempotency key of grammar 9.4 is exactly what makes that
- * safe: the ledger already holds the first attempt, or it does not.
+ * **Refused rather than redialled *inside the op*.** On a store that is a
+ * narrower claim than on the journal: there is no guard to hand to another
+ * process, so the reason is the simpler one — a command whose connection died
+ * mid-transaction does not know whether its write landed, and a silent redial
+ * under it would answer as though it had. The node fails under its own
+ * `retry:`/`on_error:` (grammar 9.2), and a retry carrying the idempotency key
+ * of grammar 9.4 is exactly what makes that safe: the ledger already holds the
+ * first attempt, or it does not.
+ *
+ * **And the connection is dropped, so the retry has one to run over.** Neither
+ * `pg` nor `mysql2` reconnects on its own and this fault is permanent once set,
+ * so a connection left in the dialled cache would refuse every op of every later
+ * execution with this same error until the process restarted — which on a
+ * `serve`, the deployment a dialled store exists for, is for ever. The
+ * journal's identical stickiness is deliberate, because a lost session there is
+ * a lost writer guard and redialling would fork the record; a store has no guard
+ * and nothing to fork, so the narrow claim above is the whole of it.
  */
 function storeConnectionLost(where: string, cause: unknown): Error {
   const detail = cause instanceof Error ? cause.message : String(cause);
   return new Error(
-    `this project lost its connection to the \`postgres\` store backend at \`\${${where}}\`: ${detail}. It is not redialled inside the op that failed — a write whose connection died is one nothing can say landed or did not — so this op fails and the node's own \`retry:\` decides what happens next; a retry carries the idempotency key its first attempt carried, which is what makes it apply once (grammar 9.4, PRD 5.8)`,
+    `this project lost its connection to the \`postgres\` store backend at \`\${${where}}\`: ${detail}. It is not redialled inside the op that failed — a write whose connection died is one nothing can say landed or did not — so this op fails and the node's own \`retry:\` decides what happens next; a retry carries the idempotency key its first attempt carried, which is what makes it apply once (grammar 9.4, PRD 5.8), and it runs over a connection dialled again rather than over this one`,
   );
 }
 
@@ -148,8 +241,15 @@ function storeConnectionLost(where: string, cause: unknown): Error {
  * every op on one queue over this connection, which is what makes a transaction
  * a transaction; two *processes* stay concurrent, which is the multi-writer
  * posture this store is for.
+ *
+ * `lost` is what the caller does with a connection this one reports gone — see
+ * [`storeConnectionLost`].
  */
-async function openPostgresStore(url: string, where: string): Promise<StoreDriver> {
+async function openPostgresStore(
+  url: string,
+  where: string,
+  lost: () => void,
+): Promise<StoreDriver> {
   const client = new Client({
     connectionString: url,
     // This side's own probes: a process whose store server has gone finds out on
@@ -163,10 +263,13 @@ async function openPostgresStore(url: string, where: string): Promise<StoreDrive
   // listening ends the process.
   client.on("error", (reported: unknown) => {
     fault.error ??= storeConnectionLost(where, reported);
+    // …and the connection goes with it, so the next op dials a fresh one rather
+    // than inheriting this error for the life of the process.
+    lost();
   });
   await client.connect();
   try {
-    await client.query(POSTGRES_STORE_SCHEMA);
+    await createPostgresStoreSchema(client);
   } catch (error) {
     await client.end().catch(() => undefined);
     throw error;

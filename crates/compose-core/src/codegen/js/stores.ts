@@ -1088,8 +1088,15 @@ function tabular(
 //
 // **The keepalive and reap-window machinery.** Those exist on the journal to
 // bound how long a dead host's *guard* locks a live one out. With no guard there
-// is nothing to reap: a connection this process loses is one refused statement
-// (the node fails under its `retry:`/`on_error:`), and the next run dials again.
+// is nothing to reap: a connection this process loses is one refused op (the
+// node fails under its `retry:`/`on_error:`), and the connection itself is
+// dropped from [`DIALLED`] so the retry dials a fresh one. That last half is the
+// other place the journal is deliberately not copied — a journal keeps its
+// faulted connection *because* redialling would take the writer guard back
+// behind the record's back, while a store has no guard and a redial is only a
+// socket. Without it a single lost socket — a managed failover, an idle-socket
+// reaper — would refuse every op on that store for the life of the process, and
+// a `serve` is exactly the deployment that has no next run.
 //
 // # What *is* carried over, and why
 //
@@ -1209,7 +1216,7 @@ function positionalBind(sql: string): string {
  * than a deployment's mistake, and [`dialled`] says so by name.
  */
 const STORE_BACKENDS: Partial<
-  Record<BackendProvider, (url: string, where: string) => Promise<StoreDriver>>
+  Record<BackendProvider, (url: string, where: string, lost: () => void) => Promise<StoreDriver>>
 > = {};
 
 /**
@@ -1258,18 +1265,45 @@ function connectionFor(store: StoreBinding): Promise<RemoteKv> {
       `\`${store.address}\` is bound to the \`${store.backend.provider}\` backend (${store.backend.from}) and this project carries no driver for one: \`build\` emits the arm each store's backend binds, so a project this happens to was not built from this composition's deploy layer`,
     );
   }
+  // What an arm calls the moment its connection reports a fault.
+  //
+  // Neither driver reconnects on its own and an arm's fault is permanent once
+  // set, so a faulted connection left here would refuse every op on this store —
+  // in this execution and in every later one — until the process restarted. The
+  // entry goes, the socket is given back, and the next op dials a fresh
+  // connection; the idempotency key of grammar 9.4 is what makes the retry that
+  // runs over it apply once, which is what the arms' own message promises. See
+  // the module header on what is deliberately not copied from the journal.
+  let dialling: Promise<RemoteKv> | undefined;
+  let faulted = false;
+  const lost = (): void => {
+    faulted = true;
+    const held = dialling;
+    // Nothing to drop yet: the fault arrived while the dial was still in flight,
+    // and the line below this one answers it once there is. An arm cannot report
+    // one before its first `await`, so this is belt and braces rather than a
+    // path anybody has taken.
+    if (held === undefined) return;
+    if (DIALLED.get(cacheKey) === held) DIALLED.delete(cacheKey);
+    // Queued behind whatever is still in flight on it, which is `RemoteKv`'s
+    // own serialization; a close that fails is a socket the server reaps.
+    void held.then(async (connection) => await connection.close()).catch(() => undefined);
+  };
   // The **name** goes with the address, because every message an arm raises
   // about this connection has to name the line an operator can change — and the
   // address itself is a credential this module never prints.
-  const dialling = (async () => new RemoteKv(await open(address, variable)))();
+  dialling = (async () => new RemoteKv(await open(address, variable, lost)))();
   // Registered before the first `await` inside it, so a concurrent caller finds
   // this promise rather than dialling a second time. A failed dial is dropped
   // from the cache so the next op tries again instead of inheriting the failure
   // for the life of the process.
   DIALLED.set(cacheKey, dialling);
+  const dialled = dialling;
   void dialling.catch(() => {
-    if (DIALLED.get(cacheKey) === dialling) DIALLED.delete(cacheKey);
+    if (DIALLED.get(cacheKey) === dialled) DIALLED.delete(cacheKey);
   });
+  // See [`lost`]: a fault reported before there was a promise to drop.
+  if (faulted) lost();
   return dialling;
 }
 

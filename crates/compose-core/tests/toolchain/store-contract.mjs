@@ -43,9 +43,11 @@ const at = (relative) => pathToFileURL(path.resolve(project, relative)).href;
 const stores = await import(at("src/stores.ts"));
 const journal = await import(at("src/journal.ts"));
 
-/** The variable each of the two connections reads its address from. */
+/** The variable each of the four connections reads its address from. */
 const URL_ENV = "AGENT_COMPOSE_STORE_URL";
 const OTHER_URL_ENV = "AGENT_COMPOSE_STORE_URL_B";
+const THIRD_URL_ENV = "AGENT_COMPOSE_STORE_URL_C";
+const FOURTH_URL_ENV = "AGENT_COMPOSE_STORE_URL_D";
 
 /**
  * A prefix nothing else on this server is using.
@@ -64,6 +66,29 @@ const UNICODE = "héllo → 世界 🙂 \\\" ' ; = -- /* not sql */";
 
 /** …and one past the 64 KiB a MySQL `TEXT` holds (PRD resolved q63). */
 const LARGE = "x".repeat(200_000);
+
+/**
+ * A key past the few hundred characters a column indexed whole can hold.
+ *
+ * Grammar 11.4 puts no restriction on a `kv` key and the local backend's SQLite
+ * `TEXT` has none either, so a key this long is a green `store set` on one
+ * backend and has to be one on all three — which is the same sentence this file
+ * already drives about a value past 64 KiB. 1024 characters rather than the
+ * largest any arm takes: what is under test is that the arms agree, and the
+ * Postgres arm's own ceiling is its btree tuple.
+ */
+const LONG_KEY = `long-${"k".repeat(1019)}`;
+
+/**
+ * …and a session key whose *partition* name is the long one.
+ *
+ * The quieter half of the same column question, and the half a composition does
+ * not choose: a partition is `session/` plus `encodeKey(sessionKey)`, which
+ * percent-encodes every byte outside `[A-Za-z0-9_-]` — so one CJK character of a
+ * session key a trigger supplied becomes nine ASCII ones, and 100 of them are
+ * 908.
+ */
+const LONG_SESSION = "世".repeat(100);
 
 /** One binding, on the backend this run is driving. */
 const kv = (name, scope, variable = URL_ENV) => ({
@@ -102,6 +127,45 @@ const list = (store, run, prefix = undefined, limit = 50) =>
   stores.runStoreOp(store, "list", { limit, ...(prefix === undefined ? {} : { prefix }) }, run, node());
 
 const answer = {};
+
+// --- A fresh schema, opened by four connections at once ----------------------
+
+{
+  // **First in this file on purpose.** A dialled store's schema is created at
+  // the first op of whichever process gets there first, and grammar 14.1 rule 5
+  // admits a dialled store from a *placement* — a hub and its workers, each of
+  // which opens one at its own first op — so several first opens against one
+  // fresh database is the ordinary start-up rather than an edge case. Neither
+  // server makes `CREATE TABLE IF NOT EXISTS` atomic against a concurrent
+  // creator: Postgres can answer one of the two a duplicate key in `pg_type` or
+  // `pg_class`, which is a catalog error naming nothing an operator wrote. This
+  // case is only really a race on a database whose tables do not exist yet,
+  // which is what running it before anything else buys — CI's service containers
+  // are fresh, and a developer's second run against a kept server drives the
+  // weaker half of it.
+  //
+  // On the local backend the four bindings are one store by design (a local
+  // provider names no `url:`), and the case still says what it says about four
+  // concurrent first ops.
+  const openers = [URL_ENV, OTHER_URL_ENV, THIRD_URL_ENV, FOURTH_URL_ENV];
+  const run = ctx(execution("opening"));
+  const opened = openers.map((variable) => kv("opening", "global", variable));
+  const settled = await Promise.allSettled(
+    opened.map((store, index) => set(store, `k${index}`, { opener: index }, run, `n/${index}`)),
+  );
+  answer.a_fresh_schema_takes_every_opener_at_once = settled.every(
+    (outcome) => outcome.status === "fulfilled",
+  );
+  // Not asserted on, and printed by the Rust side beside the failure: a schema
+  // that lost the race says so by SQLSTATE, and this is where that sentence is.
+  answer.opening_errors = settled
+    .filter((outcome) => outcome.status === "rejected")
+    .map((outcome) => String(outcome.reason?.message ?? outcome.reason));
+  const held = await Promise.all(opened.map((store, index) => get(store, `k${index}`, run)));
+  answer.every_opener_wrote_through_its_own_connection = held.every(
+    (row, index) => row.found === true && row.value?.opener === index,
+  );
+}
 
 // --- Round trip: unicode, size, and the types `value_schema` admits ----------
 
@@ -186,6 +250,45 @@ const answer = {};
   // UTF-16 code units.
   answer.prefix_keys = (await list(store, run, "😀")).keys;
   answer.deeper_prefix_keys = (await list(store, run, "😀al")).keys;
+}
+
+// --- Keys and partitions longer than a column indexed whole can hold ---------
+
+{
+  // A `kv` key is whatever the composition evaluated — a URL with a query
+  // string, a document path, a concatenated identifier — and grammar 11.4 bounds
+  // none of it. A backend that bounds it where the others do not turns a
+  // composition green on a laptop into an `ER_DATA_TOO_LONG` the moment a deploy
+  // file swaps the backend under it, which is the divergence this whole suite is
+  // about.
+  const store = kv("long_key", "global");
+  const run = ctx(execution("long"));
+  await set(store, LONG_KEY, { text: "long" }, run, "l/1");
+  const held = await get(store, LONG_KEY, run);
+  answer.round_trips_a_key_longer_than_512_characters =
+    held.found === true && held.value?.text === "long";
+  // …and it is still a whole key rather than a prefix of one: a column that
+  // truncated instead of refusing would make these two one row, and a `get` of
+  // either would answer the survivor.
+  const neighbour = `${LONG_KEY}-and-more`;
+  await set(store, neighbour, { text: "neighbour" }, run, "l/2");
+  answer.two_long_keys_sharing_a_prefix_are_two_rows =
+    (await get(store, LONG_KEY, run)).value?.text === "long" &&
+    (await get(store, neighbour, run)).value?.text === "neighbour";
+}
+
+{
+  // The partition name is the quieter half, because the composition does not
+  // choose it: it is `session/` plus the encoded session key a **trigger**
+  // supplied, and `encodeKey` inflates a non-ASCII one ninefold.
+  const store = kv("long_session", "session");
+  const mine = ctx(execution("l_s1"), LONG_SESSION);
+  const later = ctx(execution("l_s2"), LONG_SESSION);
+  const other = ctx(execution("l_s3"), `${LONG_SESSION}世`);
+  await set(store, "note", { text: "mine" }, mine, "ls/1");
+  answer.a_long_session_key_is_its_own_partition =
+    (await get(store, "note", later)).value?.text === "mine" &&
+    (await get(store, "note", other)).found === false;
 }
 
 // --- Scope: three partitions, keyed as the local backend keys them -----------
