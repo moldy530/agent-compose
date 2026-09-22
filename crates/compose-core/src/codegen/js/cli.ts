@@ -161,7 +161,7 @@ import {
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
-import { dataRoot } from "./stores.ts";
+import { dataRoot, releaseStores } from "./stores.ts";
 import { httpTriggers, manualTriggers } from "./triggers.ts";
 
 /** What a `--format` selects. */
@@ -196,6 +196,11 @@ export async function runMain(argv: readonly string[]): Promise<void> {
   // through here and holds the journal for as long as it serves, which is what
   // the guard is for (`./journal.ts`, `docs/durability.md` §2).
   await releaseJournal();
+  // …and so is every dialled store, which holds no guard and still holds a
+  // socket: a `postgres` or `mysql` `kv` backend is a connection this process
+  // opened at its first op (PRD resolved q63), and a server told nothing keeps
+  // the session until it notices the far end is gone.
+  await releaseStores();
   await flush();
   process.exit(code);
 }

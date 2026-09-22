@@ -261,11 +261,12 @@ const storeDocs: stores.StoreBinding = {
   backend: {
     provider: "chroma",
     from: "the alias `docs_db`, defined by the `staging` target",
+    urlEnv: "CHROMA_URL",
   },
 };
 
 /**
- * `store.triage_memory` — a `kv` store with `scope: session`, on the `redis` backend (the `kv` default of the `staging` target) (grammar 11.1, 11.3).
+ * `store.triage_memory` — a `kv` store with `scope: session`, on the `postgres` backend (the `kv` default of the `staging` target) (grammar 11.1, 11.3).
  */
 const storeTriageMemory: stores.StoreBinding = {
   address: "store.triage_memory",
@@ -275,8 +276,9 @@ const storeTriageMemory: stores.StoreBinding = {
   description: "What this session has already triaged.",
   metadata: false,
   backend: {
-    provider: "redis",
+    provider: "postgres",
     from: "the `kv` default of the `staging` target",
+    urlEnv: "TRIAGE_MEMORY_URL",
   },
 };
 

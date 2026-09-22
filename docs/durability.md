@@ -1125,6 +1125,14 @@ resumed execution reads across the frontier has to be `scope: session` or
 directory on disk, so its contents are still there, and the resumed run removes
 the partition when it ends exactly as the crashed one would have.
 
+A **dialled** store is not affected either, at any scope, and for the same
+reason read one step further out: a `kv` store bound to `postgres` or `mysql`
+(`docs/grammar.md` §14.3, PRD resolved q63) keeps its rows on a server, so
+`scope: execution` fixes when they are deleted rather than where they live. The
+generation that **ends** the execution deletes that partition, a generation that
+only parked deletes nothing, and a resumed run reads exactly the world its
+recorded prefix left behind.
+
 A generation that only **parked** removes nothing. `agent-compose run` reaching
 a `human` pause with nobody to answer it is not a crash — it exits `3` and
 leaves the row open (§3.6) — so it lets go of what it holds *in this process*

@@ -5,13 +5,16 @@
 // is the single source of truth (PRD 5.12); to own this code instead, copy
 // the whole directory out and stop regenerating it.
 //
-// Attachable storage: the local backends every `store.*` runs on (PRD 5.8,
+// Attachable storage: the backends every `store.*` runs on (PRD 5.8,
 // grammar 11).
 //
 // `./graph.ts` binds one `StoreBinding` per `store.*` — its kind, its scope, the
 // schemas it declares and the backend the active target resolved — and this
-// module is what those bindings do. It is byte-identical in every project this
-// compiler release builds, like `./runtime.ts` and `./cel.ts`.
+// module is what those bindings do. Its invariant half is byte-identical in
+// every project this compiler release builds, like `./runtime.ts` and
+// `./cel.ts`; a target that binds a **dialled** `kv` backend gets that arm
+// appended, and the driver it imports pinned, exactly as `./journal.ts` carries
+// the arm its target's `journal:` bound (PRD resolved q62, q63).
 //
 // # The zero-infra guarantee
 //
@@ -19,10 +22,29 @@
 // unconditionally". So a composition with a `store.*` in it runs with nothing
 // installed and nothing configured: `kv` and `vector` are tables in a SQLite
 // database this module creates on first use, and `blob` is a directory of files.
-// Grammar 14.2's other providers — `redis`, `postgres`, `chroma`, `pgvector`,
-// `qdrant`, `s3`, `gcs` — are M3's ("production `storage_backends` behind the
-// store plugin interface"), and a binding that resolves to one says so at the
-// op rather than answering out of the wrong store.
+// That is what `--target local` binds, whatever any deploy file says, and it is
+// unchanged by everything below.
+//
+// # The dialled backends
+//
+// A **named** target may bind a `kv` store to `postgres` or `mysql` (grammar
+// 14.3, PRD resolved q63), and those are implemented here, behind this file's
+// one interface: `runStoreOp` is the entry point on every backend, the ops are
+// grammar 11.4's same rows, the scope partitions are keyed by the same
+// derivation, the reads are recorded and the writes are deduped on the same
+// key — so a store-op node, a synthesized tool and the trace record they file
+// cannot tell which arm answered. What that buys is the thing a file cannot
+// give: several processes reaching **one** store, which is why grammar 14.1
+// rule 5 admits a dialled backend where it refuses a process-local one.
+//
+// A store is deliberately multi-writer, and nothing here takes a writer guard —
+// see the dialled section for the whole of that, including the per-key
+// last-write-wins it means.
+//
+// Grammar 14.3's other providers — `redis`, `chroma`, `pgvector`, `qdrant`,
+// `s3`, `gcs` — are still M3's ("production `storage_backends` behind the store
+// plugin interface"), and a binding that resolves to one says so at the op
+// rather than answering out of the wrong store.
 //
 // # Where the data goes
 //
@@ -53,11 +75,14 @@
 //
 // # Scope
 //
-// * `execution` — dies with the run. Its rows live in an **in-memory** database
+// * `execution` — dies with the run on every backend, though not by the same
+//   mechanism. On a local backend its rows live in an **in-memory** database
 //   opened per execution and closed by [`releaseExecution`], which `runFlow`
 //   calls when the run ends; its blobs live under a directory removed at the same
-//   point. Nothing survives the process, which is what "dies with the run" has to
-//   mean for a store nothing else can address.
+//   point; and a dialled `kv` store's rows are a partition on the server that the
+//   same call **deletes**. So "dies with the run" is the lifetime on all three,
+//   and only the in-memory one also dies with the *process* — which is the
+//   difference the replay discipline below turns on.
 // * `session` — partitioned by the session key the trigger supplied
 //   (`execution.session_key`, grammar 11.3). Cross-session memory is exactly this:
 //   a session-scoped store plus a trigger-supplied session key.
@@ -99,13 +124,21 @@
 //   written down here rather than promised away.
 //
 // A store a **resumed** execution reads across the frontier therefore has to be
-// one that outlives the run. `scope: session` and `scope: global` are files on
-// disk and are exactly the world the recorded prefix left behind; a
-// `scope: execution` `kv`/`vector` store and anything a target bound to
-// `provider: memory` are not — their rows died with the process, and a replayed
-// write is not applied a second time, so a live read past the frontier would
-// answer out of an empty database. That is refused rather than answered, by
-// [`inProcessState`], and `docs/durability.md` §5 is normative for it.
+// one that outlives the **process**, and which stores those are is a property of
+// the backend as much as of the scope. A store whose data is on disk or on a
+// server is exactly the world the recorded prefix left behind: `scope: session`
+// and `scope: global` under the local backends are files, a `scope: execution`
+// `blob` store is a directory, and a `kv` store bound to `postgres` or `mysql`
+// is rows on a server at **every** scope — `scope: execution` fixes when
+// [`releaseExecution`] deletes that partition (at the generation that *ends* the
+// execution, never at one that only parked) rather than where it lives. What
+// does not outlive the process is what was opened inside it: a
+// `scope: execution` `kv`/`vector` store on a local backend, and any
+// `kv`/`vector` store a target bound to `provider: memory`. Their rows died with
+// the process, and a replayed write is not applied a second time, so a live read
+// past the frontier would answer out of an empty database. That is refused
+// rather than answered, by [`inProcessState`] over [`inProcessOnly`], and
+// `docs/durability.md` §5 is normative for it.
 //
 // A store write an **agent** made through a synthesized tool (grammar 11.5)
 // carries no key and is not deduped. Grammar 9.4 names exactly two carriers — "a
@@ -116,17 +149,19 @@
 //
 // # One process
 //
-// These backends are the local, zero-infra ones, and they assume the project is
-// one process: SQLite here is a WebAssembly build over `node:fs`, whose virtual
+// **The local backends** assume the project is one process, and that is the
+// paragraph a dialled binding is the way out of: SQLite here is a WebAssembly
+// build over `node:fs`, whose virtual
 // file system takes a lock by creating `<file>.lock` as a directory, so two
 // `agent-compose run`s sharing a session-scoped store are outside what this
 // release promises — the second one's op waits out `PRAGMA busy_timeout` and
 // then fails the node with `SQLite3Error: database is locked` rather than
 // corrupting anything. That is the same boundary PRD 5.10 draws — `--target
-// local` is one process — and production backends are M3. The emitted
-// `README.md` says so where a reader meets the data directory, because
-// `agent-compose run` is the surface where running two at once is the obvious
-// thing to try.
+// local` is one process. The emitted `README.md` says so where a reader meets
+// the data directory, because `agent-compose run` is the surface where running
+// two at once is the obvious thing to try. A deployment that really has two
+// processes over one store binds a dialled backend, which is what the section
+// below is (PRD resolved q63).
 //
 // **A lock does not die with its owner**, which is the same fact `./journal.ts`
 // is written around and matters here for the same reason: a `run` killed inside
@@ -180,12 +215,13 @@ export type StoreKind = "kv" | "vector" | "blob";
 /** The three lifetimes (Decision D35). */
 export type StoreScope = "execution" | "session" | "global";
 
-/** Grammar 14.2's storage vocabulary, over all three kinds. */
+/** Grammar 14.3's storage vocabulary, over all three kinds. */
 export type BackendProvider =
   | "memory"
   | "sqlite"
   | "redis"
   | "postgres"
+  | "mysql"
   | "sqlite_vec"
   | "chroma"
   | "pgvector"
@@ -194,12 +230,29 @@ export type BackendProvider =
   | "s3"
   | "gcs";
 
-/** The providers this compiler release actually implements. */
-const LOCAL_PROVIDERS: readonly BackendProvider[] = ["memory", "sqlite", "sqlite_vec", "local_fs"];
+/**
+ * The providers whose bytes live **in the process that reaches them**.
+ *
+ * Grammar 14.1 rule 5's criterion, read at run time (Decision D131): a heap map,
+ * a SQLite file with or without the vector extension, and a directory of blobs
+ * are opened by whichever process reaches them. `validate` refuses a placement
+ * over exactly this set; here it decides which arm answers an op.
+ */
+const IN_PROCESS_PROVIDERS: readonly BackendProvider[] = [
+  "memory",
+  "sqlite",
+  "sqlite_vec",
+  "local_fs",
+];
+
+/** Whether a provider's store is opened in this process. See above. */
+function opensInProcess(provider: BackendProvider): boolean {
+  return IN_PROCESS_PROVIDERS.includes(provider);
+}
 
 /** Which backend a store resolved to, and where that resolution came from. */
 export interface BackendBinding {
-  /** The storage plugin (grammar 14.2). */
+  /** The storage plugin (grammar 14.3). */
   readonly provider: BackendProvider;
   /**
    * How it was resolved, in the words grammar 11.3 uses: the `local` target's
@@ -208,6 +261,18 @@ export interface BackendBinding {
    * to it, which is the line an author has to change.
    */
   readonly from: string;
+  /**
+   * The **name** of the variable holding this backend's address, on an entry
+   * that declared a `url:` (grammar 4.3, 14.3).
+   *
+   * A name and never a value, like every credential this artifact carries: the
+   * deploy file writes an `${ENV}` reference, `validate` never sees an address,
+   * and the environment partition has already routed this variable to every
+   * process that reaches this store (`docs/distributed.md` §9.1). It is what a
+   * dialled arm opens with (PRD resolved q63), and absent on every binding a
+   * target's built-in decided — which is every process-local one.
+   */
+  readonly urlEnv?: string;
 }
 
 /** A resolved `store.*` (grammar 11.1), as `./graph.ts` binds it. */
@@ -398,7 +463,18 @@ const DATABASES = new Map<string, Promise<Database>>();
  */
 const PER_EXECUTION = new Map<
   string,
-  { readonly databases: Set<string>; readonly directories: Set<string> }
+  {
+    readonly databases: Set<string>;
+    readonly directories: Set<string>;
+    /**
+     * The partitions of a **dialled** store this run owns — rows on a server,
+     * deleted when the run ends rather than released with a handle.
+     *
+     * Each entry is the store's binding and its partition, because both are
+     * needed to write the `DELETE` and neither is derivable from the other.
+     */
+    readonly partitions: Map<string, { readonly store: StoreBinding; readonly scopeKey: string }>;
+  }
 >();
 
 /** Which database a store's op addresses. */
@@ -549,11 +625,15 @@ function remember(
   if (store.scope !== "execution") return;
   let held = PER_EXECUTION.get(execution.id);
   if (held === undefined) {
-    held = { databases: new Set(), directories: new Set() };
+    held = { databases: new Set(), directories: new Set(), partitions: new Map() };
     PER_EXECUTION.set(execution.id, held);
   }
   if (store.kind === "blob") {
     held.directories.add(blobRoot(store, scopeKey));
+    return;
+  }
+  if (!opensInProcess(store.backend.provider)) {
+    held.partitions.set(`${store.address}\u0000${scopeKey}`, { store, scopeKey });
     return;
   }
   held.databases.add(handleKey(store, execution));
@@ -613,6 +693,23 @@ export function releaseExecution(id: string, parked = false): void {
     } catch {
       // Best effort: a temporary directory that outlives the process is a
       // nuisance, and failing a completed run over one would be worse.
+    }
+  }
+  for (const { store, scopeKey } of held.partitions.values()) {
+    // A dialled store's `scope: execution` rows are on a server, so what makes
+    // them "die with the run" is a `DELETE` rather than a closed handle. Not
+    // awaited — this function is synchronous and is called from `runFlow` on the
+    // way out — and not retried, for the `rmSync` above's reason. What a failed
+    // one leaves is rows under an execution id nothing will address again, which
+    // the dialled section's retention note is about.
+    try {
+      void connectionFor(store)
+        .then((connection) => connection.forget(store.name, scopeKey))
+        .catch(() => undefined);
+    } catch {
+      // `connectionFor` refuses a binding with no address, and a run that
+      // reached this store already had one; a teardown is not where that is
+      // worth raising.
     }
   }
 }
@@ -713,9 +810,16 @@ export async function runStoreOp(
  * ([`remember`]). A generation that only *parked* removes nothing, which is what
  * leaves that directory there to be read across the resume
  * (`docs/durability.md` §5).
+ *
+ * A **dialled** store is the same case as a blob and for the same reason: its
+ * rows are on a server, so `scope: execution` fixes when they are deleted rather
+ * than where they live, and a resumed generation reads the world its recorded
+ * prefix left behind (PRD resolved q63). That is what makes the dialled arms a
+ * store a resume may read past its frontier at every scope.
  */
 function inProcessOnly(store: StoreBinding): boolean {
   if (store.kind === "blob") return false;
+  if (!opensInProcess(store.backend.provider)) return false;
   return store.scope === "execution" || store.backend.provider === "memory";
 }
 
@@ -785,11 +889,21 @@ interface Applied {
   readonly deduped: boolean;
 }
 
-/** Refuse a backend this compiler release does not implement (PRD §7 M3). */
+/**
+ * Refuse a backend this compiler release does not implement (PRD §7 M3).
+ *
+ * The set it refuses **narrowed** with PRD resolved q63: `postgres` and `mysql`
+ * are implemented for the `kv` kind, behind this same interface and with this
+ * same op catalogue, so a store bound to one is answered rather than refused.
+ * They are named in the message as the shape the rest will arrive in — one arm
+ * per provider under `runStoreOp`, not a second store surface — because an
+ * author reading this is being told what exists as much as what does not.
+ */
 function supported(store: StoreBinding): void {
-  if (LOCAL_PROVIDERS.includes(store.backend.provider)) return;
+  if (opensInProcess(store.backend.provider)) return;
+  if (DIALLED_KV.includes(store.backend.provider)) return;
   throw new Error(
-    `\`${store.address}\` is bound to the \`${store.backend.provider}\` backend (${store.backend.from}), which this compiler release does not implement: production \`storage_backends\` — Redis, pgvector, S3 and the rest of grammar 14.2's vocabulary — land behind the store plugin interface in M3 (PRD §7). Build for \`--target local\`, which substitutes SQLite and local disk for every store unconditionally (PRD 5.8)`,
+    `\`${store.address}\` is bound to the \`${store.backend.provider}\` backend (${store.backend.from}), which this compiler release does not implement: the \`postgres\` and \`mysql\` \`kv\` backends are implemented and answer the same ops behind the same interface (PRD resolved q63), and the rest of grammar 14.3's vocabulary — Redis, pgvector, Qdrant, S3 and the rest — lands in that shape behind the store plugin interface in M3 (PRD §7). Bind one of the implemented backends, or build for \`--target local\`, which substitutes SQLite and local disk for every store unconditionally (PRD 5.8)`,
   );
 }
 
@@ -804,6 +918,13 @@ async function perform(
 ): Promise<Applied> {
   if (store.kind === "blob") {
     return blobOp(store, op, params, scopeKey, idempotencyKey);
+  }
+  if (!opensInProcess(store.backend.provider)) {
+    // A dialled `kv` store. `vector` and `blob` never arrive here: grammar
+    // 14.3's capability check refuses a `postgres`/`mysql` binding on either
+    // kind at compile time, and [`supported`] above has already refused every
+    // other networked provider.
+    return await dialled(store, op, params, scopeKey, idempotencyKey);
   }
   const database = await open(store, execution);
   // A `vector` write and a `vector` search both need a vector, and computing one
@@ -952,6 +1073,542 @@ function tabular(
     default:
       throw new Error(`\`${store.address}\` is \`kind: ${store.kind}\` and takes no \`${op}\``);
   }
+}
+
+// ---------------------------------------------------------------------------
+// The dialled `kv` backends: Postgres and MySQL (PRD resolved q63)
+// ---------------------------------------------------------------------------
+//
+// One implementation of the op catalogue, not two. Everything grammar 11.4's
+// `kv` rows mean — which partition an op addresses, what a miss answers, the key
+// order a `list` comes back in, and the idempotency ledger of grammar 9.4 — is
+// written once, below, and a [`StoreDriver`] differs only in how it carries a
+// statement to a server and a row back. That is the same shape `./journal.ts`
+// takes for the same reason (PRD resolved q62), and it is what makes "the
+// runtime cannot tell which arm answered" true by construction rather than by
+// review: `runStoreOp` above reaches this through the one seam in [`perform`],
+// and a store-op node, a synthesized tool and the trace record they file are all
+// the same code on every backend.
+//
+// # What is deliberately *not* copied from the journal
+//
+// **The writer guard.** A journal has exactly one writer (`docs/durability.md`
+// §2, PRD resolved q42) and its remote arms take a session-scoped lock to say
+// so. A store is the opposite by design: grammar 14.1 rule 5 already governs who
+// may reach one, and two processes reaching a dialled store are **two readers of
+// one store** rather than a forked state — which is the whole reason that rule
+// admits them. So nothing here locks, and the concurrency posture is stated
+// rather than prevented: **per key, last write wins**. Two writers setting one
+// key leave the value of whichever statement the server ran second; two writers
+// at different keys never meet. A composition that needs more than that is
+// asking for a transaction across nodes, which is not what a `kv` store is.
+//
+// **The keepalive and reap-window machinery.** Those exist on the journal to
+// bound how long a dead host's *guard* locks a live one out. With no guard there
+// is nothing to reap: a connection this process loses is one refused op (the
+// node fails under its `retry:`/`on_error:`), and the connection itself is
+// dropped from [`DIALLED`] so the retry dials a fresh one. That last half is the
+// other place the journal is deliberately not copied — a journal keeps its
+// faulted connection *because* redialling would take the writer guard back
+// behind the record's back, while a store has no guard and a redial is only a
+// socket. Without it a single lost socket — a managed failover, an idle-socket
+// reaper — would refuse every op on that store for the life of the process, and
+// a `serve` is exactly the deployment that has no next run.
+//
+// # What *is* carried over, and why
+//
+// The session hygiene seven review rounds of the journal work paid for, because
+// every one of those failures is a store's too:
+//
+//  * **`error` listeners before anything else.** Both drivers emit `error` on
+//    the connection when the far end goes away with no command in flight, and an
+//    `EventEmitter` that emits `error` with nothing listening ends the process —
+//    a `serve` killed that way loses every in-flight execution's in-process
+//    state to a server closing an idle socket.
+//  * **Byte-wise key collation.** A `kv` key is the composition's own string and
+//    two keys differing in case are two keys. MySQL's default collation is
+//    case-**insensitive**, so `PRIMARY KEY` would fold them into one row and a
+//    `get` would answer another key's value. See [`MYSQL_STORE_SCHEMA`] for the
+//    second half of that, which is padding.
+//  * **A payload column sized past 64 KiB.** MySQL's `TEXT` holds 64 KiB and the
+//    arm sets `STRICT_TRANS_TABLES`, so a larger value is an error rather than a
+//    truncation — and a `value:` this size is a write the other arms take.
+//  * **`ANSI_QUOTES` and `autocommit` asserted at session open**, and a schema
+//    named on the address rather than assumed.
+//
+// # What the columns hold
+//
+// A `kv` value is stored the way the local backend stores it: as the **JSON text
+// this module produced**, in a `TEXT`/`LONGTEXT` column, parsed back with
+// `JSON.parse`. Not a `JSONB`/`JSON` column, which is the tempting choice and
+// the wrong one — those normalize what they are given (key order, whitespace,
+// numeric spelling), so a `value:` would come back a different document than
+// the one `value_schema` was checked against and two backends would disagree
+// about what round-tripped. The column is text because the interface's payload
+// is text.
+//
+// # Retention
+//
+// Nothing here is pruned either, and the module header's note on the idempotency
+// ledger applies verbatim — with one addition a dialled backend has and a file
+// does not. A `scope: execution` store's rows really do outlive the process, so
+// [`releaseExecution`] deletes that execution's partition when the run **ends**
+// (and leaves it where the run only parked, which is the world a resume is
+// promised). A delete that could not be made leaves rows under an execution id
+// nothing will ever address again; it is not retried, because failing a
+// completed run over cleanup would be worse, and `DELETE FROM store_entries
+// WHERE scope_key LIKE 'execution/%'` is the operator's broom.
+
+/** The providers this release dials for a `kv` store (PRD resolved q63). */
+const DIALLED_KV: readonly BackendProvider[] = ["postgres", "mysql"];
+
+/** A value a statement binds to a `?`. */
+type Bound = string | number;
+
+/**
+ * How one server spells the three things the statements below differ in.
+ *
+ * Three, and no more than three: the ops are **one** implementation of grammar
+ * 11.4 rather than two that have to be kept in step, which is the whole reason
+ * this interface is narrow. A fourth entry would be a place two backends could
+ * come to mean different things, and the conformance suite would be proving it
+ * rather than the servers. The schema is not here for the same reason it is not
+ * a statement: a DDL is how a backend spells the *shape* these statements need,
+ * which really is per-backend, so each arm holds its own and runs it at open.
+ */
+interface StoreDialect {
+  /**
+   * The statements as written, with their `?` placeholders in this server's
+   * spelling. Only Postgres needs one: it numbers its parameters.
+   */
+  readonly bind: (sql: string) => string;
+  /**
+   * The clause that makes an insert overwrite the row already there.
+   *
+   * Everything after the statement's `VALUES (…)` list, which is more than the
+   * conflict clause on one arm: MySQL's row alias (`AS excluded`) sits there
+   * too, and a hook that could only return the conflict half would have made
+   * the shared statement carry a dialect.
+   */
+  readonly overwrite: (target: string, column: string) => string;
+  /**
+   * …and the clause that makes it do **nothing** — the ledger's half, and the
+   * one the whole dedupe rests on.
+   */
+  readonly ignore: (target: string, noop: string) => string;
+}
+
+/** What one server's connection does, and the whole of it. */
+interface StoreDriver {
+  readonly dialect: StoreDialect;
+  /** Every row a query answers. */
+  all(sql: string, parameters: readonly Bound[]): Promise<Record<string, unknown>[]>;
+  /** One statement, and how many rows it changed. */
+  run(sql: string, parameters: readonly Bound[]): Promise<number>;
+  /** Give the connection back. */
+  close(): Promise<void>;
+}
+
+/** `ON CONFLICT … DO UPDATE`, which Postgres speaks. */
+function standardOverwrite(target: string, column: string): string {
+  return `ON CONFLICT ${target} DO UPDATE SET ${column} = excluded.${column}`;
+}
+
+/** …and `ON CONFLICT … DO NOTHING`. */
+function standardIgnore(target: string, _noop: string): string {
+  return `ON CONFLICT ${target} DO NOTHING`;
+}
+
+/** `?`, unchanged — MySQL takes it as written. */
+function positionalBind(sql: string): string {
+  return sql;
+}
+
+/**
+ * What a statement is refused with once a dialled store's connection has been
+ * lost.
+ *
+ * **In the invariant half rather than once per arm**, and that placement is a
+ * correctness requirement rather than tidiness. This module is assembled from
+ * this half plus one arm per provider the target's stores bind
+ * (`codegen::stores`), so a helper declared in *each* arm is two top-level
+ * declarations of one name in the `src/stores.ts` of a target that binds one
+ * store to `postgres` and another to `mysql`: `tsc` calls it TS2393 and Node
+ * refuses the module outright at import, because a top-level `function` in an ES
+ * module is lexically declared. The sentence was identical on both arms in any
+ * case — only the provider differed — so the provider is a parameter and the
+ * arms share the one declaration.
+ *
+ * **Refused rather than redialled *inside the op*.** On a store that is a
+ * narrower claim than on the journal: there is no guard to hand to another
+ * process, so the reason is the simpler one — a command whose connection died
+ * mid-transaction does not know whether its write landed, and a silent redial
+ * under it would answer as though it had. The node fails under its own
+ * `retry:`/`on_error:` (grammar 9.2), and a retry carrying the idempotency key
+ * of grammar 9.4 is exactly what makes that safe: the ledger already holds the
+ * first attempt, or it does not.
+ *
+ * **And the connection is dropped, so the retry has one to run over.** Neither
+ * `pg` nor `mysql2` reconnects on its own and this fault is permanent once set,
+ * so a connection left in the dialled cache would refuse every op of every later
+ * execution with this same error until the process restarted — which on a
+ * `serve`, the deployment a dialled store exists for, is for ever. The
+ * journal's identical stickiness is deliberate, because a lost session there is
+ * a lost writer guard and redialling would fork the record; a store has no guard
+ * and nothing to fork, so the narrow claim above is the whole of it.
+ *
+ * `where` is the **variable name** the address was read from, never the address:
+ * every message this module raises about a connection names the line an operator
+ * can change, and a store URL is a credential.
+ */
+function storeConnectionLost(provider: BackendProvider, where: string, cause: unknown): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(
+    `this project lost its connection to the \`${provider}\` store backend at \`\${${where}}\`: ${detail}. It is not redialled inside the op that failed — a write whose connection died is one nothing can say landed or did not — so this op fails and the node's own \`retry:\` decides what happens next; a retry carries the idempotency key its first attempt carried, which is what makes it apply once (grammar 9.4, PRD 5.8), and it runs over a connection dialled again rather than over this one`,
+  );
+}
+
+/**
+ * The arms this build emitted, by provider.
+ *
+ * Empty until an arm appended to this module registers itself, which `build`
+ * does for exactly the providers this project's stores bind (`codegen::stores`).
+ * A project built for a provider with no entry here is a compiler bug rather
+ * than a deployment's mistake, and [`dialled`] says so by name.
+ */
+const STORE_BACKENDS: Partial<
+  Record<BackendProvider, (url: string, where: string, lost: () => void) => Promise<StoreDriver>>
+> = {};
+
+/**
+ * Every dialled connection this process holds, by the server it addresses.
+ *
+ * Keyed on the provider and the **variable name** rather than on the address:
+ * two stores whose entries name one variable are one server, and a key that was
+ * the resolved URL would put a credential in a map key for nothing. Two stores
+ * naming two variables that happen to point at one server get two connections,
+ * which costs a socket and changes no answer — there is no guard to contend
+ * over.
+ *
+ * The map holds the **promise**, for [`DATABASES`]' reason: a `map` dispatches
+ * its instances concurrently, and two of them reaching one store in the same
+ * turn would otherwise both dial, leaving one connection behind unclosed.
+ */
+const DIALLED = new Map<string, Promise<RemoteKv>>();
+
+/**
+ * The connection one dialled store's ops run over, opened on first use.
+ *
+ * The address is read at the op rather than at import, like every other
+ * credential this runtime spends: a composition with a store it never reaches
+ * does not demand a variable, and a launch that is short one is already refused
+ * by `./env.ts` with the site that asked for it.
+ */
+function connectionFor(store: StoreBinding): Promise<RemoteKv> {
+  const variable = store.backend.urlEnv;
+  if (variable === undefined) {
+    throw new Error(
+      `\`${store.address}\` is bound to the \`${store.backend.provider}\` backend (${store.backend.from}) and that entry names no \`url:\`: a provider that dials out has nowhere to go without one (grammar 4.3, 14.3). Give the entry a \`url: \${SOME_VARIABLE}\`, or bind a backend this target opens in process`,
+    );
+  }
+  const address = process.env[variable];
+  if (address === undefined || address === "") {
+    throw new Error(
+      `\`${variable}\` is unset, and it is where \`${store.address}\` is (${store.backend.from}): a store on a \`${store.backend.provider}\` backend is a connection this process opens before its first op (grammar 4.3, PRD resolved q15)`,
+    );
+  }
+  const cacheKey = `${store.backend.provider}\u0000${variable}`;
+  const held = DIALLED.get(cacheKey);
+  if (held !== undefined) return held;
+  const open = STORE_BACKENDS[store.backend.provider];
+  if (open === undefined) {
+    throw new Error(
+      `\`${store.address}\` is bound to the \`${store.backend.provider}\` backend (${store.backend.from}) and this project carries no driver for one: \`build\` emits the arm each store's backend binds, so a project this happens to was not built from this composition's deploy layer`,
+    );
+  }
+  // What an arm calls the moment its connection reports a fault.
+  //
+  // Neither driver reconnects on its own and an arm's fault is permanent once
+  // set, so a faulted connection left here would refuse every op on this store —
+  // in this execution and in every later one — until the process restarted. The
+  // entry goes, the socket is given back, and the next op dials a fresh
+  // connection; the idempotency key of grammar 9.4 is what makes the retry that
+  // runs over it apply once, which is what the arms' own message promises. See
+  // the module header on what is deliberately not copied from the journal.
+  let dialling: Promise<RemoteKv> | undefined;
+  let faulted = false;
+  let dropped = false;
+  const lost = (): void => {
+    faulted = true;
+    const held = dialling;
+    // Nothing to drop yet: the fault arrived while the dial was still in flight,
+    // and the line below this one answers it once there is. An arm cannot report
+    // one before its first `await`, so this is belt and braces rather than a
+    // path anybody has taken.
+    if (held === undefined) return;
+    // **Dropped once.** An arm reports a lost socket from two places — the
+    // statement it died under, and the driver's own `error` event — and one loss
+    // is both of them: the statement settles first and the event follows when
+    // the socket ends. Without this the second call would queue a second close
+    // on a connection already closing.
+    if (dropped) return;
+    dropped = true;
+    if (DIALLED.get(cacheKey) === held) DIALLED.delete(cacheKey);
+    // Queued behind whatever is still in flight on it, which is `RemoteKv`'s
+    // own serialization; a close that fails is a socket the server reaps.
+    void held.then(async (connection) => await connection.close()).catch(() => undefined);
+  };
+  // The **name** goes with the address, because every message an arm raises
+  // about this connection has to name the line an operator can change — and the
+  // address itself is a credential this module never prints.
+  dialling = (async () => new RemoteKv(await open(address, variable, lost)))();
+  // Registered before the first `await` inside it, so a concurrent caller finds
+  // this promise rather than dialling a second time. A failed dial is dropped
+  // from the cache so the next op tries again instead of inheriting the failure
+  // for the life of the process.
+  DIALLED.set(cacheKey, dialling);
+  const dialled = dialling;
+  void dialling.catch(() => {
+    if (DIALLED.get(cacheKey) === dialled) DIALLED.delete(cacheKey);
+  });
+  // See [`lost`]: a fault reported before there was a promise to drop.
+  if (faulted) lost();
+  return dialling;
+}
+
+/** One op against a dialled `kv` store (PRD resolved q63). */
+async function dialled(
+  store: StoreBinding,
+  op: StoreOp,
+  params: StoreParams,
+  scopeKey: string,
+  idempotencyKey: string | undefined,
+): Promise<Applied> {
+  const connection = await connectionFor(store);
+  return await connection.apply(store, op, params, scopeKey, idempotencyKey);
+}
+
+/**
+ * One server's connection, with the whole `kv` catalogue over it.
+ *
+ * **Every op runs on one queue.** `#serial` is `SqlJournal`'s mechanism and is
+ * here for the sharper version of its reason: a keyed write is a `BEGIN`, an
+ * effect and a ledger insert, and a second op interleaving its statements into
+ * that transaction on the same connection would join a transaction it knows
+ * nothing about. A `map` dispatches its instances concurrently, so that is the
+ * ordinary case rather than an edge one. Two *processes* are still concurrent —
+ * that is the multi-writer posture, and last-write-wins is what it means.
+ */
+class RemoteKv {
+  readonly #driver: StoreDriver;
+
+  /** The tail of the queue every op chains onto. */
+  #queue: Promise<unknown> = Promise.resolve();
+
+  constructor(driver: StoreDriver) {
+    this.#driver = driver;
+  }
+
+  /** Run one op against this server, dedupe included. */
+  apply(
+    store: StoreBinding,
+    op: StoreOp,
+    params: StoreParams,
+    scopeKey: string,
+    idempotencyKey: string | undefined,
+  ): Promise<Applied> {
+    return this.#serial(() => this.#apply(store, op, params, scopeKey, idempotencyKey));
+  }
+
+  /** Delete one execution-scoped partition, when its run has ended. */
+  forget(store: string, scopeKey: string): Promise<unknown> {
+    return this.#serial(async () => {
+      await this.#run("DELETE FROM store_entries WHERE store = ? AND scope_key = ?", [
+        store,
+        scopeKey,
+      ]);
+      await this.#run("DELETE FROM store_applied WHERE store = ? AND scope_key = ?", [
+        store,
+        scopeKey,
+      ]);
+    });
+  }
+
+  /** Give the connection back. */
+  close(): Promise<void> {
+    return this.#serial(() => this.#driver.close());
+  }
+
+  /** One step of the queue. See the class doc. */
+  #serial<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.#queue.then(work, work);
+    // The tail must not reject: it is what the *next* caller chains onto, and an
+    // unhandled rejection on this runtime's Node floor ends the process. The
+    // failure still reaches this caller through `next`.
+    this.#queue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  #all(sql: string, parameters: readonly Bound[]): Promise<Record<string, unknown>[]> {
+    return this.#driver.all(this.#driver.dialect.bind(sql), parameters);
+  }
+
+  #run(sql: string, parameters: readonly Bound[]): Promise<number> {
+    return this.#driver.run(this.#driver.dialect.bind(sql), parameters);
+  }
+
+  /**
+   * The op, and the ledger of grammar 9.4 around it.
+   *
+   * **The dedupe is the server's, not this module's** (PRD resolved q63): the
+   * ledger's primary key is a unique index and the claim is an insert whose
+   * conflict clause does nothing, so a repeated write carrying the key its first
+   * attempt carried applies **once** even when the two attempts are two
+   * processes. A read-then-write would not: both would read nothing and both
+   * would apply.
+   *
+   * The effect and its ledger row are one transaction, so an attempt that failed
+   * half way leaves neither — and a duplicate is exactly the case where that
+   * transaction is *rolled back*, taking the second application of the effect
+   * with it. The answer the first attempt gave is then read outside the
+   * transaction, because it is another transaction's committed row and one
+   * server here reads at a snapshot.
+   *
+   * A **read** opens no transaction at all: one statement is atomic on both
+   * servers, and a `BEGIN` around it would buy a round trip and nothing else.
+   */
+  async #apply(
+    store: StoreBinding,
+    op: StoreOp,
+    params: StoreParams,
+    scopeKey: string,
+    idempotencyKey: string | undefined,
+  ): Promise<Applied> {
+    if (idempotencyKey === undefined) {
+      return { row: await this.#row(store, op, params, scopeKey), deduped: false };
+    }
+    await this.#run("BEGIN", []);
+    let row: Record<string, unknown>;
+    let claimed: number;
+    try {
+      row = await this.#row(store, op, params, scopeKey);
+      claimed = await this.#run(
+        "INSERT INTO store_applied (store, scope_key, idempotency_key, op, result) " +
+          `VALUES (?, ?, ?, ?, ?) ${this.#driver.dialect.ignore(
+            "(store, idempotency_key)",
+            "idempotency_key = idempotency_key",
+          )}`,
+        [store.name, scopeKey, idempotencyKey, op, JSON.stringify(row)],
+      );
+    } catch (error) {
+      await this.#run("ROLLBACK", []).catch(() => undefined);
+      throw error;
+    }
+    if (claimed !== 0) {
+      await this.#run("COMMIT", []);
+      return { row, deduped: false };
+    }
+    // Somebody has this key already, so this attempt's effect is undone and the
+    // answer is theirs. The read is after the rollback rather than inside the
+    // transaction because the row it is looking for is another transaction's,
+    // and MySQL's default isolation would answer a snapshot taken before that
+    // row existed.
+    await this.#run("ROLLBACK", []);
+    const held = await this.#all(
+      "SELECT result FROM store_applied WHERE store = ? AND idempotency_key = ?",
+      [store.name, idempotencyKey],
+    );
+    const result = held[0]?.["result"];
+    if (result === undefined || result === null) {
+      throw new Error(
+        `\`${store.address}\` refused a write under an idempotency key its ledger holds and then could not read what that key answered; the ledger row and the effect it dedupes are written in one transaction, so this server is not the one that took the write (grammar 9.4, PRD 5.8)`,
+      );
+    }
+    return { row: JSON.parse(String(result)) as Record<string, unknown>, deduped: true };
+  }
+
+  /** The `kv` rows of grammar 11.4's catalogue, as this server answers them. */
+  async #row(
+    store: StoreBinding,
+    op: StoreOp,
+    params: StoreParams,
+    scopeKey: string,
+  ): Promise<Record<string, unknown>> {
+    switch (op) {
+      case "get": {
+        const key = required(params.key, "key", store);
+        const found = await this.#all(
+          'SELECT value FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
+          [store.name, scopeKey, key],
+        );
+        const value = found[0]?.["value"];
+        // A miss answers `found: false` and **no** `value` at all, which is the
+        // same row the local backend answers (Decision D110).
+        return value === undefined || value === null
+          ? { found: false }
+          : { value: JSON.parse(String(value)) as unknown, found: true };
+      }
+      case "set": {
+        const key = required(params.key, "key", store);
+        await this.#run(
+          'INSERT INTO store_entries (store, scope_key, "key", value) VALUES (?, ?, ?, ?) ' +
+            this.#driver.dialect.overwrite('(store, scope_key, "key")', "value"),
+          [store.name, scopeKey, key, JSON.stringify(params.value ?? {})],
+        );
+        return { key };
+      }
+      case "delete": {
+        const key = required(params.key, "key", store);
+        const changed = await this.#run(
+          'DELETE FROM store_entries WHERE store = ? AND scope_key = ? AND "key" = ?',
+          [store.name, scopeKey, key],
+        );
+        return { deleted: changed > 0 };
+      }
+      case "list": {
+        const limit = required(params.limit, "limit", store);
+        const prefix = params.prefix ?? "";
+        const rows = await this.#all(
+          'SELECT "key" FROM store_entries WHERE store = ? AND scope_key = ? ' +
+            'AND SUBSTR("key", 1, ?) = ? ORDER BY "key" LIMIT ?',
+          // Characters, not JavaScript string length — the local backend's note
+          // on `substr` applies to both servers, which count characters too.
+          [store.name, scopeKey, [...prefix].length, prefix, limit],
+        );
+        return { keys: rows.map((row) => String(row["key"])) };
+      }
+      default:
+        throw new Error(`\`${store.address}\` is \`kind: ${store.kind}\` and takes no \`${op}\``);
+    }
+  }
+}
+
+/**
+ * Close every dialled connection this process opened.
+ *
+ * Called by `./cli.ts` on the way out of a `run` or a `resume`, beside
+ * `releaseJournal()` and for that call's reason: a socket left open is a process
+ * that does not exit. A `serve` holds them for as long as it serves.
+ *
+ * Idempotent, and never the caller's failure: a connection that could not be
+ * closed is one the server will reap, and the command that asked has already
+ * done its work.
+ */
+export async function releaseStores(): Promise<void> {
+  const held = [...DIALLED.values()];
+  DIALLED.clear();
+  await Promise.all(
+    held.map(async (dialling) => {
+      try {
+        await (await dialling).close();
+      } catch {
+        // A connection that could not be closed is one the server reaps.
+      }
+    }),
+  );
 }
 
 /** One row of the `blob` backend's idempotency ledger (grammar 9.4). */

@@ -99,15 +99,19 @@
 //!
 //! # What is emitted for a construct this release does not execute
 //!
-//! A store bound to a **production** backend is the only one. Grammar
-//! 14.3's vocabulary reaches past this release — `redis`, `pgvector`, `s3` and
-//! the rest land in M3 — so `ir::deploy::backend_of` resolves the alias at compile time
-//! and the emitted binding carries the provider it resolved to; `src/stores.ts`
-//! is where a store bound to one says so, naming the backend, where the
-//! resolution came from, and the milestone. Under `--target local` no alias and
-//! no per-kind default is consulted at all (PRD 5.8, Decision D87), which is
-//! what makes a project with production infrastructure in `deploy/staging.yml`
-//! still runnable with none.
+//! A store bound to a backend this release does not **open** is the only one.
+//! Grammar 14.3's vocabulary reaches past what runs — `redis`, `pgvector`, `s3`
+//! and the rest land in M3 — so `ir::deploy::backend_of` resolves the alias at
+//! compile time and the emitted binding carries the provider it resolved to,
+//! with the variable that provider would dial where the entry named one;
+//! `src/stores.ts` is where a store bound to one of the unimplemented providers
+//! says so, naming the backend, where the resolution came from, and the
+//! milestone. The two dialled ones this release **does** open — `postgres` and
+//! `mysql` for the `kv` kind (PRD resolved q63) — are not under this heading at
+//! all: nothing about what is emitted for them differs, which is the point.
+//! Under `--target local` no alias and no per-kind default is consulted at all
+//! (PRD 5.8, Decision D87), which is what makes a project with production
+//! infrastructure in `deploy/staging.yml` still runnable with none.
 //!
 //! A `flow.*` in an agent's `tools:` was the other entry under this heading and
 //! is not one any more. Flow-as-tool **runs**: the emitted `invoke` calls
@@ -699,6 +703,13 @@ fn stores(ir: &Ir, names: &Names) -> String {
             names::string(backend.provider.as_str())
         ));
         text.push_str(&format!("    from: {},\n", names::string(&backend.from)));
+        // The **name** of the variable the entry's `url:` named, where it named
+        // one (grammar 4.3, 14.3). A dialled backend opens with it (PRD resolved
+        // q63); a process-local one never reads it, and a target built-in wrote
+        // none — so this line is absent from every `--target local` build.
+        if let Some(variable) = &backend.url_env {
+            text.push_str(&format!("    urlEnv: {},\n", names::string(variable)));
+        }
         text.push_str("  },\n");
         text.push_str("};\n");
     }
@@ -5768,6 +5779,92 @@ flow.f:
             emitted.contains("    provider: \"sqlite_vec\",\n    from: \"the built-in for `kind: vector`, which the `staging` target does not override\","),
             "{emitted}"
         );
+    }
+
+    /// **The synthesized tool surface is the same on every backend, and
+    /// `agent_access: read` still withholds the write tools** (Decision D37, PRD
+    /// resolved q13, q63).
+    ///
+    /// The least-privilege narrowing is enforced **above** the backend: it
+    /// decides which tools a model is offered, and a store bound to a dialled
+    /// `postgres` or `mysql` backend answers the very same `runStoreTool` calls
+    /// as one bound to a file. A release that made a backend live must not move
+    /// that line by a byte, which is what this compares — the agent's whole
+    /// emitted binding, on two backends, expected equal.
+    ///
+    /// What the store bindings themselves carry does differ, and that is the
+    /// point of the second half: a dialled backend names the variable it dials
+    /// with (grammar 4.3), and a process-local one names none.
+    #[test]
+    fn the_store_tool_surface_does_not_move_when_the_backend_dials_out() {
+        let surface = |emitted: &str| -> String {
+            emitted
+                .split("const agentGrounded: runtime.AgentBinding = {")
+                .nth(1)
+                .expect("the agent is emitted")
+                .to_string()
+        };
+        let local = emit(STORES);
+        let dialled = with_deploy(
+            "store-backend-dialled",
+            STORES,
+            "version: \"0.1\"\n\nstorage_backends:\n  defaults:\n    kv: { provider: postgres, url: \"${PREFS_URL}\" }\n",
+        );
+
+        assert_eq!(
+            surface(&local),
+            surface(&dialled),
+            "the agent's store tools are not the same on a dialled backend as on a local one, so \
+             the model's surface depends on where the data lives (PRD resolved q63)"
+        );
+        let surface = surface(&dialled);
+        assert!(surface.contains("name: \"prefs_get\","), "{surface}");
+        assert!(surface.contains("name: \"prefs_set\","), "{surface}");
+        // `store.docs` is `agent_access: read`, and it stays read on a target
+        // whose deploy layer binds a server.
+        assert!(surface.contains("name: \"docs_search\","), "{surface}");
+        assert!(!surface.contains("docs_upsert"), "{surface}");
+
+        // …and the binding under it names the variable its backend dials with,
+        // as a **name** and never a value (grammar 4.3).
+        assert!(
+            dialled.contains(
+                "    provider: \"postgres\",\n    from: \"the `kv` default of the `staging` \
+                 target\",\n    urlEnv: \"PREFS_URL\",\n"
+            ),
+            "{dialled}"
+        );
+        // The `vector` store beside it falls to the built-in and names none.
+        assert!(
+            dialled.contains(
+                "    provider: \"sqlite_vec\",\n    from: \"the built-in for `kind: vector`, \
+                 which the `staging` target does not override\",\n  },\n"
+            ),
+            "{dialled}"
+        );
+    }
+
+    /// Emit one composition under a `staging` deploy file of the caller's.
+    fn with_deploy(label: &str, composition: &str, deploy: &str) -> String {
+        let directory =
+            std::env::temp_dir().join(format!("agent-compose-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("deploy")).expect("a scratch directory");
+        std::fs::write(directory.join("main.yml"), composition)
+            .expect("the entrypoint is writable");
+        std::fs::write(directory.join("deploy/staging.yml"), deploy)
+            .expect("the deploy file is writable");
+        let resolution = crate::resolve_with_target(directory.join("main.yml"), "staging");
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            resolution.diagnostics.is_empty(),
+            "{:#?}",
+            resolution.diagnostics
+        );
+        let ir = resolution.ir.expect("a clean resolution has an artifact");
+        let mut names = Names::of(&ir);
+        declare(&mut names, &ir);
+        module(&ir, &names).contents
     }
 
     /// A declared `route_on:` replaces the default rather than extending it.

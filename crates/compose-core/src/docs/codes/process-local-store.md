@@ -7,9 +7,9 @@ One store, not several wearing one address.
 A `memory`, `sqlite`, `sqlite_vec` or `local_fs` store is **opened by the
 process that reaches it**. There is no server in the middle: the bytes are a heap
 map, a SQLite file, or a directory, and two processes reaching that store hold
-two stores. A `redis`, `postgres`, `chroma`, `pgvector`, `qdrant`, `s3` or `gcs`
-store is the opposite — the process dials something outside itself, and two
-processes reaching it are two readers of one store.
+two stores. A `redis`, `postgres`, `mysql`, `chroma`, `pgvector`, `qdrant`, `s3`
+or `gcs` store is the opposite — the process dials something outside itself, and
+two processes reaching it are two readers of one store.
 
 A mesh runs a placed component in **more than one process by design**. Several
 workers may claim one placement — that is what a pool is — and the hub dispatches
@@ -100,17 +100,15 @@ storage_backends:
 
 ## The fix
 
-**Take the component out of the mesh** — the repair a build of this release
-runs. A store only the hub ever opens is a store with one process, whatever its
-backend. Dropping `agent.archivist` from `members:` says the filing happens on
-the hub, which is where the store is.
-
-**Or bind a networked backend**, which is where the deployment is heading and
-what the design already carries: the environment partition routes a backend's
-variables to the hub *and* to every placement whose components reach a store
-bound to it, so a worker that opens the store is refused at join if it has no
-credential for it rather than failing at its first op. One line of the deploy
-file, and the two processes are two readers of one store.
+**Bind a dialled backend**, which for a `kv` store is a repair a build of this
+release runs. `postgres` and `mysql` are implemented behind the store interface
+(PRD resolved question 63): the ops, the scopes, the recorded reads and the
+deduplicated writes are the same on them as on a file, and the one thing that
+changes is that the hub and every worker reach the same rows. The environment
+partition routes a backend's variables to the hub *and* to every placement whose
+components reach a store bound to it, so a worker that opens the store is refused
+at join if it has no credential for it rather than failing at its first op. One
+line of the deploy file, and the two processes are two readers of one store.
 
 ```yaml deploy fixed
 version: "0.1"
@@ -124,27 +122,38 @@ placements:
 
 storage_backends:
   defaults:
-    kv: { provider: redis, url: "${REDIS_URL}" }
+    kv: { provider: postgres, url: "${NOTES_DB_URL}" }
 ```
 
-**This release opens only the process-local backends**, so that block is a
-deployment rather than a repair today: `validate` and `build` take it, and the
-first store op throws — production `storage_backends` (Redis, Postgres, pgvector,
-S3 and the rest of grammar §14.3's vocabulary) land behind the store plugin
-interface in M3 (PRD §7). That is why the repair a build runs is first here and
-the caveat is last. The **diagnostic** makes the same two points in the other
-order — it names the networked backend first, because that is the shape the
-deployment is heading for, and then ends on this same sentence — so both texts
-leave a reader at the edit this release can actually run, whichever of the two
-they met first.
+Such a store is deliberately **multi-writer** — it takes no writer guard, because
+this rule is what governs who may reach it — and per key the last write wins.
+
+**For a `vector` or a `blob` store that repair is still a deployment rather than
+an edit**: `validate` and `build` take the block, and the first store op throws —
+the rest of production `storage_backends` (Redis, Chroma, pgvector, Qdrant, S3
+and GCS) land behind the store plugin interface in M3 (PRD §7). For those, the
+repair a build of this release runs is the other one.
+
+**Take the component out of the mesh.** A store only the hub ever opens is a
+store with one process, whatever its backend. Dropping `agent.archivist` from
+`members:` says the filing happens on the hub, which is where the store is.
+
+This page and the **diagnostic** both lead with the dialled backend, because that
+is the shape the deployment is heading for, and both offer taking the component
+out of the mesh as the other repair. What differs is where the release caveat
+sits. This page puts it *between* the two, so a `vector` or `blob` reader meets
+it exactly where the first repair stops applying to them and is handed the second
+in the same breath. The diagnostic is one line with no room to interleave, so it
+names both repairs and then ends on which of the names it offered this release
+opens — last, because that is what a reader has to leave with. Either way a
+reader ends at an edit that works, whichever of the two texts they met first.
 
 **Under `--target local` the backend repair is not available at all**, and the
 diagnostic says so: `local` substitutes local storage for every store
 unconditionally and refuses a `storage_backends:` block outright, so there is no
 line to edit. A `local` mesh that has to share a store is a target of its own — a
-`deploy/<name>.yml` naming a networked backend — and until there is one (and
-until this release opens it), the component that binds the store belongs outside
-`placements:`.
+`deploy/<name>.yml` naming a dialled backend — and until there is one, the
+component that binds the store belongs outside `placements:`.
 
 Grammar: `docs/grammar.md` §14.1 rule 5, §11.3, §14.3, Decision D131. PRD:
 resolved question 45. Protocol: `docs/distributed.md` §1, §9.1. Topic:

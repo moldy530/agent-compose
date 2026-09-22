@@ -173,6 +173,7 @@ export const hubEnvironment: readonly string[] = [
   "REPO_ROOT",
   "TRACE_SINK_TOKEN",
   "TRIAGE_HOST",
+  "TRIAGE_MEMORY_URL",
   "TRIAGE_TOKEN",
 ];
 

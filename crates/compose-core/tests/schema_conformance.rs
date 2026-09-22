@@ -1093,6 +1093,107 @@ fn the_published_schema_takes_every_journal_the_grammar_spells() {
     }
 }
 
+/// **The published schema takes every storage provider the grammar spells**
+/// (grammar 14.3, PRD resolved q63).
+///
+/// Four `enum`s, one vocabulary. The schema states the `kv`, `vector` and `blob`
+/// rows separately — that is what gives an editor the per-kind completion a
+/// `defaults:` entry wants — and states the union once more for an alias, whose
+/// kind is only decided by the stores that name it. All four are read off
+/// `BackendProvider::ALL` rather than written out: a provider added to the enum
+/// and forgotten in one of them leaves the published schema squiggling a
+/// `provider:` `validate` accepts, which is the direction grammar Appendix B
+/// forbids outright, and one added to an `enum` alone leaves an editor blessing
+/// YAML the compiler refuses.
+///
+/// The example corpus cannot see either: the keyword that would have caught it
+/// is the one nobody wrote yet.
+#[test]
+fn the_published_schema_takes_every_storage_provider_the_grammar_spells() {
+    use compose_core::ast::definition::StoreKind;
+    use compose_core::ast::deploy::BackendProvider;
+
+    let schema = read_schema();
+    let validator = compile_schema();
+
+    for (definition, kind) in [
+        ("kvBackend", Some(StoreKind::Kv)),
+        ("vectorBackend", Some(StoreKind::Vector)),
+        ("blobBackend", Some(StoreKind::Blob)),
+        ("anyBackend", None),
+    ] {
+        let published = variants(&schema["$defs"][definition]["properties"]["provider"])
+            .unwrap_or_else(|| {
+                panic!("`{definition}.provider` must stay a closed set in the published schema")
+            });
+        let table: BTreeSet<String> = BackendProvider::ALL
+            .iter()
+            .filter(|provider| kind.is_none_or(|kind| provider.kind() == kind))
+            .map(|provider| provider.as_str().to_string())
+            .collect();
+        assert_eq!(
+            published, table,
+            "the published schema and the compiler's table disagree about `{definition}.provider`"
+        );
+    }
+
+    // …and each keyword goes through both authorities, in the position its kind
+    // puts it: a per-kind `defaults:` entry, where the schema's row is the one
+    // that applies.
+    for provider in BackendProvider::ALL {
+        let instance = json!({
+            "version": "0.1",
+            "storage_backends": {
+                "defaults": {
+                    provider.kind().as_str(): { "provider": provider.as_str(), "url": "${BACKEND_URL}" }
+                }
+            }
+        });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal backend:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "deploy/staging.yml");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "the parser must accept what the published schema accepts:\n{source}\n{}",
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // …and the narrowing direction, which is what makes the per-kind rows worth
+    // stating at all: a `kv` default naming a vector provider is refused by both
+    // authorities, and so is a provider neither vocabulary has.
+    for refused in [
+        json!({ "defaults": { "kv": { "provider": "chroma" } } }),
+        json!({ "defaults": { "vector": { "provider": "mysql" } } }),
+        json!({ "defaults": { "blob": { "provider": "postgres" } } }),
+        json!({ "defaults": { "kv": { "provider": "cockroach" } } }),
+    ] {
+        let instance = json!({ "version": "0.1", "storage_backends": refused });
+        assert!(
+            !validation_errors(&validator, &instance).is_empty(),
+            "the published schema must refuse this backend:\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance")
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "deploy/staging.yml");
+        assert!(
+            !parsed.diagnostics.is_empty(),
+            "the parser must refuse what the published schema refuses:\n{source}"
+        );
+    }
+}
+
 /// The two closed sets an inbound `hmac:` chooses between are one table each,
 /// written twice: once as the parser's keywords and once as an `enum` in the
 /// published schema (grammar 13.3, PRD resolved q32).

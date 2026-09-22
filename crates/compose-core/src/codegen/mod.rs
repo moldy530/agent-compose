@@ -60,7 +60,7 @@
 //! src/mesh.ts           the hub half of the worker protocol (distributed §3)
 //! src/modules.ts        the `module:` bindings' contracts, and the one seam
 //! src/runtime.ts        what a node does when it runs (grammar 8, 9)
-//! src/stores.ts         the local store backends (PRD 5.8, grammar 11)
+//! src/stores.ts         the store backends this target binds (PRD 5.8, grammar 11)
 //! src/schemas.ts        every schema in the composition, as Zod (grammar 3.8)
 //! src/state.ts          the LangGraph state model (grammar 10)
 //! src/graph.ts          the compiled graph, and `runFlow`
@@ -197,6 +197,7 @@ pub mod cel;
 pub mod cli;
 pub mod delivery;
 pub mod deployment;
+pub mod drivers;
 pub mod env;
 pub mod graph;
 pub mod harness;

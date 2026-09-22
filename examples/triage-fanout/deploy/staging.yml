@@ -28,9 +28,17 @@ placements:
 
 storage_backends:
   defaults:
+    # store.triage_memory names no `backend:`, so this per-kind default is what
+    # it binds. `postgres` is one of the two `kv` backends this release opens
+    # for real (grammar 14.3, PRD resolved q63): the store is a table on a
+    # server, so the hub and every worker that reaches it read one store rather
+    # than one copy each — which is the whole reason grammar 14.1 rule 5 admits
+    # a dialled backend where it refuses a file. It is the same server this
+    # target's `journal:` names below, and the generated project pins `pg` once
+    # for both.
     kv:
-      provider: redis
-      url: ${REDIS_URL}
+      provider: postgres
+      url: ${TRIAGE_MEMORY_URL}
   aliases:
     # store.docs declares `backend: docs_db`; this is where that abstract slot
     # becomes physical. Swapping staging to pgvector is a one-line edit here.

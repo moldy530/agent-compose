@@ -274,17 +274,25 @@ fn every_backend_the_reaching_process_opens_for_itself_is_refused() {
     }
 }
 
-/// …and the seven that are a connection to something outside the process, each
+/// …and the eight that are a connection to something outside the process, each
 /// accepted.
 ///
 /// This is the over-rejection guard, and it is the half a negative corpus can
 /// say nothing about: a rule that classified `redis` as local would make the
 /// repair it recommends the next diagnostic.
+///
+/// Two of these are no longer only a direction of travel: PRD resolved q63 makes
+/// `postgres` and `mysql` the rule's first **live** dialled members for the `kv`
+/// kind, so an author who takes the repair this diagnostic offers gets a mesh
+/// that runs rather than one that compiles and throws. The acceptance itself is
+/// unchanged — the rule reads `opens_in_process`, which was defined for exactly
+/// this release (Decision D131).
 #[test]
 fn every_networked_backend_is_accepted_from_a_placement() {
     for (provider, extra) in [
         ("redis", ""),
         ("postgres", ""),
+        ("mysql", ""),
         ("chroma", VECTOR_STORE),
         ("pgvector", VECTOR_STORE),
         ("qdrant", VECTOR_STORE),
@@ -587,29 +595,40 @@ fn the_local_target_refuses_and_names_the_repair_it_admits() {
     );
 }
 
-/// Both repairs are offered, and the message says which one this release runs.
+/// Both repairs are offered, and the message says which of the named backends
+/// this release opens.
 ///
 /// The rule is ratified and correct, and the backend half of its repair is the
-/// deployment the design is heading for — but a build of *this* release opens
-/// only the process-local backends: `src/stores.ts` throws on every other
-/// provider, because production `storage_backends` land behind the store plugin
-/// interface in M3 (PRD §7). An author who followed a message that stopped at
-/// "bind `redis`" would write a deploy file that validates, builds, and throws
-/// at the first `store set`, which is a worse outcome than the one they came in
-/// with. So the message names the repair that runs today as well, and this is
-/// the test that fails when the release grows the backends and the caveat is
-/// left behind: a `redis` store that no longer throws makes the sentence below
-/// wrong, and the fixtures' exact `# help:` lines come with it.
+/// deployment the design is heading for — but only **some** of the names it
+/// offers are backends a build of this release opens. PRD resolved q63 made
+/// `postgres` and `mysql` live for the `kv` kind, so a `kv` store's message
+/// names those two as the repair that runs and the caveat is about the others;
+/// for a `vector` or `blob` store nothing networked is open yet, so the caveat
+/// is the whole of it and the repair a build runs is taking the component out of
+/// `placements:`. An author who followed a message that stopped at "bind
+/// `chroma`" would write a deploy file that validates, builds, and throws at the
+/// first `store upsert`, which is a worse outcome than the one they came in
+/// with.
 ///
-/// **The order the two are named in is pinned as well**, because
-/// `src/docs/codes/process-local-store.md` tells a reader what it is — the
-/// document leads with the repair a build runs and says so, and says the
-/// diagnostic leads with the other. Nothing else holds those two texts together,
-/// and a reader who checks one against the other is exactly the reader the
-/// `explain` document is for.
+/// This is therefore the test that fails when the release grows the backends and
+/// the caveat is left behind — a `redis` store that no longer throws makes the
+/// `kv` sentence below wrong, and the fixtures' exact `# help:` lines come with
+/// it.
+///
+/// **The order the repairs are named in is pinned as well**, because
+/// `src/docs/codes/process-local-store.md` tells a reader what it is — both
+/// texts lead with the dialled backend, both offer the composition repair as the
+/// other one, and the document states where each puts the release caveat: itself
+/// between the two repairs, the diagnostic last. Nothing else holds those two
+/// texts together, and a reader who checks one against the other is exactly the
+/// reader the `explain` document is for.
 #[test]
 fn the_repair_names_the_half_a_build_of_this_release_can_run() {
-    let caveat = "refuses at the first store op";
+    // The one phrase both spellings of the caveat share — "the others compile
+    // and then refuse at the first store op" where some are open, and "a
+    // networked one compiles and then refuses at the first store op" where none
+    // is.
+    let caveat = "at the first store op";
     let diagnostics = diagnose(
         "release-caveat",
         &format!("{BACKEND}{KV_STORE}{}", filer("archivist", "")),
@@ -625,30 +644,31 @@ fn the_repair_names_the_half_a_build_of_this_release_can_run() {
         .clone()
         .expect("the refusal offers a repair");
     assert!(
-        named.contains("bind `redis` or `postgres` instead"),
+        named.contains("bind `redis`, `postgres` or `mysql` instead"),
         "the design's repair is not offered under a named target: {named}"
     );
     assert!(
-        named.contains(caveat) && named.contains("M3"),
-        "the message offers a networked backend without saying that this release refuses one at \
-         run time, so an author who takes it gets a project that compiles and throws: {named}"
+        named.contains("this release opens `postgres` and `mysql`"),
+        "the `kv` message does not name the dialled backends this release really opens, so an \
+         author is left thinking every name it offered is a build that throws (PRD resolved \
+         q63): {named}"
     );
     assert!(
-        named.contains(
-            "taking the component out of `placements:` is the repair a build of this \
-                        release runs"
-        ),
-        "the message never names the repair this release can actually run: {named}"
+        named.contains(caveat) && named.contains("M3"),
+        "the message offers backends this release still refuses at run time without saying so, \
+         so an author who takes one gets a project that compiles and throws: {named}"
     );
 
     // **The order of the two, which the `explain` document describes.** The
     // networked backend is named first because it is the shape the deployment is
     // heading for, and the caveat is last because it is what a reader has to
-    // leave with. `src/docs/codes/process-local-store.md` states that ordering
-    // and contrasts it with its own, so a message reordered here without the
-    // document is a document that describes another compiler's output.
+    // leave with. `src/docs/codes/process-local-store.md` states that ordering —
+    // it leads with the same backend repair, and says this message names both
+    // repairs and then ends on the caveat, where the page instead keeps the
+    // caveat between the two — so a message reordered here without the document
+    // is a document that describes another compiler's output.
     let backend = named
-        .find("bind `redis` or `postgres` instead")
+        .find("bind `redis`, `postgres` or `mysql` instead")
         .expect("the design's repair is offered");
     let composition = named
         .find("take the component that binds it out of `placements:`")
@@ -658,6 +678,29 @@ fn the_repair_names_the_half_a_build_of_this_release_can_run() {
         backend < composition && composition < last,
         "the two repairs are no longer named backend-first with the caveat last, which is the \
          order `agent-compose explain process-local-store` tells a reader to expect: {named}"
+    );
+
+    // …and a **`vector`** store, where nothing networked is open yet: the whole
+    // caveat is still there, and the repair a build of this release runs is the
+    // composition one.
+    let vector = diagnose(
+        "release-caveat-vector",
+        &format!("{BACKEND}{VECTOR_STORE}{}", filer("archivist", "")),
+        Some(&mesh(
+            "  vault:\n    members: [agent.archivist]\n",
+            "sqlite_vec",
+        )),
+        "mesh",
+    );
+    refused("release-caveat-vector", &vector, "store.notes", "vault");
+    let vector = vector[0].help.clone().expect("the refusal offers a repair");
+    assert!(
+        vector.contains(
+            "taking the component out of `placements:` is the repair a build of this \
+             release runs"
+        ),
+        "a `vector` store has no dialled backend this release opens, so the message has to name \
+         the repair it can run: {vector}"
     );
 
     // …and under `local`, where the first repair is a target of its own rather
@@ -687,8 +730,8 @@ fn the_repair_names_the_half_a_build_of_this_release_can_run() {
         .expect("the refusal offers a repair");
     assert!(
         local.contains(caveat),
-        "the `local` message sends an author to a target of its own without saying this release \
-         would refuse the backend it names: {local}"
+        "the `local` message sends an author to a target of its own without saying which of the \
+         backends it names this release would refuse: {local}"
     );
 }
 

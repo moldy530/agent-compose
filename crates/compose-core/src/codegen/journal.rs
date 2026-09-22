@@ -42,6 +42,8 @@ use crate::ast::deploy::JournalProvider;
 use crate::ir::Ir;
 use crate::ir::deploy::journal_of;
 
+use super::drivers::RemoteDriver;
+
 /// The invariant half: the record, the keys, the statements, and the SQLite arm.
 const SOURCE: &str = include_str!("js/journal.ts");
 
@@ -51,47 +53,33 @@ const POSTGRES: &str = include_str!("js/journal-postgres.ts");
 /// …and the MySQL arm.
 const MYSQL: &str = include_str!("js/journal-mysql.ts");
 
-/// The driver each remote provider is reached through, pinned exactly.
+/// The driver one journal provider dials through, or `None` for the arm that
+/// opens a file.
 ///
-/// The discipline [`super::project::PINS`] and [`super::harness::HARNESS_PINS`]
-/// are under, for their reason: what a journal does is what a compiled graph
-/// survives, so a release that let a driver float would change that with no
-/// commit saying so (PRD §9.18, §5.12).
-///
-/// `@types/pg` is in the list because `pg` ships no types of its own and this
-/// project type-checks under `strict`; it is a **development** pin, which
-/// [`development_pins_of`] is what separates out. `mysql2` ships its own, so its
-/// row is one entry long.
-pub const JOURNAL_PINS: &[(JournalProvider, &[(&str, &str)])] = &[
-    (JournalProvider::Postgres, &[("pg", "8.23.0")]),
-    (JournalProvider::Mysql, &[("mysql2", "3.24.4")]),
-];
-
-/// The development dependencies one remote provider brings, pinned.
-///
-/// Only Postgres has any, and only because `pg` publishes no type declarations:
-/// a `tsc --noEmit` over a project that imports it would fail on the import
-/// rather than on anything this compiler emitted.
-pub const JOURNAL_DEV_PINS: &[(JournalProvider, &[(&str, &str)])] =
-    &[(JournalProvider::Postgres, &[("@types/pg", "8.23.1")])];
+/// The pins themselves are [`super::drivers`]'s, shared with the `kv` store
+/// arms that dial the same two servers (PRD resolved q63): a target whose
+/// journal and whose store both bind Postgres declares `pg` **once**, and one
+/// table is what makes that true rather than two tables that happen to agree.
+#[must_use]
+pub const fn driver_of(provider: JournalProvider) -> Option<RemoteDriver> {
+    match provider {
+        JournalProvider::Sqlite => None,
+        JournalProvider::Postgres => Some(RemoteDriver::Pg),
+        JournalProvider::Mysql => Some(RemoteDriver::Mysql2),
+    }
+}
 
 /// The packages one provider's arm brings, pinned — empty for `sqlite`, whose
 /// driver `./stores.ts` already pins for every project.
 #[must_use]
 pub fn pins_of(provider: JournalProvider) -> &'static [(&'static str, &'static str)] {
-    JOURNAL_PINS
-        .iter()
-        .find(|(held, _)| *held == provider)
-        .map_or(&[], |(_, pins)| *pins)
+    driver_of(provider).map_or(&[], super::drivers::pins_of)
 }
 
 /// …and the development ones.
 #[must_use]
 pub fn development_pins_of(provider: JournalProvider) -> &'static [(&'static str, &'static str)] {
-    JOURNAL_DEV_PINS
-        .iter()
-        .find(|(held, _)| *held == provider)
-        .map_or(&[], |(_, pins)| *pins)
+    driver_of(provider).map_or(&[], super::drivers::development_pins_of)
 }
 
 /// `src/journal.ts`.
@@ -197,17 +185,20 @@ mod tests {
                     provider.as_str()
                 );
             }
-            for (other, pins) in JOURNAL_PINS.iter().chain(JOURNAL_DEV_PINS) {
-                if *other == provider {
+            for other in RemoteDriver::ALL {
+                if driver_of(provider) == Some(*other) {
                     continue;
                 }
-                for (package, _) in *pins {
+                for (package, _) in crate::codegen::drivers::pins_of(*other)
+                    .iter()
+                    .chain(crate::codegen::drivers::development_pins_of(*other))
+                {
                     assert!(
                         !manifest.contains(&format!("\"{package}\"")),
                         "a target binding `{}` pins `{package}`, which only a `{}` journal \
                          reaches",
                         provider.as_str(),
-                        other.as_str()
+                        other.package()
                     );
                 }
             }

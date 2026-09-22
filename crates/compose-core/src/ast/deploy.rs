@@ -339,7 +339,10 @@ pub struct ConnectionField {
 }
 
 /// The v0 storage providers (grammar 14.3, Decision D48).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Ordered by the declaration order of [`Self::ALL`], which is grammar 14.3's
+/// own — kind by kind — so a set of them iterates the way the table reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BackendProvider {
     /// `memory` (kv)
     Memory,
@@ -349,6 +352,8 @@ pub enum BackendProvider {
     Redis,
     /// `postgres` (kv)
     Postgres,
+    /// `mysql` (kv)
+    Mysql,
     /// `sqlite_vec` (vector)
     SqliteVec,
     /// `chroma` (vector)
@@ -372,6 +377,7 @@ impl BackendProvider {
         Self::Sqlite,
         Self::Redis,
         Self::Postgres,
+        Self::Mysql,
         Self::SqliteVec,
         Self::Chroma,
         Self::Pgvector,
@@ -389,6 +395,7 @@ impl BackendProvider {
             Self::Sqlite => "sqlite",
             Self::Redis => "redis",
             Self::Postgres => "postgres",
+            Self::Mysql => "mysql",
             Self::SqliteVec => "sqlite_vec",
             Self::Chroma => "chroma",
             Self::Pgvector => "pgvector",
@@ -403,7 +410,9 @@ impl BackendProvider {
     #[must_use]
     pub const fn kind(self) -> StoreKind {
         match self {
-            Self::Memory | Self::Sqlite | Self::Redis | Self::Postgres => StoreKind::Kv,
+            Self::Memory | Self::Sqlite | Self::Redis | Self::Postgres | Self::Mysql => {
+                StoreKind::Kv
+            }
             Self::SqliteVec | Self::Chroma | Self::Pgvector | Self::Qdrant => StoreKind::Vector,
             Self::LocalFs | Self::S3 | Self::Gcs => StoreKind::Blob,
         }
@@ -429,6 +438,7 @@ impl BackendProvider {
             Self::Memory | Self::Sqlite | Self::SqliteVec | Self::LocalFs => true,
             Self::Redis
             | Self::Postgres
+            | Self::Mysql
             | Self::Chroma
             | Self::Pgvector
             | Self::Qdrant
@@ -444,6 +454,36 @@ impl BackendProvider {
             .iter()
             .copied()
             .filter(|provider| !provider.opens_in_process())
+    }
+
+    /// Whether a store bound to this provider **runs** under this compiler
+    /// release, rather than being refused at its first op.
+    ///
+    /// The four process-local backends have always been here — a heap map, a
+    /// SQLite file with or without the vector extension, and a directory of
+    /// blobs (PRD 5.8's zero-infra guarantee). `postgres` and `mysql` joined
+    /// them for the `kv` kind with PRD resolved q63, which is what makes
+    /// grammar 14.1 rule 5's dialled side reachable rather than a repair that
+    /// compiles and then throws. Everything else is still M3's (PRD §7), and
+    /// `src/stores.ts` is where a binding to one says so at the op.
+    ///
+    /// Stated here rather than only in the runtime because two diagnostics read
+    /// it: [`crate::check::placements`] offers a repair a build of this release
+    /// really runs, and a drift test holds this list equal to the runtime's own
+    /// (`codegen::stores`).
+    #[must_use]
+    pub const fn implemented(self) -> bool {
+        match self {
+            Self::Memory
+            | Self::Sqlite
+            | Self::SqliteVec
+            | Self::LocalFs
+            | Self::Postgres
+            | Self::Mysql => true,
+            Self::Redis | Self::Chroma | Self::Pgvector | Self::Qdrant | Self::S3 | Self::Gcs => {
+                false
+            }
+        }
     }
 }
 

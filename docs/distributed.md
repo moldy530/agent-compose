@@ -88,9 +88,15 @@ whichever execution opened it, and a placement is several processes by design
 error wherever a component that can execute in a placement's process binds such a
 store, at every scope and under `--target local` too (PRD resolved q45). A mesh
 that shares one store binds a **networked** backend, whose variables §9.1's
-partition already carries to every placement that reaches it — and until this
-compiler release opens one (production `storage_backends` land behind the store
-plugin interface in M3, PRD §7), a mesh whose composition needs a store keeps the
+partition already carries to every placement that reaches it.
+
+For a **`kv`** store that repair runs today: `postgres` and `mysql` are
+implemented behind the store interface (PRD resolved q63, grammar §14.3,
+Decision D149), so the hub and every worker that reaches the store reach the same
+rows — the store is deliberately multi-writer, takes no writer guard, and per key
+the last write wins. For a `vector` or a `blob` store nothing networked is open
+yet (the rest of production `storage_backends` land behind the store plugin
+interface in M3, PRD §7), so a mesh whose composition needs one keeps the
 component that binds it on the hub.
 
 Peer partition — each machine owning a subgraph and its own journal — is

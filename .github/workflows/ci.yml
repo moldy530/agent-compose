@@ -22,15 +22,23 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    # The two servers the journal conformance suite drives its remote providers
-    # against (PRD resolved q62, `docs/durability.md` §10). `journal:` binds one
-    # of three backends behind one interface, and the two that dial out fail in
-    # ways only a real server has: a collation that folds case, a `TEXT` column
-    # too small for a harness payload, an `AUTO_INCREMENT` that needs a key, an
-    # advisory lock that is or is not released when a connection dies. None of
-    # that is visible to a type-check or to a mock, so "CI green" means "actually
-    # done" for these backends only if the suite has talked to them (CLAUDE.md's
-    # Validation strategy).
+    # The two servers the **two** backend conformance suites drive their dialled
+    # providers against: the journal's (PRD resolved q62, `docs/durability.md`
+    # §10) and the `kv` store's (PRD resolved q63, grammar §14.3). Each slot
+    # binds one of three backends behind one interface, and the two that dial out
+    # fail in ways only a real server has: a collation that folds case or pads a
+    # trailing space away, a `TEXT` column too small for a payload, an
+    # `AUTO_INCREMENT` that needs a key, an advisory lock that is or is not
+    # released when a connection dies, a unique index that does or does not make
+    # a double-delivered write land once. None of that is visible to a type-check
+    # or to a mock, so "CI green" means "actually done" for these backends only
+    # if the suites have talked to them (CLAUDE.md's Validation strategy).
+    #
+    # **One pair of containers serves both**, which is why nothing is added here:
+    # the suites read the same two variables and never share a table — the
+    # journal's are `executions`, `effects`, `deliveries` and `dispatches`, and a
+    # store's are `store_entries` and `store_applied`, each keyed by a store name
+    # the runner mints per run.
     #
     # Images are the official ones at their current stable majors, pinned by
     # major rather than by digest because these are a test fixture rather than
@@ -39,8 +47,8 @@ jobs:
     # would fail on a connection refused rather than on anything it checks.
     #
     # `AGENT_COMPOSE_TEST_POSTGRES_URL` and `AGENT_COMPOSE_TEST_MYSQL_URL` are
-    # what the suite reads. Absent — which is every developer machine — each
-    # remote arm is **skipped loudly**, naming the variable, and the SQLite arm
+    # what both suites read. Absent — which is every developer machine — each
+    # dialled arm is **skipped loudly**, naming the variable, and the SQLite arm
     # runs anyway; set, the arm runs for real. Nothing here is a credential worth
     # protecting: the servers live and die with the job.
     services:
@@ -154,11 +162,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        # The two journal URLs are the whole of what the service containers above
-        # are for: `journal_backend_conformance` drives the same contract cases
-        # against SQLite always and against each remote provider whose variable
-        # is set, so setting them here is what turns two skips into two runs
-        # (`docs/durability.md` §10).
+        # The two database URLs are the whole of what the service containers
+        # above are for: `journal_backend_conformance` and
+        # `store_backend_conformance` each drive their contract cases against
+        # SQLite always and against each dialled provider whose variable is set,
+        # so setting them here is what turns four skips into four runs
+        # (`docs/durability.md` §10, grammar §14.3).
         env:
           AGENT_COMPOSE_TEST_POSTGRES_URL: postgres://agent_compose:agent_compose@127.0.0.1:5432/agent_compose_journal
           AGENT_COMPOSE_TEST_MYSQL_URL: mysql://root:agent_compose@127.0.0.1:3306/agent_compose_journal

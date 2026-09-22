@@ -127,8 +127,38 @@ that declares `placements:` runs a placed component in more than one process by
 design. Binding one from anything a placement's process can execute is
 `process-local-store`, at every `scope:` and under `local` too. The repair is a
 networked backend, whose variables the deployment already routes to every
-placement that reaches the store — or, until this release opens one, keeping the
-component that binds the store off `placements:` so only the hub opens it.
+placement that reaches the store — or keeping the component that binds the store
+off `placements:` so only the hub opens it.
+
+**Which backends this release opens.** The four above, and — for the `kv` kind —
+`postgres` and `mysql`. A store bound to one of those two is a connection rather
+than a file, and nothing else about it changes: the same ops below, the same
+scope partitions, the same recorded reads and deduplicated writes, so a graph
+moved between backends addresses the same rows and cannot tell which answered. It
+is deliberately **multi-writer** — no writer guard, because the placement rule
+above is what governs who may reach a store — and per key the last write wins.
+Each dialled store creates its tables at the first op of whichever process
+reaches it first, and several processes of one placement doing that at the same
+moment is the ordinary start-up rather than a race to lose. The one place a
+server shows through is how long a key may be: a `kv` key and a session key are
+whatever the composition and the trigger supplied, and a `mysql` store holds
+2048 characters of a `kv` key. A session key is bounded more tightly than that
+number suggests, because it is not stored as it arrived: the partition a
+`scope: session` store writes is `session/` followed by the session key
+**percent-encoded**, one `%XX` escape per byte outside `[A-Za-z0-9_-]` — so the
+same 2048 characters are 2040 of an ASCII session key but only 226 of a CJK one,
+each of whose characters is three bytes and therefore nine encoded characters. A
+`postgres` store holds about 2704 bytes across the store name, the partition —
+encoded the same way — and the key together. A `sqlite` store bounds neither.
+A `mysql` store also has a version floor — **MySQL 8.0.19 or newer**, the release
+whose upsert spelling and key collation it is written for — and a server below it
+is refused when the store is opened, naming the version that server reported
+rather than failing later on a write. The `postgres` arm asks for nothing newer
+than `ON CONFLICT`, which every Postgres still in support has, so it states no
+floor of its own.
+A store bound to any other provider (`redis`, `chroma`, `pgvector`, `qdrant`,
+`s3`, `gcs`) compiles and then refuses at its first op, naming the backend and
+where the binding came from.
 
 `scope: session` requires the execution to have a session identity, and that
 identity comes from the trigger. A declared `http`, `schedule`, or `event`

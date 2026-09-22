@@ -30,7 +30,7 @@ The LangGraph TypeScript project `agent-compose build` produced from `main.yml`,
 | `src/modules.ts` | the generated half of every `module:` binding: one contract type per module-bound tool, written from that tool's own `input:`/`output:`, the type of the `env:` that binding declared, and the typed `const` holding the authored implementation. The **only** generated module that imports code you wrote |
 | `src/otlp.ts` | the OTLP/JSON span exporter: one settled trace envelope mapped to an `ExportTraceServiceRequest`, hand-written and with no OpenTelemetry dependency behind it (`docs/trace.md` §12) |
 | `src/runtime.ts` | what every node does when it runs: the retry/timeout/error policy of grammar 9, the provider surfaces, the model failover ladder, the `exec`/`http` wrappers, and the router |
-| `src/stores.ts` | the local store backends: SQLite for `kv` and `vector`, a directory of files for `blob` (PRD 5.8) |
+| `src/stores.ts` | the store backends: SQLite for a local `kv` or `vector`, a directory of files for a `blob`, and the arm for each dialled `kv` backend this target binds (PRD 5.8) |
 | `src/schemas.ts` | every schema the composition declares, as Zod |
 | `src/state.ts` | the graph's state model: one channel per `state:` channel, the implicit conversation history, and `$run` — what the runtime keeps beside them |
 | `src/graph.ts` | the compiled graph: one node per flow node, the `flows` registry, and `runFlow` |
@@ -492,7 +492,34 @@ resume route instead.
 
 `--target local` substitutes SQLite and local disk for every store
 unconditionally, so a composition with a `store.*` in it runs with nothing
-installed (PRD 5.8). What it writes lives under this directory:
+installed (PRD 5.8). A named target may bind a `kv` store to `postgres` or
+`mysql` instead, in which case that store's rows are on the server its
+`storage_backends:` entry names and nothing of it is under this directory.
+
+This target bound these:
+
+| store | backend | address |
+|---|---|---|
+| `store.triage_memory` | `postgres` | `${TRIAGE_MEMORY_URL}` |
+
+Each address is the **name** of a variable and never its value: it is read at
+that store's first op, and a launch that is short one is refused with the site
+that asked for it before the graph is invoked. This project therefore pins the
+driver each of those stores is reached through, in `package.json` beside every
+other pin; a target whose stores are all local pins none of these:
+
+| package | version |
+|---|---|
+| `pg` | `8.23.0` |
+| `@types/pg` | `8.23.1` |
+
+A store on a server is a connection rather than a file, so every process that
+reaches it reaches the same rows — which is what makes one usable from a
+placement where a local store is refused. It takes no lock and no writer guard,
+and per key the last write wins. The ops, the scopes, the recorded reads and the
+deduplicated writes are the same on every backend.
+
+What the local backends write lives here:
 
 ```text
 .agent-compose/stores/<name>.sqlite                      a `kv` or `vector` store
@@ -539,9 +566,13 @@ rather than the operating system's — so two `agent-compose run`s sharing a
 `session` or `global` store contend for it, and the loser waits and then fails
 the node with `SQLite3Error: database is locked`. It fails loudly rather than
 corrupting anything, and a `serve` process — which runs its executions in **one**
-process — is not affected. Concurrency across processes arrives with the
-production `storage_backends:` of a later milestone; until then `--target local`
-means one process, which is the same boundary the target draws everywhere else.
+process — is not affected. `--target local` means one process, which is the same
+boundary the target draws everywhere else. A deployment that really has two is a
+named target binding a **dialled** backend: a `kv` store on `postgres` or
+`mysql` is a connection rather than a file, every process reaching it reaches the
+same rows, and nothing else about the store changes — same ops, same scopes, same
+recorded reads and deduplicated writes. It takes no lock and no writer guard, and
+per key the last write wins.
 
 **Opening** is the concession to that, and both artifacts make it: the journal
 and the stores wait for a lock rather than failing on one, so an
