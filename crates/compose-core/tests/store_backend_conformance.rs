@@ -42,6 +42,14 @@
 //! so this is the only place `src/codegen/js/stores-mysql.ts` meets `tsc` on a
 //! machine with no database.
 //!
+//! A **fourth** project is built and type-checked beside those three, and it
+//! binds one store to Postgres and another to MySQL. `src/stores.ts` is
+//! assembled from the invariant half plus one arm per bound provider, so a
+//! project per provider never compiles the *union* of the arms — and the union
+//! is where two arms declaring one name become a duplicate top-level
+//! declaration that `tsc` refuses and Node will not even load. See
+//! [`a_target_binding_both_dialled_arms_is_one_module_that_compiles`].
+//!
 //! The **cases** then run where there is something to run them against. SQLite
 //! always: it needs nothing but the pinned driver, so a developer machine runs
 //! the same cases CI does. Each dialled provider runs when its environment
@@ -138,6 +146,38 @@ flow.probe:\n  \
     - { from: start, to: step }\n    \
     - { from: step, to: end }\n";
 
+/// …and the composition that binds **two** stores, for the arms-together case
+/// below.
+///
+/// Two `kv` stores rather than one, because a deploy file binds a backend to an
+/// alias and a store names one alias: two providers in one project is two
+/// stores. Otherwise it is [`COMPOSITION`] — the same probe flow, which is there
+/// so that a project is a project rather than because anything runs it. Nothing
+/// ever does: see
+/// [`a_target_binding_both_dialled_arms_is_one_module_that_compiles`].
+const BOTH_ARMS: &str = "version: \"0.1\"\n\
+store.prefs:\n  \
+  kind: kv\n  \
+  scope: global\n  \
+  description: What the Postgres arm answers for.\n  \
+  backend: prefs_db\n  \
+  value_schema:\n    \
+    text: { type: string }\n\
+store.notes:\n  \
+  kind: kv\n  \
+  scope: global\n  \
+  description: …and the MySQL one.\n  \
+  backend: notes_db\n  \
+  value_schema:\n    \
+    text: { type: string }\n\
+flow.probe:\n  \
+  outputs: {}\n  \
+  nodes:\n    \
+    step: { exec: { command: \"true\" } }\n  \
+  edges:\n    \
+    - { from: start, to: step }\n    \
+    - { from: step, to: end }\n";
+
 /// The variable the emitted project's store binding names its address in.
 ///
 /// Named here rather than reused from the ambient environment: the emitted
@@ -161,16 +201,48 @@ const OTHER_STORE_URLS: &[&str] = &[
     "AGENT_COMPOSE_STORE_URL_D",
 ];
 
-/// Build one project whose store binds `provider`, and answer where it landed.
+/// Build the project `composition` and `deploy` describe, and answer where the
+/// emitted TypeScript landed.
 ///
-/// The area is a directory of its own per provider, because libtest runs the
-/// tests of one binary in **parallel threads**: two tests both building under
-/// one path would be one `remove_dir_all` racing the other's `bun`.
-fn built(root: &Path, provider: &str) -> PathBuf {
-    let source = root.join("projects").join("store-sources").join(provider);
+/// `area` names a scratch directory of its own, because libtest runs the tests
+/// of one binary in **parallel threads**: two tests both building under one path
+/// would be one `remove_dir_all` racing the other's `bun`.
+fn build_project(root: &Path, area: &str, composition: &str, deploy: &str) -> PathBuf {
+    let source = root.join("projects").join("store-sources").join(area);
     let _ = fs::remove_dir_all(&source);
     fs::create_dir_all(source.join("deploy")).expect("the scratch area is writable");
-    fs::write(source.join("main.yml"), COMPOSITION).expect("the entrypoint is writable");
+    fs::write(source.join("main.yml"), composition).expect("the entrypoint is writable");
+    fs::write(source.join("deploy/remote.yml"), deploy).expect("the deploy file is writable");
+
+    let entrypoint = source.join("main.yml");
+    let resolution = compose_core::resolve_with_target(&entrypoint, "remote");
+    assert!(
+        resolution.diagnostics.is_empty(),
+        "the `{area}` fixture does not resolve: {:#?}",
+        resolution.diagnostics
+    );
+    let ir = resolution.ir.expect("a clean resolution has an artifact");
+    let diagnostics = compose_core::check(&ir);
+    assert!(
+        diagnostics.is_empty(),
+        "the `{area}` fixture does not validate: {diagnostics:#?}"
+    );
+
+    let authored = compose_core::Authored::read(&ir, &source)
+        .expect("the fixture references no module binding");
+    let destination = root.join("projects").join("store").join(area);
+    let _ = fs::remove_dir_all(&destination);
+    for file in compose_core::emit(&ir, &authored).files() {
+        let target = destination.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        fs::create_dir_all(target.parent().expect("an emitted path has a parent"))
+            .expect("the scratch area is writable");
+        fs::write(&target, &file.contents).expect("an emitted file is writable");
+    }
+    destination
+}
+
+/// Build one project whose store binds `provider`, and answer where it landed.
+fn built(root: &Path, provider: &str) -> PathBuf {
     // `local` substitutes local storage for every store unconditionally and
     // consults no alias at all (Decision D87), so the target has a name — which
     // is also the shape an operator writes, since a store on a server is a
@@ -184,33 +256,22 @@ fn built(root: &Path, provider: &str) -> PathBuf {
             "version: \"0.1\"\nstorage_backends:\n  aliases:\n    contract_db: {{ provider: {provider}, url: \"${{{STORE_URL}}}\" }}\n"
         )
     };
-    fs::write(source.join("deploy/remote.yml"), deploy).expect("the deploy file is writable");
+    build_project(root, provider, COMPOSITION, &deploy)
+}
 
-    let entrypoint = source.join("main.yml");
-    let resolution = compose_core::resolve_with_target(&entrypoint, "remote");
+/// Type-check one built project, naming it in the failure.
+fn type_check(project: &Path, what: &str) {
+    let checked = bun()
+        .args(["run", "typecheck"])
+        .current_dir(project)
+        .output()
+        .expect("bun runs");
     assert!(
-        resolution.diagnostics.is_empty(),
-        "the `{provider}` fixture does not resolve: {:#?}",
-        resolution.diagnostics
+        checked.status.success(),
+        "the `{what}` store project does not type-check:\n{}\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr),
     );
-    let ir = resolution.ir.expect("a clean resolution has an artifact");
-    let diagnostics = compose_core::check(&ir);
-    assert!(
-        diagnostics.is_empty(),
-        "the `{provider}` fixture does not validate: {diagnostics:#?}"
-    );
-
-    let authored = compose_core::Authored::read(&ir, &source)
-        .expect("the fixture references no module binding");
-    let destination = root.join("projects").join("store").join(provider);
-    let _ = fs::remove_dir_all(&destination);
-    for file in compose_core::emit(&ir, &authored).files() {
-        let target = destination.join(file.path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        fs::create_dir_all(target.parent().expect("an emitted path has a parent"))
-            .expect("the scratch area is writable");
-        fs::write(&target, &file.contents).expect("an emitted file is writable");
-    }
-    destination
 }
 
 /// Say something a plain `cargo test` really prints.
@@ -238,18 +299,7 @@ fn contract(root: &Path, backend: &Backend) -> Option<BTreeMap<String, Value>> {
     // with no MySQL and fail only in CI. What an absent server skips is the
     // **run**, below.
     let project = built(root, backend.provider);
-    let checked = bun()
-        .args(["run", "typecheck"])
-        .current_dir(&project)
-        .output()
-        .expect("bun runs");
-    assert!(
-        checked.status.success(),
-        "the `{}` store project does not type-check:\n{}\n{}",
-        backend.provider,
-        String::from_utf8_lossy(&checked.stdout),
-        String::from_utf8_lossy(&checked.stderr),
-    );
+    type_check(&project, backend.provider);
 
     let address = match backend.variable {
         None => None,
@@ -432,6 +482,58 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_replayed_read_answers_out_of_the_record",
     "a_replayed_write_is_not_applied_again",
 ];
+
+/// **A target that binds both dialled arms gets one module, and it compiles.**
+///
+/// `src/stores.ts` is **assembled** — the invariant half plus one arm per
+/// provider this composition's stores bind (`codegen::stores`) — so the arms are
+/// not three files a reader checks one at a time: the top level of an emitted
+/// module is their *union*. Two arms that happen to declare one name are a
+/// duplicate top-level declaration there, and that is not a style problem.
+/// `tsc` refuses it (TS2393 for a function, TS2451 for a binding), so the
+/// emitted project fails its own `typecheck` script; Node refuses to load the
+/// module at all, because a top-level `function` in an ES module is lexically
+/// declared, so every command of that build — `run`, `serve`, `resume` — dies at
+/// import before a single store op; and Bun is lenient, silently keeping the
+/// last declaration, which is worse than either, because a MySQL store would
+/// then raise the Postgres arm's wording on the runtime the README makes
+/// default.
+///
+/// The suite above builds one project **per provider** and would never see it,
+/// and no golden carries two dialled arms either (`triage-fanout-staging` is
+/// Postgres twice over, its store and its journal). This is the only place the
+/// union is compiled.
+///
+/// No server, and none is skipped for: what is under test is the composition of
+/// the arms, which `tsc` answers on a machine with no database.
+#[test]
+fn a_target_binding_both_dialled_arms_is_one_module_that_compiles() {
+    let Some(root) = installed() else {
+        return;
+    };
+    // Two variables, because two aliases naming one would be one connection —
+    // fine for a graph, and beside the point here. Neither is read: nothing runs.
+    let deploy = format!(
+        "version: \"0.1\"\nstorage_backends:\n  aliases:\n    \
+         prefs_db: {{ provider: postgres, url: \"${{{STORE_URL}}}\" }}\n    \
+         notes_db: {{ provider: mysql, url: \"${{{}}}\" }}\n",
+        OTHER_STORE_URLS[0]
+    );
+    let project = build_project(root, "both-arms", BOTH_ARMS, &deploy);
+
+    // The project really carries both arms, so a green run cannot be one that
+    // quietly compiled a single-arm module.
+    let module = fs::read_to_string(project.join("src/stores.ts")).expect("the module is emitted");
+    for registration in ["STORE_BACKENDS.postgres = ", "STORE_BACKENDS.mysql = "] {
+        assert!(
+            module.contains(registration),
+            "the two-provider project's `src/stores.ts` carries no `{registration}`, so this case \
+             type-checks a module that is not the union it exists to check (PRD resolved q63)"
+        );
+    }
+
+    type_check(&project, "postgres+mysql");
+}
 
 /// **Every `kv` backend this release opens is driven, or says why it is not.**
 ///

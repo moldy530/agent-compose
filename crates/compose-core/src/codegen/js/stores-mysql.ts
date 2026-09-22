@@ -252,20 +252,6 @@ function storeNamesNoDatabase(where: string): Error {
   );
 }
 
-/**
- * What a statement is refused with once a store's connection has been lost.
- *
- * The Postgres arm's doc says what "refused" means and what it deliberately
- * does not mean: this connection is not redialled *inside* the op that failed,
- * and the faulted connection is dropped so the **next** op dials a fresh one.
- */
-function storeConnectionLost(where: string, cause: unknown): Error {
-  const detail = cause instanceof Error ? cause.message : String(cause);
-  return new Error(
-    `this project lost its connection to the \`mysql\` store backend at \`\${${where}}\`: ${detail}. It is not redialled inside the op that failed — a write whose connection died is one nothing can say landed or did not — so this op fails and the node's own \`retry:\` decides what happens next; a retry carries the idempotency key its first attempt carried, which is what makes it apply once (grammar 9.4, PRD 5.8), and it runs over a connection dialled again rather than over this one`,
-  );
-}
-
 /** One MySQL server, as the connection a dialled `kv` store runs over. */
 class MysqlStoreDriver implements StoreDriver {
   readonly dialect = MYSQL_STORE_DIALECT;
@@ -377,7 +363,7 @@ async function openMysqlStore(
   // connection to attach to: the promise `createConnection` answers rejects
   // rather than emits when it is the *connect* that failed.
   connection.on("error", (reported: unknown) => {
-    fault.error ??= storeConnectionLost(where, reported);
+    fault.error ??= storeConnectionLost("mysql", where, reported);
     // …and the connection goes with it, so the next op dials a fresh one rather
     // than inheriting this error for the life of the process. See
     // [`storeConnectionLost`].

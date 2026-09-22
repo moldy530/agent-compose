@@ -233,6 +233,96 @@ mod tests {
         );
     }
 
+    /// **The halves are appended into one module, so they share no top-level
+    /// name.**
+    ///
+    /// [`module`] concatenates the invariant half with one arm per bound
+    /// provider, which makes the top level of an emitted `src/stores.ts` the
+    /// *union* of the three files' top levels rather than any one of them. A
+    /// name declared in two of them is therefore a duplicate declaration in
+    /// every project that binds both: `tsc` refuses it (TS2393 for a function,
+    /// TS2451 for a binding) and Node refuses to load the module at all, because
+    /// a top-level `function` in an ES module is lexically declared — so every
+    /// command of that build would die at import, before a single store op. Bun
+    /// is lenient and silently keeps the last declaration, which is worse: a
+    /// MySQL store would raise the Postgres arm's wording.
+    ///
+    /// Checked here, in Rust, rather than only by the `tsc` gate in
+    /// `tests/store_backend_conformance.rs`, because this one needs no
+    /// toolchain: it runs on a `cargo test` with no Bun, where that suite stands
+    /// down.
+    ///
+    /// Names in **two different files** are what this flags. A name declared
+    /// twice inside one file is that file's business — TypeScript's overload
+    /// signatures and interface merging are both spelled that way, and both are
+    /// as legal in the emitted module as in the source.
+    #[test]
+    fn the_halves_of_the_module_share_no_top_level_name() {
+        use std::collections::BTreeMap;
+
+        /// Every name a file declares at its top level — column zero, since
+        /// these three are formatted files and nothing else is out there.
+        fn declared(module: &str) -> Vec<&str> {
+            module
+                .lines()
+                .filter(|line| !line.starts_with(char::is_whitespace))
+                .filter_map(|line| {
+                    let rest = line.strip_prefix("export ").unwrap_or(line);
+                    let rest = rest.strip_prefix("declare ").unwrap_or(rest);
+                    let rest = rest.strip_prefix("async ").unwrap_or(rest);
+                    let rest = [
+                        "function ",
+                        "const ",
+                        "let ",
+                        "var ",
+                        "class ",
+                        "type ",
+                        "interface ",
+                        "enum ",
+                    ]
+                    .into_iter()
+                    .find_map(|keyword| rest.strip_prefix(keyword))?;
+                    let name = rest
+                        .split(|character: char| {
+                            !(character.is_alphanumeric() || character == '_' || character == '$')
+                        })
+                        .next()?;
+                    (!name.is_empty()).then_some(name)
+                })
+                .collect()
+        }
+
+        let mut declarers: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (file, module) in [
+            ("stores.ts", SOURCE),
+            ("stores-postgres.ts", POSTGRES),
+            ("stores-mysql.ts", MYSQL),
+        ] {
+            for name in declared(module) {
+                declarers.entry(name).or_default().insert(file);
+            }
+        }
+        let collisions: Vec<_> = declarers
+            .iter()
+            .filter(|(_, files)| files.len() > 1)
+            .collect();
+        assert!(
+            collisions.is_empty(),
+            "two halves of `src/stores.ts` declare one name, so a target that binds both arms \
+             emits a module with a duplicate top-level declaration — `tsc` refuses it and Node \
+             refuses to load it, which kills every command of that build at import (PRD resolved \
+             q63). Give each arm its own name, or hoist the shared one into the invariant half: \
+             {collisions:#?}"
+        );
+
+        // …and the scan really sees declarations, rather than passing because it
+        // matched nothing: the seam an arm answers through is in the invariant
+        // half, and each arm has a driver class of its own.
+        assert!(declared(SOURCE).contains(&"STORE_BACKENDS"));
+        assert!(declared(POSTGRES).contains(&"PostgresStoreDriver"));
+        assert!(declared(MYSQL).contains(&"MysqlStoreDriver"));
+    }
+
     /// The driver is reached by the one specifier PRD §9.18 admits, and the two
     /// this project refuses are named nowhere in it.
     #[test]

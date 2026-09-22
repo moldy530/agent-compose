@@ -1214,6 +1214,50 @@ function positionalBind(sql: string): string {
 }
 
 /**
+ * What a statement is refused with once a dialled store's connection has been
+ * lost.
+ *
+ * **In the invariant half rather than once per arm**, and that placement is a
+ * correctness requirement rather than tidiness. This module is assembled from
+ * this half plus one arm per provider the target's stores bind
+ * (`codegen::stores`), so a helper declared in *each* arm is two top-level
+ * declarations of one name in the `src/stores.ts` of a target that binds one
+ * store to `postgres` and another to `mysql`: `tsc` calls it TS2393 and Node
+ * refuses the module outright at import, because a top-level `function` in an ES
+ * module is lexically declared. The sentence was identical on both arms in any
+ * case — only the provider differed — so the provider is a parameter and the
+ * arms share the one declaration.
+ *
+ * **Refused rather than redialled *inside the op*.** On a store that is a
+ * narrower claim than on the journal: there is no guard to hand to another
+ * process, so the reason is the simpler one — a command whose connection died
+ * mid-transaction does not know whether its write landed, and a silent redial
+ * under it would answer as though it had. The node fails under its own
+ * `retry:`/`on_error:` (grammar 9.2), and a retry carrying the idempotency key
+ * of grammar 9.4 is exactly what makes that safe: the ledger already holds the
+ * first attempt, or it does not.
+ *
+ * **And the connection is dropped, so the retry has one to run over.** Neither
+ * `pg` nor `mysql2` reconnects on its own and this fault is permanent once set,
+ * so a connection left in the dialled cache would refuse every op of every later
+ * execution with this same error until the process restarted — which on a
+ * `serve`, the deployment a dialled store exists for, is for ever. The
+ * journal's identical stickiness is deliberate, because a lost session there is
+ * a lost writer guard and redialling would fork the record; a store has no guard
+ * and nothing to fork, so the narrow claim above is the whole of it.
+ *
+ * `where` is the **variable name** the address was read from, never the address:
+ * every message this module raises about a connection names the line an operator
+ * can change, and a store URL is a credential.
+ */
+function storeConnectionLost(provider: BackendProvider, where: string, cause: unknown): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(
+    `this project lost its connection to the \`${provider}\` store backend at \`\${${where}}\`: ${detail}. It is not redialled inside the op that failed — a write whose connection died is one nothing can say landed or did not — so this op fails and the node's own \`retry:\` decides what happens next; a retry carries the idempotency key its first attempt carried, which is what makes it apply once (grammar 9.4, PRD 5.8), and it runs over a connection dialled again rather than over this one`,
+  );
+}
+
+/**
  * The arms this build emitted, by provider.
  *
  * Empty until an arm appended to this module registers itself, which `build`
