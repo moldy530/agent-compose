@@ -3307,9 +3307,20 @@ document states the asymmetry rather than implying the two are equivalent:
 * **`cc` enforces it in-loop**, in two layers, because one of them has a hole.
   The list is the **tool set the Agent SDK makes available** to the run at all,
   so a tool outside it is one the harness is never offered; and a call outside it
-  that reaches the loop anyway goes through the SDK's per-call permission
-  callback and is denied with a message the model reads. The denial is recorded
-  as a `"refused"` tool event in the trace ([`docs/trace.md`](trace.md) §7.6).
+  that reaches the loop anyway is answered per call by whichever party the
+  node's permission mode consults, which is the mode's to say and not this
+  grammar's. Under `default`, `acceptEdits` and `plan` that party is the SDK's
+  per-call permission callback, which denies the call with a message the model
+  reads, and the denial is recorded as a `"refused"` tool event in the trace
+  ([`docs/trace.md`](trace.md) §7.6). Under `dontAsk` no callback is consulted
+  at all — the mode denies whatever it finds no pre-approval for — so the list
+  is handed to the SDK as that pre-approval and no callback is set: a call
+  outside it is still denied, by the mode, but the trace records it as the error
+  result the loop hands back (`"failed"`), not as `"refused"`. Under `auto` the
+  mode's classifier answers first and the callback only where the classifier
+  hands the question back, so a call the classifier settles itself — allowing it
+  or denying it — never reaches the callback, and a denial it makes is recorded
+  as `dontAsk`'s is. Under `bypassPermissions` nobody is asked.
   The available set is the load-bearing layer, and the reason is `access:`: the
   `full_access` preset is the SDK's mode that bypasses **every** permission
   check, so a bound resting on the callback alone would not hold on the one node
@@ -9268,11 +9279,21 @@ could verify against anything.
 
 **Rationale, the asymmetry**: `cc` enforces `allow_tools:` inside its own loop —
 as the set of tools the Agent SDK makes available to the run, and per call
-through that SDK's permission callback over the top. Both layers, deliberately:
-the callback alone would lapse exactly where containment is loosest, because
+through that SDK's permission surface over the top. Both layers, deliberately:
+the per-call one alone would lapse exactly where containment is loosest, because
 `access: full_access` is the permission mode that bypasses every permission
 check, and a bound that a preset can switch off is not one this document should
-be claiming. `codex` bounds at the sandbox boundary only — its per-call approval
+be claiming. Which party answers the per-call half is the node's permission
+mode's to say, since
+[D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)
+made the mode a key: the SDK's permission callback under `default`,
+`acceptEdits` and `plan`, where a denial is taped `"refused"`; `auto`'s
+classifier first and the callback only where the classifier hands the question
+back; and under `dontAsk`, which consults no callback, the list is the SDK's
+pre-approval instead and the mode itself denies what lies outside it. A denial
+the SDK makes without consulting the callback reaches the trace as the error
+result the loop hands back — `"failed"` rather than `"refused"` (§8.9). `codex`
+bounds at the sandbox boundary only — its per-call approval
 tier belongs to an app server this release does not adopt. The two are **not**
 equivalent and §8.9 says so, the
 `plan` report says so, and the graph document carries it as a field
