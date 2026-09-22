@@ -625,12 +625,19 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  *    `allowedTools` — and no callback is set. A call outside the list is still
  *    denied per call, by the mode, and still taped `"refused"`: the SDK
  *    reports that denial with the same frame as the classifier's.
- *  * `bypassPermissions` consults nobody either, and approves: see the hole.
+ *  * `bypassPermissions` approves an ordinary call itself, asking nobody: see
+ *    the hole. It is not a mode that never asks, though. The pinned CLI's
+ *    permission flow still returns `ask` under it for a check it marks
+ *    **bypass-immune** — a dangerous removal among them — and hands that ask
+ *    to the host as any other mode would, so the same callback is set and
+ *    answers those asks with the list. That is read off the pinned CLI's
+ *    permission flow, not observed in a run.
  *
  * The hole is `access: full_access`, and it is why `tools` carries the bound
  * rather than the gate: that preset is `permissionMode: "bypassPermissions"`,
- * which the SDK documents as bypassing **all** permission checks — so no gate
- * runs, and a node whose `enforcesTools` says its list is enforced would be
+ * which the SDK documents as bypassing **all** permission checks — and which
+ * does approve an ordinary call without asking the gate, so a node whose
+ * `enforcesTools` says its list is enforced would, on the gate alone, be
  * asserting a bound nothing held (grammar 8.9, PRD resolved q57 ruling c).
  * Narrowing the available set is the answer the SDK's own documentation gives
  * for `allowedTools`: "to restrict which tools are available, use the `tools`
@@ -647,11 +654,18 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  * `allowedTools` stays on [`CC_RESERVED`] for the same reason: a `settings:`
  * key spelling it would put the shadow back under every other mode.
  *
- * One shadow is accepted, and it is the hole above: under `bypassPermissions`
- * the SDK reports the callback as shadowed under the same code, because that
- * mode approves every call before any callback runs. The callback is kept there
- * all the same — that mode reads no pre-approval the list could move into, and
- * under it the bound was never the gate's to hold: `tools` holds it.
+ * One shadow report is accepted, and it is the hole above: under
+ * `bypassPermissions` the SDK reports the callback as shadowed under the same
+ * code, with a warning that the mode "auto-approves every tool call (except
+ * explicit deny rules) before the callback is consulted". That is true of an
+ * ordinary call and not of every one: the bypass-immune checks above still
+ * come back as asks, and the SDK hands an ask to `canUseTool` where one is set
+ * and treats it as a denial where none is. So the callback is not dead under
+ * that mode, and that is why it is kept: it answers those asks with the list —
+ * `allow` for a tool inside it, as under every mode that asks it, so on a
+ * `full_access` node whose list holds `Bash` a removal the CLI stopped to ask
+ * about is approved. What the gate never holds under that mode is the bound
+ * itself: `tools` holds it.
  *
  * # How a refusal reaches the trace
  *
@@ -828,10 +842,11 @@ export function ccOptions(
       options.allowedTools = [...allowed];
     } else {
       // Every other mode asks the host about a call it does not settle itself
-      // (`auto` once its classifier hands the question back), and this is the
-      // host's answer: `allow` inside the list, which is what keeps a bounded
-      // run from prompting, and a taped `deny` outside it. Under
-      // `bypassPermissions` nothing is asked, and `tools` holds the bound.
+      // (`auto` once its classifier hands the question back, and
+      // `bypassPermissions` for the checks the CLI holds immune to that mode),
+      // and this is the host's answer: `allow` inside the list, which is what
+      // keeps a bounded run from prompting, and a taped `deny` outside it.
+      // Under `bypassPermissions` `tools` holds the bound.
       options.canUseTool = (name, _input, ask) => {
         if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
         const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;

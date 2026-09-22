@@ -3307,13 +3307,31 @@ document states the asymmetry rather than implying the two are equivalent:
 * **`cc` enforces it in-loop**, in two layers, because one of them has a hole.
   The list is the **tool set the Agent SDK makes available** to the run at all,
   so a tool outside it is one the harness is never offered; and a call outside it
-  that reaches the loop anyway goes through the SDK's per-call permission
-  callback and is denied with a message the model reads. The denial is recorded
-  as a `"refused"` tool event in the trace ([`docs/trace.md`](trace.md) §7.6).
+  that reaches the loop anyway is denied per call by the SDK's permission
+  surface, with a message the model reads. The denial is recorded as a
+  `"refused"` tool event in the trace ([`docs/trace.md`](trace.md) §7.6),
+  whichever part of that surface made it. *Which* part answers is the node's
+  permission mode's to say — the modes differ in who answers a call they do not
+  settle themselves — so the list is handed to the part its mode consults:
+  * under `default`, `acceptEdits` and `plan`, the SDK's per-call permission
+    callback, which answers `allow` inside the list and denies outside it;
+  * under `auto`, the mode's classifier answers first and that same callback
+    only where the classifier hands the question back. The classifier may
+    therefore refuse a call **inside** the list, which is the mode the node
+    asked for: the list says what the run may reach, and `auto` says a
+    classifier approves each call within that;
+  * under `dontAsk`, which consults no callback and denies whatever is not
+    pre-approved, the list is handed to the SDK as that pre-approval instead, so
+    a call inside it runs and the mode itself denies the rest;
+  * under `bypassPermissions`, the mode approves an ordinary call without asking
+    anyone. What still reaches the callback is the few safety checks the SDK
+    holds immune to that mode — a dangerous removal among them — and the
+    callback answers those with the list.
+
   The available set is the load-bearing layer, and the reason is `access:`: the
   `full_access` preset is the SDK's mode that bypasses **every** permission
-  check, so a bound resting on the callback alone would not hold on the one node
-  that asked for the least containment.
+  check but those few, so a bound resting on the per-call half alone would not
+  hold on the one node that asked for the least containment.
 * **`codex` bounds at the sandbox only.** Its per-call approval tier belongs to
   an app server this release does not adopt, so the list is what the harness is
   *offered* and the sandbox preset is what holds. Offered is literal: a thread
@@ -9268,11 +9286,21 @@ could verify against anything.
 
 **Rationale, the asymmetry**: `cc` enforces `allow_tools:` inside its own loop —
 as the set of tools the Agent SDK makes available to the run, and per call
-through that SDK's permission callback over the top. Both layers, deliberately:
-the callback alone would lapse exactly where containment is loosest, because
+through that SDK's permission surface over the top. Both layers, deliberately:
+the per-call one alone would lapse exactly where containment is loosest, because
 `access: full_access` is the permission mode that bypasses every permission
-check, and a bound that a preset can switch off is not one this document should
-be claiming. `codex` bounds at the sandbox boundary only — its per-call approval
+check but a few safety checks, and a bound that a preset can switch off is not
+one this document should be claiming. Which part of the permission surface
+carries the per-call half is the node's permission mode's to say, since
+[D146](#d146-a-coder-nodes-permission-mode-is-a-key-bounded-by-access-and-a-reserved-setting-is-refused)
+made the mode a key and the modes differ in who answers a call: the SDK's
+permission callback under the modes that consult one — `auto` only where its
+classifier hands the question back, so the classifier may refuse a call inside
+the list — and, under `dontAsk`, which consults none and denies whatever is not
+pre-approved, the SDK's pre-approval list. Whichever part carries it, what the
+list contributes is the same — `allow` inside it, a denial outside it — and a
+denial is a `"refused"` tool event whichever part made it (§8.9).
+`codex` bounds at the sandbox boundary only — its per-call approval
 tier belongs to an app server this release does not adopt. The two are **not**
 equivalent and §8.9 says so, the
 `plan` report says so, and the graph document carries it as a field

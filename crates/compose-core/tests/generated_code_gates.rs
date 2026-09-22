@@ -6779,8 +6779,10 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
     // — a bare entry there approves the whole tool before the callback is
     // consulted, which the pinned SDK reports from `query()` as
     // `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`. `auto` asks its classifier first and
-    // the callback where the classifier hands a question back; under
-    // `bypassPermissions` nothing is asked and `tools` holds the bound.
+    // the callback where the classifier hands a question back;
+    // `bypassPermissions` approves an ordinary call itself and asks the
+    // callback about the checks the CLI holds immune to that mode, and `tools`
+    // holds the bound.
     let gates = &answer["allowlistByMode"];
     for mode in [
         "default",

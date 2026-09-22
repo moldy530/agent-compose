@@ -7984,8 +7984,10 @@ function decode(
 // two harnesses do not enforce them identically:
 //
 //  * `cc` takes a working directory and a permission mode, and enforces the
-//    node's `allow_tools:` **in its own loop**, per call, through the Agent
-//    SDK's permission callback;
+//    node's `allow_tools:` **in its own loop**: as the tool set its loop is
+//    offered, and per call through the part of the Agent SDK's permission
+//    surface the mode consults — its permission callback, or under `dontAsk`
+//    its pre-approval list;
 //  * `codex` takes a sandbox preset and bounds at that boundary only. Its
 //    per-call approval tier is their app server's, which this release does not
 //    adopt, so an `allow_tools:` on a `codex` node is what the harness is
