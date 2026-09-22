@@ -6645,14 +6645,17 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         "the `cc` options carry bare `allowedTools` beside `canUseTool`, which shadows the \
          callback for every name on the list"
     );
-    // …so the callback is what answers the list: `allow` for a call inside it,
-    // which is what keeps a bounded run from prompting, and `deny` outside it.
+    // …so under this node's mode — `acceptEdits`, derived, which asks the host
+    // about a call it does not settle itself — the callback is what answers the
+    // list: `allow` for a call inside it, which is what keeps a bounded run from
+    // prompting, and `deny` outside it. Whether a given mode asks the callback
+    // at all is the `allowlistByMode` table below.
     assert_eq!(
         bound["callback"],
         json!({ "inList": "allow", "outOfList": "deny" }),
-        "the `cc` permission callback does not answer the node's own list — with no \
-         `allowedTools` beside it, an in-list call it does not allow is one the run stops to \
-         ask about"
+        "the `cc` permission callback does not answer the node's own list — under \
+         `acceptEdits`, which asks the host about a call it does not settle itself, an in-list \
+         call the callback does not allow is one the run stops to ask about"
     );
     assert_eq!(
         bound["systemPromptIsThePreset"],
@@ -6706,7 +6709,8 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
     // all three are read, because keying two of them off `run.access` is the
     // shape that looks right and is not — it would arm the skip flag on a
     // `full_access` node that asked for `plan`, and leave that same node running
-    // the vendor's default plan body instead of its own `prompt:`.
+    // the vendor's default plan body instead of its own `prompt:`. The fourth
+    // thing that answers to it, the allowlist's per-call gate, follows them.
     let modes = &answer["permissionMode"];
     for (level, derived) in [
         ("derivedReadOnly", "plan"),
@@ -6761,6 +6765,59 @@ fn the_harness_run_stayed_inside_its_bounds(answer: &Value) {
         json!({ "mode": "bypassPermissions", "skip": true, "planBody": null }),
         "writing out the mode a level already derives changed what the run is handed"
     );
+
+    // …and the fourth thing that answers to the mode: which option carries
+    // `allow_tools:`'s per-call answer (grammar 8.9, Decisions D138 and D146).
+    // The answer is the list's in every mode; what differs is who the SDK asks.
+    // Every mode but `dontAsk` gets the callback and no `allowedTools` beside it
+    // — a bare entry there approves the whole tool before the callback is
+    // consulted, which the pinned SDK reports from `query()` as
+    // `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`. `auto` asks its classifier first and
+    // the callback where the classifier hands a question back; under
+    // `bypassPermissions` nothing is asked and `tools` holds the bound.
+    let gates = &answer["allowlistByMode"];
+    for mode in [
+        "default",
+        "acceptEdits",
+        "plan",
+        "auto",
+        "bypassPermissions",
+    ] {
+        assert_eq!(
+            gates[mode],
+            json!({
+                "mode": mode,
+                "tools": ["Bash", "Read"],
+                "allowedTools": null,
+                "callback": { "inList": "allow", "outOfList": "deny" },
+            }),
+            "a `cc` run under `{mode}` is not bounded by `tools` and gated by the permission \
+             callback alone: with `allowedTools` beside the callback the SDK reports it shadowed, \
+             and without a callback that answers the list an in-list call stops to ask or is \
+             denied"
+        );
+    }
+    // `dontAsk` is the mode that consults no callback: the pinned SDK documents
+    // it as "deny if not pre-approved", and its CLI denies a would-ask call
+    // without asking `canUseTool`. So the list is the pre-approval and no
+    // callback is set — a callback there is dead, and beside bare `allowedTools`
+    // it is the shadowed pairing again. Read at two levels, so the choice is
+    // seen to key off the mode rather than off `access:`.
+    for case in ["dontAsk", "dontAskUnderFullAccess"] {
+        assert_eq!(
+            gates[case],
+            json!({
+                "mode": "dontAsk",
+                "tools": ["Bash", "Read"],
+                "allowedTools": ["Bash", "Read"],
+                "callback": null,
+            }),
+            "a `dontAsk` run does not pre-approve its own `allow_tools:` — that mode denies a \
+             call it finds no pre-approval for without consulting `canUseTool`, so every in-list \
+             tool that needs a permission (`Bash`, `Edit`, `Write`) is denied on a node whose \
+             list allows it, and no `settings:` key can pre-approve one instead (Decision D146)"
+        );
+    }
 
     let codex = &answer["codexBound"];
     assert_eq!(

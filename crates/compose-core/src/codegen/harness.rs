@@ -965,40 +965,54 @@ mod tests {
     }
 
     /// **A `cc` run never pairs bare `allowedTools` with its permission
-    /// callback** (grammar 8.9, Decision D138, PRD resolved q57 ruling c).
+    /// callback, and carries the list's per-call answer through the option its
+    /// mode reads** (grammar 8.9, Decisions D138 and D146, PRD resolved q57
+    /// ruling c and q60 ruling a).
     ///
-    /// `allow_tools:` reaches the Agent SDK as two options: `tools`, the
-    /// availability bound no permission mode widens, and `canUseTool`, the
-    /// per-call gate that answers `allow` for a call inside the list — which is
-    /// what keeps a bounded run from prompting — and denies, and tapes as
-    /// `"refused"`, a call outside it. A third option reads like the obvious way
-    /// to stop the prompting, and this driver shipped it: `allowedTools`, the
-    /// same list again. A bare entry there approves the whole tool **before**
-    /// the callback is consulted, so the pinned SDK
-    /// (`@anthropic-ai/claude-agent-sdk` 0.3.272) reports the pairing from
-    /// `query()` as a shadowed callback — `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` —
-    /// on every run of every `cc` node that declares `allow_tools:`, and half
-    /// of the list's decision is made ahead of the callback, where the trace's
-    /// refusal taping cannot see it.
+    /// `allow_tools:` reaches the Agent SDK as two layers: `tools`, the
+    /// availability bound no permission mode widens, and a per-call gate whose
+    /// answer is the list's own — `allow` inside it, so a bounded run neither
+    /// prompts about nor denies what it allows, and `deny` outside it. Which
+    /// option carries the gate is the mode's to say:
+    ///
+    ///  * every mode that consults a callback (`default`, `acceptEdits`,
+    ///    `plan`, and `auto` once its classifier hands a question back) gets
+    ///    `canUseTool`, which also tapes a denial as `"refused"` — and **no**
+    ///    `allowedTools` beside it: a bare entry there approves the whole tool
+    ///    before the callback is consulted, so the pinned SDK
+    ///    (`@anthropic-ai/claude-agent-sdk` 0.3.272) reports the pairing from
+    ///    `query()` as a shadowed callback, `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`;
+    ///  * `dontAsk`, which the SDK documents as "deny if not pre-approved" and
+    ///    whose CLI denies a would-ask call **without** consulting
+    ///    `canUseTool`, gets the list as `allowedTools` and no callback. A
+    ///    callback there is dead, and with nothing pre-approved every in-list
+    ///    tool that needs a permission is denied — the regression this test
+    ///    keeps out, and one a check that only asked the callback what it
+    ///    answers could never see.
     ///
     /// Read off the **emitted** module rather than the driver constant, so the
     /// prelude and the `passthrough` it holds are covered too, and read as code:
     /// a comment naming the option to say why it is absent is the comment doing
-    /// its job. The one mention code may make is the reserved-list entry, which
-    /// is what drops a `settings:` key spelling it (the runtime half of that is
-    /// `generated_code_gates`' `a_harness_run_is_contained_journaled_and_recorded`,
-    /// which calls the real option builder). The positive half is held here
-    /// too: the two layers that replace it are still set from the list, and
-    /// the callback still answers `allow` inside it.
+    /// its job. Code may name `allowedTools` in two places — the reserved-list
+    /// entry, which drops a `settings:` key spelling it, and the `dontAsk`
+    /// branch — and the two gate options must be the two arms of one
+    /// `mode === "dontAsk"` test, so no mode is handed both. The runtime half,
+    /// mode by mode, is `generated_code_gates`'
+    /// `a_harness_run_is_contained_journaled_and_recorded`, which calls the real
+    /// option builder.
     #[test]
     fn bare_allowed_tools_are_never_paired_with_the_permission_callback() {
         let emitted = module(&one_coder_node(Harness::Cc)).contents;
-        let mentions: Vec<&str> = emitted
+        let code: Vec<&str> = emitted
             .lines()
             .map(str::trim)
             .filter(|line| {
                 !(line.starts_with("//") || line.starts_with("/*") || line.starts_with('*'))
             })
+            .collect();
+        let mentions: Vec<&str> = code
+            .iter()
+            .copied()
             .filter(|line| {
                 line.split(|held: char| !held.is_ascii_alphanumeric() && held != '_' && held != '$')
                     .any(|word| word == "allowedTools")
@@ -1006,11 +1020,25 @@ mod tests {
             .collect();
         assert_eq!(
             mentions,
-            ["\"allowedTools\","],
-            "the emitted `cc` driver names `allowedTools` in code outside its reserved list: a bare \
-             entry there approves the whole tool before `canUseTool` is consulted, which the pinned \
-             SDK reports from `query()` as `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` (grammar 8.9, \
-             Decision D138)"
+            ["\"allowedTools\",", "options.allowedTools = [...allowed];"],
+            "the emitted `cc` driver names `allowedTools` in code outside its reserved list and its \
+             `dontAsk` branch: a bare entry beside `canUseTool` approves the whole tool before the \
+             callback is consulted, which the pinned SDK reports from `query()` as \
+             `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` (grammar 8.9, Decision D138)"
+        );
+        let gate = [
+            "if (mode === \"dontAsk\") {",
+            "options.allowedTools = [...allowed];",
+            "} else {",
+            "options.canUseTool = (name, _input, ask) => {",
+        ];
+        assert!(
+            code.windows(gate.len()).any(|window| window == gate),
+            "the `cc` driver's two gate options are no longer the two arms of one \
+             `mode === \"dontAsk\"` test: either some mode is handed `allowedTools` beside the \
+             callback it shadows, or `dontAsk` — which denies a would-ask call without consulting \
+             `canUseTool` — is handed the callback instead of the pre-approval, and every in-list \
+             tool that needs a permission is denied (Decision D146)"
         );
         assert!(
             quoted_list(&emitted, "CC_RESERVED").contains("allowedTools"),
@@ -1023,16 +1051,11 @@ mod tests {
              `access: full_access` cannot lift (PRD resolved q57 ruling c)"
         );
         assert!(
-            emitted.contains("options.canUseTool = (name, _input, ask) => {"),
-            "the `cc` driver no longer sets the permission callback, so a call outside the list \
-             is neither denied per call nor taped as `refused`"
-        );
-        assert!(
             emitted.contains(
                 "if (allowed.includes(name)) return Promise.resolve({ behavior: \"allow\" as const });"
             ),
             "the `cc` permission callback no longer answers `allow` for a call inside the list, \
-             and with no `allowedTools` beside it nothing else keeps a bounded run from prompting"
+             so under a mode that consults it an in-list call stops to ask"
         );
     }
 

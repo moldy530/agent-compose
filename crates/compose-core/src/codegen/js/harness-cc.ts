@@ -33,15 +33,17 @@ const CC_SETTINGS: readonly string[] = [
  *    and custom headers are variables of the process it spawns (Decision D143),
  *    so one reserved name holds both bounds — `output:` is
  *    `outputFormat`, `prompt:` is `systemPrompt`, `allow_tools:` is the
- *    available tool set and the callback over it, `timeout:` is the abort
- *    controller, and `model:` is the model and the one thinking budget
- *    Decision D141 maps into it (`thinking` is here for that last reason: the
- *    SDK documents it as taking precedence over the `maxThinkingTokens` D141
- *    writes). `allowedTools` spells `allow_tools:` too, and it is the one name
- *    of this kind the driver below **never** writes: a bare entry there
- *    approves a whole tool before `canUseTool` is consulted, which the pinned
- *    SDK flags as a shadowed callback (see [`CC_DRIVER`]) — so a key spelling
- *    it would put back the very pairing the driver leaves out;
+ *    available tool set and the per-call gate over it (`canUseTool`, or
+ *    `allowedTools` under the one mode that never consults a callback),
+ *    `timeout:` is the abort controller, and `model:` is the model and the one
+ *    thinking budget Decision D141 maps into it (`thinking` is here for that
+ *    last reason: the SDK documents it as taking precedence over the
+ *    `maxThinkingTokens` D141 writes). `allowedTools` is the name of this kind
+ *    the driver below writes under **one** mode only, and never beside
+ *    `canUseTool`: a bare entry there approves a whole tool before the callback
+ *    is consulted, which the pinned SDK flags as a shadowed callback (see
+ *    [`CC_DRIVER`]) — so a key spelling it would put back the very pairing the
+ *    driver leaves out;
  *  * an option that **contains** one without spelling it, which a driver never
  *    assigns and a list keyed off the driver could therefore never hold.
  *    `extraArgs` is an arbitrary CLI flag — `dangerously-skip-permissions` and
@@ -160,12 +162,14 @@ const CC_PERMISSION: Readonly<Record<runtime.WorkspaceAccess, PermissionMode>> =
  * `access:` level derives (grammar 8.9, Decision D146, PRD resolved q60 ruling
  * a).
  *
- * **One function, because three options answer to this value** and a second
+ * **One function, because four options answer to this value** and a second
  * reading of it would be a second answer. `permissionMode` is the mode itself;
  * `allowDangerouslySkipPermissions` is the flag the SDK *requires* beside
- * `bypassPermissions` and beside nothing else; and `planModeInstructions` is
- * plan mode's body, which exists only when the mode is `plan`. Keying those two
- * off `run.access` instead — which is what this driver did while `access:` was
+ * `bypassPermissions` and beside nothing else; `planModeInstructions` is plan
+ * mode's body, which exists only when the mode is `plan`; and `allow_tools:`'s
+ * per-call gate is `canUseTool` or `allowedTools` according to whether the mode
+ * ever consults a callback (see [`CC_DRIVER`]). Keying the two flags off
+ * `run.access` instead — which is what this driver did while `access:` was
  * the only axis — would arm the skip flag on a `full_access` node that asked for
  * `plan`, and leave a `full_access` node that asked for `plan` running the
  * vendor's default code-implementation body instead of the node's own prompt.
@@ -408,41 +412,67 @@ function ccEnvironment(run: runtime.HarnessRun): Record<string, string> {
  *
  * # What enforces the allowlist
  *
- * **Two options, because one of them has a hole.** `tools` is the SDK's own
+ * **Two layers, because one of them has a hole.** `tools` is the SDK's own
  * "base set of available built-in tools", so a list written there is a tool set
  * the model is never offered — the availability bound, which holds whatever the
- * permission mode is. `canUseTool` is the per-call gate over it, consulted
- * where a call would otherwise stop to ask: it answers `allow` for a name
- * inside the list, so a bounded run is not also a prompting one, and it denies
- * anything outside the list that reached the loop anyway, taping the denial as
- * a `"refused"` tool event so the trace says the bound bit.
+ * permission mode is. Over it sits a per-call gate whose answer is always the
+ * list's own — `allow` inside it, so a bounded run is not also a prompting or
+ * a denying one, and `deny` outside it — and **which option carries that answer
+ * is the mode's to say**, because the SDK's six modes do not all consult the
+ * same party about a call they do not settle themselves:
+ *
+ *  * `default`, `acceptEdits` and `plan` stop to ask the host, and the host's
+ *    answer is `canUseTool`. It answers `allow` for a name inside the list and
+ *    denies anything outside it that reached the loop anyway, taping the
+ *    denial as a `"refused"` tool event so the trace says the bound bit.
+ *  * `auto` asks its model classifier first and the host only where the
+ *    classifier hands the question back, so the same callback is set — and an
+ *    in-list call the classifier refuses is refused before the callback is
+ *    consulted, reaching the trace as the error `tool_result` it comes back as
+ *    rather than as `"refused"`. That order is the mode the node named ("use a
+ *    model classifier to approve/deny permission prompts"): approving the list
+ *    ahead of the classifier would leave it nothing to answer. It is read off
+ *    the pinned CLI's permission flow, not observed — no offline run engages
+ *    the classifier.
+ *  * `dontAsk` consults nobody. The pinned SDK documents it as "deny if not
+ *    pre-approved", and its CLI denies a call that would ask **without**
+ *    consulting `canUseTool` (observed against the pinned release, not only
+ *    read: the call denied, the callback never asked) — so a callback there
+ *    would be dead, and the list's `allow` would be answered by nothing: every
+ *    in-list tool that needs a permission (`Bash`, `Edit`, `Write`) denied, on
+ *    a node whose own list allows it, with no other way for the author to
+ *    pre-approve one (`allowedTools`, `settings` and `settingSources` are all
+ *    on [`CC_RESERVED`]). So under `dontAsk` the list *is* the pre-approval —
+ *    `allowedTools` — and no callback is set. A call outside the list is still
+ *    denied per call, by the mode; what that mode gives up is the taping, for
+ *    the classifier's reason above.
+ *  * `bypassPermissions` consults nobody either, and approves: see the hole.
  *
  * The hole is `access: full_access`, and it is why `tools` carries the bound
- * rather than the callback: that preset is `permissionMode: "bypassPermissions"`,
- * which the SDK documents as bypassing **all** permission checks — so
- * `canUseTool` does not run, and a node whose `enforcesTools` says its list is
- * enforced would be asserting a bound nothing held (grammar 8.9, PRD resolved
- * q57 ruling c). Narrowing the available set is the answer the SDK's own
- * documentation gives for `allowedTools`: "to restrict which tools are
- * available, use the `tools` option instead".
+ * rather than the gate: that preset is `permissionMode: "bypassPermissions"`,
+ * which the SDK documents as bypassing **all** permission checks — so no gate
+ * runs, and a node whose `enforcesTools` says its list is enforced would be
+ * asserting a bound nothing held (grammar 8.9, PRD resolved q57 ruling c).
+ * Narrowing the available set is the answer the SDK's own documentation gives
+ * for `allowedTools`: "to restrict which tools are available, use the `tools`
+ * option instead".
  *
- * **And not three: there is no `allowedTools`**, though it reads like the way
- * to keep a bounded run from prompting. A bare name there approves the whole
- * tool *before* the callback is consulted, so beside `canUseTool` it shadows
- * the callback — and the pinned SDK does not leave that silent: `query()`
- * reports the pairing as a shadowed callback under
- * `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`, naming every bare entry the callback
- * will never be asked about. The callback already answers `allow` for exactly
- * those names, so the list's whole decision is made in one place — the place a
- * refusal is taped — rather than half of it ahead of the callback, where the
- * trace cannot see it. `allowedTools` stays on [`CC_RESERVED`] for the same
- * reason: a `settings:` key spelling it would put the shadow back.
+ * **Never both.** A bare `allowedTools` name approves the whole tool *before*
+ * the callback is consulted, so beside `canUseTool` it shadows the callback —
+ * and the pinned SDK does not leave that silent: `query()` reports the pairing
+ * as a shadowed callback under `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`, naming every
+ * bare entry the callback will never be asked about. So under a mode that
+ * consults the callback the list is answered there alone — where a refusal is
+ * taped — and under `dontAsk`, which reads the pre-approval and never the
+ * callback, it is answered there alone, with no callback beside it to shadow.
+ * `allowedTools` stays on [`CC_RESERVED`] for the same reason: a `settings:`
+ * key spelling it would put the shadow back under every other mode.
  *
  * One shadow is accepted, and it is the hole above: under `bypassPermissions`
  * the SDK reports the callback as shadowed under the same code, because that
  * mode approves every call before any callback runs. The callback is kept there
- * all the same — it is one options object for every mode, and under that mode
- * the bound was never the callback's to hold: `tools` holds it.
+ * all the same — that mode reads no pre-approval the list could move into, and
+ * under it the bound was never the gate's to hold: `tools` holds it.
  *
  * # Whose system prompt a run has
  *
@@ -518,7 +548,7 @@ export function ccOptions(
   refusals: runtime.HarnessEvent[],
   refused: Set<string>,
 ): Options {
-  // The node's approval mode, resolved once: the three options below that
+  // The node's approval mode, resolved once: the four options below that
   // answer to it read this value rather than `run.access`, so a stated mode and
   // the flags its SDK requires can never disagree (see [`ccPermissionMode`]).
   const mode = ccPermissionMode(run);
@@ -569,31 +599,43 @@ export function ccOptions(
     // can reach, which is true under every one of the three `access:`
     // presets — `bypassPermissions` included.
     options.tools = [...allowed];
-    // …and the per-call gate over it, which is also what keeps a bounded run
-    // from prompting: an in-list call is answered `allow` here. Nothing
-    // approves the list ahead of this callback — a bare `allowedTools` would,
-    // and the pinned SDK flags that pairing as a shadowed callback (see
-    // [`CC_DRIVER`]).
-    options.canUseTool = (name, _input, ask) => {
-      if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
-      const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;
-      // The call this denial answers, remembered by its id: the SDK hands
-      // the model the denial as the `tool_result` for that `tool_use`, and
-      // one call is one tool event.
-      refused.add(ask.toolUseID);
-      refusals.push({
-        source: { type: "agent-compose.permission_denied", tool: name, message },
-        // A denial inside a **subagent** is that subagent's, and the
-        // envelope carries the top level only — the same depth rule
-        // [`ccEvents`] reads off `parent_tool_use_id`, read here off the
-        // sub-agent id the SDK passes the callback (PRD resolved q57
-        // ruling a).
-        ...(ask.agentID === undefined
-          ? { tap: { kind: "tool" as const, name, outcome: "refused" as const, error: message } }
-          : {}),
-      });
-      return Promise.resolve({ behavior: "deny" as const, message });
-    };
+    // …and the per-call gate over it, whose answer is the list's and whose
+    // option is the mode's (see [`CC_DRIVER`]). Never both options at once: a
+    // bare `allowedTools` beside `canUseTool` approves the list ahead of the
+    // callback, and the pinned SDK flags that pairing as a shadowed callback.
+    if (mode === "dontAsk") {
+      // The mode that consults no callback: a call it finds no pre-approval
+      // for is denied without `canUseTool` being asked, so the list is that
+      // pre-approval — or every in-list tool that needs a permission is
+      // denied on a node whose own list allows it.
+      options.allowedTools = [...allowed];
+    } else {
+      // Every other mode asks the host about a call it does not settle itself
+      // (`auto` once its classifier hands the question back), and this is the
+      // host's answer: `allow` inside the list, which is what keeps a bounded
+      // run from prompting, and a taped `deny` outside it. Under
+      // `bypassPermissions` nothing is asked, and `tools` holds the bound.
+      options.canUseTool = (name, _input, ask) => {
+        if (allowed.includes(name)) return Promise.resolve({ behavior: "allow" as const });
+        const message = `\`${run.node}\` allows ${allowed.map((tool) => `\`${tool}\``).join(", ")}, and \`${name}\` is not one of them`;
+        // The call this denial answers, remembered by its id: the SDK hands
+        // the model the denial as the `tool_result` for that `tool_use`, and
+        // one call is one tool event.
+        refused.add(ask.toolUseID);
+        refusals.push({
+          source: { type: "agent-compose.permission_denied", tool: name, message },
+          // A denial inside a **subagent** is that subagent's, and the
+          // envelope carries the top level only — the same depth rule
+          // [`ccEvents`] reads off `parent_tool_use_id`, read here off the
+          // sub-agent id the SDK passes the callback (PRD resolved q57
+          // ruling a).
+          ...(ask.agentID === undefined
+            ? { tap: { kind: "tool" as const, name, outcome: "refused" as const, error: message } }
+            : {}),
+        });
+        return Promise.resolve({ behavior: "deny" as const, message });
+      };
+    }
   }
   return options;
 }

@@ -833,8 +833,10 @@ const results = {};
     // `allow_tools:` is two options and not three: no bare `allowedTools`
     // beside the callback, from the driver or from the key above…
     allowedTools: Object.hasOwn(options, "allowedTools") ? options.allowedTools : null,
-    // …because the callback is what answers the list — `allow` inside it, so
-    // a bounded run does not prompt, and `deny` outside it.
+    // …because under this node's mode (`acceptEdits`, derived — the reserved
+    // `permissionMode` key above is dropped) the callback is what the SDK asks
+    // and what answers the list: `allow` inside it, so a bounded run does not
+    // prompt, and `deny` outside it. Whether a mode asks it at all is case 14's.
     callback: {
       inList: await decide("Read", "toolu_in"),
       outOfList: await decide("Write", "toolu_out"),
@@ -1182,9 +1184,10 @@ const results = {};
 // bound. So this reads what `query` would have been handed, three times over the
 // derived mapping and three times over a stated mode.
 //
-// Three options answer to the resolved mode and all three are read here,
-// because keying two of them off `run.access` instead is the shape that looks
-// right and is not:
+// Four things answer to the resolved mode and all four are read here — the
+// three options below, because keying two of them off `run.access` instead is
+// the shape that looks right and is not, and the option carrying
+// `allow_tools:`'s per-call answer, which is read after them:
 //
 //   * `permissionMode` itself — the node's, or the one its `access:` level
 //     derives, which is the mapping resolved q57 shipped and every composition
@@ -1225,6 +1228,53 @@ const results = {};
       access: "full_access",
       permissionMode: "bypassPermissions",
     }),
+  };
+
+  // …and the fourth thing that answers to the mode: which option carries
+  // `allow_tools:`'s per-call answer. The answer itself never changes — `allow`
+  // inside the list, `deny` outside it — but the six modes do not all consult
+  // the same party, and an answer handed to a party the mode never asks is no
+  // answer at all. `dontAsk` is the case that makes this a table: its CLI
+  // denies a would-ask call **without** consulting `canUseTool`, so a callback
+  // there is dead and the list has to arrive as the pre-approval that mode
+  // reads — or every in-list tool that needs a permission is denied. Asking a
+  // callback what it answers says nothing about whether the SDK ever asks it,
+  // so each row records which option is present at all, beside the answer.
+  const gateOf = async (overrides) => {
+    const stub = harness.scriptedDriver("cc", script({ summary: "x", touched: [] }));
+    await runCoder(binding(overrides), { goal: "fix it" }, context(), {
+      cc: stub.driver,
+    });
+    const options = harness.ccOptions(stub.runs[0], [], new Set());
+    const ask = (toolUseID) => ({ signal: new AbortController().signal, toolUseID });
+    return {
+      mode: options.permissionMode,
+      tools: options.tools ?? null,
+      allowedTools: Object.hasOwn(options, "allowedTools") ? options.allowedTools : null,
+      // `Bash` rather than `Read`: a tool that needs a permission, which is
+      // the call a dead gate would deny.
+      callback:
+        typeof options.canUseTool === "function"
+          ? {
+              inList: (await options.canUseTool("Bash", {}, ask("toolu_in"))).behavior,
+              outOfList: (await options.canUseTool("Write", {}, ask("toolu_out"))).behavior,
+            }
+          : null,
+    };
+  };
+
+  results["allowlistByMode"] = {
+    // Each mode at a level that admits it (grammar 8.9's table), derived where
+    // the level derives it.
+    default: await gateOf({ access: "workspace_write", permissionMode: "default" }),
+    acceptEdits: await gateOf({ access: "workspace_write" }),
+    plan: await gateOf({ access: "read_only" }),
+    auto: await gateOf({ access: "workspace_write", permissionMode: "auto" }),
+    dontAsk: await gateOf({ access: "workspace_write", permissionMode: "dontAsk" }),
+    bypassPermissions: await gateOf({ access: "full_access" }),
+    // …and `dontAsk` under the widest level, which is the pair that says the
+    // choice reads the **mode** rather than the level.
+    dontAskUnderFullAccess: await gateOf({ access: "full_access", permissionMode: "dontAsk" }),
   };
 }
 
