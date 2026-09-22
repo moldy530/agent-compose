@@ -32,9 +32,11 @@
 // out of a trace and a key read out of a journal name the same effect site.
 // This module invents no second addressing scheme.
 //
-// # Where it lives
+// # Where it lives, and who decides
 //
-// One SQLite file per project, beside the project's stores:
+// The deploy layer, and nothing in the composition (grammar §14.7, PRD resolved
+// q27, q62). A target that declares no `journal:` binds **SQLite**, one file per
+// project beside the project's stores:
 //
 // ```text
 // <project>/.agent-compose/journal.sqlite
@@ -46,57 +48,98 @@
 // the execution a crashed `run` left behind (resolved q27: "beside the project",
 // "one file to delete").
 //
-// # The driver
+// A target that binds `provider: postgres` or `provider: mysql` dials a server
+// instead, at the address the deploy file's `url:` names as an `${ENV}`
+// reference. What that buys is the property a file cannot give: the hub's record
+// survives the hub's disk, so a `serve` restarted on a fresh machine recovers
+// every open execution (resolved q62). What it does **not** change is anything
+// above [`Journal`] — the record, its keys, the frontier and the recovery verbs
+// are the same behind all three, and this runtime cannot tell which it got.
 //
-// `node-sqlite3-wasm`, the same one `./stores.ts` opens, for the reason PRD
-// §9.18 gives: a generated module runs on Bun **and** on Node, so it may not
-// reach for `bun:sqlite` or `node:sqlite`. It is already pinned, so the journal
-// costs no new dependency.
+// # The drivers
+//
+// `node-sqlite3-wasm` for the file, the same one `./stores.ts` opens, for the
+// reason PRD §9.18 gives: a generated module runs on Bun **and** on Node, so it
+// may not reach for `bun:sqlite` or `node:sqlite`. It is already pinned, so a
+// SQLite journal costs no new dependency; `pg` and `mysql2` are pinned only into
+// the projects whose target binds them, and the arm that imports one is emitted
+// only there (`codegen::journal`).
 //
 // # Atomicity, and what a crash can leave
 //
-// One effect is one `INSERT`, which SQLite runs in an implicit transaction of
-// its own: a process that dies mid-write leaves the row absent, never half
-// present, so nothing in this file can parse as a complete record that is not
-// one. `synchronous = FULL` is what makes "committed" mean "on the disk"
-// rather than "in the page cache". SQLite's **rollback journal** is what backs
-// that, and a write-ahead log is deliberately not asked for: this driver's
-// virtual file system does not implement one — the pragma is accepted and
-// leaves the mode at `delete` — so asking would be a line that reads like a
-// guarantee and is not one. Atomicity per statement, which is the property
-// this file needs, is the same either way.
+// **One effect is one `INSERT`**, on every backend: SQLite runs it in an
+// implicit transaction of its own, and both remote servers commit a single
+// statement before answering it. A process that dies mid-write leaves the row
+// absent, never half present, so nothing any of the three holds can parse as a
+// complete record that is not one. What makes "committed" mean "on the disk"
+// differs and is stated per backend in `docs/durability.md` §2: `synchronous =
+// FULL` and SQLite's **rollback journal** here — a write-ahead log is
+// deliberately not asked for, because this driver's virtual file system does not
+// implement one, so asking would be a line that reads like a guarantee and is
+// not one — and the server's own commit on the other two.
 //
 // What a crash *can* leave is an effect that happened with no row for it: the
 // row is written when the effect answers, and the window between the two is
 // not closable by anything on this side of the network. A replay re-executes
 // such an effect, which is the at-least-once compromise grammar 9.4's
 // idempotency keys exist for — the key a repeated write carries is the one the
-// first attempt carried, so the receiver that dedupes still does.
+// first attempt carried, so the receiver that dedupes still does. It is the same
+// window on all three, because it is the network's rather than the store's.
 //
 // # Concurrency
 //
-// A `serve` process runs many executions at once, and every statement here is
-// synchronous: `node-sqlite3-wasm` blocks the event loop for the duration of a
-// call, so two executions can never interleave inside one statement and no
-// intra-process locking is needed.
+// **In this process**, every journal method runs under one serializing queue
+// ([`SqlJournal`]'s `#serial`), so a method's read and the write that follows it
+// are one step and two executions can never interleave between them. That is the
+// property the synchronous SQLite driver used to give for free — it blocks the
+// event loop for the duration of a call — held explicitly instead, because a
+// backend reached over a socket cannot give it and every statement below was
+// written against it.
 //
-// Across *processes* this release keeps the boundary `./stores.ts` keeps and
-// PRD 5.10 draws — `--target local` is one process, and **one process at a time
-// writes a project's journal**. That stays a rule rather than a promise, but it
-// is not an unenforced one: `node-sqlite3-wasm` takes SQLite's exclusive lock by
-// creating `<file>.lock` as a directory and gives it back by removing it, so a
-// second process meets `SQLITE_BUSY` rather than interleaving into pages the
-// first has not committed. `busy_timeout` is set before any statement that can
-// contend, and the open is retried under a deadline for the statements the
-// pragma does not cover.
+// **Across processes** this release keeps the boundary `./stores.ts` keeps and
+// PRD 5.10 draws: **one process at a time writes a project's journal**, which on
+// a mesh is the hub and only the hub (resolved q42 — workers stream their effect
+// records home). That stays a rule rather than a promise, and each backend puts
+// a real lock under it:
 //
-// What that lock does not do is die with its owner. A process killed **inside**
-// a write never reaches the `rmdir`, and the directory it leaves would refuse
-// every later open of that journal — the resume of the interrupted execution
-// and every future run of the project alike. So a lock still held after this
-// process has waited the deadline out is treated as the corpse it is under the
-// rule above, and removed ([`LOCK_DIRECTORY`]). The rollback journal the same
-// crash leaves is untouched: SQLite recovers it on the next open.
+//  * **SQLite** — `node-sqlite3-wasm` takes SQLite's exclusive lock by creating
+//    `<file>.lock` as a directory and gives it back by removing it, so a second
+//    process meets `SQLITE_BUSY` rather than interleaving into pages the first
+//    has not committed. `busy_timeout` is set before any statement that can
+//    contend, and the open is retried under a deadline for the statements the
+//    pragma does not cover. What that lock does not do is die with its owner: a
+//    process killed **inside** a write never reaches the `rmdir`, and the
+//    directory it leaves would refuse every later open of that journal — the
+//    resume of the interrupted execution and every future run of the project
+//    alike. So a lock still held after this process has waited the deadline out
+//    is treated as the corpse it is under the rule above, and removed
+//    ([`LOCK_DIRECTORY`]). The rollback journal the same crash leaves is
+//    untouched: SQLite recovers it on the next open.
+//  * **Postgres and MySQL** — a **session-scoped writer guard**, taken on the one
+//    connection this process holds and held for its lifetime:
+//    `pg_try_advisory_lock` and `GET_LOCK`. Defence in depth under the rule
+//    above rather than a second design: a second opener is refused by name
+//    instead of writing into a record another process is replaying. They are the
+//    right primitive for the same reason SQLite's lock is the wrong one — **the
+//    server drops them when the session ends**, so a hub killed on a machine
+//    that is still running leaves no lock behind: the kernel closes its socket,
+//    the server ends the session, and the machine that takes over walks straight
+//    in. Nothing has to break a corpse's lock here.
+//
+//    A host that **vanishes** — a crash, a power loss, a partition — closes
+//    nothing, and that is the case cross-host recovery is *for*. The server ends
+//    such a session only when it notices, and left at its own defaults it
+//    notices after hours (Linux's `tcp_keepalive_time` is two hours; MySQL's
+//    `wait_timeout` is eight). For that whole time a dead hub's guard would
+//    refuse the live one. So both arms shorten that window for their own session
+//    and keep a heartbeat on it ([`GUARD_REAP_SECONDS`],
+//    [`GUARD_HEARTBEAT_MS`]): the lockout after a host is lost is bounded to
+//    minutes and stated, here and in `docs/durability.md` §2.3, rather than
+//    being described as instant.
+//
+//    A connection that is lost under a live process is **not** redialled, and
+//    every statement after it is refused ([`connectionLost`]). A redial would
+//    take a guard back that another hub may already hold.
 //
 // So the two live surfaces are kept apart rather than serialized. `serve`
 // recovers every open execution at start, which means an execution a live
@@ -124,6 +167,11 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+
+import { journal as BINDING } from "./deployment.ts";
+import type { JournalBinding, JournalProvider } from "./deployment.ts";
+
+export type { JournalBinding, JournalProvider } from "./deployment.ts";
 
 // ---------------------------------------------------------------------------
 // Version
@@ -172,9 +220,34 @@ export function dataRoot(): string {
     : path.resolve(override);
 }
 
-/** The journal file: one per project, whatever runs against it. */
+/**
+ * The journal file: one per project, whatever runs against it.
+ *
+ * **SQLite's answer, and only SQLite's.** A target that dials a server has no
+ * path, and a caller that has to *name* where this project's journal lives asks
+ * [`journalLocation`] instead — which answers this on a `sqlite` binding and
+ * names the variable holding the address on the other two.
+ */
 export function journalPath(): string {
   return path.join(dataRoot(), "journal.sqlite");
+}
+
+/** Which journal this build's target bound (grammar §14.7). */
+export const journalBinding: JournalBinding = BINDING;
+
+/**
+ * Where this project's journal lives, for a person.
+ *
+ * Quoted by `./cli.ts`'s `resume` refusals, which are the one surface that has
+ * to say *where* a record a reader is asking about would have been. On a remote
+ * binding it names the **variable** rather than what the variable holds:
+ * `docs/trace.md` §11.1 keeps a resolved `${ENV}` out of every artifact this
+ * project writes, and a refusal printed on a terminal is not an exception — a
+ * connection string carries a password.
+ */
+export function journalLocation(): string {
+  if (journalBinding.provider === "sqlite") return `\`${journalPath()}\``;
+  return `the \`${journalBinding.provider}\` journal at \`\${${journalBinding.urlEnv ?? ""}}\``;
 }
 
 // ---------------------------------------------------------------------------
@@ -555,32 +628,38 @@ export interface ExecutionRow {
 /**
  * What the runtime asks of a journal, and the whole of it.
  *
- * One interface, one implementation in this release: resolved q27 makes the
- * journal a **deploy-target slot** — `--target local` binds SQLite, a
- * distributed target will bind Postgres — and every target this compiler can
- * currently build is process-local, so SQLite is what every project gets and
- * nothing in the composition says so. The shape is deliberately the shape a
- * Postgres implementation could take: keyed reads, one-row appends, and no
- * assumption that the store is a file or that the process owns it.
+ * **One interface, three implementations** (grammar §14.7, PRD resolved q27,
+ * q62): the journal is a deploy-target slot — a target that says nothing binds
+ * SQLite beside the project, and one that declares `provider: postgres` or
+ * `provider: mysql` dials a server — and nothing in the composition says which.
+ * The shape is what it always was and the two remote arms cost it nothing: keyed
+ * reads, one-row appends, and no assumption that the store is a file or that the
+ * process owns it.
+ *
+ * Every method answers a promise, including the ones a file could answer at
+ * once. That is what a socket costs and is the whole of what it costs: the
+ * serializing queue of [`SqlJournal`] keeps a method's read and the write after
+ * it one step, so every statement below means exactly what it meant when the
+ * driver beneath it blocked the event loop.
  */
 export interface Journal {
   /** Record that an execution has begun. Idempotent on the id. */
-  begin(row: ExecutionRow): void;
+  begin(row: ExecutionRow): Promise<void>;
   /** Record how it ended. */
-  end(id: string, status: Exclude<ExecutionStatus, "open">, error?: string): void;
+  end(id: string, status: Exclude<ExecutionStatus, "open">, error?: string): Promise<void>;
   /** One execution's lifecycle row. */
-  execution(id: string): ExecutionRow | undefined;
+  execution(id: string): Promise<ExecutionRow | undefined>;
   /** Every execution the journal holds open, oldest first. */
-  openExecutions(): readonly ExecutionRow[];
+  openExecutions(): Promise<readonly ExecutionRow[]>;
   /** What this execution recorded at `key`, if anything. */
-  lookup(execution: string, key: string): JournalRecord | undefined;
+  lookup(execution: string, key: string): Promise<JournalRecord | undefined>;
   /** Append one effect. */
-  append(record: JournalRecord): void;
+  append(record: JournalRecord): Promise<void>;
   /**
    * Record that the generation which wrote `key` refused its own answer — see
    * [`JournalRecord.refused`]. Idempotent, and a no-op for a key nothing wrote.
    */
-  refuse(execution: string, key: string): void;
+  refuse(execution: string, key: string): Promise<void>;
   /**
    * Record the intent to deliver one lifecycle webhook, **before** the first
    * attempt, allocating this execution's next event ordinal (resolved q35).
@@ -589,7 +668,7 @@ export interface Journal {
    * at-most-once: a process that dies mid-attempt leaves a row a later start
    * finishes, under the id the receiver dedupes on.
    */
-  intendDelivery(intent: DeliveryIntent): DeliveryRecord;
+  intendDelivery(intent: DeliveryIntent): Promise<DeliveryRecord>;
   /**
    * Record a delivery the allowlist refused, which is one nothing was ever sent
    * for (grammar 13.3, Decision D127).
@@ -604,7 +683,7 @@ export interface Journal {
    * a type error rather than a row nobody will ever send and nothing will ever
    * explain.
    */
-  refuseDelivery(intent: CallbackIntent, reason: string): DeliveryRecord;
+  refuseDelivery(intent: CallbackIntent, reason: string): Promise<DeliveryRecord>;
   /**
    * Refuse a delivery this journal already holds **pending**, without an
    * attempt.
@@ -619,7 +698,7 @@ export interface Journal {
    * the **statement** carries the rule instead: it matches a `callback` row and
    * no other, and a `trace_sink` row handed to it is left exactly as it was.
    */
-  refuseRecorded(execution: string, ordinal: number, reason: string): void;
+  refuseRecorded(execution: string, ordinal: number, reason: string): Promise<void>;
   /**
    * End a delivery this journal already holds **pending** whose schedule has
    * nothing left in it, without an attempt.
@@ -632,7 +711,7 @@ export interface Journal {
    * webhook the status route reports as owed for ever. Idempotent, and it leaves
    * an outcome another process wrote exactly as it is.
    */
-  exhaustRecorded(execution: string, ordinal: number, reason: string): void;
+  exhaustRecorded(execution: string, ordinal: number, reason: string): Promise<void>;
   /**
    * Record what one attempt did, and where the delivery stands after it.
    *
@@ -646,9 +725,9 @@ export interface Journal {
     ordinal: number,
     attempt: DeliveryAttempt,
     status: DeliveryStatus,
-  ): void;
+  ): Promise<void>;
   /** Every delivery of one execution, by ordinal. */
-  deliveries(execution: string): readonly DeliveryRecord[];
+  deliveries(execution: string): Promise<readonly DeliveryRecord[]>;
   /**
    * Every delivery still owed an attempt, oldest intent first.
    *
@@ -656,7 +735,7 @@ export interface Journal {
    * (`docs/durability.md` §6.1): a delivery is an unfinished effect of its own,
    * and the execution it reports on may have ended in the process that died.
    */
-  undelivered(): readonly DeliveryRecord[];
+  undelivered(): Promise<readonly DeliveryRecord[]>;
   /**
    * Put one placed node's dispatch on the board, or answer the row already
    * there (`docs/distributed.md` §6.1).
@@ -666,24 +745,24 @@ export interface Journal {
    * identity, and is handed whatever its predecessor left — a settled answer to
    * consume, or a wait still on the board to go on holding.
    */
-  park(row: DispatchRow): DispatchRow;
+  park(row: DispatchRow): Promise<DispatchRow>;
   /** The dispatch at one wait identity, if the journal holds one. */
-  dispatchAt(execution: string, wait: string): DispatchRow | undefined;
+  dispatchAt(execution: string, wait: string): Promise<DispatchRow | undefined>;
   /** The dispatch a `dispatch_id` names, wherever it is (§3.4). */
-  dispatchOf(id: string): DispatchRow | undefined;
+  dispatchOf(id: string): Promise<DispatchRow | undefined>;
   /** Every dispatch of one execution, in park order. */
-  dispatchesOf(execution: string): readonly DispatchRow[];
+  dispatchesOf(execution: string): Promise<readonly DispatchRow[]>;
   /**
    * Every dispatch that is still `parked` or `dispatched`, in **park order**
    * (§6.2: "dispatch resumes in park order").
    */
-  unsettledDispatches(): readonly DispatchRow[];
+  unsettledDispatches(): Promise<readonly DispatchRow[]>;
   /**
    * Hand one parked dispatch to a session, answering the row it became — or
    * `undefined` where it was no longer parked, which is the race two polls
    * arriving together are.
    */
-  claimDispatch(id: string, session: string): DispatchRow | undefined;
+  claimDispatch(id: string, session: string): Promise<DispatchRow | undefined>;
   /**
    * Put a dispatch back on the board that a session was handed and **cannot have
    * received** — the exact inverse of [`claimDispatch`], answering whether this
@@ -701,7 +780,7 @@ export interface Journal {
    * moved on since — settled by a result, superseded by a deadline — is left
    * exactly as it is.
    */
-  releaseDispatch(id: string, session: string): boolean;
+  releaseDispatch(id: string, session: string): Promise<boolean>;
   /**
    * Settle one dispatch with what the worker answered (§3.4).
    *
@@ -710,12 +789,12 @@ export interface Journal {
    * `204` rather than a second settlement; a row the hub superseded answers
    * `false` too and keeps that, which is the `409`.
    */
-  settleDispatch(id: string, outcome: JournalOutcome): boolean;
+  settleDispatch(id: string, outcome: JournalOutcome): Promise<boolean>;
   /**
    * End one unsettled dispatch **without** a result (§6.3), leaving a settled or
    * already-superseded row exactly as it is.
    */
-  supersedeDispatch(id: string, reason: string): void;
+  supersedeDispatch(id: string, reason: string): Promise<void>;
   /**
    * Every effect recorded at, or inside, one instance path — the
    * `effect_history` a redispatch carries (§3.2, §7.2).
@@ -725,16 +804,631 @@ export interface Journal {
    * and a redispatched node has to replay all of it, not only its own outermost
    * effect.
    */
-  effectsUnder(execution: string, site: string): readonly JournalRecord[];
+  effectsUnder(execution: string, site: string): Promise<readonly JournalRecord[]>;
+  /**
+   * Give the connection back, and the writer guard with it.
+   *
+   * What `./cli.ts` calls on its way out of a `run` or a `resume`, and what
+   * nothing calls in a `serve`, whose process holds the journal for as long as
+   * it serves. A file needs no such call and answers it by closing the handle; a
+   * remote arm needs it, because the guard it holds is the server's idea of who
+   * is writing and a socket left open is a lock nobody released until the TCP
+   * connection times out.
+   */
+  close(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
-// The SQLite implementation
+// The statements, and the three backends that run them
+// ---------------------------------------------------------------------------
+
+/** One row, as any of the three drivers hands it back. */
+type Row = Record<string, unknown>;
+
+/**
+ * A value a statement binds to a `?`.
+ *
+ * The whole of what this journal ever sends: every payload is canonical JSON
+ * (see [`canonical`]), every instant is an ISO 8601 string, every ordinal is a
+ * number, and an absent column is `null` rather than `undefined` — the drivers
+ * refuse that, and the difference between "no history" and "a history whose
+ * value is `null`" is one [`park`] depends on.
+ */
+type Bound = string | number | null;
+
+/**
+ * How one backend spells the three things the statements below differ in.
+ *
+ * Three, and no more than three: the statements are **one** implementation of
+ * `docs/durability.md`'s contract rather than three that have to be kept in
+ * step, which is the whole reason this interface is narrow. A fourth entry here
+ * would be a place two backends could come to mean different things, and the
+ * conformance suite would be proving it rather than the servers.
+ */
+interface Dialect {
+  /** Which of grammar §14.7's three this is. */
+  readonly provider: JournalProvider;
+  /**
+   * The clause that makes an insert a no-op when the row is already there.
+   *
+   * Two spellings of one intent: `ON CONFLICT … DO NOTHING` where the standard
+   * upsert is spoken, and MySQL's `ON DUPLICATE KEY UPDATE` with an assignment
+   * that changes nothing. `INSERT IGNORE` is deliberately **not** the MySQL
+   * spelling — it swallows every error the statement can raise, not only the
+   * duplicate key, so a truncated payload or a bad type would be a row silently
+   * not written rather than a failure this journal reports.
+   */
+  readonly conflict: (target: string, noop: string) => string;
+  /**
+   * The statements as written, with their `?` placeholders in this backend's
+   * spelling.
+   *
+   * Only Postgres needs one: it numbers its parameters, so the `?`s are counted
+   * off into `$1`, `$2`, … in order. Nothing below writes a `?` inside a string
+   * literal, which is what makes counting them enough.
+   */
+  readonly bind: (sql: string) => string;
+  /**
+   * The column that orders `dispatches` rows by when they went in.
+   *
+   * SQLite's implicit `rowid`, and an explicit `seq` on the two that have none.
+   * `docs/distributed.md` §6.2 says dispatch resumes "in park order", and
+   * `parked_at` is milliseconds while a fan-out parks its instances from one
+   * synchronous burst — so the tiebreak has to be insertion order, and every
+   * backend needs a column that really is one (see [`INSERTION_ORDER`]).
+   */
+  readonly insertionOrder: string;
+}
+
+/**
+ * What one backend's connection does, and the whole of it.
+ *
+ * Three methods, because the statements are [`SqlJournal`]'s: an arm supplies a
+ * way to run SQL, a way to read rows back, and a way to let go — never a
+ * statement of its own. That is what makes "one interface, three backends"
+ * (PRD resolved q62) true by construction rather than by review.
+ */
+interface JournalDriver {
+  readonly dialect: Dialect;
+  /** Every row a query answers. */
+  all(sql: string, parameters: readonly Bound[]): Promise<Row[]>;
+  /** One statement, whose rows nothing reads. */
+  run(sql: string, parameters: readonly Bound[]): Promise<void>;
+  /** Give the connection back, and the writer guard with it. */
+  close(): Promise<void>;
+}
+
+/**
+ * How park order breaks a tie (`docs/distributed.md` §6.2).
+ *
+ * `parked_at` is an ISO instant with millisecond resolution, and a fan-out parks
+ * its instances from one synchronous burst — sixteen `dispatchPlaced` calls
+ * inside one tick all carry the same instant. §6.2 says dispatch resumes "in
+ * park order", so the tiebreak has to be the order they went on the board, and
+ * every backend needs a column that is exactly that: SQLite's implicit `rowid`,
+ * and an explicit sequence on the two that have none. Rows here are inserted and
+ * never deleted, so each is monotonic insertion order.
+ *
+ * The tiebreak it replaced was `wait ASC`, which is a **string** — `<instance
+ * path>/<ordinal>` — so instance 10 sorted before instance 2 and a one-worker
+ * pool ran a `map`'s items 0, 1, 10, 11, …, 2, 3. §6.4's undispatched-is-a-pause
+ * row leans on park order for fairness: the item that has waited longest, and
+ * whose `timeout:` has been running longest, is the one taken next.
+ */
+const INSERTION_ORDER = "insertion_order ASC";
+
+/** `ON CONFLICT … DO NOTHING`, which SQLite and Postgres both speak. */
+function standardConflict(target: string, _noop: string): string {
+  return `ON CONFLICT ${target} DO NOTHING`;
+}
+
+/** `?`, unchanged — SQLite and MySQL both take it. */
+function positionalBind(sql: string): string {
+  return sql;
+}
+
+/**
+ * The journal's statements, run against whichever backend the target bound.
+ *
+ * **One implementation of `docs/durability.md`, not three.** Everything a record
+ * means — the keys of §4, the frontier of §5, the two ledgers of §3.7 and §3.8,
+ * the predicates that keep a settled row settled — is written once, here, and
+ * the three [`JournalDriver`]s differ only in how they carry a statement to a
+ * server and a row back. A conformance suite then has one thing left to prove,
+ * which is that each server really runs them (`journal_backend_conformance`).
+ *
+ * **Every method runs on one queue.** `#serial` is what makes a method's read
+ * and the write after it a single step, which most of the statements below are
+ * written against: `#openDelivery` allocates an ordinal it then inserts under,
+ * `park` reads the row it may be about to create, `settleDispatch` reads the
+ * status its own update is about to change. The synchronous SQLite driver gave
+ * that for free by blocking the event loop; a socket cannot, so it is held here
+ * instead, on every backend, so that one reading of these statements is right
+ * for all three.
+ *
+ * Across processes the guard is the backend's — a file lock, or a session-scoped
+ * advisory lock — and the module header is where that is set out.
+ */
+class SqlJournal implements Journal {
+  readonly #driver: JournalDriver;
+
+  /** The tail of the queue every method chains onto. */
+  #queue: Promise<unknown> = Promise.resolve();
+
+  constructor(driver: JournalDriver) {
+    this.#driver = driver;
+  }
+
+  /** Which backend this is, for a diagnostic that has to name one. */
+  get provider(): JournalProvider {
+    return this.#driver.dialect.provider;
+  }
+
+  /**
+   * Run one method's statements with nothing else of this journal's between
+   * them.
+   *
+   * What is chained on is a **settled** promise rather than this one: a method
+   * that threw is one method failing, and a queue that adopted its rejection
+   * would fail every later call on a journal that is perfectly usable — and, on
+   * a runtime that reports them, leave an unhandled rejection for each.
+   */
+  #serial<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.#queue.then(work, work);
+    this.#queue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  /** Every row one statement answers. */
+  #all(sql: string, parameters: readonly Bound[] = []): Promise<Row[]> {
+    return this.#driver.all(this.#driver.dialect.bind(sql), parameters);
+  }
+
+  /** The first row one statement answers, or `undefined`. */
+  async #one(sql: string, parameters: readonly Bound[] = []): Promise<Row | undefined> {
+    return (await this.#all(sql, parameters))[0];
+  }
+
+  /** One statement, whose rows nothing reads. */
+  #run(sql: string, parameters: readonly Bound[] = []): Promise<void> {
+    return this.#driver.run(this.#driver.dialect.bind(sql), parameters);
+  }
+
+  /** The clause that makes an insert a no-op on a row already there. */
+  #conflict(target: string, noop: string): string {
+    return this.#driver.dialect.conflict(target, noop);
+  }
+
+  begin(row: ExecutionRow): Promise<void> {
+    return this.#serial(() =>
+      this.#run(
+        `INSERT INTO executions
+           (id, flow, trigger_kind, inputs, session_key, callback, traceparent, status, journal_version, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ${this.#conflict("(id)", "id = id")}`,
+        [
+          row.id,
+          row.flow,
+          row.trigger,
+          JSON.stringify(row.inputs),
+          row.sessionKey,
+          row.callback ?? null,
+          row.traceparent ?? null,
+          row.status,
+          row.journalVersion,
+          row.startedAt,
+        ],
+      ),
+    );
+  }
+
+  end(id: string, status: Exclude<ExecutionStatus, "open">, error?: string): Promise<void> {
+    return this.#serial(() =>
+      this.#run("UPDATE executions SET status = ?, ended_at = ?, error = ? WHERE id = ?", [
+        status,
+        new Date().toISOString(),
+        error ?? null,
+        id,
+      ]),
+    );
+  }
+
+  execution(id: string): Promise<ExecutionRow | undefined> {
+    return this.#serial(() => this.#execution(id));
+  }
+
+  async #execution(id: string): Promise<ExecutionRow | undefined> {
+    const found = await this.#one("SELECT * FROM executions WHERE id = ?", [id]);
+    return found === undefined ? undefined : executionOf(found);
+  }
+
+  openExecutions(): Promise<readonly ExecutionRow[]> {
+    return this.#serial(async () => {
+      const rows = await this.#all(
+        "SELECT * FROM executions WHERE status = 'open' ORDER BY started_at ASC, id ASC",
+      );
+      return rows.map((row) => executionOf(row));
+    });
+  }
+
+  lookup(execution: string, key: string): Promise<JournalRecord | undefined> {
+    return this.#serial(async () => {
+      const found = await this.#one('SELECT * FROM effects WHERE execution = ? AND "key" = ?', [
+        execution,
+        key,
+      ]);
+      return found === undefined ? undefined : recordOf(found);
+    });
+  }
+
+  append(record: JournalRecord): Promise<void> {
+    const payload =
+      record.outcome.kind === "value"
+        ? canonical(record.outcome.value)
+        : canonical({ name: record.outcome.name, message: record.outcome.message });
+    // One statement, so one transaction of the backend's own: a crash leaves the
+    // row absent rather than half written (see the module header).
+    return this.#serial(() =>
+      this.#run(
+        `INSERT INTO effects
+           (execution, "key", site, kind, ordinal, request, outcome, payload, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ${this.#conflict('(execution, "key")', "execution = execution")}`,
+        [
+          record.execution,
+          record.key,
+          record.site,
+          record.kind,
+          record.ordinal,
+          record.request,
+          record.outcome.kind,
+          payload,
+          record.recordedAt,
+        ],
+      ),
+    );
+  }
+
+  refuse(execution: string, key: string): Promise<void> {
+    // One statement again, and one that says the same thing however many times
+    // it runs: a ladder that met this answer on two generations marks it twice
+    // and the row is the same row (see [`JournalRecord.refused`]).
+    return this.#serial(() =>
+      this.#run('UPDATE effects SET refused = 1 WHERE execution = ? AND "key" = ?', [
+        execution,
+        key,
+      ]),
+    );
+  }
+
+  intendDelivery(intent: DeliveryIntent): Promise<DeliveryRecord> {
+    return this.#serial(() => this.#openDelivery(intent, "pending", undefined));
+  }
+
+  refuseDelivery(intent: CallbackIntent, reason: string): Promise<DeliveryRecord> {
+    return this.#serial(() => this.#openDelivery(intent, "refused", reason));
+  }
+
+  /**
+   * Allocate this execution's next event ordinal and write the row.
+   *
+   * The read and the write are two statements and are atomic where it matters,
+   * for the reason the class header gives: `#serial` runs them with nothing else
+   * of this journal's between them, and **one process at a time writes a
+   * project's journal**. A `MAX(ordinal)` taken inside one queued step is
+   * therefore a number no other writer can be holding.
+   */
+  async #openDelivery(
+    intent: DeliveryIntent,
+    status: DeliveryStatus,
+    detail: string | undefined,
+  ): Promise<DeliveryRecord> {
+    const found = await this.#one(
+      "SELECT COALESCE(MAX(ordinal), -1) + 1 AS next FROM deliveries WHERE execution = ?",
+      [intent.execution],
+    );
+    const ordinal = Number(found?.["next"] ?? 0);
+    const at = new Date().toISOString();
+    const record: DeliveryRecord = {
+      ...intent,
+      ordinal,
+      id: `${intent.execution}:${ordinal}`,
+      status,
+      attempts: [],
+      intendedAt: at,
+      ...(status === "pending" ? {} : { settledAt: at }),
+      ...(detail === undefined ? {} : { detail }),
+    };
+    await this.#run(
+      `INSERT INTO deliveries
+         (execution, ordinal, kind, trigger_kind, event, url, body, pauses, status, attempts, intended_at, settled_at, detail)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        record.execution,
+        record.ordinal,
+        record.kind,
+        record.trigger ?? null,
+        record.event,
+        record.url,
+        record.body,
+        JSON.stringify(record.pauses),
+        record.status,
+        "[]",
+        record.intendedAt,
+        record.settledAt ?? null,
+        detail ?? null,
+      ],
+    );
+    return record;
+  }
+
+  refuseRecorded(execution: string, ordinal: number, reason: string): Promise<void> {
+    // `status = 'pending'` in the predicate rather than read first: a row that
+    // has already been delivered, refused or exhausted has an outcome, and one
+    // statement that will not touch it is better than two that could race.
+    //
+    // …and `kind` beside it, because `refused` is a **callback** row's outcome:
+    // a trace sink's address is admitted by no list, so there is nothing for it
+    // to fail to match (grammar 14.5, PRD resolved q50). A row written before
+    // the ledger recorded a kind is a callback, which is what `IS NULL` says.
+    return this.#serial(() =>
+      this.#run(
+        "UPDATE deliveries SET status = 'refused', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending' AND (kind IS NULL OR kind = 'callback')",
+        [new Date().toISOString(), reason, execution, ordinal],
+      ),
+    );
+  }
+
+  exhaustRecorded(execution: string, ordinal: number, reason: string): Promise<void> {
+    // The sibling above's statement with the other of §3.7's two ends in it,
+    // and the same predicate for the same reason: `attempts` is left alone,
+    // because this row's end is that there was no attempt left to make.
+    return this.#serial(() =>
+      this.#run(
+        "UPDATE deliveries SET status = 'exhausted', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
+        [new Date().toISOString(), reason, execution, ordinal],
+      ),
+    );
+  }
+
+  recordAttempt(
+    execution: string,
+    ordinal: number,
+    attempt: DeliveryAttempt,
+    status: DeliveryStatus,
+  ): Promise<void> {
+    return this.#serial(async () => {
+      const held = await this.#one(
+        "SELECT attempts, status FROM deliveries WHERE execution = ? AND ordinal = ?",
+        [execution, ordinal],
+      );
+      // **A row that already has an outcome is not reopened by a late attempt**,
+      // which is the predicate the two statements above carry and this one needs
+      // for the same reason: an attempt recorded against a `delivered` row would
+      // write `pending` back over it, and the next start would read a webhook the
+      // receiver already took as one it still owes — past the bounded number of
+      // attempts `docs/durability.md` §3.7 promises.
+      if (held === undefined || held["status"] !== "pending") return;
+      const attempts = [...(JSON.parse(String(held["attempts"])) as DeliveryAttempt[]), attempt];
+      // The read and the write are one queued step (see the class header), so
+      // the predicate repeats what the guard above decided rather than closing a
+      // window between them — and it is what a second writer would meet.
+      await this.#run(
+        "UPDATE deliveries SET attempts = ?, status = ?, settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
+        [
+          JSON.stringify(attempts),
+          status,
+          status === "pending" ? null : new Date().toISOString(),
+          attempt.detail ?? null,
+          execution,
+          ordinal,
+        ],
+      );
+    });
+  }
+
+  deliveries(execution: string): Promise<readonly DeliveryRecord[]> {
+    return this.#serial(async () => {
+      const rows = await this.#all(
+        "SELECT * FROM deliveries WHERE execution = ? ORDER BY ordinal ASC",
+        [execution],
+      );
+      return rows.map((row) => deliveryOf(row));
+    });
+  }
+
+  undelivered(): Promise<readonly DeliveryRecord[]> {
+    return this.#serial(async () => {
+      const rows = await this.#all(
+        "SELECT * FROM deliveries WHERE status = 'pending' ORDER BY intended_at ASC, execution ASC, ordinal ASC",
+      );
+      return rows.map((row) => deliveryOf(row));
+    });
+  }
+
+  park(row: DispatchRow): Promise<DispatchRow> {
+    return this.#serial(async () => {
+      // The read and the write are one queued step, so the row this answers is
+      // the row that is there — see the class header for why that is enough.
+      const held = await this.#dispatchAt(row.execution, row.wait);
+      if (held !== undefined) return held;
+      await this.#run(
+        `INSERT INTO dispatches
+           (execution, wait, id, placement, node, site, inputs,
+            item_index, history, policy, status, parked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ${this.#conflict("(execution, wait)", "execution = execution")}`,
+        [
+          row.execution,
+          row.wait,
+          row.id,
+          row.placement,
+          row.node,
+          row.site,
+          canonical(row.inputs),
+          row.itemIndex ?? null,
+          // SQL `NULL` rather than the four characters `null` for an absent one:
+          // the read below has to tell a dispatch that carries no history apart
+          // from one whose history is the JSON value `null`, which is §3.2's
+          // difference between omitting a key and sending it.
+          row.history === undefined ? null : canonical(row.history),
+          row.policy === undefined ? null : canonical(row.policy),
+          "parked",
+          row.parkedAt,
+        ],
+      );
+      return (await this.#dispatchAt(row.execution, row.wait)) ?? row;
+    });
+  }
+
+  dispatchAt(execution: string, wait: string): Promise<DispatchRow | undefined> {
+    return this.#serial(() => this.#dispatchAt(execution, wait));
+  }
+
+  async #dispatchAt(execution: string, wait: string): Promise<DispatchRow | undefined> {
+    const found = await this.#one(
+      `SELECT ${this.#driver.dialect.insertionOrder} AS insertion_order, dispatches.*
+         FROM dispatches WHERE execution = ? AND wait = ?`,
+      [execution, wait],
+    );
+    return found === undefined ? undefined : dispatchOf(found);
+  }
+
+  dispatchOf(id: string): Promise<DispatchRow | undefined> {
+    return this.#serial(() => this.#dispatchOf(id));
+  }
+
+  async #dispatchOf(id: string): Promise<DispatchRow | undefined> {
+    const found = await this.#one(
+      `SELECT ${this.#driver.dialect.insertionOrder} AS insertion_order, dispatches.*
+         FROM dispatches WHERE id = ?`,
+      [id],
+    );
+    return found === undefined ? undefined : dispatchOf(found);
+  }
+
+  dispatchesOf(execution: string): Promise<readonly DispatchRow[]> {
+    return this.#serial(async () => {
+      const rows = await this.#all(
+        `SELECT ${this.#driver.dialect.insertionOrder} AS insertion_order, dispatches.*
+           FROM dispatches WHERE execution = ? ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
+        [execution],
+      );
+      return rows.map((row) => dispatchOf(row));
+    });
+  }
+
+  unsettledDispatches(): Promise<readonly DispatchRow[]> {
+    return this.#serial(async () => {
+      const rows = await this.#all(
+        `SELECT ${this.#driver.dialect.insertionOrder} AS insertion_order, dispatches.*
+           FROM dispatches WHERE status IN ('parked', 'dispatched')
+           ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
+      );
+      return rows.map((row) => dispatchOf(row));
+    });
+  }
+
+  claimDispatch(id: string, session: string): Promise<DispatchRow | undefined> {
+    return this.#serial(async () => {
+      // `status = 'parked'` in the predicate rather than read first, for the
+      // reason `refuseRecorded` carries it: two polls arriving together are the
+      // race, and the loser must take nothing rather than take it twice.
+      await this.#run(
+        "UPDATE dispatches SET status = 'dispatched', session = ?, dispatched_at = ? WHERE id = ? AND status = 'parked'",
+        [session, new Date().toISOString(), id],
+      );
+      const held = await this.#dispatchOf(id);
+      return held?.status === "dispatched" && held.session === session ? held : undefined;
+    });
+  }
+
+  releaseDispatch(id: string, session: string): Promise<boolean> {
+    return this.#serial(async () => {
+      await this.#run(
+        "UPDATE dispatches SET status = 'parked', session = NULL, dispatched_at = NULL WHERE id = ? AND status = 'dispatched' AND session = ?",
+        [id, session],
+      );
+      return (await this.#dispatchOf(id))?.status === "parked";
+    });
+  }
+
+  settleDispatch(id: string, outcome: JournalOutcome): Promise<boolean> {
+    const payload =
+      outcome.kind === "value"
+        ? canonical(outcome.value)
+        : canonical({ name: outcome.name, message: outcome.message });
+    return this.#serial(async () => {
+      // **Read first, and the read is what answers.** The `WHERE` clause is still
+      // the guard — a row already ended keeps the outcome it has — but a status
+      // read *after* the write cannot tell a row this call settled from one an
+      // earlier result settled, and the contract above is that it can. The read
+      // and the write are one queued step, which is the property [`park`] already
+      // relies on.
+      const before = await this.#dispatchOf(id);
+      await this.#run(
+        "UPDATE dispatches SET status = 'settled', outcome = ?, payload = ?, settled_at = ? WHERE id = ? AND status IN ('parked', 'dispatched')",
+        [outcome.kind, payload, new Date().toISOString(), id],
+      );
+      if (before === undefined || (before.status !== "parked" && before.status !== "dispatched")) {
+        return false;
+      }
+      const held = await this.#dispatchOf(id);
+      return held?.status === "settled" && held.settledAt !== undefined;
+    });
+  }
+
+  supersedeDispatch(id: string, reason: string): Promise<void> {
+    return this.#serial(() =>
+      this.#run(
+        "UPDATE dispatches SET status = 'superseded', settled_at = ?, detail = ?, session = NULL WHERE id = ? AND status IN ('parked', 'dispatched')",
+        [new Date().toISOString(), reason, id],
+      ),
+    );
+  }
+
+  effectsUnder(execution: string, site: string): Promise<readonly JournalRecord[]> {
+    // `substr` rather than `LIKE`, and that is a correctness choice rather than
+    // a stylistic one: a node id is grammar 2.1's identifier, which admits `_`,
+    // and `_` is `LIKE`'s single-character wildcard — so `LIKE 'my_node/0/%'`
+    // would also take the effects of a `myXnode`, handing a redispatched node a
+    // history of calls another node made.
+    //
+    // The comparison is byte-wise on every backend, which is the other half of
+    // the same correctness: the DDL puts these columns under SQLite's `BINARY`,
+    // Postgres' `"C"` and MySQL's `ascii_bin`, so a key is never equal to a key
+    // spelled with different case and `ORDER BY "key"` is the order a reader of
+    // `docs/durability.md` §4 derives.
+    const inside = `${site}/`;
+    // The prefix **length** is written into the statement rather than bound,
+    // and it is a number this module computed rather than anything a caller
+    // supplied, so nothing is injectable through it. Bound, it would be a
+    // parameter each backend has to infer an integer type for inside a
+    // `substr(text, int, int)` call — one more thing three servers could read
+    // three ways, for a value that is not a value.
+    return this.#serial(async () => {
+      const rows = await this.#all(
+        `SELECT * FROM effects WHERE execution = ? AND (site = ? OR substr(site, 1, ${inside.length}) = ?) ORDER BY "key" ASC`,
+        [execution, site, inside],
+      );
+      return rows.map((row) => recordOf(row));
+    });
+  }
+
+  close(): Promise<void> {
+    return this.#serial(() => this.#driver.close());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The SQLite arm: one file beside the project's stores
 // ---------------------------------------------------------------------------
 
 type SqliteModule = typeof import("node-sqlite3-wasm");
 type Database = InstanceType<SqliteModule["Database"]>;
-type Row = Record<string, unknown>;
 
 /**
  * The driver, loaded on first use.
@@ -830,377 +1524,192 @@ CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
 CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
 `;
 
-/**
- * How park order breaks a tie (`docs/distributed.md` §6.2).
- *
- * `parked_at` is an ISO instant with millisecond resolution, and a fan-out parks
- * its instances from one synchronous burst — sixteen `dispatchPlaced` calls
- * inside one tick all carry the same instant. §6.2 says dispatch resumes "in
- * park order", so the tiebreak has to be the order they went on the board, and
- * the only column that is is the implicit `rowid`: rows here are inserted and
- * never deleted, so it is exactly monotonic insertion order.
- *
- * The tiebreak it replaced was `wait ASC`, which is a **string** — `<instance
- * path>/<ordinal>` — so instance 10 sorted before instance 2 and a one-worker
- * pool ran a `map`'s items 0, 1, 10, 11, …, 2, 3. §6.4's undispatched-is-a-pause
- * row leans on park order for fairness: the item that has waited longest, and
- * whose `timeout:` has been running longest, is the one taken next.
- */
-const INSERTION_ORDER = "rowid ASC";
+/** SQLite's three answers: standard upsert, `?` as written, and the `rowid`. */
+const SQLITE_DIALECT: Dialect = {
+  provider: "sqlite",
+  conflict: standardConflict,
+  bind: positionalBind,
+  insertionOrder: "rowid",
+};
 
-/** The journal as a SQLite file — the only backend `--target local` binds. */
-class SqliteJournal implements Journal {
+/** The journal as a SQLite file — what a target that says nothing binds. */
+class SqliteDriver implements JournalDriver {
+  readonly dialect = SQLITE_DIALECT;
   readonly #database: Database;
 
   constructor(database: Database) {
     this.#database = database;
   }
 
-  begin(row: ExecutionRow): void {
-    this.#database.run(
-      `INSERT INTO executions
-         (id, flow, trigger_kind, inputs, session_key, callback, traceparent, status, journal_version, started_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT (id) DO NOTHING`,
-      [
-        row.id,
-        row.flow,
-        row.trigger,
-        JSON.stringify(row.inputs),
-        row.sessionKey,
-        row.callback ?? null,
-        row.traceparent ?? null,
-        row.status,
-        row.journalVersion,
-        row.startedAt,
-      ],
-    );
+  all(sql: string, parameters: readonly Bound[]): Promise<Row[]> {
+    return Promise.resolve(this.#database.all(sql, [...parameters]) as Row[]);
   }
 
-  end(id: string, status: Exclude<ExecutionStatus, "open">, error?: string): void {
-    this.#database.run(
-      "UPDATE executions SET status = ?, ended_at = ?, error = ? WHERE id = ?",
-      [status, new Date().toISOString(), error ?? null, id],
-    );
+  run(sql: string, parameters: readonly Bound[]): Promise<void> {
+    this.#database.run(sql, [...parameters]);
+    return Promise.resolve();
   }
 
-  execution(id: string): ExecutionRow | undefined {
-    const found = this.#database.get("SELECT * FROM executions WHERE id = ?", [id]) as Row | null;
-    return found === null ? undefined : executionOf(found);
+  close(): Promise<void> {
+    this.#database.close();
+    return Promise.resolve();
   }
+}
 
-  openExecutions(): readonly ExecutionRow[] {
-    const rows = this.#database.all(
-      "SELECT * FROM executions WHERE status = 'open' ORDER BY started_at ASC, id ASC",
-    ) as Row[];
-    return rows.map((row) => executionOf(row));
+/**
+ * How long the journal waits on a locked file, and how long the retry below
+ * keeps trying for.
+ *
+ * There *is* something to wait on: this driver's virtual file system takes
+ * SQLite's exclusive lock by creating `<file>.lock` as a directory and gives it
+ * back by removing it, so a second process on one journal meets `SQLITE_BUSY`
+ * rather than interleaving into the same pages. `busy_timeout` is set first for
+ * that reason, and the retry beneath it covers the schema statements the pragma
+ * cannot.
+ *
+ * What that lock does **not** do is die with the process holding it — see
+ * [`LOCK_DIRECTORY`].
+ */
+const LOCK_WAIT_MS = 5_000;
+
+/**
+ * The lock a killed writer leaves behind, and why breaking it is right.
+ *
+ * A `mkdir` lock is released by an `rmdir` that a process which dies inside its
+ * write never reaches. Nothing else ever removes it, so one interrupted write
+ * would leave a directory that refuses **every** later open of that journal:
+ * not just the resume of the execution the crash interrupted, but every future
+ * run of the project. A durability story whose one artifact a crash can render
+ * permanently unopenable is not one.
+ *
+ * So a lock that is still there after this process has waited [`LOCK_WAIT_MS`]
+ * for it is treated as a corpse and removed, and the open is tried once more.
+ * That is sound under exactly the rule this file already keeps (the module
+ * header, `docs/durability.md` §2): **one process at a time writes a project's
+ * journal**. A lock nobody gave back inside five seconds is, under that rule,
+ * a lock whose owner is gone — and every write here is a single statement, so a
+ * live owner never holds one for anything like that long.
+ *
+ * The two remote arms need no such rule and have none: a session-scoped lock is
+ * the server's, and the server drops it the moment the connection ends (see the
+ * module header). Breaking a lock is a thing only a filesystem makes necessary.
+ *
+ * The hot rollback journal the same crash leaves is *not* touched: SQLite
+ * recovers it on the next open, which is what makes the interrupted write leave
+ * no half-written row (§2).
+ */
+const LOCK_DIRECTORY = ".lock";
+
+/** Remove a lock no live process is giving back. See [`LOCK_DIRECTORY`]. */
+function breakStaleLock(): boolean {
+  const lock = `${journalPath()}${LOCK_DIRECTORY}`;
+  if (!fs.existsSync(lock)) return false;
+  try {
+    fs.rmSync(lock, { recursive: true, force: true });
+    return true;
+  } catch {
+    // A lock this process cannot remove is one it cannot get past either; the
+    // open below fails with the driver's own message rather than with this.
+    return false;
   }
+}
 
-  lookup(execution: string, key: string): JournalRecord | undefined {
-    const found = this.#database.get("SELECT * FROM effects WHERE execution = ? AND key = ?", [
-      execution,
-      key,
-    ]) as Row | null;
-    return found === null ? undefined : recordOf(found);
-  }
+/** Open the SQLite file, with the schema applied. */
+async function openSqlite(): Promise<JournalDriver> {
+  const { Database } = await sqlite();
+  fs.mkdirSync(dataRoot(), { recursive: true });
+  return new SqliteDriver(await migrated(Database));
+}
 
-  append(record: JournalRecord): void {
-    const payload =
-      record.outcome.kind === "value"
-        ? canonical(record.outcome.value)
-        : canonical({ name: record.outcome.name, message: record.outcome.message });
-    // One statement, so one implicit transaction: a crash leaves the row absent
-    // rather than half written (see the module header).
-    this.#database.run(
-      `INSERT INTO effects
-         (execution, key, site, kind, ordinal, request, outcome, payload, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT (execution, key) DO NOTHING`,
-      [
-        record.execution,
-        record.key,
-        record.site,
-        record.kind,
-        record.ordinal,
-        record.request,
-        record.outcome.kind,
-        payload,
-        record.recordedAt,
-      ],
-    );
-  }
-
-  refuse(execution: string, key: string): void {
-    // One statement again, and one that says the same thing however many times
-    // it runs: a ladder that met this answer on two generations marks it twice
-    // and the row is the same row (see [`JournalRecord.refused`]).
-    this.#database.run("UPDATE effects SET refused = 1 WHERE execution = ? AND key = ?", [
-      execution,
-      key,
-    ]);
-  }
-
-  intendDelivery(intent: DeliveryIntent): DeliveryRecord {
-    return this.#openDelivery(intent, "pending", undefined);
-  }
-
-  refuseDelivery(intent: CallbackIntent, reason: string): DeliveryRecord {
-    return this.#openDelivery(intent, "refused", reason);
-  }
-
-  /**
-   * Allocate this execution's next event ordinal and write the row.
-   *
-   * The read and the write are two statements and are still atomic where it
-   * matters, for the reason the module header gives: every statement here is
-   * synchronous, so nothing else in this process runs between them, and **one
-   * process at a time writes a project's journal**. A `MAX(ordinal)` taken in
-   * the same synchronous step the row is written in is therefore a number no
-   * other writer can be holding.
-   */
-  #openDelivery(
-    intent: DeliveryIntent,
-    status: DeliveryStatus,
-    detail: string | undefined,
-  ): DeliveryRecord {
-    const found = this.#database.get(
-      "SELECT COALESCE(MAX(ordinal), -1) + 1 AS next FROM deliveries WHERE execution = ?",
-      [intent.execution],
-    ) as Row | null;
-    const ordinal = Number((found?.["next"] as number | undefined) ?? 0);
-    const at = new Date().toISOString();
-    const record: DeliveryRecord = {
-      ...intent,
-      ordinal,
-      id: `${intent.execution}:${ordinal}`,
-      status,
-      attempts: [],
-      intendedAt: at,
-      ...(status === "pending" ? {} : { settledAt: at }),
-      ...(detail === undefined ? {} : { detail }),
-    };
-    this.#database.run(
-      `INSERT INTO deliveries
-         (execution, ordinal, kind, trigger_kind, event, url, body, pauses, status, attempts, intended_at, settled_at, detail)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        record.execution,
-        record.ordinal,
-        record.kind,
-        record.trigger ?? null,
-        record.event,
-        record.url,
-        record.body,
-        JSON.stringify(record.pauses),
-        record.status,
-        "[]",
-        record.intendedAt,
-        record.settledAt ?? null,
-        detail ?? null,
-      ],
-    );
-    return record;
-  }
-
-  refuseRecorded(execution: string, ordinal: number, reason: string): void {
-    // `status = 'pending'` in the predicate rather than read first: a row that
-    // has already been delivered, refused or exhausted has an outcome, and one
-    // statement that will not touch it is better than two that could race.
-    //
-    // …and `kind` beside it, because `refused` is a **callback** row's outcome:
-    // a trace sink's address is admitted by no list, so there is nothing for it
-    // to fail to match (grammar 14.5, PRD resolved q50). A row written before
-    // the ledger recorded a kind is a callback, which is what `IS NULL` says.
-    this.#database.run(
-      "UPDATE deliveries SET status = 'refused', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending' AND (kind IS NULL OR kind = 'callback')",
-      [new Date().toISOString(), reason, execution, ordinal],
-    );
-  }
-
-  exhaustRecorded(execution: string, ordinal: number, reason: string): void {
-    // The sibling above's statement with the other of §3.7's two ends in it,
-    // and the same predicate for the same reason: `attempts` is left alone,
-    // because this row's end is that there was no attempt left to make.
-    this.#database.run(
-      "UPDATE deliveries SET status = 'exhausted', settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
-      [new Date().toISOString(), reason, execution, ordinal],
-    );
-  }
-
-  recordAttempt(
-    execution: string,
-    ordinal: number,
-    attempt: DeliveryAttempt,
-    status: DeliveryStatus,
-  ): void {
-    const held = this.#database.get(
-      "SELECT attempts, status FROM deliveries WHERE execution = ? AND ordinal = ?",
-      [execution, ordinal],
-    ) as Row | null;
-    // **A row that already has an outcome is not reopened by a late attempt**,
-    // which is the predicate the two statements above carry and this one needs
-    // for the same reason: an attempt recorded against a `delivered` row would
-    // write `pending` back over it, and the next start would read a webhook the
-    // receiver already took as one it still owes — past the bounded number of
-    // attempts `docs/durability.md` §3.7 promises.
-    if (held === null || held["status"] !== "pending") return;
-    const attempts = [...(JSON.parse(String(held["attempts"])) as DeliveryAttempt[]), attempt];
-    // The read and the write are one synchronous step (see [`#openDelivery`]),
-    // so the predicate repeats what the guard above decided rather than closing
-    // a window between them — and it is what a second writer would meet.
-    this.#database.run(
-      "UPDATE deliveries SET attempts = ?, status = ?, settled_at = ?, detail = ? WHERE execution = ? AND ordinal = ? AND status = 'pending'",
-      [
-        JSON.stringify(attempts),
-        status,
-        status === "pending" ? null : new Date().toISOString(),
-        attempt.detail ?? null,
-        execution,
-        ordinal,
-      ],
-    );
-  }
-
-  deliveries(execution: string): readonly DeliveryRecord[] {
-    const rows = this.#database.all(
-      "SELECT * FROM deliveries WHERE execution = ? ORDER BY ordinal ASC",
-      [execution],
-    ) as Row[];
-    return rows.map((row) => deliveryOf(row));
-  }
-
-  undelivered(): readonly DeliveryRecord[] {
-    const rows = this.#database.all(
-      "SELECT * FROM deliveries WHERE status = 'pending' ORDER BY intended_at ASC, execution ASC, ordinal ASC",
-    ) as Row[];
-    return rows.map((row) => deliveryOf(row));
-  }
-
-  park(row: DispatchRow): DispatchRow {
-    // The read and the write are one synchronous step, so the row this answers
-    // is the row that is there — see [`#openDelivery`] for why that is enough.
-    const held = this.dispatchAt(row.execution, row.wait);
-    if (held !== undefined) return held;
-    this.#database.run(
-      `INSERT INTO dispatches
-         (execution, wait, id, placement, node, site, inputs,
-          item_index, history, policy, status, parked_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT (execution, wait) DO NOTHING`,
-      [
-        row.execution,
-        row.wait,
-        row.id,
-        row.placement,
-        row.node,
-        row.site,
-        canonical(row.inputs),
-        row.itemIndex ?? null,
-        // SQL `NULL` rather than the four characters `null` for an absent one:
-        // the read below has to tell a dispatch that carries no history apart
-        // from one whose history is the JSON value `null`, which is §3.2's
-        // difference between omitting a key and sending it.
-        row.history === undefined ? null : canonical(row.history),
-        row.policy === undefined ? null : canonical(row.policy),
-        "parked",
-        row.parkedAt,
-      ],
-    );
-    return this.dispatchAt(row.execution, row.wait) ?? row;
-  }
-
-  dispatchAt(execution: string, wait: string): DispatchRow | undefined {
-    const found = this.#database.get(
-      `SELECT rowid AS insertion_order, * FROM dispatches WHERE execution = ? AND wait = ?`,
-      [execution, wait],
-    ) as Row | null;
-    return found === null ? undefined : dispatchOf(found);
-  }
-
-  dispatchOf(id: string): DispatchRow | undefined {
-    const found = this.#database.get("SELECT rowid AS insertion_order, * FROM dispatches WHERE id = ?", [
-      id,
-    ]) as Row | null;
-    return found === null ? undefined : dispatchOf(found);
-  }
-
-  dispatchesOf(execution: string): readonly DispatchRow[] {
-    const rows = this.#database.all(
-      `SELECT rowid AS insertion_order, * FROM dispatches WHERE execution = ? ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
-      [execution],
-    ) as Row[];
-    return rows.map((row) => dispatchOf(row));
-  }
-
-  unsettledDispatches(): readonly DispatchRow[] {
-    const rows = this.#database.all(
-      `SELECT rowid AS insertion_order, * FROM dispatches WHERE status IN ('parked', 'dispatched') ORDER BY parked_at ASC, ${INSERTION_ORDER}`,
-    ) as Row[];
-    return rows.map((row) => dispatchOf(row));
-  }
-
-  claimDispatch(id: string, session: string): DispatchRow | undefined {
-    // `status = 'parked'` in the predicate rather than read first, for the
-    // reason `refuseRecorded` carries it: two polls arriving together are the
-    // race, and the loser must take nothing rather than take it twice.
-    this.#database.run(
-      "UPDATE dispatches SET status = 'dispatched', session = ?, dispatched_at = ? WHERE id = ? AND status = 'parked'",
-      [session, new Date().toISOString(), id],
-    );
-    const held = this.dispatchOf(id);
-    return held?.status === "dispatched" && held.session === session ? held : undefined;
-  }
-
-  releaseDispatch(id: string, session: string): boolean {
-    this.#database.run(
-      "UPDATE dispatches SET status = 'parked', session = NULL, dispatched_at = NULL WHERE id = ? AND status = 'dispatched' AND session = ?",
-      [id, session],
-    );
-    return this.dispatchOf(id)?.status === "parked";
-  }
-
-  settleDispatch(id: string, outcome: JournalOutcome): boolean {
-    const payload =
-      outcome.kind === "value"
-        ? canonical(outcome.value)
-        : canonical({ name: outcome.name, message: outcome.message });
-    // **Read first, and the read is what answers.** The `WHERE` clause is still
-    // the guard — a row already ended keeps the outcome it has — but a status
-    // read *after* the write cannot tell a row this call settled from one an
-    // earlier result settled, and the contract above is that it can. The read
-    // and the write are one synchronous step in this driver, which is the
-    // property [`park`] already relies on.
-    const before = this.dispatchOf(id);
-    this.#database.run(
-      "UPDATE dispatches SET status = 'settled', outcome = ?, payload = ?, settled_at = ? WHERE id = ? AND status IN ('parked', 'dispatched')",
-      [outcome.kind, payload, new Date().toISOString(), id],
-    );
-    if (before === undefined || (before.status !== "parked" && before.status !== "dispatched")) {
-      return false;
+/** The open handle, with the schema applied. */
+async function migrated(
+  Database: SqliteModule["Database"],
+): Promise<InstanceType<SqliteModule["Database"]>> {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let broke = false;
+  let delay = 10;
+  for (;;) {
+    const database = new Database(journalPath());
+    try {
+      // **First**, so that every statement after it waits on a locked file
+      // rather than failing at once. A `PRAGMA` that arrives after the contended
+      // statement is a setting nobody read.
+      database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
+      // What makes "committed" mean "on the disk" rather than "in the page
+      // cache", which is the whole of what a journal is for.
+      database.exec("PRAGMA synchronous = FULL;");
+      database.exec(SCHEMA);
+      // `CREATE TABLE IF NOT EXISTS` leaves a table that exists exactly as it
+      // is, so a column the schema grew after a file was created is a column
+      // that file does not have. §11.2 makes a physical schema change
+      // compatible only where it still reads older files, and a column added to
+      // the lifecycle row has to be writable in one too — an `INSERT` naming a
+      // column the file lacks would fail every new execution in it.
+      //
+      // The two remote arms carry no such probes and need none: their schema is
+      // created whole on first open by a build that already has every column,
+      // because no journal older than they are exists (§11.2).
+      const columns = database.all("PRAGMA table_info(executions)") as Row[];
+      if (!columns.some((column) => column["name"] === "callback")) {
+        database.exec("ALTER TABLE executions ADD COLUMN callback TEXT;");
+      }
+      // The caller's `traceparent`, added to the lifecycle row after it, and
+      // nullable for the same reason `callback` is: an execution started before
+      // this column existed carried no header this file could hold, and one
+      // started without one carries none either (PRD resolved q51).
+      if (!columns.some((column) => column["name"] === "traceparent")) {
+        database.exec("ALTER TABLE executions ADD COLUMN traceparent TEXT;");
+      }
+      const effects = database.all("PRAGMA table_info(effects)") as Row[];
+      if (!effects.some((column) => column["name"] === "refused")) {
+        database.exec("ALTER TABLE effects ADD COLUMN refused INTEGER NOT NULL DEFAULT 0;");
+      }
+      // The delivery's own trigger, added to the ledger after it: nullable
+      // because a row written before it cannot be backfilled — nothing in the
+      // file says what trigger that delivery was for — and a row that answers
+      // `null` is read off the lifecycle row instead (see
+      // [`DeliveryIntent.trigger`]).
+      const deliveries = database.all("PRAGMA table_info(deliveries)") as Row[];
+      if (!deliveries.some((column) => column["name"] === "trigger_kind")) {
+        database.exec("ALTER TABLE deliveries ADD COLUMN trigger_kind TEXT;");
+      }
+      // Which of `docs/durability.md` §3.7's two kinds a row is, added to the
+      // ledger after the first of them. Nullable because a row written before it
+      // needs no backfill: `callback` is the only kind that existed then, and
+      // [`deliveryOf`] reads a null as one.
+      if (!deliveries.some((column) => column["name"] === "kind")) {
+        database.exec("ALTER TABLE deliveries ADD COLUMN kind TEXT;");
+      }
+      // A whole *table* the schema grew needs no probe of its own: `CREATE
+      // TABLE IF NOT EXISTS` above created `deliveries` in a file written
+      // before it existed, and an execution open in such a file has no delivery
+      // rows — which is exactly right, because the build that wrote it made no
+      // lifecycle deliveries to record (see the module header).
+      return database;
+      // A write-ahead log is deliberately **not** asked for. This driver's
+      // virtual file system does not implement one — `PRAGMA journal_mode =
+      // WAL` is accepted and leaves the mode at `delete` — so asking would be a
+      // line that reads like a guarantee and is not one. The rollback journal
+      // it uses instead is atomic per statement, which is the property this
+      // file needs (see the module header).
+    } catch (error) {
+      database.close();
+      if (Date.now() >= deadline) {
+        // The deadline is up. Either a lock is still held — in which case its
+        // owner is gone and it goes, once ([`LOCK_DIRECTORY`]) — or this is a
+        // failure waiting cannot fix, and it is the caller's.
+        if (broke || !breakStaleLock()) throw error;
+        broke = true;
+        continue;
+      }
+      // Whatever refused the open, tried again under a deadline rather than
+      // failed on at once: the schema statements are the widest window a journal
+      // has, and the honest thing to do about a file that is momentarily busy is
+      // to let this process in rather than to fail its run over a table that
+      // already exists.
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 200);
     }
-    const held = this.dispatchOf(id);
-    return held?.status === "settled" && held.settledAt !== undefined;
-  }
-
-  supersedeDispatch(id: string, reason: string): void {
-    this.#database.run(
-      "UPDATE dispatches SET status = 'superseded', settled_at = ?, detail = ?, session = NULL WHERE id = ? AND status IN ('parked', 'dispatched')",
-      [new Date().toISOString(), reason, id],
-    );
-  }
-
-  effectsUnder(execution: string, site: string): readonly JournalRecord[] {
-    // `substr` rather than `LIKE`, and that is a correctness choice rather than
-    // a stylistic one: a node id is grammar 2.1's identifier, which admits `_`,
-    // and `_` is `LIKE`'s single-character wildcard — so `LIKE 'my_node/0/%'`
-    // would also take the effects of a `myXnode`, handing a redispatched node a
-    // history of calls another node made.
-    const inside = `${site}/`;
-    const rows = this.#database.all(
-      "SELECT * FROM effects WHERE execution = ? AND (site = ? OR substr(site, 1, ?) = ?) ORDER BY key ASC",
-      [execution, site, inside.length, inside],
-    ) as Row[];
-    return rows.map((row) => recordOf(row));
   }
 }
 
@@ -1336,21 +1845,199 @@ function executionOf(row: Row): ExecutionRow {
   };
 }
 
+// ---------------------------------------------------------------------------
+// What a remote arm needs, and what it is refused with
+// ---------------------------------------------------------------------------
+
+/**
+ * The name this journal's writer guard is taken under, on the two backends that
+ * have one.
+ *
+ * A constant rather than something derived from the project: the tables are the
+ * project's, and two deployments pointed at one database share those tables
+ * whatever this string says — so a guard keyed per project would let two hubs
+ * write one set of rows while each believed it was alone. One database, one
+ * journal, one writer (`docs/durability.md` §2).
+ *
+ * **One *database*, though, and not one server**, which is the other half of the
+ * same sentence and the half only one of the two arms gets for free. Two
+ * deployments — a `staging` and a `prod` — routinely live in two databases of one
+ * managed server, and they share no table: each is a journal of its own and each
+ * must have a writer of its own. Postgres' advisory locks are scoped to the
+ * database the session connected to, so this name is already per-database there.
+ * MySQL's user-level locks are **server-wide** — the name alone is the key — so
+ * the MySQL arm qualifies this string with the schema it is connected to
+ * ([`journal-mysql.ts`]'s `MYSQL_GUARD_NAME`) rather than locking `staging` out
+ * of `prod`'s journal.
+ */
+const WRITER_GUARD = "agent-compose:journal";
+
+/**
+ * Postgres has no string locks, so the same name as a pair of 32-bit keys.
+ *
+ * The two-argument `pg_try_advisory_lock(int4, int4)` rather than the
+ * one-argument `bigint` form, and that is arithmetic rather than taste: a 64-bit
+ * key does not fit in a JavaScript number, so a constant written as one would be
+ * rounded on its way to the server and the value this module locked on would not
+ * be the value it was written as. Two `int4`s are exact.
+ *
+ * The numbers are [`WRITER_GUARD`]'s first eight characters read as two
+ * big-endian ASCII words — `agen` and `t-co` — which is a constant a reader can
+ * check rather than a magic number, and each is under `int4`'s ceiling by
+ * construction because ASCII is seven bits.
+ */
+const WRITER_GUARD_KEYS: readonly [number, number] = [0x6167_656e, 0x742d_636f];
+
+/**
+ * The longest a server is asked to go on holding a session that has gone silent
+ * — and therefore the longest a dead host's guard locks a live one out.
+ *
+ * The property a remote journal exists for is cross-host recovery: a `serve`
+ * restarted on a fresh machine recovers every open execution from the database
+ * (`docs/durability.md` §2.3, §10). The machine it is taking over from is,
+ * almost by definition, one that stopped without closing anything — a crash, a
+ * power loss, a partition — so the far end's session is still open as far as the
+ * server is concerned, and the guard on it is still held. Left at its own
+ * defaults the server finds out very late: Linux's `tcp_keepalive_time` is two
+ * hours, and MySQL's `wait_timeout` is eight. Each arm therefore shortens the
+ * window **for its own session**, to this.
+ *
+ * Five minutes rather than five seconds, and the asymmetry is the reason: a
+ * window short enough to trip over a slow network would reap a hub that is still
+ * writing, and a guard nobody holds costs a takeover a few minutes while a guard
+ * taken from somebody still writing costs the record itself. Bounded, stated,
+ * and the same number on both backends.
+ */
+const GUARD_REAP_SECONDS = 300;
+
+/**
+ * How often a held connection says something, so that a shortened window never
+ * reaps a hub that is alive.
+ *
+ * A `serve` can hold this connection for hours and journal nothing — an idle
+ * deployment is the ordinary case, not an edge one — and silence is exactly what
+ * [`GUARD_REAP_SECONDS`] is measuring. The heartbeat is what makes "silent"
+ * mean "gone" rather than "quiet", with an order of magnitude between the two so
+ * a slow round trip is never mistaken for a dead host.
+ *
+ * The timer is `unref`'d: it never holds a process open, so a `run` that has
+ * finished still exits on its own.
+ */
+const GUARD_HEARTBEAT_MS = 30_000;
+
+/**
+ * The fault a remote connection reported, shared between the arm that opened it
+ * and the driver that runs statements over it.
+ *
+ * Both halves need it, and at different moments. The listener has to be attached
+ * **before** the connection is opened: both drivers emit `error` on the
+ * connection whenever the far end goes away with no command in flight, and an
+ * `EventEmitter` that emits `error` with nothing listening raises
+ * `ERR_UNHANDLED_ERROR` and takes the process with it — which for a `serve` is
+ * every in-flight execution's in-process state, lost to a server closing an idle
+ * socket. What has to *answer* for the fault, though, is every later statement,
+ * which is the driver's half.
+ */
+interface ConnectionFault {
+  /** The first one, which is the one that says what happened. */
+  error?: Error;
+}
+
+/**
+ * What a statement is refused with once the journal's connection has been lost.
+ *
+ * **Refused rather than redialled**, and that is §2.1's one-writer rule read at
+ * the moment it matters most: a connection this process lost is a guard the
+ * server has already dropped or is about to, so another hub may be opening this
+ * journal right now. A silent redial would take the guard back and put two
+ * writers into one record — the state the guard exists to prevent — so the
+ * command fails by name instead and whatever holds the journal keeps it.
+ */
+function connectionLost(cause: unknown): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  return new Error(
+    `this project's journal lost its connection to ${journalLocation()}: ${detail}. It is not redialled: the writer guard went with the connection, and one process at a time writes a project's journal (\`docs/durability.md\` §2), so another process may already hold it. Start this command again — a \`serve\` recovers every execution an interrupted one left open`,
+  );
+}
+
+/**
+ * Say so when a server will not take the setting that shortens its reap window.
+ *
+ * Tolerated rather than fatal, and warned about rather than swallowed. A journal
+ * that refused to open because a server spells one connection setting
+ * differently would be a deployment blocked on something that does not touch a
+ * single record; a journal that quietly fell back to an eight-hour lockout would
+ * be `docs/durability.md` §2.3's bound untrue with nothing saying so. The
+ * operator gets the one line that tells them which of the two they have.
+ */
+function guardWindowUnshortened(cause: unknown): void {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  process.stderr.write(
+    `warning: this server would not shorten the window it reaps a silent session in (${detail}), so this journal's writer guard is released on the server's own schedule rather than within ${GUARD_REAP_SECONDS}s of a host disappearing (\`docs/durability.md\` §2.3). A \`serve\` started on a fresh machine may be refused until then.\n`,
+  );
+}
+
+/** The connection string this target's journal dials, or a refusal. */
+function journalUrl(): string {
+  const variable = journalBinding.urlEnv;
+  if (variable === undefined) {
+    throw new Error(
+      `this project's target binds a \`${journalBinding.provider}\` journal and names no variable for its address; that is a compiler bug, since grammar §14.7 requires \`url:\` on a provider that dials out`,
+    );
+  }
+  const held = process.env[variable];
+  if (held === undefined || held === "") {
+    throw new Error(
+      `\`${variable}\` is unset, and it is where this project's \`${journalBinding.provider}\` journal is: every invocation of every flow is journaled, so the run cannot start without it (grammar §14.7, PRD resolved q15)`,
+    );
+  }
+  return held;
+}
+
+/** What a second opener of a remote journal is told. See the module header. */
+function guardHeld(): Error {
+  return new Error(
+    `another process is already writing this project's journal: ${journalLocation()} is held by an open session, and one process at a time writes a project's journal (\`docs/durability.md\` §2). A \`serve\` that is up has already recovered every execution it holds open, so finish one through its \`POST /executions/:id/resume\` route rather than beside it. The guard is the server's own session lock and is released when that session ends — a process killed on a machine that is still running has released it already, and a host that vanished outright releases it within ${GUARD_REAP_SECONDS}s, which is the window this journal shortens its server's own reaping to. So: if no \`serve\` is up, this is a host that has just been lost, and the same command ${GUARD_REAP_SECONDS}s from now goes in`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Opening, and letting go
+// ---------------------------------------------------------------------------
+
+/**
+ * The backends this build emitted, by provider.
+ *
+ * `sqlite` is always here — it is what a target that declares nothing binds, and
+ * `./stores.ts` pins its driver anyway — and each remote arm appended below adds
+ * itself. A build whose target binds a provider with no entry here is a compiler
+ * bug rather than a deployment's mistake, and [`openJournal`] says so by name
+ * rather than failing on an `undefined`.
+ */
+const BACKENDS: Partial<Record<JournalProvider, () => Promise<JournalDriver>>> = {
+  sqlite: openSqlite,
+};
+
 /**
  * The project's journal, opened and migrated on first use.
  *
  * The promise is cached rather than the handle, for the reason `./stores.ts`
  * caches its own: opening is asynchronous — the driver is imported lazily — and
  * a `serve` recovering several executions at once would otherwise open several
- * handles to one file.
+ * handles to one journal. On a remote binding that matters twice over: the
+ * second handle would meet its own writer guard and refuse.
  */
 let opening: Promise<Journal> | undefined;
 
 export function openJournal(): Promise<Journal> {
   opening ??= (async () => {
-    const { Database } = await sqlite();
-    fs.mkdirSync(dataRoot(), { recursive: true });
-    return new SqliteJournal(await migrated(Database));
+    const open = BACKENDS[journalBinding.provider];
+    if (open === undefined) {
+      throw new Error(
+        `this project was built for a \`${journalBinding.provider}\` journal and carries no driver for one: \`build\` emits the arm the target binds, so a project this happens to was not built from this composition's deploy layer`,
+      );
+    }
+    return new SqlJournal(await open());
   })();
   void opening.catch(() => {
     opening = undefined;
@@ -1359,144 +2046,29 @@ export function openJournal(): Promise<Journal> {
 }
 
 /**
- * How long the journal waits on a locked file, and how long the retry below
- * keeps trying for.
+ * Close this project's journal, and let go of the writer guard with it.
  *
- * There *is* something to wait on: this driver's virtual file system takes
- * SQLite's exclusive lock by creating `<file>.lock` as a directory and gives it
- * back by removing it, so a second process on one journal meets `SQLITE_BUSY`
- * rather than interleaving into the same pages. `busy_timeout` is set first for
- * that reason, and the retry beneath it covers the schema statements the pragma
- * cannot.
+ * Called by `./cli.ts` on the way out of a `run` or a `resume`, and by nothing
+ * in a `serve`: that process holds the journal for as long as it serves, which
+ * is what the guard is for. A file needs no such call and answers it by closing
+ * the handle; a remote arm needs it, because what it holds is a server-side
+ * session lock and a socket left open is a lock nobody released until the
+ * connection times out.
  *
- * What that lock does **not** do is die with the process holding it — see
- * [`LOCK_DIRECTORY`].
+ * Idempotent, and never the caller's failure: a journal that could not be closed
+ * is a connection the server will reap, and the command that asked has already
+ * done its work.
  */
-const LOCK_WAIT_MS = 5_000;
-
-/**
- * The lock a killed writer leaves behind, and why breaking it is right.
- *
- * A `mkdir` lock is released by an `rmdir` that a process which dies inside its
- * write never reaches. Nothing else ever removes it, so one interrupted write
- * would leave a directory that refuses **every** later open of that journal:
- * not just the resume of the execution the crash interrupted, but every future
- * run of the project. A durability story whose one artifact a crash can render
- * permanently unopenable is not one.
- *
- * So a lock that is still there after this process has waited [`LOCK_WAIT_MS`]
- * for it is treated as a corpse and removed, and the open is tried once more.
- * That is sound under exactly the rule this file already keeps (the module
- * header, `docs/durability.md` §2): **one process at a time writes a project's
- * journal**. A lock nobody gave back inside five seconds is, under that rule,
- * a lock whose owner is gone — and every write here is a single statement, so a
- * live owner never holds one for anything like that long.
- *
- * The hot rollback journal the same crash leaves is *not* touched: SQLite
- * recovers it on the next open, which is what makes the interrupted write leave
- * no half-written row (§2).
- */
-const LOCK_DIRECTORY = ".lock";
-
-/** Remove a lock no live process is giving back. See [`LOCK_DIRECTORY`]. */
-function breakStaleLock(): boolean {
-  const lock = `${journalPath()}${LOCK_DIRECTORY}`;
-  if (!fs.existsSync(lock)) return false;
+export async function releaseJournal(): Promise<void> {
+  const held = opening;
+  if (held === undefined) return;
+  opening = undefined;
   try {
-    fs.rmSync(lock, { recursive: true, force: true });
-    return true;
+    await (await held).close();
   } catch {
-    // A lock this process cannot remove is one it cannot get past either; the
-    // open below fails with the driver's own message rather than with this.
-    return false;
-  }
-}
-
-/** The open handle, with the schema applied. */
-async function migrated(
-  Database: SqliteModule["Database"],
-): Promise<InstanceType<SqliteModule["Database"]>> {
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  let broke = false;
-  let delay = 10;
-  for (;;) {
-    const database = new Database(journalPath());
-    try {
-      // **First**, so that every statement after it waits on a locked file
-      // rather than failing at once. A `PRAGMA` that arrives after the contended
-      // statement is a setting nobody read.
-      database.exec(`PRAGMA busy_timeout = ${LOCK_WAIT_MS};`);
-      // What makes "committed" mean "on the disk" rather than "in the page
-      // cache", which is the whole of what a journal is for.
-      database.exec("PRAGMA synchronous = FULL;");
-      database.exec(SCHEMA);
-      // `CREATE TABLE IF NOT EXISTS` leaves a table that exists exactly as it
-      // is, so a column the schema grew after a file was created is a column
-      // that file does not have. §11.2 makes a physical schema change
-      // compatible only where it still reads older files, and a column added to
-      // the lifecycle row has to be writable in one too — an `INSERT` naming a
-      // column the file lacks would fail every new execution in it.
-      const columns = database.all("PRAGMA table_info(executions)") as Row[];
-      if (!columns.some((column) => column["name"] === "callback")) {
-        database.exec("ALTER TABLE executions ADD COLUMN callback TEXT;");
-      }
-      // The caller's `traceparent`, added to the lifecycle row after it, and
-      // nullable for the same reason `callback` is: an execution started before
-      // this column existed carried no header this file could hold, and one
-      // started without one carries none either (PRD resolved q51).
-      if (!columns.some((column) => column["name"] === "traceparent")) {
-        database.exec("ALTER TABLE executions ADD COLUMN traceparent TEXT;");
-      }
-      const effects = database.all("PRAGMA table_info(effects)") as Row[];
-      if (!effects.some((column) => column["name"] === "refused")) {
-        database.exec("ALTER TABLE effects ADD COLUMN refused INTEGER NOT NULL DEFAULT 0;");
-      }
-      // The delivery's own trigger, added to the ledger after it: nullable
-      // because a row written before it cannot be backfilled — nothing in the
-      // file says what trigger that delivery was for — and a row that answers
-      // `null` is read off the lifecycle row instead (see
-      // [`DeliveryIntent.trigger`]).
-      const deliveries = database.all("PRAGMA table_info(deliveries)") as Row[];
-      if (!deliveries.some((column) => column["name"] === "trigger_kind")) {
-        database.exec("ALTER TABLE deliveries ADD COLUMN trigger_kind TEXT;");
-      }
-      // Which of `docs/durability.md` §3.7's two kinds a row is, added to the
-      // ledger after the first of them. Nullable because a row written before it
-      // needs no backfill: `callback` is the only kind that existed then, and
-      // [`deliveryOf`] reads a null as one.
-      if (!deliveries.some((column) => column["name"] === "kind")) {
-        database.exec("ALTER TABLE deliveries ADD COLUMN kind TEXT;");
-      }
-      // A whole *table* the schema grew needs no probe of its own: `CREATE
-      // TABLE IF NOT EXISTS` above created `deliveries` in a file written
-      // before it existed, and an execution open in such a file has no delivery
-      // rows — which is exactly right, because the build that wrote it made no
-      // lifecycle deliveries to record (see the module header).
-      return database;
-      // A write-ahead log is deliberately **not** asked for. This driver's
-      // virtual file system does not implement one — `PRAGMA journal_mode =
-      // WAL` is accepted and leaves the mode at `delete` — so asking would be a
-      // line that reads like a guarantee and is not one. The rollback journal
-      // it uses instead is atomic per statement, which is the property this
-      // file needs (see the module header).
-    } catch (error) {
-      database.close();
-      if (Date.now() >= deadline) {
-        // The deadline is up. Either a lock is still held — in which case its
-        // owner is gone and it goes, once ([`LOCK_DIRECTORY`]) — or this is a
-        // failure waiting cannot fix, and it is the caller's.
-        if (broke || !breakStaleLock()) throw error;
-        broke = true;
-        continue;
-      }
-      // Whatever refused the open, tried again under a deadline rather than
-      // failed on at once: the schema statements are the widest window a journal
-      // has, and the honest thing to do about a file that is momentarily busy is
-      // to let this process in rather than to fail its run over a table that
-      // already exists.
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(delay * 2, 200);
-    }
+    // Nothing to report and nobody to report it to: the run is over, the guard
+    // goes with the connection, and a diagnostic here would be the last thing a
+    // reader saw about a command that succeeded.
   }
 }
 
@@ -1507,9 +2079,16 @@ async function migrated(
  * so — `openJournal` would otherwise create an empty file and then report the
  * execution id as unknown, which sends a reader to look at the id rather than
  * at the directory (PRD G3).
+ *
+ * **A file question, and answered only for a file.** A remote journal's schema
+ * is created on its first open, so "has this project ever journaled" is a
+ * question only the rows can answer — and the refusal after this one already
+ * asks them, naming the id and the executions the journal holds open. Answering
+ * `true` here sends the reader to that one rather than to a path a remote
+ * binding does not have.
  */
 export function journalExists(): boolean {
-  return fs.existsSync(journalPath());
+  return journalBinding.provider === "sqlite" ? fs.existsSync(journalPath()) : true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,10 +2260,20 @@ export function openSession(
   return session;
 }
 
-/** Close one execution's session. The journal handle is the project's. */
+/**
+ * Close one execution's session. The journal handle is the project's.
+ *
+ * A refusal mark this execution owed and nothing waited for ([`marks`]) is let
+ * go of here rather than awaited: this is a synchronous release called from a
+ * `finally`, the write is already on its way to the journal, and a mark that
+ * fails after the run has ended still says so on stderr. What a `run` or a
+ * `resume` gives it beyond that is `releaseJournal`, which closes the handle
+ * through the same queue the write is in.
+ */
 export function closeSession(execution: string): void {
   sessions.delete(execution);
   latched.delete(execution);
+  marks.delete(execution);
 }
 
 /**
@@ -1737,9 +2326,9 @@ export interface EffectSlot {
    * [`revived`]: the two generations are handed the same value or the promise
    * `docs/durability.md` §11.1 makes is not one.
    */
-  keep(value: unknown): unknown;
+  keep(value: unknown): Promise<unknown>;
   /** Record what the live effect threw. */
-  fail(error: unknown): void;
+  fail(error: unknown): Promise<void>;
 }
 
 /**
@@ -1807,8 +2396,15 @@ export class EffectRecorder {
    * site would have made under a different composition. It is compared verbatim
    * against the recorded identity, and a difference is a [`ReplayDivergence`]
    * rather than a re-execution (resolved q29).
+   *
+   * **The ordinal is allocated before anything is awaited**, which is what keeps
+   * a key derivable on a journal reached over a socket: two branches of one
+   * execution claiming at the same site in the same tick take their counters in
+   * the order they asked, exactly as they did when the lookup beneath this was
+   * synchronous. What the `await` below changes is only when the answer comes
+   * back.
    */
-  claim(kind: EffectKind, request: unknown): EffectSlot {
+  async claim(kind: EffectKind, request: unknown): Promise<EffectSlot> {
     // A divergence raised where nothing could carry it out — a detached `map`
     // delivery, whose whole point is that the flow instance does not wait for it
     // (grammar 8.6 rule 7) — belongs to the **execution** rather than to that
@@ -1830,7 +2426,7 @@ export class EffectRecorder {
 
     let held: JournalOutcome | undefined;
     if (session.resuming) {
-      const found = session.journal.lookup(session.execution, key);
+      const found = await session.journal.lookup(session.execution, key);
       if (found !== undefined) {
         if (found.request !== identity) {
           throw new ReplayDivergence(
@@ -1876,8 +2472,15 @@ export class EffectRecorder {
       refused: false,
     };
 
-    const write = (outcome: JournalOutcome): void => {
-      session.journal.append({ ...from, outcome, recordedAt: new Date().toISOString() });
+    const write = async (outcome: JournalOutcome): Promise<void> => {
+      // Whatever this execution has said about an *earlier* answer goes down
+      // first. A refusal is marked from a synchronous parse, so the mark is
+      // issued and owed rather than finished there ([`refuseRecorded`]); this is
+      // the one place it has to have landed by, because the record about to be
+      // appended is the retried attempt's and a resume reading it past an
+      // unmarked refusal calls this build the first to refuse that answer (§7).
+      await refusalsMarked(session.execution);
+      await session.journal.append({ ...from, outcome, recordedAt: new Date().toISOString() });
     };
 
     return {
@@ -1887,11 +2490,16 @@ export class EffectRecorder {
       ordinal,
       request: identity,
       held,
-      keep: (value) => {
+      keep: async (value) => {
         // Recorded **and returned** as the journal now holds it, so this
         // generation and the next are handed the same value ([`revived`]).
+        //
+        // **Awaited before the value is handed back**, which is the whole of
+        // what a remote backend changes here: a caller that went on before the
+        // row was committed would be a generation running past an effect its own
+        // record does not hold, and the next resume would perform it again.
         const kept = revived(value);
-        write({ kind: "value", value: kept });
+        await write({ kind: "value", value: kept });
         // And noted as this record's, so that a contract which refuses it says
         // so **on the record** rather than leaving the next generation to infer
         // it (see [`produced`], [`refuseRecorded`]).
@@ -2007,6 +2615,96 @@ export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergen
 }
 
 /**
+ * The refusal marks one execution has **issued and nothing has awaited yet**,
+ * and the first of them that failed.
+ *
+ * [`refuseRecorded`] is called from a synchronous parse and a journal answers
+ * promises, so the write cannot be finished where it is started. Dropping the
+ * promise there would leave two things nobody owns — the moment the mark lands,
+ * and a mark that could not be written at all — so it is owed here instead, and
+ * [`refusalsMarked`] is where both are collected.
+ *
+ * The promise held **never rejects**: a mark that failed resolves to its error.
+ * A rejection with nothing yet awaiting it is an unhandled rejection, which
+ * this runtime's Node floor ends the process on — a journal hiccup would take
+ * the hub down with it.
+ */
+const marks = new Map<string, Promise<Error | undefined>>();
+
+/**
+ * The failures [`refusalsMarked`] has already raised about.
+ *
+ * "Raised once" has to be true of the **failure** rather than of the map entry
+ * holding it: a mark owed by a second branch while the first is being waited for
+ * is collected with the failed one, so an entry dropped on the way out is not by
+ * itself enough to keep a single refused `UPDATE` from ending every attempt the
+ * node's ladder has left.
+ */
+const raised = new WeakSet<Error>();
+
+/**
+ * Owe one execution a refusal mark that has been issued.
+ *
+ * Marks of one execution are collected rather than chained: they are
+ * independent one-statement `UPDATE`s at distinct keys, so what the seam below
+ * has to wait for is *all* of them, in whatever order the backend runs them.
+ */
+function owe(execution: string, writing: Promise<void>): void {
+  const settled: Promise<Error | undefined> = writing.then(
+    () => undefined,
+    (error: unknown) => {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      // Said here as well as raised at the seam, because the two readers are
+      // different: the seam's raise reaches whoever is running this execution,
+      // and this reaches the operator of a process where nothing of this
+      // execution writes again (the run ended, or the node it failed was the
+      // last of it).
+      process.stderr.write(`could not mark a refused answer on its record: ${failure.message}\n`);
+      return failure;
+    },
+  );
+  const owed = marks.get(execution);
+  marks.set(
+    execution,
+    owed === undefined
+      ? settled
+      : Promise.all([owed, settled]).then(([earlier, later]) => earlier ?? later),
+  );
+}
+
+/**
+ * Wait for the refusal marks this execution has issued, and raise the first one
+ * that failed.
+ *
+ * Awaited **before this execution appends its next record** ([`EffectRecorder`],
+ * and the paragraph on [`refuseRecorded`] for why that is the ordering that
+ * matters). It raises rather than reports, because a generation that went on
+ * would be writing the retried attempt's record past a refusal the record does
+ * not carry — and the way *that* shows up is a resume months later refusing an
+ * execution whose composition nobody touched, with the journal hiccup that
+ * caused it long gone. Raising fails the node while the cause is still on the
+ * screen.
+ *
+ * The failure is raised **once** ([`raised`]), so the retry that follows writes
+ * its record and this execution goes on under the conservative half of
+ * [`refuseRecorded`]'s paragraph — an unmarked refusal a later resume reports as
+ * a divergence naming the step.
+ */
+export async function refusalsMarked(execution: string): Promise<void> {
+  const owed = marks.get(execution);
+  if (owed === undefined) return;
+  const failure = await owed;
+  // Only if nothing was owed on top while this was awaited, so a mark issued by
+  // another branch in the meantime is still owed by the execution.
+  if (marks.get(execution) === owed) marks.delete(execution);
+  if (failure === undefined || raised.has(failure)) return;
+  raised.add(failure);
+  throw new Error(
+    `the journal could not mark an answer this run's contract refused: ${failure.message}`,
+  );
+}
+
+/**
  * Say on the record that this generation's own contract refused what a live
  * effect answered. See [`JournalRecord.refused`].
  *
@@ -2016,18 +2714,30 @@ export function recordedAnswerOf(value: unknown, detail: string): ReplayDivergen
  * generation *replayed* rather than performed — is not on any record and this
  * does nothing about it.
  *
- * Written **before** the mismatch is thrown, so the retry the mismatch sets off
- * appends its own record after the mark rather than before it. A process killed
- * between the effect's row and this one leaves the record unmarked, which is the
- * conservative half: a later resume reports a divergence naming the step instead
- * of replaying silently past it (§2's window, decided the safe way).
+ * **Issued before the mismatch is thrown and owed to the execution, which is
+ * what orders it against the retry that mismatch sets off.** The parse is
+ * synchronous and a journal answers promises — a remote one over a socket — so
+ * the write cannot be *finished* here. What the next generation has to be able
+ * to read is not "the mark was down before the throw" but "the mark was down
+ * before the record of the attempt that followed it": a record appended past an
+ * unmarked refusal is what a resume reads as this build being the first to
+ * refuse that answer (§7). So the mark is owed ([`owe`]) and the seam waits for
+ * what is owed before it appends ([`refusalsMarked`]), on every backend rather
+ * than on the one whose driver happens to queue its statements.
+ *
+ * A process killed between the effect's row and the mark still leaves the record
+ * unmarked, and that window is wider than a synchronous journal's — a microtask
+ * on SQLite, a round trip on `postgres` and `mysql`. It is the conservative
+ * half: a later resume reports a divergence naming the step instead of replaying
+ * silently past it (§2's window, decided the safe way).
  */
 export function refuseRecorded(value: unknown): void {
   if (value === null || typeof value !== "object") return;
   const record = produced.get(value);
   if (record === undefined) return;
   const session = sessions.get(record.execution);
-  session?.journal.refuse(record.execution, record.key);
+  if (session === undefined) return;
+  owe(record.execution, session.journal.refuse(record.execution, record.key));
 }
 
 // ---------------------------------------------------------------------------
@@ -2120,15 +2830,15 @@ export async function journaled<T>(
    * For a caller that has to decide something from *whether the journal holds
    * this effect* — `./stores.ts` is the one, and what it decides is whether a
    * live op is about to read a store the recorded prefix filled in a process
-   * that is gone. It runs in the same synchronous step the ordinal was
-   * allocated in, so two branches of one execution cannot interleave between
-   * the claim and the decision. It may throw, and a throw here reaches the
-   * caller with the effect not performed and nothing written.
+   * that is gone. It runs the moment the claim answers and before the effect
+   * could be performed, on the slot that claim allocated — so what it decides is
+   * decided about this effect and no other. It may throw, and a throw here
+   * reaches the caller with the effect not performed and nothing written.
    */
   inspect?: (slot: EffectSlot) => void,
 ): Promise<T> {
   if (recorder === undefined) return await perform();
-  const slot = recorder.claim(kind, request);
+  const slot = await recorder.claim(kind, request);
   inspect?.(slot);
   if (slot.held !== undefined) {
     if (slot.held.kind === "error") throw replayedFailure(slot.held);
@@ -2145,11 +2855,391 @@ export async function journaled<T>(
     // effect never reached, and a later resume would replay that error as the
     // world's, absorbable by the very policies resolved q29 keeps it away from.
     if (error instanceof ReplayDivergence) throw error;
-    slot.fail(error);
+    await slot.fail(error);
     throw error;
   }
   // The **kept** value rather than the live one: what the journal now holds is
   // what a resumed generation will be handed, so it is what this one goes on
   // with too (`docs/durability.md` §11.1, and see [`revived`]).
-  return slot.keep(value) as T;
+  return (await slot.keep(value)) as T;
 }
+
+// ---------------------------------------------------------------------------
+// The Postgres arm (grammar §14.7, PRD resolved q62)
+// ---------------------------------------------------------------------------
+//
+// Emitted only into a project whose target binds `provider: postgres`, which is
+// also the only project whose `package.json` pins `pg`. A build that binds
+// SQLite carries neither the driver nor this code, which is what keeps the
+// zero-infra guarantee a property of the artifact rather than of a code path
+// nobody takes.
+//
+// Nothing here is a second implementation of anything. The statements are
+// `SqlJournal`'s and the contract is `docs/durability.md`'s; what this file adds
+// is a connection, a schema, and the writer guard.
+
+import { Client } from "pg";
+
+/**
+ * The schema, created on first open and never migrated.
+ *
+ * `IF NOT EXISTS` throughout, so a second open of a journal this build already
+ * created does nothing — which is the whole of what `docs/durability.md` §11.2
+ * asks of a physical schema, and all it can ask of this one: a remote journal is
+ * created by this release or a later one, so there is no older file whose
+ * columns have to be probed for. (The SQLite arm's `PRAGMA table_info` walks
+ * exist because there *are* older files.) A column added here in a later release
+ * is the case to read §11.2 twice for, exactly as it is there.
+ *
+ * **`COLLATE "C"` on every column a statement compares or orders by**, and that
+ * is a correctness choice rather than a preference. A journal key is
+ * `<site>#<kind>/<ordinal>` and a site is an instance path (grammar §9.4): two
+ * keys differing in case are two effects, `effectsUnder` matches a prefix with
+ * `substr`, and `ORDER BY "key"` has to be the order `docs/durability.md` §4
+ * derives. A database created under a linguistic default collation would fold
+ * punctuation and case in both — silently, and only for some rows.
+ *
+ * `seq` is the insertion order `docs/distributed.md` §6.2's park order breaks
+ * ties with, which SQLite gets from its implicit `rowid` and this has to
+ * declare. Rows are inserted and never deleted, so it is exactly monotonic.
+ */
+const POSTGRES_SCHEMA = `
+CREATE TABLE IF NOT EXISTS executions (
+  id              TEXT COLLATE "C" PRIMARY KEY,
+  flow            TEXT NOT NULL,
+  trigger_kind    TEXT NOT NULL,
+  inputs          TEXT NOT NULL,
+  session_key     TEXT NOT NULL,
+  callback        TEXT,
+  traceparent     TEXT,
+  status          TEXT COLLATE "C" NOT NULL,
+  journal_version INTEGER NOT NULL,
+  started_at      TEXT COLLATE "C" NOT NULL,
+  ended_at        TEXT,
+  error           TEXT
+);
+CREATE TABLE IF NOT EXISTS effects (
+  execution   TEXT COLLATE "C" NOT NULL,
+  "key"       TEXT COLLATE "C" NOT NULL,
+  site        TEXT COLLATE "C" NOT NULL,
+  kind        TEXT COLLATE "C" NOT NULL,
+  ordinal     INTEGER NOT NULL,
+  request     TEXT NOT NULL,
+  outcome     TEXT COLLATE "C" NOT NULL,
+  payload     TEXT NOT NULL,
+  refused     SMALLINT NOT NULL DEFAULT 0,
+  recorded_at TEXT NOT NULL,
+  PRIMARY KEY (execution, "key")
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+  execution    TEXT COLLATE "C" NOT NULL,
+  ordinal      INTEGER NOT NULL,
+  kind         TEXT COLLATE "C",
+  trigger_kind TEXT,
+  event        TEXT COLLATE "C" NOT NULL,
+  url          TEXT NOT NULL,
+  body         TEXT NOT NULL,
+  pauses       TEXT NOT NULL,
+  status       TEXT COLLATE "C" NOT NULL,
+  attempts     TEXT NOT NULL,
+  intended_at  TEXT COLLATE "C" NOT NULL,
+  settled_at   TEXT,
+  detail       TEXT,
+  PRIMARY KEY (execution, ordinal)
+);
+CREATE TABLE IF NOT EXISTS dispatches (
+  seq           BIGSERIAL NOT NULL UNIQUE,
+  execution     TEXT COLLATE "C" NOT NULL,
+  wait          TEXT COLLATE "C" NOT NULL,
+  id            TEXT COLLATE "C" NOT NULL,
+  placement     TEXT NOT NULL,
+  node          TEXT NOT NULL,
+  site          TEXT COLLATE "C" NOT NULL,
+  inputs        TEXT NOT NULL,
+  item_index    INTEGER,
+  history       TEXT,
+  policy        TEXT,
+  status        TEXT COLLATE "C" NOT NULL,
+  session       TEXT COLLATE "C",
+  outcome       TEXT COLLATE "C",
+  payload       TEXT,
+  parked_at     TEXT COLLATE "C" NOT NULL,
+  dispatched_at TEXT,
+  settled_at    TEXT,
+  detail        TEXT,
+  PRIMARY KEY (execution, wait)
+);
+CREATE INDEX IF NOT EXISTS effects_of_execution ON effects (execution);
+CREATE INDEX IF NOT EXISTS executions_by_status ON executions (status, started_at);
+CREATE INDEX IF NOT EXISTS deliveries_by_status ON deliveries (status, intended_at);
+CREATE INDEX IF NOT EXISTS dispatches_by_id ON dispatches (id);
+CREATE INDEX IF NOT EXISTS dispatches_by_status ON dispatches (status, parked_at);
+`;
+
+/**
+ * Postgres numbers its parameters, so the statements' `?`s are counted off.
+ *
+ * Nothing in `SqlJournal` writes a `?` inside a string literal — every literal
+ * it spells is a status word — which is what makes counting them enough, and
+ * what a statement that ever needed one would have to change here first.
+ */
+function numberedBind(sql: string): string {
+  let next = 0;
+  return sql.replace(/\?/g, () => `$${++next}`);
+}
+
+/** Postgres speaks the standard upsert, and orders dispatches by `seq`. */
+const POSTGRES_DIALECT: Dialect = {
+  provider: "postgres",
+  conflict: standardConflict,
+  bind: numberedBind,
+  insertionOrder: "seq",
+};
+
+/**
+ * How the server is asked to notice that the far end of this session is gone.
+ *
+ * `tcp_keepalives_*` rather than `idle_session_timeout`, and that is the
+ * difference between "this host is unreachable" and "this host is quiet". The
+ * keepalive probes are answered by the peer's **kernel**, so a hub whose event
+ * loop is wedged behind a long step still keeps its session; only a machine that
+ * is really gone fails to answer. A timeout measured on the application's own
+ * silence would reap the first of those too, which is the failure that costs the
+ * record rather than a few minutes of a takeover.
+ *
+ * The three compose to [`GUARD_REAP_SECONDS`]: the server waits
+ * `tcp_keepalives_idle` seconds of silence, then sends `tcp_keepalives_count`
+ * probes `tcp_keepalives_interval` apart before it ends the session and drops
+ * every advisory lock on it.
+ */
+const KEEPALIVE_IDLE_SECONDS = 60;
+
+/** …how far apart the probes after that silence are. */
+const KEEPALIVE_INTERVAL_SECONDS = 20;
+
+/** …and how many of them go unanswered before the session is ended. */
+const KEEPALIVE_PROBES = (GUARD_REAP_SECONDS - KEEPALIVE_IDLE_SECONDS) / KEEPALIVE_INTERVAL_SECONDS;
+
+/**
+ * The settings, as one statement. All three are `USERSET`, so a session sets its
+ * own without any privilege beyond the one it connected with.
+ */
+const POSTGRES_KEEPALIVES = `SET tcp_keepalives_idle = ${KEEPALIVE_IDLE_SECONDS}; SET tcp_keepalives_interval = ${KEEPALIVE_INTERVAL_SECONDS}; SET tcp_keepalives_count = ${KEEPALIVE_PROBES}`;
+
+/**
+ * What makes "committed" mean "in the write-ahead log" rather than "in a buffer
+ * the next power cut takes with it".
+ *
+ * The SQLite arm sets `PRAGMA synchronous = FULL` for exactly this, and says so
+ * in one line; this is the same sentence spoken to the other server.
+ * `docs/durability.md` §2.1 promises that one effect is one `INSERT`
+ * **committed before it is answered**, and §2.3 spells that out as "each
+ * statement is its own transaction and the server has written it before it
+ * answers". On a server whose `synchronous_commit` is `off` — settable
+ * cluster-wide in `postgresql.conf`, per database with `ALTER DATABASE … SET`
+ * and per role with `ALTER ROLE … SET`, and the default on more than one managed
+ * provider's "fast" tier — an `INSERT` into `effects` answers the hub before its
+ * WAL record is flushed, and a crash or a power loss discards up to roughly
+ * three times `wal_writer_delay` of effects this journal has already claimed to
+ * hold. A replay then re-issues model calls and tool invocations whose answers
+ * the record said were down, which is the one thing §2.1's per-record atomicity
+ * rules out — and the crash window §2.3 calls "the round trip" would be silently
+ * wider than one.
+ *
+ * `USERSET` like the three above, so this costs no privilege either. It is the
+ * arm's standing rule, the same one the MySQL side applies to `sql_mode` and
+ * `autocommit`: **a session setting this journal's statements rest on is stated
+ * by the arm rather than assumed of the server**. Unlike the reap window it is
+ * not best-effort — a server that refuses it fails the open, because a journal
+ * that cannot promise §2.1 is not this journal.
+ */
+const POSTGRES_SYNCHRONOUS_COMMIT = "SET synchronous_commit = on";
+
+/**
+ * …and what the session really carries once both statements have been sent.
+ *
+ * Read back rather than assumed, because on this backend a `SET` that *succeeds*
+ * is not a setting that took. The assign hooks for the three keepalive GUCs call
+ * `pq_setkeepalives*` and **discard the return value**: a platform without
+ * `TCP_KEEPIDLE` logs "setting the keepalive idle time is not supported" on the
+ * server and the `SET` still answers, and a Unix-domain-socket connection is a
+ * documented no-op that also answers. In both cases `SHOW tcp_keepalives_idle`
+ * reads back `0` — which is the only place the difference is visible from here.
+ *
+ * Without this read the `.catch` in [`openPostgres`] is unreachable, so
+ * [`guardWindowUnshortened`] never prints, and a hub whose host vanished holds
+ * its `pg_try_advisory_lock` until Linux's own two-hour `tcp_keepalive_time`
+ * reaps the backend — while the takeover `serve` is refused by [`guardHeld`]'s
+ * text promising that "a host that vanished outright releases it within 300s".
+ * The operator waits five minutes, is refused again, and the only explanation
+ * the message offers is a live `serve` that does not exist.
+ */
+const POSTGRES_SESSION_HELD =
+  "SELECT current_setting('synchronous_commit') AS synchronous_commit, " +
+  "current_setting('tcp_keepalives_idle') AS idle, " +
+  "current_setting('tcp_keepalives_interval') AS probe_interval, " +
+  "current_setting('tcp_keepalives_count') AS probes";
+
+/** What an unflushed server is refused with. See [`POSTGRES_SYNCHRONOUS_COMMIT`]. */
+function writesAreNotFlushed(): Error {
+  return new Error(
+    `this project's journal is ${journalLocation()}, and that server answers before it has written: \`synchronous_commit\` is \`off\` on this session even though it was asked for \`on\`. Every effect this journal records would be acknowledged out of a buffer, so a crash or a power loss would drop records the run has already treated as down and a replay would re-issue the model calls and tool invocations behind them — which is the one thing \`docs/durability.md\` §2.1 promises it will not do. Take the \`synchronous_commit = off\` off this database or role (\`ALTER DATABASE … SET\`, \`ALTER ROLE … SET\`, \`postgresql.conf\`), or point \`journal:\` at a server that flushes`,
+  );
+}
+
+/**
+ * Read the session back, and say what did not take.
+ *
+ * Two severities, because two different promises are at stake. The flush is
+ * §2.1's and is not negotiable, so a server that will not make it is refused by
+ * name. The reap window is §2.3's five-minute bound on a *lockout*, which costs
+ * a takeover minutes rather than costing the record — §2.3 says in as many words
+ * that a server which will not take it is "warned about on stderr and opened
+ * anyway".
+ */
+async function confirmPostgresSession(client: Client): Promise<void> {
+  let held: Record<string, unknown> | undefined;
+  try {
+    const answered = await client.query(POSTGRES_SESSION_HELD);
+    held = answered.rows[0] as Record<string, unknown> | undefined;
+  } catch (error) {
+    // The read is the check, so a read that failed is a window nothing
+    // confirmed — which is what the warning says.
+    guardWindowUnshortened(error);
+    return;
+  }
+  if (held?.["synchronous_commit"] === "off") throw writesAreNotFlushed();
+  const asked: readonly (readonly [string, string, number])[] = [
+    ["tcp_keepalives_idle", "idle", KEEPALIVE_IDLE_SECONDS],
+    ["tcp_keepalives_interval", "probe_interval", KEEPALIVE_INTERVAL_SECONDS],
+    ["tcp_keepalives_count", "probes", KEEPALIVE_PROBES],
+  ];
+  const missed = asked.filter(([, column, seconds]) => Number(held?.[column]) !== seconds);
+  if (missed.length === 0) return;
+  guardWindowUnshortened(
+    `the server took the settings and this session carries ${missed
+      .map(([name, column]) => `\`${name}\` = ${String(held?.[column] ?? "")}`)
+      .join(", ")}`,
+  );
+}
+
+/** The journal as a Postgres database, on one connection this process holds. */
+class PostgresDriver implements JournalDriver {
+  readonly dialect = POSTGRES_DIALECT;
+  readonly #client: Client;
+  /** What the connection reported, if it has reported anything. */
+  readonly #fault: ConnectionFault;
+  /** What keeps a shortened reap window from reaping an idle hub. */
+  readonly #heartbeat: ReturnType<typeof setInterval>;
+
+  constructor(client: Client, fault: ConnectionFault) {
+    this.#client = client;
+    this.#fault = fault;
+    this.#heartbeat = setInterval(() => {
+      // Nothing reads the answer and nothing acts on the failure: a round trip
+      // is the whole point, and a connection that could not make one has
+      // already told the listener in [`openPostgres`]. The rejection is caught
+      // so that a lost connection is one refused statement rather than an
+      // unhandled rejection.
+      void this.#client.query("SELECT 1").catch(() => undefined);
+    }, GUARD_HEARTBEAT_MS);
+    this.#heartbeat.unref();
+  }
+
+  async all(sql: string, parameters: readonly Bound[]): Promise<Row[]> {
+    if (this.#fault.error !== undefined) throw this.#fault.error;
+    const answered = await this.#client.query(sql, [...parameters]);
+    return answered.rows as Row[];
+  }
+
+  async run(sql: string, parameters: readonly Bound[]): Promise<void> {
+    if (this.#fault.error !== undefined) throw this.#fault.error;
+    await this.#client.query(sql, [...parameters]);
+  }
+
+  async close(): Promise<void> {
+    // The advisory lock goes with the session, so ending it is releasing the
+    // guard — there is nothing to unlock, and a session this process never got
+    // to end is reaped by the server inside [`GUARD_REAP_SECONDS`] (see
+    // [`guardHeld`]).
+    clearInterval(this.#heartbeat);
+    await this.#client.end();
+  }
+}
+
+/**
+ * Open the Postgres journal: one connection, the schema, and the writer guard.
+ *
+ * **One `Client` rather than a pool**, and that is the design rather than a
+ * simplification. The journal has exactly one writer (`docs/durability.md` §2,
+ * PRD resolved q42), every statement it runs is a single short one, and
+ * `SqlJournal` already serializes them — so a pool would buy no parallelism this
+ * module can use while making the writer guard unholdable: `pg_advisory_lock` is
+ * **session**-scoped, and a pool hands sessions out and takes them back.
+ *
+ * **The session states what it rests on rather than inheriting it**, which is
+ * the MySQL arm's rule read on this backend: `synchronous_commit` decides
+ * whether "committed" means "in the write-ahead log" or "in a buffer", and it is
+ * settable per cluster, per database and per role — so it is asked for by name
+ * ([`POSTGRES_SYNCHRONOUS_COMMIT`]) and read back with the reap window
+ * ([`confirmPostgresSession`]) rather than assumed of the server.
+ *
+ * The guard is taken with the `try` form rather than the blocking one: a second
+ * opener is told what is happening ([`guardHeld`]) rather than left blocking on
+ * a connection that may be a `serve` which will hold it for days.
+ *
+ * **The guard is taken before the schema is created**, and the order is load
+ * bearing rather than tidy. Two processes opening one fresh journal at the same
+ * time — a `serve` restart overlapping the one it replaces, an
+ * `agent-compose resume` typed beside a live `serve` — would otherwise both run
+ * the DDL, and `CREATE TABLE IF NOT EXISTS` is documented as *not* atomic
+ * against a concurrent creator: one of the two can fail on a duplicate key in
+ * `pg_type`, which is a catalog error rather than the refusal this design
+ * promises. Under the guard there is one creator by construction, and the opener
+ * that is about to be refused runs no DDL against an operator's database at all.
+ */
+async function openPostgres(): Promise<JournalDriver> {
+  const client = new Client({
+    connectionString: journalUrl(),
+    // This side's own probes, which are the other direction of the same
+    // question the server-side settings below ask: a hub whose database has
+    // gone finds out on the heartbeat rather than on the next execution.
+    keepAlive: true,
+    keepAliveInitialDelayMillis: GUARD_HEARTBEAT_MS,
+  });
+  const fault: ConnectionFault = {};
+  // **Before `connect`**, because `pg` emits `error` on the client whenever it
+  // loses the socket with no query in flight — `Client._handleErrorEvent` does
+  // it unconditionally — and an `EventEmitter` that emits `error` with nothing
+  // listening ends the process. See [`ConnectionFault`].
+  client.on("error", (reported: unknown) => {
+    fault.error ??= connectionLost(reported);
+  });
+  await client.connect();
+  try {
+    // Best effort, and said out loud where it does not take: a `SET` the server
+    // refuses lands in this `catch`, and a `SET` it accepts without applying
+    // lands in [`confirmPostgresSession`]'s read-back. Both reach
+    // [`guardWindowUnshortened`], and on this backend the second is the path
+    // that really happens.
+    await client.query(POSTGRES_KEEPALIVES).catch(guardWindowUnshortened);
+    // Not best-effort: §2.1's "committed before it is answered" rests on it, so
+    // a server that refuses it refuses the open. See
+    // [`POSTGRES_SYNCHRONOUS_COMMIT`].
+    await client.query(POSTGRES_SYNCHRONOUS_COMMIT);
+    await confirmPostgresSession(client);
+    const guard = await client.query("SELECT pg_try_advisory_lock($1, $2) AS taken", [
+      WRITER_GUARD_KEYS[0],
+      WRITER_GUARD_KEYS[1],
+    ]);
+    const taken = (guard.rows[0] as { taken?: unknown } | undefined)?.taken;
+    if (taken !== true) throw guardHeld();
+    await client.query(POSTGRES_SCHEMA);
+  } catch (error) {
+    await client.end().catch(() => undefined);
+    throw error;
+  }
+  return new PostgresDriver(client, fault);
+}
+
+BACKENDS.postgres = openPostgres;

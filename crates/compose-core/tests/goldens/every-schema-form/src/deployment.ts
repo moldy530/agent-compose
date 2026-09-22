@@ -29,6 +29,12 @@
 // placement takes something off the hub's — the least-privilege line PRD 5.10
 // draws and §9.1 computes: the hub cannot leak what it never held.
 //
+// `journal` is the one fact here that is neither reported nor spent but
+// *bound*: `./journal.ts` reads it once, at the first open, and dispatches to
+// the arm `build` emitted for it (grammar §14.7). A target that declared no
+// block carries the default spelled out, so the artifact answers where this
+// project's journal lives without a reader knowing what the default is.
+//
 // `traceSink` is the last of them and the one this process **spends** rather
 // than reports: `./delivery.ts` reads it at every settle (grammar §14.5, PRD
 // resolved q50). It carries the format with its default already applied, so a
@@ -84,6 +90,40 @@ export interface OutboundAuth {
   readonly hmac?: { readonly secretEnv: string };
 }
 
+/**
+ * Which backend an execution journal lives on (grammar §14.7, PRD resolved q62).
+ *
+ * A closed set of three, and the runtime never widens it: `./journal.ts` looks
+ * the provider up in the arms `build` emitted, and a provider with no arm is a
+ * project that was not built from this deploy layer rather than a deployment's
+ * mistake.
+ */
+export type JournalProvider = "sqlite" | "postgres" | "mysql";
+
+/**
+ * What this target said about its journal (grammar §14.7).
+ *
+ * A target that declared no `journal:` block carries `provider: "sqlite"` here
+ * and no variable: the default is *stated* in the artifact rather than left for
+ * a reader to infer, so "where does this project's journal live" is answerable
+ * from the emitted bytes under every target.
+ *
+ * Never a credential: the **variable name** holding the address, resolved by the
+ * process that dials it (grammar §4.3), which on a mesh is the hub and only the
+ * hub — PRD resolved q42 makes it the single writer, so no worker's manifest
+ * carries this one (`docs/distributed.md` §9.1).
+ */
+export interface JournalBinding {
+  readonly provider: JournalProvider;
+  /**
+   * The variable holding the connection, on a provider that dials out.
+   *
+   * Absent on `sqlite`, which opens a file beside the project's stores and has
+   * no address at all.
+   */
+  readonly urlEnv?: string;
+}
+
 /** `trace_sink:` — where every settled execution's trace goes (grammar §14.5). */
 export interface TraceSink {
   /** The absolute address it is POSTed to. */
@@ -116,5 +156,7 @@ export const joinTokenEnv: string | undefined = undefined;
 export const publicUrl: string | undefined = undefined;
 
 export const deployTarget: string = "local";
+
+export const journal: JournalBinding = { provider: "sqlite" };
 
 export const traceSink: TraceSink | undefined = undefined;

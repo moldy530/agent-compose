@@ -151,9 +151,51 @@ function park(execution, instancePath, fields = {}, effects = undefined) {
  * and the refusal happens at the settlement rather than at the claim.
  *
  * It is a stub rather than a real journal because what is under test is what
- * `runHuman` does with a throw, and a real one made to throw on command would be
- * the same stub with a database behind it.
+ * `runHuman` does with a refused write, and a real one made to refuse on command
+ * would be the same stub with a database behind it.
+ *
+ * The refusal is a **rejected promise** rather than a throw because that is what
+ * the interface it stands in for answers: every `Journal` verb returns one since
+ * the backend became the deploy target's to choose (PRD resolved q62), and a
+ * driver that has already dialled a server cannot fail any other way — the
+ * refusal arrives from the far end, a turn of the loop after the call.
  */
+/**
+ * An effect recorder whose write lands a **turn of the loop later**, logging
+ * when it does.
+ *
+ * The delay is what makes the ordering decidable. A `keep` that answers an
+ * already-resolved promise is written inside the same microtask drain as the
+ * delivery that settled the wait, so "the record went down before the answer was
+ * acknowledged" and "after" look identical. A remote journal's write really is a
+ * round trip (PRD resolved q62), and this stands in for one: the log is appended
+ * to from the timer, and the delivery's own caller appends to it when
+ * `deliverHumanAnswer` answers.
+ *
+ * It holds nothing for the key, so the pause really parks.
+ */
+function deferring(order) {
+  return {
+    child: () => deferring(order),
+    claim: () => ({
+      key: "review/0/sign/0#human/0",
+      site: "review/0/sign/0",
+      kind: "human",
+      ordinal: 0,
+      request: '{"node":"sign"}',
+      held: undefined,
+      keep: (value) =>
+        new Promise((resolve) =>
+          setTimeout(() => {
+            order.push("written");
+            resolve(value);
+          }, 5),
+        ),
+      fail: () => Promise.resolve(),
+    }),
+  };
+}
+
 function refusing(error) {
   return {
     child: () => refusing(error),
@@ -163,10 +205,8 @@ function refusing(error) {
       kind: "human",
       ordinal: 0,
       held: undefined,
-      keep: () => {
-        throw error;
-      },
-      fail: () => {},
+      keep: () => Promise.reject(error),
+      fail: () => Promise.resolve(),
     }),
   };
 }
@@ -261,7 +301,7 @@ const observed = {};
   // the status route and out of the resume route.
   runtime.abandonPausesUnder(execution, "fan/0");
   await settle();
-  const refused = runtime.deliverHumanAnswer(execution, "fan/0/0/sign/0", {
+  const refused = await runtime.deliverHumanAnswer(execution, "fan/0/0/sign/0", {
     decision: "approve",
   });
   observed.abandoning = {
@@ -311,7 +351,7 @@ const observed = {};
     published: runtime.humanWaits(execution).map((wait) => wait.id),
     settled: parked.state,
     node_failed: failed,
-    refusal: runtime.deliverHumanAnswer(execution, "fan/0/1/sign/0", { decision: "approve" })
+    refusal: (await runtime.deliverHumanAnswer(execution, "fan/0/1/sign/0", { decision: "approve" }))
       .reason,
   };
   runtime.releaseHumanWaits(execution);
@@ -463,7 +503,7 @@ const observed = {};
 
   const open = runtime.pausesUnder(execution, "wrap/0");
   const published = runtime.humanWaits(execution).map((wait) => wait.id);
-  const taken = runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
+  const taken = await runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
   await settle();
 
   observed.successor = {
@@ -497,7 +537,7 @@ const observed = {};
   // still holding the standing pause, not one the delivery below put back.
   const published = runtime.humanWaits(execution).map((wait) => wait.id);
   const open = runtime.pausesUnder(execution, "wrap/0");
-  const taken = runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
+  const taken = await runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
   await settle();
 
   observed.displacing = {
@@ -549,7 +589,7 @@ const observed = {};
     cleared_after_release: cleared,
     settled: held.state,
     // The board is gone with the run, so a resume finds nothing to deliver to.
-    after_release: runtime.deliverHumanAnswer(execution, undefined, { decision: "approve" })
+    after_release: (await runtime.deliverHumanAnswer(execution, undefined, { decision: "approve" }))
       .reason,
   };
 }
@@ -562,12 +602,12 @@ const observed = {};
   await settle();
 
   const published = runtime.humanWaits(execution)[0];
-  const taken = runtime.deliverHumanAnswer(execution, undefined, { decision: "reject" });
+  const taken = await runtime.deliverHumanAnswer(execution, undefined, { decision: "reject" });
   await settle();
-  const again = runtime.deliverHumanAnswer(execution, "review/0/sign/0", {
+  const again = await runtime.deliverHumanAnswer(execution, "review/0/sign/0", {
     decision: "approve",
   });
-  const mismatched = runtime.deliverHumanAnswer(execution, "review/0/sign/0", { decision: 7 });
+  const mismatched = await runtime.deliverHumanAnswer(execution, "review/0/sign/0", { decision: 7 });
 
   observed.answering = {
     published: { id: published?.id, shown: published?.shown, schema: published?.schema },
@@ -585,6 +625,44 @@ const observed = {};
     // rather than as a mismatch: which pause comes before what is in the body.
     mismatched: { ok: mismatched.ok, reason: mismatched.reason },
     still_published: runtime.humanWaits(execution).map((wait) => wait.id),
+  };
+  runtime.releaseHumanWaits(execution);
+}
+
+// …and the **acknowledgment** waits for the record, which is the half of that
+// ordering the node's own promise cannot show.
+//
+// A record that goes down before the parked task resolves is still a record
+// written after the person was told their answer was taken, if the surface that
+// took it answered the moment `settle` returned — and `settle` is synchronous
+// while the append beneath it is a promise. On a `postgres` or `mysql` journal
+// that gap is a network round trip: a hub killed inside it is recovered on a
+// fresh machine, finds no `human` record at the wait's key, re-parks the wait
+// and puts to the person the very question they were just told was answered
+// (`docs/durability.md` §3.4). So `deliverHumanAnswer` waits for the write, and
+// the two events are logged here in the order they really happen.
+//
+// The write is deferred by a turn of the loop, which is what a remote journal's
+// is and what makes the two orderable at all: a `keep` that answers an
+// already-resolved promise settles inside the same drain as the delivery.
+{
+  const execution = "exec_acknowledged";
+  runtime.openHumanWaits(execution, true);
+  const order = [];
+  const held = park(execution, ["review", "0"], {}, deferring(order));
+  await settle();
+
+  const taken = await runtime.deliverHumanAnswer(execution, undefined, { decision: "approve" });
+  order.push("acknowledged");
+  await settle();
+
+  observed.acknowledging = {
+    order,
+    taken: { ok: taken.ok, wait: taken.wait?.id },
+    settled: held.state,
+    // …and the answer the node goes on with is still the one the journal took,
+    // which is what the chaining buys beside the ordering.
+    output: held.value?.output,
   };
   runtime.releaseHumanWaits(execution);
 }
@@ -615,7 +693,7 @@ const observed = {};
   let delivery = null;
   let threw = null;
   try {
-    delivery = runtime.deliverHumanAnswer(execution, undefined, { decision: "approve" });
+    delivery = await runtime.deliverHumanAnswer(execution, undefined, { decision: "approve" });
   } catch (error) {
     threw = error?.message ?? String(error);
   }
@@ -626,7 +704,7 @@ const observed = {};
     settled: held.state,
     reported: held.value,
     still_published: runtime.humanWaits(execution).map((wait) => wait.id),
-    again: runtime.deliverHumanAnswer(execution, "review/0/sign/0", { decision: "approve" })
+    again: (await runtime.deliverHumanAnswer(execution, "review/0/sign/0", { decision: "approve" }))
       .reason,
   };
   runtime.releaseHumanWaits(execution);
@@ -784,7 +862,7 @@ const observed = {};
       await tick();
       seen.held_moved_by = context.deadline - held;
 
-      runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
+      await runtime.deliverHumanAnswer(execution, "wrap/0/sign/0", { decision: "approve" });
       await settle();
       const rearmed = context.deadline;
       await tick();
@@ -826,7 +904,14 @@ const observed = {};
 // the turn; abandoned when the run ends; and settled into exactly the record a
 // local pause writes through `slot.keep`, which is what the redispatch replays.
 
-/** A recorder that holds nothing, so a claim lands at the frontier. */
+/**
+ * A recorder that holds nothing, so a claim lands at the frontier.
+ *
+ * `keep` answers the record it was handed, wrapped, because that is the shape a
+ * real slot's answers have: the journal's verbs return promises, and `runHuman`
+ * chains the pause's own resolve onto the write rather than sequencing it after
+ * (`docs/durability.md` §3.4).
+ */
 function claiming(key, site) {
   return {
     child: () => claiming(key, site),
@@ -837,8 +922,8 @@ function claiming(key, site) {
       ordinal: 0,
       request: '{"node":"sign"}',
       held: undefined,
-      keep: (value) => value,
-      fail: () => {},
+      keep: (value) => Promise.resolve(value),
+      fail: () => Promise.resolve(),
     }),
   };
 }
@@ -863,17 +948,33 @@ function remote(fields = {}) {
 }
 
 /**
+ * A writer for the arms where the record is not what is being observed.
+ *
+ * Still a promise, because `holdRemotePause` chains the pause's resolve onto
+ * what this answers: a writer that returned nothing would be a hub whose resume
+ * route acknowledges an answer no journal was asked to hold.
+ */
+const unwatched = () => Promise.resolve();
+
+/**
  * The hub's writer, as `./mesh.ts`'s `answered` hands one in: what a local
  * pause's `slot.keep` is, for a wait a worker opened.
  *
- * `wrote` is appended to inside the settlement and the promise's continuation
- * appends to it after, so the order of the two is the reading that says the
- * record was written **before** the answer was acknowledged
- * (`docs/durability.md` §3.4).
+ * `wrote` is appended to inside the settlement and the parked promise's
+ * continuation appends to it after, so the order of the two is the reading that
+ * says the record was written **before the node goes on** from the pause
+ * (`docs/durability.md` §3.4). The other half of that ordering — the record
+ * before the *answer is acknowledged* — is `exec_acknowledged`'s, where the
+ * write is deferred far enough to be orderable against the delivery.
  */
 function writer(wrote) {
   return (record) => {
     wrote.push({ kept: record });
+    // The hub's real writer is `journal.append`, which answers a promise, and
+    // `holdRemotePause` chains the resume route's resolve onto it. The push
+    // above is synchronous, so what this still shows is the **order**: the
+    // record is handed over before anything the promise resolves can run.
+    return Promise.resolve();
   };
 }
 
@@ -911,7 +1012,7 @@ runtime.registerHumanNodes({
   await settle();
   const published = runtime.humanWaits(execution);
   // A payload the node's `output:` refuses does **not** consume the wait.
-  const refused = runtime.deliverHumanAnswer(execution, pause.wait, { decision: "maybe" });
+  const refused = await runtime.deliverHumanAnswer(execution, pause.wait, { decision: "maybe" });
   const plantedAt = published[0]?.pausedAt;
   const seen = {
     published: published.map((wait) => ({
@@ -932,7 +1033,7 @@ runtime.registerHumanNodes({
     refused: refused.ok === false ? refused.reason : "taken",
     waiting_after_a_mismatch: runtime.humanWaits(execution).length,
   };
-  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
   await settle();
   seen.settled = held.state;
   seen.record = held.value;
@@ -947,7 +1048,7 @@ runtime.registerHumanNodes({
   // …and a **second** answer is refused, exactly as a local pause's is: a wait
   // is settled once, and a delivery that re-settled one would journal a second
   // `human` record over an answer somebody already gave.
-  const twice = runtime.deliverHumanAnswer(execution, pause.wait, { decision: "reject" });
+  const twice = await runtime.deliverHumanAnswer(execution, pause.wait, { decision: "reject" });
   await settle();
   seen.twice = twice.ok === false ? twice.reason : "taken";
   seen.record_after_the_second_answer = held.value;
@@ -993,7 +1094,7 @@ runtime.registerHumanNodes({
     node: "confirm",
     expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
   });
-  const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, unwatched));
   await settle();
   const seen = { settled_while_the_budget_runs: held.state };
   // …and the deadline a reader is shown is the one this hub will fire, derived
@@ -1004,7 +1105,7 @@ runtime.registerHumanNodes({
   seen.published_expires_at_is_the_wires = shown === pause.expiresAt;
   seen.published_expires_at_is_ahead =
     typeof shown === "string" && shown > new Date().toISOString();
-  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
   await settle();
   seen.settled = held.state;
   seen.record = held.value;
@@ -1035,7 +1136,7 @@ runtime.registerHumanNodes({
     expiresAt: new Date(Date.parse(asked) + 60_000).toISOString(),
   });
   const planted = Date.now();
-  const held = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  const held = outcomeOf(runtime.holdRemotePause(execution, pause, unwatched));
   await settle();
   const shown = runtime.humanWaits(execution)[0];
   const seen = {
@@ -1058,7 +1159,7 @@ runtime.registerHumanNodes({
         ? Date.parse(shown.expiresAt) - Date.parse(shown.pausedAt)
         : null,
   };
-  runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
+  await runtime.deliverHumanAnswer(execution, pause.wait, { decision: "approve" });
   await settle();
   seen.settled = held.state;
   // The journal keeps the pair the board published, so the answered pause's own
@@ -1077,7 +1178,7 @@ runtime.registerHumanNodes({
   const execution = "exec_remote_unbounded";
   runtime.openHumanWaits(execution, true);
   const dated = remote({ expiresAt: new Date(Date.now() + 3_600_000).toISOString() });
-  const held = outcomeOf(runtime.holdRemotePause(execution, dated, () => {}));
+  const held = outcomeOf(runtime.holdRemotePause(execution, dated, unwatched));
   await settle();
   observed.remote_unbounded = {
     settled: held.state,
@@ -1098,7 +1199,7 @@ runtime.registerHumanNodes({
   const execution = "exec_remote_unregistered";
   runtime.openHumanWaits(execution, true);
   const gone = outcomeOf(
-    runtime.holdRemotePause(execution, remote({ node: "withdrawn" }), () => {}),
+    runtime.holdRemotePause(execution, remote({ node: "withdrawn" }), unwatched),
   );
   await settle();
   observed.remote_unregistered = {
@@ -1121,10 +1222,10 @@ runtime.registerHumanNodes({
   const execution = "exec_remote_replanted";
   runtime.openHumanWaits(execution, true);
   const pause = remote({ node: "decide" });
-  const first = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  const first = outcomeOf(runtime.holdRemotePause(execution, pause, unwatched));
   await until(() => first.state !== "pending");
   const replanted = Date.now();
-  const again = outcomeOf(runtime.holdRemotePause(execution, pause, () => {}));
+  const again = outcomeOf(runtime.holdRemotePause(execution, pause, unwatched));
   await until(() => again.state !== "pending");
   observed.remote_replanted = {
     first: first.state,
@@ -1141,21 +1242,21 @@ runtime.registerHumanNodes({
   // The two settlements that are the run's own shape, not the composition's.
   const abandoned = "exec_remote_abandoned";
   runtime.openHumanWaits(abandoned, true);
-  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote(), () => {}));
+  const dropped = outcomeOf(runtime.holdRemotePause(abandoned, remote(), unwatched));
   await settle();
   runtime.releaseHumanWaits(abandoned);
   await settle();
 
   const withdrawn = "exec_remote_withdrawn";
   runtime.openHumanWaits(withdrawn, true);
-  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote(), () => {}));
+  const closed = outcomeOf(runtime.holdRemotePause(withdrawn, remote(), unwatched));
   await settle();
   runtime.closeHumanWaits(withdrawn);
   await settle();
 
   const unanswerable = "exec_remote_unanswerable";
   runtime.openHumanWaits(unanswerable, false);
-  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote(), () => {}));
+  const raised = outcomeOf(runtime.holdRemotePause(unanswerable, remote(), unwatched));
   await settle();
 
   observed.remote_unsettled = {

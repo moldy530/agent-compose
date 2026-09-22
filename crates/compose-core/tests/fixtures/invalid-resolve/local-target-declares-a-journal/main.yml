@@ -1,0 +1,13 @@
+# rule: `deploy/local.yml` carries no `journal:` (grammar 14.7, Decisions D87, D148)
+# code: misplaced-section
+# message: `deploy/local.yml` may not declare `journal:`
+# at: deploy/local.yml:7:3
+# help: `local` binds the SQLite journal file beside the project unconditionally, so no `provider:` written here is ever consulted: the block could only be a key whose author expected a substitution that never happens, and a journal on a server is a `--target` of its own (grammar 14.7, Decisions D87, D148)
+version: "0.1"
+flow.f:
+  outputs: {}
+  nodes:
+    run: { exec: { command: "true" } }
+  edges:
+    - { from: start, to: run }
+    - { from: run, to: end }

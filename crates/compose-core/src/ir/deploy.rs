@@ -17,7 +17,9 @@ use serde::Serialize;
 
 use crate::ast::common::{Address, EnvRef, Ident};
 use crate::ast::definition::StoreKind;
-use crate::ast::deploy::{BackendProvider, EventSourceKind, PluginValue, TraceSinkFormat};
+use crate::ast::deploy::{
+    BackendProvider, EventSourceKind, JournalProvider, PluginValue, TraceSinkFormat,
+};
 use crate::diag::{Span, Spanned};
 
 use super::Section;
@@ -46,6 +48,11 @@ pub struct Deploy {
     /// it holds two maps rather than one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_backends: Option<StorageBackends>,
+    /// `journal:` — which backend this target's execution journal binds
+    /// (grammar 14.7, PRD resolved q62). Absent means
+    /// [`JournalProvider::DEFAULT`], which [`journal_of`] is the one reading of.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal: Option<Journal>,
     /// `package_registry:` — where this target's installer resolves packages
     /// from (grammar 14.6, PRD resolved q59).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,6 +88,33 @@ pub struct TraceSink {
     /// resolved, so a sink delivery is signed by the headers a callback is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<crate::ir::trigger::CallbackAuth>,
+    /// The section's own span.
+    pub span: Span,
+}
+
+/// The `journal:` block, resolved (grammar 14.7, PRD resolved q62).
+///
+/// A struct beside [`Section`] rather than one of them, for the reason [`Hub`],
+/// [`TraceSink`] and [`PackageRegistry`] are: it is the deployment's own
+/// singleton. **One journal per target** — nothing in the composition names one,
+/// so there is nothing for a map of named entries to be keyed by (PRD resolved
+/// q27).
+///
+/// The **absence** of the block is not modelled here and deliberately: `None` on
+/// [`Deploy::journal`] is a target that declared nothing, which is
+/// [`JournalProvider::DEFAULT`], and [`journal_of`] is the single place that
+/// reading is made. A default applied here instead would make a target that
+/// wrote nothing indistinguishable in the artifact from one that wrote
+/// `provider: sqlite`, which is a difference a plan document reports.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Journal {
+    /// `provider:` — which of the three backends this target binds.
+    pub provider: JournalProvider,
+    /// `url:` — the connection a provider that dials out is reached at,
+    /// unresolved (grammar 4.3): a name the deployment supplies, never a value
+    /// the artifact carries. Absent on `sqlite`, which opens a file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<Spanned<EnvRef>>,
     /// The section's own span.
     pub span: Span,
 }
@@ -230,6 +264,31 @@ pub struct EventSource {
     pub extra: BTreeMap<String, Spanned<PluginValue>>,
     /// The whole entry's span.
     pub span: Span,
+}
+
+// ---------------------------------------------------------------------------
+// Which journal a target binds (grammar 14.7, PRD resolved q62)
+// ---------------------------------------------------------------------------
+
+/// Which journal backend the active target binds.
+///
+/// One reading of the absent block, stated once, for [`backend_of`]'s reason:
+/// codegen asks in order to emit the arm and pin its driver,
+/// [`crate::codegen::env`] asks whether a connection variable joins the hub's
+/// manifest, and the emitted `README.md` asks in order to tell a reader where
+/// this project's journal lives. Three answers to one question would be three
+/// ways for a deployment to be told something its journal does not do.
+///
+/// A target that declares no `journal:` binds [`JournalProvider::DEFAULT`] —
+/// SQLite beside the project — under **every** target and not only `local`,
+/// which is PRD resolved q62's "zero-config parity is the default everywhere,
+/// not a local-only concession".
+#[must_use]
+pub fn journal_of(ir: &crate::ir::Ir) -> JournalProvider {
+    ir.deploy
+        .journal
+        .as_ref()
+        .map_or(JournalProvider::DEFAULT, |journal| journal.provider)
 }
 
 // ---------------------------------------------------------------------------

@@ -68,6 +68,10 @@
       },
       "additionalProperties": false
     },
+    "journal": {
+      "description": "DEPLOY FILE ONLY. Which backend this target's execution journal binds: one journal per target, behind one interface the runtime cannot see through. Absent means provider: sqlite - a file beside the project, durable by default with zero configuration. Grammar 14.7 / PRD resolved q62.",
+      "$ref": "#/$defs/journal"
+    },
     "package_registry": {
       "description": "DEPLOY FILE ONLY. Where a generated project's installer resolves packages from; build writes a bunfig.toml and an .npmrc from it. Grammar 14.6 / PRD resolved q59.",
       "$ref": "#/$defs/packageRegistry"
@@ -97,6 +101,7 @@
     "hub": ["version"],
     "placements": ["version"],
     "storage_backends": ["version"],
+    "journal": ["version"],
     "package_registry": ["version"],
     "trace_sink": ["version"],
     "event_sources": ["version"]
@@ -122,6 +127,7 @@
     "hub": { "$ref": "#/$defs/deployFileOnly" },
     "placements": { "$ref": "#/$defs/deployFileOnly" },
     "storage_backends": { "$ref": "#/$defs/deployFileOnly" },
+    "journal": { "$ref": "#/$defs/deployFileOnly" },
     "package_registry": { "$ref": "#/$defs/deployFileOnly" },
     "trace_sink": { "$ref": "#/$defs/deployFileOnly" },
     "event_sources": { "$ref": "#/$defs/deployFileOnly" }
@@ -135,6 +141,7 @@
           { "required": ["hub"] },
           { "required": ["placements"] },
           { "required": ["storage_backends"] },
+          { "required": ["journal"] },
           { "required": ["package_registry"] },
           { "required": ["trace_sink"] },
           { "required": ["event_sources"] }
@@ -142,7 +149,7 @@
       }
     },
     "deployFileOnly": {
-      "description": "A deploy file carries only version + hub/placements/storage_backends/package_registry/trace_sink/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
+      "description": "A deploy file carries only version + hub/placements/storage_backends/journal/package_registry/trace_sink/event_sources: no definitions, imports, state, triggers, or defaults (PRD 5.8 per-target invariant).",
       "not": {
         "anyOf": [
           { "required": ["imports"] },
@@ -2869,6 +2876,44 @@
       },
       "required": ["url"],
       "additionalProperties": false
+    },
+    "journal": {
+      "description": "DEPLOY FILE ONLY. The execution journal this target binds (grammar 14.7 / PRD resolved q62). One journal per target rather than aliases and per-kind defaults: nothing in a composition names a journal, so the target binds it and the composition says nothing. The record vocabulary, the keys, the frontier and the recovery verbs of docs/durability.md are the same behind all three providers. sqlite opens a file beside the project's stores and takes no further keys; postgres and mysql dial out and require url: as an ${ENV} reference, which is what keeps validate from ever seeing a credential.",
+      "type": "object",
+      "properties": {
+        "provider": {
+          "description": "Which backend binds. sqlite is a file beside the project, opened in this process; postgres is dialled with the pg driver and mysql with mysql2, and a generated project carries a driver only where its target binds that provider.",
+          "enum": ["sqlite", "postgres", "mysql"]
+        },
+        "url": {
+          "description": "The connection a provider that dials out is reached at, as an ${ENV} reference and never a literal. Required by postgres and mysql; refused by sqlite, which has no address. Presence is checked at launch rather than at build (PRD resolved q15).",
+          "$ref": "#/$defs/envRef"
+        }
+      },
+      "required": ["provider"],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "provider": { "enum": ["postgres", "mysql"] } },
+            "required": ["provider"]
+          },
+          "then": {
+            "description": "A journal on a server is a connection rather than a file, so the deploy file names the slot and the environment holds the credential: write url: ${SOME_VAR}, or bind provider: sqlite, which needs no address at all (grammar 14.7, Decision D148).",
+            "required": ["url"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "provider": { "const": "sqlite" } },
+            "required": ["provider"]
+          },
+          "then": {
+            "description": "A sqlite journal is one file beside the project's stores, moved as a whole by AGENT_COMPOSE_DATA_DIR, so there is no address to dial and nothing for a url: to say: drop the key, or bind a provider that dials out (grammar 14.7, Decision D148).",
+            "not": { "required": ["url"] }
+          }
+        }
+      ]
     },
     "packageRegistry": {
       "description": "DEPLOY FILE ONLY. Where a generated project's installer resolves packages from. build writes a bunfig.toml and an .npmrc from it, both pure-generated members of the emitted file list, so a worker that materialises the artifact installs through the mirror too. A token is the NAME of an environment variable, which the installer expands at install time (grammar 14.6 / PRD resolved q59).",

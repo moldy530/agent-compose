@@ -2,7 +2,7 @@
 //! the **real** pinned JavaScript toolchain — under **Bun**, which PRD §9.18
 //! makes the default runtime and package manager of every emitted project.
 //!
-//! Twenty-six gates. The first four are in increasing strength, each one
+//! Twenty-eight gates. The first four are in increasing strength, each one
 //! existing because the one above it passes on code the one below it catches;
 //! the fifth is about a construct whose guarantees are only observable from
 //! inside the runtime; the next two are about the schemas rather than the graph;
@@ -19,9 +19,11 @@
 //! twenty-second is about the two built-in tools a model drives, read from
 //! inside one call of them; the twenty-third is back to the schemas, about the
 //! one place the two columns are *not* equal and what bounds that gap; the next
-//! two are about a node kind the acceptance suite cannot reach at all — one run
-//! of a coding harness, and then a whole graph of them; and the last is about
-//! the two emitted files whose reader is an **installer** rather than a runtime:
+//! three are about a node kind the acceptance suite cannot reach at all — one
+//! run of a coding harness, then a whole graph of them, then a fan-out of those;
+//! the twenty-seventh is about the two emitted files whose reader is an
+//! **installer** rather than a runtime; and the last is about the one bit of a
+//! journal record that only the generation which wrote the record can set:
 //!
 //! 1. **`bun run typecheck`** — every golden project type-checks under its own
 //!    strict `tsconfig.json`, against installed `@langchain/langgraph`,
@@ -341,6 +343,22 @@
 //!     can see. Hermetic on both sides: the parsers read a file, the lookup
 //!     resolves a URL as a string, and nothing installs from a registry (PRD
 //!     resolved q59 ruling e).
+//! 28. **The bit only the recording generation can set** — `parseResult` and
+//!     `refuseRecorded` driven together against a golden's own `src/runtime.ts`
+//!     and `src/journal.ts`, out of `refused-answers.mjs`. PRD resolved q29
+//!     tells its second divergence from an ordinary mismatch by one flag on one
+//!     row: whether the generation that recorded an answer went on to refuse it
+//!     too (`docs/durability.md` §3, §7). The flag is written by a
+//!     **synchronous** parse into a journal that answers promises — a socket
+//!     away on `postgres` and `mysql` — so the gate is about *when* it is down:
+//!     the mark is asserted against the order the journal finished its own
+//!     writes in, and must land before the record of the attempt the mismatch
+//!     set off. Both readings of the flag are driven, because either alone
+//!     passes on a build that marks nothing or marks everything: a marked record
+//!     replays as the mismatch that generation's ladder already absorbed, an
+//!     unmarked one as the divergence no policy may. And a mark the journal
+//!     refuses outright fails the node that was about to write past it — once —
+//!     rather than being swallowed into a resume refused months later.
 //!
 //! # The toolchain fixture
 //!
@@ -2171,6 +2189,34 @@ fn the_wait_board_behaved(observed: &Value) {
         json!({ "ok": false, "reason": "settled" })
     );
     assert_eq!(observed["answering"]["still_published"], json!([]));
+
+    // …and the answer is **acknowledged after it is recorded**, not before.
+    // `settle` is synchronous while the append beneath it is a promise — a
+    // network round trip on a `postgres` or `mysql` journal (PRD resolved q62) —
+    // so a delivery that answered the moment the wait was settled would have the
+    // resume route reply `202`, and `agent-compose run` print `taken.`, while
+    // the `INSERT` was still in flight. A hub killed in that gap is recovered on
+    // a fresh machine, finds no `human` record at the wait's key and puts to the
+    // person the question they were just told was answered
+    // (`docs/durability.md` §3.4). The recorder's write is deferred a turn of
+    // the loop, so the two events are orderable: `written` before
+    // `acknowledged`, or the guarantee is gone.
+    assert_eq!(
+        observed["acknowledging"]["order"],
+        json!(["written", "acknowledged"]),
+        "an answer is acknowledged before its journal record is written, so a `202` claims a \
+         row the person's hub may never have had: {observed}"
+    );
+    assert_eq!(
+        observed["acknowledging"]["taken"],
+        json!({ "ok": true, "wait": "review/0/sign/0" })
+    );
+    assert_eq!(observed["acknowledging"]["settled"], json!("resolved"));
+    assert_eq!(
+        observed["acknowledging"]["output"],
+        json!({ "decision": "approve" }),
+        "the node went on with something other than the answer the journal took: {observed}"
+    );
 
     // …and a journal that refuses the settled wait's record fails the **node**
     // rather than leaving the pause parked for ever. The wait is marked settled
@@ -7870,9 +7916,10 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     // the `patch-pipeline` golden, which binds both, is type-checked against
     // exactly these versions by gate 1.
     let runtime_and_harness = runtime_and_harness_pins();
+    let development = development_pins();
     for (section, pins) in [
         ("dependencies", runtime_and_harness.as_slice()),
-        ("devDependencies", compose_core::codegen::project::DEV_PINS),
+        ("devDependencies", development.as_slice()),
     ] {
         let block = manifest[section]
             .as_object()
@@ -7899,7 +7946,7 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     let declared = &lock;
     for (section, pins) in [
         ("dependencies", runtime_and_harness.as_slice()),
-        ("devDependencies", compose_core::codegen::project::DEV_PINS),
+        ("devDependencies", development.as_slice()),
     ] {
         for (package, version) in pins {
             // `bun.lock` is JSONC — trailing commas and all — so it is read as
@@ -7927,7 +7974,7 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     let root = &lock["packages"][""];
     for (section, pins) in [
         ("dependencies", runtime_and_harness.as_slice()),
-        ("devDependencies", compose_core::codegen::project::DEV_PINS),
+        ("devDependencies", development.as_slice()),
     ] {
         for (package, version) in pins {
             assert_eq!(
@@ -7940,15 +7987,59 @@ fn the_toolchain_fixture_pins_what_the_emitter_pins() {
     }
 }
 
-/// Every package a generated project can declare under `dependencies`: the
-/// runtime's own pins, plus every harness SDK a `coder:` node can bind.
+/// Every package a generated project can declare under `devDependencies`: the
+/// type gate and the runtime's types, plus the typings a journal driver needs.
 ///
-/// Two lists rather than one in the emitter, because a composition declares the
-/// second set only where it binds a harness — and one list here, because the
-/// toolchain fixture installs the union once and every golden resolves against
-/// it (PRD resolved q57, `codegen::harness`).
+/// One list here for [`runtime_and_harness_pins`]' reason: a generated project
+/// declares `@types/pg` only where its target's `journal:` binds Postgres (PRD
+/// resolved q62), and the fixture installs the union once so that every project
+/// the suites build type-checks against exactly these versions.
+fn development_pins() -> Vec<(&'static str, &'static str)> {
+    let mut held: Vec<(&'static str, &'static str)> =
+        compose_core::codegen::project::DEV_PINS.to_vec();
+    for (provider, pins) in compose_core::codegen::journal::JOURNAL_DEV_PINS {
+        for (package, version) in *pins {
+            if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {
+                assert_eq!(
+                    already,
+                    version,
+                    "`{}` pins `{package}` at a version another list already holds",
+                    provider.as_str()
+                );
+                continue;
+            }
+            held.push((package, version));
+        }
+    }
+    held
+}
+
+/// Every package a generated project can declare under `dependencies`: the
+/// runtime's own pins, plus every harness SDK a `coder:` node can bind and every
+/// journal driver a target's `journal:` can bind.
+///
+/// Three lists rather than one in the emitter, because a composition declares
+/// the second set only where it binds a harness and a *target* declares the
+/// third only where it binds a remote journal — and one list here, because the
+/// toolchain fixture installs the union once and every project the suites build
+/// resolves against it (PRD resolved q57, q62; `codegen::harness`,
+/// `codegen::journal`).
 fn runtime_and_harness_pins() -> Vec<(&'static str, &'static str)> {
     let mut held: Vec<(&'static str, &'static str)> = compose_core::codegen::project::PINS.to_vec();
+    for (provider, pins) in compose_core::codegen::journal::JOURNAL_PINS {
+        for (package, version) in *pins {
+            if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {
+                assert_eq!(
+                    already,
+                    version,
+                    "`{}` pins `{package}` at a version another list already holds",
+                    provider.as_str()
+                );
+                continue;
+            }
+            held.push((package, version));
+        }
+    }
     for (harness, pins) in compose_core::codegen::harness::HARNESS_PINS {
         for (package, version) in *pins {
             if let Some((_, already)) = held.iter().find(|(held, _)| held == package) {
@@ -9126,4 +9217,148 @@ fn the_emitted_npmrc_is_the_configuration_npm_reads_out_of_it() {
             );
         }
     }
+}
+
+/// Gate 28: **what a contract refusing a live answer leaves on that answer's
+/// record** — `src/runtime.ts`'s `parseResult` and `src/journal.ts`'s
+/// `refuseRecorded`, driven together out of `refused-answers.mjs`.
+///
+/// PRD resolved q29 makes two things a divergence, and the second — "a recorded
+/// answer [that] fails the current contract" — is told from an ordinary
+/// mismatch by one bit on one row: whether the generation that recorded the
+/// answer refused it too (`docs/durability.md` §3, §7). A `ReplayDivergence`
+/// travels past every policy and a `ResultMismatch` is absorbed by a `retry:`,
+/// so the bit decides whether a resume of an execution nobody touched finishes
+/// or is refused.
+///
+/// Nothing about it is visible from a run's answer, and each half of the seam
+/// fails in a way the others hide:
+///
+///   * the mark is started from a **synchronous** parse and finished by a
+///     journal that answers promises — a socket away on `postgres` and `mysql`
+///     (PRD resolved q62). A mark that is issued and never waited for leaves the
+///     record unmarked for as long as the process lives, so every assertion
+///     inside the run still passes; the failure is the *resume*, months later;
+///   * what actually has to be ordered is the mark against the record of the
+///     attempt the mismatch set off, so the runner asserts the order the journal
+///     **finished its own writes in** rather than the order they were asked for.
+///     On a queueing driver the two agree by accident, which is exactly why the
+///     assertion is on the journal's own account of it;
+///   * the control matters as much as the case: the same replay of an *unmarked*
+///     record must be the divergence. Without it a build that marked nothing and
+///     a build that marked everything would both pass;
+///   * a mark the journal refuses is a rejected promise. Swallowed it costs
+///     nothing here and a refused resume later, so it fails the node that was
+///     about to write past it — once, after which the execution goes on under
+///     the conservative half.
+#[test]
+fn a_contract_refusing_a_live_answer_marks_the_record_before_the_retry_writes_its_own() {
+    let Some(root) = installed() else {
+        return;
+    };
+    let project = staged(goldens::golden("review-loop"), root, "refused-answers");
+    let output = runner("refused-answers.mjs")
+        .arg(&project)
+        .output()
+        .expect("bun runs");
+    assert!(
+        output.status.success(),
+        "the refusal runner did not run:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let observed: Value =
+        serde_json::from_slice(&output.stdout).expect("the runner prints one JSON object");
+
+    // A live answer is refused as the ordinary mismatch a policy may absorb, in
+    // the voice the subject was passed under (PRD 5.2, G3).
+    assert_eq!(
+        observed["a_live_refusal_is_a_mismatch"],
+        json!(true),
+        "a contract refusing an answer this generation produced raised something other than a \
+         `ResultMismatch`, so the run's own `retry:` cannot absorb a bad answer from the world: \
+         {observed:#}"
+    );
+    assert_eq!(
+        observed["the_mismatch_names_its_subject"],
+        json!(true),
+        "the mismatch does not open with the subject it was given: {observed:#}"
+    );
+    assert_eq!(
+        observed["the_retried_attempt_answers"],
+        json!(true),
+        "the attempt after the refusal did not answer at all: {observed:#}"
+    );
+
+    // …and the record it came out of carries the mark.
+    assert_eq!(
+        observed["the_mark_is_on_the_record"],
+        json!(true),
+        "the record of an answer this generation's contract refused is not marked `refused`, so \
+         the next resume reads it as a disagreement this build is the first to have and raises \
+         the divergence resolved q29 makes un-absorbable (`docs/durability.md` §3, §7): \
+         {observed:#}"
+    );
+    assert_eq!(
+        observed["the_mark_lands_before_the_retried_attempts_record"],
+        json!([
+            "append review/0#model/0",
+            "refuse review/0#model/0",
+            "append review/0#model/1",
+        ]),
+        "the journal finished the retried attempt's record before — or without — the mark on the \
+         answer that retry was set off by. A process that dies between the two leaves a refusal \
+         this generation really had with no record of having had it, and `docs/durability.md` §3 \
+         states that ordering as the one a later generation reads: {observed:#}"
+    );
+
+    // What the next generation does with it, and what it does without it.
+    assert_eq!(
+        observed["a_marked_answer_replays_as_a_mismatch"],
+        json!(true),
+        "a resume meeting a refusal the recording generation marked raised a divergence rather \
+         than the mismatch that generation's own ladder already absorbed: {observed:#}"
+    );
+    assert_eq!(
+        observed["an_unmarked_answer_replays_as_a_divergence"],
+        json!(true),
+        "a resume meeting an answer no generation marked treated the disagreement as an ordinary \
+         mismatch — which a `retry:` absorbs, and whose second attempt claims an ordinal past the \
+         frontier and re-issues the effect live (PRD resolved q29): {observed:#}"
+    );
+    assert_eq!(
+        observed["the_divergence_names_the_step"],
+        json!(true),
+        "the divergence does not name the key it was raised about, which is the diagnostic q29 \
+         requires of it: {observed:#}"
+    );
+
+    // A mark the journal refuses outright.
+    assert_eq!(
+        observed["a_refused_mark_does_not_fail_the_parse"],
+        json!(true),
+        "a journal that could not take the mark changed what the parse raised, so the node's own \
+         policy chain sees a journal error where the world answered off-contract: {observed:#}"
+    );
+    let said = observed["a_mark_that_cannot_be_written_fails_the_node"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        said.contains("the journal could not mark an answer this run's contract refused")
+            && said.contains("the journal is unavailable"),
+        "a mark the journal refused was swallowed instead of failing the node that was about to \
+         append its record past it, or the failure does not say what could not be written: \
+         {observed:#}"
+    );
+    assert_eq!(
+        observed["a_failed_mark_is_raised_once"],
+        json!(true),
+        "the failed mark is raised at every later write of this execution, so a journal that \
+         refused one `UPDATE` ends every attempt the ladder has left: {observed:#}"
+    );
+    assert_eq!(
+        observed["the_attempt_after_it_still_records"],
+        json!(["append review/1#model/0", "append review/1#model/2"]),
+        "the attempt that met the failed mark wrote its record anyway, or the one after it did \
+         not write at all: {observed:#}"
+    );
 }

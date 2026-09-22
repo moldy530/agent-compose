@@ -86,33 +86,45 @@ Deploy(
                 span: 30:3..40:26,
             },
         ),
+        journal: Some(
+            JournalSection {
+                provider: Some(
+                    Postgres @ 52:13..52:21,
+                ),
+                url: Some(
+                    env("${JOURNAL_URL}") @ 53:8..53:22,
+                ),
+                declares_url: true,
+                span: 52:3..53:22,
+            },
+        ),
         package_registry: Some(
             PackageRegistrySection {
                 url: Some(
-                    "https://npm.internal.example/repository/npm-group/" @ 50:8..50:60,
+                    "https://npm.internal.example/repository/npm-group/" @ 63:8..63:60,
                 ),
                 token: Some(
-                    env("${NPM_MIRROR_TOKEN}") @ 51:10..51:29,
+                    env("${NPM_MIRROR_TOKEN}") @ 64:10..64:29,
                 ),
                 scopes: [
                     PackageRegistryScope {
-                        name: "@corp" @ 54:5..54:12,
+                        name: "@corp" @ 67:5..67:12,
                         url: Some(
-                            "https://npm.internal.example/repository/corp/" @ 55:12..55:59,
+                            "https://npm.internal.example/repository/corp/" @ 68:12..68:59,
                         ),
                         token: Some(
-                            env("${NPM_CORP_TOKEN}") @ 56:14..56:31,
+                            env("${NPM_CORP_TOKEN}") @ 69:14..69:31,
                         ),
-                        span: 54:5..56:31,
+                        span: 67:5..69:31,
                     },
                 ],
-                span: 50:3..56:31,
+                span: 63:3..69:31,
             },
         ),
         trace_sink: Some(
             TraceSinkSection {
                 url: Some(
-                    "https://collector.internal.example/v1/traces" @ 67:8..67:54,
+                    "https://collector.internal.example/v1/traces" @ 80:8..80:54,
                 ),
                 format: None,
                 auth: Some(
@@ -120,52 +132,52 @@ Deploy(
                         bearer: Some(
                             BearerAuth {
                                 token: Some(
-                                    env("${TRACE_SINK_TOKEN}") @ 70:14..70:33,
+                                    env("${TRACE_SINK_TOKEN}") @ 83:14..83:33,
                                 ),
                                 header: None,
                                 prefix: None,
                             },
                         ),
                         hmac: None,
-                    } @ 69:5..70:33,
+                    } @ 82:5..83:33,
                 ),
-                span: 67:3..70:33,
+                span: 80:3..83:33,
             },
         ),
         event_sources: Some(
             EventSourcesSection {
                 sources: [
                     EventSource {
-                        name: "bug_reports" @ 75:3..75:14,
+                        name: "bug_reports" @ 88:3..88:14,
                         kind: Some(
-                            RedisStreams @ 76:11..76:24,
+                            RedisStreams @ 89:11..89:24,
                         ),
                         connection: [
                             ConnectionField {
-                                name: "url" @ 77:5..77:8,
-                                value: env("${REDIS_URL}") @ 77:10..77:22,
+                                name: "url" @ 90:5..90:8,
+                                value: env("${REDIS_URL}") @ 90:10..90:22,
                             },
                         ],
                         extra: [
                             PluginEntry {
-                                key: "stream" @ 78:5..78:11,
+                                key: "stream" @ 91:5..91:11,
                                 value: Text(
                                     "bug-reports",
-                                ) @ 78:13..78:24,
+                                ) @ 91:13..91:24,
                             },
                             PluginEntry {
-                                key: "consumer_group" @ 79:5..79:19,
+                                key: "consumer_group" @ 92:5..92:19,
                                 value: Text(
                                     "agent-compose",
-                                ) @ 79:21..79:34,
+                                ) @ 92:21..92:34,
                             },
                         ],
-                        span: 75:3..79:34,
+                        span: 88:3..92:34,
                     },
                 ],
-                span: 75:3..79:34,
+                span: 88:3..92:34,
             },
         ),
-        span: 4:1..79:34,
+        span: 4:1..92:34,
     },
 )

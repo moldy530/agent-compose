@@ -229,6 +229,38 @@ pub(super) fn components(before: &Ir, after: &Ir) -> Vec<ComponentChange> {
         &[],
     );
 
+    // …and so is `journal:`, the fourth block of one address (grammar 14.7, PRD
+    // resolved q62) — but unlike the three above it, this is a section `local`
+    // **refuses**: a declared block under that target is a `misplaced-section`
+    // error, exactly as `storage_backends:` is (Decisions D87, D148). `plan`
+    // resolves `local` on both sides (docs/plan.md §1), so no artifact *this
+    // command* can build carries one. The entry belongs here all the same
+    // (docs/plan.md §11, §12.6): the `component` vocabulary is the plan
+    // format's rather than this command's and a reader is entitled to exhaust
+    // it, and a plan built for a named target reports the block — so that a
+    // deployment which moved its journal onto a server, or off one, is a change
+    // a plan reports rather than a silent difference in where an execution's
+    // record survives. An **absent** block compares as absent rather than as
+    // `provider: sqlite`: the two are the same binding and a plan that said
+    // nothing changed would be right, but the artifact records which was
+    // written, and a reader diffing two deploy files sees the key appear.
+    entry(
+        &mut found,
+        ComponentKind::Journal,
+        "journal",
+        before
+            .deploy
+            .journal
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        after
+            .deploy
+            .journal
+            .as_ref()
+            .map(|held| (semantic(held), held.span.clone())),
+        &[],
+    );
+
     let sources: BTreeSet<&str> = names(before.deploy.event_sources.as_ref())
         .chain(names(after.deploy.event_sources.as_ref()))
         .collect();

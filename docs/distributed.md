@@ -1476,7 +1476,15 @@ Which gives, concretely:
   moves them off the hub's. An unplaced `tool.*` a `function:` node names is the
   same case for the same reason;
 - a variable referenced from the deploy layer itself — a storage backend, an
-  event source, `hub.join_token:` — belongs to the hub's. Two entries of that
+  event source, `hub.join_token:`, a **journal** — belongs to the hub's. The
+  journal is the sharpest case and the one worth naming, because the plausible
+  reading is the wrong one: a target that binds `journal: { provider: postgres |
+  mysql, url: ${…} }` (`docs/grammar.md` §14.7, PRD resolved q62) journals the
+  effects of **placed** nodes too, so a reader could expect the worker to need
+  that address. It does not. The hub is the single writer (§8 rule 3, PRD
+  resolved q42): a worker streams its effect records home over this wire and the
+  hub writes the rows, so no worker ever opens that connection and no
+  placement's manifest carries what would. Two entries of that
   layer a placement can **also** reach are the exceptions, and each adds
   placements without moving anything off the hub's list. The first is a
   **package registry** (`docs/grammar.md` §14.6, PRD resolved q59), and it is the

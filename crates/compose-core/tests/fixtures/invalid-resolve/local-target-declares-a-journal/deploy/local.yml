@@ -1,0 +1,8 @@
+version: "0.1"
+
+# `local` binds the file beside the project whatever this says, so the block
+# could only be a key whose author expected their executions to be recorded on a
+# server. A journal that lives on one is a `--target` of its own.
+journal:
+  provider: postgres
+  url: ${JOURNAL_URL}

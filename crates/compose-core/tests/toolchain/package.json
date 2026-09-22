@@ -23,6 +23,12 @@
     "shared tree is the union, and a golden that binds no harness simply never",
     "imports them.",
     "",
+    "The two journal drivers and `@types/pg` are",
+    "`compose_core::codegen::journal::JOURNAL_PINS` and `JOURNAL_DEV_PINS`, which a",
+    "generated `package.json` declares only where the target's `journal:` binds that",
+    "provider (PRD resolved q62). The union again, and for the same reason: a golden",
+    "that binds the default journal never imports either.",
+    "",
     "After a pin moves, regenerate BOTH — `bun install` and",
     "`npm install --package-lock-only` — and commit them; a `--frozen-lockfile`",
     "install fails rather than resolving something the last one did not."
@@ -40,10 +46,13 @@
     "@anthropic-ai/claude-agent-sdk": "0.3.272",
     "@anthropic-ai/sdk": "0.126.0",
     "@modelcontextprotocol/sdk": "1.30.0",
-    "@openai/codex-sdk": "0.154.0"
+    "@openai/codex-sdk": "0.154.0",
+    "pg": "8.23.0",
+    "mysql2": "3.24.4"
   },
   "devDependencies": {
     "@types/node": "22.20.1",
+    "@types/pg": "8.23.1",
     "typescript": "7.0.2"
   }
 }

@@ -1,0 +1,13 @@
+# rule: `journal.url` is an `${ENV}` reference and never a literal (grammar 4.3, 14.7)
+# code: invalid-env-ref
+# message: `journal.url` takes an environment reference, found the literal `postgres://compose:hunter2@db.internal.example/journal`
+# at: 13:8
+# help: the spec never contains credentials or connection strings: write `${NAME}`
+version: "0.1"
+
+# The deploy file names the slot and the environment holds the credential, so a
+# connection string written out is a password in a file `validate` reads — and
+# in every artifact built from it.
+journal:
+  provider: mysql
+  url: "postgres://compose:hunter2@db.internal.example/journal"

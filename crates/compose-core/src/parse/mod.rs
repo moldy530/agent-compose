@@ -274,6 +274,7 @@ const DEPLOY_ONLY: &[&str] = &[
     "hub",
     "placements",
     "storage_backends",
+    "journal",
     "package_registry",
     "trace_sink",
     "event_sources",
@@ -402,6 +403,7 @@ fn deploy_file(
         placements: None,
         hub: None,
         storage_backends: None,
+        journal: None,
         package_registry: None,
         trace_sink: None,
         event_sources: None,
@@ -417,6 +419,7 @@ fn deploy_file(
             "storage_backends" => {
                 file.storage_backends = deploy::storage_backends(&entry.value, cx);
             }
+            "journal" => file.journal = deploy::journal(&entry.value, cx),
             "package_registry" => {
                 file.package_registry = deploy::package_registry(&entry.value, cx);
             }

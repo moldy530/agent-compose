@@ -23,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use compose_core::ast::definition::{Builtin, ProviderKind};
+use compose_core::ast::deploy::JournalProvider;
 use compose_core::ast::{HmacAlgorithm, SignatureEncoding};
 use jsonschema::Validator;
 use serde_json::{Value, json};
@@ -997,6 +998,97 @@ fn the_published_schema_accepts_the_whole_package_registry_surface() {
                 .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+    }
+}
+
+/// The whole `journal:` surface, in the editor and in the parser (grammar 14.7,
+/// PRD resolved q62).
+///
+/// The block is the deploy layer's smallest and its conditional half is the
+/// interesting one: which keys are legal depends on the `provider:` written
+/// beside them, so an editor that typed the two keys independently would bless a
+/// `postgres` with no address and a `sqlite` with one. Both directions are here,
+/// and both are put through the **parser** as well, because the schema and
+/// `validate` disagreeing is the one failure a reader meets as a squiggle over
+/// YAML the compiler accepts — or, worse, as a clean editor over YAML it
+/// refuses.
+///
+/// The provider set is read off `JournalProvider::ALL` rather than written out,
+/// for the reason the signature-keyword test below reads its tables off the
+/// compiler's: a fourth backend added to the enum and forgotten here leaves the
+/// published schema squiggling a provider `validate` accepts.
+#[test]
+fn the_published_schema_takes_every_journal_the_grammar_spells() {
+    let schema = read_schema();
+    let validator = compile_schema();
+
+    let published = variants(&schema["$defs"]["journal"]["properties"]["provider"])
+        .expect("`journal.provider` must stay a closed set in the published schema");
+    let table: BTreeSet<String> = JournalProvider::ALL
+        .iter()
+        .map(|provider| provider.as_str().to_string())
+        .collect();
+    assert_eq!(
+        published, table,
+        "the published schema and the compiler's table disagree about `journal.provider`"
+    );
+
+    let block = |provider: JournalProvider| {
+        if provider.opens_in_process() {
+            json!({ "provider": provider.as_str() })
+        } else {
+            json!({ "provider": provider.as_str(), "url": "${JOURNAL_URL}" })
+        }
+    };
+
+    for provider in JournalProvider::ALL {
+        let instance = json!({ "version": "0.1", "journal": block(*provider) });
+        let errors = validation_errors(&validator, &instance);
+        assert!(
+            errors.is_empty(),
+            "the published schema must accept this legal journal:\n{}\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance"),
+            errors.join("\n")
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "deploy/staging.yml");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "the parser must accept what the published schema accepts:\n{source}\n{}",
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!("  [{}] {}", diagnostic.code, diagnostic.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // …and the conditional half, from both sides. Each of these is a block the
+    // parser refuses by name (`missing-journal-url`, `unsupported-journal-key`,
+    // `unknown-variant`, `unknown-key`), so an editor that accepted one would be
+    // telling an author their deploy file is fine right up until `build`.
+    for refused in [
+        json!({ "provider": "postgres" }),
+        json!({ "provider": "mysql" }),
+        json!({ "provider": "sqlite", "url": "${JOURNAL_URL}" }),
+        json!({ "provider": "postgres", "url": "postgres://user:pass@db.example/journal" }),
+        json!({ "provider": "cockroach", "url": "${JOURNAL_URL}" }),
+        json!({ "provider": "postgres", "url": "${JOURNAL_URL}", "pool_size": 8 }),
+        json!({ "url": "${JOURNAL_URL}" }),
+    ] {
+        let instance = json!({ "version": "0.1", "journal": refused });
+        assert!(
+            !validation_errors(&validator, &instance).is_empty(),
+            "the published schema must refuse this journal:\n{}",
+            serde_json::to_string_pretty(&instance).expect("a printable instance")
+        );
+        let source = serde_yaml_ng::to_string(&instance).expect("a printable document");
+        let parsed = compose_core::parse_str(&source, "deploy/staging.yml");
+        assert!(
+            !parsed.diagnostics.is_empty(),
+            "the parser must refuse what the published schema refuses:\n{source}"
         );
     }
 }

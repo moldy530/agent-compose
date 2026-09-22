@@ -1,0 +1,13 @@
+# rule: unknown keys are errors outside a plugin-config object (grammar 14.7, D50)
+# code: unknown-key
+# message: unknown key `pool_size` in `journal`
+# at: 13:3
+version: "0.1"
+
+# The interface behind this block is a handful of per-record inserts and frontier
+# reads rather than a database configuration surface, so a pool size is not
+# grammar here — it belongs in the connection string the `${ENV}` holds.
+journal:
+  provider: postgres
+  url: ${JOURNAL_URL}
+  pool_size: 8

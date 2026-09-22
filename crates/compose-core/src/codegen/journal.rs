@@ -9,10 +9,18 @@
 //! so SQLite is what every project gets and the composition says nothing about
 //! it (`docs/durability.md` §10).
 //!
-//! It is a **constant**, like [`super::runtime`], [`super::cel`] and
-//! [`super::stores`]: byte-identical in every project this compiler release
-//! builds, edited as TypeScript in the compiler's own tree
-//! (`src/codegen/js/journal.ts`) rather than as a Rust string literal.
+//! It is **assembled** the way [`super::harness`] is, and for that module's
+//! reason: an invariant half that is byte-identical in every project this
+//! compiler release builds, plus the arm the target's `journal:` bound
+//! (grammar §14.7, PRD resolved q62). A project whose target says nothing, or
+//! says `provider: sqlite`, gets the invariant half alone — the same bytes every
+//! project has always had — and neither the network driver nor the code that
+//! would import one. That is "emit only the drivers a composition uses", read
+//! one construct along from the harness SDKs.
+//!
+//! Every half is edited as TypeScript in the compiler's own tree
+//! (`src/codegen/js/journal.ts`, `journal-postgres.ts`, `journal-mysql.ts`)
+//! rather than as a Rust string literal.
 //!
 //! # Why it is a module of its own
 //!
@@ -30,16 +38,81 @@
 //! keying discipline have different sensitivity is better served by two files
 //! than by one file with a rule in the middle of it.
 
+use crate::ast::deploy::JournalProvider;
 use crate::ir::Ir;
+use crate::ir::deploy::journal_of;
 
-/// The journal's source, carried in the compiler and emitted verbatim.
+/// The invariant half: the record, the keys, the statements, and the SQLite arm.
 const SOURCE: &str = include_str!("js/journal.ts");
+
+/// The Postgres arm, emitted where the target binds one.
+const POSTGRES: &str = include_str!("js/journal-postgres.ts");
+
+/// …and the MySQL arm.
+const MYSQL: &str = include_str!("js/journal-mysql.ts");
+
+/// The driver each remote provider is reached through, pinned exactly.
+///
+/// The discipline [`super::project::PINS`] and [`super::harness::HARNESS_PINS`]
+/// are under, for their reason: what a journal does is what a compiled graph
+/// survives, so a release that let a driver float would change that with no
+/// commit saying so (PRD §9.18, §5.12).
+///
+/// `@types/pg` is in the list because `pg` ships no types of its own and this
+/// project type-checks under `strict`; it is a **development** pin, which
+/// [`development_pins_of`] is what separates out. `mysql2` ships its own, so its
+/// row is one entry long.
+pub const JOURNAL_PINS: &[(JournalProvider, &[(&str, &str)])] = &[
+    (JournalProvider::Postgres, &[("pg", "8.23.0")]),
+    (JournalProvider::Mysql, &[("mysql2", "3.24.4")]),
+];
+
+/// The development dependencies one remote provider brings, pinned.
+///
+/// Only Postgres has any, and only because `pg` publishes no type declarations:
+/// a `tsc --noEmit` over a project that imports it would fail on the import
+/// rather than on anything this compiler emitted.
+pub const JOURNAL_DEV_PINS: &[(JournalProvider, &[(&str, &str)])] =
+    &[(JournalProvider::Postgres, &[("@types/pg", "8.23.1")])];
+
+/// The packages one provider's arm brings, pinned — empty for `sqlite`, whose
+/// driver `./stores.ts` already pins for every project.
+#[must_use]
+pub fn pins_of(provider: JournalProvider) -> &'static [(&'static str, &'static str)] {
+    JOURNAL_PINS
+        .iter()
+        .find(|(held, _)| *held == provider)
+        .map_or(&[], |(_, pins)| *pins)
+}
+
+/// …and the development ones.
+#[must_use]
+pub fn development_pins_of(provider: JournalProvider) -> &'static [(&'static str, &'static str)] {
+    JOURNAL_DEV_PINS
+        .iter()
+        .find(|(held, _)| *held == provider)
+        .map_or(&[], |(_, pins)| *pins)
+}
 
 /// `src/journal.ts`.
 #[must_use]
 pub fn module(ir: &Ir) -> super::GeneratedFile {
     let mut contents = super::header(ir, "// ");
     contents.push_str(SOURCE);
+    // The arm the target bound, appended. It assigns itself into `BACKENDS`,
+    // which is what makes the dispatch in the invariant half above a lookup
+    // rather than a `switch` naming providers this project has no driver for.
+    match journal_of(ir) {
+        JournalProvider::Sqlite => {}
+        JournalProvider::Postgres => {
+            contents.push('\n');
+            contents.push_str(POSTGRES);
+        }
+        JournalProvider::Mysql => {
+            contents.push('\n');
+            contents.push_str(MYSQL);
+        }
+    }
     super::GeneratedFile {
         path: "src/journal.ts".to_string(),
         contents,
@@ -60,12 +133,903 @@ mod tests {
         assert!(emitted.ends_with(SOURCE), "the journal is emitted verbatim");
     }
 
-    /// Every composition gets the same journal, like the runtime beside it.
+    /// Every composition gets the same journal *under one binding*, like the
+    /// runtime beside it.
+    ///
+    /// The qualifier is grammar §14.7's and is the whole of what resolved q62
+    /// changed here: what a project's journal module holds is a function of the
+    /// **target's** `journal:` and of nothing else, so two compositions built
+    /// for one target are byte-identical and the composition still says nothing.
     #[test]
     fn every_composition_gets_the_same_journal() {
         let empty = module(&ir_of("version: \"0.1\"\n")).contents;
         let full = module(&ir_of(crate::codegen::test_support::EVERY_FORM)).contents;
         assert_eq!(empty.replace("main.yml", ""), full.replace("main.yml", ""));
+    }
+
+    /// **The arm the target bound, and no other** (grammar §14.7, PRD resolved
+    /// q62).
+    ///
+    /// Three claims in one, and the third is the one a reader of the ruling
+    /// should be able to check: a target that binds the default gets the bytes
+    /// every project has always had — no `pg`, no `mysql2`, and no code that
+    /// would import either — which is what makes "the zero-infra local build
+    /// keeps its dependency set unchanged" a property of the artifact rather
+    /// than of a branch nobody takes.
+    #[test]
+    fn a_project_carries_the_journal_arm_its_target_bound_and_no_other() {
+        for (provider, present, absent) in [
+            (JournalProvider::Sqlite, None, vec![POSTGRES, MYSQL]),
+            (JournalProvider::Postgres, Some(POSTGRES), vec![MYSQL]),
+            (JournalProvider::Mysql, Some(MYSQL), vec![POSTGRES]),
+        ] {
+            let emitted = module(&journal_ir(provider)).contents;
+            assert!(
+                emitted.contains(SOURCE),
+                "`{}` lost the invariant half of the journal",
+                provider.as_str()
+            );
+            if let Some(arm) = present {
+                assert!(
+                    emitted.contains(arm),
+                    "a target binding `{}` gets no arm for it, so `openJournal` would refuse \
+                     its own build",
+                    provider.as_str()
+                );
+            }
+            for other in absent {
+                assert!(
+                    !emitted.contains(other),
+                    "a target binding `{}` carries an arm it never dispatches to, and the \
+                     driver that arm imports is one its `package.json` does not pin",
+                    provider.as_str()
+                );
+            }
+            // …and the driver goes exactly where the arm does.
+            let manifest = crate::codegen::project::package_json(&journal_ir(provider)).contents;
+            for (package, _) in pins_of(provider)
+                .iter()
+                .chain(development_pins_of(provider))
+            {
+                assert!(
+                    manifest.contains(&format!("\"{package}\"")),
+                    "a target binding `{}` does not pin `{package}`",
+                    provider.as_str()
+                );
+            }
+            for (other, pins) in JOURNAL_PINS.iter().chain(JOURNAL_DEV_PINS) {
+                if *other == provider {
+                    continue;
+                }
+                for (package, _) in *pins {
+                    assert!(
+                        !manifest.contains(&format!("\"{package}\"")),
+                        "a target binding `{}` pins `{package}`, which only a `{}` journal \
+                         reaches",
+                        provider.as_str(),
+                        other.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The statements are one implementation, not three** (PRD resolved q62).
+    ///
+    /// The ruling puts all three backends "behind the one journal interface",
+    /// and the way this module keeps that true is structural: every statement
+    /// lives in the invariant half, and an arm supplies a connection, a schema
+    /// and a writer guard. An arm that grew a statement of its own would be a
+    /// second reading of `docs/durability.md` that nothing compares against the
+    /// first — and the conformance suite would be proving the divergence rather
+    /// than the servers.
+    ///
+    /// The schemas are the exception, and are excluded by name: a DDL is how a
+    /// backend spells the *shape* the statements need, which really is
+    /// per-backend — `BIGSERIAL` against `AUTO_INCREMENT`, `COLLATE "C"` against
+    /// `ascii_bin`.
+    #[test]
+    fn every_statement_the_journal_runs_is_in_its_invariant_half() {
+        for (arm, name, schema) in [
+            (POSTGRES, "journal-postgres.ts", "POSTGRES_SCHEMA"),
+            (MYSQL, "journal-mysql.ts", "MYSQL_SCHEMA"),
+        ] {
+            let (_, beyond) = arm
+                .split_once(schema)
+                .expect("each arm declares its schema by name");
+            // The clause MySQL spells its no-op upsert with is a *fragment*
+            // `SqlJournal` splices into its own insert, so the verb inside it is
+            // not a statement of this arm's: it is taken out before the scan.
+            let beyond = beyond.replace("ON DUPLICATE KEY UPDATE ", "");
+            for verb in ["INSERT INTO", "UPDATE ", "DELETE FROM", "SELECT * FROM"] {
+                assert!(
+                    !beyond.contains(verb),
+                    "`{name}` runs a `{verb}` of its own: every statement of the journal is \
+                     `SqlJournal`'s, so that one reading of `docs/durability.md` is right for \
+                     all three backends (PRD resolved q62)"
+                );
+            }
+        }
+    }
+
+    /// **The one column whose name is a keyword is quoted, and MySQL is told to
+    /// read that quote as one.**
+    ///
+    /// `key` is a reserved word in MySQL and a plain identifier in SQLite and
+    /// Postgres, so the shared statements spell it `"key"` — which SQLite and
+    /// Postgres read as an identifier natively and MySQL reads as a *string*
+    /// unless its session says otherwise. `ANSI_QUOTES` is what says otherwise,
+    /// and it is load-bearing in the way a reader cannot see from either file
+    /// alone: without it, every statement naming that column silently compares
+    /// against the three-letter string `key` instead of a column, and the
+    /// journal answers nothing for every effect it holds.
+    ///
+    /// So the dependency is written down in one place, here, in both
+    /// directions: the statements quote it, and the arm that needs the setting
+    /// sets it.
+    #[test]
+    fn the_reserved_column_is_quoted_and_mysql_is_told_to_read_the_quote() {
+        let source = include_str!("js/journal.ts");
+        assert!(
+            source.contains("\"key\""),
+            "the shared statements no longer quote `key`, which is a reserved word on one of \
+             the three backends (grammar §14.7, PRD resolved q62)"
+        );
+        for statement in source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("FROM effects") || line.contains("INTO effects"))
+        {
+            assert!(
+                !statement.contains(" key ") && !statement.contains("(key"),
+                "a statement names `key` unquoted, which MySQL reads as a reserved word: \
+                 {statement}"
+            );
+        }
+        // …and the setting is read off the **statement** `openMysql` sends, not
+        // off the file: the arm's own doc comment names `ANSI_QUOTES` too, so a
+        // `MYSQL.contains` here stayed green with the functional
+        // `SET SESSION sql_mode` replaced by a no-op — a false guarantee in the
+        // one test that claims to hold the dependency a reader cannot see from
+        // either file alone.
+        let opening = function_code(MYSQL, "openMysql");
+        assert!(
+            opening.contains("SET SESSION sql_mode") && opening.contains("'ANSI_QUOTES'"),
+            "`openMysql` no longer sets `ANSI_QUOTES` on its session, so every shared statement \
+             naming `\"key\"` compares against a three-letter string rather than against the \
+             column, and the journal answers nothing for every effect it holds"
+        );
+        assert!(
+            !POSTGRES.contains("ANSI_QUOTES"),
+            "the Postgres arm sets a MySQL session variable"
+        );
+    }
+
+    /// **The strict mode the MySQL schema's bounds rest on is set, not assumed**
+    /// (`docs/durability.md` §10).
+    ///
+    /// Every bounded column in `MYSQL_SCHEMA` — and the whole argument that a
+    /// value too long for one is an *error* on all three backends rather than a
+    /// silent divergence on one — rests on `STRICT_TRANS_TABLES`. Without it
+    /// MySQL right-**truncates**, and the column it costs most is
+    /// `effects."key"`: two journal keys sharing a 2048-byte prefix would
+    /// truncate to the same primary key, so the second `append` becomes
+    /// `duplicateKeyNoop` and the replay hands the first effect's recorded
+    /// answer back at the second effect's site.
+    ///
+    /// MySQL 8 ships the mode on, which is exactly why this is a drift test
+    /// rather than a conformance case: CI's server has it, so no case run
+    /// against a real database can see it missing, and the servers that do not
+    /// have it — `sql_mode=''` on a managed or legacy deployment — are the ones
+    /// nobody is running the suite against. It is read off the statement rather
+    /// than off the file for the sibling above's reason.
+    #[test]
+    fn mysql_sets_the_strict_mode_its_column_bounds_rest_on() {
+        let opening = function_code(MYSQL, "openMysql");
+        assert!(
+            opening.contains("SET SESSION sql_mode") && opening.contains("'STRICT_TRANS_TABLES'"),
+            "`openMysql` no longer sets `STRICT_TRANS_TABLES` on its session, so a server \
+             configured with a relaxed `sql_mode` silently truncates an over-long value where \
+             SQLite and Postgres refuse it — and two effect keys sharing a 2048-byte prefix \
+             become one row (`docs/durability.md` §10)"
+        );
+        assert!(
+            MYSQL.contains("VARCHAR(2048)"),
+            "the MySQL schema no longer bounds the two halves of a compound key that are not \
+             fixed-shape ids, so the strict mode above is holding nothing"
+        );
+    }
+
+    /// **The mode that would break the escaping this arm's parameters are bound
+    /// with is cleared, not assumed absent** (`docs/durability.md` §10).
+    ///
+    /// [`MysqlDriver`] runs every statement as `connection.query(sql, params)`,
+    /// and `mysql2`'s `query` — unlike its `execute` — interpolates the
+    /// parameters on the **client**, with `SqlString`: a quote becomes `\'` and
+    /// a backslash `\\`. Those are escapes only while the server reads a
+    /// backslash as one, and `NO_BACKSLASH_ESCAPES` is the mode that says it
+    /// does not. On a server carrying it, an apostrophe in a payload ends its
+    /// own string literal and the `INSERT` is refused mid-run, while a payload
+    /// with only double quotes — every JSON payload this journal writes — is
+    /// stored with literal backslashes and throws in the `JSON.parse` on
+    /// replay.
+    ///
+    /// A drift test for `mysql_sets_the_strict_mode_its_column_bounds_rest_on`'s
+    /// reason exactly: CI's server ships the default `sql_mode`, so no case run
+    /// against a real database can see the mode set, and the servers that do set
+    /// it are the ones nobody runs this suite against. The comma-wrapping is
+    /// asserted with it, because a bare `REPLACE` of the member would leave the
+    /// doubled comma MySQL refuses and turn a correctness fix into an open that
+    /// fails on every server carrying the mode.
+    #[test]
+    fn mysql_clears_the_mode_that_would_break_its_client_side_escaping() {
+        let opening = function_code(MYSQL, "openMysql");
+        assert!(
+            opening.contains("SET SESSION sql_mode") && opening.contains("NO_BACKSLASH_ESCAPES"),
+            "`openMysql` no longer clears `NO_BACKSLASH_ESCAPES` on its session, so on a server \
+             carrying that mode the client-side escaping every bound parameter goes through \
+             either ends a payload's string literal early or stores the backslashes it wrote \
+             (`docs/durability.md` §10)"
+        );
+        assert!(
+            opening.contains("',NO_BACKSLASH_ESCAPES,'") && opening.contains("TRIM"),
+            "the mode is taken out of the list without its separator, so a server that carries \
+             it in the middle of its `sql_mode` is sent `A,,B` — the empty mode name the \
+             `CONCAT_WS` beside it exists to avoid, and an open refused on exactly the servers \
+             this clearing is for"
+        );
+        // …and the other half of the pairing: the escaping is the client's
+        // because the parameters are interpolated rather than bound server-side.
+        // A driver that moved to `execute` would bind them on the server and
+        // need none of this. Read off the module's code rather than off one
+        // function, because `all` and `run` are a class's methods and the reader
+        // above takes top-level declarations.
+        let driver = code(MYSQL);
+        assert!(
+            driver.contains("(sql, [...parameters])") && !driver.contains(".execute("),
+            "the MySQL driver no longer interpolates its parameters client-side, which is the \
+             reason the session clears `NO_BACKSLASH_ESCAPES` above — state the new pairing \
+             here rather than leaving this test asserting a setting nothing rests on"
+        );
+    }
+
+    /// **Each remote arm states the durability its records rest on rather than
+    /// inheriting it** (`docs/durability.md` §2.1, §2.3, §10).
+    ///
+    /// §2.1 promises of every backend that one effect is one `INSERT`,
+    /// **committed before it is answered**, and §2.3 spells that out for the two
+    /// servers: "each statement is its own transaction and the server has
+    /// written it before it answers". Neither sentence is true by default on
+    /// either backend, and on both the setting that makes it true is a session
+    /// one the arm has to ask for.
+    ///
+    /// On **MySQL** it is `autocommit`. `mysql2` never sends the statement, so
+    /// what a connection gets is the server's own — a dynamic system variable an
+    /// operator sets globally or through `init_connect`. With it off, the DDL
+    /// still lands (it commits implicitly) and every record after it joins one
+    /// transaction nothing here commits; the reads come back over the same
+    /// connection and see their own uncommitted rows, so a hub, a status route
+    /// and the whole conformance suite all read correct until the process ends
+    /// and the server rolls the lot back.
+    ///
+    /// On **Postgres** it is `synchronous_commit`, which the SQLite arm's
+    /// `PRAGMA synchronous = FULL` is the other spelling of. Set `off` — per
+    /// cluster, per database or per role — an insert answers before its WAL
+    /// record is flushed, so a power loss drops effects the run already treated
+    /// as recorded and a replay re-issues the model calls behind them.
+    ///
+    /// A drift test rather than a conformance case, for
+    /// `mysql_sets_the_strict_mode_its_column_bounds_rest_on`'s reason exactly:
+    /// CI's `mysql:8` ships `autocommit = 1` and its `postgres:17` ships
+    /// `synchronous_commit = on`, so no case run against a real server can see
+    /// either missing — and a MySQL journal with `autocommit` off would report
+    /// every case in the suite green.
+    #[test]
+    fn each_remote_arm_states_the_durability_its_records_rest_on() {
+        for (arm, name, open, statement) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "openPostgres",
+                "POSTGRES_SYNCHRONOUS_COMMIT",
+            ),
+            (MYSQL, "journal-mysql.ts", "openMysql", "MYSQL_AUTOCOMMIT"),
+        ] {
+            assert!(
+                function_code(arm, open).contains(&format!("query({statement})")),
+                "`{name}` does not send `{statement}` from `{open}`, so whether a record this \
+                 journal answers for has been committed is the server's configuration rather \
+                 than this arm's promise (`docs/durability.md` §2.1, §2.3)"
+            );
+        }
+        assert!(
+            declaration(POSTGRES, "POSTGRES_SYNCHRONOUS_COMMIT")
+                .contains("synchronous_commit = on"),
+            "the Postgres arm asks for something other than `synchronous_commit = on`, so an \
+             `INSERT` can answer before its WAL record is flushed and a power loss drops effects \
+             the run already treated as recorded (`docs/durability.md` §2.1)"
+        );
+        assert!(
+            declaration(MYSQL, "MYSQL_AUTOCOMMIT").contains("SET SESSION autocommit = 1"),
+            "the MySQL arm asks for something other than `autocommit = 1`, so on a server with \
+             `autocommit` off every record joins one transaction with no `COMMIT` in this \
+             module — and a `serve` restarted on a fresh machine finds nothing to recover \
+             (`docs/durability.md` §2.1, §2.3)"
+        );
+        // …and neither is best-effort. The reap window is warned about and
+        // opened anyway (§2.3 says so in as many words) because it costs a
+        // takeover minutes; this costs the record, so a server that will not
+        // make the promise does not get to open the journal.
+        for (arm, name, statement) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "POSTGRES_SYNCHRONOUS_COMMIT",
+            ),
+            (MYSQL, "journal-mysql.ts", "MYSQL_AUTOCOMMIT"),
+        ] {
+            assert!(
+                !code(arm).contains(&format!("query({statement}).catch")),
+                "`{name}` swallows a refusal of `{statement}`, so a server that will not commit \
+                 what it answers for opens this journal anyway with a line on stderr"
+            );
+        }
+    }
+
+    /// **…and each reads back what the session really carries**
+    /// (`docs/durability.md` §2.3).
+    ///
+    /// The window is the setting a `SET` can take without taking effect, and
+    /// that is why it is the one that is read back. In PostgreSQL the assign
+    /// hooks for `tcp_keepalives_idle`/`interval`/`count` call `pq_setkeepalives*`
+    /// and **discard** the return value, so a platform without `TCP_KEEPIDLE`
+    /// logs a `LOG` line server-side and answers the client `SET`, and a
+    /// Unix-domain-socket connection is a documented no-op that also answers;
+    /// `SET SESSION wait_timeout` on MySQL cannot fail at all. So a
+    /// `.catch(guardWindowUnshortened)` on either statement is a path nothing
+    /// takes, and without a read-back beside it [`guardWindowUnshortened`] never
+    /// prints: a hub whose host vanished would hold the guard until the OS
+    /// reaped the backend two hours later, while the takeover `serve` was
+    /// refused by [`guardHeld`]'s promise that "the same command 300s from now
+    /// goes in" — the operator retries at five minutes, is refused again, and
+    /// the only explanation the message offers is a live `serve` that does not
+    /// exist.
+    ///
+    /// The read is held here rather than in the conformance suite because CI's
+    /// servers take the settings: a case can only ever see the window shortened.
+    #[test]
+    fn each_remote_arm_reads_its_reap_window_back_rather_than_assuming_it_took() {
+        for (arm, name, open, confirm, held, reads) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "openPostgres",
+                "confirmPostgresSession",
+                "POSTGRES_SESSION_HELD",
+                "current_setting('tcp_keepalives_idle')",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "openMysql",
+                "confirmMysqlSession",
+                "MYSQL_SESSION_HELD",
+                "@@session.wait_timeout",
+            ),
+        ] {
+            assert!(
+                declaration(arm, held).contains(reads),
+                "`{name}`'s `{held}` no longer reads `{reads}` back, so the shortened reap \
+                 window is a setting this arm sent and nothing observed — and the `SET` that \
+                 carries it cannot fail, so nothing else would notice \
+                 (`docs/durability.md` §2.3)"
+            );
+            assert!(
+                function_code(arm, open).contains(&format!("{confirm}(")),
+                "`{name}` reads its session settings back from nowhere `{open}` calls, so the \
+                 check is dead code beside a promise (`docs/durability.md` §2.3)"
+            );
+            assert!(
+                function_code(arm, confirm).contains("guardWindowUnshortened("),
+                "`{name}`'s `{confirm}` reads the window back and says nothing when it is not \
+                 the one asked for, so §2.3's five-minute bound stays a written claim rather \
+                 than a checked one"
+            );
+        }
+    }
+
+    /// **Every column a statement compares carries a binary collation**, and the
+    /// one a reader would not look for is `dispatches.session`.
+    ///
+    /// Each arm states the rule — `COLLATE "C"` on Postgres, `ascii_bin` on
+    /// MySQL, "on every column a statement compares or orders by" — and the
+    /// keys and status words are where a reader checks it. `session` reads as a
+    /// payload and is not: `releaseDispatch` puts a claimed row back on the
+    /// board `WHERE … AND session = ?`, so a column left at MySQL's
+    /// case-insensitive table default would let a worker release a dispatch
+    /// another worker is holding, where SQLite's `BINARY` and a deterministic
+    /// Postgres collation both refuse it (`docs/durability.md` §3.8).
+    ///
+    /// Held here rather than only in the conformance suite because the ids the
+    /// runtime mints are lowercase, so the guarantee is currently an accident of
+    /// the generator; this is the assertion that it is the schema's.
+    #[test]
+    fn the_session_a_release_compares_is_bound_to_a_binary_collation() {
+        assert!(
+            SOURCE.contains("AND session = ?"),
+            "`releaseDispatch` no longer compares the session in SQL, so the collations below \
+             are guarding something else"
+        );
+        for (arm, name, bound) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "session       TEXT COLLATE \"C\"",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "session       VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin",
+            ),
+        ] {
+            assert!(
+                arm.contains(bound),
+                "`{name}` declares `dispatches.session` without the binary collation its own \
+                 schema comment requires of every compared column, so `releaseDispatch` can put \
+                 a dispatch another session is holding back on the board"
+            );
+        }
+    }
+
+    /// **Each arm takes a writer guard, and says what a second opener is told**
+    /// (`docs/durability.md` §2, PRD resolved q42, q62).
+    ///
+    /// Defence in depth under the one-writer rule, and the reason the two
+    /// primitives are the right ones is a property a reader cannot see from the
+    /// call: both are **session-scoped**, so the server drops them when the
+    /// connection ends and a hub that was killed mid-write leaves nothing
+    /// holding the journal it has to be resumed from. SQLite's file lock is the
+    /// opposite — it outlives its owner, which is why that arm has to break one
+    /// — and a guard that acquired *blocking* would be a third behaviour again:
+    /// a `resume` typed beside a live `serve` would hang rather than be told.
+    #[test]
+    fn each_remote_arm_takes_a_guard_that_does_not_outlive_its_connection() {
+        for (arm, name, acquire, blocking) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "pg_try_advisory_lock($1, $2)",
+                "pg_advisory_lock(",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "GET_LOCK(${MYSQL_GUARD_NAME}, 0)",
+                "GET_LOCK(${MYSQL_GUARD_NAME}, -1)",
+            ),
+        ] {
+            assert!(
+                arm.contains(acquire),
+                "`{name}` takes no writer guard, so two processes would write one journal \
+                 (`docs/durability.md` §2)"
+            );
+            assert!(
+                arm.contains("guardHeld()"),
+                "`{name}` takes a guard and says nothing when it is held: a second opener is \
+                 refused by name rather than left to interleave"
+            );
+            assert!(
+                !arm.contains("RELEASE_LOCK") && !arm.contains("pg_advisory_unlock"),
+                "`{name}` releases its guard by statement, which is a release a crash skips: \
+                 the point of a session-scoped lock is that the server drops it when the \
+                 connection ends"
+            );
+            assert!(
+                !arm.contains(blocking),
+                "`{name}` acquires its guard blocking (`{blocking}`), so a `resume` typed \
+                 beside a live `serve` hangs instead of being told what is happening"
+            );
+        }
+        // …and the refusal says the two things a reader has to know: who may
+        // hold it, and when it goes. "When it goes" is bounded rather than
+        // instant — a host that vanished holds it until its server notices —
+        // and the refusal states the bound rather than the comfortable half of
+        // it, or a reader whose takeover was refused goes hunting for a `serve`
+        // that does not exist.
+        let refusal = function_body(include_str!("js/journal.ts"), "guardHeld");
+        for named in [
+            "released when that session ends",
+            "one process at a time",
+            "${GUARD_REAP_SECONDS}s",
+        ] {
+            assert!(
+                refusal.contains(named),
+                "the guard refusal does not say `{named}`, so a reader meets a lock with no \
+                 account of who holds it or when it goes"
+            );
+        }
+    }
+
+    /// How the MySQL arm spells the name it takes its guard under.
+    ///
+    /// Read by the two tests below, and spelled a third time by
+    /// `tests/toolchain/journal-contract.mjs` — which
+    /// `the_runner_and_the_module_take_one_writer_guard` holds to this one,
+    /// because a runner asking `IS_USED_LOCK` for another name finds nothing
+    /// holding the lock and reports the dead-owner case unavailable against a
+    /// server that is working perfectly.
+    const MYSQL_GUARD_NAME: &str = "CONCAT(?, ':', LEFT(SHA2(DATABASE(), 256), 32))";
+
+    /// **One database, one journal, one writer — on MySQL too**
+    /// (`docs/durability.md` §2.3, PRD resolved q62).
+    ///
+    /// The guard's name is a constant because the *tables* are shared by
+    /// everything pointed at one database, which is the reasoning
+    /// [`WRITER_GUARD`]'s doc comment gives and which Postgres makes true for
+    /// free: `pg_try_advisory_lock` is scoped to the database the session
+    /// connected to, so `staging` and `prod` in two databases of one cluster
+    /// take two locks under one name.
+    ///
+    /// **MySQL's user-level locks are server-wide.** The name alone is the key,
+    /// with no schema component anywhere in it — so the same two deployments on
+    /// one managed MySQL server would take the *same* lock, and the second
+    /// `serve` to start would be refused by [`guardHeld`] with advice that
+    /// cannot come true: the message says a vanished host's guard is released
+    /// within `GUARD_REAP_SECONDS`, and this one is held by a healthy,
+    /// unrelated deployment that will hold it for as long as it is up. No
+    /// conformance case can see it either — one suite run drives one database on
+    /// one server — so the asymmetry is bound here, where the two arms sit side
+    /// by side.
+    #[test]
+    fn the_mysql_guard_is_scoped_to_the_schema_the_postgres_one_gets_for_free() {
+        assert!(
+            MYSQL.contains(&format!("const MYSQL_GUARD_NAME = \"{MYSQL_GUARD_NAME}\";")),
+            "the MySQL arm no longer qualifies its writer guard with `DATABASE()`, so a lock \
+             name MySQL keys server-wide is shared by every deployment on the server: two \
+             journals in two databases of one instance lock each other out, and the refusal \
+             tells the second operator to wait out a host loss that never happened \
+             (`docs/durability.md` §2.3)"
+        );
+        assert!(
+            function_code(MYSQL, "openMysql").contains("GET_LOCK(${MYSQL_GUARD_NAME}, 0)"),
+            "the MySQL arm declares a qualified guard name and takes its lock under something \
+             else"
+        );
+        // …and the Postgres arm does not reach for one: the key it locks on is
+        // `WRITER_GUARD_KEYS`, and the database it locked in is the one it
+        // connected to.
+        assert!(
+            !POSTGRES.contains("DATABASE()") && !POSTGRES.contains("current_database()"),
+            "the Postgres arm qualifies its advisory lock by database, which the server already \
+             does — two deployments in two databases of one cluster hold two locks under one \
+             key"
+        );
+    }
+
+    /// **A guard nobody is holding is given back in minutes, not in hours**
+    /// (`docs/durability.md` §2.3, PRD resolved q62).
+    ///
+    /// The sibling above binds the *primitive*; this binds the property the
+    /// primitive only has once each arm asks for it. A session-scoped lock is
+    /// dropped when the **session** ends, and a session ends when the server
+    /// notices its peer is gone — which is immediate when a process is killed on
+    /// a machine that is still running, and is the server's own default when the
+    /// machine itself is lost. Those defaults are two hours (Linux's
+    /// `tcp_keepalive_time`, which Postgres leaves alone) and eight
+    /// (`wait_timeout`). A crash, a power loss or a partition is exactly the case
+    /// "a `serve` restarted on a fresh machine recovers every open execution"
+    /// exists for, so an unshortened window makes the headline property of a
+    /// remote journal unavailable for most of a working day — with the refusal
+    /// text telling the operator to go and look for a live `serve` that is not
+    /// there.
+    ///
+    /// So each arm shortens the window for its own session and keeps a heartbeat
+    /// on it, and both halves are read here: a shortened window with no heartbeat
+    /// reaps a `serve` that is merely idle, which is worse than the bug.
+    ///
+    /// **Every assertion below reads the statement rather than the identifier**,
+    /// and that is the difference between this test and the one it replaced. A
+    /// setting is only a bound once it is *sent*: `arm.contains("…idle")` is
+    /// satisfied by the constant's own declaration and by the paragraph above it,
+    /// so deleting the `query(POSTGRES_KEEPALIVES)` line left the suite green
+    /// with the window back at Linux's two hours and nothing else in the project
+    /// observing it — the live conformance case ends the guard session by
+    /// *killing* the backend, so no test waits out a reap.
+    #[test]
+    fn each_remote_arm_bounds_how_long_a_lost_host_holds_the_guard() {
+        assert!(
+            SOURCE.contains("const GUARD_REAP_SECONDS = 300;")
+                && SOURCE.contains("const GUARD_HEARTBEAT_MS = 30_000;"),
+            "the window and the heartbeat are one pair of numbers for both arms, stated in the \
+             invariant half beside the guard they are about (`docs/durability.md` §2.3)"
+        );
+        for (arm, name, open, setting, shortens) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "openPostgres",
+                "POSTGRES_KEEPALIVES",
+                "tcp_keepalives_idle",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "openMysql",
+                "MYSQL_WAIT_TIMEOUT",
+                "SET SESSION wait_timeout",
+            ),
+        ] {
+            let declared = declaration(arm, setting);
+            assert!(
+                declared.contains(shortens),
+                "`{name}`'s `{setting}` no longer says `{shortens}`, so a host that vanished \
+                 holds this journal's writer guard for hours and the takeover `serve` is \
+                 refused for all of them (`docs/durability.md` §2.3)"
+            );
+            assert!(
+                code(arm).contains("GUARD_REAP_SECONDS"),
+                "`{name}` shortens the window to a number of its own, so the two backends \
+                 promise different bounds while §2.3 states one"
+            );
+            // …and it is **applied**, in the function that takes the guard the
+            // window is about. A setting declared and never sent is the
+            // server's default with a constant beside it.
+            assert!(
+                function_code(arm, open).contains(&format!("query({setting})")),
+                "`{name}` declares `{setting}` and never sends it from `{open}`, so the server \
+                 reaps a silent session on its own schedule — two hours, or eight — while \
+                 `docs/durability.md` §2.3's table and `guardHeld`'s \
+                 `${{GUARD_REAP_SECONDS}}s` both promise five minutes \
+                 (`docs/durability.md` §2.3)"
+            );
+            // …and the heartbeat that keeps the shortened window off a hub which
+            // is merely idle is a timer with that period, not a keepalive option
+            // that happens to name the constant.
+            assert!(
+                code(arm).contains("}, GUARD_HEARTBEAT_MS);"),
+                "`{name}` shortens the window and never says it is alive on a timer of that \
+                 period, so a `serve` that journals nothing for an afternoon is reaped \
+                 mid-deployment"
+            );
+            assert!(
+                code(arm).contains("clearInterval(this.#heartbeat);"),
+                "`{name}` heartbeats and never stops, so a finished `run` does not exit"
+            );
+        }
+    }
+
+    /// **Neither arm lets a disconnect take the process with it**
+    /// (`docs/durability.md` §2.3).
+    ///
+    /// Both drivers are `EventEmitter`s that emit `error` on a connection the far
+    /// end closed with no command in flight, and an `EventEmitter` that emits
+    /// `error` with nothing listening raises `ERR_UNHANDLED_ERROR` — which for a
+    /// `serve` is every in-flight execution's in-process state, lost because a
+    /// server closed an idle socket. Nothing in the emitted app installs an
+    /// `uncaughtException` handler, and nothing should: this is the listener that
+    /// belongs beside the connection.
+    ///
+    /// The listener **records** rather than redials, and that is the one-writer
+    /// rule at the moment it matters most: the guard went with the connection, so
+    /// another hub may already hold the journal, and a redial would put two
+    /// writers into one record.
+    #[test]
+    fn a_lost_connection_is_refused_rather_than_taking_the_process_or_redialling() {
+        assert!(
+            SOURCE.contains("function connectionLost("),
+            "the invariant half no longer says what a statement over a lost connection is \
+             refused with, so each arm would answer it its own way"
+        );
+        for (arm, name) in [
+            (POSTGRES, "journal-postgres.ts"),
+            (MYSQL, "journal-mysql.ts"),
+        ] {
+            assert!(
+                arm.contains(".on(\"error\", (reported: unknown) =>"),
+                "`{name}` opens a connection and never listens for its `error` event, so a \
+                 server-side disconnect — a MySQL `wait_timeout`, a restarted Postgres — ends \
+                 the whole process with `ERR_UNHANDLED_ERROR` (`docs/durability.md` §2.3)"
+            );
+            assert!(
+                arm.contains("fault.error ??= connectionLost(reported)"),
+                "`{name}` hears the fault and does not keep it, so the statements after it go \
+                 to a connection that is gone"
+            );
+            assert!(
+                arm.contains("if (this.#fault.error !== undefined) throw this.#fault.error;"),
+                "`{name}`'s driver runs statements without asking whether the connection it \
+                 holds is still there"
+            );
+        }
+        // …and each arm dials **once**, in the function that takes the guard.
+        // A second dial anywhere is a redial by another name.
+        for (arm, name, open, dial) in [
+            (POSTGRES, "journal-postgres.ts", "openPostgres", "connect()"),
+            (MYSQL, "journal-mysql.ts", "openMysql", "createConnection({"),
+        ] {
+            assert_eq!(
+                arm.matches(dial).count(),
+                1,
+                "`{name}` opens a connection in more than one place, so something other than \
+                 `{open}` can dial: the writer guard went with the connection it lost, and a \
+                 redial would take it back from a hub that may already hold this journal \
+                 (`docs/durability.md` §2)"
+            );
+            assert!(
+                function_body(arm, open).contains(dial),
+                "`{name}` dials somewhere other than `{open}`, which is the one place that \
+                 takes the writer guard"
+            );
+        }
+    }
+
+    /// **The guard is taken before the schema is created** (§2.3).
+    ///
+    /// Two processes opening one fresh remote journal at the same time — a
+    /// `serve` restart overlapping the one it replaces, an `agent-compose resume`
+    /// typed beside a live `serve` — would otherwise both run the DDL. Postgres
+    /// documents `CREATE TABLE IF NOT EXISTS` as *not* atomic against a
+    /// concurrent creator, so one of the two can fail on a duplicate key in
+    /// `pg_type`: a catalog error on open rather than the refusal by name this
+    /// design promises. Under the guard there is one creator by construction, and
+    /// the opener about to be refused runs no DDL against an operator's database
+    /// at all.
+    #[test]
+    fn a_remote_arm_takes_the_guard_before_it_creates_anything() {
+        for (arm, name, open, acquire, schema) in [
+            (
+                POSTGRES,
+                "journal-postgres.ts",
+                "openPostgres",
+                "pg_try_advisory_lock",
+                "POSTGRES_SCHEMA",
+            ),
+            (
+                MYSQL,
+                "journal-mysql.ts",
+                "openMysql",
+                "GET_LOCK(${MYSQL_GUARD_NAME}, 0)",
+                "MYSQL_SCHEMA",
+            ),
+        ] {
+            let body = function_body(arm, open);
+            let taken = body
+                .find(acquire)
+                .unwrap_or_else(|| panic!("`{name}` takes a writer guard in `{open}`"));
+            let created = body
+                .find(schema)
+                .unwrap_or_else(|| panic!("`{name}` creates its schema in `{open}`"));
+            assert!(
+                taken < created,
+                "`{name}` runs its DDL before it takes the guard, so a second opener that is \
+                 about to be refused still creates tables in an operator's database — and two \
+                 concurrent creators is a race Postgres does not make atomic \
+                 (`docs/durability.md` §2.3)"
+            );
+        }
+    }
+
+    /// **Every backend's schema holds every column the statements name.**
+    ///
+    /// The statements are shared (see the sibling above), so a table one arm
+    /// declares a column short of is a backend on which the very first `INSERT`
+    /// fails — at run time, on a server, in a deployment. That is the one class
+    /// of divergence a shared implementation makes *more* likely rather than
+    /// less, and it is the one a type-check cannot see: SQL is a string.
+    ///
+    /// So the SQLite schema is read as the inventory — it is the arm that has
+    /// always been right, and `docs/durability.md` §3 is written against it —
+    /// and each remote schema is held to naming the same columns of the same
+    /// tables. Types are deliberately **not** compared: `TEXT` against
+    /// `LONGTEXT` against `VARCHAR(512) … ascii_bin` is exactly what a
+    /// per-backend schema is for, and §10 states why each is what it is.
+    ///
+    /// The conformance suite is what proves the columns then *behave*
+    /// (`journal_backend_conformance`); this is what fails in a second rather
+    /// than only where a server is reachable.
+    #[test]
+    fn every_backend_declares_every_column_the_statements_name() {
+        let expected = columns(SOURCE);
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            vec!["deliveries", "dispatches", "effects", "executions"],
+            "the SQLite schema is the inventory every other backend is held to, and it no \
+             longer holds the four tables `docs/durability.md` §3 describes"
+        );
+        for (arm, name) in [
+            (POSTGRES, "journal-postgres.ts"),
+            (MYSQL, "journal-mysql.ts"),
+        ] {
+            let held = columns(arm);
+            for (table, wanted) in &expected {
+                let found = held.get(table).unwrap_or_else(|| {
+                    panic!(
+                        "`{name}` declares no `{table}` table, so every statement of \
+                         `SqlJournal` that names one fails on that backend"
+                    )
+                });
+                for column in wanted {
+                    assert!(
+                        found.contains(column),
+                        "`{name}`'s `{table}` declares no `{column}`, so the shared statement \
+                         that names it fails on the first row (`docs/durability.md` §10)"
+                    );
+                }
+            }
+            // …and `seq`, which only a backend without SQLite's implicit `rowid`
+            // needs, and which park order is derived from
+            // (`docs/distributed.md` §6.2).
+            assert!(
+                held.get("dispatches")
+                    .is_some_and(|found| found.contains(&"seq".to_string())),
+                "`{name}`'s `dispatches` declares no `seq`: a backend with no implicit rowid \
+                 has to carry insertion order as a column, or a fan-out's five rows sharing \
+                 one `parked_at` drain in an order nothing defines"
+            );
+        }
+    }
+
+    /// The columns each `CREATE TABLE` in a schema declares, by table.
+    ///
+    /// A reading of the DDL rather than of a list written beside it: a list is
+    /// only as current as the last person to extend it, and the failure this
+    /// guards is precisely somebody adding a column to one schema and not the
+    /// others.
+    fn columns(source: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut found: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut table: Option<String> = None;
+        for line in source.lines() {
+            // A schema is a template literal, and MySQL's is an array of them —
+            // so a `CREATE TABLE` can open a line behind the backtick that opens
+            // its literal.
+            let trimmed = line.trim().trim_start_matches(['`', '"']);
+            if let Some(rest) = trimmed.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
+                table = rest
+                    .split_whitespace()
+                    .next()
+                    .map(|name| name.trim_end_matches('(').to_string());
+                if let Some(name) = &table {
+                    found.entry(name.clone()).or_default();
+                }
+                continue;
+            }
+            let Some(name) = table.clone() else { continue };
+            if trimmed.starts_with(')') {
+                table = None;
+                continue;
+            }
+            // A column line opens with the column's own name; a constraint line
+            // opens with the keyword that names the constraint.
+            let Some(word) = trimmed.split_whitespace().next() else {
+                continue;
+            };
+            let column = word.trim_matches(|held| held == '"' || held == '`');
+            if column.is_empty()
+                || matches!(
+                    column.to_ascii_uppercase().as_str(),
+                    "PRIMARY" | "UNIQUE" | "KEY" | "INDEX" | "CONSTRAINT" | "FOREIGN" | "--"
+                )
+            {
+                continue;
+            }
+            found.entry(name).or_default().push(column.to_string());
+        }
+        found
+    }
+
+    /// An artifact for one journal binding, and nothing else different.
+    fn journal_ir(provider: JournalProvider) -> Ir {
+        if provider == JournalProvider::DEFAULT {
+            return ir_of("version: \"0.1\"\n");
+        }
+        crate::codegen::test_support::ir_of_mesh(
+            "version: \"0.1\"\n",
+            &format!(
+                "version: \"0.1\"\njournal:\n  provider: {}\n  url: ${{JOURNAL_URL}}\n",
+                provider.as_str()
+            ),
+        )
     }
 
     /// The driver is the one PRD §9.18 admits, and the two it refuses are named
@@ -105,6 +1069,84 @@ mod tests {
         assert!(
             !SOURCE.contains("BEGIN IMMEDIATE"),
             "an append that opened a transaction of its own would have a window a crash could land in"
+        );
+    }
+
+    /// **A refused answer's mark is owed to its execution and waited for before
+    /// that execution's next record** (`docs/durability.md` §3, §7; PRD
+    /// resolved q29).
+    ///
+    /// The one seam in this runtime where a **synchronous** function starts a
+    /// journal **write**: `parseResult` refuses a live answer and the mark that
+    /// tells the next generation so is an `UPDATE` — a socket away on the two
+    /// remote arms. Three spellings are wrong and every one of them is silent:
+    ///
+    ///  * `refuseRecorded` **answering** the write, which a synchronous parse
+    ///    can only drop. The mark then lands whenever the backend gets to it,
+    ///    the record of the attempt the mismatch set off can be down first, and
+    ///    a `refuse` the server refuses rejects into nothing;
+    ///  * waiting for nothing at the seam and leaving the order to the driver.
+    ///    [`SqlJournal`] runs every method of one journal on one queue, so on
+    ///    all three backends this compiler ships the ordering would hold by
+    ///    accident — until a verb stops going through `#serial`, or a journal
+    ///    that is not this class answers the session ([`DispatchJournal`] in
+    ///    `./worker-node.ts` already is one);
+    ///  * `void`ing the promise under a `.catch`, which is the right shape for
+    ///    the superseded dispatch in `./mesh.ts` and the wrong one here: that
+    ///    write has nothing after it that must not be written first, and this
+    ///    one does.
+    ///
+    /// So the rule is read off both ends. The parse calls it as a statement —
+    /// nothing awaited, nothing dropped — the function hands its write to
+    /// [`owe`], and the recorder waits for what the execution owes before it
+    /// appends.
+    #[test]
+    fn a_refused_answers_mark_is_owed_by_its_execution_and_waited_for_before_its_next_record() {
+        let runtime = include_str!("js/runtime.ts");
+        let parse = function_code(runtime, "parseResult");
+        assert!(
+            parse.contains("refuseRecorded(value);"),
+            "`parseResult` no longer marks the record of an answer it refused, so a later resume \
+             reads this generation's own mismatch as a disagreement nobody has had before and \
+             raises the divergence resolved q29 makes un-absorbable"
+        );
+        assert!(
+            !parse.contains("await refuseRecorded") && !parse.contains("refuseRecorded(value)."),
+            "`parseResult` treats the mark as a promise of its own. It is synchronous — every \
+             caller of it is, down to a `CompiledFlow.parse` — so what it can do with a promise \
+             is drop it: the mark is owed to the execution instead (`refuseRecorded`)"
+        );
+
+        let marking = function_code(SOURCE, "refuseRecorded");
+        assert!(
+            marking.contains("export function refuseRecorded(value: unknown): void"),
+            "`refuseRecorded` answers its caller with the write rather than owing it, and its \
+             caller is a synchronous parse that can only drop it: nothing then orders the mark \
+             against the retried attempt's record, and a mark the journal refuses is swallowed \
+             (`docs/durability.md` §3)"
+        );
+        assert!(
+            marking.contains("owe(record.execution, session.journal.refuse("),
+            "the mark is issued without being owed by its execution, so nothing waits for it and \
+             nothing reports a `refuse` that failed"
+        );
+
+        let recorder = declaration(SOURCE, "EffectRecorder");
+        assert!(
+            recorder.contains("await refusalsMarked(session.execution);"),
+            "the effect seam appends this execution's next record without waiting for the \
+             refusal marks the execution owes. The ordering `docs/durability.md` §3 states — the \
+             mark down before the record of the attempt the mismatch set off — would then rest \
+             on `SqlJournal` running one queue rather than on anything this seam does"
+        );
+        let appending = recorder
+            .split_once("await refusalsMarked(session.execution);")
+            .expect("the seam waits for what the execution owes")
+            .1;
+        assert!(
+            appending.contains("session.journal.append("),
+            "the seam waits for the marks this execution owes somewhere other than before the \
+             record it is about to append, which is the one place the order matters"
         );
     }
 
@@ -641,7 +1683,7 @@ mod tests {
     /// make today, the whole of `node:child_process` rather than `spawn` alone.
     /// A module listed here is a decision that anything reached through it
     /// leaves the process.
-    const WORLD_MODULES: [&str; 13] = [
+    const WORLD_MODULES: [&str; 15] = [
         "node:fs",
         "node:fs/promises",
         "node:child_process",
@@ -655,6 +1697,11 @@ mod tests {
         "node:cluster",
         "node:worker_threads",
         "node-sqlite3-wasm",
+        // The two journal drivers, each reached only from the arm a target that
+        // binds it gets (grammar §14.7, PRD resolved q62). They are the world by
+        // the plainest reading of this list: a socket to a database is a socket.
+        "pg",
+        "mysql2/promise",
     ];
 
     /// Module specifiers that reach nothing outside the process, each with the
@@ -684,13 +1731,15 @@ mod tests {
     ///
     /// Two families. The **platform globals** — `fetch` and the transports a
     /// future surface would most plausibly reach for — are in the runtime rather
-    /// than in a module, so no specifier introduces them. And the SQLite
-    /// **handle**: its driver arrives by dynamic `import()` (classified with the
-    /// rest, see [`WORLD_MODULES`]) and its binding is destructured out of the
-    /// promise, so the names to watch are the constructor and the handle every
-    /// statement goes through — `#database.run(…)` included, which is why the
-    /// entry is the member prefix rather than a call.
-    const UNIMPORTED: [&str; 9] = [
+    /// than in a module, so no specifier introduces them. And the three journal
+    /// **handles**: a constructor is a call an import's binding catches, but the
+    /// handle a driver then runs every statement through is a *member* of a
+    /// private field, so `#database.run(…)`, `#client.query(…)` and
+    /// `#connection.query(…)` are watched as member prefixes rather than as
+    /// calls. Without them the one place each arm really reaches its server
+    /// would be the one place this walk could not see (grammar §14.7, PRD
+    /// resolved q62).
+    const UNIMPORTED: [&str; 11] = [
         "fetch(",
         "WebSocket(",
         "EventSource(",
@@ -700,6 +1749,8 @@ mod tests {
         "Deno.",
         "Database(",
         "database.",
+        "#client.",
+        "#connection.",
     ];
 
     #[test]
@@ -730,27 +1781,38 @@ mod tests {
         //  * `writeTrace` — the run's own trace document, written by the command
         //    after the run (`docs/trace.md`). A resumed generation writes a fresh
         //    whole one, which is §9's promise rather than a repeat.
-        //  * the journal's **own** storage: `SqliteJournal`, the open path that
-        //    creates and migrates the file, the lock a killed writer leaves
-        //    behind (§2), and `journalExists`. These are the record itself. A
-        //    replay that "re-executed" them would be a replay reading its own
-        //    journal, which is what a replay *is*.
-        const NOT_AN_EFFECT: [(&str, &str); 9] = [
+        //  * the journal's **own** storage: the three drivers, the open paths
+        //    that create and migrate each backend's schema, the lock a killed
+        //    writer leaves behind (§2), and `journalExists`. These are the record
+        //    itself. A replay that "re-executed" them would be a replay reading
+        //    its own journal, which is what a replay *is*. The two remote arms
+        //    are read here like every other emitted module, so a driver call
+        //    that ever escaped one of them fails this test rather than nothing.
+        const NOT_AN_EFFECT: [(&str, &str); 13] = [
             ("src/stores.ts", "releaseExecution"),
             ("src/runtime.ts", "releaseWorkspaces"),
             ("src/delivery.ts", "attemptDelivery"),
             ("src/cli.ts", "writeTrace"),
-            ("src/journal.ts", "SqliteJournal"),
-            ("src/journal.ts", "openJournal"),
+            ("src/journal.ts", "SqliteDriver"),
+            ("src/journal.ts", "openSqlite"),
             ("src/journal.ts", "breakStaleLock"),
             ("src/journal.ts", "migrated"),
             ("src/journal.ts", "journalExists"),
+            ("src/journal.ts", "PostgresDriver"),
+            ("src/journal.ts", "openPostgres"),
+            ("src/journal.ts", "MysqlDriver"),
+            ("src/journal.ts", "openMysql"),
         ];
 
         let modules = [
             ("src/runtime.ts", include_str!("js/runtime.ts")),
             ("src/stores.ts", include_str!("js/stores.ts")),
             ("src/journal.ts", include_str!("js/journal.ts")),
+            // The two arms, under the path they are appended to: a project
+            // whose target binds one really does carry it inside
+            // `src/journal.ts` (grammar §14.7, PRD resolved q62).
+            ("src/journal.ts", POSTGRES),
+            ("src/journal.ts", MYSQL),
             ("src/serve.ts", include_str!("js/serve.ts")),
             ("src/delivery.ts", include_str!("js/delivery.ts")),
             ("src/otlp.ts", include_str!("js/otlp.ts")),
@@ -1012,6 +2074,41 @@ mod tests {
         }
         found.push((name, body));
         found
+    }
+
+    /// One top-level declaration's own lines, by name.
+    ///
+    /// [`declarations`] partitions a module at its column-zero declarations and
+    /// drops the prose, so this is what a `const` really says rather than what
+    /// the paragraph above it describes.
+    fn declaration(source: &str, name: &str) -> String {
+        declarations(source)
+            .into_iter()
+            .find(|(declared, _)| declared == name)
+            .unwrap_or_else(|| panic!("the emitted module declares `{name}`"))
+            .1
+    }
+
+    /// An emitted module's code, with its prose taken out.
+    ///
+    /// The difference between a rule that binds a statement and a rule its own
+    /// doc comment satisfies. Two of the tests above were the latter — one was
+    /// green with the `SET SESSION sql_mode` that makes every `"key"` a column
+    /// replaced by a no-op, the other with the statement that shortens the
+    /// guard's reap window deleted — because the identifier they matched on was
+    /// still there, in the paragraph explaining why the deleted line mattered.
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !is_comment(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// …and of one function of it, which is the pairing most of these rules
+    /// want: a statement is sent from somewhere, and *where* is half the rule.
+    fn function_code(source: &str, name: &str) -> String {
+        code(&function_body(source, name))
     }
 
     /// Whether this line is comment or documentation rather than code.

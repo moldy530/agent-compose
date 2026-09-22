@@ -1,0 +1,7 @@
+# rule: a sqlite journal is a file and has no address to dial (grammar 14.7)
+# at: /journal
+# via: /$defs/journal/allOf/1/then/not
+version: "0.1"
+journal:
+  provider: sqlite
+  url: ${JOURNAL_URL}

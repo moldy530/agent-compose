@@ -273,6 +273,46 @@ environment check this project already makes: the variable is in
 `environmentReferences`, so loading `src/index.ts` names it, and a worker that
 does not have it is refused at join rather than after a failed install.
 
+## Where this project's journal lives
+
+Every invocation of every flow is **journaled** — every model answer, every tool
+result, every store op, every answer a person gave a `human:` node — and a
+resumed execution consumes that record rather than re-issuing it, up to the
+frontier. Nothing turns it on and nothing turns it off. What the deploy layer
+chooses is only where the record goes.
+
+This target binds a **`postgres`** journal, at the address `${JOURNAL_URL}` holds.
+The variable is named here and never its value: `JOURNAL_URL` is read at
+process start, and `run`, `serve` and `resume` all fail before the graph is
+invoked when it is unset.
+
+The record lives on that server rather than in this directory, which is what
+lets a `serve` restarted on another machine recover every execution this one
+left open — and what makes retention a `DELETE` rather than removing a file.
+This project therefore pins the driver its journal is reached through, in
+`package.json` beside every other pin; a target that binds the default
+journal pins none of these:
+
+| package | version |
+|---|---|
+| `pg` | `8.23.0` |
+| `@types/pg` | `8.23.1` |
+
+**One process at a time writes this journal**, and the server holds a
+session-scoped lock saying which. A second process that opens it is refused
+by name rather than left to interleave; the lock goes with the connection, so
+a process killed on a machine that is still running is never what is holding
+it. A host that vanished outright — a crash, a power loss, a partition — holds
+it until its server notices, which this project bounds to about five minutes
+by shortening the window that server reaps a silent session in. That bound is
+what keeps a `serve` started on a fresh machine from being locked out of the
+record it exists to resume.
+
+Because the journal holds what a trace deliberately does not — completions,
+tool results, a person's answer — it is private recovery data with the same
+sensitivity as this project's stores. Binding it into a shared database is
+this deploy file's explicit choice about where those payloads live.
+
 ## Answering a `human` node
 
 A flow that reaches a `human` node stops there and its execution reports

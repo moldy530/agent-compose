@@ -1,0 +1,8 @@
+# rule: a journal block is closed, and a pool size is not grammar (grammar 14.7, D50)
+# at: /journal
+# via: /$defs/journal/additionalProperties
+version: "0.1"
+journal:
+  provider: postgres
+  url: ${JOURNAL_URL}
+  pool_size: 8

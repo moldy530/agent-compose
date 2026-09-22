@@ -673,6 +673,6 @@ The version number alone is a promise; seven tests make it a checkable one:
   anywhere upstream (PRD 5.9, resolved q15).
 * **Anything a run did.** This is a picture of a composition, not of an
   execution. What happened is [`docs/trace.md`](trace.md).
-* **The deploy layer.** Placements, storage backends, the hub and the trace sink
-  are the target's rather than the graph's; `agent-compose plan` reports them and
-  the IR carries them.
+* **The deploy layer.** Placements, storage backends, the journal, the hub and
+  the trace sink are the target's rather than the graph's; `agent-compose plan`
+  reports them and the IR carries them.

@@ -403,7 +403,7 @@ export function createApp(): FastifyInstance {
     return reply.code(200).send(await report(execution));
   });
 
-  app.post("/executions/:id/resume", (request, reply) => {
+  app.post("/executions/:id/resume", async (request, reply) => {
     const id = (request.params as { id: string }).id;
     const execution = executions.get(id);
     // The existence check first: a resume against an id this process never
@@ -443,7 +443,13 @@ export function createApp(): FastifyInstance {
       });
     }
     const named = asked;
-    const outcome = deliverHumanAnswer(id, named, request.body);
+    // **Awaited**, which is what makes the `202` below a statement about the
+    // journal rather than only about this process's memory: `deliverHumanAnswer`
+    // settles the wait and then waits for the record of it to be appended, so a
+    // hub that dies between this line and the reply has already written the
+    // answer it is about to acknowledge (`runtime.deliverHumanAnswer`,
+    // `docs/durability.md` §3.4).
+    const outcome = await deliverHumanAnswer(id, named, request.body);
     if (outcome.ok) {
       // `202` rather than `200`: the answer has been delivered and the graph has
       // gone back to work, which the status route is where to watch. The run is

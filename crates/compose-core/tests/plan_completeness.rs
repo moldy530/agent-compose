@@ -515,6 +515,17 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
             Slice::own(registry.clone()),
         );
     }
+    // …and `journal:`, the fourth singleton block (grammar §14.7, PRD resolved
+    // q62). It is reported at one address like the three above, and a plan built
+    // under `local` never carries one — the target refuses the section — which
+    // is exactly why the *vocabulary* member exists whatever this command sees
+    // (`docs/plan.md` §11, §12.6).
+    if let Some(journal) = artifact.pointer("/deploy/journal") {
+        found.insert(
+            (COMPONENTS, "journal".to_string()),
+            Slice::own(journal.clone()),
+        );
+    }
     for (name, source) in section(&artifact, &["deploy", "event_sources"]) {
         found.insert(
             (COMPONENTS, format!("event_source.{name}")),
@@ -526,6 +537,7 @@ fn subjects(ir: &Ir) -> BTreeMap<Subject, Slice> {
         &[
             "hub",
             "placements",
+            "journal",
             "package_registry",
             "trace_sink",
             "event_sources",

@@ -1,0 +1,11 @@
+# rule: `journal.provider` is one of three (grammar 14.7)
+# code: unknown-variant
+# message: `cockroach` is not a valid `journal.provider`
+# at: 10:13
+version: "0.1"
+
+# Three providers, and a fourth is a backend this release carries no driver and
+# no arm for.
+journal:
+  provider: cockroach
+  url: ${JOURNAL_URL}

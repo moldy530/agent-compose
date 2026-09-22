@@ -554,7 +554,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
   // reads that decide it are the first thing after the park.
   for (;;) {
     const wait = `${site}/${nextOrdinal(options.execution, site)}`;
-    const row = journal.park({
+    const row = await journal.park({
       execution: options.execution,
       wait,
       id: `dsp_${globalThis.crypto.randomUUID()}`,
@@ -591,7 +591,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
       // answered (§5, PRD resolved q46's parity bar). Planting is one function
       // for both generations ([`answered`]), so the pair a reader is shown is
       // derived once and here as there.
-      if (journal.lookup(options.execution, ending.pause.effect.key) === undefined) {
+      if ((await journal.lookup(options.execution, ending.pause.effect.key)) === undefined) {
         await answered(journal, options, ending.pause);
       }
       continue;
@@ -610,7 +610,7 @@ export async function dispatchPlaced(options: DispatchOptions): Promise<PlacedAn
     // where the reasoning is. This is its belt-and-braces: a row that reached
     // here still `dispatched` is one that start could not read.
     if (row.status === "dispatched" && !sessions.has(row.session ?? "")) {
-      journal.supersedeDispatch(row.id, ORPHANED);
+      await journal.supersedeDispatch(row.id, ORPHANED);
       throw new DispatchSuperseded(options.node, options.placement, ORPHANED);
     }
     rows.set(row.id, row);
@@ -651,17 +651,33 @@ function awaited(
       // The node's own deadline ran out (§6.5: the chain runs from dispatch, so
       // queueing is inside the budget). The hub is done with the dispatch, so
       // the row is ended rather than left for a worker to take work nothing
-      // will read the answer of. **Synchronously**, and the journal is the
-      // caller's for that reason: a row left `parked` for one turn of the loop
-      // is a row a poll in that turn could claim, handing a worker work whose
-      // answer nothing will read.
+      // will read the answer of.
       const reason =
         options.signal?.reason instanceof Error
           ? options.signal.reason.message
           : "the node execution ended";
-      journal.supersedeDispatch(row.id, `the hub stopped waiting for this dispatch: ${reason}`);
+      // **The board is cleared in this turn, and the row is ended after it.**
+      // `rows` is what a poll reads, so dropping the entry here is what stops a
+      // poll in this very turn from handing a worker work whose answer nothing
+      // will read — the property this handler had when the journal answered
+      // synchronously, kept now that it does not. The row itself is superseded
+      // on the turn the write lands, and a hub that died in between meets the
+      // dispatch again at the next start's `unsettledDispatches` walk, which
+      // supersedes exactly the rows this one would have.
       rows.delete(row.id);
       held.settle({ kind: "error", name: "DispatchSuperseded", message: reason });
+      void journal
+        .supersedeDispatch(row.id, `the hub stopped waiting for this dispatch: ${reason}`)
+        .catch((error: unknown) => {
+          // Nothing left to fail: the node execution this dispatch belonged to
+          // has already been told, and a row still `dispatched` is one the next
+          // start supersedes by the same rule.
+          process.stderr.write(
+            `could not supersede \`${row.id}\`: ${
+              error instanceof Error ? error.message : String(error)
+            }\n`,
+          );
+        });
       // A dispatch that has stopped being unsettled frees whichever session was
       // holding it, and the queue behind it is what that session is answered
       // next — see [`stirPolls`].
@@ -707,10 +723,12 @@ function awaited(
  * its next resume (`docs/durability.md` §3.4), so the throw travels as this
  * node's failure rather than being swallowed. It is also **inside** the
  * settlement rather than after it, which is the other half of the same rule: the
- * resume route answers `202` when `settle` returns, so a record appended in a
- * later turn of the loop is one a process killed in between never wrote. The
- * writer below is what `runtime.holdRemotePause` calls where `runtime.runHuman`
- * calls `slot.keep`.
+ * resume route answers `202` only once the settlement's write has landed — it
+ * awaits the very promise this returns (`runtime.deliverHumanAnswer`, the
+ * `Held.kept` it waits on) — so a record appended in a later turn of the loop
+ * would be one a process killed in between never wrote and an operator had
+ * already been told was taken. The writer below is what
+ * `runtime.holdRemotePause` calls where `runtime.runHuman` calls `slot.keep`.
  *
  * The wait's budget is the node's own `timeout:`, spent from the moment
  * `holdRemotePause` puts it on the board — never the worker-stamped
@@ -725,7 +743,7 @@ async function answered(
   options: DispatchOptions,
   pause: runtime.RemotePause,
 ): Promise<void> {
-  await holdRemotePause(options.execution, pause, (settled) => {
+  await holdRemotePause(options.execution, pause, (settled) =>
     journal.append({
       execution: options.execution,
       key: pause.effect.key,
@@ -739,8 +757,8 @@ async function answered(
       outcome: { kind: "value", value: settled },
       refused: false,
       recordedAt: new Date().toISOString(),
-    });
-  });
+    }),
+  );
 }
 
 /** The next placement-wait ordinal at one instance path (§6.1). */
@@ -864,11 +882,11 @@ function endingIn(value: unknown): Ending {
  * states the rule, which is what makes it something a second implementation may
  * rely on (§10.1) rather than infer from a refusal it is forbidden to read.
  */
-function pauseOf(
+async function pauseOf(
   journal: Journal,
   row: DispatchRow,
   value: unknown,
-): runtime.RemotePause | undefined {
+): Promise<runtime.RemotePause | undefined> {
   if (value === null || typeof value !== "object") return undefined;
   const held = value as Record<string, unknown>;
   const wait = held["wait"];
@@ -909,7 +927,7 @@ function pauseOf(
   // from a `site` that is not the `wait` is a correct key for the wrong node.
   if (wait !== site) return undefined;
   if (key !== effectKey(site, "human", ordinal)) return undefined;
-  if (ordinal !== claimedHumanOrdinal(journal, row.execution, site)) return undefined;
+  if (ordinal !== (await claimedHumanOrdinal(journal, row.execution, site))) return undefined;
   // …and the node that identity ends at is the node whose contract will hold the
   // answer. `runtime.holdRemotePause` looks the descriptor up by `${flow}.${node}`
   // and arms *its* `timeout:`, publishes *its* `output:` on the status route and
@@ -951,9 +969,13 @@ function pauseOf(
  * back. Records deeper inside the site belong to other claims and are not
  * counted: an ordinal is per site, not per subtree.
  */
-function claimedHumanOrdinal(journal: Journal, execution: string, site: string): number {
+async function claimedHumanOrdinal(
+  journal: Journal,
+  execution: string,
+  site: string,
+): Promise<number> {
   let claimed = 0;
-  for (const record of journal.effectsUnder(execution, site)) {
+  for (const record of await journal.effectsUnder(execution, site)) {
     if (record.kind === "human" && record.site === site) claimed += 1;
   }
   return claimed;
@@ -982,8 +1004,8 @@ export function releasePlacementWaits(execution: string): void {
     // resolves is a `serve` process holding one per abandoned branch.
     held.settle({ kind: "error", name: "DispatchSuperseded", message: ended });
     void openJournal()
-      .then((journal) => {
-        journal.supersedeDispatch(id, ended);
+      .then(async (journal) => {
+        await journal.supersedeDispatch(id, ended);
       })
       .catch(() => {
         // A journal this process cannot write is not a reason to fail a run that
@@ -1218,8 +1240,8 @@ export function mountWorkerRoutes(app: FastifyInstance): void {
 async function supersedeOrphans(): Promise<void> {
   try {
     const journal = await openJournal();
-    for (const row of journal.unsettledDispatches()) {
-      if (row.status === "dispatched") journal.supersedeDispatch(row.id, ORPHANED);
+    for (const row of await journal.unsettledDispatches()) {
+      if (row.status === "dispatched") await journal.supersedeDispatch(row.id, ORPHANED);
     }
   } catch (error) {
     // A journal this process cannot read is not a reason to refuse to serve:
@@ -1523,14 +1545,14 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
   if (!session.dispatchable) return undefined;
   if (holding(session.id)) return undefined;
   const journal = await openJournal();
-  for (const row of journal.unsettledDispatches()) {
+  for (const row of await journal.unsettledDispatches()) {
     if (row.status !== "parked") continue;
     if (!session.claims.includes(row.placement)) continue;
     // A row this process is not awaiting is one whose node is not running here
     // — a predecessor's, on an execution nothing has replayed yet. Left alone:
     // handing it out would dispatch work no node is waiting for the answer to.
     if (!awaiting.has(row.id)) continue;
-    const claimed = journal.claimDispatch(row.id, session.id);
+    const claimed = await journal.claimDispatch(row.id, session.id);
     if (claimed === undefined) continue;
     rows.set(claimed.id, claimed);
     const local = awaiting.get(claimed.id);
@@ -1544,7 +1566,7 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
     // the moment it is needed. A worker that had to default it would fail a
     // `scope: session` store with a diagnostic telling the operator to pass a
     // `--session` the run already passed.
-    const sessionKey = journal.execution(claimed.execution)?.sessionKey ?? "";
+    const sessionKey = (await journal.execution(claimed.execution))?.sessionKey ?? "";
     return {
       dispatch_id: claimed.id,
       execution_id: claimed.execution,
@@ -1558,7 +1580,9 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
       // What a redispatched node replays to the frontier before going live
       // (§3.2, §7.2). Read out of the journal at the moment it is handed over,
       // which is §5's first rule: nothing is held from an earlier session.
-      effect_history: journal.effectsUnder(claimed.execution, claimed.site).map(wireEffect),
+      effect_history: (await journal.effectsUnder(claimed.execution, claimed.site)).map(
+        wireEffect,
+      ),
     };
   }
   return undefined;
@@ -1581,8 +1605,8 @@ async function taken(session: Session): Promise<Record<string, unknown> | undefi
  */
 async function released(id: string, session: string): Promise<void> {
   const journal = await openJournal();
-  if (!journal.releaseDispatch(id, session)) return;
-  const parked = journal.dispatchOf(id);
+  if (!(await journal.releaseDispatch(id, session))) return;
+  const parked = await journal.dispatchOf(id);
   if (parked !== undefined) rows.set(id, parked);
   const local = awaiting.get(id);
   if (local !== undefined) {
@@ -1705,7 +1729,7 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
       .send({ error: "a batch names its `dispatch_id` and carries an `effects` array" });
   }
   const journal = await openJournal();
-  const row = journal.dispatchOf(id);
+  const row = await journal.dispatchOf(id);
   if (row === undefined) {
     return reply.code(409).send({ dispatch_id: id, error: `no dispatch \`${id}\`` });
   }
@@ -1725,7 +1749,7 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
     // **Workers SEND, the hub INSERTS** (§3.3), idempotently by effect key: a
     // record the journal already holds is accepted and dropped, which is what
     // makes a batch safe to re-send after a transport failure.
-    journal.append(record);
+    await journal.append(record);
     // …and the one field an insert cannot carry, because it is written *after*
     // the row: `refused` says the generation that produced this answer had its
     // own contract refuse it (`docs/durability.md` §5, `./journal.ts`'s
@@ -1733,7 +1757,7 @@ async function effects(request: FastifyRequest, reply: FastifyReply): Promise<un
     // on it, the insert above drops the duplicate, and this is what makes the
     // mark stick — without which the retry of §7.3 would read an unmarked record
     // and call the node's own mismatch a replay divergence.
-    if (record.refused) journal.refuse(record.execution, record.key);
+    if (record.refused) await journal.refuse(record.execution, record.key);
   }
   return reply.code(204).send();
 }
@@ -1847,7 +1871,7 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
     });
   }
   const journal = await openJournal();
-  const row = journal.dispatchOf(id);
+  const row = await journal.dispatchOf(id);
   // **`409`, not `410`.** §3.4: the hub knows this worker and does not want this
   // result — the execution has moved past it, and re-driving it from a stale
   // result is the divergence `docs/durability.md` §7 refuses.
@@ -1876,8 +1900,8 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
   // makes at-least-once dispatch safe on the return path too.
   if (row.status === "settled") return reply.code(204).send();
 
-  const outcome: JournalOutcome = settlementOf(journal, row, body);
-  journal.settleDispatch(id, outcome);
+  const outcome: JournalOutcome = await settlementOf(journal, row, body);
+  await journal.settleDispatch(id, outcome);
   rows.delete(id);
   const held = awaiting.get(id);
   if (held !== undefined) held.settle(outcome);
@@ -1917,11 +1941,11 @@ async function result(request: FastifyRequest, reply: FastifyReply): Promise<unk
  * remove. Which of the two the sender meant is not something a hub can decide,
  * so it decides neither and costs the attempt.
  */
-function settlementOf(
+async function settlementOf(
   journal: Journal,
   row: DispatchRow,
   body: Record<string, unknown>,
-): JournalOutcome {
+): Promise<JournalOutcome> {
   const paused = body["paused"];
   if (paused !== undefined && paused !== null) {
     const beside = ["output", "error"].filter(
@@ -1936,7 +1960,7 @@ function settlementOf(
           .join(" and ")} in the same body: a result carries at most one of \`output\`, \`error\` and \`paused\`, so a hub cannot tell whether this node answered or stopped at a question (docs/distributed.md §3.4)`,
       };
     }
-    const pause = pauseOf(journal, row, paused);
+    const pause = await pauseOf(journal, row, paused);
     return pause === undefined
       ? {
           kind: "error",
@@ -2124,7 +2148,7 @@ async function sweep(windowMs: number): Promise<void> {
     if (row.session === undefined || !stale.includes(row.session)) continue;
     if (row.status !== "dispatched") continue;
     const detail = `the session holding this dispatch made no request for ${windowMs}ms, so the hub gave up on it (docs/distributed.md §6.3)`;
-    journal.supersedeDispatch(id, detail);
+    await journal.supersedeDispatch(id, detail);
     rows.delete(id);
     const held = awaiting.get(id);
     if (held === undefined) continue;

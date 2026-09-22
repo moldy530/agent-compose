@@ -154,9 +154,10 @@ import {
   intendDelivery,
   interruptOf,
   journalExists,
-  journalPath,
+  journalLocation,
   journaledExecution,
   openExecutions,
+  releaseJournal,
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
@@ -188,6 +189,13 @@ class UsageError extends Error {
  */
 export async function runMain(argv: readonly string[]): Promise<void> {
   const code = await main(argv);
+  // **The journal is let go before the process ends**, which is the one thing a
+  // remote binding needs that a file does not: what it holds is a session-scoped
+  // writer guard on the server, and a connection torn down by an exiting process
+  // is a lock the server only drops when it notices. `serve` never comes back
+  // through here and holds the journal for as long as it serves, which is what
+  // the guard is for (`./journal.ts`, `docs/durability.md` §2).
+  await releaseJournal();
   await flush();
   process.exit(code);
 }
@@ -306,14 +314,14 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
 
   if (!journalExists()) {
     throw new UsageError(
-      `this project has never journaled an execution, so there is none to resume: \`${journalPath()}\` does not exist, and it is written by the \`run\` or \`serve\` that starts an execution`,
+      `this project has never journaled an execution, so there is none to resume: ${journalLocation()} does not exist, and it is written by the \`run\` or \`serve\` that starts an execution`,
     );
   }
   const row = await journaledExecution(execution);
   if (row === undefined) {
     const open = await openExecutions();
     throw new UsageError(
-      `\`${execution}\` is not an execution in \`${journalPath()}\`: ${
+      `\`${execution}\` is not an execution in ${journalLocation()}: ${
         open.length === 0
           ? "it holds none open"
           : `the executions it holds open are ${open.map((held) => `\`${held.id}\``).join(", ")}`
@@ -332,7 +340,7 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
   const flow = flows[row.flow];
   if (flow === undefined) {
     throw new UsageError(
-      `\`${execution}\` was running \`${row.flow}\`, which this build does not declare: it names ${Object.keys(flows).join(", ")}. Build the composition that started it, or delete \`${journalPath()}\``,
+      `\`${execution}\` was running \`${row.flow}\`, which this build does not declare: it names ${Object.keys(flows).join(", ")}. Build the composition that started it, or clear ${journalLocation()}`,
     );
   }
   requireSession(row.flow, flow, row.sessionKey);
@@ -984,7 +992,10 @@ async function ask(
       output.write(asked(wait));
       continue;
     }
-    const outcome = deliverHumanAnswer(execution, wait.id, payload);
+    // Awaited for the resume route's reason: `taken.` is printed once the
+    // journal holds the answer, never while the append is still in flight
+    // (`runtime.deliverHumanAnswer`).
+    const outcome = await deliverHumanAnswer(execution, wait.id, payload);
     if (outcome.ok) {
       output.write(`taken.\n`);
       return "settled";

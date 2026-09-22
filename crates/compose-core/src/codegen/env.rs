@@ -895,6 +895,25 @@ impl References {
             }
         }
 
+        // The journal's own connection, and it is the **hub's alone**: PRD
+        // resolved q42 makes the hub the single writer — "workers stream effect
+        // records home" — so a worker never opens this connection and must not
+        // be asked for the credential that would. It is the sharpest case
+        // §9.1's fifth clause covers, because the alternative reads plausible:
+        // a placed node's effects are journaled, so a reader could expect the
+        // worker to need the address. It does not; the batch goes over the
+        // wire and the hub writes the row (grammar 14.7, PRD resolved q62).
+        //
+        // Unconditional past this gate, like the trace sink and unlike
+        // `hub.join_token:`: every invocation of every flow is journaled with no
+        // key to turn it off (Decision D121), so a target that binds a remote
+        // provider opens that connection on every `run`, `serve` and `resume`.
+        if let Some(journal) = &ir.deploy.journal
+            && let Some(url) = &journal.url
+        {
+            references.record(&url.value.name, "deploy.journal.url");
+        }
+
         if let Some(triggers) = &ir.triggers {
             for (name, trigger) in &triggers.entries {
                 let TriggerKind::Http(http) = &trigger.kind else {
@@ -1635,6 +1654,82 @@ trace_sink:\n  url: \"https://collector.internal.example/v1/traces\"\n  auth:\n 
             references.sites("TRACE_SINK_SECRET"),
             ["deploy.trace_sink.auth.hmac.secret"]
         );
+    }
+
+    /// The journal's address is a variable the deployment needs, and it is the
+    /// **hub's alone** (grammar §14.7, PRD resolved q42, q62).
+    ///
+    /// The sharpest case §9.1's fifth clause covers, and the one where the
+    /// plausible misreading is a real one: a placed node's effects **are**
+    /// journaled, so a reader could expect the worker that ran it to need the
+    /// address the record goes to. It does not — resolved q42 makes the hub the
+    /// single writer, and a worker streams its effect records home over the wire
+    /// — so asking a worker for this variable would refuse a join over a
+    /// connection that machine never opens.
+    ///
+    /// The other half is the ordinary one: a hub missing it cannot journal at
+    /// all, and journaling is unconditional (Decision D121), so the launch check
+    /// has to name it.
+    #[test]
+    fn the_journals_address_is_the_hubs_and_no_workers() {
+        let (ir, partition) = partitioned(
+            "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai\n  api_key: ${VENDOR_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+agent.signer:\n  model: model.smart\n  prompt: Sign what you are given.\n  input: { path: { type: string } }\n  output: { verdict: { type: string } }\n\
+flow.release:\n  inputs:\n    path: { type: string }\n  outputs: {}\n  nodes:\n    sign:\n      agent: agent.signer\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: sign }\n    - { from: sign, to: end }\n",
+            "version: \"0.1\"\n\
+hub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.signer]\n\
+journal:\n  provider: postgres\n  url: ${JOURNAL_URL}\n",
+        );
+
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Hub),
+            ["JOURNAL_URL", "MESH_TOKEN"],
+            "the hub is the journal's single writer, so the address it writes to is its own"
+        );
+        assert_eq!(
+            manifest(&ir, &partition, &Process::Placement("mac".to_string())),
+            ["VENDOR_KEY"],
+            "a worker streams its effect records home and never opens the journal, so asking \
+             it for the address would be the false requirement §9.1 exists to prevent — and \
+             the one a reader is most likely to think is real, because a placed node's \
+             effects really are journaled"
+        );
+
+        let references = References::of(&ir);
+        assert_eq!(references.sites("JOURNAL_URL"), ["deploy.journal.url"]);
+    }
+
+    /// …and the journal every other target binds contributes nothing.
+    ///
+    /// A target that says nothing, or says `provider: sqlite`, opens a file
+    /// beside the project: there is no address, so there is no variable, and a
+    /// launch that demanded one would be refusing to start over a connection
+    /// this build never makes.
+    #[test]
+    fn a_file_journal_contributes_no_variable() {
+        for deploy in [
+            "version: \"0.1\"\nhub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.signer]\n",
+            "version: \"0.1\"\nhub:\n  join_token: ${MESH_TOKEN}\n\
+placements:\n  mac:\n    members: [agent.signer]\njournal:\n  provider: sqlite\n",
+        ] {
+            let (ir, partition) = partitioned(
+                "version: \"0.1\"\n\
+provider.vendor:\n  kind: openai\n  api_key: ${VENDOR_KEY}\n\
+model.smart:\n  provider: provider.vendor\n  id: some-model\n\
+agent.signer:\n  model: model.smart\n  prompt: Sign what you are given.\n  input: { path: { type: string } }\n  output: { verdict: { type: string } }\n\
+flow.release:\n  inputs:\n    path: { type: string }\n  outputs: {}\n  nodes:\n    sign:\n      agent: agent.signer\n      input:\n        path: \"input.path\"\n  edges:\n    - { from: start, to: sign }\n    - { from: sign, to: end }\n",
+                deploy,
+            );
+            assert_eq!(
+                manifest(&ir, &partition, &Process::Hub),
+                ["MESH_TOKEN"],
+                "a file journal has no address, so it contributes no variable to any manifest"
+            );
+        }
     }
 
     /// …and a sink that authenticates nothing contributes nothing.

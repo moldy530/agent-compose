@@ -201,6 +201,14 @@ pub fn dependencies(ir: &Ir) -> Vec<(String, String)> {
             );
         }
     }
+    // …and the journal driver, pinned where this target's `journal:` binds a
+    // provider that dials out (grammar §14.7, PRD resolved q62). One provider
+    // per target, so there is nothing to reconcile: the zero-infra build binds
+    // `sqlite`, whose driver `super::stores` already pins for every project, and
+    // adds nothing here at all.
+    for (package, version) in super::journal::pins_of(crate::ir::deploy::journal_of(ir)) {
+        harness.insert((*package).to_string(), (*version).to_string());
+    }
     let mut declared: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (address, module) in crate::check::modules::bindings(ir) {
@@ -252,11 +260,11 @@ pub fn package_json(ir: &Ir) -> super::GeneratedFile {
     ));
     contents.push_str("  \"scripts\": {\n    \"typecheck\": \"tsc --noEmit\"\n  },\n");
     contents.push_str(&dependency_block("dependencies", &dependencies(ir), true));
-    let development: Vec<(String, String)> = DEV_PINS
-        .iter()
-        .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
-        .collect();
-    contents.push_str(&dependency_block("devDependencies", &development, false));
+    contents.push_str(&dependency_block(
+        "devDependencies",
+        &development_dependencies(ir),
+        false,
+    ));
     contents.push_str("}\n");
 
     super::GeneratedFile {
@@ -277,6 +285,29 @@ fn dependency_block(key: &str, pins: &[(String, String)], trailing_comma: bool) 
     }
     text.push_str(if trailing_comma { "  },\n" } else { "  }\n" });
     text
+}
+
+/// Every package the generated `package.json` declares under
+/// `devDependencies`: [`DEV_PINS`], plus what this target's journal driver needs
+/// to type-check.
+///
+/// One entry has ever arrived from the second half and it is `@types/pg`: `pg`
+/// publishes no type declarations of its own, and an emitted module importing it
+/// under `strict` fails `tsc` on the import rather than on anything this
+/// compiler wrote. `mysql2` ships its own, so a MySQL journal adds nothing here.
+///
+/// It is a **development** dependency for the reason `typescript` is: nothing at
+/// run time reads a `.d.ts`, and a reader who installs with `--production` is
+/// installing a project that runs.
+#[must_use]
+pub fn development_dependencies(ir: &Ir) -> Vec<(String, String)> {
+    DEV_PINS
+        .iter()
+        .chain(super::journal::development_pins_of(
+            crate::ir::deploy::journal_of(ir),
+        ))
+        .map(|(package, version)| ((*package).to_string(), (*version).to_string()))
+        .collect()
 }
 
 /// `tsconfig.json`.
@@ -347,6 +378,7 @@ pub fn readme(ir: &Ir, partition: &super::env::Partition) -> super::GeneratedFil
     contents.push_str(&installer_layout_rows(ir));
     contents.push_str(README_BODY);
     contents.push_str(&private_registry(ir));
+    contents.push_str(&journal_home(ir));
     contents.push_str(&human_waits(ir, partition));
     contents.push_str(&store_data(ir));
     contents.push_str(&builtin_workspaces(ir));
@@ -1077,6 +1109,98 @@ its own instead of taking `fresh`.
 What it does **not** contain is a checkout: this project makes the directory and
 nothing else. A run that needs source control needs a step in the graph that
 puts it there.
+"#;
+
+/// Which journal this target bound, and where it lives (grammar §14.7, PRD
+/// resolved q62).
+///
+/// Emitted for **every** project, unlike the sections around it, and that is the
+/// point: durability is unconditional (Decision D121), so "where does this
+/// project's record survive a restart" always has an answer and a reader should
+/// not have to know what the default is to find it. What varies is which answer.
+///
+/// The address is the **variable's name**, never what it holds: `docs/trace.md`
+/// §11.1 keeps a resolved `${ENV}` out of every artifact this project writes,
+/// and a README is one of them.
+fn journal_home(ir: &Ir) -> String {
+    let provider = crate::ir::deploy::journal_of(ir);
+    let mut section = String::from(JOURNAL_HOME);
+    if provider.opens_in_process() {
+        section.push_str(JOURNAL_HOME_SQLITE);
+        return section;
+    }
+    let variable = ir
+        .deploy
+        .journal
+        .as_ref()
+        .and_then(|journal| journal.url.as_ref())
+        .map(|url| url.value.name.clone())
+        .unwrap_or_default();
+    let mut drivers = String::from("\n| package | version |\n|---|---|\n");
+    for (package, version) in super::journal::pins_of(provider)
+        .iter()
+        .chain(super::journal::development_pins_of(provider))
+    {
+        let _ = writeln!(drivers, "| `{package}` | `{version}` |");
+    }
+    let _ = write!(
+        section,
+        "This target binds a **`{}`** journal, at the address `${{{variable}}}` holds.\n\
+         The variable is named here and never its value: `{variable}` is read at\n\
+         process start, and `run`, `serve` and `resume` all fail before the graph is\n\
+         invoked when it is unset.\n\
+         \n\
+         The record lives on that server rather than in this directory, which is what\n\
+         lets a `serve` restarted on another machine recover every execution this one\n\
+         left open — and what makes retention a `DELETE` rather than removing a file.\n\
+         This project therefore pins the driver its journal is reached through, in\n\
+         `package.json` beside every other pin; a target that binds the default\n\
+         journal pins none of these:\n\
+         {}\n\
+         **One process at a time writes this journal**, and the server holds a\n\
+         session-scoped lock saying which. A second process that opens it is refused\n\
+         by name rather than left to interleave; the lock goes with the connection, so\n\
+         a process killed on a machine that is still running is never what is holding\n\
+         it. A host that vanished outright — a crash, a power loss, a partition — holds\n\
+         it until its server notices, which this project bounds to about five minutes\n\
+         by shortening the window that server reaps a silent session in. That bound is\n\
+         what keeps a `serve` started on a fresh machine from being locked out of the\n\
+         record it exists to resume.\n\
+         \n\
+         Because the journal holds what a trace deliberately does not — completions,\n\
+         tool results, a person's answer — it is private recovery data with the same\n\
+         sensitivity as this project's stores. Binding it into a shared database is\n\
+         this deploy file's explicit choice about where those payloads live.\n",
+        provider.as_str(),
+        drivers,
+    );
+    section
+}
+
+/// The heading both arms of [`journal_home`] open with.
+const JOURNAL_HOME: &str = r#"
+## Where this project's journal lives
+
+Every invocation of every flow is **journaled** — every model answer, every tool
+result, every store op, every answer a person gave a `human:` node — and a
+resumed execution consumes that record rather than re-issuing it, up to the
+frontier. Nothing turns it on and nothing turns it off. What the deploy layer
+chooses is only where the record goes.
+
+"#;
+
+/// …and the paragraph a target that bound the default gets.
+const JOURNAL_HOME_SQLITE: &str = r#"This target binds the default: one **SQLite** file beside this project's stores,
+at `.agent-compose/journal.sqlite`, moved as a whole by `AGENT_COMPOSE_DATA_DIR`
+and deleted by deleting it. It costs no configuration and no dependency this
+project did not already have. A target that needs the record to outlive this
+machine binds `journal: { provider: postgres | mysql, url: ${SOME_VAR} }` in its
+deploy file instead.
+
+Because the journal holds what a trace deliberately does not — completions, tool
+results, a person's answer — it is private recovery data with the same
+sensitivity as this project's stores. Nothing uploads it and no command prints
+it.
 "#;
 
 /// The section a composition declaring a `store.*` gets.
@@ -2161,6 +2285,63 @@ package_registry:
                 "the README does not document `{package}`"
             );
         }
+    }
+
+    /// **Every project is told where its journal lives, and which one it is**
+    /// (grammar §14.7, PRD resolved q62).
+    ///
+    /// Emitted unconditionally, unlike the sections around it, because
+    /// durability is unconditional (Decision D121): "where does this project's
+    /// record survive a restart" always has an answer, and a reader should not
+    /// have to know what the default is to find it.
+    ///
+    /// The half that is easy to get wrong is the address. A remote journal's is
+    /// a credential, and `docs/trace.md` §11.1 keeps a resolved `${ENV}` out of
+    /// every artifact this project writes — a README included — so what a reader
+    /// meets is the variable's **name**. A README that printed the value would
+    /// put a database password in a file every worker unpacks.
+    #[test]
+    fn every_project_is_told_which_journal_its_target_bound() {
+        let local = readme_of(&ir_of("version: \"0.1\"\n")).contents;
+        assert!(
+            local.contains("## Where this project's journal lives"),
+            "a project is not told where its journal is: {local}"
+        );
+        assert!(
+            local.contains(".agent-compose/journal.sqlite"),
+            "a target that bound the default is not told it is a file beside the project"
+        );
+        for package in ["`pg`", "`mysql2`", "`@types/pg`"] {
+            assert!(
+                !local.contains(package),
+                "the zero-infra build's README names {package}, which its `package.json` does \
+                 not pin and its `src/journal.ts` does not import"
+            );
+        }
+
+        let remote = readme_of(&crate::codegen::test_support::ir_of_mesh(
+            "version: \"0.1\"\n",
+            "version: \"0.1\"\njournal:\n  provider: postgres\n  url: ${JOURNAL_URL}\n",
+        ))
+        .contents;
+        assert!(
+            remote.contains("binds a **`postgres`** journal"),
+            "a target that bound a remote journal is not told which: {remote}"
+        );
+        assert!(
+            remote.contains("`${JOURNAL_URL}`") && remote.contains("| `pg` | "),
+            "the README names neither the variable holding the address nor the driver the \
+             manifest pins for it: {remote}"
+        );
+        assert!(
+            !remote.contains(".agent-compose/journal.sqlite"),
+            "a target that dials a server is told its record is in a file beside the project"
+        );
+        assert!(
+            remote.contains("One process at a time writes this journal"),
+            "the README does not state the one-writer rule the guard is under \
+             (`docs/durability.md` §2)"
+        );
     }
 
     /// A composition with no grammar 6.1 binding gets no host-function section,

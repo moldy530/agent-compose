@@ -635,6 +635,25 @@ pub enum DiagnosticCode {
     /// key is required is decided by a **sibling entry's** contents, and the
     /// repair is a choice of two.
     MissingRegistryToken,
+
+    // --- journal (grammar 14.7) -------------------------------------------
+    /// A `journal:` block binds a provider that **dials out** — `postgres`,
+    /// `mysql` — and declares no `url:` (grammar 14.7, PRD resolved q62,
+    /// Decision D148). Its own class rather than a
+    /// [`MissingKey`](Self::MissingKey), for the reason
+    /// [`MissingJoinToken`](Self::MissingJoinToken) is: whether the key is
+    /// required is decided by a **sibling value** — the `provider:` on the line
+    /// above — and the repair is a choice of two.
+    MissingJournalUrl,
+    /// A `journal:` block declares a key the provider it binds does not take:
+    /// `url:` under `provider: sqlite`, which opens a file beside the project
+    /// and dials nothing (grammar 14.7, PRD resolved q62, Decision D148). Its
+    /// own class rather than an [`UnknownKey`](Self::UnknownKey), for the reason
+    /// [`UnsupportedServerTools`](Self::UnsupportedServerTools) is one: the key
+    /// is the construct's own and is legal one line up, so "the construct does
+    /// not define it" would be false about the block in front of the reader —
+    /// what is refused is the pair.
+    UnsupportedJournalKey,
 }
 
 impl DiagnosticCode {
@@ -727,6 +746,8 @@ impl DiagnosticCode {
         Self::ProcessLocalStore,
         Self::ConflictingRegistryCredential,
         Self::MissingRegistryToken,
+        Self::MissingJournalUrl,
+        Self::UnsupportedJournalKey,
     ];
 
     /// The stable kebab-case spelling of this code.
@@ -813,6 +834,8 @@ impl DiagnosticCode {
             Self::ProcessLocalStore => "process-local-store",
             Self::ConflictingRegistryCredential => "conflicting-registry-credential",
             Self::MissingRegistryToken => "missing-registry-token",
+            Self::MissingJournalUrl => "missing-journal-url",
+            Self::UnsupportedJournalKey => "unsupported-journal-key",
         }
     }
 }
@@ -1045,7 +1068,7 @@ mod tests {
         }
         assert_eq!(
             DiagnosticCode::ALL.len(),
-            DiagnosticCode::MissingRegistryToken as usize + 1,
+            DiagnosticCode::UnsupportedJournalKey as usize + 1,
             "`DiagnosticCode::ALL` stops short of the last declared variant"
         );
     }

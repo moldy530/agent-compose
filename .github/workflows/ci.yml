@@ -22,6 +22,53 @@ concurrency:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # The two servers the journal conformance suite drives its remote providers
+    # against (PRD resolved q62, `docs/durability.md` §10). `journal:` binds one
+    # of three backends behind one interface, and the two that dial out fail in
+    # ways only a real server has: a collation that folds case, a `TEXT` column
+    # too small for a harness payload, an `AUTO_INCREMENT` that needs a key, an
+    # advisory lock that is or is not released when a connection dies. None of
+    # that is visible to a type-check or to a mock, so "CI green" means "actually
+    # done" for these backends only if the suite has talked to them (CLAUDE.md's
+    # Validation strategy).
+    #
+    # Images are the official ones at their current stable majors, pinned by
+    # major rather than by digest because these are a test fixture rather than
+    # something this repository ships — and health-checked, because a service
+    # container is started in parallel with the job and a suite that raced it
+    # would fail on a connection refused rather than on anything it checks.
+    #
+    # `AGENT_COMPOSE_TEST_POSTGRES_URL` and `AGENT_COMPOSE_TEST_MYSQL_URL` are
+    # what the suite reads. Absent — which is every developer machine — each
+    # remote arm is **skipped loudly**, naming the variable, and the SQLite arm
+    # runs anyway; set, the arm runs for real. Nothing here is a credential worth
+    # protecting: the servers live and die with the job.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: agent_compose
+          POSTGRES_PASSWORD: agent_compose
+          POSTGRES_DB: agent_compose_journal
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_compose -d agent_compose_journal"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: agent_compose
+          MYSQL_DATABASE: agent_compose_journal
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pagent_compose"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       # The three non-`actions/*` actions this repository uses — the two here
@@ -107,4 +154,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
+        # The two journal URLs are the whole of what the service containers above
+        # are for: `journal_backend_conformance` drives the same contract cases
+        # against SQLite always and against each remote provider whose variable
+        # is set, so setting them here is what turns two skips into two runs
+        # (`docs/durability.md` §10).
+        env:
+          AGENT_COMPOSE_TEST_POSTGRES_URL: postgres://agent_compose:agent_compose@127.0.0.1:5432/agent_compose_journal
+          AGENT_COMPOSE_TEST_MYSQL_URL: mysql://root:agent_compose@127.0.0.1:3306/agent_compose_journal
         run: cargo test --workspace

@@ -823,6 +823,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
             hub: None,
             placements: None,
             storage_backends: None,
+            journal: None,
             package_registry: None,
             trace_sink: None,
             event_sources: None,
@@ -886,6 +887,19 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         Some(ir::deploy::StorageBackends {
             defaults,
             aliases,
+            span: section.span.clone(),
+        })
+    })?;
+
+    // A target that declares nothing binds `JournalProvider::DEFAULT`, and that
+    // reading is `ir::deploy::journal_of`'s rather than this pass's: a default
+    // applied here would make a target that wrote nothing indistinguishable in
+    // the artifact from one that wrote `provider: sqlite`, which is a difference
+    // a plan document reports (grammar 14.7, PRD resolved q62).
+    let journal = optional(file.file.journal.as_ref(), |section| {
+        Some(ir::deploy::Journal {
+            provider: section.provider.as_ref()?.value,
+            url: section.url.clone(),
             span: section.span.clone(),
         })
     })?;
@@ -957,6 +971,7 @@ fn deploy(source: &Composition) -> Option<ir::Deploy> {
         hub,
         placements,
         storage_backends,
+        journal,
         package_registry,
         trace_sink,
         event_sources,

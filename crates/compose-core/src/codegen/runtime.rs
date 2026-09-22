@@ -290,27 +290,94 @@ mod tests {
     /// settlement, where a local pause's is (`docs/durability.md` §3.4).
     ///
     /// [`runHuman`]'s `slot.keep` runs before its promise resolves, and the
-    /// reason is stated at length there: the resume route answers `202` off the
-    /// settlement, so a record written in a later turn of the event loop is one
-    /// a process killed in between never wrote — leaving a wait this board has
-    /// settled with nothing in the journal, which the next start re-derives off
-    /// the settled dispatch row and asks a second time. The hub's writer is
-    /// handed in as `keep` for exactly that ordering, and a write that throws
-    /// fails the node rather than hanging it.
+    /// reason is stated at length there: a run that went on out of a wait its
+    /// own journal does not hold is a run whose resume would ask the person
+    /// again. The hub's writer is handed in as `keep` for exactly that
+    /// ordering, and a write that throws fails the node rather than hanging it.
+    ///
+    /// The write **answers a promise** since the journal became a deploy-target
+    /// slot with backends that dial out (PRD resolved q62), so the ordering is
+    /// now a *chain* rather than two statements: what this reads is that the
+    /// resolve is inside the write's own continuation, which is the same claim
+    /// one turn of the event loop along. A second `resolve(settled)` anywhere
+    /// would be a path out of the wait that does not go through the journal,
+    /// which is the failure either shape has.
+    ///
+    /// **And the chain is kept on the board's entry rather than dropped**,
+    /// which is the half the ordering above cannot supply: the surface that
+    /// delivered the answer waits on `Held.kept` before it reports success, so
+    /// the resume route's `202` is a statement about a row rather than about
+    /// this process's memory. A `void` here would put the write back a turn of
+    /// the loop *after* the acknowledgment, which is where it was before this
+    /// slot existed.
     #[test]
     fn a_remote_pauses_answer_is_journaled_before_its_promise_resolves() {
         let held = function_body("export async function holdRemotePause(");
-        let kept = held
-            .find("keep(settled);")
-            .expect("`holdRemotePause` writes the record through the caller's `keep`");
+        let kept = held.find("mine.kept = keep(settled).then(").expect(
+            "`holdRemotePause` writes the record through the caller's `keep`, and keeps \
+                     the write on the board's entry for the delivering surface to wait on",
+        );
         let resolved = held
-            .find("resolve(settled);")
+            .find("() => resolve(settled),")
             .expect("`holdRemotePause` resolves with the record it wrote");
         assert!(
             kept < resolved,
             "the record is written after the promise resolves, so the `202` the resume route \
              answers can precede the write it acknowledges: {held}"
         );
+        assert_eq!(
+            held.matches("resolve(settled)").count(),
+            1,
+            "a second `resolve(settled)` is a path out of this wait that does not go through \
+             the journal: {held}"
+        );
+    }
+
+    /// **An answer is acknowledged no sooner than it is recorded**
+    /// (`docs/durability.md` §3.4).
+    ///
+    /// The other half of the sibling above, and the half that only became a
+    /// question when the journal's verbs started answering promises (PRD
+    /// resolved q62). `settle` is synchronous — its caller reads the `boolean`
+    /// it answers to decide whether this call was the one that settled the wait
+    /// — while the append beneath it is a network round trip on a `postgres` or
+    /// `mysql` journal. So both settlements hand their write to `Held.kept`, and
+    /// [`deliverHumanAnswer`] awaits it before it answers `{ok: true}`: the
+    /// resume route replies `202`, and `agent-compose run` prints `taken.`, with
+    /// the row already down.
+    ///
+    /// Without it a hub killed inside that gap is recovered on a fresh machine,
+    /// finds no `human` record at the wait's key, re-parks the wait and puts to
+    /// the person the question they were just told was answered. Read off the
+    /// source because it is an *ordering* between two files — no type says a
+    /// caller awaited anything.
+    #[test]
+    fn a_delivered_answer_waits_for_the_record_that_holds_it() {
+        let deliver = function_body("export async function deliverHumanAnswer(");
+        assert!(
+            deliver.contains("await chosen.kept;"),
+            "`deliverHumanAnswer` answers without waiting for the settlement's journal write, so \
+             the resume route's `202` and the terminal's `taken.` claim a record that may never \
+             have landed (`docs/durability.md` §3.4): {deliver}"
+        );
+        let settled = function_body("export async function runHuman(");
+        assert_eq!(
+            settled.matches("mine.kept = kept(slot, {").count(),
+            2,
+            "`runHuman` no longer keeps both settlements' writes on the board's entry, so a \
+             delivery has nothing to wait on and the answer is acknowledged before it is \
+             recorded: {settled}"
+        );
+        for (source, name) in [
+            (include_str!("js/serve.ts"), "serve.ts"),
+            (include_str!("js/cli.ts"), "cli.ts"),
+        ] {
+            assert!(
+                source.contains("await deliverHumanAnswer("),
+                "`{name}` reports an answer taken without awaiting the delivery, so the write it \
+                 acknowledges is still in flight"
+            );
+        }
     }
 
     /// A `builtin.bash` command's stop sweep is armed **before** the shell is

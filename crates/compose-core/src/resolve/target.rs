@@ -48,17 +48,42 @@ pub(crate) fn check(composition: &Composition, index: &Index<'_>, diagnostics: &
         return;
     };
 
-    if local && let Some(section) = deploy.file.storage_backends.as_ref() {
-        diagnostics.push(
-            Diagnostic::error(
-                DiagnosticCode::MisplacedSection,
-                section.span.clone(),
-                format!("`{}` may not declare `storage_backends:`", deploy.name),
-            )
-            .with_help(
+    if local {
+        // The two sections `local` overrides **unconditionally**, so a block
+        // could only be a key whose author expected a substitution that never
+        // happens — the inert key D61 and D50 refuse, reported rather than
+        // silently ignored (grammar 14, Decision D87, extended verbatim to
+        // `journal:` by PRD resolved q62 / Decision D148).
+        for (section, key, help) in [
+            (
+                deploy
+                    .file
+                    .storage_backends
+                    .as_ref()
+                    .map(|section| section.span.clone()),
+                "storage_backends",
                 "`local` substitutes local storage for every store unconditionally, so no alias and no per-kind default is ever consulted there: the block could only be a key whose author expected a substitution that never happens (grammar 14, Decision D87)",
             ),
-        );
+            (
+                deploy
+                    .file
+                    .journal
+                    .as_ref()
+                    .map(|section| section.span.clone()),
+                "journal",
+                "`local` binds the SQLite journal file beside the project unconditionally, so no `provider:` written here is ever consulted: the block could only be a key whose author expected a substitution that never happens, and a journal on a server is a `--target` of its own (grammar 14.7, Decisions D87, D148)",
+            ),
+        ] {
+            let Some(span) = section else { continue };
+            diagnostics.push(
+                Diagnostic::error(
+                    DiagnosticCode::MisplacedSection,
+                    span,
+                    format!("`{}` may not declare `{key}:`", deploy.name),
+                )
+                .with_help(help),
+            );
+        }
     }
 
     if let Some(section) = deploy.file.placements.as_ref() {
@@ -250,11 +275,12 @@ mod tests {
     use crate::ast::DEPLOY_SECTIONS;
     use crate::prose::enumeration;
 
-    /// The only deploy section `local` refuses, which is what [`super::check`]
-    /// reports: `local` substitutes local storage for every store
-    /// unconditionally, so the block could only be an inert key whose author
-    /// expected a substitution that never happens (grammar 14, Decision D87).
-    const REFUSED_UNDER_LOCAL: &[&str] = &["storage_backends"];
+    /// The deploy sections `local` refuses, which is what [`super::check`]
+    /// reports: `local` substitutes local storage for every store and binds the
+    /// SQLite journal file beside the project, both unconditionally, so either
+    /// block could only be an inert key whose author expected a substitution
+    /// that never happens (grammar 14, Decisions D87, D148).
+    const REFUSED_UNDER_LOCAL: &[&str] = &["storage_backends", "journal"];
 
     /// `version:` belongs to both document kinds (grammar 1.5), so it is never
     /// what a "what `deploy/local.yml` may declare" sentence is enumerating.

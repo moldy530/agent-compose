@@ -180,6 +180,107 @@ pub struct PackageRegistryScope {
     pub span: Span,
 }
 
+/// The `journal:` section (grammar 14.7, PRD resolved q62).
+///
+/// **One journal per target**, which is what makes this a single backend config
+/// rather than `storage_backends:`' aliases-and-defaults shape: a store is a
+/// slot a composition names and a journal is not named anywhere at all — the
+/// composition says nothing (PRD resolved q27), so there is one of these and no
+/// key selects between two.
+///
+/// The block is OPTIONAL and its absence is [`JournalProvider::DEFAULT`] stated
+/// rather than implied: a target that declares nothing gets a SQLite file beside
+/// the project, which is "durable by default, zero configuration" everywhere and
+/// not only on a laptop (PRD resolved q27, q62).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JournalSection {
+    /// `provider:` — required. Which of the three backends binds.
+    pub provider: Option<Spanned<JournalProvider>>,
+    /// `url:` — the connection this journal dials, as an `${ENV}` reference and
+    /// never a literal (grammar 4.3, PRD resolved q32). Required by a provider
+    /// that dials out, refused by the one that does not.
+    pub url: Option<Spanned<EnvRef>>,
+    /// Whether `url:` was **written**, whatever became of it.
+    ///
+    /// [`Self::url`] is `None` both for a key nobody wrote and for one the
+    /// env-ref rule refused, and the requiredness rule has to tell those apart,
+    /// for the reason [`HubSection::declares_join_token`] does: an author who
+    /// wrote a literal has already been told what is wrong with it, and adding
+    /// "this provider dials out and declares no `url:`" would be a second
+    /// diagnostic for one mistake.
+    pub declares_url: bool,
+    /// The section's own span.
+    pub span: Span,
+}
+
+/// The journal backends a target binds (grammar 14.7, PRD resolved q62).
+///
+/// One interface, three implementations: the record vocabulary, the keys, the
+/// frontier and the recovery verbs of [`docs/durability.md`] do not move, and a
+/// runtime cannot tell which it got (PRD resolved q27).
+///
+/// [`docs/durability.md`]: https://docs.rs/ "docs/durability.md"
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalProvider {
+    /// `sqlite` — one file beside the project's stores, opened in this process.
+    Sqlite,
+    /// `postgres` — a Postgres server, dialled with the `pg` driver.
+    Postgres,
+    /// `mysql` — a MySQL server, dialled with the `mysql2` driver.
+    Mysql,
+}
+
+impl JournalProvider {
+    /// Every provider, in the order grammar 14.7 lists them.
+    pub const ALL: &'static [Self] = &[Self::Sqlite, Self::Postgres, Self::Mysql];
+
+    /// What a target binds when it declares no `journal:` block at all.
+    ///
+    /// SQLite, everywhere — not as a local-only concession but as the default a
+    /// named target keeps until it says otherwise, which is what makes "durable
+    /// by default, zero configuration" true of every target (PRD resolved q27,
+    /// q62).
+    pub const DEFAULT: Self = Self::Sqlite;
+
+    /// The keyword that names this provider.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+            Self::Mysql => "mysql",
+        }
+    }
+
+    /// Whether the process reaching this journal **opens it itself**, rather
+    /// than dialling a service that holds it.
+    ///
+    /// The journal's analogue of [`BackendProvider::opens_in_process`], stated
+    /// on the vocabulary that names the providers for the same reason: it is a
+    /// property of the backend rather than of a target. Unlike the store rule it
+    /// keys no placement check — **only the hub ever writes the journal** (PRD
+    /// resolved q42), so there is no second process to fork a file between — and
+    /// what it decides instead is whether the block needs a `url:` at all
+    /// (PRD resolved q45, q62, Decision D131).
+    #[must_use]
+    pub const fn opens_in_process(self) -> bool {
+        match self {
+            Self::Sqlite => true,
+            Self::Postgres | Self::Mysql => false,
+        }
+    }
+
+    /// The providers that dial out, in declaration order — the ones a `url:`
+    /// belongs to.
+    pub fn networked() -> impl Iterator<Item = Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|provider| !provider.opens_in_process())
+    }
+}
+
 /// The `storage_backends:` section (grammar 14.3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StorageBackendsSection {

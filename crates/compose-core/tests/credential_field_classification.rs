@@ -227,6 +227,62 @@ fn validate_enforces_the_package_registry_credentials_class() {
     }
 }
 
+/// …and so is the `journal:` block's address, which is the one deploy-layer
+/// credential whose field name was already in the table for **other** sections.
+///
+/// `url` was class 1 in `provider.*`, `storage_backends.*` and `event_sources.*`
+/// — and class **3** at the deploy layer's three other URL keys, which are
+/// addresses a deployment writes out and this compiler shape-checks
+/// (`hub.public_url:`, `trace_sink.url:`, `package_registry`'s). So a reader
+/// asking "may `journal.url:` be a literal?" meets a name that is classified
+/// both ways one section apart, and §4.3's totality rule (D92) makes the
+/// unnamed answer the wrong one: class 3 is the default, and class 3 here is a
+/// connection string — a **password** — written into the spec text and into
+/// every artifact built from it. The row has to name §14.7 for the answer to be
+/// findable rather than inferable (PRD resolved q62).
+#[test]
+fn the_journal_address_is_tabulated_as_class_one() {
+    let grammar =
+        fs::read_to_string(repository().join("docs/grammar.md")).expect("the grammar is readable");
+    let table = class_one_table(&grammar);
+    let row = table
+        .lines()
+        .find(|line| line.contains("§14.7"))
+        .expect("grammar 4.3's class-1 table carries the journal row");
+    assert!(
+        row.contains("`url`"),
+        "grammar 4.3's §14.7 row does not name `url`: {row}"
+    );
+}
+
+/// …and the class the table names is the class `validate` enforces, on both
+/// providers that take an address.
+#[test]
+fn validate_enforces_the_journal_addresss_class() {
+    for provider in ["postgres", "mysql"] {
+        let block = format!("version: \"0.1\"\njournal:\n  provider: {provider}\n");
+        let literal =
+            format!("{block}  url: \"{provider}://compose:hunter2@db.example/journal\"\n");
+        assert_eq!(
+            parse_str(&literal, "deploy/staging.yml")
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["invalid-env-ref"],
+            "a literal `journal.url:` must be refused as class 1 requires, on `{provider}`"
+        );
+        let reference = format!("{block}  url: ${{JOURNAL_URL}}\n");
+        assert!(
+            parse_str(&reference, "deploy/staging.yml")
+                .diagnostics
+                .is_empty(),
+            "the value form is the form class 1 asks for and it must be accepted for \
+             `journal.url:` on `{provider}`"
+        );
+    }
+}
+
 /// The other end of the bind: the class the table names is the class `validate`
 /// enforces.
 ///

@@ -39,6 +39,19 @@ storage_backends:
       url: ${CHROMA_URL}
       index: project-docs
 
+# Where this target's execution journal lives (grammar 14.7, PRD resolved q62).
+# The composition says nothing about durability — every invocation of every flow
+# is journaled, with no key to turn it on or off — and this block says only where
+# the record goes. `local` keeps the SQLite file beside the project; staging is
+# several processes on several machines, so it binds Postgres: the hub's record
+# then survives the hub's disk, and a `serve` restarted elsewhere recovers every
+# open execution. The address is an `${ENV}` reference like every other
+# credential, and it belongs to the hub's environment and to no worker's — the
+# hub is the single writer, and workers stream their effect records home to it.
+journal:
+  provider: postgres
+  url: ${JOURNAL_URL}
+
 # Where the installer of a built project resolves packages from (grammar 14.6,
 # PRD resolved q59). This network mandates an internal mirror, so `build` writes
 # a `bunfig.toml` and an `.npmrc` into the artifact — which is what makes the
