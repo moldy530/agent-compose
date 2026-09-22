@@ -91,10 +91,11 @@ import type { Connection, ResultSetHeader, RowDataPacket } from "mysql2/promise"
  * **The residual bounds are the row rather than the index**, and they are
  * stated because they are still bounds: `key` holds 2048 characters and
  * `scope_key` 2048 encoded ASCII ones (`session/` plus 2040 ASCII characters of
- * session key, or 226 CJK ones — `encodeKey` spends nine on each). The local arm's SQLite `TEXT` has no bound
- * and the Postgres arm's is its own — a btree tuple of about 2704 bytes across
- * the whole primary key — so this is the arm to check first when a very long
- * key has to travel. Past the bounds is an **error** rather than a truncation,
+ * session key, or 226 CJK ones — `encodeKey` spends nine on each), which is the
+ * bound `docs/topics/stores.md` states for an operator in the same two halves.
+ * The local arm's SQLite `TEXT` has no bound and the Postgres arm's is its own
+ * — a btree tuple of about 2704 bytes across the whole primary key — so this is
+ * the arm to check first when a very long key has to travel. Past the bounds is an **error** rather than a truncation,
  * because [`openMysqlStore`] sets `STRICT_TRANS_TABLES` — and a truncated key
  * is two keys becoming one row, which is the same wrong answer the collation is
  * about.

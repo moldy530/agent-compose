@@ -483,6 +483,61 @@ const answer = {};
     (await get(store, "k", run)).value?.attempt === "third";
 }
 
+{
+  // The same key delivered **at once over two connections**, which is the half
+  // the block above cannot reach and the half that tells the two possible
+  // implementations apart.
+  //
+  // Those two attempts run through one binding, so `#serial` puts them on one
+  // queue on one socket and the first has committed before the second looks: a
+  // dedupe that *read* the ledger and then wrote it would answer them exactly as
+  // the real one does. Resolved q63 moved the dedupe from the caller to the
+  // backend — "a repeated write carrying the key the first attempt carried
+  // applies once, stated and tested rather than assumed of the caller" — and
+  // what the server is doing that a read-then-write is not only shows when the
+  // two attempts are two transactions in flight together: the claim is an
+  // `INSERT` on the ledger's primary key whose conflict clause changes no row,
+  // so exactly one of them can be the one that applied. Two readers of an empty
+  // ledger would both apply.
+  //
+  // Redelivery really does arrive this way. Grammar 9.4's key is
+  // `<execution id>/<instance path>` (PRD 5.8), so a retried delivery and the
+  // attempt it is retrying are one key issued by two processes — and grammar
+  // 14.1 rule 5 admits a dialled store from a placement precisely so that those
+  // processes can be more than one.
+  //
+  // On the local backend the two bindings are one store by design (a local
+  // provider names no `url:`), and the case still says what it says about the
+  // ledger: `transact`'s body is synchronous, so the second attempt cannot begin
+  // inside the first.
+  const mine = kv("dedupe_race", "global", URL_ENV);
+  const theirs = kv("dedupe_race", "global", OTHER_URL_ENV);
+  const id = execution("dedupe_race");
+  const key = `${id}/write/0`;
+  // A context each, because the answers have to be told apart: `set` derives its
+  // row from the key alone, so what says which attempt applied is the `deduped`
+  // its own trace record carries.
+  const mineRun = ctx(id);
+  const theirsRun = ctx(id);
+  await Promise.all([
+    set(mine, "k", { attempt: "mine" }, mineRun, key),
+    set(theirs, "k", { attempt: "theirs" }, theirsRun, key),
+  ]);
+  const deduped = [mineRun, theirsRun].map(
+    (run) => run.storeRecords.find((record) => record.idempotencyKey === key)?.deduped,
+  );
+  answer.a_concurrent_double_delivery_is_deduped_by_the_backend = same([...deduped].sort(), [
+    false,
+    true,
+  ]);
+  // …and one value landed: the deduplicated attempt's effect is rolled back with
+  // the claim it lost, so what is stored is the applying attempt's value and not
+  // whichever write happened to run second.
+  const applied = deduped[0] === false ? "mine" : "theirs";
+  answer.a_concurrent_double_delivery_leaves_the_applied_value =
+    (await get(mine, "k", ctx(id))).value?.attempt === applied;
+}
+
 // --- Two writers, one store, last write wins ---------------------------------
 
 {

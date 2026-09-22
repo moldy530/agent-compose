@@ -1919,7 +1919,14 @@ import { Client } from "pg";
  *
  * Two keys, and the second differs from the journal's (`WRITER_GUARD_KEYS`) so
  * that a project whose journal and stores share one database does not have its
- * store openers queue behind the journal's writer.
+ * store openers queue behind the journal's writer. Advisory locks share one
+ * namespace per database, and the wait above is the blocking one, so a pair that
+ * coincided would be an open that never returns — no SQLSTATE, no timeout and no
+ * message. The two constants are in two files, so
+ * `the_store_schema_lock_is_not_the_journals_writer_guard` (`codegen::stores`)
+ * is what compares them; nothing else in the workspace does, and no conformance
+ * case can, since reproducing it needs a Postgres journal and a Postgres store
+ * open against one server at once.
  */
 const POSTGRES_STORE_SCHEMA_LOCK: readonly [number, number] = [0x6167_656e, 0x742d_7374];
 

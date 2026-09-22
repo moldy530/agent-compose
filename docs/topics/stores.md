@@ -142,8 +142,14 @@ reaches it first, and several processes of one placement doing that at the same
 moment is the ordinary start-up rather than a race to lose. The one place a
 server shows through is how long a key may be: a `kv` key and a session key are
 whatever the composition and the trigger supplied, and a `mysql` store holds
-2048 characters of each while a `postgres` one holds about 2704 bytes across the
-store name, the partition and the key together. A `sqlite` store bounds neither.
+2048 characters of a `kv` key. A session key is bounded more tightly than that
+number suggests, because it is not stored as it arrived: the partition a
+`scope: session` store writes is `session/` followed by the session key
+**percent-encoded**, one `%XX` escape per byte outside `[A-Za-z0-9_-]` — so the
+same 2048 characters are 2040 of an ASCII session key but only 226 of a CJK one,
+each of whose characters is three bytes and therefore nine encoded characters. A
+`postgres` store holds about 2704 bytes across the store name, the partition —
+encoded the same way — and the key together. A `sqlite` store bounds neither.
 A `mysql` store also has a version floor — **MySQL 8.0.19 or newer**, the release
 whose upsert spelling and key collation it is written for — and a server below it
 is refused when the store is opened, naming the version that server reported

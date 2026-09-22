@@ -367,6 +367,100 @@ mod tests {
         );
     }
 
+    /// **The store's schema lock and the journal's writer guard are two
+    /// different locks** (PRD resolved q63).
+    ///
+    /// The store arm takes `pg_advisory_xact_lock` — the **blocking** form —
+    /// around its DDL, and the journal takes `pg_try_advisory_lock` on a
+    /// *session* scope and holds it for as long as a `serve` lives. Postgres
+    /// advisory locks share one namespace per database, so if the two key pairs
+    /// ever coincided, a store opened against a database a `serve` is journaling
+    /// into would block on that `serve`'s guard **forever**: no SQLSTATE, no
+    /// timeout, no message — every store op of the deployment simply stops. And
+    /// that deployment is the shipped example, not a hypothetical:
+    /// `examples/triage-fanout/deploy/staging.yml` binds its store to the same
+    /// server its `journal:` names.
+    ///
+    /// The two constants live in two files in two modules, so nothing but this
+    /// compares them — which is why the distinctness is checked here rather than
+    /// left to the doc comment in `stores-postgres.ts` that states it. It cannot
+    /// be a conformance case either: reproducing it needs a Postgres journal and
+    /// a Postgres store open against one server at once, which is a deployment
+    /// CI's suites never stand up.
+    #[test]
+    fn the_store_schema_lock_is_not_the_journals_writer_guard() {
+        /// The two `int4` words a `readonly [number, number]` constant holds.
+        ///
+        /// Read out of the source rather than mirrored in Rust, because a copy
+        /// here would be the drift this test is about.
+        fn advisory_pair(module: &str, file: &str, name: &str) -> (u32, u32) {
+            let needle = format!("const {name}: readonly [number, number] = [");
+            let start = module.find(&needle).unwrap_or_else(|| {
+                panic!(
+                    "`{file}` no longer declares `{name}` as a pair of `int4` words, so this \
+                     test can no longer tell the store's schema lock from the journal's writer \
+                     guard — and those two taking one key is an `openPostgresStore` that blocks \
+                     on a live `serve` with no error at all (PRD resolved q63)"
+                )
+            });
+            let rest = &module[start + needle.len()..];
+            let end = rest
+                .find(']')
+                .unwrap_or_else(|| panic!("`{file}`'s `{name}` is an unterminated literal"));
+            let words: Vec<u32> = rest[..end]
+                .split(',')
+                .map(|word| {
+                    let digits = word.trim().trim_start_matches("0x").replace('_', "");
+                    u32::from_str_radix(&digits, 16).unwrap_or_else(|_| {
+                        panic!("`{file}`'s `{name}` holds `{word}`, which is not a hex `int4`")
+                    })
+                })
+                .collect();
+            assert_eq!(
+                words.len(),
+                2,
+                "`{file}`'s `{name}` is no longer two words: {words:?}"
+            );
+            (words[0], words[1])
+        }
+
+        let journal = include_str!("js/journal.ts");
+        let guard = advisory_pair(journal, "journal.ts", "WRITER_GUARD_KEYS");
+        let schema = advisory_pair(POSTGRES, "stores-postgres.ts", "POSTGRES_STORE_SCHEMA_LOCK");
+        assert_ne!(
+            guard, schema,
+            "the Postgres store's schema lock and the journal's writer guard are one key pair, \
+             so a target whose `journal:` and whose store name one server has `openPostgresStore` \
+             waiting on `pg_advisory_xact_lock` for a session guard the hub holds until it exits: \
+             every store op of that deployment hangs with no SQLSTATE, no timeout and no message \
+             (PRD resolved q63). Give the store its own low word"
+        );
+
+        // …and the halves of the argument the distinctness rests on: the store
+        // waits, the journal does not, and a store that had copied the guard
+        // rather than declared its own would read as distinct here while taking
+        // the very same lock.
+        assert!(
+            POSTGRES.contains(
+                "pg_advisory_xact_lock(${POSTGRES_STORE_SCHEMA_LOCK[0]}, \
+                 ${POSTGRES_STORE_SCHEMA_LOCK[1]})"
+            ),
+            "the store arm no longer takes its schema lock by the constant this test reads, so \
+             the pair it really locks on is not the pair checked above"
+        );
+        assert!(
+            journal.contains("const WRITER_GUARD_KEYS") && !POSTGRES.contains("WRITER_GUARD_KEYS["),
+            "the store arm reaches for the journal's `WRITER_GUARD_KEYS` instead of its own \
+             constant, which is the collision this test exists to refuse"
+        );
+        assert!(
+            !MYSQL.contains("GET_LOCK"),
+            "the MySQL store arm now takes a named lock, so it can queue behind the journal's \
+             `GET_LOCK` on a server both bind — state the name it takes and check it against \
+             `MYSQL_GUARD_NAME` here, the way the Postgres pair is checked above"
+        );
+    }
+
     /// The driver is reached by the one specifier PRD §9.18 admits, and the two
     /// this project refuses are named nowhere in it.
     #[test]

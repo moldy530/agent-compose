@@ -495,6 +495,14 @@ const TRUE_EVERYWHERE: &[&str] = &[
     "a_double_delivered_write_lands_once",
     "the_second_delivery_is_recorded_as_deduped",
     "a_write_under_another_key_is_another_effect",
+    // …and the clause "by the backend" read at the one moment it means
+    // anything: the same key in flight on **two** connections at once. The three
+    // above run over one binding, so one queue on one socket serializes them and
+    // a dedupe that read the ledger before writing it would pass them all. Two
+    // transactions racing can only be arbitrated by the ledger's primary key,
+    // and exactly one of them may answer `deduped: false`.
+    "a_concurrent_double_delivery_is_deduped_by_the_backend",
+    "a_concurrent_double_delivery_leaves_the_applied_value",
     // Multi-writer by design, and per key last write wins.
     "a_second_writer_reads_what_the_first_wrote",
     "two_writers_share_one_store_and_the_last_write_wins",
