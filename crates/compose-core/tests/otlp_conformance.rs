@@ -89,10 +89,14 @@ fn fixtures() -> Vec<(String, Value)> {
 /// `the_exporter_is_the_same_module_in_every_project` is what says so — so one
 /// golden answers the corpus for all of them, exactly as one golden answers the
 /// CEL corpus.
-fn staged(root: &Path) -> PathBuf {
+///
+/// `purpose` names the directory, one per test: the tests of this file run on
+/// parallel threads, and two of them staging into one directory would each
+/// remove it from under the other's copy — or under the other's runner.
+fn staged(root: &Path, purpose: &str) -> PathBuf {
     let golden = goldens::golden("review-loop");
     let destination = root
-        .join("projects/otlp-conformance")
+        .join(format!("projects/otlp-conformance-{purpose}"))
         .join(golden.directory);
     let _ = fs::remove_dir_all(&destination);
     let source = goldens_root().join(golden.directory);
@@ -115,7 +119,7 @@ fn the_emitted_exporter_answers_the_conformance_corpus() {
     let Some(root) = installed() else {
         return;
     };
-    let project = staged(root);
+    let project = staged(root, "exporter");
     let mut command = runner("otlp-conformance.mjs");
     command.arg(&project).arg(corpus());
     if std::env::var_os("UPDATE_GOLDENS").is_some() {
@@ -150,7 +154,7 @@ fn the_emitted_parser_answers_the_traceparent_corpus() {
     let Some(root) = installed() else {
         return;
     };
-    let project = staged(root);
+    let project = staged(root, "traceparent");
     let mut command = runner("traceparent-conformance.mjs");
     command.arg(&project).arg(traceparent_corpus());
     let output = command.output().expect("bun runs");
