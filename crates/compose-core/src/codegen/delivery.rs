@@ -78,9 +78,10 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
              sink's: there is no list a sink's address could miss (grammar §14.5)"
         );
         // The once-per-execution guard asks which **kind** a row is — a callback
-        // webhook is not an export — and, since PRD resolved q64 put a second
-        // event class on the sink's rows, which **class**: a detached delivery's
-        // envelope is not its parent's export either.
+        // webhook is not an export — and whether a sink row is the execution's
+        // **own**: a journal written before PRD resolved q65 may hold a detached
+        // delivery's envelope on its parent's ledger, and that is not the
+        // parent's export either.
         let guard = SOURCE
             .split_once("async function exportedAlready(")
             .expect("`src/delivery.ts` guards the export")
@@ -91,20 +92,21 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
         assert!(
             guard.contains("executionExport"),
             "the once-per-execution guard no longer asks whether a row is the execution's **own** \
-             export, so a detached delivery's envelope would silence its parent's trace"
+             export, so an envelope an older build shipped onto a parent's ledger would silence \
+             the parent's trace"
         );
         let own = SOURCE
             .split_once("export function executionExport(")
-            .expect("`src/delivery.ts` tells an execution's export from a delivery's envelope")
+            .expect("`src/delivery.ts` tells an execution's export from a legacy envelope")
             .1
             .split_once("\n}\n")
             .expect("…in a function with a closing brace")
             .0;
         assert!(
             own.contains("record.kind !== \"trace_sink\"")
-                && own.contains("traceSinkClass(record) === \"execution\""),
-            "the export guard no longer asks the ledger which kind a row is and which class, so \
-             a callback webhook or a detached delivery's envelope would stand in for an export \
+                && own.contains("traceSinkClass(record) === \"export\""),
+            "the export guard no longer asks the ledger which kind a row is and whose it is, so \
+             a callback webhook or a legacy detached envelope would stand in for an export \
              nobody made"
         );
         assert!(
@@ -148,40 +150,46 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
         );
     }
 
-    /// **A detached delivery's envelope is journaled, never sent from the
-    /// intent, and never guarded as once-only** (PRD resolved q64).
+    /// **A child execution is exported by the one path every execution is, and
+    /// headed by the lineage its own row carries** (PRD resolved q65).
     ///
-    /// The sibling above, read for the sink's second event class, and its one
-    /// deliberate difference. An execution's export is once per execution because
-    /// a settle is; a detached delivery is re-run by its parent's recovery and
-    /// re-ships on that settlement — at-least-once, deduped by a receiver on
-    /// `(parent_execution, idempotency_key)` — so a guard here would be the
-    /// runtime deciding a dedupe the ruling gives to the receiver, and would be
-    /// wrong besides: a map node's own `retry:` re-issues a delivery under the
-    /// same key, and that is a delivery the ledger has to carry.
+    /// The sink's second event class collapsed into the first: there is no
+    /// second shipper any more, so a child execution's export is `shipTrace`'s —
+    /// guarded once per execution like any other, journaled on the child's own
+    /// ledger through the one export writer — and what makes it a child's is
+    /// read off its lifecycle row rather than handed in, so every process that
+    /// closes a child's row, the one that started it or one that recovered it
+    /// after its parent settled, heads the envelope the same way. Its caller's
+    /// trace is its **parent's**, read off the parent's row.
     #[test]
-    fn a_detached_envelope_is_journaled_unguarded_and_never_sent_from_the_intent() {
+    fn a_child_executions_export_is_headed_by_the_lineage_its_row_carries() {
         let ship = SOURCE
-            .split_once("export async function shipDetachedTrace(")
-            .expect("`src/delivery.ts` ships a detached delivery's envelope")
+            .split_once("export async function shipTrace(")
+            .expect("`src/delivery.ts` ships a settled trace")
             .1
             .split_once("\n}\n")
             .expect("…in a function with a closing brace")
             .0;
         assert!(
-            ship.contains("intendExport(") && ship.contains("detachedTraceDocument("),
-            "a detached delivery's envelope is the runtime's one writer of it, journaled through \
-             the one export writer"
+            ship.contains("row?.lineage") && ship.contains("traceDocument("),
+            "the export no longer reads a child's lineage off its row and heads the envelope \
+             through the runtime's one writer of it (`docs/trace.md` §2)"
         );
         assert!(
-            !ship.contains("exportedAlready("),
-            "a detached delivery's envelope is guarded as once-only, so a recovered delivery \
-             never re-ships (PRD resolved q64: at-least-once across recovery)"
+            ship.contains("journaledExecution(lineage.parent)"),
+            "a child's export no longer joins its **parent's** trace: the caller's \
+             `traceparent` is the parent's row's (`docs/trace.md` §12.2)"
         );
-        assert!(
-            !ship.contains("workDelivery("),
-            "`shipDetachedTrace` attempts the delivery itself, so a settling delivery would \
-             wait on a collector"
-        );
+        for gone in [
+            "shipDetachedTrace",
+            "journalDetachedTrace",
+            "detachedTraceDocument",
+        ] {
+            assert!(
+                !SOURCE.contains(gone),
+                "`src/delivery.ts` still carries `{gone}`, the second event class PRD resolved \
+                 q65 collapsed into the first"
+            );
+        }
     }
 }

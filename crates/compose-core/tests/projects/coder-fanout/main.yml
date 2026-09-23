@@ -15,6 +15,11 @@
 #     §9.4 instance path — created clean at the start of every attempt, which is
 #     what its `retry:` is here to exercise.
 #
+# And a third shape beside them: `flow.review_batch` **detaches** a review per
+# checkout, so each of those coder runs is inside a child execution of its own
+# (PRD resolved q65) — the one place a harness record lands on a journal that
+# is not the execution a trigger started.
+#
 # It is deliberately model-free apart from the harness runs: `over:` reads the
 # flow's own `inputs:`, so there is no agent node and nothing here needs a
 # provider endpoint to reach. The harness runs reach a scripted driver through
@@ -142,3 +147,65 @@ flow.batch:
     - { from: start, to: work }
     - { from: work, to: summarise }
     - { from: summarise, to: end }
+
+# The same checkouts, reviewed off the run's clock. A detached dispatch to a
+# `flow.*` starts a **child execution** (PRD resolved q65): an execution with
+# an id, a journal and an export of its own, so the coder node inside it runs —
+# and journals its harness record — under the child's id rather than its
+# parent's. `outputs: {}` because what a detached `flow.*` returns is written
+# after everything that reads it and so is refused (Decision D94), and the
+# node writes nothing for the same reason (grammar 8.6 rule 7).
+flow.review:
+  description: Review one checkout, in an execution of its own.
+  inputs:
+    goal: { type: string }
+    worktree: { type: string }
+  outputs: {}
+  nodes:
+    inspect:
+      coder:
+        harness: cc
+        model: model.implementer
+        workspace: "input.worktree"
+        access: read_only
+        prompt: |
+          Read the checkout you have been given and say whether the change it
+          holds meets the goal.
+        input:
+          goal: { type: string }
+        output:
+          verdict: { enum: [approve, revise] }
+        allow_tools: [Read]
+      input:
+        goal: "input.goal"
+      timeout: 10m
+  edges:
+    - { from: start, to: inspect }
+    - { from: inspect, to: end }
+
+flow.review_batch:
+  description: Detach one review per checkout, and settle without waiting for any.
+  inputs:
+    tasks:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        properties:
+          goal: { type: string }
+          worktree: { type: string }
+  outputs: {}
+  nodes:
+    hand_off:
+      map:
+        over: input.tasks
+        as: task
+        node: flow.review
+        detach: true
+        max_concurrency: 4
+        input:
+          goal: "task.goal"
+          worktree: "task.worktree"
+  edges:
+    - { from: start, to: hand_off }
+    - { from: hand_off, to: end }

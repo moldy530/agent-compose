@@ -533,6 +533,19 @@ export async function runFlow(
      */
     readonly resume?: boolean;
     /**
+     * What started this execution, where a detached `flow.*` dispatch did —
+     * which makes it a **child execution** (PRD resolved q65).
+     *
+     * [`runChildFlow`] passes it and nothing else does. It goes on the lifecycle
+     * row beside the execution's inputs, which is what lets a generation that
+     * resumes the child — after its parent has settled, in another process —
+     * know where it came from: `execution.item_index` inside it is the
+     * dispatch's (grammar 4.1), and the envelope it ships is headed by it
+     * (`docs/trace.md` §2). A resumed generation reads it back off the row
+     * rather than being handed it.
+     */
+    readonly lineage?: runtime.Lineage;
+    /**
      * Called once, **immediately before this run closes its lifecycle row**,
      * and awaited.
      *
@@ -581,7 +594,7 @@ export async function runFlow(
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // Before the graph is streamed, so an execution the process dies in the middle
   // of already has a row saying it was open (PRD resolved q28).
-  await runtime.openExecution({
+  const lineage = await runtime.openExecution({
     execution: executionId,
     flow: address,
     trigger: options.trigger ?? "manual",
@@ -590,9 +603,17 @@ export async function runFlow(
     ...(options.callback === undefined ? {} : { callback: options.callback }),
     ...(options.traceparent === undefined ? {} : { traceparent: options.traceparent }),
     ...(options.resume === true ? { resuming: true } : {}),
+    ...(options.lineage === undefined ? {} : { lineage: options.lineage }),
   });
   try {
-    const produced = await quiesceFlow(address, flow, parsed, ceiling, sessionKey, executionId, options);
+    const produced = await quiesceFlow(
+      address,
+      flow,
+      parsed,
+      ceiling,
+      { id: executionId, session_key: sessionKey, ...(lineage?.itemIndex === undefined ? {} : { item_index: lineage.itemIndex }) },
+      options,
+    );
     // A run that reached quiescence may still be holding a divergence raised
     // where nothing could throw it — a detached `map` delivery, which grammar 8.6
     // rule 7 says the flow instance does not wait for. PRD resolved q29 makes a
@@ -638,16 +659,64 @@ export async function runFlow(
   }
 }
 
-/** [`runFlow`]'s body, with the journal's lifecycle row already open. */
+/**
+ * Run one **child execution** — what a detached `flow.*` dispatch starts (PRD
+ * resolved q65) — as the ordinary execution of its flow that it is.
+ *
+ * The one place a child's run is composed, so every process that runs one runs
+ * it the same way: `runtime.dispatchChild` and `runtime.resumeChild` decide
+ * *whether* a child runs, and hand it to the runner the process hosts
+ * (`runtime.hostChildren`), which comes here. A child the journal does not hold
+ * yet begins with its lineage on its row; one it does hold replays to its
+ * frontier and reads its lineage back off that row.
+ *
+ * No `resumable`: a child never parks, because a detached dispatch that could
+ * reach a `human` node is refused at build time (Decision D118) — and were one
+ * to reach one anyway, ending the run where it stands beats a wait no route
+ * could ever be sent to.
+ *
+ * `closing` is `runFlow`'s own hook and is what a host owes a child at its
+ * close: `src/serve.ts` and `src/cli.ts` journal its trace export there, on the
+ * child's own ledger, exactly as they do for an execution a trigger started.
+ */
+export function runChildFlow(
+  child: runtime.ChildExecution,
+  closing?: (produced: FlowRun | undefined, error: unknown) => Promise<void>,
+): Promise<FlowRun> {
+  return runFlow(child.flow, child.inputs, {
+    executionId: child.id,
+    sessionKey: child.sessionKey,
+    trigger: child.trigger,
+    lineage: child.lineage,
+    ...(child.resume ? { resume: true } : {}),
+    ...(closing === undefined ? {} : { closing }),
+  });
+}
+
+// The plain runner, hosted as this module loads: a child execution started in a
+// process that owes it nothing more — an ejected caller of `runFlow` — runs and
+// settles like any execution and ships nothing. `src/serve.ts` and `src/cli.ts`
+// host their own over it for as long as they run (`runtime.hostChildren`).
+runtime.hostChildren((child) => runChildFlow(child));
+
+/**
+ * [`runFlow`]'s body, with the journal's lifecycle row already open.
+ *
+ * `identity` is grammar 4.1's `execution` root for the whole run: the id and the
+ * session, and — on a child execution — the source-item index of the dispatch
+ * that started it, because a child execution *is* the instance a `map`
+ * dispatched and `execution.item_index` is present everywhere inside one
+ * (PRD resolved q65, Decision D115).
+ */
 async function quiesceFlow(
   address: string,
   flow: CompiledFlow,
   parsed: Record<string, unknown>,
   ceiling: number,
-  sessionKey: string,
-  executionId: string,
+  identity: runtime.ExecutionIdentity,
   options: { readonly resumable?: boolean; readonly resume?: boolean },
 ): Promise<FlowRun> {
+  const executionId = identity.id;
   // Opened before the graph is streamed, so a status route asked the instant
   // after `start` answered already has somewhere to read this run's pauses from
   // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers
@@ -701,6 +770,12 @@ async function quiesceFlow(
     // Grammar 8.6 rule 7 is untouched either way: the join returned at
     // dispatch, the trace entry was written without it, and this is `runFlow`
     // on its way out of a run that has already stopped advancing.
+    //
+    // A detached `flow.*` is **not** among them: it is a child execution with
+    // a record, a recovery and a divergence of its own (PRD resolved q65), so
+    // neither half is about it and this run waits for it on neither. What
+    // waits for a child is the process that would otherwise end under it
+    // (`src/cli.ts`, `runtime.childrenSettled`).
     if (runtime.staysOpen(executionId, outcome) || options.resume === true) {
       await runtime.settleDetached(executionId);
     }
@@ -731,7 +806,7 @@ async function quiesceFlow(
         $run: {
           ...runtime.emptyRun(),
           input: parsed,
-          execution: { id: executionId, session_key: sessionKey },
+          execution: identity,
         },
       },
       ceiling,

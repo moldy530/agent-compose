@@ -25,6 +25,9 @@ import {
   flowBatchNodeSummariseOutput,
   flowFixInputs,
   flowFixNodeImplementOutput,
+  flowReviewBatchInputs,
+  flowReviewInputs,
+  flowReviewNodeInspectOutput,
 } from "./schemas.ts";
 import { State } from "./state.ts";
 import type { GraphState } from "./state.ts";
@@ -79,6 +82,35 @@ const flowFixShape: runtime.Shape = {
 const flowFixNodeImplementShape: runtime.Shape = {
   "properties": {
     "summary": "string"
+  }
+};
+
+/** `flow.review` — the `input` root inside it (grammar 7.5). */
+const flowReviewShape: runtime.Shape = {
+  "properties": {
+    "goal": "string",
+    "worktree": "string"
+  }
+};
+
+/** `flow.review` node `inspect` — the `inspect.output` root its guards read. */
+const flowReviewNodeInspectShape: runtime.Shape = {
+  "properties": {
+    "verdict": "string"
+  }
+};
+
+/** `flow.review_batch` — the `input` root inside it (grammar 7.5). */
+const flowReviewBatchShape: runtime.Shape = {
+  "properties": {
+    "tasks": {
+      "items": {
+        "properties": {
+          "goal": "string",
+          "worktree": "string"
+        }
+      }
+    }
   }
 };
 
@@ -354,6 +386,186 @@ const flowFixBinding: runtime.SubflowBinding = {
     }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
 };
 
+// --- flow.review ---
+
+/**
+ * `flow.review` node `inspect` — the harness run it is: the config map, the workspace it is contained by, and the schema its answer is gated against (grammar 8.9, PRD resolved q57).
+ */
+const flowReviewNodeInspectCoder: runtime.HarnessBinding = {
+  node: "flow.review.inspect",
+  id: "inspect",
+  harness: "cc",
+  model: "model.implementer",
+  modelId: "claude-sonnet-4-5",
+  modelSettings: {},
+  connection: {
+    provider: "provider.anthropic",
+    credential: [{ env: "ANTHROPIC_API_KEY", site: "provider.anthropic.api_key" }],
+  },
+  prompt: "Read the checkout you have been given and say whether the change it\nholds meets the goal.\n",
+  workspace: { expression: ["input.worktree"] },
+  access: "read_only",
+  allowTools: ["Read"],
+  env: [],
+  settings: {},
+  schema: {
+    "additionalProperties": false,
+    "properties": {
+      "verdict": {
+        "enum": [
+          "approve",
+          "revise"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "verdict"
+    ],
+    "type": "object"
+  },
+  result: flowReviewNodeInspectOutput,
+};
+
+/**
+ * `flow.review` node `inspect` — one `harness: cc` run on `model.implementer` (grammar 8.9).
+ */
+const flowReviewNodeInspect: runtime.NodeDescriptor = {
+  flow: "flow.review",
+  node: "inspect",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the node, `on_error` from the built-in.
+  policy: {
+    timeoutMs: 600000,
+    onError: "fail",
+  },
+  shapes: { input: flowReviewShape, state: stateShape, output: flowReviewNodeInspectShape },
+  input: (roots, view) => ({
+    "goal": runtime.toJson(runtime.evaluate("input.goal", roots)),
+  }),
+  run: async (input, context, view) =>
+    runtime.runCoder(flowReviewNodeInspectCoder, input, context, view, harness.DRIVERS),
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/** `flow.review` — its nodes, its `start` edges, and the compiled graph. */
+function flowReview() {
+  return new StateGraph(State)
+    .addNode("inspect", (state: GraphState) => runtime.runNode(flowReviewNodeInspect, state), {
+      ends: [END],
+    })
+    .addEdge(START, "inspect")
+    .compile();
+}
+
+/**
+ * `flow.review`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowReviewGraph = flowReview();
+
+/**
+ * `flow.review` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowReviewBinding: runtime.SubflowBinding = {
+  address: "flow.review",
+  outputs: [],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowReviewGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowReviewGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
+// --- flow.review_batch ---
+
+/**
+ * `flow.review_batch` node `hand_off` — the fan-out it dispatches (grammar 8.6). `over` resolves against `input.tasks`, and `task` is what an instance's own bindings call the item.
+ */
+const flowReviewBatchNodeHandOffMap: runtime.MapDescriptor = {
+  node: "hand_off",
+  as: "task",
+  source: {
+    path: "input.tasks",
+    shape: "any",
+  },
+  maxConcurrency: 4,
+  onItemError: "fail",
+  routes: [
+    {
+      target: "flow.review",
+      maxConcurrency: 4,
+      detach: true,
+      itemShape: {
+        "properties": {
+          "goal": "string",
+          "worktree": "string"
+        }
+      },
+      input: (roots) => ({
+        "goal": runtime.toJson(runtime.evaluate("task.goal", roots)),
+        "worktree": runtime.toJson(runtime.evaluate("task.worktree", roots)),
+      }),
+      run: (input, _context, site) =>
+        runtime.dispatchChild("flow.review", input, site),
+      writes: [],
+    },
+  ],
+};
+
+/** `flow.review_batch` node `hand_off` — a fan-out (grammar 8.6). */
+const flowReviewBatchNodeHandOff: runtime.NodeDescriptor = {
+  flow: "flow.review_batch",
+  node: "hand_off",
+  // Grammar 9.3, resolved: `retry` from the built-in, `timeout` from the built-in, `on_error` from the built-in.
+  policy: {
+    onError: "fail",
+  },
+  shapes: { input: flowReviewBatchShape, state: stateShape, output: "any" },
+  input: (_roots, view) => runtime.mapPlan(flowReviewBatchNodeHandOffMap, view),
+  run: async (input, context) =>
+    runtime.runMap(flowReviewBatchNodeHandOffMap, input as runtime.MapPlan, context),
+  writes: [],
+  edges: [
+    { to: END },
+  ],
+};
+
+/**
+ * `flow.review_batch` — its nodes, its `start` edges, and the compiled graph.
+ */
+function flowReviewBatch() {
+  return new StateGraph(State)
+    .addNode("hand_off", (state: GraphState) => runtime.runNode(flowReviewBatchNodeHandOff, state), {
+      ends: [END],
+    })
+    .addEdge(START, "hand_off")
+    .compile();
+}
+
+/**
+ * `flow.review_batch`, compiled once. Building it at import is also what checks it: a state model LangGraph refuses, or an edge to a node that is not registered, fails here rather than at the first invocation.
+ */
+const flowReviewBatchGraph = flowReviewBatch();
+
+/**
+ * `flow.review_batch` as a module: what a `flow:` node instantiates and a `map` dispatches to (grammar 7.5, 8.5).
+ */
+const flowReviewBatchBinding: runtime.SubflowBinding = {
+  address: "flow.review_batch",
+  outputs: [],
+  recursionLimit: 26,
+  stream: (initial, options) =>
+    flowReviewBatchGraph.stream(initial, {
+      ...options,
+      streamMode: "values",
+      outputKeys: flowReviewBatchGraph.outputChannels,
+    }) as unknown as Promise<AsyncIterable<runtime.GraphStateLike>>,
+};
+
 /**
  * How a declared flow input reads a command-line value (grammar 13.2).
  *
@@ -445,6 +657,38 @@ export const flows: Readonly<Record<string, CompiledFlow>> = {
         ...options,
         streamMode: "values",
         outputKeys: flowFixGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.review": {
+    address: "flow.review",
+    inputs: ["goal", "worktree"],
+    inputKinds: { "goal": "string", "worktree": "string", },
+    outputs: [],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowReviewInputs, inputs, "the `inputs:` of `flow.review`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowReviewGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowReviewGraph.outputChannels,
+      }) as unknown as Promise<AsyncIterable<GraphState>>,
+  },
+  "flow.review_batch": {
+    address: "flow.review_batch",
+    inputs: ["tasks"],
+    inputKinds: { "tasks": "json", },
+    outputs: [],
+    sessionStores: [],
+    recursionLimit: 26,
+    parse: (inputs: unknown) =>
+      runtime.parseResult(flowReviewBatchInputs, inputs, "the `inputs:` of `flow.review_batch`") as Record<string, unknown>,
+    stream: (initial, options) =>
+      flowReviewBatchGraph.stream(initial, {
+        ...options,
+        streamMode: "values",
+        outputKeys: flowReviewBatchGraph.outputChannels,
       }) as unknown as Promise<AsyncIterable<GraphState>>,
   },
 };
@@ -581,6 +825,19 @@ export async function runFlow(
      */
     readonly resume?: boolean;
     /**
+     * What started this execution, where a detached `flow.*` dispatch did —
+     * which makes it a **child execution** (PRD resolved q65).
+     *
+     * [`runChildFlow`] passes it and nothing else does. It goes on the lifecycle
+     * row beside the execution's inputs, which is what lets a generation that
+     * resumes the child — after its parent has settled, in another process —
+     * know where it came from: `execution.item_index` inside it is the
+     * dispatch's (grammar 4.1), and the envelope it ships is headed by it
+     * (`docs/trace.md` §2). A resumed generation reads it back off the row
+     * rather than being handed it.
+     */
+    readonly lineage?: runtime.Lineage;
+    /**
      * Called once, **immediately before this run closes its lifecycle row**,
      * and awaited.
      *
@@ -629,7 +886,7 @@ export async function runFlow(
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // Before the graph is streamed, so an execution the process dies in the middle
   // of already has a row saying it was open (PRD resolved q28).
-  await runtime.openExecution({
+  const lineage = await runtime.openExecution({
     execution: executionId,
     flow: address,
     trigger: options.trigger ?? "manual",
@@ -638,9 +895,17 @@ export async function runFlow(
     ...(options.callback === undefined ? {} : { callback: options.callback }),
     ...(options.traceparent === undefined ? {} : { traceparent: options.traceparent }),
     ...(options.resume === true ? { resuming: true } : {}),
+    ...(options.lineage === undefined ? {} : { lineage: options.lineage }),
   });
   try {
-    const produced = await quiesceFlow(address, flow, parsed, ceiling, sessionKey, executionId, options);
+    const produced = await quiesceFlow(
+      address,
+      flow,
+      parsed,
+      ceiling,
+      { id: executionId, session_key: sessionKey, ...(lineage?.itemIndex === undefined ? {} : { item_index: lineage.itemIndex }) },
+      options,
+    );
     // A run that reached quiescence may still be holding a divergence raised
     // where nothing could throw it — a detached `map` delivery, which grammar 8.6
     // rule 7 says the flow instance does not wait for. PRD resolved q29 makes a
@@ -686,16 +951,64 @@ export async function runFlow(
   }
 }
 
-/** [`runFlow`]'s body, with the journal's lifecycle row already open. */
+/**
+ * Run one **child execution** — what a detached `flow.*` dispatch starts (PRD
+ * resolved q65) — as the ordinary execution of its flow that it is.
+ *
+ * The one place a child's run is composed, so every process that runs one runs
+ * it the same way: `runtime.dispatchChild` and `runtime.resumeChild` decide
+ * *whether* a child runs, and hand it to the runner the process hosts
+ * (`runtime.hostChildren`), which comes here. A child the journal does not hold
+ * yet begins with its lineage on its row; one it does hold replays to its
+ * frontier and reads its lineage back off that row.
+ *
+ * No `resumable`: a child never parks, because a detached dispatch that could
+ * reach a `human` node is refused at build time (Decision D118) — and were one
+ * to reach one anyway, ending the run where it stands beats a wait no route
+ * could ever be sent to.
+ *
+ * `closing` is `runFlow`'s own hook and is what a host owes a child at its
+ * close: `src/serve.ts` and `src/cli.ts` journal its trace export there, on the
+ * child's own ledger, exactly as they do for an execution a trigger started.
+ */
+export function runChildFlow(
+  child: runtime.ChildExecution,
+  closing?: (produced: FlowRun | undefined, error: unknown) => Promise<void>,
+): Promise<FlowRun> {
+  return runFlow(child.flow, child.inputs, {
+    executionId: child.id,
+    sessionKey: child.sessionKey,
+    trigger: child.trigger,
+    lineage: child.lineage,
+    ...(child.resume ? { resume: true } : {}),
+    ...(closing === undefined ? {} : { closing }),
+  });
+}
+
+// The plain runner, hosted as this module loads: a child execution started in a
+// process that owes it nothing more — an ejected caller of `runFlow` — runs and
+// settles like any execution and ships nothing. `src/serve.ts` and `src/cli.ts`
+// host their own over it for as long as they run (`runtime.hostChildren`).
+runtime.hostChildren((child) => runChildFlow(child));
+
+/**
+ * [`runFlow`]'s body, with the journal's lifecycle row already open.
+ *
+ * `identity` is grammar 4.1's `execution` root for the whole run: the id and the
+ * session, and — on a child execution — the source-item index of the dispatch
+ * that started it, because a child execution *is* the instance a `map`
+ * dispatched and `execution.item_index` is present everywhere inside one
+ * (PRD resolved q65, Decision D115).
+ */
 async function quiesceFlow(
   address: string,
   flow: CompiledFlow,
   parsed: Record<string, unknown>,
   ceiling: number,
-  sessionKey: string,
-  executionId: string,
+  identity: runtime.ExecutionIdentity,
   options: { readonly resumable?: boolean; readonly resume?: boolean },
 ): Promise<FlowRun> {
+  const executionId = identity.id;
   // Opened before the graph is streamed, so a status route asked the instant
   // after `start` answered already has somewhere to read this run's pauses from
   // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers
@@ -749,6 +1062,12 @@ async function quiesceFlow(
     // Grammar 8.6 rule 7 is untouched either way: the join returned at
     // dispatch, the trace entry was written without it, and this is `runFlow`
     // on its way out of a run that has already stopped advancing.
+    //
+    // A detached `flow.*` is **not** among them: it is a child execution with
+    // a record, a recovery and a divergence of its own (PRD resolved q65), so
+    // neither half is about it and this run waits for it on neither. What
+    // waits for a child is the process that would otherwise end under it
+    // (`src/cli.ts`, `runtime.childrenSettled`).
     if (runtime.staysOpen(executionId, outcome) || options.resume === true) {
       await runtime.settleDetached(executionId);
     }
@@ -779,7 +1098,7 @@ async function quiesceFlow(
         $run: {
           ...runtime.emptyRun(),
           input: parsed,
-          execution: { id: executionId, session_key: sessionKey },
+          execution: identity,
         },
       },
       ceiling,

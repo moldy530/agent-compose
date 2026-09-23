@@ -923,9 +923,16 @@ mod tests {
         let expected = columns(SOURCE);
         assert_eq!(
             expected.keys().collect::<Vec<_>>(),
-            vec!["deliveries", "dispatches", "effects", "executions"],
+            vec![
+                "deliveries",
+                "dispatches",
+                "effects",
+                "executions",
+                "lineage"
+            ],
             "the SQLite schema is the inventory every other backend is held to, and it no \
-             longer holds the four tables `docs/durability.md` §3 describes"
+             longer holds the five tables `docs/durability.md` §3 describes — the fifth \
+             being a child execution's cause, beside its lifecycle row (§3.5, PRD resolved q65)"
         );
         for (arm, name) in [
             (POSTGRES, "journal-postgres.ts"),
@@ -1304,30 +1311,29 @@ mod tests {
              attempt is made and recorded nowhere (`docs/durability.md` §3.7)"
         );
 
-        // The **trace sink's** intents, on the same ledger and in the same order:
-        // an execution's export recorded where the lifecycle row closes, a
-        // detached delivery's envelope where the delivery settles, and neither
-        // attempted from there (grammar 14.5, PRD resolved q50, q64). Both go
-        // through the one writer that serializes an export and opens its row.
+        // The **trace sink's** intent, on the same ledger and in the same order:
+        // an execution's export recorded where its lifecycle row closes — a
+        // child execution's included, on its own ledger (PRD resolved q65) —
+        // and never attempted from there (grammar 14.5, PRD resolved q50). It
+        // goes through the one writer that serializes an export and opens its
+        // row.
         let intend = function_body(delivery, "intendExport");
         assert!(
             intend.contains("intendDelivery("),
             "a trace export is journaled like every other delivery, or a sink outage is a trace \
              nothing will ever ship"
         );
-        for shipper in ["shipTrace", "shipDetachedTrace"] {
-            let ship = function_body(delivery, shipper);
-            assert!(
-                ship.contains("intendExport("),
-                "`{shipper}` no longer journals through the one export writer, so the sink's \
-                 two event classes can ship different things under one `format:`"
-            );
-            assert!(
-                !ship.contains("fetch(") && !ship.contains("workDelivery("),
-                "`{shipper}` sends the trace itself, so the moment it is called from — a \
-                 lifecycle row closing, a detached delivery settling — waits on a collector"
-            );
-        }
+        let ship = function_body(delivery, "shipTrace");
+        assert!(
+            ship.contains("intendExport("),
+            "`shipTrace` no longer journals through the one export writer, so two exports can \
+             ship different things under one `format:`"
+        );
+        assert!(
+            !ship.contains("fetch(") && !ship.contains("workDelivery("),
+            "`shipTrace` sends the trace itself, so the lifecycle row it is called from closing \
+             waits on a collector"
+        );
         assert!(
             !intend.contains("fetch(") && !intend.contains("workDelivery("),
             "the export writer sends what it journals, so nothing about a sink is off the path \

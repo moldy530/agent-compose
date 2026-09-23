@@ -70,8 +70,8 @@
 //!
 //! | id | where | which way | why it is left |
 //! |---|---|---|---|
-//! | `a-detached-dispatch-is-keyed-and-nothing-else-is` | which calls carry the idempotency key of grammar 9.4, and what wins when a binding names the same slot | only a **detached** dispatch to a `tool.*`, and the binding's own `headers:`/`env:` sit *over* the delivery while a `tool.*`'s input fields sit *under* it | grammar 9.4 fixes the string (D104) and now the surface — `Idempotency-Key`, `IDEMPOTENCY_KEY`, `idempotency_key` — leaving two things it does not say. *Which calls*: an `agent.*` has no delivery slot on the provider wire, and keying it would key the tool calls its own loop makes, which are distinct effects meant to repeat; a `flow.*` is handed the dispatch site itself, so an effect inside the instance derives its own key from the instance path rather than reusing the boundary's; a **joined** dispatch has an observed outcome, which is what dedupe is a substitute for. *What wins*: a binding's declared `headers:`/`env:` is the author configuring their own wire, so it layers over the delivery exactly as it layers over the emitted `content-type`; an `exec:` target's input fields layer under it, because an input field spelling `idempotency_key` is precisely what grammar 9.4 says the key is never part of, and losing the key there would lose the one thing a sink dedupes on — and no *composition* reaches that layer, because `check::maps` refuses a detached dispatch to a sink declaring the slot, which is Decision D66's rule for the same environment |
-//! | `a-subgraph-is-the-one-activity-a-deadline-stops` | what a node's `timeout:` does to the work it was waiting on | a `flow:` node's instance — and a joined `map` dispatch's — is handed that node's `context.signal` and stops advancing; every other activity is raced and left running | grammar 9.2 bounds **one node execution** and says nothing about what becomes of the work, and `runtime.runActivity` records why that is usually all a deadline can mean: a host function cannot be unscheduled, and a raced promise is merely abandoned. A subgraph is not in that position — it is a run of its own, and LangGraph's `RunnableConfig.signal` stops the Pregel loop scheduling supersteps — so here the choice is real rather than forced. It is left the **stopping** way: an instance that runs on issues every effect its remaining nodes were going to issue *after* the node that started it has already failed, and holds the map node's admission permit (`runtime.Admission`) for the whole of it, so a later execution of that node queues behind work its own budget was supposed to have ended. What is still not stopped is the one activity already in flight *inside* the instance, which is the abandoned-host-function case again one level down. A **detached** dispatch keeps the other reading deliberately: its signal is the one nothing aborts, because Decision D94 says the fan-out never waited for it |
+//! | `a-detached-dispatch-is-keyed-and-nothing-else-is` | which calls carry the idempotency key of grammar 9.4, and what wins when a binding names the same slot | only a **detached** dispatch to a `tool.*`, and the binding's own `headers:`/`env:` sit *over* the delivery while a `tool.*`'s input fields sit *under* it | grammar 9.4 fixes the string (D104) and now the surface — `Idempotency-Key`, `IDEMPOTENCY_KEY`, `idempotency_key` — leaving two things it does not say. *Which calls*: an `agent.*` has no delivery slot on the provider wire, and keying it would key the tool calls its own loop makes, which are distinct effects meant to repeat; a `flow.*` is handed the dispatch site itself, so an effect inside the instance derives its own key from the instance path rather than reusing the boundary's — and a **detached** `flow.*` reads the key for the third thing it is for, the id of the child execution it starts (PRD resolved q65, `runtime.childExecutionId`), whose effects then key off that id; a **joined** dispatch has an observed outcome, which is what dedupe is a substitute for. *What wins*: a binding's declared `headers:`/`env:` is the author configuring their own wire, so it layers over the delivery exactly as it layers over the emitted `content-type`; an `exec:` target's input fields layer under it, because an input field spelling `idempotency_key` is precisely what grammar 9.4 says the key is never part of, and losing the key there would lose the one thing a sink dedupes on — and no *composition* reaches that layer, because `check::maps` refuses a detached dispatch to a sink declaring the slot, which is Decision D66's rule for the same environment |
+//! | `a-subgraph-is-the-one-activity-a-deadline-stops` | what a node's `timeout:` does to the work it was waiting on | a `flow:` node's instance — and a joined `map` dispatch's — is handed that node's `context.signal` and stops advancing; every other activity is raced and left running | grammar 9.2 bounds **one node execution** and says nothing about what becomes of the work, and `runtime.runActivity` records why that is usually all a deadline can mean: a host function cannot be unscheduled, and a raced promise is merely abandoned. A subgraph is not in that position — it is a run of its own, and LangGraph's `RunnableConfig.signal` stops the Pregel loop scheduling supersteps — so here the choice is real rather than forced. It is left the **stopping** way: an instance that runs on issues every effect its remaining nodes were going to issue *after* the node that started it has already failed, and holds the map node's admission permit (`runtime.Admission`) for the whole of it, so a later execution of that node queues behind work its own budget was supposed to have ended. What is still not stopped is the one activity already in flight *inside* the instance, which is the abandoned-host-function case again one level down. A **detached** dispatch keeps the other reading deliberately: its signal is the one nothing aborts, because Decision D94 says the fan-out never waited for it — and a detached `flow.*` is not an instance of this node's at all but a child execution of its own (PRD resolved q65), on no node's clock |
 //! | `a-dispatch-runs-inside-the-map-nodes-task` | `map` dispatch and `flow:` instantiation | the instances run **in the node's task**, and a subflow is a separate run of its own compiled graph (PRD 9.17) | a `Send` schedules a node of the **parent** graph, and seven of grammar 8.6's own rules are then unstateable. A Send'd task reads the packet as its whole input and writes the **parent's** channels, so a dispatched `flow.*` cannot hold its own channel values (grammar 10.1, 7.6.4 clause 3) and its instances share the caller's `messages`, which grammar 10.4 and Decision D105 make an unwaivable module boundary. `detach: true` is *resolved at dispatch* (D94) and a superstep barrier waits for every task it scheduled. A dispatch of **zero** instances must complete and fire its edges (rule 6), while `goto: []` retires the branch. `max_concurrency` is a per-node admission bound routes may tighten (D28) and LangGraph's `maxConcurrency` is a run-level config the Pregel runner applies to every task of a superstep. `on_item_error`'s parameterized retry, and the map's own `on_error:` absorbing an exhausted item (rule 10), are policies over an *item* that a node-level `retryPolicy` cannot express — the same mismatch `runtime.runActivity` records for grammar 9. The map's own outgoing edges would be evaluated once per instance, over N different local states, and not at all when N is 0. And LangGraph orders a step's writes by `task.path`, where every `__pregel_pull` sorts before every `__pregel_push`, so a map's writes would land after *every* ordinary node's rather than in the map node's own place in clause 1's node-id order. Index-tagging survives the change: what the map writes is one `runtime.OrderedWrites` per channel, in source-item order, which every emitted reducer unpacks |
 //!
 //! What the row does **not** trade away is grammar 7.6's two properties. P1
@@ -3096,8 +3096,12 @@ fn dispatch_route(
 /// How one dispatched instance is run: an agent call, a tool invocation, or a
 /// subflow instantiation (grammar 8.6, and the target's own section).
 ///
-/// `detach` decides one thing here: whether the call is handed the idempotency
-/// key of grammar 9.4. It goes to a **`tool.*`** and to nothing else, because
+/// `detach` decides two things here. For a **`flow.*`** it decides what the
+/// dispatch *is*: a detached one starts a child execution of its own (PRD
+/// resolved q65, `runtime.dispatchChild`) rather than instantiating the flow
+/// inside this node's task. For everything else it decides whether the call is
+/// handed the idempotency key of grammar 9.4. It goes to a **`tool.*`** and to
+/// nothing else, because
 /// that is the construct PRD 5.6's sentence is about — "an `idempotency_key` …
 /// is passed to the sink automatically, and sinks are documented to dedupe on
 /// it" — and grammar 9.4's delivery surface is written per binding kind, which
@@ -3193,6 +3197,18 @@ fn dispatch_run(
             "{indent}run: async (input, context) => ({{ output: await {}(input, context) }}),\n",
             names.value(target)
         ),
+        // A detached `flow.*` starts a **child execution** (PRD resolved q65):
+        // an execution of its own, with an id derived from this execution's and
+        // the dispatch's key, its own journal, its own recovery and its own
+        // export. Nothing of the map node's context crosses — not its clock, not
+        // its collectors, not its effect site — because none of them is the
+        // child's; what crosses is the dispatch site, which is where the child's
+        // identity and its cause are read from (`runtime.dispatchChild`).
+        DefinitionBody::Flow(_) if detach => format!(
+            "{indent}run: (input, _context, site) =>\n{indent}  \
+             runtime.dispatchChild({}, input, site),\n",
+            names::string(target)
+        ),
         DefinitionBody::Flow(_) => {
             let binding = names.value(&format!("{target}.binding"));
             // Grammar 8.6 rule 10: a dispatched subflow's nodes resolve their
@@ -3201,9 +3217,9 @@ fn dispatch_run(
             // discarded (D105), so no `history:` does either.
             //
             // The dispatch's clock does cross: `context.signal` is the map
-            // node's on a joined dispatch, so its `timeout:` ends the instance
-            // rather than only the wait for it, and the delivery's own — which
-            // nothing aborts — on a detached one (D94, `runtime.runSubflow`).
+            // node's, so its `timeout:` ends the instance rather than only the
+            // wait for it (`runtime.runSubflow`). A detached dispatch never
+            // reaches here — see the arm above.
             format!(
                 "{indent}run: async (input, context, site) =>\n{indent}  \
                  runtime.runSubflow({binding}, {{\n{indent}    \
@@ -4167,6 +4183,19 @@ export async function runFlow(
      */
     readonly resume?: boolean;
     /**
+     * What started this execution, where a detached `flow.*` dispatch did —
+     * which makes it a **child execution** (PRD resolved q65).
+     *
+     * [`runChildFlow`] passes it and nothing else does. It goes on the lifecycle
+     * row beside the execution's inputs, which is what lets a generation that
+     * resumes the child — after its parent has settled, in another process —
+     * know where it came from: `execution.item_index` inside it is the
+     * dispatch's (grammar 4.1), and the envelope it ships is headed by it
+     * (`docs/trace.md` §2). A resumed generation reads it back off the row
+     * rather than being handed it.
+     */
+    readonly lineage?: runtime.Lineage;
+    /**
      * Called once, **immediately before this run closes its lifecycle row**,
      * and awaited.
      *
@@ -4215,7 +4244,7 @@ export async function runFlow(
   const executionId = options.executionId ?? `exec_${globalThis.crypto.randomUUID()}`;
   // Before the graph is streamed, so an execution the process dies in the middle
   // of already has a row saying it was open (PRD resolved q28).
-  await runtime.openExecution({
+  const lineage = await runtime.openExecution({
     execution: executionId,
     flow: address,
     trigger: options.trigger ?? "manual",
@@ -4224,9 +4253,17 @@ export async function runFlow(
     ...(options.callback === undefined ? {} : { callback: options.callback }),
     ...(options.traceparent === undefined ? {} : { traceparent: options.traceparent }),
     ...(options.resume === true ? { resuming: true } : {}),
+    ...(options.lineage === undefined ? {} : { lineage: options.lineage }),
   });
   try {
-    const produced = await quiesceFlow(address, flow, parsed, ceiling, sessionKey, executionId, options);
+    const produced = await quiesceFlow(
+      address,
+      flow,
+      parsed,
+      ceiling,
+      { id: executionId, session_key: sessionKey, ...(lineage?.itemIndex === undefined ? {} : { item_index: lineage.itemIndex }) },
+      options,
+    );
     // A run that reached quiescence may still be holding a divergence raised
     // where nothing could throw it — a detached `map` delivery, which grammar 8.6
     // rule 7 says the flow instance does not wait for. PRD resolved q29 makes a
@@ -4272,16 +4309,64 @@ export async function runFlow(
   }
 }
 
-/** [`runFlow`]'s body, with the journal's lifecycle row already open. */
+/**
+ * Run one **child execution** — what a detached `flow.*` dispatch starts (PRD
+ * resolved q65) — as the ordinary execution of its flow that it is.
+ *
+ * The one place a child's run is composed, so every process that runs one runs
+ * it the same way: `runtime.dispatchChild` and `runtime.resumeChild` decide
+ * *whether* a child runs, and hand it to the runner the process hosts
+ * (`runtime.hostChildren`), which comes here. A child the journal does not hold
+ * yet begins with its lineage on its row; one it does hold replays to its
+ * frontier and reads its lineage back off that row.
+ *
+ * No `resumable`: a child never parks, because a detached dispatch that could
+ * reach a `human` node is refused at build time (Decision D118) — and were one
+ * to reach one anyway, ending the run where it stands beats a wait no route
+ * could ever be sent to.
+ *
+ * `closing` is `runFlow`'s own hook and is what a host owes a child at its
+ * close: `src/serve.ts` and `src/cli.ts` journal its trace export there, on the
+ * child's own ledger, exactly as they do for an execution a trigger started.
+ */
+export function runChildFlow(
+  child: runtime.ChildExecution,
+  closing?: (produced: FlowRun | undefined, error: unknown) => Promise<void>,
+): Promise<FlowRun> {
+  return runFlow(child.flow, child.inputs, {
+    executionId: child.id,
+    sessionKey: child.sessionKey,
+    trigger: child.trigger,
+    lineage: child.lineage,
+    ...(child.resume ? { resume: true } : {}),
+    ...(closing === undefined ? {} : { closing }),
+  });
+}
+
+// The plain runner, hosted as this module loads: a child execution started in a
+// process that owes it nothing more — an ejected caller of `runFlow` — runs and
+// settles like any execution and ships nothing. `src/serve.ts` and `src/cli.ts`
+// host their own over it for as long as they run (`runtime.hostChildren`).
+runtime.hostChildren((child) => runChildFlow(child));
+
+/**
+ * [`runFlow`]'s body, with the journal's lifecycle row already open.
+ *
+ * `identity` is grammar 4.1's `execution` root for the whole run: the id and the
+ * session, and — on a child execution — the source-item index of the dispatch
+ * that started it, because a child execution *is* the instance a `map`
+ * dispatched and `execution.item_index` is present everywhere inside one
+ * (PRD resolved q65, Decision D115).
+ */
 async function quiesceFlow(
   address: string,
   flow: CompiledFlow,
   parsed: Record<string, unknown>,
   ceiling: number,
-  sessionKey: string,
-  executionId: string,
+  identity: runtime.ExecutionIdentity,
   options: { readonly resumable?: boolean; readonly resume?: boolean },
 ): Promise<FlowRun> {
+  const executionId = identity.id;
   // Opened before the graph is streamed, so a status route asked the instant
   // after `start` answered already has somewhere to read this run's pauses from
   // (grammar 8.7, PRD 5.11). Every instance nested inside the run registers
@@ -4335,6 +4420,12 @@ async function quiesceFlow(
     // Grammar 8.6 rule 7 is untouched either way: the join returned at
     // dispatch, the trace entry was written without it, and this is `runFlow`
     // on its way out of a run that has already stopped advancing.
+    //
+    // A detached `flow.*` is **not** among them: it is a child execution with
+    // a record, a recovery and a divergence of its own (PRD resolved q65), so
+    // neither half is about it and this run waits for it on neither. What
+    // waits for a child is the process that would otherwise end under it
+    // (`src/cli.ts`, `runtime.childrenSettled`).
     if (runtime.staysOpen(executionId, outcome) || options.resume === true) {
       await runtime.settleDetached(executionId);
     }
@@ -4365,7 +4456,7 @@ async function quiesceFlow(
         $run: {
           ...runtime.emptyRun(),
           input: parsed,
-          execution: { id: executionId, session_key: sessionKey },
+          execution: identity,
         },
       },
       ceiling,
@@ -6526,6 +6617,90 @@ flow.f:
             declaration(&emitted, "flowFNodeEachMap:").contains("input: (roots) => ({\n      }),"),
             "…and so does a `map` dispatch onto the same flow, which is the \
              position that already answered:\n{emitted}"
+        );
+    }
+
+    /// **A detached `flow.*` dispatch starts a child execution; a joined one
+    /// instantiates the flow inside the map node's task** (PRD resolved q65,
+    /// grammar 8.6 rule 7).
+    ///
+    /// The two routes differ in what the dispatch *is*, so they differ in
+    /// everything the emitted `run` passes. A joined dispatch is an instance of
+    /// this node's — handed its signal, its site and its execution — while a
+    /// detached one is handed to `runtime.dispatchChild`, which derives an
+    /// execution of its own from the site and nothing else: not the node's clock,
+    /// not its collectors. A detached route that still instantiated the flow in
+    /// place would journal the child's effects under the parent's id, which is
+    /// the mechanism PRD resolved q65 was ratified to remove.
+    #[test]
+    fn a_detached_flow_dispatch_starts_a_child_execution() {
+        let source = format!(
+            r#"{PREAMBLE}
+flow.inner:
+  inputs: {{ goal: {{ type: string }} }}
+  outputs: {{}}
+  nodes:
+    only: {{ agent: agent.reviewer, input: {{ goal: "input.goal", draft: "'none'" }} }}
+  edges:
+    - {{ from: start, to: only }}
+    - {{ from: only, to: end }}
+
+flow.f:
+  inputs: {{ goals: {{ type: array, max_items: 4, items: {{ type: string }} }} }}
+  outputs: {{}}
+  nodes:
+    joined:
+      map:
+        over: input.goals
+        as: goal
+        node: flow.inner
+        max_concurrency: 2
+        input: {{ goal: "goal" }}
+    away:
+      map:
+        over: input.goals
+        as: goal
+        node: flow.inner
+        max_concurrency: 2
+        detach: true
+        input: {{ goal: "goal" }}
+  edges:
+    - {{ from: start, to: joined }}
+    - {{ from: joined, to: away }}
+    - {{ from: away, to: end }}
+"#
+        );
+        let ir = ir_of(&source);
+        assert!(
+            crate::check(&ir).is_empty(),
+            "the composition validates clean: {:#?}",
+            crate::check(&ir)
+        );
+        let mut names = Names::of(&ir);
+        declare(&mut names, &ir);
+        let emitted = module(&ir, &names).contents;
+
+        let away = declaration(&emitted, "flowFNodeAwayMap");
+        assert!(away.contains("detach: true,"), "{away}");
+        assert!(
+            away.contains(
+                "run: (input, _context, site) =>\n        runtime.dispatchChild(\"flow.inner\", input, site),"
+            ),
+            "a detached `flow.*` route starts a child execution from the dispatch site:\n{away}"
+        );
+        assert!(
+            !away.contains("runtime.runSubflow("),
+            "…and never instantiates the flow inside the map node's task:\n{away}"
+        );
+
+        let joined = declaration(&emitted, "flowFNodeJoinedMap");
+        assert!(
+            joined.contains("runtime.runSubflow(") && joined.contains("signal: context.signal,"),
+            "a joined `flow.*` route is an instance of the node's, on its clock:\n{joined}"
+        );
+        assert!(
+            !joined.contains("runtime.dispatchChild("),
+            "…and starts no child execution:\n{joined}"
         );
     }
 
