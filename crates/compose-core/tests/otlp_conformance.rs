@@ -426,15 +426,21 @@ fn every_expectation_is_a_well_formed_export() {
         );
 
         // Every parent, and every link, resolves to a span of this export — with
-        // the one exception §12.3 states: a root parented at the **caller's**
-        // span, which is not one of ours.
+        // the two exceptions §12.2 and §12.3 state: a root parented at the
+        // **caller's** span, which is not one of ours, and a detached delivery's
+        // root parented at its **parent execution's** root, which is in the
+        // parent's export rather than this one (PRD resolved q64).
         let caller = fixture["context"]["parent"]["spanId"].as_str();
+        let execution_root = detached_parent_root(&fixture["document"]);
         for span in spans {
             if let Some(parent) = span["parentSpanId"].as_str() {
                 assert!(
-                    ids.contains(parent) || Some(parent) == caller,
+                    ids.contains(parent)
+                        || (execution_root.is_none() && Some(parent) == caller)
+                        || Some(parent) == execution_root.as_deref(),
                     "{file}: the span `{}` is parented at `{parent}`, which this export does \
-                     not declare and no `traceparent` names",
+                     not declare, no `traceparent` names, and is not the parent execution's \
+                     root",
                     span["name"]
                 );
             }
@@ -730,6 +736,161 @@ fn is_iso_instant(held: &str) -> bool {
         && bytes[7] == b'-'
         && bytes[8..10].iter().all(u8::is_ascii_digit)
         && bytes[10] == b'T'
+}
+
+/// The first `bytes` bytes of SHA-256 over `input`, in lowercase hex — the
+/// derivation `docs/trace.md` §12.2 publishes, computed independently of the
+/// emitted module so the corpus is held to the document rather than to itself.
+fn derived(input: &str, bytes: usize) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(input.as_bytes())[..bytes]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The span id of the **parent execution's** root, for a detached delivery's
+/// envelope; `None` for every other envelope (PRD resolved q64, `docs/trace.md`
+/// §12.2).
+///
+/// A function of the execution id alone — the root of any execution is keyed by
+/// that id under the kind word `execution` — which is what lets a delivery's
+/// export name its parent's root without the parent's export in hand.
+fn detached_parent_root(document: &Value) -> Option<String> {
+    if document["detached"] != true {
+        return None;
+    }
+    let execution = document["execution_id"]
+        .as_str()
+        .expect("an envelope names its execution");
+    Some(derived(
+        &format!("agent-compose/span/v1\n{execution}\nexecution\n{execution}"),
+        8,
+    ))
+}
+
+/// **A detached delivery's export is rooted in its parent's trace, under its
+/// parent's root, and says so on its root span** (PRD resolved q64,
+/// `docs/trace.md` §12.2, §12.5).
+///
+/// The sink's second event class, read off the corpus. A detached envelope's
+/// `execution_id` is its parent's, so without the §12.2 rule for it its root
+/// would derive the parent root's very span id — two roots of one id, one span
+/// to a collector — and it would float free of the run it was dispatched from.
+/// So, for every detached fixture: the trace is the parent's (the caller's,
+/// where a `traceparent` started the parent; otherwise the one the execution id
+/// derives); the root is parented at the parent execution's root and is not that
+/// span; the root carries the envelope's head as the three documented
+/// attributes; and every entry's instance path hangs off the dispatch's key.
+/// And the other way round: no other envelope's root carries any of the three.
+#[test]
+fn a_detached_deliverys_export_is_rooted_under_its_parents_execution() {
+    let heads = [
+        "agentcompose.detached",
+        "agentcompose.parent_execution",
+        "agentcompose.idempotency_key",
+    ];
+    let mut statuses: BTreeSet<String> = BTreeSet::new();
+    let mut traced_into = false;
+    for (file, fixture) in fixtures() {
+        let document = &fixture["document"];
+        let spans = fixture["expected"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{file}: a scope carries spans"));
+        let root = &spans[0];
+        let attribute = |key: &str| -> Option<Value> {
+            root["attributes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|held| held["key"] == key)
+                .map(|held| held["value"].clone())
+        };
+        let Some(parent_root) = detached_parent_root(document) else {
+            for head in heads {
+                assert!(
+                    attribute(head).is_none(),
+                    "{file}: `{head}` is on the root of an envelope that is not a detached \
+                     delivery's (`docs/trace.md` §12.5)"
+                );
+            }
+            continue;
+        };
+        statuses.insert(document["status"].as_str().unwrap_or_default().to_string());
+        let execution = document["execution_id"].as_str().expect("an execution id");
+        let key = document["idempotency_key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{file}: a detached envelope carries its key"));
+
+        let caller = fixture["context"]["parent"]["traceId"].as_str();
+        traced_into |= caller.is_some();
+        let trace = caller.map_or_else(
+            || derived(&format!("agent-compose/trace/v1\n{execution}"), 16),
+            str::to_string,
+        );
+        assert_eq!(
+            root["traceId"], trace,
+            "{file}: a detached delivery is exported into its parent's trace"
+        );
+        assert_eq!(
+            root["parentSpanId"], parent_root,
+            "{file}: a detached delivery's root hangs off its parent execution's root — not \
+             off a caller's span, which started the parent and not the delivery"
+        );
+        assert_ne!(
+            root["spanId"], parent_root,
+            "{file}: a detached delivery's root is not its parent's root"
+        );
+        assert_eq!(
+            root["spanId"],
+            derived(
+                &format!("agent-compose/span/v1\n{execution}\nexecution\n{key}"),
+                8
+            ),
+            "{file}: a detached delivery's root is keyed by its idempotency key (§12.2)"
+        );
+        assert_eq!(
+            attribute("agentcompose.detached"),
+            Some(serde_json::json!({ "boolValue": true })),
+            "{file}"
+        );
+        assert_eq!(
+            attribute("agentcompose.parent_execution"),
+            Some(serde_json::json!({ "stringValue": document["parent_execution"] })),
+            "{file}"
+        );
+        assert_eq!(
+            attribute("agentcompose.idempotency_key"),
+            Some(serde_json::json!({ "stringValue": key })),
+            "{file}"
+        );
+        for span in &spans[1..] {
+            for held in span["attributes"].as_array().into_iter().flatten() {
+                if held["key"] == "agentcompose.instance_path" {
+                    let path = held["value"]["stringValue"].as_str().unwrap_or_default();
+                    assert!(
+                        path.starts_with(&format!("{key}/")),
+                        "{file}: `{path}` does not hang off the dispatch's own path `{key}`, as \
+                         an instance's entries do (`docs/trace.md` §8)"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        statuses,
+        ["completed", "failed"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<String>>(),
+        "the corpus holds a detached delivery that completed and one that failed — a failed \
+         delivery ships too, with its outcome (PRD resolved q64)"
+    );
+    assert!(
+        traced_into,
+        "no detached fixture sits under a caller's `traceparent`, which is the one context in \
+         which a caller's span and the parent execution's root are different parents to pick"
+    );
 }
 
 /// **The caller's trace is adopted, not merely noted** (`docs/trace.md` §12.3).

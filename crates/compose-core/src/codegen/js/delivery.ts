@@ -15,7 +15,9 @@
 //    `callback_allow:` at the delivery. That half stays in `./serve.ts`, where
 //    the trigger is.
 //  * `trace_sink` — the settled trace every execution ships to the address the
-//    deploy layer names (grammar §14.5, PRD resolved q50). The URL is written by
+//    deploy layer names (grammar §14.5, PRD resolved q50), and — the sink's
+//    second event class — the envelope every settled detached `flow.*`
+//    delivery ships of its own (PRD resolved q64). The URL is written by
 //    the operator in the deploy file, beside the database credentials, and is
 //    trusted on the terms a connection string is: there is no allowlist, and
 //    `refused` — the status an allowlist miss produces — cannot apply to one.
@@ -33,7 +35,9 @@
 // a row with an outcome and a sentence on stderr. The trace is shipped from the
 // hook that closes the lifecycle row, so an export is at-least-once with the rest
 // of the ledger — and a run whose sink is a black hole still prints its answer
-// and exits with the code its outcome earned.
+// and exits with the code its outcome earned. A detached delivery's envelope is
+// shipped from the moment that delivery settles, which is past the join and
+// downstream of everything the flow instance waits for (grammar 8.6 rule 7).
 
 import { createHmac } from "node:crypto";
 import process from "node:process";
@@ -45,10 +49,12 @@ import { exportRequest, parseTraceparent } from "./otlp.ts";
 import {
   TRACE_VERSION,
   deliveriesOf,
+  detachedTraceDocument,
   exhaustRecordedDelivery,
   intendDelivery,
   journaledExecution,
   recordDeliveryAttempt,
+  traceSinkClass,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 
@@ -154,7 +160,95 @@ export async function shipTrace(
   // (`docs/durability.md` §6.1), and the row is where it survived.
   const row = await journaledExecution(settled.execution);
   const startedAt = row?.startedAt ?? new Date().toISOString();
-  const parent = parseTraceparent(row?.traceparent);
+  return await intendExport(sink, document, {
+    startedAt,
+    endedAt: new Date().toISOString(),
+    traceparent: row?.traceparent,
+  });
+}
+
+/**
+ * Journal a settled **detached `flow.*` delivery**'s own envelope, and answer
+ * with the row (PRD resolved q64, `docs/trace.md` §1.4).
+ *
+ * The sink's second event class, and the same channel as the first: one row on
+ * the delivery ledger of the execution the delivery ran under, `kind:
+ * "trace_sink"` and `event: "settled"` — a delivery that has stopped is what a
+ * `settled` row records — worked on the same schedule, signed with the same
+ * identity and shaped by the same `format:` switch. What tells the two classes
+ * apart is the body's head (`detached: true`, or the root span's
+ * `agentcompose.detached` under `format: otlp`), which is where a receiver
+ * reads it too; the wire's `X-AgentCompose-Event` vocabulary is grammar 13.3's
+ * and does not move.
+ *
+ * **No "already shipped" guard**, and the absence is the ruling rather than an
+ * oversight. The parent's export is once per execution because a settle is; a
+ * detached delivery is re-run by the recovery of its parent (`docs/durability.md`
+ * §3.2) and re-ships on *that* settlement, so its envelope is at-least-once, and
+ * a receiver dedupes on `(parent_execution, idempotency_key)` — grammar 9.4's
+ * receiver-side rule, read one more time. A second row is a second delivery id
+ * for the same delivery, which is exactly what that pair exists to fold.
+ *
+ * The window is the delivery's own — issued to settled — and the caller's trace,
+ * where the parent's request carried one, is the parent's: the envelope is
+ * exported **into** the trace its parent's export lands in (`docs/trace.md`
+ * §12.2).
+ */
+export async function shipDetachedTrace(
+  settled: runtime.DetachedSettlement,
+): Promise<runtime.DeliveryRecord | undefined> {
+  const sink = traceSink;
+  if (sink === undefined) return undefined;
+  const row = await journaledExecution(settled.parentExecution);
+  return await intendExport(sink, detachedTraceDocument(settled), {
+    startedAt: settled.dispatchedAt,
+    endedAt: settled.settledAt,
+    traceparent: row?.traceparent,
+  });
+}
+
+/**
+ * [`shipDetachedTrace`], insisted on, and said on stderr where the ladder ends.
+ *
+ * What both processes that settle executions call from their
+ * `watchDetachedSettlements` listener: the intent is the one write nothing else
+ * comes back to — no lifecycle row is closing for a delivery, and a replay
+ * re-ships only where the parent is recovered — so a journal busy for a moment
+ * costs the envelope a retry rather than the envelope. Never throws: the
+ * listener it runs in is downstream of a delivery that has already settled, and
+ * nothing it does may reach back (grammar 8.6 rule 7).
+ */
+export async function journalDetachedTrace(
+  settled: runtime.DetachedSettlement,
+): Promise<runtime.DeliveryRecord | undefined> {
+  let journaled: runtime.DeliveryRecord | undefined;
+  await insisting(async () => {
+    try {
+      journaled = await shipDetachedTrace(settled);
+      return true;
+    } catch (error) {
+      process.stderr.write(
+        `the detached delivery \`${settled.idempotencyKey}\`'s trace could not be journaled: ${message(error)}\n`,
+      );
+      return false;
+    }
+  });
+  return journaled;
+}
+
+/**
+ * Serialize one export in the sink's `format:` and journal its intent.
+ *
+ * One writer for both event classes, so the switch between the envelope and
+ * OTLP/JSON is made once: a second copy is where the two classes would start to
+ * ship different things under one `format:`.
+ */
+async function intendExport(
+  sink: NonNullable<typeof traceSink>,
+  document: runtime.TraceDocument,
+  window: { readonly startedAt: string; readonly endedAt: string; readonly traceparent?: string },
+): Promise<runtime.DeliveryRecord> {
+  const parent = parseTraceparent(window.traceparent);
   const body =
     sink.format === "otlp"
       ? JSON.stringify(
@@ -162,22 +256,39 @@ export async function shipTrace(
             target: deployTarget,
             artifact: ARTIFACT_HASH,
             compiler: COMPILER_VERSION,
-            startedAt,
-            endedAt: new Date().toISOString(),
+            startedAt: window.startedAt,
+            endedAt: window.endedAt,
             ...(parent === undefined ? {} : { parent }),
           }),
         )
       : JSON.stringify(document);
   return await intendDelivery({
-    execution: settled.execution,
+    execution: document.execution_id,
     kind: "trace_sink",
     event: "settled",
     url: sink.url,
     body,
-    // A trace export reports no pauses: it is the record of a run that has
-    // stopped.
+    // A trace export reports no pauses: it is the record of a run — or of a
+    // detached delivery — that has stopped.
     pauses: [],
   });
+}
+
+/**
+ * Whether one `trace_sink` row is its execution's **own** export, rather than
+ * the envelope a detached delivery under it shipped (PRD resolved q64).
+ *
+ * Asked of `runtime.traceSinkClass`, the one reader of the difference — which
+ * the status route's report asks too — and it reads it off the body: both are
+ * `trace_sink` rows of `settled` events on one execution, and the journal gains
+ * no column for it. A `"detached"` row is not the export, and neither is a body
+ * that cannot be read: it answers `false` — "not known to be the export" — for
+ * [`exportedAlready`]'s reason: the direction "I cannot tell" resolves toward is
+ * the one a receiver can dedupe.
+ */
+export function executionExport(record: runtime.DeliveryRecord): boolean {
+  if (record.kind !== "trace_sink") return false;
+  return traceSinkClass(record) === "execution";
 }
 
 // ---------------------------------------------------------------------------
@@ -193,10 +304,17 @@ export async function shipTrace(
  * resolve toward the recoverable half. Delivery is at-least-once and receivers
  * dedupe on the delivery id, so a trace exported twice is a collector's
  * duplicate; a trace exported never is a run nothing will ever describe.
+ *
+ * **Only the execution's own export counts** ([`executionExport`]). A detached
+ * `flow.*` delivery under this execution ships its envelope onto the same
+ * ledger, as a `trace_sink` row of its own — usually *before* its parent
+ * settles, since the parent is the one still running — and a guard that read
+ * any such row as "exported" would silence the parent's trace for the life of
+ * the journal (PRD resolved q64).
  */
 async function exportedAlready(execution: string): Promise<boolean> {
   try {
-    return (await deliveriesOf(execution)).some((record) => record.kind === "trace_sink");
+    return (await deliveriesOf(execution)).some(executionExport);
   } catch {
     return false;
   }

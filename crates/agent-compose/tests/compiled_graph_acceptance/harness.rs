@@ -129,6 +129,13 @@ pub const FIXTURES: &[&str] = &[
     "agent-openai",
     "bounded-cycle",
     "builtin-tools",
+    // The trace sink's second event class (PRD resolved q64): detached `flow.*`
+    // deliveries whose own envelopes ship beside their parents'. Under `local`
+    // with no deploy file — which is what `the_acceptance_fixtures_validate_clean`
+    // resolves it as — it declares no sink; `tests/trace_sink_acceptance.rs`
+    // writes the `deploy/local.yml` it needs into a copy, as it does for
+    // `trace-sink`, and `local` is the one target `detach: true` is legal under.
+    "detached-trace-sink",
     "durability",
     "fanout",
     "flow-as-tool",
@@ -2161,6 +2168,8 @@ pub struct Receiver {
     delivered: Arc<Mutex<Vec<Delivered>>>,
     /// Statuses to answer the next requests with, oldest first.
     script: Arc<Mutex<std::collections::VecDeque<u16>>>,
+    /// How long to sit on the next requests before answering, oldest first.
+    holds: Arc<Mutex<std::collections::VecDeque<Duration>>>,
     /// What to answer once the script is spent.
     fallback: Arc<AtomicU32>,
     /// The `Location:` every answer carries, where one has been set.
@@ -2177,12 +2186,14 @@ impl Receiver {
         listener.set_nonblocking(true)?;
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let holds = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let fallback = Arc::new(AtomicU32::new(200));
         let location: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let delivered = Arc::clone(&delivered);
             let script = Arc::clone(&script);
+            let holds = Arc::clone(&holds);
             let fallback = Arc::clone(&fallback);
             let location = Arc::clone(&location);
             let stop = Arc::clone(&stop);
@@ -2197,8 +2208,14 @@ impl Receiver {
                                 .unwrap_or_else(|| {
                                     u16::try_from(fallback.load(Ordering::Relaxed)).unwrap_or(200)
                                 });
+                            let hold = holds
+                                .lock()
+                                .expect("the holds")
+                                .pop_front()
+                                .unwrap_or(Duration::ZERO);
                             let moved = location.lock().expect("the location").clone();
-                            if let Some(held) = deliver(&mut stream, answer, moved.as_deref()) {
+                            if let Some(held) = deliver(&mut stream, answer, hold, moved.as_deref())
+                            {
                                 delivered.lock().expect("the deliveries").push(held);
                             }
                         }
@@ -2216,6 +2233,7 @@ impl Receiver {
             base_url,
             delivered,
             script,
+            holds,
             fallback,
             location,
             stop,
@@ -2227,6 +2245,18 @@ impl Receiver {
     pub fn answer_with(&self, statuses: &[u16]) {
         let mut script = self.script.lock().expect("the script");
         script.extend(statuses.iter().copied());
+    }
+
+    /// Sit on the next requests for these durations, in order, before answering
+    /// each — the shape of a collector that is up and slow. A request past the
+    /// end of the list is answered at once.
+    ///
+    /// The receiver answers one connection at a time, so a hold also holds every
+    /// request behind it: what a sender sees is exactly a POST that takes this
+    /// long, which is what a claim about "while it was still sending" needs.
+    pub fn hold_answers(&self, holds: &[Duration]) {
+        let mut queued = self.holds.lock().expect("the holds");
+        queued.extend(holds.iter().copied());
     }
 
     /// Answer every request from now on with this status.
@@ -2410,7 +2440,12 @@ impl Drop for Blackhole {
 
 /// Read one HTTP request off `stream`, answer it `status` — under `location`,
 /// where one was given — and hand it back.
-fn deliver(stream: &mut TcpStream, status: u16, location: Option<&str>) -> Option<Delivered> {
+fn deliver(
+    stream: &mut TcpStream,
+    status: u16,
+    hold: Duration,
+    location: Option<&str>,
+) -> Option<Delivered> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("a read budget");
@@ -2440,6 +2475,9 @@ fn deliver(stream: &mut TcpStream, status: u16, location: Option<&str>) -> Optio
             Ok(read) => buffer.extend_from_slice(&chunk[..read]),
         }
     }
+    // The request is read in full before the hold, so what is slow is the
+    // answer: the sender has sent everything and is waiting on this.
+    std::thread::sleep(hold);
     let moved = match location {
         Some(url) => format!("location: {url}\r\n"),
         None => String::new(),

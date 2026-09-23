@@ -1392,7 +1392,15 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
 ///     every node it had left *after* the node that started it had failed. The
 ///     detached counterpart is asserted beside it, because Decision D94 puts
 ///     that delivery off the node's clock and the same signal must not cross
-///     there.
+///     there;
+///   * **a detached `flow.*` delivery is collected on a trace of its own and
+///     never on its parent's** (PRD resolved q64). The parent's entry keeps the
+///     stub record and nothing the delivery did; the delivery's collector hears
+///     its settlement after the join has returned, for a completed and a failed
+///     delivery alike, and not for one that met a divergence or for a `tool.*`
+///     sink — which is a claim about *who* holds a record, and only the runtime
+///     can be asked that. Beside it, the one reader that tells the two event
+///     classes' ledger rows apart, over the bytes both `format:`s write.
 ///
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds, so driving it directly is driving what every project runs.
@@ -1804,6 +1812,119 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
             "exempt": { "onError": "skip" },
             "plain": { "timeoutMs": 10_000, "onError": "fail" },
         })
+    );
+
+    // PRD resolved q64, the first half: the parent's entry does not move. Its
+    // `models` is the joined instance's call and no other — the three deliveries
+    // that each pushed a call, a store op and a tool dispatch into whatever
+    // context they were handed pushed into nothing — and every detached dispatch
+    // is the stub record `docs/trace.md` §5.1 describes: `attempts: 0`, no
+    // `inner`, whatever the delivery went on to do.
+    let collected = &observed["detachedCollector"];
+    assert_eq!(
+        collected["parent"],
+        serde_json::json!({
+            "models": ["model.joined"],
+            "stores": null,
+            "toolDispatches": null,
+            "dispatches": [
+                { "index": 0, "target": "agent.worker", "outcome": "completed", "attempts": 1,
+                  "key": "exec_trace_q64/hand_off/0/0", "inner": null },
+                { "index": 1, "target": "flow.review", "outcome": "detached", "attempts": 0,
+                  "key": "exec_trace_q64/hand_off/0/1", "inner": null },
+                { "index": 2, "target": "flow.broken", "outcome": "detached", "attempts": 0,
+                  "key": "exec_trace_q64/hand_off/0/2", "inner": null },
+                { "index": 3, "target": "flow.diverged", "outcome": "detached", "attempts": 0,
+                  "key": "exec_trace_q64/hand_off/0/3", "inner": null },
+                { "index": 4, "target": "tool.sink", "outcome": "detached", "attempts": 0,
+                  "key": "exec_trace_q64/hand_off/0/4", "inner": null },
+            ],
+        }),
+        "a detached delivery's activity reached its parent's entry (`docs/trace.md` §5.1)"
+    );
+    // The second half: the delivery's own collector, settled where the
+    // quiescence mark comes off — after the join returned, so nothing was heard
+    // by the time the node answered — and heard for the two `flow.*` deliveries
+    // that ended, the failed one included. Not for the one that diverged, which
+    // did not end (q29's "a divergence fires nothing"), and not for the
+    // `tool.*` sink, which runs no nodes and has no trace of its own to ship. A
+    // listener that throws cost the one beside it nothing.
+    assert_eq!(
+        collected["heardAtReturn"], 0,
+        "a settlement was announced before the join it is detached from returned"
+    );
+    assert_eq!(
+        collected["heard"],
+        serde_json::json!(["exec_trace_q64/hand_off/0/1", "exec_trace_q64/hand_off/0/2"])
+    );
+    assert_eq!(
+        collected["review"],
+        serde_json::json!({
+            "parentExecution": "exec_trace_q64",
+            "flow": "flow.review",
+            "status": "completed",
+            "error": null,
+            "entries": [["judge", "completed", 1]],
+            "ordered": true,
+        }),
+        "the completed delivery's collector holds its instance's own trace"
+    );
+    assert_eq!(collected["broken"]["status"], "failed");
+    assert_eq!(
+        collected["broken"]["entries"],
+        serde_json::json!([["judge", "completed"], ["file", "failed"]]),
+        "a delivery that failed still carries the trace it made, off its `SubflowFailure`"
+    );
+    assert!(
+        collected["broken"]["error"]
+            .as_str()
+            .is_some_and(|held| held.starts_with("SubflowFailure: ")),
+        "a failed delivery's error is in `<error name>: <message>` shape: {collected:#}"
+    );
+    // The envelope a settlement ships, head first: the version, `detached`,
+    // the parent it ran under and the key its stub record carries — and the
+    // parent's id as `execution_id`, because a delivery is not an execution.
+    assert_eq!(
+        collected["document"],
+        serde_json::json!({
+            "trace_version": 4,
+            "detached": true,
+            "parent_execution": "exec_trace_q64",
+            "idempotency_key": "exec_trace_q64/hand_off/0/1",
+            "flow": "flow.review",
+            "execution_id": "exec_trace_q64",
+            "status": "completed",
+            "entries": [{
+                "step": 1, "flow": "flow.review", "node": "judge", "traversal": 0,
+                "outcome": "completed", "attempts": 1, "writes": [],
+                "models": [{ "model": "model.local", "servedBy": "model.local",
+                             "fallback": 0, "failovers": [] }],
+            }],
+        })
+    );
+    assert_eq!(collected["failedDocument"]["status"], "failed");
+    assert_eq!(
+        collected["failedDocument"]["error"], collected["broken"]["error"],
+        "a failed delivery's envelope carries its outcome"
+    );
+    // …and the one reader of which class a sink row is, over the bytes both
+    // `format:`s write. The export guard counts only `"execution"` and the
+    // status route's report leaves out only `"detached"`, so a body neither can
+    // read — and a callback row, whatever it holds — is neither.
+    assert_eq!(
+        collected["sinkClass"],
+        serde_json::json!({
+            "envelopeExport": "execution",
+            "envelopeDetached": "detached",
+            "otlpExport": "execution",
+            "otlpDetached": "detached",
+            "unreadable": null,
+            "notAnObject": null,
+            "noSpans": null,
+            "callback": null,
+        }),
+        "`runtime.traceSinkClass` misreads a sink row, so a delivery's envelope reaches the \
+         status route's report or silences its parent's export"
     );
 }
 

@@ -184,6 +184,13 @@ state (`detached-write`), and its target **must not reach a `human` node**
 answer. `max_concurrency` still admits it: a detached dispatch waits for a
 permit to *start*, the join just never waits on its outcome.
 
+In the trace, the map node's entry records a detached dispatch as a stub —
+`outcome: "detached"`, `attempts: 0`, no `inner` — and nothing the delivery goes
+on to do. A detached `flow.*` delivery's own account is elsewhere: under a
+target that declares a `trace_sink:`, it ships an envelope of its own when it
+settles, headed `detached: true` and an `idempotency_key` equal to the stub's
+(`agent-compose docs trace`).
+
 In v0, `detach: true` is a validation error under any target whose execution
 state is durably checkpointed — every target except `local`. The same
 composition is legal under `--target local` and rejected under

@@ -166,9 +166,12 @@ export interface ExportContext {
   readonly artifact: string;
   /** `COMPILER_VERSION` — the agent-compose release that emitted this module. */
   readonly compiler: string;
-  /** When the execution opened, as an ISO 8601 instant. */
+  /**
+   * When the execution opened, as an ISO 8601 instant — or, for a detached
+   * delivery's envelope, when the delivery was issued.
+   */
   readonly startedAt: string;
-  /** When it settled, as an ISO 8601 instant. */
+  /** When it settled — the execution, or the detached delivery — as an ISO 8601 instant. */
   readonly endedAt: string;
   /** The inbound `traceparent` this execution was started by, where there was one. */
   readonly parent?: TraceParent;
@@ -198,6 +201,12 @@ const SCOPE_NAME = "agent-compose";
  *  * a **flow-as-tool** call links the model-call span to the dispatch span that
  *    answered it (resolved q51's `span links`).
  *
+ * A **detached delivery's** envelope (PRD resolved q64) is the same tree rooted
+ * one step further in: its root is the delivery rather than the execution, hung
+ * off the parent execution's root span in the parent's trace, and it carries the
+ * envelope's head — `detached`, `parent_execution`, `idempotency_key` — as
+ * attributes (`docs/trace.md` §12.2, §12.5).
+ *
  * What is deliberately **not** carried is payload: `StoreRecord.answer` and
  * `ToolCallRecord.result` are in the envelope and are not mapped to attributes.
  * `docs/trace.md` §11 keeps a model's completion and a tool's answer out of this
@@ -218,11 +227,30 @@ export function exportRequest(
   const emitted: OtlpSpan[] = [];
   const state: Emission = { document, context, traceId, window, spans: emitted };
 
-  const rootId = spanIdOf(document.execution_id, "execution", document.execution_id);
+  // **A detached delivery's envelope is rooted where it ran** (PRD resolved
+  // q64, `docs/trace.md` §12.2). Its `execution_id` is its parent's, so the
+  // trace id above is the parent's trace — the delivery's spans land in the
+  // trace its parent's export lands in — and three things change beside it:
+  //
+  //  * the root's key is the delivery's `idempotency_key` rather than the
+  //    execution id, so its span id cannot be the parent's root's, which the
+  //    same execution id and kind word would otherwise derive;
+  //  * the root hangs off the **parent's root span**, whose id is a function of
+  //    the execution id alone and so is known here without the parent's export
+  //    in hand: a detached delivery ran under that execution, past its join;
+  //  * the entries' instance paths hang off the dispatch's own path, which the
+  //    key is (grammar 9.4) — exactly as a joined dispatch's `inner` does.
+  const detached = document.detached === true ? document.idempotency_key : undefined;
+  const rootKey = detached ?? document.execution_id;
+  const rootId = spanIdOf(document.execution_id, "execution", rootKey);
+  const rootParent =
+    detached !== undefined
+      ? spanIdOf(document.execution_id, "execution", document.execution_id)
+      : context.parent?.spanId;
   emitted.push({
     traceId,
     spanId: rootId,
-    ...(context.parent === undefined ? {} : { parentSpanId: context.parent.spanId }),
+    ...(rootParent === undefined ? {} : { parentSpanId: rootParent }),
     name: document.flow,
     kind: 1,
     startTimeUnixNano: window.start,
@@ -233,6 +261,19 @@ export function exportRequest(
       text("agentcompose.status", document.status),
       integer("agentcompose.trace_version", document.trace_version),
       ...(document.error === undefined ? [] : [text("agentcompose.error", document.error)]),
+      // The envelope's head, read onto the root span: how a collector tells the
+      // sink's two event classes apart, and the pair it dedupes a re-shipped
+      // delivery on.
+      ...(detached === undefined
+        ? []
+        : [
+            { key: "agentcompose.detached", value: { boolValue: true } },
+            text(
+              "agentcompose.parent_execution",
+              document.parent_execution ?? document.execution_id,
+            ),
+            text("agentcompose.idempotency_key", detached),
+          ]),
     ],
     events: [],
     links: [],
@@ -247,7 +288,7 @@ export function exportRequest(
             { code: 0 },
   });
 
-  walk(state, document.entries, document.execution_id, document.execution_id, rootId);
+  walk(state, document.entries, rootKey, rootKey, rootId);
 
   return {
     resourceSpans: [

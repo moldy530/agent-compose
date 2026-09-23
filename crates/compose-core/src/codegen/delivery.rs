@@ -77,10 +77,35 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
             "`src/delivery.ts` reaches a refusal, which is a `callback` row's outcome and not a \
              sink's: there is no list a sink's address could miss (grammar §14.5)"
         );
+        // The once-per-execution guard asks which **kind** a row is — a callback
+        // webhook is not an export — and, since PRD resolved q64 put a second
+        // event class on the sink's rows, which **class**: a detached delivery's
+        // envelope is not its parent's export either.
+        let guard = SOURCE
+            .split_once("async function exportedAlready(")
+            .expect("`src/delivery.ts` guards the export")
+            .1
+            .split_once("\n}\n")
+            .expect("…in a function with a closing brace")
+            .0;
         assert!(
-            SOURCE.contains("record.kind === \"trace_sink\""),
-            "the once-per-execution guard no longer asks the ledger which kind a row is, so a \
-             callback webhook would stand in for an export nobody made"
+            guard.contains("executionExport"),
+            "the once-per-execution guard no longer asks whether a row is the execution's **own** \
+             export, so a detached delivery's envelope would silence its parent's trace"
+        );
+        let own = SOURCE
+            .split_once("export function executionExport(")
+            .expect("`src/delivery.ts` tells an execution's export from a delivery's envelope")
+            .1
+            .split_once("\n}\n")
+            .expect("…in a function with a closing brace")
+            .0;
+        assert!(
+            own.contains("record.kind !== \"trace_sink\"")
+                && own.contains("traceSinkClass(record) === \"execution\""),
+            "the export guard no longer asks the ledger which kind a row is and which class, so \
+             a callback webhook or a detached delivery's envelope would stand in for an export \
+             nobody made"
         );
         assert!(
             SOURCE.contains("kind: \"trace_sink\""),
@@ -109,7 +134,7 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
             .find("exportedAlready(")
             .expect("a settle is once per execution, and the ledger is what says so");
         let journaled = ship
-            .find("intendDelivery(")
+            .find("intendExport(")
             .expect("…and the intent is recorded");
         assert!(
             guarded < journaled,
@@ -120,6 +145,43 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
             !ship.contains("workDelivery("),
             "`shipTrace` attempts the delivery itself, so the hook that closes a lifecycle row \
              would wait on a collector (PRD resolved q50: never blocking the run it describes)"
+        );
+    }
+
+    /// **A detached delivery's envelope is journaled, never sent from the
+    /// intent, and never guarded as once-only** (PRD resolved q64).
+    ///
+    /// The sibling above, read for the sink's second event class, and its one
+    /// deliberate difference. An execution's export is once per execution because
+    /// a settle is; a detached delivery is re-run by its parent's recovery and
+    /// re-ships on that settlement — at-least-once, deduped by a receiver on
+    /// `(parent_execution, idempotency_key)` — so a guard here would be the
+    /// runtime deciding a dedupe the ruling gives to the receiver, and would be
+    /// wrong besides: a map node's own `retry:` re-issues a delivery under the
+    /// same key, and that is a delivery the ledger has to carry.
+    #[test]
+    fn a_detached_envelope_is_journaled_unguarded_and_never_sent_from_the_intent() {
+        let ship = SOURCE
+            .split_once("export async function shipDetachedTrace(")
+            .expect("`src/delivery.ts` ships a detached delivery's envelope")
+            .1
+            .split_once("\n}\n")
+            .expect("…in a function with a closing brace")
+            .0;
+        assert!(
+            ship.contains("intendExport(") && ship.contains("detachedTraceDocument("),
+            "a detached delivery's envelope is the runtime's one writer of it, journaled through \
+             the one export writer"
+        );
+        assert!(
+            !ship.contains("exportedAlready("),
+            "a detached delivery's envelope is guarded as once-only, so a recovered delivery \
+             never re-ships (PRD resolved q64: at-least-once across recovery)"
+        );
+        assert!(
+            !ship.contains("workDelivery("),
+            "`shipDetachedTrace` attempts the delivery itself, so a settling delivery would \
+             wait on a collector"
         );
     }
 }

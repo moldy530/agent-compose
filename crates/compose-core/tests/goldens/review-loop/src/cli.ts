@@ -142,6 +142,7 @@ import {
   CallbackRetryError,
   blankSinkCredentials,
   insisting,
+  journalDetachedTrace,
   shipTrace,
   sinkAuth,
   sinkConfigured,
@@ -164,6 +165,7 @@ import {
   journaledExecution,
   openExecutions,
   releaseJournal,
+  watchDetachedSettlements,
   watchHumanPauses,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
@@ -401,9 +403,37 @@ async function execute(job: Job): Promise<number> {
   // after the run has reported: PRD resolved q50 puts the sink "wherever
   // executions settle, `run` included", and never in front of the answer.
   const exported: { record?: runtime.DeliveryRecord } = {};
-  const code = await executing(job, exported);
-  await shipped(exported.record);
-  return code;
+  // …and the sink's second event class (PRD resolved q64): the envelope every
+  // detached `flow.*` delivery ships when it settles. Journaled from the moment
+  // each one settles and sent here, after the answer, exactly as the run's own
+  // export is. A delivery still in flight when this command exits is one the
+  // command's exit ends — `detach: true` promises that nothing waits for it —
+  // so what this can ship is what settled while the command was still here.
+  const detached: Promise<runtime.DeliveryRecord | undefined>[] = [];
+  const unwatch = sinkConfigured()
+    ? watchDetachedSettlements((settled) => {
+        detached.push(journalDetachedTrace(settled));
+      })
+    : () => {};
+  try {
+    const code = await executing(job, exported);
+    await shipped(exported.record);
+    // **Drained, not snapshotted.** "Still here" lasts until this command
+    // returns, and the sending below is part of that: each POST can take an
+    // attempt's ten seconds (`docs/durability.md` §3.7), and a delivery that
+    // settles during one of them is one this command was still here for. So the
+    // subscription stays open while it sends, the list is re-read after every
+    // POST, and it is let go of only once nothing is left unsent — which is a
+    // check and a return with no `await` between them, so no settlement can land
+    // in a gap between "nothing left" and "stopped listening" and be dropped
+    // with no row, no POST and no word on stderr.
+    for (let sent = 0; sent < detached.length; sent += 1) {
+      await shipped(await detached[sent]);
+    }
+    return code;
+  } finally {
+    unwatch();
+  }
 }
 
 /**

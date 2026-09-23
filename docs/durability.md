@@ -549,8 +549,23 @@ carries.
 
 A **detached** `map` delivery (`docs/grammar.md` §8.6 rule 7) is journaled like
 any other effect under the dispatch's own instance path. Its outcome is never
-observed by the join (Decision D94) and nothing about the trace changes; what
-the record buys is that a replay does not deliver it twice. A divergence raised
+observed by the join (Decision D94) and nothing about the parent's trace
+changes; what the record buys is that a replay does not deliver it twice.
+
+A detached **`flow.*`** delivery is also where the trace sink's second event
+class comes from (`docs/trace.md` §1.4, PRD resolved q64): when it settles it
+ships an envelope of its own. That envelope is a delivery on the parent's
+ledger (§3.7) and nothing else — no lifecycle row, no journal of its own, no
+record this section does not already write — because the delivery is not an
+execution: its effects stay journaled under the parent's id, and replay is
+untouched. Its recovery is the parent's. A generation that resumes the parent
+re-runs the delivery, replaying what this section holds, and the delivery
+re-ships on **that** settlement under a new delivery id — so the envelope is
+at-least-once across recovery, and a receiver dedupes it on
+`(parent_execution, idempotency_key)` rather than on the delivery id. A
+delivery that meets a divergence ships nothing (§7: a divergence fires
+nothing), and one still in flight when a settled parent's process dies is not
+recovered, because nothing resumes a settled execution. A divergence raised
 inside one is the exception to rule 7's "nothing it does can delay the enclosing
 flow instance" — §7 makes a divergence un-absorbable by any policy, and
 `detach:` is a policy — so it is held against the execution and fails it: at the
@@ -708,7 +723,17 @@ are worked:
 * a **trace sink** export, which the deploy layer's `trace_sink:` subscribed to
   for every execution the deployment settles (`docs/grammar.md` §14.5, PRD
   resolved q50). One per settled execution, carrying the trace envelope
-  `docs/trace.md` §2 specifies or the OTLP/JSON §12 maps it to.
+  `docs/trace.md` §2 specifies or the OTLP/JSON §12 maps it to — and, the
+  sink's second event class, one per settled **detached `flow.*` delivery**,
+  carrying that delivery's own envelope (`docs/trace.md` §1.4, PRD resolved
+  q64). A delivery's envelope is a row on the ledger of the execution it ran
+  under, because a detached delivery is not an execution: it has no lifecycle
+  row and no journal of its own. It is on that ledger and not in that
+  execution's **report**: the status route's `deliveries`, which every `parked`
+  and `settled` webhook carries (`docs/grammar.md` §13.3), lists the
+  execution's own deliveries and leaves a delivery's envelope out — it is not
+  one of the execution's lifecycle events, and it is journaled while the
+  execution may still be running or parked.
 
 Nothing in the composition dispatches either: the graph does not know the
 subscription exists, no instance path addresses it, and no replay ever consumes
@@ -723,7 +748,7 @@ What is recorded, and in this order (PRD resolved q35, q50):
 | `execution`, `ordinal` | who it is about, and which of that execution's lifecycle events it is. The ordinal is **monotonically increasing per execution across every kind and event** and is allocated in the journal, so a restart cannot reuse one |
 | `id` | `<execution_id>:<ordinal>` — the `X-AgentCompose-Delivery` header, and what a receiver dedupes on. The same on every attempt |
 | `kind` | `callback` or `trace_sink` — who asked. A row written before the ledger recorded this is a `callback`, which is the only kind that existed then |
-| `event` | `parked` or `settled`. A `trace_sink` row is always `settled`: it is the record of a run that has stopped |
+| `event` | `parked` or `settled`. A `trace_sink` row is always `settled`: it is the record of a run that has stopped — or, for a detached delivery's envelope, of a delivery that has. The two are told apart by the body's head (`docs/trace.md` §1.4) rather than by a column, and a settle's "is this execution already exported?" asks about the execution's own export only |
 | `trigger` | the trigger whose `callback_auth:` signs this delivery and whose `callback_allow:` admits its URL (`docs/grammar.md` §13.3). On the delivery rather than read off the execution's lifecycle row when it is picked up, because one delivery has no lifecycle row to read: the `settled` journaled for a run that failed **before** it was journaled at all. A start that could not name that row's trigger could neither send it nor end it, and `pending` is neither of the two ends below. A `trace_sink` row carries none — the identity it signs with is the deploy layer's own, so there is nothing for a later start to look up |
 | `url` | the callback URL the request payload named, resolved when the request arrived (§3.5); or, on a `trace_sink` row, the address the deploy file wrote |
 | `body` | the exact bytes every attempt POSTs. Bytes rather than a value, because a signature is over what is sent: a body re-serialized on a later attempt, or in a later process, would be a second delivery wearing the first one's id |
@@ -859,7 +884,13 @@ of `src/journal.ts`; `deliver` and `opening` in `src/serve.ts` for the half that
 is a trigger's — resolving a callback URL and holding it to `callback_allow:` —
 and `shipping` there for the trace; `owed` and `settled` in `src/cli.ts` for the
 `resume` and `run` above; and `runtime.executionReport` writing the report body a
-callback and the status route both publish. `attemptDelivery` is the one
+callback and the status route both publish. A detached delivery's envelope is
+`shipDetachedTrace` and `journalDetachedTrace` in `src/delivery.ts`, reached from
+`runtime.watchDetachedSettlements` — which `src/serve.ts`'s `exportingDetached`
+and `src/cli.ts`'s `execute` subscribe to — and `runtime.traceSinkClass` is the
+one reader that tells an execution's own export from one of those: a settle's
+guard asks it through `executionExport` there, and `runtime.executionReport`
+asks it to leave a delivery's envelope out of the report. `attemptDelivery` is the one
 declaration in the emitted app that reaches the network for a delivery, which is
 why §3's primitive walk names it as an exemption and
 `crates/compose-core/src/codegen/journal.rs`'s
