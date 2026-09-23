@@ -373,8 +373,9 @@ async function resumeVerb(argv: readonly string[]): Promise<number> {
     // the one place outside `serve` where such a row closes.
     ...(row.callback === undefined ? {} : { callback: row.callback }),
     // …and what started it, where a detached dispatch did: a child execution
-    // resumed by hand is still a child, and its trace file is headed so
-    // (PRD resolved q65, `docs/trace.md` §2).
+    // resumed by hand is still a child — it runs on the inputs its dispatch
+    // bound, never parsed again (Decision D150), and its trace file is headed
+    // so (PRD resolved q65, `docs/trace.md` §2).
     ...(row.lineage === undefined ? {} : { lineage: row.lineage }),
   });
 }
@@ -392,7 +393,11 @@ interface Job {
   readonly trigger?: string;
   /** Where its `settled` webhook goes, for a `resume` that closes one. */
   readonly callback?: string;
-  /** What started it, for a `resume` of a child execution (PRD resolved q65). */
+  /**
+   * What started it, for a `resume` of a child execution (PRD resolved q65):
+   * handed to `runFlow`, which runs it as the child it is, and to the trace file
+   * it heads.
+   */
   readonly lineage?: runtime.Lineage;
 }
 
@@ -524,6 +529,13 @@ async function executing(
     resumable: asking,
     ...(job.trigger === undefined ? {} : { trigger: job.trigger }),
     ...(job.resuming ? { resume: true } : {}),
+    // A child execution resumed by its own id is still a child, and `runFlow`
+    // runs it as one: on the inputs its dispatch bound and its row recorded,
+    // **not parsed** against its flow's `inputs:` as an invocation's are (PRD
+    // resolved q65, Decision D150, `docs/durability.md` §6.2). Without it, the
+    // one surface left to recover a child whose parent has settled would refuse
+    // a bound input its dispatch — and `serve`'s recovery — runs on.
+    ...(job.lineage === undefined ? {} : { lineage: job.lineage }),
     // What this run owes at the moment its lifecycle row closes: the webhook a
     // `serve`-started execution finished here still owes ([`owed`]), and the
     // trace every settled execution ships under a target that declares a

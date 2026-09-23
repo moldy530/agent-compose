@@ -34,7 +34,11 @@
 //! * **a failed child ships its failed envelope** —
 //!   [`a_child_execution_that_failed_ships_its_failed_envelope`];
 //! * **recovery with the parent settled** —
-//!   [`a_child_caught_mid_run_after_its_parent_settled_is_recovered_without_asking_again`];
+//!   [`a_child_caught_mid_run_after_its_parent_settled_is_recovered_without_asking_again`]
+//!   by a restarted `serve`, and by hand, through `agent-compose resume` given
+//!   the child's own id, on the input its dispatch bound and with its trace file
+//!   headed by its lineage —
+//!   [`a_child_resumed_by_its_own_id_runs_on_the_input_its_dispatch_bound`];
 //! * **re-dispatch idempotence** —
 //!   [`a_recovered_parent_that_re_issues_its_dispatch_joins_the_child_it_started`]
 //!   for a child caught mid-run, and
@@ -1070,6 +1074,145 @@ fn a_child_caught_mid_run_after_its_parent_settled_is_recovered_without_asking_a
         "one export per execution: {:?}",
         collector.distinct("settled")
     );
+}
+
+/// **A child resumed by its own id runs on the input its dispatch bound, and the
+/// trace file it writes is headed by its lineage** (PRD resolved q65, Decision
+/// D150, `docs/durability.md` §6.2, `docs/trace.md` §2).
+///
+/// The recovery a person makes by hand. The parent detaches a review of the
+/// empty subject — which `flow.review_and_stall`'s own `inputs:`
+/// (`min_length: 1`) would refuse at an **invocation**, and which the dispatch
+/// ran on — and settles while the child stalls; the process is killed with the
+/// child mid-run. The parent has completed, so `agent-compose resume` refuses it,
+/// and the one recovery left on the command line is `resume` given the
+/// **child's** id. That is a resume of a child, not an invocation: the child
+/// replays under the input its row recorded, unparsed, exactly as its dispatch
+/// ran it and as a `serve`'s recovery would — so whether a child can be resumed
+/// does not depend on which surface resumes it. Its model is not asked again,
+/// the stalled step runs once more, and it completes; the trace file the command
+/// names carries the lineage head, and the export it ships is the child's.
+#[test]
+fn a_child_resumed_by_its_own_id_runs_on_the_input_its_dispatch_bound() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let shims = harness::Scratch::new("child-by-id-shims");
+    let environment = stalling(&provider, &shims);
+    let Some((_composition, entrypoint, project, mut first)) =
+        served("child-by-id", &collector, None, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&first.base_url).expect("a client for the generated app");
+    let answered = app
+        .send(Request::post("/stalling-reviews").json(&json!({ "subjects": [""] })))
+        .expect("the trigger's route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+    let parent_id = answered.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+
+    // The parent settles and exports while its child is still running…
+    let exported = collector.wait_for_event("settled", 1, PATIENCE);
+    assert!(
+        exported[0].body.get("detached").is_none(),
+        "the first export is the parent's: {:#}",
+        exported[0].body
+    );
+    let key = stub_record(&exported[0].body, "review")["idempotencyKey"]
+        .as_str()
+        .expect("a key")
+        .to_string();
+    let child_id = harness::child_execution_id(&parent_id, &key);
+    // …and the child is mid-run on the empty subject: its model call recorded,
+    // its stall started.
+    harness::until(PATIENCE, || (stalls(&environment) == 1).then_some(()));
+    assert_eq!(
+        effect_keys(&project, &child_id),
+        [("judge/0#model/0".to_string(), "model".to_string())],
+        "the child ran on the subject its dispatch bound, and its model call is on its record"
+    );
+    let asked = provider.requests().len();
+    assert_eq!(asked, 1, "the child asked its model once");
+
+    first.stop();
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            "SELECT id, status, inputs FROM executions ORDER BY started_at, id"
+        ),
+        json!([
+            { "id": parent_id, "status": "completed", "inputs": "{\"subjects\":[\"\"]}" },
+            { "id": child_id, "status": "open", "inputs": "{\"subject\":\"\"}" },
+        ]),
+        "the crash left the parent settled and its child open, on the input its dispatch bound"
+    );
+
+    let mut resuming = environment.clone();
+    resuming.push((harness::INTERACTIVE.to_string(), "0".to_string()));
+    let refused = harness::resume_target(&project, &entrypoint, LOCAL, &parent_id, &resuming);
+    let said = refused.failed();
+    assert!(
+        said.contains(&format!("`{parent_id}` has already completed")),
+        "a settled parent is never resumed, so the child is the one thing left to resume: \
+         {said}"
+    );
+
+    let resumed = harness::resume_target(&project, &entrypoint, LOCAL, &child_id, &resuming);
+    resumed.succeeded();
+    assert_eq!(
+        provider.requests().len(),
+        asked,
+        "the resumed child's model call was replayed from its journal, not asked again"
+    );
+    assert_eq!(
+        stalls(&environment),
+        2,
+        "the stalled step ran once in the generation that died and once in the resume"
+    );
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            &format!("SELECT status, inputs FROM executions WHERE id = '{child_id}'")
+        ),
+        json!([{ "status": "completed", "inputs": "{\"subject\":\"\"}" }]),
+        "the child completed on the input its row recorded"
+    );
+
+    let document = resumed.trace_document();
+    assert_eq!(document["execution_id"], child_id, "{document:#}");
+    assert_eq!(document["flow"], "flow.review_and_stall", "{document:#}");
+    assert_eq!(document["status"], "completed", "{document:#}");
+    assert_eq!(
+        (
+            &document["detached"],
+            &document["parent_execution"],
+            &document["idempotency_key"],
+        ),
+        (&json!(true), &json!(parent_id), &json!(key)),
+        "the trace file of a child resumed by its own id is headed by its lineage: {document:#}"
+    );
+    let nodes: Vec<&str> = document["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|entry| entry["node"].as_str())
+        .collect();
+    assert_eq!(nodes, ["judge", "stall"], "{document:#}");
+
+    let all = collector.wait_for_event("settled", 2, PATIENCE);
+    let (_, children) = by_lineage(&all);
+    assert_eq!(children.len(), 1, "{all:#?}");
+    let child = &children[0].body;
+    assert_eq!(child["execution_id"], child_id, "{child:#}");
+    assert_eq!(child["parent_execution"], parent_id, "{child:#}");
+    assert_eq!(child["idempotency_key"], key, "{child:#}");
+    assert_eq!(child["status"], "completed", "{child:#}");
 }
 
 /// **A recovered parent that re-issues its detached dispatch resumes the child it

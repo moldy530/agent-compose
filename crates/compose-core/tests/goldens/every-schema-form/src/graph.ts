@@ -1296,13 +1296,16 @@ export async function runFlow(
      * What started this execution, where a detached `flow.*` dispatch did —
      * which makes it a **child execution** (PRD resolved q65).
      *
-     * [`runChildFlow`] passes it and nothing else does. It goes on the lifecycle
-     * row beside the execution's inputs, which is what lets a generation that
-     * resumes the child — after its parent has settled, in another process —
-     * know where it came from: `execution.item_index` inside it is the
-     * dispatch's (grammar 4.1), and the envelope it ships is headed by it
-     * (`docs/trace.md` §2). A resumed generation reads it back off the row
-     * rather than being handed it.
+     * [`runChildFlow`] passes it, and so does `src/cli.ts` for an
+     * `agent-compose resume` of a child by its own id, which reads it off the
+     * child's lifecycle row. It goes on that row beside the execution's inputs,
+     * which is what lets a generation that resumes the child — after its parent
+     * has settled, in another process — know where it came from:
+     * `execution.item_index` inside it is the dispatch's (grammar 4.1), and the
+     * envelope it ships is headed by it (`docs/trace.md` §2). Whoever resumes a
+     * child passes it, because it is also what says the run is a child rather
+     * than an invocation: its inputs are the ones its dispatch bound, never
+     * parsed again (see the note at the top of the body).
      */
     readonly lineage?: runtime.Lineage;
     /**
@@ -1454,12 +1457,15 @@ export async function runFlow(
  * Run one **child execution** — what a detached `flow.*` dispatch starts (PRD
  * resolved q65) — as the ordinary execution of its flow that it is.
  *
- * The one place a child's run is composed, so every process that runs one runs
- * it the same way: `runtime.dispatchChild` and `runtime.resumeChild` decide
- * *whether* a child runs, and hand it to the runner the process hosts
- * (`runtime.hostChildren`), which comes here. A child the journal does not hold
- * yet begins with its lineage on its row; one it does hold replays to its
- * frontier and reads its lineage back off that row.
+ * The one place a child a dispatch or a recovery hands on is composed, so every
+ * process that runs one runs it the same way: `runtime.dispatchChild` and
+ * `runtime.resumeChild` decide *whether* a child runs, and hand it to the runner
+ * the process hosts (`runtime.hostChildren`), which comes here. A child the
+ * journal does not hold yet begins with its lineage on its row; one it does hold
+ * replays to its frontier and reads its lineage back off that row. The one other
+ * caller that resumes a child — `agent-compose resume` given the child's own id
+ * — passes `runFlow` the same lineage off the same row, so a child runs on what
+ * its dispatch bound whichever surface resumes it.
  *
  * No `resumable`: a child never parks, because a detached dispatch that could
  * reach a `human` node is refused at build time (Decision D118) — and were one
