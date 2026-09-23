@@ -569,15 +569,24 @@ Being an execution, a child has an execution's own lifetimes. A `scope:
 execution` store it reaches is **its** partition, keyed by its id — empty when it
 begins, removed when it settles (§5) — and not its parent's, which is removed
 when the parent settles and which a child routinely outlives (`docs/grammar.md`
-§11.3, Decision D150). Its row records the inputs its dispatch bound, which are
+§11.3, Decision D150). The same is true of the directory a **built-in tool** that
+names no `workspace:` works in (`docs/grammar.md` §6.1): the execution's own
+workspace is keyed by the execution's id, so a child's `builtin.files` and
+`builtin.bash` start in a fresh, empty directory of the child's, removed when
+the child settles — not in the parent's, which is removed when the parent
+settles. A file handed on to a detached flow goes through a `workspace:` both
+bindings name, or a store whose scope the two share. Its row records the inputs
+its dispatch bound, which are
 what it runs on: a child is not an invocation, so its flow's `inputs:` is not
 asked about them again, exactly as it is not for a joined instance of the same
 flow — and its row is begun before anything can stop it, so whatever does closes
 that row `failed` and ships the envelope that says why rather than leaving no
-record at all. And it is begun by the journal's single writer: a worker that
-reaches a detached `flow.*` dispatch inside a flow its placed agent attaches
-refuses it by name rather than beginning a child on a journal the hub never
-reads (`docs/distributed.md` §3.3).
+record at all. And it is begun by the journal's single writer: on a worker —
+which reaches a detached `flow.*` dispatch only inside a flow its placed agent
+attaches — the dispatch cannot be issued, so the `map` node that would issue it
+fails by name under its own `on_error:` (`docs/grammar.md` §8.6 rule 7) rather
+than beginning a child on a journal the hub never reads (`docs/distributed.md`
+§3.3).
 
 **The child's id is derived, never minted**: `exec_` and a version-8 UUID
 (RFC 9562) whose 122 free bits are the leading bits of SHA-256 over
@@ -592,7 +601,7 @@ child's row to decide what it is:
 
 | the child's row | what the dispatch does |
 |---|---|
-| none | begins the child — its lineage (§3.5), its parent's session and trigger, the inputs the dispatch bound — and runs it |
+| none | begins the child at once — its lineage and the admission bound it was issued under (§3.5), its parent's session and trigger, the inputs the dispatch bound — and runs it once it is admitted |
 | `open` | resumes it: replays it to its frontier (§5) under the inputs its row recorded, its model not asked again for anything its record holds |
 | `completed` or `failed` | nothing: the child already ran to its end, and nothing resumes a settled execution (resolved q28) |
 
@@ -604,7 +613,21 @@ inside one: it holds the *child* open, as it would any execution (§7), and
 reaches the parent not at all. A child never parks, because Decision D118 refuses
 a detached dispatch that could reach a `human` node; and Decision D28's
 admission bound covers it exactly as it covered the delivery it replaced — the
-map node's permits are held until the child settles.
+map node's permits, taken behind the node's joined instances, are held until the
+child settles.
+
+**A child is an execution from the moment it is issued**, not from the moment it
+is admitted. Its row is begun first — before it asks for a permit — so a child
+still waiting behind its siblings' permits is already an open row with its
+cause on it: a process that stops then leaves it for the next start to recover
+(§6.1), and a command about to exit counts it among the children it waits for
+(§6.2). What admits it is whichever generation of it actually runs: a second
+arrival at a child already on the process's books joins it and holds nothing.
+And the parent's row does not **close** until every child it dispatched has its
+row begun — a journal write, and never the child's permit or its work — because
+a closed row is one nothing replays, and a dispatch whose child had no row yet
+would then have nobody left to re-issue it. A parent whose row stays open needs
+no such wait: the generation that resumes it re-issues every dispatch it made.
 
 A divergence raised inside a detached `agent.*` or `tool.*` delivery is the
 exception to rule 7's "nothing it does can delay the enclosing flow instance" —
@@ -738,7 +761,7 @@ One row per execution, written before the graph is streamed:
 | `inputs` | the invocation's inputs, as the flow's `inputs:` parsed them |
 | `sessionKey` | the session identity `scope: session` stores key off (`docs/grammar.md` §11.3) |
 | `callback` | where this execution's lifecycle webhooks go, for an `async` `http` trigger that asked for one (`docs/grammar.md` §13.3) — absent for every other invocation. Recorded because the process that *finishes* an execution need not be the one that started it (§6.1), and resolved when the request arrives rather than when the run ends, which is what makes that possible. The URL only: the request it came out of is not kept. §3.7 is what is delivered to it |
-| `lineage` | what started a **child execution** (§3.2, PRD resolved q65): the `parent` execution's id, the dispatch's `idempotency_key`, and its `item_index` where a `map` dispatched it — the value `execution.item_index` holds everywhere inside the child (Decision D115). Absent on every execution a trigger or a command started. Held in a table of its own, `lineage`, keyed by the execution id, rather than as columns here: a whole table is what `CREATE TABLE IF NOT EXISTS` adds to a journal an older build wrote, on every backend, with no column probe on any of them (§11.2). It is written **before** the lifecycle row, so a process that dies between the two leaves a lineage row nothing reads rather than a child that has forgotten its cause |
+| `lineage` | what started a **child execution** (§3.2, PRD resolved q65): the `parent` execution's id, the dispatch's `idempotency_key`, and its `item_index` where a `map` dispatched it — the value `execution.item_index` holds everywhere inside the child (Decision D115) — and its `admission`: the map node's `max_concurrency:` and the route's own bound it was issued under, each named by the key the runtime counts that node's permits against, as JSON. That last is what a recovery with no parent to re-issue the child admits it under (§6.1, Decision D28). Absent on every execution a trigger or a command started. Held in a table of its own, `lineage`, keyed by the execution id, rather than as columns here: a whole table is what `CREATE TABLE IF NOT EXISTS` adds to a journal an older build wrote, on every backend, with no column probe on any of them (§11.2). It is written **before** the lifecycle row, so a process that dies between the two leaves a lineage row nothing reads rather than a child that has forgotten its cause |
 | `status` | `open`, `completed` or `failed` — §3.6 |
 | `journalVersion` | the version at the head of this document |
 | `startedAt`, `endedAt`, `error` | when, and why it failed |
@@ -1309,18 +1332,41 @@ on:
 * a **child execution** (§3.2) is recovered like every open execution, and
   that includes the case PRD resolved q65 was ratified from: a child still
   running when its **parent had already settled**, which used to be lost with the
-  process. It replays to its frontier — its model not asked again for anything
-  its record holds — settles, and exports under its own id. It is on the status
-  route by that id, guarded by its parent's trigger's `auth:` (§3.5);
-* **one open child is one generation**, however many ways recovery reaches it.
-  A restart can reach an open child from two directions at once — this walk
-  finds its row, and its parent, open too, replays to the detached dispatch and
-  re-issues it — and both derive the same id. The process keeps one generation
-  per child id and the second arrival **joins** the first rather than opening
-  the child's record again, so the child's effects are issued once and its
-  record has one writer (`runtime.dispatchChild`, `runtime.resumeChild`). Across
-  processes the rule is the journal's own: one process writes a project's
-  journal (§2.1, PRD resolved q42);
+  process — and a child still **queued** for its map node's permit when the
+  process stopped, whose row was begun the moment its dispatch was issued. It
+  replays to its frontier — its model not asked again for anything its record
+  holds; a queued child's record is empty, so it simply runs — settles, and
+  exports under its own id. It is on the status route by that id once it runs,
+  guarded by its parent's trigger's `auth:` (§3.5);
+* **how** a child is resumed is decided by its parent's row. Where the parent is
+  **open** too, the walk leaves the child to the parent — logging `recovered
+  <id> (<flow>), for its open parent <parent> to re-issue` — because the
+  parent's replay reaches the detached dispatch again, derives the same id,
+  finds the open row and resumes the child through that node's own admission:
+  behind the node's joined instances and under its bounds, exactly as the first
+  generation ran it. Resuming it from the walk as well would put it in front of
+  the parent's own joined instances in that node's permit queue, which is the
+  delay grammar §8.6 rule 7 says a detached dispatch never causes. A parent this
+  start cannot replay — its flow no longer declared, or its record diverging
+  before it reaches the dispatch (§7) — holds its open children with it, open,
+  for the build that can. Where the
+  parent has **settled**, nothing will re-issue it, so the walk resumes it
+  itself, admitted under the bound its lineage recorded (§3.5, Decision D28):
+  the children of one node share that node's gates as they did when they ran, so
+  a `max_concurrency: 1` fan-out stopped with one child running and three queued
+  restarts one at a time, not four at once. A lineage row that recorded no bound
+  — begun by a caller of the runtime that passed none — resumes unbounded rather
+  than not at all;
+* **one open child is one generation**, however many ways it is reached. One
+  process can reach one child twice — a map node's own `retry:` re-issues its
+  dispatches at the same paths, a `resume` of a parent re-issues a dispatch
+  whose child is open — and both arrivals derive the same id. The process keeps
+  one generation per child id and the second arrival **joins** the first, holding
+  no permit of its own, rather than opening the child's record again, so the
+  child's effects are issued once and its record has one writer
+  (`runtime.dispatchChild`, `runtime.resumeChild`). Across processes the rule is
+  the journal's own: one process writes a project's journal (§2.1, PRD resolved
+  q42);
 * recovery **does not wait** for the replays to finish. The executions it
   recovers are by definition ones that were still running, and the commonest of
   them is parked on a question nobody has answered yet. Registering them is what
@@ -1356,11 +1402,11 @@ is one no `serve` is running — see §2 on what is outside the promise.
 
 **A stop leaves every execution where it was**, child executions included. A
 `serve` that receives `SIGINT` or `SIGTERM` closes and exits without waiting for
-the executions in flight — a parent's or a child's — and that is the durability
-contract rather than a gap in it: each is an open row, so the next start
-recovers it, a child whose parent had already settled among them. What a stop
-costs is the one effect each was in the middle of, which is §2's window for any
-execution.
+the executions in flight — a parent's or a child's, running or still queued for a
+permit — and that is the durability contract rather than a gap in it: each is an
+open row, so the next start recovers it, a child whose parent had already
+settled among them. What a stop costs is the one effect each was in the middle
+of, which is §2's window for any execution.
 
 ### 6.2 `run` journals; `resume` replays
 
@@ -1417,9 +1463,13 @@ starts a child execution (§3.2) that the run itself never waits for — nothing
 detached dispatch does can delay the flow instance that issued it — so a `run`
 reports as soon as its own execution has, and then the **command** waits: until
 every child it started has settled, and every child those started, before it
-exits. A process that ended under a running child would end in the middle of an
-effect with no record, which the generation that resumes the child issues a
-second time, and a command has no later start to resume it from. Each child
+exits — a child still queued behind its map node's `max_concurrency:` included,
+which the command counts from the moment its dispatch was issued rather than
+from the moment it was admitted, so the instant one child settles and hands its
+permit to the next is not an instant with nothing left to wait for. A process
+that ended under a running child would end in the middle of an effect with no
+record, which the generation that resumes the child issues a second time, and a
+command has no later start to resume it from. Each child
 settles and exports like any execution, and the command sends each export after
 its own — the same "every offset already due" posture as its own trace (§3.7).
 A `resume` of a parent does the same, and a `resume` of a **child** is a resume
@@ -1680,7 +1730,8 @@ value this project writes.
   every request, an execution's `inputs`, a delivery's `body` and `attempts`, a
   dispatch's `inputs`, `history` and `policy`, a node address, a placement, an
   instance `site`, and a child's `lineage.idempotency_key`, which is an instance
-  path under its parent's id. So is `executions.error`, which is a provider's whole
+  path under its parent's id — and `lineage.admission`, whose node key is one
+  too. So is `executions.error`, which is a provider's whole
   failure body or a harness run's quoted transcript: a `failed` outcome the
   server refused would leave the lifecycle row `open` for ever, so every later
   `serve` start would re-recover an execution that has already finished.

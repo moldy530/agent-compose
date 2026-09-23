@@ -188,15 +188,20 @@ In the trace, the map node's entry records a detached dispatch as a stub —
 `outcome: "detached"`, `attempts: 0`, no `inner` — and nothing the delivery goes
 on to do. A detached **`flow.*`** dispatch starts a **child execution**: an
 execution of its own, with an id derived from the parent's and the dispatch's
-idempotency key, its own journal and recovery — a child still running when its
-parent settles is resumed by the next `serve` — and, under a target that
-declares a `trace_sink:`, its own export, headed `detached: true` and an
-`idempotency_key` equal to the stub's (`agent-compose docs trace`). The parent
-never waits for it; a `run` command does, before it exits. Being an execution,
-it has its own `scope: execution` stores — its own partition, empty when it
-begins — so data a parent hands on to a detached flow through a store belongs in
-a `scope: session` or `scope: global` one. Its flow runs on the input the
-dispatch bound, exactly as a joined dispatch of it would.
+idempotency key, its own journal and recovery — its row is written the moment
+the dispatch is issued, so a child still running, or still queued behind
+`max_concurrency`, when its process stops is resumed by the next `serve`, under
+the same bound — and, under a target that declares a `trace_sink:`, its own
+export, headed `detached: true` and an `idempotency_key` equal to the stub's
+(`agent-compose docs trace`). The parent never waits for it; a `run` command
+does, before it exits. Being an execution, it has its own `scope: execution`
+stores — its own partition, empty when it begins — and its own default workspace
+for `builtin.files` and `builtin.bash`, so data a parent hands on to a detached
+flow belongs in a `scope: session` or `scope: global` store, or a `workspace:`
+both bindings name. Its flow runs on the input the dispatch bound, exactly as a
+joined dispatch of it would. A detached `flow.*` inside a flow a **placed** agent
+attaches cannot be issued on the worker running it, so that map node fails by
+name, under its own `on_error:`.
 
 In v0, `detach: true` is a validation error under any target whose execution
 state is durably checkpointed — every target except `local`. The same

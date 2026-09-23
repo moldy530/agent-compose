@@ -1497,7 +1497,12 @@ Written, it must name something: `workspace: ""` is a compile error and a
 directory the runtime happened to be started in and a bound nobody wrote is not a
 bound. **Omitting** it is the way to take the default — one fresh directory per
 execution, shared by every built-in of that execution that took it, removed when
-the execution settles.
+the execution settles. A **child execution** — what a detached `flow.*` dispatch
+starts (§8.6 rule 7) — is an execution of its own, so its built-ins take a fresh
+directory of the child's rather than sharing its parent's, which is removed when
+the parent settles; a file handed on to a detached flow goes through a
+`workspace:` both bindings name (Decision
+[D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)).
 
 **`timeout:` defaults to 120s**, which is a bound chosen to be longer than a
 build step and shorter than a wedged process: a model that wanted longer says so,
@@ -2755,7 +2760,9 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    execution, it has an execution's own lifetimes: a `scope: execution` store
    it reaches addresses **the child's** partition, which begins empty and dies
    with the child — not its parent's, whose partition dies when the parent
-   settles (§11.3). It runs on the inputs the dispatch bound, as any dispatched
+   settles (§11.3) — and a built-in tool that names no `workspace:` works in
+   **the child's** own workspace, for the same reason (§6.1). It runs on the
+   inputs the dispatch bound, as any dispatched
    instance does: the target's `inputs:` guards an invocation's boundary
    (§13.2), and rule 12 below is what checked the binding.
 
@@ -10367,8 +10374,8 @@ what the construct *is* rather than a new key: no field is added to `map:`, no
 check moves, and a composition valid before is valid now with the same meaning
 at the join. What moves is below the grammar — the child's journal, recovery
 and export are `docs/durability.md` §3.2 and §6.1's and `docs/trace.md` §1.4's
-— and **two things a flow observes from inside**, both because
-`execution.id` now names the child:
+— and **three things a flow observes from inside**, every one because
+`execution.id` now names the child and every one keyed by it:
 
 * `execution.id` itself, in CEL;
 * the partition of a **`scope: execution` store** (§11.3), which is keyed by that
@@ -10380,9 +10387,26 @@ and export are `docs/durability.md` §3.2 and §6.1's and `docs/trace.md` §1.4'
   before or after its parent's release. A composition that hands data on to a
   detached flow through a store declares `scope: session` or `scope: global`,
   whose partitions the child shares with its parent (it runs under the parent's
-  session). This is the ruling's "journaled, recovered and exported like any
-  execution" read through §11.3's per-execution lifetime rather than a separate
-  ruling, and it is stated here so it is read rather than inferred.
+  session);
+* the **default workspace of a built-in tool** (§6.1) — the directory a
+  `builtin.files` or `builtin.bash` binding that names no `workspace:` works in,
+  which is the execution's own and keyed by that id. A detached flow's built-ins
+  now start in a fresh, empty directory of the child's, removed when the child
+  settles, where before they shared the parent's — and, for the store's reason,
+  that sharing was never reliable: the parent's workspace is removed when the
+  parent settles, so a file the parent wrote was there or not depending on
+  whether the detached flow read it before or after that release. A composition
+  that hands a file on to a detached flow names the directory in a `workspace:`
+  both bindings share.
+
+These three are the ruling's "journaled, recovered and exported like any
+execution" read through the per-execution lifetimes §11.3 and §6.1 already
+give an execution, rather than rulings of their own. PRD resolved q65 does not
+enumerate them — they were derived when the ruling was implemented — so they
+are **stated here so they are read rather than inferred**, and they are the
+part of this entry the owner has yet to confirm in the PRD's own words: an
+answer there that kept any of them the parent's would amend this list, not the
+ruling.
 
 A child also runs on the inputs its dispatch **bound**, not on those inputs
 re-parsed by the target's `inputs:`: that schema guards an invocation (§13.2), a
