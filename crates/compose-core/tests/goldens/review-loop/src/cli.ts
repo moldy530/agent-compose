@@ -418,8 +418,18 @@ async function execute(job: Job): Promise<number> {
   try {
     const code = await executing(job, exported);
     await shipped(exported.record);
-    unwatch();
-    for (const record of await Promise.all(detached)) await shipped(record);
+    // **Drained, not snapshotted.** "Still here" lasts until this command
+    // returns, and the sending below is part of that: each POST can take an
+    // attempt's ten seconds (`docs/durability.md` §3.7), and a delivery that
+    // settles during one of them is one this command was still here for. So the
+    // subscription stays open while it sends, the list is re-read after every
+    // POST, and it is let go of only once nothing is left unsent — which is a
+    // check and a return with no `await` between them, so no settlement can land
+    // in a gap between "nothing left" and "stopped listening" and be dropped
+    // with no row, no POST and no word on stderr.
+    for (let sent = 0; sent < detached.length; sent += 1) {
+      await shipped(await detached[sent]);
+    }
     return code;
   } finally {
     unwatch();

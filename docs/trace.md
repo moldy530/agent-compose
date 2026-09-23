@@ -169,7 +169,12 @@ between the two envelopes is string equality (§8).
   carry `X-AgentCompose-Event: settled` — grammar §13.3's vocabulary is
   unchanged. A receiver that files envelopes by `execution_id` alone files a
   delivery's under its parent, which is where it belongs; `detached` is what
-  tells it which it is holding.
+  tells it which it is holding. Nor does the parent's **report** move: a
+  delivery's envelope row rides the parent's ledger without being one of the
+  parent's lifecycle events, and it is journaled while the parent is still
+  running or parked, so the status route's `deliveries` — the report every
+  `parked` and `settled` webhook carries — leaves it out. It stays on the
+  ledger and is worked like any other row (`docs/durability.md` §3.7).
 
 **At-least-once, and deduped on the pair.** A `serve` restart that recovers a
 parent re-runs the detached deliveries its dead generation issued, each
@@ -188,9 +193,11 @@ own beyond what §9.4 gives it.
 local` and under no other target (grammar §8.6 rule 7, Decision D59), so the
 second event class exists exactly where detach does: a `deploy/local.yml` that
 declares `trace_sink:`. Under `agent-compose run` the command ships what settled
-while it was still running, after the run has reported; a delivery still in
-flight when the command exits ends with it, which is `detach: true`'s own
-promise — nothing waits for a detached delivery.
+while it was still running, after the run has reported — and it is still
+running while it sends: it keeps listening until every envelope it has
+collected is sent, so a delivery that settles during one of those POSTs ships
+too. A delivery still in flight when the command exits ends with it, which is
+`detach: true`'s own promise — nothing waits for a detached delivery.
 
 ### 1.1 `run --format json`
 

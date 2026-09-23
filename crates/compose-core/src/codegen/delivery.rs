@@ -101,7 +101,8 @@ model.m:\n  provider: provider.p\n  id: some-model\n",
             .expect("…in a function with a closing brace")
             .0;
         assert!(
-            own.contains("record.kind !== \"trace_sink\"") && own.contains("detached"),
+            own.contains("record.kind !== \"trace_sink\"")
+                && own.contains("traceSinkClass(record) === \"execution\""),
             "the export guard no longer asks the ledger which kind a row is and which class, so \
              a callback webhook or a detached delivery's envelope would stand in for an export \
              nobody made"

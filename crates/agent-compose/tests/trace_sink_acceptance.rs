@@ -1690,6 +1690,15 @@ fn a_recovered_execution_reships_its_detached_delivery_and_still_exports_itself(
     );
     let parked = harness::settled(&app, &execution);
     assert_eq!(parked["status"], "interrupted", "{parked}");
+    // The envelope's row is on this execution's ledger by now — it was
+    // journaled before it was sent — and it is not one of the execution's
+    // lifecycle events. So the report of a parent that has not settled, which
+    // is also the body every `parked` and `settled` webhook carries (grammar
+    // §13.3), publishes no `settled` delivery and no sink address.
+    assert!(
+        parked.get("deliveries").is_none(),
+        "a detached delivery's envelope reached its parked parent's report: {parked:#}"
+    );
     let asked = provider.requests().len();
 
     first.stop();
@@ -1755,6 +1764,36 @@ fn a_recovered_execution_reships_its_detached_delivery_and_still_exports_itself(
         deliveries[0].body["idempotency_key"],
         "{parent:#}"
     );
+
+    // …and the settled parent's report still leaves both envelopes out: they
+    // stay on the ledger, and the report is the one grammar §13.3 states.
+    let envelopes: Vec<&str> = deliveries
+        .iter()
+        .map(|delivered| {
+            delivered
+                .header("x-agentcompose-delivery")
+                .expect("a delivery names its id")
+        })
+        .collect();
+    let settled = harness::until(PATIENCE, || {
+        let report: Value = app
+            .get(&format!("/executions/{execution}"))
+            .expect("the status route answers")
+            .json();
+        (report["status"] == "completed").then_some(report)
+    });
+    let reported: Vec<&str> = settled["deliveries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|delivery| delivery["delivery_id"].as_str())
+        .collect();
+    for envelope in &envelopes {
+        assert!(
+            !reported.contains(envelope),
+            "the detached delivery's envelope `{envelope}` is on its parent's report: {settled:#}"
+        );
+    }
 }
 
 /// **A `run` ships the envelope of a detached delivery that settled while the
@@ -1880,5 +1919,139 @@ fn a_run_ships_the_envelope_of_a_detached_delivery_that_settled_before_it_exited
         rows,
         json!([{ "kind": "trace_sink", "event": "settled", "status": "delivered" }]),
         "one row on the parent's ledger — the delivery's envelope — and the command sent it"
+    );
+}
+
+/// **A `run` keeps listening while it sends, so a delivery that settles during
+/// one of the command's POSTs ships too** (PRD resolved q64's "one POST per
+/// settled detached delivery", `docs/trace.md` §1.4).
+///
+/// "What settled while the command was still here" includes the time the
+/// command spends sending: one POST can take an attempt's ten seconds
+/// (`docs/durability.md` §3.7), and a command that stopped listening once its
+/// own export had gone would drop every delivery that settled while the
+/// envelopes it had already collected were still on the wire — no row, no POST
+/// and no word on stderr, which is the failure the ruling was written against.
+///
+/// So the collector is slow on purpose, and the second delivery's model call is
+/// timed to land inside that slowness. `flow.dispatch` detaches two reviews and
+/// settles at once. The first review is answered at once and settles before the
+/// run has reported. The collector sits on the parent's export for `EXPORT_HOLD`
+/// and on the first envelope for `ENVELOPE_HOLD`, and the second review is
+/// answered `LATE_REVIEW` after it asks — after the parent's export has been
+/// answered, while the first envelope is still being held. A command that
+/// stopped listening once its own export went sends two POSTs and journals two
+/// rows; this one sends three.
+#[test]
+fn a_run_ships_the_envelope_of_a_detached_delivery_that_settled_while_it_was_sending() {
+    // The margins that matter are the two a correct command could miss: the
+    // first review settles well inside `EXPORT_HOLD`, and the second well inside
+    // `EXPORT_HOLD + ENVELOPE_HOLD`. The one a broken command could slip through
+    // — the second settling before the export is answered — is the gap between
+    // `LATE_REVIEW` and `EXPORT_HOLD`.
+    const EXPORT_HOLD: Duration = Duration::from_millis(2_500);
+    const ENVELOPE_HOLD: Duration = Duration::from_secs(6);
+    const LATE_REVIEW: Duration = Duration::from_millis(4_500);
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })).after(LATE_REVIEW),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    collector.hold_answers(&[EXPORT_HOLD, ENVELOPE_HOLD]);
+    let (_composition, entrypoint) = harness::staged_with_deploy(
+        "sink-detached-run-sending",
+        DETACHED_FIXTURE,
+        LOCAL,
+        &sink_target(&format!("{}/v1/traces", collector.base_url), None, false),
+    );
+    let Some(project) = harness::scratch_project("sink-detached-run-sending") else {
+        return;
+    };
+    let run = harness::run_target(
+        &project,
+        &entrypoint,
+        LOCAL,
+        "flow.dispatch",
+        &[("subjects", r#"["the first","the second"]"#)],
+        &environment(&provider),
+    );
+    run.succeeded();
+    let said = run.stderr();
+    let execution = said
+        .lines()
+        .find_map(|line| line.strip_prefix("execution: "))
+        .unwrap_or_else(|| panic!("the run names its execution\nstderr: {said}"))
+        .trim()
+        .to_string();
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "both reviews asked for their verdict before the command exited"
+    );
+
+    // The command sent all three before it exited: its own export, then each
+    // envelope — the second one's delivery settling while the first envelope
+    // was still being held.
+    let exported = collector.wait_for_event("settled", 3, PATIENCE);
+    let (parents, deliveries) = by_class(&exported);
+    assert_eq!(
+        (parents.len(), deliveries.len()),
+        (1, 2),
+        "the sink received the run's export and both deliveries' envelopes: {exported:#?}"
+    );
+    assert_eq!(parents[0].body["execution_id"], execution, "{exported:#?}");
+    let mut keys: Vec<&str> = deliveries
+        .iter()
+        .map(|delivered| {
+            assert_eq!(
+                delivered.body["parent_execution"], execution,
+                "{:#}",
+                delivered.body
+            );
+            assert_eq!(
+                delivered.body["status"], "completed",
+                "{:#}",
+                delivered.body
+            );
+            delivered.body["idempotency_key"]
+                .as_str()
+                .expect("a detached envelope carries its key")
+        })
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            format!("{execution}/review/0/0"),
+            format!("{execution}/review/0/1"),
+        ],
+        "one envelope per detached delivery, the late one included"
+    );
+    assert_eq!(
+        collector.distinct("settled").len(),
+        3,
+        "three deliveries, not a retry of two: {:?}",
+        collector.distinct("settled")
+    );
+
+    // …and all three are rows the command finished, on the parent's ledger.
+    let rows = harness::journal_rows(
+        &project,
+        "SELECT kind, event, status FROM deliveries ORDER BY ordinal ASC",
+    );
+    assert_eq!(
+        rows,
+        json!([
+            { "kind": "trace_sink", "event": "settled", "status": "delivered" },
+            { "kind": "trace_sink", "event": "settled", "status": "delivered" },
+            { "kind": "trace_sink", "event": "settled", "status": "delivered" },
+        ]),
+        "the late delivery's envelope was journaled and sent, not dropped"
     );
 }

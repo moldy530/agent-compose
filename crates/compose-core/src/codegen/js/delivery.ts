@@ -46,7 +46,6 @@ import { ARTIFACT_HASH, COMPILER_VERSION } from "./artifact.ts";
 import { deployTarget, traceSink } from "./deployment.ts";
 import type { OutboundAuth } from "./deployment.ts";
 import { exportRequest, parseTraceparent } from "./otlp.ts";
-import type { OtlpAttribute } from "./otlp.ts";
 import {
   TRACE_VERSION,
   deliveriesOf,
@@ -55,6 +54,7 @@ import {
   intendDelivery,
   journaledExecution,
   recordDeliveryAttempt,
+  traceSinkClass,
 } from "./runtime.ts";
 import type * as runtime from "./runtime.ts";
 
@@ -278,42 +278,17 @@ async function intendExport(
  * Whether one `trace_sink` row is its execution's **own** export, rather than
  * the envelope a detached delivery under it shipped (PRD resolved q64).
  *
- * Read off the body, because that is the one place the ledger records which of
- * the two it is: both are `trace_sink` rows of `settled` events on one
- * execution, and the journal gains no column for the difference. A body this
- * cannot read answers `false` — "not known to be the export" — for
+ * Asked of `runtime.traceSinkClass`, the one reader of the difference — which
+ * the status route's report asks too — and it reads it off the body: both are
+ * `trace_sink` rows of `settled` events on one execution, and the journal gains
+ * no column for it. A `"detached"` row is not the export, and neither is a body
+ * that cannot be read: it answers `false` — "not known to be the export" — for
  * [`exportedAlready`]'s reason: the direction "I cannot tell" resolves toward is
  * the one a receiver can dedupe.
  */
 export function executionExport(record: runtime.DeliveryRecord): boolean {
   if (record.kind !== "trace_sink") return false;
-  let body: unknown;
-  try {
-    body = JSON.parse(record.body);
-  } catch {
-    return false;
-  }
-  if (typeof body !== "object" || body === null) return false;
-  const held = body as {
-    readonly detached?: unknown;
-    readonly execution_id?: unknown;
-    readonly resourceSpans?: readonly {
-      readonly scopeSpans?: readonly { readonly spans?: unknown }[];
-    }[];
-  };
-  // The envelope: its head says which it is.
-  if (typeof held.execution_id === "string") return held.detached !== true;
-  // OTLP/JSON: the detached delivery's root span is the one that says so.
-  const spans: unknown = held.resourceSpans?.[0]?.scopeSpans?.[0]?.spans;
-  if (!Array.isArray(spans)) return false;
-  const exported = spans as readonly { readonly attributes?: readonly OtlpAttribute[] }[];
-  return !exported.some((span) =>
-    (span.attributes ?? []).some(
-      (attribute: OtlpAttribute) =>
-        attribute.key === "agentcompose.detached" &&
-        (attribute.value as { readonly boolValue?: unknown }).boolValue === true,
-    ),
-  );
+  return traceSinkClass(record) === "execution";
 }
 
 // ---------------------------------------------------------------------------

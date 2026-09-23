@@ -1445,6 +1445,44 @@ const observed = {};
     document: runtime.detachedTraceDocument(review),
     failedDocument: runtime.detachedTraceDocument(broken),
   };
+
+  // Which event class a sink row carries, read back off the bytes each
+  // `format:` writes (`runtime.traceSinkClass`). One reader with two callers:
+  // a settle's once-per-execution guard counts only a row known to be the
+  // execution's export, and the status route's report — the body every
+  // lifecycle webhook carries — leaves out only a row known to be a delivery's
+  // envelope. So a body that cannot be read is neither, and a callback row is
+  // not a sink's whatever it holds.
+  const otlp = await import(pathToFileURL(path.resolve(project, "src/otlp.ts")).href);
+  const exportOf = (document) =>
+    JSON.stringify(
+      otlp.exportRequest(document, {
+        target: "local",
+        artifact: "sha256:0",
+        compiler: "0.0.0",
+        startedAt: review.dispatchedAt,
+        endedAt: review.settledAt,
+      }),
+    );
+  const parentDocument = {
+    trace_version: runtime.TRACE_VERSION,
+    flow: "flow.dispatch",
+    execution_id: "exec_trace_q64",
+    status: "completed",
+    entries: [],
+  };
+  const classOf = (body, kind = "trace_sink") =>
+    runtime.traceSinkClass({ kind, body }) ?? null;
+  observed.detachedCollector.sinkClass = {
+    envelopeExport: classOf(JSON.stringify(parentDocument)),
+    envelopeDetached: classOf(JSON.stringify(runtime.detachedTraceDocument(review))),
+    otlpExport: classOf(exportOf(parentDocument)),
+    otlpDetached: classOf(exportOf(runtime.detachedTraceDocument(broken))),
+    unreadable: classOf("{not json"),
+    notAnObject: classOf("42"),
+    noSpans: classOf(JSON.stringify({ resourceSpans: [] })),
+    callback: classOf(JSON.stringify(runtime.detachedTraceDocument(review)), "callback"),
+  };
 }
 
 // --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------

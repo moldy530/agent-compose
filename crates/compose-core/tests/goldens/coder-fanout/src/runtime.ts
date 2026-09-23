@@ -11480,7 +11480,7 @@ export interface DetachedSettlement {
  * `runFlow` that issued it (D94: the join never waits for it) and the one thing
  * that has to hear about it — the trace sink — is the deployment's standing
  * subscription rather than a request's. `src/serve.ts` subscribes for as long as
- * its app lives, and `src/cli.ts` for as long as one command's run does.
+ * its app lives, and `src/cli.ts` for as long as one command runs and sends.
  */
 const detachedListeners = new Set<(settled: DetachedSettlement) => void>();
 
@@ -11600,6 +11600,70 @@ export function detachedTraceDocument(settled: DetachedSettlement): TraceDocumen
     ...(settled.error === undefined ? {} : { error: settled.error }),
     entries: settled.entries,
   };
+}
+
+/**
+ * Which of the trace sink's two event classes one delivery row carries (PRD
+ * resolved q64, `docs/trace.md` §1.4): `"execution"` for an execution's own
+ * export, `"detached"` for the envelope a detached `flow.*` delivery under it
+ * shipped, and `undefined` for a row that is not a sink's or whose body cannot
+ * be read as either.
+ *
+ * [`detachedTraceDocument`]'s reader, beside it so the two cannot drift. Read
+ * off the body, because that is the one place the ledger records the
+ * difference: both are `trace_sink` rows of `settled` events on one execution,
+ * and the journal gains no column for it (`docs/durability.md` §3.7). Under
+ * `format: envelope` the head says which it is; under `format: otlp` the
+ * delivery's root span carries `agentcompose.detached` (§12.5).
+ *
+ * Two readers ask, and each resolves "cannot tell" in its own direction: a
+ * settle's once-per-execution guard counts only a row known to be the export
+ * (`src/delivery.ts`'s `executionExport`), because a trace exported twice is a
+ * collector's duplicate and one exported never is lost; and
+ * [`executionReport`] leaves out only a row known to be a delivery's envelope,
+ * because every other row on the ledger is one the report published before
+ * the ruling and still does.
+ */
+export function traceSinkClass(record: DeliveryRecord): "execution" | "detached" | undefined {
+  if (record.kind !== "trace_sink") return undefined;
+  let body: unknown;
+  try {
+    body = JSON.parse(record.body);
+  } catch {
+    return undefined;
+  }
+  if (typeof body !== "object" || body === null) return undefined;
+  const held = body as {
+    readonly detached?: unknown;
+    readonly execution_id?: unknown;
+    readonly resourceSpans?: unknown;
+  };
+  // The envelope: its head says which it is.
+  if (typeof held.execution_id === "string") {
+    return held.detached === true ? "detached" : "execution";
+  }
+  // OTLP/JSON: the detached delivery's root span is the one that says so.
+  const resources = Array.isArray(held.resourceSpans) ? (held.resourceSpans as unknown[]) : [];
+  const scopes = (resources[0] as { readonly scopeSpans?: unknown } | null | undefined)
+    ?.scopeSpans;
+  const spans = Array.isArray(scopes)
+    ? (scopes[0] as { readonly spans?: unknown } | null | undefined)?.spans
+    : undefined;
+  if (!Array.isArray(spans)) return undefined;
+  const detached = spans.some((span: unknown) => {
+    const attributes = (span as { readonly attributes?: unknown } | null | undefined)?.attributes;
+    return (
+      Array.isArray(attributes) &&
+      attributes.some((attribute: unknown) => {
+        const pair = attribute as
+          | { readonly key?: unknown; readonly value?: { readonly boolValue?: unknown } | null }
+          | null
+          | undefined;
+        return pair?.key === "agentcompose.detached" && pair.value?.boolValue === true;
+      })
+    );
+  });
+  return detached ? "detached" : "execution";
 }
 
 /** A failed item, carrying how many attempts its policy made. */
@@ -13915,13 +13979,27 @@ export interface ReportedExecution {
  * `status` says nothing about either and this is the only place a reader can see
  * them. No credential appears in it, and neither does a delivered body: what is
  * published is what happened.
+ *
+ * **A detached delivery's envelope is not on it** (PRD resolved q64). That row
+ * rides this execution's ledger only because a detached delivery has no ledger
+ * of its own (`docs/durability.md` §3.7): it is not this execution's lifecycle
+ * event, and it is journaled while the execution is still running or parked —
+ * so publishing it would put a `settled` delivery, and the sink's address, on
+ * the report of a run that has not settled, in the `parked` and `settled`
+ * webhooks a callback receiver is sent. The report is the one grammar 13.3
+ * states, and the ruling moved no wire: the rows this leaves out are exactly
+ * the ones [`traceSinkClass`] knows to be a delivery's envelope, which stay on
+ * the ledger and are worked on its schedule like any other row — they are
+ * left out of this document, not out of the journal.
  */
 export async function executionReport(
   execution: ReportedExecution,
 ): Promise<Record<string, unknown>> {
   let delivered: readonly DeliveryRecord[] = [];
   try {
-    delivered = await deliveriesOf(execution.id);
+    delivered = (await deliveriesOf(execution.id)).filter(
+      (record) => traceSinkClass(record) !== "detached",
+    );
   } catch {
     // A journal this process cannot read is not a reason to refuse the report:
     // what a reader is asking about is the run, and the rest of it is here.

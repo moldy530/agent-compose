@@ -728,7 +728,12 @@ are worked:
   carrying that delivery's own envelope (`docs/trace.md` §1.4, PRD resolved
   q64). A delivery's envelope is a row on the ledger of the execution it ran
   under, because a detached delivery is not an execution: it has no lifecycle
-  row and no journal of its own.
+  row and no journal of its own. It is on that ledger and not in that
+  execution's **report**: the status route's `deliveries`, which every `parked`
+  and `settled` webhook carries (`docs/grammar.md` §13.3), lists the
+  execution's own deliveries and leaves a delivery's envelope out — it is not
+  one of the execution's lifecycle events, and it is journaled while the
+  execution may still be running or parked.
 
 Nothing in the composition dispatches either: the graph does not know the
 subscription exists, no instance path addresses it, and no replay ever consumes
@@ -882,8 +887,10 @@ and `shipping` there for the trace; `owed` and `settled` in `src/cli.ts` for the
 callback and the status route both publish. A detached delivery's envelope is
 `shipDetachedTrace` and `journalDetachedTrace` in `src/delivery.ts`, reached from
 `runtime.watchDetachedSettlements` — which `src/serve.ts`'s `exportingDetached`
-and `src/cli.ts`'s `execute` subscribe to — and `executionExport` there is how a
-settle's guard tells the execution's own export from one of those. `attemptDelivery` is the one
+and `src/cli.ts`'s `execute` subscribe to — and `runtime.traceSinkClass` is the
+one reader that tells an execution's own export from one of those: a settle's
+guard asks it through `executionExport` there, and `runtime.executionReport`
+asks it to leave a delivery's envelope out of the report. `attemptDelivery` is the one
 declaration in the emitted app that reaches the network for a delivery, which is
 why §3's primitive walk names it as an exemption and
 `crates/compose-core/src/codegen/journal.rs`'s

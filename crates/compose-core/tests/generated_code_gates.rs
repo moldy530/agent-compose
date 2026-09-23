@@ -1399,7 +1399,8 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
 ///     its settlement after the join has returned, for a completed and a failed
 ///     delivery alike, and not for one that met a divergence or for a `tool.*`
 ///     sink — which is a claim about *who* holds a record, and only the runtime
-///     can be asked that.
+///     can be asked that. Beside it, the one reader that tells the two event
+///     classes' ledger rows apart, over the bytes both `format:`s write.
 ///
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds, so driving it directly is driving what every project runs.
@@ -1905,6 +1906,25 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
     assert_eq!(
         collected["failedDocument"]["error"], collected["broken"]["error"],
         "a failed delivery's envelope carries its outcome"
+    );
+    // …and the one reader of which class a sink row is, over the bytes both
+    // `format:`s write. The export guard counts only `"execution"` and the
+    // status route's report leaves out only `"detached"`, so a body neither can
+    // read — and a callback row, whatever it holds — is neither.
+    assert_eq!(
+        collected["sinkClass"],
+        serde_json::json!({
+            "envelopeExport": "execution",
+            "envelopeDetached": "detached",
+            "otlpExport": "execution",
+            "otlpDetached": "detached",
+            "unreadable": null,
+            "notAnObject": null,
+            "noSpans": null,
+            "callback": null,
+        }),
+        "`runtime.traceSinkClass` misreads a sink row, so a delivery's envelope reaches the \
+         status route's report or silences its parent's export"
     );
 }
 
