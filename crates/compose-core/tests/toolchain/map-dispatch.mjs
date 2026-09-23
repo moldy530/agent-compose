@@ -1376,13 +1376,15 @@ const observed = {};
     return { output: {} };
   });
   const called = (model) => ({ model, servedBy: model, fallback: 0, failovers: [] });
+  // Exactly what `codegen::graph` emits for a detached `flow.*` route: the
+  // dispatch site, and the node's admission for the child to be admitted under.
   const child = (tag, target) =>
     route({
       tag,
       detach: true,
       target,
       writes: [],
-      run: (input, _context, site) => runtime.dispatchChild(target, input, site),
+      run: (input, context, site) => runtime.dispatchChild(target, input, site, context.admission),
     });
   const map = descriptor({
     node: "hand_off",
@@ -1587,6 +1589,121 @@ const observed = {};
     noSpans: classOf(JSON.stringify({ resourceSpans: [] }), parent),
     callback: classOf(JSON.stringify(legacy), parent, "callback"),
   };
+
+  // --- …a queued child is on the books, and in the journal, from issue --------
+  //
+  // (PRD resolved q65, Decision D28.) `max_concurrency: 1` over two detached
+  // children, so the second waits for the first's permit. From the moment the
+  // join returns both are **begun** — two open rows, each with its lineage and
+  // the bound it was issued under — though only one has been handed to a
+  // runner: a process that stops now leaves both to recover, rather than one row
+  // and a dispatch that existed only in memory. And `childrenSettled` waits for
+  // both across the moment the first settles and hands its permit on — which is
+  // exactly when a drain that counted only *running* children found nothing left
+  // and let its process exit under the second.
+  {
+    const queuedParent = "exec_queued";
+    const queuedKey = (index) => `${queuedParent}/fan/0/${index}`;
+    const queuedHanded = [];
+    const queuedGates = new Map();
+    const unhostQueued = runtime.hostChildren(async (held) => {
+      queuedHanded.push(held.lineage.itemIndex);
+      await new Promise((open) => queuedGates.set(held.lineage.itemIndex, open));
+      return { output: {} };
+    });
+    const queued = descriptor({
+      node: "fan",
+      maxConcurrency: 1,
+      routes: [child(undefined, "flow.queued")],
+    });
+    const node = mapNode(queued, [{ subject: "first" }, { subject: "second" }], {
+      id: queuedParent,
+    });
+    node.state.$run = {
+      ...node.state.$run,
+      execution: { id: queuedParent, session_key: session },
+    };
+    const queuedEntry = entryOf(await runtime.runNode(node.descriptor, node.state));
+    for (let waited = 0; queuedHanded.length < 1 && waited < 200; waited += 1) await sleep(25);
+    // Room for a second child to be handed over, were the bound not holding.
+    await sleep(80);
+    const rowsAtIssue = [];
+    for (const index of [0, 1]) {
+      const row = await journal.execution(runtime.childExecutionId(queuedParent, queuedKey(index)));
+      rowsAtIssue.push(row === undefined ? null : { status: row.status, lineage: row.lineage });
+    }
+    const handedWhileFirstRan = [...queuedHanded];
+    let queuedDrained = false;
+    const queuedDraining = runtime.childrenSettled().then(() => {
+      queuedDrained = true;
+    });
+    // The first settles, and its permit goes to the second.
+    queuedGates.get(handedWhileFirstRan[0])?.();
+    for (let waited = 0; queuedHanded.length < 2 && waited < 200; waited += 1) await sleep(25);
+    await sleep(30);
+    const drainedWhileSecondRan = queuedDrained;
+    for (const open of queuedGates.values()) open();
+    await within(queuedDraining, "`childrenSettled` over a child that had been queued");
+    unhostQueued();
+    observed.queuedChildren = {
+      dispatches: queuedEntry.dispatches.map((record) => [record.index, record.outcome]),
+      rowsAtIssue,
+      handedWhileFirstRan: handedWhileFirstRan.length,
+      handedAtEnd: [...queuedHanded].sort(),
+      drainedWhileSecondRan,
+    };
+  }
+
+  // --- …and a recovered child is admitted under the bound it was issued under --
+  //
+  // (`docs/durability.md` §6.1.) Three open children of one settled parent, each
+  // recording `max_concurrency: 1`, resumed at once — what a `serve` start does
+  // with the rows a stop left. They start **one at a time**, on gates rebuilt
+  // from what their lineage recorded, and every one of them runs.
+  {
+    const recoveredParent = "exec_recovered_parent";
+    const bounds = { node: `${recoveredParent}/fan`, nodeBound: 1, route: "0", routeBound: 1 };
+    const rowFor = (index) => ({
+      id: runtime.childExecutionId(recoveredParent, `${recoveredParent}/fan/0/${index}`),
+      flow: "flow.queued",
+      trigger: "manual",
+      inputs: { subject: `recovered ${index}` },
+      sessionKey: "",
+      lineage: {
+        parent: recoveredParent,
+        idempotencyKey: `${recoveredParent}/fan/0/${index}`,
+        itemIndex: index,
+        admission: bounds,
+      },
+      status: "open",
+      journalVersion: runtime.JOURNAL_VERSION,
+      startedAt: new Date().toISOString(),
+    });
+    const running = new Set();
+    let peak = 0;
+    const recoveredHanded = [];
+    const recoveredGates = [];
+    const unhostRecovered = runtime.hostChildren(async (held) => {
+      recoveredHanded.push(held.lineage.itemIndex);
+      running.add(held.id);
+      peak = Math.max(peak, running.size);
+      await new Promise((open) => recoveredGates.push(open));
+      running.delete(held.id);
+      return { output: {} };
+    });
+    const resumed = [0, 1, 2].map((index) => runtime.resumeChild(rowFor(index)));
+    for (let opened = 0; opened < 3; opened += 1) {
+      for (let waited = 0; recoveredGates.length <= opened && waited < 200; waited += 1) {
+        await sleep(25);
+      }
+      // Room for another child to start beside this one, were the bound not held.
+      await sleep(40);
+      recoveredGates[opened]?.();
+    }
+    await within(Promise.all(resumed), "three recovered children, admitted one at a time");
+    unhostRecovered();
+    observed.recoveredChildren = { peak, handed: [...recoveredHanded].sort() };
+  }
 }
 
 // --- Grammar 9.3 level 1, and D79's outermost-wins --------------------------
@@ -1605,18 +1722,21 @@ const observed = {};
   };
 }
 
-// --- A worker begins no child execution (PRD resolved q42, q65) --------------
+// --- A worker issues no child execution (PRD resolved q42, q65) --------------
 //
 // **Last**, because both switches it turns on are the process's and are never
 // turned off: a worker runs one dispatch and exits (`./worker-node.ts`), and it
 // turns them on before anything runs. A worker reaches a detached `flow.*`
 // dispatch only inside a flow a placed agent attaches as a tool (grammar 14.1
 // rule 4), and a child execution is begun, journaled and recovered by the hub —
-// the journal's single writer — which a worker is not. So the dispatch answers
-// as a detached one does, hands no child to any runner, writes no row to the
-// journal this process can see, and says why on stderr by name. And the journal
-// a worker binds is the one every open in its process answers with, so no path
-// reaches a second journal beside the hub's.
+// the journal's single writer — which a worker is not. So the dispatch **cannot
+// be issued**, which grammar 8.6 rule 7 makes the map node's own failure: the
+// node fails by name before it dispatches anything — no stub record claiming a
+// dispatch was made — and its `on_error:` decides what follows (`skip`, here,
+// so the entry is what a reader of the trace is shown). No child is handed to
+// any runner and no row is written to the journal this process can see. And
+// the journal a worker binds is the one every open in its process answers
+// with, so no path reaches a second journal beside the hub's.
 {
   const journals = await import(pathToFileURL(path.resolve(project, "src/journal.ts")).href);
   const parent = "exec_on_a_worker";
@@ -1627,29 +1747,24 @@ const observed = {};
     return { output: {} };
   });
   runtime.refuseChildExecutions();
-  const written = [];
-  const write = process.stderr.write;
-  process.stderr.write = (chunk) => {
-    written.push(String(chunk));
-    return true;
-  };
-  let answer;
-  try {
-    answer = await within(
-      runtime.dispatchChild(
-        "flow.review",
-        { subject: "a" },
-        {
-          execution: { id: parent, session_key: "", item_index: 0 },
-          path: ["hand_off/0/0"],
-          idempotencyKey: key,
-        },
-      ),
-      "a detached dispatch refused on a worker",
-    );
-  } finally {
-    process.stderr.write = write;
-  }
+  const onAWorker = descriptor({
+    node: "hand_off",
+    routes: [
+      route({
+        detach: true,
+        target: "flow.review",
+        writes: [],
+        run: (input, context, site) =>
+          runtime.dispatchChild("flow.review", input, site, context.admission),
+      }),
+    ],
+  });
+  const node = mapNode(onAWorker, [{ subject: "a" }], { policy: { onError: "skip" }, id: parent });
+  const entry = entryOf(
+    await within(runtime.runNode(node.descriptor, node.state), "a map node on a worker"),
+  );
+  // Room for a child to be handed over, had the dispatch been issued anyway.
+  await sleep(60);
   unhost();
   // The scratch journal the child-execution section opened is still this
   // process's, so a row begun for the child would be there.
@@ -1657,10 +1772,11 @@ const observed = {};
   const dispatchJournal = { close: () => Promise.resolve() };
   journals.hostJournal(dispatchJournal);
   observed.onAWorker = {
-    answer,
+    outcome: entry.outcome,
+    error: entry.error ?? null,
+    dispatches: entry.dispatches ?? null,
     handed,
     row: row ?? null,
-    refusal: written.join(""),
     hosted: (await runtime.openJournal()) === dispatchJournal,
   };
 }

@@ -1402,11 +1402,16 @@ fn the_run_channel_folds_a_steps_contributions_in_canonical_order() {
 ///     child, and a recovery reaching it from its row, **join** it rather than
 ///     start a second generation; and `childrenSettled` waits for all of it —
 ///     which is a claim about *which generation runs*, and only the runtime can
-///     be asked that. Beside it, the one writer of an envelope's lineage head, and
-///     the one reader that tells an export from a legacy detached row, over the
-///     bytes both `format:`s write. And on a **worker** it starts none: the hub is
-///     the journal's single writer (PRD resolved q42), so the dispatch is refused
-///     by name, no runner is handed a child and no journal is given a row.
+///     be asked that. A child still **queued** behind its node's
+///     `max_concurrency:` already has its lifecycle row and is already on the
+///     drain, and children a recovery resumes are admitted under the bound their
+///     lineage recorded (Decision D28). Beside it, the one writer of an
+///     envelope's lineage head, and the one reader that tells an export from a
+///     legacy detached row, over the bytes both `format:`s write. And on a
+///     **worker** it starts none: the hub is the journal's single writer (PRD
+///     resolved q42), so the dispatch cannot be issued and the map node fails by
+///     name under its own `on_error:` (grammar 8.6 rule 7) — no stub record, no
+///     runner handed a child, no journal given a row.
 ///
 /// `src/runtime.ts` is a compiler constant, byte-identical in every project this
 /// release builds, so driving it directly is driving what every project runs.
@@ -1868,6 +1873,24 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         "a child settled before the join it is detached from returned"
     );
     let lineage = |index: usize| serde_json::json!({ "parent": parent, "idempotencyKey": key(index), "itemIndex": index });
+    // A first dispatch's child carries the bound it was issued under — the
+    // node's `max_concurrency: 8`, and its own route's, by the route's position
+    // — which is what a recovery with no parent to re-issue it admits it under
+    // (Decision D28, `docs/durability.md` §3.5, §6.1). The re-opened child's
+    // lineage is the one its row recorded, and that row recorded none.
+    let issued = |index: usize| {
+        serde_json::json!({
+            "parent": parent,
+            "idempotencyKey": key(index),
+            "itemIndex": index,
+            "admission": {
+                "node": format!("{parent}/hand_off"),
+                "nodeBound": 8,
+                "route": index.to_string(),
+                "routeBound": 8,
+            },
+        })
+    };
     assert_eq!(
         children["handed"],
         serde_json::json!([
@@ -1877,7 +1900,7 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
                 "inputs": { "kind": "review", "subject": "a" },
                 "sessionKey": "sess_children",
                 "trigger": "on_request",
-                "lineage": lineage(1),
+                "lineage": issued(1),
                 "resume": false,
             },
             {
@@ -1886,7 +1909,7 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
                 "inputs": { "kind": "broken", "subject": "b" },
                 "sessionKey": "sess_children",
                 "trigger": "on_request",
-                "lineage": lineage(2),
+                "lineage": issued(2),
                 "resume": false,
             },
             {
@@ -1993,17 +2016,95 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
          is taken for one"
     );
 
+    // A **queued** child (PRD resolved q65, Decision D28): `max_concurrency: 1`
+    // over two detached children. Both dispatches are the stub record; both
+    // children's rows are down, open and with their lineage, from the moment the
+    // join returned — while only one had been handed to a runner — so a process
+    // that stopped then would leave both to recover. And the drain a process
+    // ends on did not answer while the second, admitted when the first settled,
+    // was still running.
+    let queued = &observed["queuedChildren"];
+    let queued_parent = "exec_queued";
+    let queued_lineage = |index: usize| {
+        json!({
+            "parent": queued_parent,
+            "idempotencyKey": format!("{queued_parent}/fan/0/{index}"),
+            "itemIndex": index,
+            "admission": {
+                "node": format!("{queued_parent}/fan"),
+                "nodeBound": 1,
+                "route": "0",
+                "routeBound": 1,
+            },
+        })
+    };
+    assert_eq!(
+        queued["dispatches"],
+        json!([[0, "detached"], [1, "detached"]]),
+        "{queued:#}"
+    );
+    assert_eq!(
+        queued["rowsAtIssue"],
+        json!([
+            { "status": "open", "lineage": queued_lineage(0) },
+            { "status": "open", "lineage": queued_lineage(1) },
+        ]),
+        "a child still queued for its node's permit has no lifecycle row, so a process that \
+         stops now loses it for good (`docs/durability.md` §3.2, §6.1)"
+    );
+    assert_eq!(
+        queued["handedWhileFirstRan"], 1,
+        "a queued child started beside the running one, past `max_concurrency: 1`: {queued:#}"
+    );
+    assert_eq!(queued["handedAtEnd"], json!([0, 1]), "{queued:#}");
+    assert_eq!(
+        queued["drainedWhileSecondRan"], false,
+        "`childrenSettled` answered while a child that had been queued was still running — the \
+         moment the first settled and handed its permit on, a process ends under the second \
+         (`src/cli.ts`, PRD resolved q65)"
+    );
+    // …and **recovered** children are admitted under the bound their lineage
+    // recorded (`docs/durability.md` §6.1): three resumed at once, one at a time.
+    assert_eq!(
+        observed["recoveredChildren"],
+        json!({ "peak": 1, "handed": [0, 1, 2] }),
+        "recovered children of one `max_concurrency: 1` node ran side by side, or not at all"
+    );
+
     // …and on a **worker**, none of it (PRD resolved q42, q65). A child
     // execution is begun, journaled and recovered by the journal's single
     // writer, the hub; a worker reaches a detached `flow.*` dispatch only inside
     // a flow a placed agent attaches (grammar 14.1 rule 4), and there the
-    // dispatch answers as a detached one does, hands no child to any runner,
-    // begins no row on any journal this process can open, and names the refusal
-    // on stderr. The journal a worker binds is what every open in its process
-    // answers with, so no path reaches a second journal beside the hub's.
+    // dispatch cannot be issued — which grammar 8.6 rule 7 makes the **map
+    // node's own failure**, under its `on_error:`. The node fails by name before
+    // it dispatches anything: no stub record, no child handed to any runner, no
+    // row on any journal this process can open. The journal a worker binds is
+    // what every open in its process answers with, so no path reaches a second
+    // journal beside the hub's.
     let worker = &observed["onAWorker"];
     let refused = "exec_on_a_worker/hand_off/0/0";
-    assert_eq!(worker["answer"], json!({ "output": {} }));
+    assert_eq!(
+        worker["outcome"], "skipped",
+        "the map node that could not issue its dispatch did not fail into its `on_error: \
+         skip`: {worker:#}"
+    );
+    let said = worker["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains(&format!(
+            "node `hand_off` failed: ChildOnAWorker: `flow.review` is dispatched with `detach: \
+             true` (key `{refused}`) inside a placed node, on the worker running it"
+        )) && said.contains("PRD resolved q42, q65")
+            && said.contains("the map node that would have issued it fails"),
+        "a detached `flow.*` dispatch on a worker is not the map node's own failure, by name: \
+         {said:?}"
+    );
+    assert!(
+        worker["dispatches"].is_null()
+            || worker["dispatches"]
+                .as_array()
+                .is_some_and(|records| records.is_empty()),
+        "the node records a dispatch it could not issue: {worker:#}"
+    );
     assert_eq!(
         worker["handed"],
         json!([]),
@@ -2013,16 +2114,6 @@ fn the_fan_out_runtime_bounds_orders_and_resolves_every_dispatch() {
         worker["row"],
         Value::Null,
         "a worker began a child execution's lifecycle row on its own journal"
-    );
-    let said = worker["refusal"].as_str().unwrap_or_default();
-    assert!(
-        said.contains(&format!(
-            "the child execution `{}` did not complete: ChildOnAWorker: `flow.review` was \
-             dispatched with `detach: true` (key `{refused}`) inside a placed node, on the \
-             worker running it",
-            child_execution_id("exec_on_a_worker", refused)
-        )) && said.contains("PRD resolved q42, q65"),
-        "a detached `flow.*` dispatch on a worker is not refused by name: {said:?}"
     );
     assert_eq!(
         worker["hosted"], true,
@@ -6453,7 +6544,21 @@ fn a_fanned_out_coder_works_per_item_and_a_fresh_one_starts_empty() {
         assert_eq!(child["flow"], "flow.review", "{child:#}");
         assert_eq!(
             child["lineage"],
-            json!({ "parent": parent, "idempotencyKey": key(index), "itemIndex": index }),
+            json!({
+                "parent": parent,
+                "idempotencyKey": key(index),
+                "itemIndex": index,
+                // …and the bound it was issued under — `hand_off`'s
+                // `max_concurrency: 4`, on its one route — so a recovery that
+                // resumes it with no parent to re-issue it admits it under that
+                // bound (Decision D28, `docs/durability.md` §3.5, §6.1).
+                "admission": {
+                    "node": format!("{parent}/hand_off"),
+                    "nodeBound": 4,
+                    "route": "0",
+                    "routeBound": 4,
+                },
+            }),
             "the child's row names the dispatch that started it: {child:#}"
         );
         let effects = child["effects"]

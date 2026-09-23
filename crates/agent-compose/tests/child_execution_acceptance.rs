@@ -41,8 +41,13 @@
 //!   [`a_recovered_parent_finds_its_settled_child_and_starts_no_second`] for one
 //!   that had finished;
 //! * **a `run` waits for the children it started** —
-//!   [`a_run_waits_for_its_child_executions_and_ships_their_envelopes`] and
-//!   [`a_run_waits_for_a_child_still_running_after_its_own_export_went`];
+//!   [`a_run_waits_for_its_child_executions_and_ships_their_envelopes`],
+//!   [`a_run_waits_for_a_child_still_running_after_its_own_export_went`] and,
+//!   for one still queued behind its node's `max_concurrency:`,
+//!   [`a_run_waits_for_a_child_still_queued_behind_its_nodes_bound`];
+//! * **a queued child is an execution from the moment it is issued** — its row
+//!   is down before it has a permit, so a crash leaves it to recover:
+//!   [`a_child_still_queued_when_its_process_stopped_is_recovered_and_run`];
 //! * **a journal an earlier build wrote** —
 //!   [`a_delivery_an_earlier_build_journaled_under_its_parent_is_replayed_as_a_child`].
 
@@ -1067,19 +1072,21 @@ fn a_child_caught_mid_run_after_its_parent_settled_is_recovered_without_asking_a
     );
 }
 
-/// **A recovered parent that re-issues its detached dispatch joins the child it
+/// **A recovered parent that re-issues its detached dispatch resumes the child it
 /// already started, rather than starting a second** (PRD resolved q65,
 /// `docs/durability.md` §6.1).
 ///
 /// The double-resume the ruling names. The parent detaches a review that stalls
 /// and parks at a `human` node, and the process is killed with both open: the
-/// child mid-run, its model call recorded. The restarted app reaches the child
-/// from two directions — its recovery resumes the open child natively, and the
-/// recovered parent replays to its detached dispatch and re-issues it, deriving
-/// the same id. One child results: one lifecycle row, one lineage, one effect per
-/// step, the model asked once, and the stalled step run once per generation and
-/// never twice in one. Then the parent is answered and settles, its export beside
-/// the child's.
+/// child mid-run, its model call recorded. The restarted app finds both rows
+/// open, and the child is resumed **by its parent**: recovery leaves it for the
+/// parent's replay, which reaches the detached dispatch again, derives the same
+/// id, finds the child's open row and resumes it behind that node's join — the
+/// one direction that keeps the node's permit queue what the first generation's
+/// was. One child results: one lifecycle row, one lineage, one effect per step,
+/// the model asked once, and the stalled step run once per generation and never
+/// twice in one. Then the parent is answered and settles, its export beside the
+/// child's.
 #[test]
 fn a_recovered_parent_that_re_issues_its_dispatch_joins_the_child_it_started() {
     let provider = MockProvider::start().expect("a loopback port");
@@ -1128,14 +1135,14 @@ fn a_recovered_parent_that_re_issues_its_dispatch_joins_the_child_it_started() {
     );
     assert_eq!(shipped[0].body["status"], "completed");
 
-    // **The join, asked about directly.** Everything below it — one row, one
-    // lineage, one effect set — is also what a second generation that *failed
-    // at once* would leave, and without the join that is exactly what the second
-    // arrival is: it puts a fresh entry for the child on this app's board and
-    // its run trips the one-generation guard (`docs/durability.md` §2.1),
-    // replacing the child the status route answers with one that failed. So the
-    // route is asked, and it has to answer the one generation that ran: the
-    // child `completed`, with both of its steps.
+    // **One generation, asked about directly.** Everything below it — one row,
+    // one lineage, one effect set — is also what a second generation that
+    // *failed at once* would leave, and a second arrival that was let in rather
+    // than joined is exactly that: it puts a fresh entry for the child on this
+    // app's board and its run trips the one-generation guard
+    // (`docs/durability.md` §2.1), replacing the child the status route answers
+    // with one that failed. So the route is asked, and it has to answer the one
+    // generation that ran: the child `completed`, with both of its steps.
     let restarted = Client::new(&second.base_url).expect("a client for the restarted app");
     let reported = harness::settled(&restarted, &child_id);
     assert_eq!(
@@ -1210,11 +1217,16 @@ fn a_recovered_parent_that_re_issues_its_dispatch_joins_the_child_it_started() {
     // …and what the restarted app said about it, which is where a second
     // generation that failed at once is the only place it is said: the line the
     // child machinery writes for a child that did not complete. The recovery
-    // line is the control — it is what shows this is the app's stderr at all.
+    // line is the control — it is what shows this is the app's stderr at all —
+    // and it says the child was left for its open parent to re-issue.
     let said = second.stop_and_read_stderr();
     assert!(
-        said.contains(&format!("recovered {child_id} (flow.review_and_stall)")),
-        "the restarted app's stderr is not the one that recovered the child: {said}"
+        said.contains(&format!(
+            "recovered {child_id} (flow.review_and_stall), for its open parent {parent_id} to \
+             re-issue"
+        )),
+        "the restarted app's stderr is not the one that recovered the child, or it resumed the \
+         child itself rather than through its open parent: {said}"
     );
     assert!(
         !said.contains(&format!("the child execution `{child_id}`")),
@@ -1483,6 +1495,225 @@ fn a_run_waits_for_a_child_still_running_after_its_own_export_went() {
             { "kind": "trace_sink", "status": "delivered" },
         ]),
         "three exports on three ledgers, all sent by the command before it exited"
+    );
+}
+
+/// **A `run` waits for a child still queued behind its node's bound** (PRD
+/// resolved q65: the process does not end under a child it started; Decision
+/// D28).
+///
+/// `flow.dispatch` detaches two reviews under `max_concurrency: 1` and settles at
+/// once, so the second child waits for the first's permit. The first review is
+/// answered `LATE_REVIEW` after it asks, and **no sink** is declared, so nothing
+/// the command sends after its answer gives the second child time to start on its
+/// own. The command must wait out the first child and then the second — the one
+/// that was never running while the first was — before it exits: both children
+/// completed, both asked their model, one lineage row each.
+#[test]
+fn a_run_waits_for_a_child_still_queued_behind_its_nodes_bound() {
+    const LATE_REVIEW: Duration = Duration::from_millis(2_000);
+
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })).after(LATE_REVIEW),
+    ));
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "revise" })),
+    ));
+    let (_composition, entrypoint) =
+        harness::staged_with_deploy("child-run-queued", FIXTURE, LOCAL, "version: \"0.1\"\n");
+    let Some(project) = harness::scratch_project("child-run-queued") else {
+        return;
+    };
+    let run = harness::run_target(
+        &project,
+        &entrypoint,
+        LOCAL,
+        "flow.dispatch",
+        &[("subjects", r#"["the first","the second"]"#)],
+        &environment(&provider),
+    );
+    run.succeeded();
+    let said = run.stderr();
+    let parent_id = said
+        .lines()
+        .find_map(|line| line.strip_prefix("execution: "))
+        .unwrap_or_else(|| panic!("the run names its execution\nstderr: {said}"))
+        .trim()
+        .to_string();
+    let first = harness::child_execution_id(&parent_id, &format!("{parent_id}/review/0/0"));
+    let second = harness::child_execution_id(&parent_id, &format!("{parent_id}/review/0/1"));
+
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the command exited before the queued child had asked its model: {said}"
+    );
+    let mut expected = vec![
+        json!({ "id": parent_id, "status": "completed" }),
+        json!({ "id": first, "status": "completed" }),
+        json!({ "id": second, "status": "completed" }),
+    ];
+    expected.sort_by_key(|row| row["id"].as_str().unwrap_or_default().to_string());
+    assert_eq!(
+        harness::journal_rows(&project, "SELECT id, status FROM executions ORDER BY id"),
+        Value::Array(expected),
+        "the command did not end under a child — the queued one included"
+    );
+    assert_eq!(
+        harness::journal_rows(&project, "SELECT COUNT(*) AS n FROM lineage"),
+        json!([{ "n": 2 }]),
+        "one child execution per detached dispatch"
+    );
+}
+
+/// **A child still queued behind its node's bound when `serve` stopped is an
+/// open row, recovered and run by the next start** (PRD resolved q65,
+/// `docs/durability.md` §3.2, §6.1).
+///
+/// `flow.dispatch_stalling` detaches two reviews under `max_concurrency: 1` and
+/// settles: the first child records its model call and stalls, holding the
+/// permit, and the second waits for it. The process is killed there. Before the
+/// fix the second dispatch existed only in memory — no row, nothing to recover —
+/// so the work its parent counted as `detached` never ran. Now it was begun the
+/// moment it was issued: the crash leaves the parent settled and **both** children
+/// open, each with its lineage, and the restart recovers both — the first replays
+/// its recorded model call, the second asks its own — and both settle and ship.
+#[test]
+fn a_child_still_queued_when_its_process_stopped_is_recovered_and_run() {
+    let provider = MockProvider::start().expect("a loopback port");
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "approve" })),
+    ));
+    provider.enqueue(Script::new(
+        REVIEWER_MODEL,
+        Outcome::structured(json!({ "verdict": "revise" })),
+    ));
+    let collector = harness::Receiver::start().expect("a loopback collector");
+    let shims = harness::Scratch::new("child-queued-shims");
+    let environment = stalling(&provider, &shims);
+    let Some((_composition, entrypoint, project, mut first)) =
+        served("child-queued", &collector, None, &environment)
+    else {
+        return;
+    };
+    let app = Client::new(&first.base_url).expect("a client for the generated app");
+    let answered = app
+        .send(Request::post("/stalling-reviews").json(&json!({ "subjects": ["one", "two"] })))
+        .expect("the trigger's route answers");
+    assert_eq!(answered.status, 202, "{}", answered.text());
+    let parent_id = answered.json()["execution_id"]
+        .as_str()
+        .expect("an execution id")
+        .to_string();
+    let running = harness::child_execution_id(&parent_id, &format!("{parent_id}/review/0/0"));
+    let queued = harness::child_execution_id(&parent_id, &format!("{parent_id}/review/0/1"));
+
+    // The parent settles and exports; the first child is mid-run, holding the
+    // node's one permit, and the second is waiting for it.
+    let exported = collector.wait_for_event("settled", 1, PATIENCE);
+    assert!(
+        exported[0].body.get("detached").is_none(),
+        "the first export is the parent's: {:#}",
+        exported[0].body
+    );
+    harness::until(PATIENCE, || (stalls(&environment) == 1).then_some(()));
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "the queued child started beside the running one"
+    );
+
+    first.stop();
+    let mut expected = vec![
+        json!({ "id": parent_id, "status": "completed" }),
+        json!({ "id": running, "status": "open" }),
+        json!({ "id": queued, "status": "open" }),
+    ];
+    expected.sort_by_key(|row| row["id"].as_str().unwrap_or_default().to_string());
+    assert_eq!(
+        harness::journal_rows(&project, "SELECT id, status FROM executions ORDER BY id"),
+        Value::Array(expected),
+        "the crash left the queued child with no row — nothing will ever run it"
+    );
+    let mut lineage = vec![
+        json!({ "execution": running, "parent": parent_id }),
+        json!({ "execution": queued, "parent": parent_id }),
+    ];
+    lineage.sort_by_key(|row| row["execution"].as_str().unwrap_or_default().to_string());
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            "SELECT execution, parent FROM lineage ORDER BY execution"
+        ),
+        Value::Array(lineage),
+        "both children's causes are on the journal"
+    );
+    assert!(
+        effect_keys(&project, &queued).is_empty(),
+        "the queued child had done nothing"
+    );
+
+    let Some(_second) = harness::serve_target_into(&project, &entrypoint, LOCAL, &environment)
+    else {
+        return;
+    };
+    // Three distinct exports — the parent's and one per child. Counted by
+    // delivery id rather than by POST, because the kill can land between the
+    // parent's export arriving and its row being marked delivered, and the
+    // restart then sends it again under the same id: at-least-once, which a
+    // receiver dedupes (`docs/durability.md` §3.7).
+    harness::until(PATIENCE, || {
+        (collector.distinct("settled").len() >= 3).then_some(())
+    });
+    let all = collector.wait_for_event("settled", 3, PATIENCE);
+    let (_, children) = by_lineage(&all);
+    let mut shipped: Vec<(String, String)> = children
+        .iter()
+        .map(|delivered| {
+            (
+                delivered.body["execution_id"]
+                    .as_str()
+                    .expect("an id")
+                    .to_string(),
+                delivered.body["status"]
+                    .as_str()
+                    .expect("a status")
+                    .to_string(),
+            )
+        })
+        .collect();
+    shipped.sort_unstable();
+    shipped.dedup();
+    let mut wanted = vec![
+        (running.clone(), "completed".to_string()),
+        (queued.clone(), "completed".to_string()),
+    ];
+    wanted.sort_unstable();
+    assert_eq!(shipped, wanted, "{all:#?}");
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the recovered child replayed its recorded call and the queued one asked its own — \
+         once each"
+    );
+    assert_eq!(
+        effect_keys(&project, &queued),
+        [
+            ("judge/0#model/0".to_string(), "model".to_string()),
+            ("stall/0#tool/0".to_string(), "tool".to_string()),
+        ],
+        "the queued child ran, on its own record"
+    );
+    assert_eq!(
+        harness::journal_rows(
+            &project,
+            "SELECT COUNT(*) AS n FROM executions WHERE status = 'completed'"
+        ),
+        json!([{ "n": 3 }])
     );
 }
 

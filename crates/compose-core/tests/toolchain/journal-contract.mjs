@@ -229,16 +229,19 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
   //  absent on a row nothing dispatched, and written once: `begin` is idempotent
   //  on the id, lineage included, which is what a re-issued dispatch relies on.
   //  `item_index` is the one integer column the journal holds, so it is the one
-  //  a driver could hand back as a string.
+  //  a driver could hand back as a string. The admission bound the dispatch was
+  //  issued under rides with it, whole, because a recovery with no parent to
+  //  re-issue the child admits it under exactly that (Decision D28, §6.1).
   const child = `${execution}-child`;
   const childKey = `${execution}/review/0/3`;
+  const admission = { node: `${execution}/review`, nodeBound: 2, route: "1", routeBound: 1 };
   await handle.begin({
     id: child,
     flow: "flow.review",
     trigger: "on_request",
     inputs: { goal: UNICODE },
     sessionKey: "",
-    lineage: { parent: execution, idempotencyKey: childKey, itemIndex: 3 },
+    lineage: { parent: execution, idempotencyKey: childKey, itemIndex: 3, admission },
     status: "open",
     journalVersion: journal.JOURNAL_VERSION,
     startedAt: new Date().toISOString(),
@@ -257,7 +260,10 @@ its schema creation is not idempotent: ${error instanceof Error ? error.message 
   const childRow = await handle.execution(child);
   const scannedChild = (await handle.openExecutions()).find((held) => held.id === child);
   const sameLineage = (held) =>
-    held?.parent === execution && held?.idempotencyKey === childKey && held?.itemIndex === 3;
+    held?.parent === execution &&
+    held?.idempotencyKey === childKey &&
+    held?.itemIndex === 3 &&
+    JSON.stringify(held?.admission) === JSON.stringify(admission);
   results.a_child_executions_lineage_round_trips =
     sameLineage(childRow?.lineage) && sameLineage(scannedChild?.lineage);
   results.an_execution_nothing_dispatched_has_no_lineage =
