@@ -579,6 +579,22 @@ SEND, the hub INSERTS.** No worker ever touches the journal, which is why SQLite
 stays a valid backend for a personal mesh — there is still exactly one writer
 (PRD resolved q42).
 
+That includes a journal a worker's code opens **by name** rather than through
+its dispatch's session. The node runner binds the dispatch's own journal — the
+handed-over history and the stream going home — as the only journal its process
+can open, and that journal refuses by name every operation that is the hub's: a
+lifecycle row, a delivery, the dispatch board. The one construct a placed node
+can reach that would need one is a detached `flow.*` dispatch, which starts a
+**child execution** (PRD resolved q65, `docs/durability.md` §3.2) — begun,
+journaled and recovered by the single writer. A worker reaches one only inside a
+flow a placed agent attaches as a tool (grammar §14.1 rule 4), and there the
+dispatch is **refused**, on the worker's stderr and naming the flow and the
+dispatch's key, rather than begun on a journal the hub never reads: the dispatch
+is detached, so the join has already counted it (Decision D94) and the refusal
+reaches the placed node not at all. A composition that needs the child dispatches
+it from a flow the hub runs, or drops `detach:` so the dispatch is joined inside
+the placed node.
+
 Each record carries its **effect key**, derived by the execution-derived rule
 grammar §9.4 fixes — `<site>#<kind>/<ordinal>`, which the hub re-derives from the
 record's own three fields and refuses a record that disagrees with, since the key

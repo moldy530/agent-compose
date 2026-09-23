@@ -2751,7 +2751,13 @@ A **route** object takes `node` (required) plus optional `max_concurrency`,
    execution — its cause, the dispatch, recorded beside it — and it outlives the
    join by construction, which is what the three clauses above already
    promised about the dispatch; none of them moves (Decision
-   [D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)).
+   [D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)). Being an
+   execution, it has an execution's own lifetimes: a `scope: execution` store
+   it reaches addresses **the child's** partition, which begins empty and dies
+   with the child — not its parent's, whose partition dies when the parent
+   settles (§11.3). It runs on the inputs the dispatch bound, as any dispatched
+   instance does: the target's `inputs:` guards an invocation's boundary
+   (§13.2), and rule 12 below is what checked the binding.
 
    A detached dispatch's target MUST NOT **reach** a `human` node, in the sense
    §7.7 fixes — which includes a `human` node inside a flow the target
@@ -4193,6 +4199,15 @@ position, so it accepts `provider.*` and nothing else (§2.3).
   by default (§13.2) and therefore satisfy the check statically; supplying the
   value is a run-time requirement (`--session`), checked at run start like
   env-ref presence (§4.3) rather than at validate time.
+- `scope: execution` is partitioned by `execution.id` and dies with that
+  execution. Inside a **child execution** — what a detached `flow.*` dispatch
+  starts (§8.6 rule 7) — that is the child's own id, so an execution-scoped store
+  the child reaches is the **child's** partition: it begins empty, sees nothing
+  its parent wrote, and dies with the child. A `scope: session` or
+  `scope: global` store is shared across the two exactly as it is across any two
+  executions of one session or one project, which is what a parent that hands
+  work on to a detached flow through a store should declare (Decision
+  [D150](#d150-a-detached-flow-dispatch-starts-a-child-execution)).
 
 ### 11.4 Store-op nodes
 
@@ -10352,9 +10367,31 @@ what the construct *is* rather than a new key: no field is added to `map:`, no
 check moves, and a composition valid before is valid now with the same meaning
 at the join. What moves is below the grammar — the child's journal, recovery
 and export are `docs/durability.md` §3.2 and §6.1's and `docs/trace.md` §1.4's
-— and the one thing CEL can observe, `execution.id` inside the flow, which now
-names the child. *PRD 5.6, 5.8, resolved q28, q29, q42, q64, q65; §4.1, §8.6
-rule 7, §9.4, [D94](#d94-a-detached-dispatch-is-resolved-at-dispatch),
+— and **two things a flow observes from inside**, both because
+`execution.id` now names the child:
+
+* `execution.id` itself, in CEL;
+* the partition of a **`scope: execution` store** (§11.3), which is keyed by that
+  id. A detached flow's execution-scoped store is now the child's own — empty
+  when the child begins, dying with the child — where before it was its
+  parent's. The earlier reading was never one an author could rely on: the
+  parent's partition dies when the parent settles, and a detached flow exists to
+  outlive exactly that moment, so what it read there depended on whether it ran
+  before or after its parent's release. A composition that hands data on to a
+  detached flow through a store declares `scope: session` or `scope: global`,
+  whose partitions the child shares with its parent (it runs under the parent's
+  session). This is the ruling's "journaled, recovered and exported like any
+  execution" read through §11.3's per-execution lifetime rather than a separate
+  ruling, and it is stated here so it is read rather than inferred.
+
+A child also runs on the inputs its dispatch **bound**, not on those inputs
+re-parsed by the target's `inputs:`: that schema guards an invocation (§13.2), a
+dispatch is not one, §8.6 rule 12 checked the binding at build time, and a
+joined dispatch of the same target runs on exactly what it was bound — so
+whether one dispatch's input is accepted cannot depend on `detach:`. *PRD 5.6,
+5.8, resolved q28, q29, q42, q64, q65; §4.1, §8.6 rule 7, §9.4, §11.3,
+[D35](#d35-scope-is-required-on-store-definitions),
+[D94](#d94-a-detached-dispatch-is-resolved-at-dispatch),
 [D104](#d104-the-idempotency-key-is-the-flattened-instance-path),
 [D118](#d118-a-detached-dispatch-reaches-no-human-node).*
 

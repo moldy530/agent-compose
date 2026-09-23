@@ -565,6 +565,20 @@ the dispatch finds its child. Every execution has a cause — a trigger, or a
 detached dispatch from another execution's node — and a child's is on its
 lifecycle row.
 
+Being an execution, a child has an execution's own lifetimes. A `scope:
+execution` store it reaches is **its** partition, keyed by its id — empty when it
+begins, removed when it settles (§5) — and not its parent's, which is removed
+when the parent settles and which a child routinely outlives (`docs/grammar.md`
+§11.3, Decision D150). Its row records the inputs its dispatch bound, which are
+what it runs on: a child is not an invocation, so its flow's `inputs:` is not
+asked about them again, exactly as it is not for a joined instance of the same
+flow — and its row is begun before anything can stop it, so whatever does closes
+that row `failed` and ships the envelope that says why rather than leaving no
+record at all. And it is begun by the journal's single writer: a worker that
+reaches a detached `flow.*` dispatch inside a flow its placed agent attaches
+refuses it by name rather than beginning a child on a journal the hub never
+reads (`docs/distributed.md` §3.3).
+
 **The child's id is derived, never minted**: `exec_` and a version-8 UUID
 (RFC 9562) whose 122 free bits are the leading bits of SHA-256 over
 `agent-compose/execution/v1`, the parent's execution id and the dispatch's

@@ -1474,7 +1474,9 @@ fields q64 defined, in the one way §10.3 does not forgive:
   detached export was keyed by the envelope's `idempotency_key`, to keep it off
   the parent root's span id; a child's id is its own, so the ordinary rule
   applies and the special one is gone (§12.2). The trace and the root's parent
-  are what they were: the parent's trace, under the parent's root span;
+  are what they were: the trace of the execution at the head of the lineage —
+  under `4` every nested delivery ran under that head's id, so it is the trace
+  a grandchild's export always landed in — under the parent's root span;
 * **a child that is still running when its parent settles is recovered, and
   exported once.** Under `4` a delivery still in flight when its parent's row
   closed was lost, and a recovered delivery re-shipped under a new delivery id;
@@ -1856,10 +1858,16 @@ q64, q65). A child is an execution with an id of its own, so every span id its
 export derives is its own by the rules above — nothing it exports can take an id
 of its parent's. Two things place it:
 
-* its **trace** is its parent's: the one the **parent's** execution id derives,
-  or the caller's where a valid `traceparent` started the parent (§12.3) — the
-  child lands in the trace its parent's export lands in, since a collector files
-  a child under the run that dispatched it rather than beside it;
+* its **trace** is the one its parent's export lands in, since a collector files
+  a child under the run that dispatched it rather than beside it. A parent that
+  is itself a child landed in *its* parent's, so down any chain of children that
+  is one trace: the one the id of the execution at the **head** of the lineage —
+  the one a trigger or a command started — derives, or the caller's where a
+  valid `traceparent` started that head (§12.3). A grandchild's trace is
+  therefore its grandparent's, never the one its own parent's id would derive,
+  which is a trace nothing else is exported into. The envelope names only the
+  immediate parent, so the exporter is told the head beside it, walked up the
+  lifecycle rows (`docs/durability.md` §3.5);
 * its root's **parent is the parent execution's root span**, whose id is a
   function of the parent's execution id alone (the root key above) and so is
   known without the parent's export in hand. Not a caller's span: the caller

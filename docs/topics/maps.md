@@ -192,7 +192,11 @@ idempotency key, its own journal and recovery — a child still running when its
 parent settles is resumed by the next `serve` — and, under a target that
 declares a `trace_sink:`, its own export, headed `detached: true` and an
 `idempotency_key` equal to the stub's (`agent-compose docs trace`). The parent
-never waits for it; a `run` command does, before it exits.
+never waits for it; a `run` command does, before it exits. Being an execution,
+it has its own `scope: execution` stores — its own partition, empty when it
+begins — so data a parent hands on to a detached flow through a store belongs in
+a `scope: session` or `scope: global` one. Its flow runs on the input the
+dispatch bound, exactly as a joined dispatch of it would.
 
 In v0, `detach: true` is a validation error under any target whose execution
 state is durably checkpointed — every target except `local`. The same
